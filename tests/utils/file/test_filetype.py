@@ -19,6 +19,8 @@ from modelaudit.scanner_registry_metadata import get_extension_format_map
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+    JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
@@ -112,6 +114,80 @@ def test_detect_file_format_zip(tmp_path):
     assert detect_file_format(str(zip_path)) == "zip"
 
 
+def test_detect_renamed_jax_json_checkpoint_without_routing_ajax_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "checkpoint.jpg"
+    near_match_path = tmp_path / "ajax.jpg"
+    checkpoint_path.write_text(
+        (" " * 1024) + json.dumps({"framework": "jax", "orbax_version": "0.1.0"}),
+        encoding="utf-8",
+    )
+    near_match_path.write_text(json.dumps({"framework": "ajax", "format": "checkpoint"}), encoding="utf-8")
+
+    assert detect_file_format_from_magic(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format_from_magic(str(near_match_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(near_match_path)) == "unknown"
+    assert detect_file_format(str(near_match_path)) == "unknown"
+
+
+def test_detect_oversized_renamed_jax_json_checkpoint_with_bounded_identity(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "checkpoint-large.jpg"
+    marker_path = tmp_path / "orbax-large.jpg"
+    near_match_path = tmp_path / "ajax-large.jpg"
+    padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
+    checkpoint_path.write_text(json.dumps({"padding": padding, "framework": "jax"}), encoding="utf-8")
+    marker_path.write_text(json.dumps({"padding": padding, "__orbax_metadata__": "x" * 512}), encoding="utf-8")
+    near_match_path.write_text(json.dumps({"padding": padding, "framework": "ajax"}), encoding="utf-8")
+
+    assert detect_file_format_from_magic(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format_from_magic(str(marker_path)) == "jax_checkpoint"
+    assert detect_file_format_for_skip_filter(str(marker_path)) == "jax_checkpoint"
+    assert detect_file_format(str(marker_path)) == "jax_checkpoint"
+    assert detect_file_format_from_magic(str(near_match_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(near_match_path)) == "unknown"
+    assert detect_file_format(str(near_match_path)) == "unknown"
+
+
+def test_detect_jax_json_checkpoint_with_object_after_routing_budget_fails_closed(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "late-object.jpg"
+    checkpoint_path.write_text(
+        (" " * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1)) + json.dumps({"framework": "jax"}),
+        encoding="utf-8",
+    )
+
+    assert detect_file_format_from_magic(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format(str(checkpoint_path)) == "jax_checkpoint"
+
+
+def test_detect_oversized_jax_json_checkpoint_with_long_identity_value(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "long-identity.jpg"
+    padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
+    checkpoint_path.write_text(
+        json.dumps({"padding": padding, "framework": ("x" * 300) + " jax"}),
+        encoding="utf-8",
+    )
+
+    assert detect_file_format_from_magic(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format(str(checkpoint_path)) == "jax_checkpoint"
+
+
+@pytest.mark.parametrize("suffix", [".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle"])
+def test_detect_jax_json_checkpoint_on_scanner_owned_suffixes(tmp_path: Path, suffix: str) -> None:
+    checkpoint_path = tmp_path / f"state{suffix}"
+    checkpoint_path.write_text(
+        json.dumps({"framework": "jax", "payload": "jax.experimental.io_callback"}), encoding="utf-8"
+    )
+
+    assert detect_file_format_from_magic(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format(str(checkpoint_path)) == "jax_checkpoint"
+    assert validate_file_type(str(checkpoint_path)) is True
+
+
 def test_detect_large_renamed_flax_msgpack_by_later_root_without_promoting_generic_map(tmp_path: Path) -> None:
     msgpack = pytest.importorskip("msgpack")
     disguised_checkpoint = tmp_path / "checkpoint.jpg"
@@ -143,7 +219,7 @@ def test_detect_large_json_array_remains_a_fail_closed_flax_candidate(tmp_path: 
     assert detect_file_format(str(json_array)) == "flax_msgpack"
 
 
-def test_flax_json_exclusion_does_not_read_unbounded_trailing_whitespace(
+def test_flax_json_exclusion_bounds_trailing_whitespace_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -160,8 +236,8 @@ def test_flax_json_exclusion_does_not_read_unbounded_trailing_whitespace(
 
     monkeypatch.setattr(Path, "open", tracking_open)
 
-    assert not file_detection._is_bounded_complete_structured_json_document(json_document, json_document.stat().st_size)
-    assert opens == 1
+    assert file_detection._probe_complete_structured_json_document(json_document, json_document.stat().st_size) is True
+    assert opens == 2
 
 
 @pytest.mark.parametrize("suffix", [".ckpt", ".checkpoint", ".orbax-checkpoint"])
@@ -185,9 +261,28 @@ def test_detect_renamed_flax_checkpoint_under_document_suffix(tmp_path: Path, su
     assert detect_file_format(str(checkpoint)) == "flax_msgpack"
 
 
+@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst"])
+def test_detect_large_plain_document_does_not_fail_closed_as_flax(tmp_path: Path, suffix: str) -> None:
+    document = tmp_path / f"notes{suffix}"
+    document.write_bytes(b" " * (2 * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1) + 2))
+
+    assert detect_file_format_from_magic(str(document)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(document)) == "unknown"
+    assert detect_file_format(str(document)) == "unknown"
+
+
 @pytest.mark.parametrize(
     ("prefix", "has_pickle_overlap"),
-    [(b"I1\n.", False), (b"cbuiltins\nstr\n.", True), (b"\x80\x04.", True)],
+    [
+        (b"I1\n.", False),
+        (b"cbuiltins\nstr\n.", True),
+        (b"\x80\x04.", True),
+        (b"\x80\x04(2.", True),
+        (b"\x80\x04NNa.", True),
+        (b"\x80\x04\x95" + struct.pack("<Q", 1_000_000) + b"N.", True),
+        (b"\x80\x04}.", True),
+        (b"\x80\x04cos\nsystem\n(S'echo pwned'\ntR.", True),
+    ],
 )
 def test_detect_renamed_flax_stream_after_pickle_shaped_prefix(
     tmp_path: Path,
@@ -204,6 +299,86 @@ def test_detect_renamed_flax_stream_after_pickle_shaped_prefix(
     assert detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
     assert detect_file_format(str(checkpoint)) == "flax_msgpack"
     assert ("pickle" in detect_flax_msgpack_overlap_routes(str(checkpoint))) is has_pickle_overlap
+
+
+def test_detect_flax_stream_preserves_binary_pickle_overlap_when_stop_is_beyond_probe(tmp_path: Path) -> None:
+    msgpack = pytest.importorskip("msgpack")
+    checkpoint = tmp_path / "delayed-binary-pickle-stop.jpg"
+    pickle_stream = b"\x80\x04cos\nsystem\n(S'echo pwned'\ntR" + (b"N0" * (PROTO0_1_MAX_PROBE_BYTES // 2 + 1)) + b"."
+    checkpoint.write_bytes(pickle_stream + msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True))
+
+    assert detect_file_format_from_magic(str(checkpoint)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+    assert detect_file_format(str(checkpoint)) == "flax_msgpack"
+    assert "pickle" in detect_flax_msgpack_overlap_routes(str(checkpoint))
+
+
+@pytest.mark.parametrize(
+    ("opcode", "operand"),
+    [(b"q", b"\x00"), (b"r", b"\x00\x00\x00\x00"), (b"p", b"0\n")],
+    ids=["binput", "long-binput", "put"],
+)
+def test_detect_flax_stream_preserves_binary_pickle_overlap_when_operand_crosses_probe_boundary(
+    tmp_path: Path,
+    opcode: bytes,
+    operand: bytes,
+) -> None:
+    msgpack = pytest.importorskip("msgpack")
+    checkpoint = tmp_path / f"binary-pickle-{opcode.hex()}-boundary.jpg"
+    malicious_prefix = b"\x80\x04cos\nsystem\n(S'echo pwned'\ntR"
+    padding_size = PROTO0_1_MAX_PROBE_BYTES - len(malicious_prefix) - 1
+    neutral_padding = (b"N0" * (padding_size // 2)) + (b"N" if padding_size % 2 else b"")
+    pickle_stream = malicious_prefix + neutral_padding + opcode + operand + b"."
+    checkpoint.write_bytes(pickle_stream + msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True))
+
+    assert pickle_stream[PROTO0_1_MAX_PROBE_BYTES - 1 : PROTO0_1_MAX_PROBE_BYTES] == opcode
+    assert detect_file_format(str(checkpoint)) == "flax_msgpack"
+    assert "pickle" in detect_flax_msgpack_overlap_routes(str(checkpoint))
+
+
+@pytest.mark.parametrize(
+    "pickle_stream",
+    [
+        b"\x80\x04Ncos\nsystem\n(S'echo pwned'\ntR.",
+        b"\x80\x04}q\x00Nq\x00cos\nsystem\n(S'echo pwned'\ntR.",
+    ],
+    ids=["extra-return-stack-item", "memo-overwrite"],
+)
+def test_detect_flax_stream_preserves_unpickler_permitted_binary_pickle_overlap(
+    tmp_path: Path,
+    pickle_stream: bytes,
+) -> None:
+    msgpack = pytest.importorskip("msgpack")
+    checkpoint = tmp_path / "unpickler-permitted-overlap.jpg"
+    checkpoint.write_bytes(pickle_stream + msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True))
+
+    assert detect_file_format(str(checkpoint)) == "flax_msgpack"
+    assert "pickle" in detect_flax_msgpack_overlap_routes(str(checkpoint))
+
+
+def test_detect_dangerous_list_setitem_binary_pickle_preserves_flax_overlap(tmp_path: Path) -> None:
+    msgpack = pytest.importorskip("msgpack")
+    checkpoint = tmp_path / "list-setitem-overlap.jpg"
+    pickle_stream = b"\x80\x04]NaK\x00cos\nsystem\n(S'id'\ntRs."
+    checkpoint.write_bytes(pickle_stream + msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True))
+
+    assert detect_file_format(str(checkpoint)) == "flax_msgpack"
+    assert "pickle" in detect_flax_msgpack_overlap_routes(str(checkpoint))
+
+
+@pytest.mark.parametrize("suffix", [".jpg", ".txt"])
+def test_detect_xml_looking_scalar_prefix_still_routes_later_flax_checkpoint(tmp_path: Path, suffix: str) -> None:
+    msgpack = pytest.importorskip("msgpack")
+    checkpoint = tmp_path / f"xml-looking-scalar{suffix}"
+    checkpoint.write_bytes(
+        msgpack.packb(60, use_bin_type=True)
+        + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+    )
+
+    assert checkpoint.read_bytes()[:1] == b"<"
+    assert detect_file_format_from_magic(str(checkpoint)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+    assert detect_file_format(str(checkpoint)) == "flax_msgpack"
 
 
 def test_detect_pmml_prefix_outranks_trailing_flax_checkpoint_structure(tmp_path: Path) -> None:
@@ -252,6 +427,19 @@ def test_detect_large_inline_scalar_stream_does_not_route_as_renamed_flax_msgpac
     assert detect_file_format_from_magic(str(ordinary_data)) == "unknown"
     assert detect_file_format_for_skip_filter(str(ordinary_data)) == "unknown"
     assert detect_file_format(str(ordinary_data)) == "unknown"
+
+
+def test_jax_json_routing_does_not_claim_incomplete_flax_scalar_stream(tmp_path: Path) -> None:
+    msgpack = pytest.importorskip("msgpack")
+    checkpoint = tmp_path / "padded-flax.jpg"
+    checkpoint.write_bytes(
+        (b" " * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1))
+        + msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
+    )
+
+    assert detect_file_format_from_magic(str(checkpoint)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+    assert detect_file_format(str(checkpoint)) == "flax_msgpack"
 
 
 def test_detect_file_format_rejects_pk_prefix_near_match(tmp_path: Path) -> None:
@@ -548,8 +736,8 @@ def test_detect_oversized_renamed_mxnet_requires_top_level_graph_contract(tmp_pa
         '{"nodes":[],"op":"Custom","name":"load","attrs":"' + padding + '"}',
         encoding="utf-8",
     )
-    decided_unrelated = tmp_path / "decided-unrelated.jpg"
-    decided_unrelated.write_text(
+    trailing_ambiguous = tmp_path / "trailing-ambiguous.jpg"
+    trailing_ambiguous.write_text(
         '{"nodes":[],"op":"Custom","name":"load"}' + (" " * (MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)),
         encoding="utf-8",
     )
@@ -563,10 +751,25 @@ def test_detect_oversized_renamed_mxnet_requires_top_level_graph_contract(tmp_pa
     assert detect_file_format_for_skip_filter(str(delayed_nodes)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
     assert detect_file_format(str(unrelated)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
     assert detect_file_format_for_skip_filter(str(unrelated)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format(str(decided_unrelated)) == "flax_msgpack"
-    assert detect_file_format_for_skip_filter(str(decided_unrelated)) == "flax_msgpack"
+    assert detect_file_format(str(trailing_ambiguous)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(trailing_ambiguous)) == "unknown"
     assert detect_file_format(str(string_near_match)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
     assert detect_file_format_for_skip_filter(str(string_near_match)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_structured_json_tail_disambiguation_fails_closed_with_bounded_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    model_path = tmp_path / "large-trailing-json.jpg"
+    model_path.write_text('{"nodes":[],"op":"Custom","name":"load"}' + (" " * 512), encoding="utf-8")
+
+    assert file_detection._probe_complete_structured_json_document(model_path, model_path.stat().st_size) is None
+    assert detect_file_format_from_magic(str(model_path)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "flax_msgpack"
+    assert detect_file_format(str(model_path)) == "flax_msgpack"
 
 
 @pytest.mark.parametrize(

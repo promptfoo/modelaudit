@@ -11,6 +11,7 @@ from modelaudit.utils.file import filtering
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
@@ -240,6 +241,32 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_legacy_tar))
         assert should_skip_file(str(real_image))
 
+    def test_disguised_jax_json_checkpoint_bypasses_skip_without_routing_ajax_near_match(self, tmp_path: Path) -> None:
+        checkpoint_path = tmp_path / "checkpoint.jpg"
+        near_match_path = tmp_path / "ajax.jpg"
+        checkpoint_path.write_text(
+            (" " * 1024) + json.dumps({"framework": "jax", "orbax_version": "0.1.0"}),
+            encoding="utf-8",
+        )
+        near_match_path.write_text(json.dumps({"framework": "ajax", "format": "checkpoint"}), encoding="utf-8")
+
+        assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+        assert not should_skip_file(str(checkpoint_path))
+        assert detect_file_format_for_skip_filter(str(near_match_path)) == "unknown"
+        assert should_skip_file(str(near_match_path))
+
+    def test_oversized_disguised_jax_json_checkpoint_bypasses_skip_after_late_identity(self, tmp_path: Path) -> None:
+        checkpoint_path = tmp_path / "large-checkpoint.jpg"
+        near_match_path = tmp_path / "large-ajax.jpg"
+        padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
+        checkpoint_path.write_text(json.dumps({"padding": padding, "framework": "jax"}), encoding="utf-8")
+        near_match_path.write_text(json.dumps({"padding": padding, "framework": "ajax"}), encoding="utf-8")
+
+        assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+        assert not should_skip_file(str(checkpoint_path))
+        assert detect_file_format_for_skip_filter(str(near_match_path)) == "unknown"
+        assert should_skip_file(str(near_match_path))
+
     def test_large_disguised_flax_checkpoint_bypasses_skip_without_promoting_generic_msgpack_map(
         self, tmp_path: Path
     ) -> None:
@@ -283,6 +310,24 @@ class TestFileFilter:
         assert detect_file_format_for_skip_filter(str(generic_map)) == "unknown"
         if suffix in {".txt", ".rst"}:
             assert should_skip_file(str(generic_map))
+
+    def test_large_plain_text_document_stays_skipped_instead_of_routing_as_flax(self, tmp_path: Path) -> None:
+        document = tmp_path / "notes.txt"
+        document.write_bytes(b" " * (2 * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1) + 2))
+
+        assert detect_file_format_for_skip_filter(str(document)) == "unknown"
+        assert should_skip_file(str(document))
+
+    def test_xml_looking_scalar_flax_checkpoint_bypasses_skip(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        checkpoint = tmp_path / "xml-looking-scalar.txt"
+        checkpoint.write_bytes(
+            msgpack.packb(60, use_bin_type=True)
+            + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        assert detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+        assert not should_skip_file(str(checkpoint))
 
     def test_large_json_array_under_skipped_suffix_is_preserved_fail_closed(self, tmp_path: Path) -> None:
         json_array = tmp_path / "metadata.jpg"

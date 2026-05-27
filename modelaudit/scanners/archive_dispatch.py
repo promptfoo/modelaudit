@@ -9,7 +9,7 @@ from typing import Any
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_registry_metadata import get_scanner_registry_metadata
-from ..scanner_results import IssueSeverity, ScanResult, mark_inconclusive_scan_result
+from ..scanner_results import Issue, IssueSeverity, ScanResult, mark_inconclusive_scan_result
 from ..scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
     add_scanner_selection_skip_check,
@@ -66,6 +66,13 @@ _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY = "_skip_composed_archive_member_scan"
+
+
+def _is_pickle_parse_only_overlap_issue(issue: Issue) -> bool:
+    """Return whether a Pickle overlap issue is only parser fallout."""
+    return (issue.rule_code == "S901" and issue.details.get("category") == "parse_error") or (
+        issue.rule_code == "S902" and issue.details.get("notice_code") == "parse_incomplete"
+    )
 
 
 def _select_nested_scanner_id(path: str, header_format_override: str | None = None) -> str | None:
@@ -323,6 +330,19 @@ def merge_flax_msgpack_overlap_findings(
                 overlap_result = _make_unavailable_recognized_format_result(path, scanner_id, scanner_id)
             else:
                 overlap_result = scanner_class(config=config).scan(path)
+            # Binary-looking Flax prefixes may be invalid Pickle near-matches;
+            # merge substantive findings, including structural-tamper S902.
+            if (
+                scanner_id == "pickle"
+                and overlap_result.metadata.get("parsing_failed") is True
+                and overlap_result.metadata.get("failure_reason") == "unknown_opcode_or_format_error"
+                and not any(
+                    issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+                    and not _is_pickle_parse_only_overlap_issue(issue)
+                    for issue in overlap_result.issues
+                )
+            ):
+                continue
             primary_bytes_scanned = result.bytes_scanned
             result.merge(overlap_result)
             result.bytes_scanned = max(primary_bytes_scanned, overlap_result.bytes_scanned)
