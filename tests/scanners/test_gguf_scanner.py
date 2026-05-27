@@ -414,6 +414,27 @@ def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -
     _assert_inconclusive_exit2(aggregate, "jinja2_template_size_limit_exceeded")
 
 
+def test_gguf_scanner_preserves_duplicate_reason_with_oversized_chat_template(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-large-template.gguf"
+    _write_gguf_string_metadata_entries(
+        path,
+        [
+            ("tokenizer.chat_template", "{{ content }}" * 10000),
+            ("tokenizer.chat_template", "{{ message['content'] }}"),
+        ],
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    reasons = direct.metadata["scan_outcome_reasons"]
+    assert GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON in reasons
+    assert "jinja2_template_size_limit_exceeded" in reasons
+    assert any(check.name == "Template Size Limit" and check.status == CheckStatus.FAILED for check in direct.checks)
+    _assert_inconclusive_exit2(aggregate, GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON)
+    assert "jinja2_template_size_limit_exceeded" in _single_file_metadata(aggregate)["scan_outcome_reasons"]
+
+
 def test_gguf_oversized_chat_template_uncached_rerun_preserves_exit2(tmp_path: Path) -> None:
     path = create_mock_gguf(
         tmp_path / "large-template.gguf",
