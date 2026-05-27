@@ -923,7 +923,7 @@ class GgufScanner(BaseScanner):
                         gguf_metadata[key] = value
 
                     except Exception as e:
-                        gguf_metadata["error_reading_metadata"] = str(e)
+                        metadata["error_reading_metadata"] = str(e)
                         break
 
                 # Extract key model information

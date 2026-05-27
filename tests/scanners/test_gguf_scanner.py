@@ -478,6 +478,23 @@ def test_gguf_metadata_byte_limit_is_inconclusive(tmp_path: Path) -> None:
     _assert_inconclusive_exit2(aggregate, GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON)
 
 
+def test_gguf_extract_metadata_reports_bounded_partial_results(tmp_path: Path) -> None:
+    path = tmp_path / "bounded-extracted-metadata.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [
+            ("general.architecture", 8, _encode_gguf_string("llama")),
+            ("test.array", 9, _encode_gguf_array(0, b"\x01\x02", 2)),
+        ],
+    )
+
+    metadata = GgufScanner(config={"gguf_max_metadata_array_items": 1}).extract_metadata(str(path))
+
+    assert metadata["architecture"] == "llama"
+    assert metadata["metadata_count"] == 2
+    assert "exceeds per-array limit 1" in metadata["error_reading_metadata"]
+
+
 def test_gguf_total_metadata_array_item_limit_is_inconclusive(tmp_path: Path) -> None:
     path = tmp_path / "bounded-total-array-items.gguf"
     _write_gguf_raw_metadata_entries(
