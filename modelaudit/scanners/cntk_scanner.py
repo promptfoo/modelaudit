@@ -277,7 +277,7 @@ class CntkScanner(BaseScanner):
         try:
             prefix = _read_prefix(path)
         except OSError:
-            return True
+            return extension in _CNTK_SUPPORTED_EXTENSIONS
         variant, _reason = _detect_cntk_variant(prefix, extension)
         return variant in {"legacy_v1", "cntk_v2"}
 

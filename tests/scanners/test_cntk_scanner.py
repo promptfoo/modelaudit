@@ -54,6 +54,34 @@ def test_cntk_scanner_rejects_model_extension_in_v1_scope(tmp_path: Path) -> Non
     assert not CntkScanner.can_handle(str(path))
 
 
+@pytest.mark.parametrize(
+    ("suffix", "expected"),
+    [
+        (".dnn", True),
+        (".cmf", True),
+        (".jpg", False),
+        (".txt", False),
+        (".lgb", False),
+        (".model", False),
+    ],
+)
+def test_cntk_scanner_only_claims_unreadable_dedicated_extensions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+    expected: bool,
+) -> None:
+    path = tmp_path / f"unreadable{suffix}"
+    _write_cntkv2(path, payload=b" inputs outputs ")
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> bytes:
+        raise OSError("simulated CNTK signature read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._read_prefix", raise_os_error)
+
+    assert CntkScanner.can_handle(str(path)) is expected
+
+
 def test_cntk_scanner_reports_unsupported_variant_info(tmp_path: Path) -> None:
     path = tmp_path / "unsupported.dnn"
     _write_cntkv2(path, payload=b"inputs outputs", include_structure=False)
