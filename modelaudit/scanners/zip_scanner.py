@@ -15,7 +15,7 @@ from .archive_dispatch import (
     NESTED_SCAN_CALLBACK_CONFIG_KEY,
     scan_nested_file,
 )
-from .archive_member_security import scan_archive_member_for_known_risks
+from .archive_member_security import is_executable_archive_member_name, scan_archive_member_for_known_risks
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -534,6 +534,17 @@ class ZipScanner(BaseScanner):
 
                 if self._should_skip_archive_entry(name):
                     scan_complete = False
+                    if is_executable_archive_member_name(name):
+                        scan_archive_member_for_known_risks(
+                            archive_kind="ZIP",
+                            archive_path=path,
+                            member_name=name,
+                            tmp_path=None,
+                            total_size=info.file_size,
+                            result=result,
+                            max_python_analysis_bytes=self._max_python_member_analysis_bytes(),
+                            python_analysis_incomplete_reason="zip_python_member_analysis_incomplete",
+                        )
                     result.add_check(
                         name="ZIP Member Analysis Coverage",
                         passed=False,

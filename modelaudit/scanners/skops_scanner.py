@@ -137,7 +137,7 @@ class SkopsScanner(BaseScanner):
         try:
             with zip_file.open(file_info, "r") as entry:
                 content = entry.read(self.max_zip_entry_read_size + 1)
-        except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
             if result is not None and zip_path is not None and not self._is_nested_array_payload(file_info.filename):
                 self._record_unreadable_zip_entry(result, zip_path, file_info, exc)
             return None
@@ -470,8 +470,32 @@ class SkopsScanner(BaseScanner):
 
         from .zip_scanner import ZipScanner
 
-        zip_scanner = ZipScanner(config=self.config)
+        nested_config = dict(self.config)
+        unreadable_entries = result.metadata.get(self._UNREADABLE_ENTRY_METADATA_KEY, ())
+        skipped_entries = (
+            {entry for entry in unreadable_entries if isinstance(entry, str)}
+            if isinstance(unreadable_entries, list)
+            else set()
+        )
+
+        if skipped_entries:
+            configured_entries = nested_config.get("skip_archive_entries", ())
+            if isinstance(configured_entries, str):
+                skipped_entries.add(configured_entries)
+            elif isinstance(configured_entries, (list, tuple, set, frozenset)):
+                skipped_entries.update(entry for entry in configured_entries if isinstance(entry, str))
+            nested_config["skip_archive_entries"] = sorted(skipped_entries)
+
+        existing_reasons = result.metadata.get("scan_outcome_reasons")
+        preserved_reasons = (
+            [reason for reason in existing_reasons if isinstance(reason, str)]
+            if isinstance(existing_reasons, list)
+            else []
+        )
+        zip_scanner = ZipScanner(config=nested_config)
         result.merge(zip_scanner.scan_archive_members(path))
+        for reason in preserved_reasons:
+            mark_archive_scan_incomplete(result, reason)
 
     def scan(self, path: str) -> ScanResult:
         """Scan a skops file for security vulnerabilities."""

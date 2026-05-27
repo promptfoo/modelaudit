@@ -2120,6 +2120,22 @@ def test_zip_scanner_marks_configured_skipped_archive_entries_incomplete(tmp_pat
     assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
 
 
+def test_zip_scanner_preserves_executable_name_finding_for_skipped_archive_entry(tmp_path: Path) -> None:
+    archive_path = tmp_path / "skipped-executable.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("bin/run.sh", "#!/bin/sh\necho hidden\n")
+
+    result = ZipScanner({"skip_archive_entries": ["bin/run.sh"], "cache_enabled": False}).scan(str(archive_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Executable Archive Member Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "bin/run.sh"
+        for check in result.checks
+    )
+
+
 def test_zip_scanner_checks_compression_ratio_before_skipping_archive_entry(tmp_path: Path) -> None:
     archive_path = tmp_path / "skipped-bomb.zip"
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:

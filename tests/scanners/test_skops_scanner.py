@@ -655,10 +655,43 @@ class TestSkopsScannerEdgeCases:
         assert result.success is False
         assert result.metadata["oversized_zip_entries"] == ["payload.bin"]
 
+    def test_oversized_executable_member_is_still_checked_by_nested_scanner(self, tmp_path: Path) -> None:
+        """A Skops detector read limit must not suppress a generic security finding."""
+        skops_file = tmp_path / "oversized_executable_member.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("bin/run.sh", "#!/bin/sh\n" + ("echo hidden\n" * 32))
+
+        result = scan_model_directory_or_file(
+            str(skops_file),
+            cache_enabled=False,
+            max_zip_entry_read_size=128,
+            max_skops_file_size=10 * 1024 * 1024,
+        )
+
+        metadata = result.file_metadata[str(skops_file)]
+        _assert_inconclusive_reason(metadata, "skops_zip_entry_size_limited")
+        assert any(
+            issue.severity == IssueSeverity.WARNING
+            and issue.message == "Executable file found in ZIP archive: bin/run.sh"
+            and issue.details.get("entry") == "bin/run.sh"
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
+
+    @pytest.mark.parametrize(
+        ("exception_type", "message"),
+        [
+            (zipfile.BadZipFile, "CRC mismatch"),
+            (NotImplementedError, "unsupported compression method"),
+        ],
+    )
     def test_unreadable_entry_core_exits_two_and_avoids_cache_reuse(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        exception_type: type[Exception],
+        message: str,
     ) -> None:
         """Member read failures are unavailable coverage, not observed vulnerabilities."""
         skops_file = tmp_path / "unreadable_readme.skops"
@@ -678,16 +711,12 @@ class TestSkopsScannerEdgeCases:
         ) -> Any:
             filename = name.filename if isinstance(name, zipfile.ZipInfo) else name
             if filename == "README.md":
-                raise zipfile.BadZipFile("CRC mismatch")
+                raise exception_type(message)
             return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
 
-        def skip_nested_members(_self: SkopsScanner, _path: str, _result: ScanResult) -> None:
-            return None
-
         monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
-        monkeypatch.setattr(SkopsScanner, "_scan_archive_members", skip_nested_members)
 
-        cache_dir = tmp_path / "unreadable-cache"
+        cache_dir = tmp_path / f"unreadable-cache-{exception_type.__name__}"
         reset_cache_manager()
         try:
             first, second = _scan_twice_with_cache(skops_file, cache_dir)
@@ -700,11 +729,52 @@ class TestSkopsScannerEdgeCases:
                 ]
                 assert len(read_issues) == 1
                 assert read_issues[0].severity == IssueSeverity.INFO
+                assert not any("Error scanning ZIP entry README.md" in issue.message for issue in aggregate.issues)
             stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
             assert stats["cache_hits"] == 0
             assert stats["total_entries"] == 0
         finally:
             reset_cache_manager()
+
+    def test_unreadable_executable_member_name_remains_a_security_finding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Skipping duplicate reads must not suppress an executable-name signal."""
+        skops_file = tmp_path / "unreadable_executable.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("bin/run.sh", "#!/bin/sh\necho hidden\n")
+
+        original_open = zipfile.ZipFile.open
+
+        def open_with_failure(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            filename = name.filename if isinstance(name, zipfile.ZipInfo) else name
+            if filename == "bin/run.sh":
+                raise zipfile.BadZipFile("CRC mismatch")
+            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+
+        result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
+
+        metadata = result.file_metadata[str(skops_file)]
+        _assert_inconclusive_reason(metadata, "skops_zip_entry_read_failed")
+        assert any(
+            issue.severity == IssueSeverity.WARNING
+            and issue.message == "Executable file found in ZIP archive: bin/run.sh"
+            and issue.details.get("entry") == "bin/run.sh"
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
 
     def test_oversized_entry_core_exits_two_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
         """Aggregate scans should preserve fail-closed exit and avoid reusing incomplete outer results."""
@@ -730,6 +800,7 @@ class TestSkopsScannerEdgeCases:
                 metadata = result.file_metadata[str(skops_file)]
                 _assert_inconclusive_reason(metadata, "skops_zip_entry_size_limited")
                 assert any("Skipped oversized ZIP entry README.md" in str(issue.message) for issue in result.issues)
+                assert not any("Error scanning ZIP entry README.md" in str(issue.message) for issue in result.issues)
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["cache_hits"] == 0
         finally:
