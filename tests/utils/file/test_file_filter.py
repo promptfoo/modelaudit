@@ -13,6 +13,7 @@ from modelaudit.utils.file.detection import (
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     detect_file_format_for_skip_filter,
 )
 from modelaudit.utils.file.filtering import (
@@ -260,6 +261,35 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_checkpoint))
         assert detect_file_format_for_skip_filter(str(generic_map)) == "unknown"
         assert should_skip_file(str(generic_map))
+
+    @pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst"])
+    def test_flax_checkpoint_under_default_skipped_text_suffix_bypasses_skip(
+        self,
+        tmp_path: Path,
+        suffix: str,
+    ) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        checkpoint = tmp_path / f"checkpoint{suffix}"
+        generic_map = tmp_path / f"metadata{suffix}"
+        checkpoint.write_bytes(
+            msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+        generic_map.write_bytes(
+            msgpack.packb({"state": {"selected": True}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        assert detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+        assert not should_skip_file(str(checkpoint))
+        assert detect_file_format_for_skip_filter(str(generic_map)) == "unknown"
+        if suffix in {".txt", ".rst"}:
+            assert should_skip_file(str(generic_map))
+
+    def test_large_json_array_under_skipped_suffix_is_preserved_fail_closed(self, tmp_path: Path) -> None:
+        json_array = tmp_path / "metadata.jpg"
+        json_array.write_bytes(b"[" + b"0," * ((MXNET_SYMBOL_SIGNATURE_READ_BYTES // 2) + 100) + b"0]")
+
+        assert detect_file_format_for_skip_filter(str(json_array)) == "flax_msgpack"
+        assert not should_skip_file(str(json_array))
 
     def test_incomplete_disguised_flax_probe_bypasses_skip_filter(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

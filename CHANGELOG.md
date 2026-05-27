@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - route renamed structurally valid Flax/JAX MessagePack checkpoints through bounded, fail-closed security analysis
+- preserve Flax/JAX MessagePack routing under document suffixes and pickle-shaped prefixes with bounded fail-closed JSON ambiguity handling
 - avoid emitting sensitive scanner finding or loader error payloads in logs
 - fail closed when PyTorch ZIP analysis cannot complete configured blacklist inspection or a required scan phase
 - fail closed when standalone Jinja2 templates exceed the configured analysis size limit or cannot be decoded as UTF-8 text

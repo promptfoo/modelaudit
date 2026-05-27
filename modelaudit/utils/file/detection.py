@@ -147,6 +147,7 @@ _FLAX_MSGPACK_STATE_WRAPPER_KEY = "state"
 _FLAX_MSGPACK_SCANNER_SUFFIXES = frozenset({".msgpack", ".flax", ".orbax", ".jax"})
 _FLAX_MSGPACK_OVERLAP_SUFFIXES = frozenset({".ckpt", ".checkpoint", ".orbax-checkpoint"})
 _FLAX_MSGPACK_CONTENT_ROUTE_EXCLUDED_SUFFIXES = frozenset({".py", ".pyw"})
+_FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES = frozenset({".txt", ".md", ".markdown", ".rst"})
 _FLAX_MSGPACK_DECLARED_SUFFIXES = frozenset(get_registered_scanner_extensions())
 _FLAX_MSGPACK_NATIVE_SUFFIXES = _FLAX_MSGPACK_SCANNER_SUFFIXES
 _FLAX_MSGPACK_PROBE_MAX_NODES = 4096
@@ -2208,8 +2209,8 @@ def has_inconclusive_renamed_flax_msgpack_routing(path: str | Path) -> bool:
     return _probe_flax_msgpack_checkpoint_file(file_path) is None
 
 
-def _is_complete_structured_json_document(file_path: Path, file_size: int) -> bool:
-    """Keep complete renamed JSON documents within their structured routing path."""
+def _is_bounded_complete_structured_json_document(file_path: Path, file_size: int) -> bool:
+    """Exclude only complete JSON documents proven within one bounded prefix."""
     read_size = min(file_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
     prefix = read_magic_bytes(str(file_path), read_size)
     normalized_prefix = prefix[len(_UTF8_BOM) :] if prefix.startswith(_UTF8_BOM) else prefix
@@ -2225,20 +2226,9 @@ def _is_complete_structured_json_document(file_path: Path, file_size: int) -> bo
         _, end_offset = json.JSONDecoder().raw_decode(stripped_prefix)
     except (json.JSONDecodeError, RecursionError, ValueError):
         return False
-    if stripped_prefix[end_offset:].strip():
-        return False
-    if read_size == file_size:
-        return True
-
-    try:
-        with file_path.open("rb") as stream:
-            stream.seek(read_size)
-            while trailing_bytes := stream.read(_MXNET_SYMBOL_STREAM_CHUNK_BYTES):
-                if trailing_bytes.strip(b" \t\r\n"):
-                    return False
-    except OSError:
-        return False
-    return True
+    # Unread trailing bytes are ambiguous: they may be whitespace in a large
+    # JSON document or later MessagePack objects containing a checkpoint root.
+    return read_size == file_size and not stripped_prefix[end_offset:].strip()
 
 
 def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
@@ -2250,7 +2240,7 @@ def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
         size = file_path.stat().st_size
     except OSError:
         return False
-    if ext not in _FLAX_MSGPACK_SCANNER_SUFFIXES and _is_complete_structured_json_document(file_path, size):
+    if ext not in _FLAX_MSGPACK_SCANNER_SUFFIXES and _is_bounded_complete_structured_json_document(file_path, size):
         return False
     if ext == "":
         xgboost_route = _detect_extensionless_xgboost_ubjson_route(
@@ -2262,6 +2252,7 @@ def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
         ext in _FLAX_MSGPACK_SCANNER_SUFFIXES
         or ext in _FLAX_MSGPACK_OVERLAP_SUFFIXES
         or ext not in _FLAX_MSGPACK_DECLARED_SUFFIXES
+        or ext in _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES
     ) and is_flax_msgpack_checkpoint_file(file_path)
 
 
@@ -2279,6 +2270,12 @@ def detect_flax_msgpack_overlap_routes(path: str) -> tuple[str, ...]:
         path, min(size, max(_TORCH7_SIGNATURE_READ_BYTES, _CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
     )
     routes: list[str] = []
+    pickle_probe_sample = _read_pickle_probe_sample(file_path, size, prefix[:16])
+    if _looks_like_binary_pickle_protocol(prefix[:4]) or _looks_like_proto0_or_1_pickle(
+        pickle_probe_sample,
+        sample_is_prefix=size > len(pickle_probe_sample),
+    ):
+        routes.append("pickle")
     if _allows_renamed_binary_content_route(file_path) and prefix[:4] == b"RKNN":
         routes.append("rknn")
     if _is_torch7_signature(prefix[:_TORCH7_SIGNATURE_READ_BYTES]):
@@ -2342,13 +2339,17 @@ def detect_format_from_magic_bytes(
     if any(magic16.startswith(marker) for marker in R_SERIALIZATION_MARKERS):
         return "r_serialized"
 
-    if _looks_like_binary_pickle_protocol(magic4):
-        return "pickle"
     if _looks_like_safetensors_structure(file_path, magic8, file_size):
         return "safetensors"
 
     if b'"__metadata__"' in magic16 and _looks_like_safetensors_structure(file_path, magic8, file_size):
         return "safetensors"
+
+    if file_path is not None and not _could_be_xml_prefix(magic16) and _could_be_content_routed_flax_msgpack(file_path):
+        return "flax_msgpack"
+
+    if _looks_like_binary_pickle_protocol(magic4):
+        return "pickle"
 
     if file_path is not None:
         pickle_probe_sample = _read_pickle_probe_sample(file_path, file_size, magic16)
@@ -2357,9 +2358,6 @@ def detect_format_from_magic_bytes(
             sample_is_prefix=file_size > len(pickle_probe_sample),
         ):
             return "pickle"
-
-    if file_path is not None and _could_be_content_routed_flax_msgpack(file_path):
-        return "flax_msgpack"
 
     return "unknown"
 
@@ -2728,14 +2726,6 @@ def detect_file_format(path: str) -> str:
             return "torchserve_mar"
         return "zip"
 
-    if _looks_like_binary_pickle_protocol(magic4):
-        return "pickle"
-    pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
-    if _looks_like_proto0_or_1_pickle(
-        pickle_probe_sample,
-        sample_is_prefix=size > len(pickle_probe_sample),
-    ):
-        return "pickle"
     if _could_be_xml_prefix(header):
         xml_prefix = read_magic_bytes(path, _XML_MODEL_SIGNATURE_READ_BYTES)
         xml_format = _detect_xml_model_format(
@@ -2748,7 +2738,19 @@ def detect_file_format(path: str) -> str:
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
-    if ext in _FLAX_MSGPACK_SCANNER_SUFFIXES or _could_be_content_routed_flax_msgpack(file_path):
+    if _could_be_content_routed_flax_msgpack(file_path):
+        return "flax_msgpack"
+
+    if _looks_like_binary_pickle_protocol(magic4):
+        return "pickle"
+    pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
+    if _looks_like_proto0_or_1_pickle(
+        pickle_probe_sample,
+        sample_is_prefix=size > len(pickle_probe_sample),
+    ):
+        return "pickle"
+
+    if ext in _FLAX_MSGPACK_SCANNER_SUFFIXES:
         return "flax_msgpack"
 
     torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)

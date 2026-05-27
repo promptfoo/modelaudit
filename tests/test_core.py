@@ -130,7 +130,7 @@ def test_multi_file_directory_scan_refreshes_changed_pickle_source_snapshot(
     assert any(issue.rule_code == "DANGEROUS_CALL_GRAPH" for issue in result.issues)
 
 
-def _build_malicious_pickle() -> bytes:
+def _build_malicious_pickle(*, protocol: int | None = None) -> bytes:
     """Build a tiny pickle payload that exercises nested dangerous-opcode scanning."""
     import os as os_module
 
@@ -141,7 +141,7 @@ def _build_malicious_pickle() -> bytes:
             """Return a dangerous reducer target for scanner regression coverage."""
             return (os_module.system, ("echo core-dispatch-test",))
 
-    return pickle.dumps(DangerousPayload())
+    return pickle.dumps(DangerousPayload(), protocol=protocol)
 
 
 def _build_malicious_skops_schema() -> bytes:
@@ -1229,6 +1229,46 @@ def test_scan_file_routes_renamed_flax_stream_with_leading_scalar_object(
     assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
 
 
+@pytest.mark.parametrize("prefix", [b"I1\n.", b"cbuiltins\nstr\n.", b"\x80\x04."])
+def test_scan_file_routes_renamed_flax_stream_after_pickle_shaped_prefix(tmp_path: Path, prefix: bytes) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "stream-pickle-prefix.jpg"
+    checkpoint.write_bytes(
+        prefix
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+def test_scan_file_preserves_pickle_findings_in_protocol0_flax_overlap(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "stream-malicious-protocol0-prefix.jpg"
+    checkpoint.write_bytes(
+        _build_malicious_pickle(protocol=0)
+        + flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
 @pytest.mark.parametrize("leading_scalar", [123, 91], ids=["json-object-byte", "json-array-byte"])
 def test_scan_file_routes_nested_renamed_flax_stream_with_json_delimiter_scalar(
     tmp_path: Path,
@@ -1244,6 +1284,23 @@ def test_scan_file_routes_nested_renamed_flax_stream_with_json_delimiter_scalar(
         use_bin_type=True,
     )
     archive = tmp_path / f"nested-leading-scalar-{leading_scalar}.zip"
+    _create_misnamed_zip(archive, {"payload.jpg": nested_payload})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+def test_scan_file_routes_nested_renamed_flax_stream_after_protocol0_pickle_prefix(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    nested_payload = b"cbuiltins\nstr\n." + flax_msgpack_scanner.msgpack.packb(
+        {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+        use_bin_type=True,
+    )
+    archive = tmp_path / "nested-protocol0-prefix.zip"
     _create_misnamed_zip(archive, {"payload.jpg": nested_payload})
 
     result = scan_file(str(archive), config={"cache_scan_results": False})
@@ -1269,6 +1326,28 @@ def test_scan_file_does_not_raise_for_deep_json_array_near_match(tmp_path: Path)
     assert direct_result.success is True
     assert nested_result.scanner_name == "zip"
     assert nested_result.success is True
+
+
+def test_scan_file_fails_closed_for_ambiguous_json_looking_stream_before_later_flax_root(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "json-looking-padding.jpg"
+    checkpoint.write_bytes(
+        b"["
+        + b" " * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(checkpoint), cache_scan_results=False)
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert core_module.determine_exit_code(aggregate) == 2
 
 
 def test_scan_file_fails_closed_for_renamed_flax_stream_with_scalar_padding_past_analysis_limit(tmp_path: Path) -> None:
@@ -1374,6 +1453,26 @@ def test_scan_file_routes_msgpack_checkpoint_overlap_suffixes_to_flax_scanner(tm
     checkpoint = tmp_path / f"malicious{suffix}"
     checkpoint.write_bytes(
         flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst"])
+def test_scan_file_routes_malicious_flax_checkpoint_under_document_suffix(tmp_path: Path, suffix: str) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / f"malicious{suffix}"
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
     )
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
