@@ -11,6 +11,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners import _registry
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.tflite_scanner import _MAX_COUNT, TFLiteScanner
+from modelaudit.utils.file.detection import detect_file_format
 
 HAS_TFLITE = importlib.util.find_spec("tflite") is not None
 
@@ -53,28 +54,100 @@ def test_tflite_scanner_cannot_handle_wrong_extension(tmp_path: Path) -> None:
 
 def test_tflite_scanner_can_handle_renamed_model_by_magic_bytes(tmp_path: Path) -> None:
     """Valid TFLite content should still route when the extension is changed."""
-    path = tmp_path / "model.bin"
+    path = tmp_path / "model.jpg"
     path.write_bytes(b"\x00\x00\x00\x00TFL3" + b"\x00" * 100)
 
     assert TFLiteScanner.can_handle(str(path)) is True
 
 
 def test_tflite_scanner_registry_routes_renamed_model_by_magic_bytes(tmp_path: Path) -> None:
-    """Registry extension prefiltering should still route renamed TFLite binaries by magic bytes."""
-    path = tmp_path / "model.bin"
+    """Registry fallback should still route renamed TFLite binaries by magic bytes."""
+    path = tmp_path / "model.jpg"
     path.write_bytes(b"\x00\x00\x00\x00TFL3" + b"\x00" * 100)
 
     assert _registry.get_scanner_for_path(str(path)) is TFLiteScanner
 
 
-def test_core_scan_file_routes_renamed_tflite_bin_to_tflite_scanner(tmp_path: Path) -> None:
-    """End-to-end routing should prefer TFLite over PyTorch binary when `.bin` magic bytes are `TFL3`."""
+def test_core_scan_file_preserves_tflite_bin_analysis_with_pytorch_binary_primary(tmp_path: Path) -> None:
+    """`.bin` retains raw analysis while a strict TFLite signature is still analyzed."""
     path = tmp_path / "model.bin"
     path.write_bytes(b"\x00\x00\x00\x00TFL3" + b"\x00" * 100)
 
-    result = core.scan_file(str(path))
+    with patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", False):
+        result = core.scan_file(str(path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "tflite"
+    assert TFLiteScanner.can_handle(str(path)) is False
+    assert detect_file_format(str(path)) == "pytorch_binary"
+    assert result.scanner_name == "pytorch_binary"
+    assert result.metadata["supplemental_scanners"] == ["tflite"]
+    assert "tflite_dependency_unavailable" in result.metadata["scan_outcome_reasons"]
+    assert result.success is False
+
+
+def test_renamed_tflite_with_skipped_suffix_routes_through_directory_scan(tmp_path: Path) -> None:
+    path = tmp_path / "model.jpg"
+    path.write_bytes(b"\x0c\x00\x00\x00TFL3" + b"\x00" * 100)
+
+    assert TFLiteScanner.can_handle(str(path))
+    assert detect_file_format(str(path)) == "tflite"
+    assert core.scan_file(str(path)).scanner_name == "tflite"
+
+    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    assert directory.files_scanned == 1
+    assert "tflite" in directory.scanner_names
+
+
+def test_extensionless_tflite_routes_through_directory_scan(tmp_path: Path) -> None:
+    path = tmp_path / "model"
+    path.write_bytes(b"\x0c\x00\x00\x00TFL3" + b"\x00" * 100)
+
+    assert TFLiteScanner.can_handle(str(path))
+    assert detect_file_format(str(path)) == "tflite"
+    assert core.scan_file(str(path)).scanner_name == "tflite"
+
+    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    assert directory.files_scanned == 1
+    assert "tflite" in directory.scanner_names
+
+
+def test_renamed_tflite_near_match_with_skipped_suffix_remains_skipped(tmp_path: Path) -> None:
+    path = tmp_path / "notes.jpg"
+    path.write_bytes(b"\x0c\x00\x00\x00XTFL3" + b"\x00" * 100)
+
+    assert not TFLiteScanner.can_handle(str(path))
+    assert detect_file_format(str(path)) == "unknown"
+
+    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    assert directory.files_scanned == 0
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_format"),
+    [
+        (b"PK\x03\x04TFL3" + b"\x00" * 32, "zip"),
+        (b"\x1f\x8b\x08\x00TFL3" + b"\x00" * 32, "gzip"),
+        (b"((S'TFL3'\ntt.", "pickle"),
+        (b"RKNNTFL3" + b"\x00" * 32, "rknn"),
+        (b"T7\x00\x00TFL3" + b"\x00" * 32, "torch7"),
+    ],
+)
+def test_tflite_identifier_does_not_override_stronger_content_routes(
+    tmp_path: Path,
+    payload: bytes,
+    expected_format: str,
+) -> None:
+    path = tmp_path / "payload.jpg"
+    path.write_bytes(payload)
+
+    assert detect_file_format(str(path)) == expected_format
+
+
+@pytest.mark.parametrize("suffix", [".dnn", ".rknn", ".t7", ".th", ".exe", ".llamafile"])
+def test_tflite_identifier_does_not_override_owned_format_extensions(tmp_path: Path, suffix: str) -> None:
+    path = tmp_path / f"payload{suffix}"
+    path.write_bytes(b"MZ\x00\x00TFL3llamafile runtime\n" if suffix in {".exe", ".llamafile"} else b"T7\x00\x00TFL3")
+
+    assert detect_file_format(str(path)) != "tflite"
 
 
 def test_tflite_scanner_can_handle_magic_near_match_requires_exact_offset(tmp_path: Path) -> None:

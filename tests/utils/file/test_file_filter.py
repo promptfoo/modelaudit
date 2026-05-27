@@ -10,6 +10,8 @@ import pytest
 from modelaudit.utils.file import filtering
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+    FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
     detect_file_format_for_skip_filter,
@@ -237,6 +239,67 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_zip))
         assert not should_skip_file(str(disguised_legacy_tar))
         assert should_skip_file(str(real_image))
+
+    def test_disguised_jax_json_checkpoint_bypasses_skip_without_routing_ajax_near_match(self, tmp_path: Path) -> None:
+        checkpoint_path = tmp_path / "checkpoint.jpg"
+        near_match_path = tmp_path / "ajax.jpg"
+        checkpoint_path.write_text(
+            (" " * 1024) + json.dumps({"framework": "jax", "orbax_version": "0.1.0"}),
+            encoding="utf-8",
+        )
+        near_match_path.write_text(json.dumps({"framework": "ajax", "format": "checkpoint"}), encoding="utf-8")
+
+        assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+        assert not should_skip_file(str(checkpoint_path))
+        assert detect_file_format_for_skip_filter(str(near_match_path)) == "unknown"
+        assert should_skip_file(str(near_match_path))
+
+    def test_oversized_disguised_jax_json_checkpoint_bypasses_skip_after_late_identity(self, tmp_path: Path) -> None:
+        checkpoint_path = tmp_path / "large-checkpoint.jpg"
+        near_match_path = tmp_path / "large-ajax.jpg"
+        padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
+        checkpoint_path.write_text(json.dumps({"padding": padding, "framework": "jax"}), encoding="utf-8")
+        near_match_path.write_text(json.dumps({"padding": padding, "framework": "ajax"}), encoding="utf-8")
+
+        assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+        assert not should_skip_file(str(checkpoint_path))
+        assert detect_file_format_for_skip_filter(str(near_match_path)) == "unknown"
+        assert should_skip_file(str(near_match_path))
+
+    def test_large_disguised_flax_checkpoint_bypasses_skip_without_promoting_generic_msgpack_map(
+        self, tmp_path: Path
+    ) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_checkpoint = tmp_path / "checkpoint.jpg"
+        generic_map = tmp_path / "metadata.jpg"
+        large_metadata = "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+        disguised_checkpoint.write_bytes(
+            msgpack.packb({"metadata": large_metadata, "params": {"w": [1, 2, 3]}}, use_bin_type=True)
+        )
+        generic_map.write_bytes(
+            msgpack.packb(
+                {"metadata": large_metadata, "state": {"selected": True}, "__reduce__": "os.system"},
+                use_bin_type=True,
+            )
+        )
+
+        assert detect_file_format_for_skip_filter(str(disguised_checkpoint)) == "flax_msgpack"
+        assert not should_skip_file(str(disguised_checkpoint))
+        assert detect_file_format_for_skip_filter(str(generic_map)) == "unknown"
+        assert should_skip_file(str(generic_map))
+
+    def test_incomplete_disguised_flax_probe_bypasses_skip_filter(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        checkpoint = tmp_path / "unavailable.jpg"
+        checkpoint.write_bytes(b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03")
+        monkeypatch.setattr(
+            "modelaudit.utils.file.detection._probe_flax_msgpack_checkpoint_file",
+            lambda _path: None,
+        )
+
+        assert detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+        assert not should_skip_file(str(checkpoint))
 
     def test_pk_prefix_near_match_stays_skipped(self, tmp_path: Path) -> None:
         near_match = tmp_path / "pknope.jpg"
