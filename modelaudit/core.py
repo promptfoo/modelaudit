@@ -135,6 +135,7 @@ _R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
 _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
 _XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
+_FORMAT_DETECTION_READ_FAILED_REASON = "format_detection_read_failed"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
@@ -355,6 +356,23 @@ def _make_unavailable_recognized_format_result(path: str, format_: str, scanner_
     )
     _mark_inconclusive_scan_outcome(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
     _mark_operational_scan_error(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_format_detection_read_result(path: str, error: OSError) -> ScanResult:
+    """Fail closed when no owning scanner can classify a file after a read failure."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="Format Detection",
+        passed=False,
+        message=f"File format could not be determined because the file could not be read: {error}",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"path": path, "error": str(error), "analysis_incomplete": True},
+    )
+    _mark_inconclusive_scan_outcome(result, _FORMAT_DETECTION_READ_FAILED_REASON)
+    _mark_operational_scan_error(result, _FORMAT_DETECTION_READ_FAILED_REASON)
     result.finish(success=False)
     return result
 
@@ -1580,7 +1598,14 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     logger.debug(f"Processing: {path}")
 
-    header_format = detect_file_format(path)
+    format_probe_error: OSError | None = None
+    try:
+        header_format = detect_file_format(path)
+    except OSError as e:
+        # Dedicated scanners can produce a format-specific inconclusive result
+        # once extension routing selects their ownership.
+        header_format = "unknown"
+        format_probe_error = e
     ext_format = detect_format_from_extension(path)
     ext = os.path.splitext(path)[1].lower()
     magic_format = (
@@ -1692,7 +1717,14 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             sr.bytes_scanned = file_size
         return sr
 
-    file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
+    try:
+        file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
+    except OSError as e:
+        # Do not turn an unreadable model into a spoofing finding before its
+        # scanner gets a chance to emit its precise read-failure outcome.
+        file_type_valid = True
+        if format_probe_error is None:
+            format_probe_error = e
     discrepancy_msg = None
 
     if not file_type_valid:
@@ -1884,7 +1916,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                         result.bytes_scanned = file_size
                     return result
 
-            if magic_format == XML_MODEL_INCONCLUSIVE_FORMAT:
+            if format_probe_error is not None and magic_format == "unknown":
+                sr = _make_incomplete_format_detection_read_result(path, format_probe_error)
+            elif magic_format == XML_MODEL_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_xml_model_result(path)
             elif magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_llamafile_routing_result(path, config)

@@ -222,6 +222,8 @@ def test_cntk_signature_read_failure_still_routes_to_inconclusive_scan(
     def raise_os_error(*_args: object, **_kwargs: object) -> bytes:
         raise OSError("simulated CNTK signature read failure")
 
+    monkeypatch.setattr("modelaudit.core.detect_file_format", raise_os_error)
+    monkeypatch.setattr("modelaudit.core.validate_file_type_with_formats", raise_os_error)
     monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_os_error)
     monkeypatch.setattr("modelaudit.scanners.cntk_scanner._read_prefix", raise_os_error)
 
@@ -246,6 +248,8 @@ def test_cntk_unreadable_path_preflight_is_inconclusive_not_security_finding(
         raise OSError("simulated permission-denied read failure")
 
     monkeypatch.setattr("modelaudit.scanners.base.os.access", deny_access)
+    monkeypatch.setattr("modelaudit.core.detect_file_format", raise_os_error)
+    monkeypatch.setattr("modelaudit.core.validate_file_type_with_formats", raise_os_error)
     monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_os_error)
     monkeypatch.setattr("modelaudit.scanners.cntk_scanner._read_prefix", raise_os_error)
 
