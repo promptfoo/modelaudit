@@ -9,6 +9,7 @@ import pytest
 
 from modelaudit import core
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.scanners import tar_scanner as tar_scanner_module
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.tar_scanner import (
@@ -24,6 +25,9 @@ def _assert_inconclusive_aggregate_not_reused(
     path: Path,
     expected_reason: str,
     cache_dir: Path,
+    *,
+    expected_exit_code: int = 2,
+    expected_security_findings: bool = False,
     **scan_kwargs: Any,
 ) -> None:
     reset_cache_manager()
@@ -47,10 +51,11 @@ def _assert_inconclusive_aggregate_not_reused(
             metadata = aggregate.file_metadata[str(path)]
             assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
             assert expected_reason in metadata["scan_outcome_reasons"]
-            assert not [
+            security_findings = [
                 issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
             ]
-            assert core.determine_exit_code(aggregate) == 2
+            assert bool(security_findings) is expected_security_findings
+            assert core.determine_exit_code(aggregate) == expected_exit_code
 
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["cache_hits"] == 0
     finally:
@@ -654,12 +659,15 @@ class TestTarScanner:
             assert result.success is False
             depth_issues = [i for i in result.issues if "maximum" in i.message.lower() and "depth" in i.message.lower()]
             assert len(depth_issues) > 0
-            assert depth_issues[0].severity == IssueSeverity.INFO
+            assert depth_issues[0].severity == IssueSeverity.WARNING
+            assert depth_issues[0].rule_code == "S902"
             assert "tar_depth_limit" in result.metadata["scan_outcome_reasons"]
             _assert_inconclusive_aggregate_not_reused(
                 Path(tar_paths[-1]),
                 "tar_depth_limit",
                 tmp_path / "depth-limit-cache",
+                expected_exit_code=1,
+                expected_security_findings=True,
             )
         finally:
             for path in tar_paths:
@@ -1041,6 +1049,59 @@ class TestTarScanner:
             "tar_scan_incomplete",
             tmp_path / "outer-failure-cache",
         )
+
+    def test_late_tar_traversal_failure_preserves_detected_security_finding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Unavailable later traversal must not erase a finding already observed."""
+        archive_path = tmp_path / "partial_traversal_after_finding.tar"
+        malicious_payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
+        with tarfile.open(archive_path, "w") as archive:
+            for name, payload in (("payload.txt", malicious_payload), ("later.txt", b"unreadable later member")):
+                info = tarfile.TarInfo(name)
+                info.size = len(payload)
+                archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        monkeypatch.setattr(
+            TarScanner,
+            "can_handle",
+            classmethod(lambda _cls, path: path == str(archive_path)),
+        )
+        monkeypatch.setattr(TarScanner, "_preflight_tar_archive", lambda _self, _path, _result: True)
+        original_member_risk_scan = tar_scanner_module.scan_archive_member_for_known_risks
+        original_next = tarfile.TarFile.next
+        malicious_member_scanned = False
+
+        def observe_member_risk_scan(**kwargs: Any) -> None:
+            nonlocal malicious_member_scanned
+            original_member_risk_scan(**kwargs)
+            if kwargs["member_name"] == "payload.txt":
+                malicious_member_scanned = True
+
+        def fail_after_detected_member(archive: tarfile.TarFile) -> tarfile.TarInfo | None:
+            if (
+                malicious_member_scanned
+                and archive.name is not None
+                and Path(os.fsdecode(archive.name)) == archive_path
+            ):
+                raise OSError("later TAR traversal unavailable")
+            return original_next(archive)
+
+        monkeypatch.setattr(tar_scanner_module, "scan_archive_member_for_known_risks", observe_member_risk_scan)
+        monkeypatch.setattr(tarfile.TarFile, "next", fail_after_detected_member)
+
+        aggregate = core.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert "tar_scan_incomplete" in aggregate.file_metadata[str(archive_path)]["scan_outcome_reasons"]
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.location == f"{archive_path}:payload.txt"
+            and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system"))
+            for issue in aggregate.issues
+        )
+        assert core.determine_exit_code(aggregate) == 1
 
     def test_scan_skips_non_regular_tar_members(self, tmp_path: Path) -> None:
         """Valid non-file TAR members should not abort scanning later regular files."""

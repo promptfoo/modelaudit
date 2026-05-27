@@ -134,20 +134,7 @@ class TarScanner(BaseScanner):
             result.finish(success=False)
             return result
         except Exception as e:
-            mark_archive_scan_incomplete(result, "tar_scan_incomplete")
-            result.add_check(
-                name="TAR File Scan",
-                passed=False,
-                message=f"Error scanning tar file: {e!s}",
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={
-                    "exception": str(e),
-                    "exception_type": type(e).__name__,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": "tar_scan_incomplete",
-                },
-            )
+            self._record_incomplete_tar_scan(result, path, e)
             result.finish(success=False)
             return result
 
@@ -467,6 +454,24 @@ class TarScanner(BaseScanner):
 
         return True
 
+    @staticmethod
+    def _record_incomplete_tar_scan(result: ScanResult, path: str, exc: Exception) -> None:
+        """Record unavailable TAR traversal without discarding findings already collected."""
+        mark_archive_scan_incomplete(result, "tar_scan_incomplete")
+        result.add_check(
+            name="TAR File Scan",
+            passed=False,
+            message=f"Error scanning tar file: {exc!s}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(exc),
+                "exception_type": type(exc).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "tar_scan_incomplete",
+            },
+        )
+
     def _scan_tar_file(self, path: str, depth: int = 0) -> ScanResult:
         result = ScanResult(scanner_name=self.name)
         contents: list[dict[str, Any]] = []
@@ -478,7 +483,8 @@ class TarScanner(BaseScanner):
                 name="TAR Depth Bomb Protection",
                 passed=False,
                 message=f"Maximum TAR nesting depth ({self.max_depth}) exceeded",
-                severity=IssueSeverity.INFO,
+                rule_code="S902",
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={
                     "depth": depth,
@@ -516,7 +522,15 @@ class TarScanner(BaseScanner):
                 except OSError as exc:
                     if not contents and exc.errno == errno.EINVAL and self._is_empty_tar_archive(path):
                         break
+                    scan_complete = False
+                    self._record_incomplete_tar_scan(result, path, exc)
+                    break
+                except tarfile.TarError:
                     raise
+                except Exception as exc:
+                    scan_complete = False
+                    self._record_incomplete_tar_scan(result, path, exc)
+                    break
 
                 if member is None:
                     break
