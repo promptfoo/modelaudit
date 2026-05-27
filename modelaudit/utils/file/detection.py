@@ -39,8 +39,20 @@ _CNTK_V2_STRUCTURE_MARKERS = (b"CompositeFunction", b"primitive_functions", b"Pr
 _CNTK_SIGNATURE_READ_BYTES = 4096
 _TF_METAGRAPH_MIN_BYTES = 8
 _TF_METAGRAPH_MAX_VALIDATE_BYTES = 20 * 1024 * 1024
+_TF_METAGRAPH_MAX_ROUTING_PAYLOAD_BYTES = _TF_METAGRAPH_MAX_VALIDATE_BYTES
 _TF_METAGRAPH_MAX_ROUTING_FIELDS = 32768
-_TensorFlowProtoRoute = Literal["unknown", "tf_metagraph", "tf_savedmodel", "inconclusive"]
+_TF_METAGRAPH_MAX_ROUTING_DEPTH = 64
+_CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES = 2 * 1024 * 1024
+_CONTENT_ROUTE_PRINTABLE_TEXT_BYTES = b"\t\n\r" + bytes(range(0x20, 0x7F))
+_TensorFlowProtoRoute = Literal[
+    "unknown",
+    "tf_metagraph",
+    "tf_savedmodel",
+    "oversized",
+    "oversized_candidate",
+    "inconclusive",
+]
+_TensorFlowOuterHint = Literal["unknown", "tf_metagraph", "tf_savedmodel"]
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
 _ONNX_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
@@ -210,6 +222,7 @@ _MXNET_SYMBOL_STREAM_CHUNK_BYTES = 64 * 1024
 LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
 NEMO_ROUTING_INCONCLUSIVE_FORMAT = "nemo_routing_inconclusive"
 XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT = "xgboost_ubjson_routing_inconclusive"
+TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT = "tensorflow_protobuf_routing_inconclusive"
 EXECUTABLE_ZIP_POLYGLOT_FORMAT = "executable_zip_polyglot"
 _XGBOOST_UBJSON_ROUTE_READ_BYTES = 256 * 1024
 _COMPRESSED_EXTENSION_CODECS = {
@@ -1868,10 +1881,16 @@ def _has_tensorflow_graph_signal(graph_def: Any) -> bool:
     )
 
 
+def _has_tensorflow_operation_signal(graph_def: Any) -> bool:
+    return any(node.op for node in graph_def.node) or any(
+        node.op for function in graph_def.library.function for node in function.node_def
+    )
+
+
 def _classify_tensorflow_field_two_payload(
     payload: bytes,
     *,
-    prefer_savedmodel: bool,
+    outer_hint: _TensorFlowOuterHint,
 ) -> _TensorFlowProtoRoute:
     """Classify a bounded protobuf field 2 payload from MetaGraph/SavedModel wrappers."""
     try:
@@ -1882,28 +1901,42 @@ def _classify_tensorflow_field_two_payload(
         from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
     except Exception:
         return "unknown"
-    savedmodel_signal = False
-    try:
-        metagraph = MetaGraphDef()
-        metagraph.ParseFromString(payload)
-        if len(metagraph.collection_def) > 0 or (
-            metagraph.HasField("graph_def") and _has_tensorflow_graph_signal(metagraph.graph_def)
-        ):
-            savedmodel_signal = True
-    except (DecodeError, ValueError, TypeError, AttributeError):
-        # Invalid MetaGraph wrappers can still be valid GraphDef payloads.
-        pass
+
+    graph_signal = False
     try:
         graph_def = GraphDef()
         graph_def.ParseFromString(payload)
-        if _has_tensorflow_graph_signal(graph_def):
-            if prefer_savedmodel and savedmodel_signal:
-                return "tf_savedmodel"
-            return "tf_metagraph"
-    except Exception:
-        # GraphDef parsing is opportunistic; preserve SavedModel or unknown fallback.
+        graph_signal = _has_tensorflow_graph_signal(graph_def)
+    except (DecodeError, ValueError, TypeError, AttributeError):
+        # This field may instead hold a MetaGraphDef wrapper; inspect that next.
         pass
-    return "tf_savedmodel" if savedmodel_signal else "unknown"
+
+    saved_model_signal = False
+    try:
+        metagraph = MetaGraphDef()
+        metagraph.ParseFromString(payload)
+        saved_model_signal = len(metagraph.collection_def) > 0 or (
+            metagraph.HasField("graph_def")
+            and (
+                _has_tensorflow_operation_signal(metagraph.graph_def)
+                or (outer_hint == "tf_savedmodel" and _has_tensorflow_graph_signal(metagraph.graph_def))
+            )
+        )
+    except (DecodeError, ValueError, TypeError, AttributeError):
+        # Raw GraphDef payloads are expected here; preserve the graph signal above.
+        pass
+
+    if outer_hint == "tf_metagraph" and graph_signal:
+        return "tf_metagraph"
+    if outer_hint == "tf_savedmodel" and saved_model_signal:
+        return "tf_savedmodel"
+    if graph_signal and not saved_model_signal:
+        return "tf_metagraph"
+    if saved_model_signal and not graph_signal:
+        return "tf_savedmodel"
+    if graph_signal and saved_model_signal:
+        return "inconclusive"
+    return "unknown"
 
 
 def _is_tensorflow_collection_payload(payload: bytes) -> bool:
@@ -1922,6 +1955,22 @@ def _is_tensorflow_collection_payload(payload: bytes) -> bool:
         return False
 
 
+def _is_tensorflow_metainfo_payload(payload: bytes) -> bool:
+    """Return whether field 1 contains recognizable MetaGraph metadata."""
+    try:
+        import modelaudit.protos  # noqa: F401, I001
+
+        from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
+    except Exception:
+        return False
+    try:
+        metainfo = MetaGraphDef.MetaInfoDef()
+        metainfo.ParseFromString(payload)
+        return bool(metainfo.meta_graph_version or metainfo.tags)
+    except Exception:
+        return False
+
+
 def _skip_proto_stream_value(
     stream: BinaryIO,
     wire_type: int,
@@ -1929,6 +1978,7 @@ def _skip_proto_stream_value(
     *,
     field_number: int | None = None,
     remaining_fields: list[int] | None = None,
+    nesting_depth: int = 0,
 ) -> bool:
     if wire_type == 0:
         return _read_proto_varint_stream(stream) is not None
@@ -1944,7 +1994,9 @@ def _skip_proto_stream_value(
     elif wire_type == 3:
         if field_number is None or remaining_fields is None:
             return False
-        group_stack = [field_number]
+        if nesting_depth >= _TF_METAGRAPH_MAX_ROUTING_DEPTH:
+            remaining_fields[0] = 0
+            return False
         while remaining_fields[0] > 0 and stream.tell() < file_size:
             remaining_fields[0] -= 1
             nested_tag = _read_proto_varint_stream(stream)
@@ -1953,23 +2005,14 @@ def _skip_proto_stream_value(
             nested_field_number = nested_tag >> 3
             nested_wire_type = nested_tag & 0x07
             if nested_wire_type == 4:
-                if nested_field_number != group_stack[-1]:
-                    return False
-                group_stack.pop()
-                if not group_stack:
-                    return True
-                continue
-            if nested_field_number == 0:
-                return False
-            if nested_wire_type == 3:
-                group_stack.append(nested_field_number)
-                continue
-            if not _skip_proto_stream_value(
+                return nested_field_number == field_number
+            if nested_field_number == 0 or not _skip_proto_stream_value(
                 stream,
                 nested_wire_type,
                 file_size,
                 field_number=nested_field_number,
                 remaining_fields=remaining_fields,
+                nesting_depth=nesting_depth + 1,
             ):
                 return False
         return False
@@ -1986,7 +2029,10 @@ def _classify_bounded_tensorflow_protobuf(path: Path, file_size: int) -> _Tensor
     """Seek past top-level protobuf values while looking for TensorFlow graph content."""
     try:
         remaining_fields = [_TF_METAGRAPH_MAX_ROUTING_FIELDS]
-        saw_savedmodel_schema_version = False
+        parsed_payload_bytes = 0
+        outer_hint: _TensorFlowOuterHint = "unknown"
+        saw_tensorflow_candidate = False
+        saw_structured_unknown = False
         with path.open("rb") as stream:
             while remaining_fields[0] > 0:
                 remaining_fields[0] -= 1
@@ -1999,16 +2045,26 @@ def _classify_bounded_tensorflow_protobuf(path: Path, file_size: int) -> _Tensor
                 wire_type = tag & 0x07
                 if field_number == 0:
                     return "unknown"
+                if wire_type in {2, 3}:
+                    saw_structured_unknown = True
                 if field_number == 1 and wire_type == 0:
                     if _read_proto_varint_stream(stream) is None:
                         return "unknown"
-                    saw_savedmodel_schema_version = True
+                    saw_tensorflow_candidate = True
+                    outer_hint = "tf_savedmodel"
                     continue
                 if field_number == 1 and wire_type == 2:
                     length = _read_proto_varint_stream(stream)
                     if length is None or stream.tell() + length > file_size:
                         return "unknown"
-                    stream.seek(length, 1)
+                    if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+                        return "oversized" if saw_tensorflow_candidate else "inconclusive"
+                    payload = stream.read(length)
+                    if len(payload) != length:
+                        return "unknown"
+                    if _is_tensorflow_metainfo_payload(payload):
+                        saw_tensorflow_candidate = True
+                        outer_hint = "tf_metagraph"
                     continue
                 if field_number == 2 and wire_type == 2:
                     length = _read_proto_varint_stream(stream)
@@ -2016,14 +2072,14 @@ def _classify_bounded_tensorflow_protobuf(path: Path, file_size: int) -> _Tensor
                         return "unknown"
                     if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
                         # Field 2 is graph_def on MetaGraphDef and meta_graphs on SavedModel.
+                        return "oversized" if saw_tensorflow_candidate else "oversized_candidate"
+                    if parsed_payload_bytes + length > _TF_METAGRAPH_MAX_ROUTING_PAYLOAD_BYTES:
                         return "inconclusive"
+                    parsed_payload_bytes += length
                     payload = stream.read(length)
                     if len(payload) != length:
                         return "unknown"
-                    payload_route = _classify_tensorflow_field_two_payload(
-                        payload,
-                        prefer_savedmodel=saw_savedmodel_schema_version,
-                    )
+                    payload_route = _classify_tensorflow_field_two_payload(payload, outer_hint=outer_hint)
                     if payload_route != "unknown":
                         return payload_route
                     continue
@@ -2032,7 +2088,10 @@ def _classify_bounded_tensorflow_protobuf(path: Path, file_size: int) -> _Tensor
                     if length is None or stream.tell() + length > file_size:
                         return "unknown"
                     if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+                        return "oversized" if saw_tensorflow_candidate else "oversized_candidate"
+                    if parsed_payload_bytes + length > _TF_METAGRAPH_MAX_ROUTING_PAYLOAD_BYTES:
                         return "inconclusive"
+                    parsed_payload_bytes += length
                     payload = stream.read(length)
                     if len(payload) != length:
                         return "unknown"
@@ -2046,26 +2105,52 @@ def _classify_bounded_tensorflow_protobuf(path: Path, file_size: int) -> _Tensor
                     field_number=field_number,
                     remaining_fields=remaining_fields,
                 ):
+                    if remaining_fields[0] <= 0:
+                        return "inconclusive" if saw_tensorflow_candidate or saw_structured_unknown else "unknown"
                     return "unknown"
     except OSError:
         return "unknown"
-    return "unknown"
+    return "inconclusive" if saw_tensorflow_candidate or saw_structured_unknown else "unknown"
 
 
-def _detect_renamed_tensorflow_protobuf(file_path: Path, file_size: int) -> str:
+def _detect_renamed_tensorflow_protobuf(
+    file_path: Path,
+    file_size: int,
+    *,
+    fail_closed_on_inconclusive: bool = True,
+) -> str:
     """Recognize renamed MetaGraph/SavedModel protobufs after bounded field discovery."""
     if file_path.suffix.lower() in {".json", ".py", ".pyw"}:
         return "unknown"
-    declared_format = detect_format_from_extension(str(file_path))
-    if declared_format not in {"unknown", "protobuf", "tf_metagraph"}:
+    if _is_complete_bounded_printable_text(file_path, file_size):
         return "unknown"
     route = _classify_bounded_tensorflow_protobuf(file_path, file_size)
     if route == "unknown":
         return "unknown"
+    if route == "oversized":
+        return "tf_metagraph" if fail_closed_on_inconclusive else route
+    if route == "oversized_candidate":
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT if fail_closed_on_inconclusive else route
     if route == "inconclusive":
-        # Preserve plausible oversized content for bounded fail-closed MetaGraph handling.
-        return "tf_metagraph"
+        if _is_complete_structured_json_tensorflow_owner(file_path, file_size):
+            return "unknown"
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT if fail_closed_on_inconclusive else route
     return route
+
+
+def _resolve_inconclusive_tensorflow_flax_overlap(file_path: Path, file_size: int) -> str:
+    """Use bounded strict parsing when an ambiguous protobuf also routes as Flax."""
+    if file_size > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    is_metagraph = _is_tensorflow_metagraph_file(str(file_path))
+    is_saved_model = _is_tensorflow_saved_model_file(str(file_path))
+    if is_metagraph and is_saved_model:
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    if is_metagraph:
+        return "tf_metagraph"
+    if is_saved_model:
+        return "tf_savedmodel"
+    return "flax_msgpack"
 
 
 def _has_torch7_ascii_object_signature(prefix: bytes) -> bool:
@@ -2595,6 +2680,52 @@ def _probe_complete_structured_json_document(file_path: Path, file_size: int) ->
     return True if read_size + trailing_read_size == file_size else None
 
 
+def _is_deep_scalar_array_json_document(payload: str) -> bool:
+    """Recognize deeply nested JSON arrays without recursive decoder traversal."""
+    stripped = payload.strip()
+    depth = 0
+    while depth < len(stripped) and stripped[depth] == "[":
+        depth += 1
+    if depth == 0 or len(stripped) < depth * 2:
+        return False
+    closing_start = len(stripped) - depth
+    if stripped[closing_start:] != "]" * depth:
+        return False
+    scalar_payload = stripped[depth:closing_start].strip()
+    if not scalar_payload:
+        return False
+    try:
+        scalar = json.loads(scalar_payload)
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        return False
+    return not isinstance(scalar, (dict, list))
+
+
+def _is_complete_structured_json_tensorflow_owner(file_path: Path, file_size: int) -> bool:
+    """Return whether bounded parsing proves that JSON, not protobuf routing, owns a file."""
+    json_document_probe = _probe_complete_structured_json_document(file_path, file_size)
+    if json_document_probe is True:
+        return True
+    if json_document_probe is None or file_size > MXNET_SYMBOL_SIGNATURE_READ_BYTES:
+        return False
+    try:
+        payload = read_magic_bytes(str(file_path), file_size).decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return _is_deep_scalar_array_json_document(payload)
+
+
+def _is_complete_bounded_printable_text(file_path: Path, file_size: int) -> bool:
+    """Return whether a small complete file cannot contain binary structure tags."""
+    if file_size > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES:
+        return False
+    try:
+        payload = read_magic_bytes(str(file_path), file_size)
+    except OSError:
+        return False
+    return not payload.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES)
+
+
 def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
     """Route declared Flax formats and renamed candidates without claiming overlaps."""
     ext = file_path.suffix.lower()
@@ -2610,6 +2741,8 @@ def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
             return False
         if json_document_probe is None:
             return True
+        if _is_complete_bounded_printable_text(file_path, size):
+            return False
     if ext == "":
         xgboost_route = _detect_extensionless_xgboost_ubjson_route(
             read_magic_bytes(str(file_path), min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
@@ -2621,33 +2754,6 @@ def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
         or ext in _FLAX_MSGPACK_OVERLAP_SUFFIXES
         or ext not in _FLAX_MSGPACK_DECLARED_SUFFIXES
     ) and is_flax_msgpack_checkpoint_file(file_path)
-
-
-def _is_confirmed_content_routed_flax_msgpack(file_path: Path) -> bool:
-    """Return whether a routable file is positively identified as Flax MessagePack."""
-    ext = file_path.suffix.lower()
-    if ext in _FLAX_MSGPACK_CONTENT_ROUTE_EXCLUDED_SUFFIXES:
-        return False
-    try:
-        size = file_path.stat().st_size
-    except OSError:
-        return False
-    if (
-        ext not in _FLAX_MSGPACK_SCANNER_SUFFIXES
-        and _probe_complete_structured_json_document(file_path, size) is not False
-    ):
-        return False
-    if ext == "":
-        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
-            read_magic_bytes(str(file_path), min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
-        )
-        if xgboost_route is not None:
-            return False
-    return (
-        ext in _FLAX_MSGPACK_SCANNER_SUFFIXES
-        or ext in _FLAX_MSGPACK_OVERLAP_SUFFIXES
-        or ext not in _FLAX_MSGPACK_DECLARED_SUFFIXES
-    ) and _probe_flax_msgpack_checkpoint_file(file_path) is True
 
 
 def detect_flax_msgpack_overlap_routes(path: str) -> tuple[str, ...]:
@@ -2746,15 +2852,30 @@ def detect_format_from_magic_bytes(
     if file_path is not None and _is_confirmed_content_routed_jax_json_checkpoint(file_path):
         return "jax_checkpoint"
 
-    if file_path is not None and _is_confirmed_content_routed_flax_msgpack(file_path):
-        return "flax_msgpack"
+    if file_path is not None and not file_path.suffix:
+        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
+            read_magic_bytes(str(file_path), min(file_size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
+        )
+        if xgboost_route is not None:
+            return xgboost_route
 
+    renamed_tensorflow_format = "unknown"
     if file_path is not None:
-        renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, file_size)
-        if renamed_tensorflow_format != "unknown":
+        renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(
+            file_path,
+            file_size,
+            fail_closed_on_inconclusive=False,
+        )
+        if renamed_tensorflow_format == "oversized":
+            return "tf_metagraph"
+        if renamed_tensorflow_format == "oversized_candidate":
+            return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+        if renamed_tensorflow_format not in {"unknown", "inconclusive"}:
             return renamed_tensorflow_format
 
     if file_path is not None and _could_be_content_routed_flax_msgpack(file_path):
+        if renamed_tensorflow_format == "inconclusive":
+            return _resolve_inconclusive_tensorflow_flax_overlap(file_path, file_size)
         return "flax_msgpack"
 
     if file_path is not None and _could_be_content_routed_jax_json_checkpoint(file_path):
@@ -2867,6 +2988,10 @@ def detect_file_format_from_magic(path: str) -> str:
                 )
                 if xml_format != "unknown":
                     return xml_format
+
+            renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
+            if renamed_tensorflow_format != "unknown":
+                return renamed_tensorflow_format
 
     except OSError:
         return "unknown"
@@ -3025,6 +3150,10 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             if xml_format != "unknown":
                 return xml_format
 
+    renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
+    if renamed_tensorflow_format != "unknown":
+        return renamed_tensorflow_format
+
     return "unknown"
 
 
@@ -3145,20 +3274,34 @@ def detect_file_format(path: str) -> str:
         if xml_format != "unknown":
             return xml_format
 
+    if ext == "":
+        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
+            read_magic_bytes(path, min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
+        )
+        if xgboost_route is not None:
+            return xgboost_route
+
+    renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(
+        file_path,
+        size,
+        fail_closed_on_inconclusive=False,
+    )
+    if renamed_tensorflow_format == "oversized":
+        return "tf_metagraph"
+    if renamed_tensorflow_format == "oversized_candidate":
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    if renamed_tensorflow_format not in {"unknown", "inconclusive"}:
+        return renamed_tensorflow_format
+
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
     if _is_confirmed_content_routed_jax_json_checkpoint(file_path):
         return "jax_checkpoint"
 
-    if _is_confirmed_content_routed_flax_msgpack(file_path):
-        return "flax_msgpack"
-
-    renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
-    if renamed_tensorflow_format != "unknown":
-        return renamed_tensorflow_format
-
     if ext in _FLAX_MSGPACK_SCANNER_SUFFIXES or _could_be_content_routed_flax_msgpack(file_path):
+        if renamed_tensorflow_format == "inconclusive":
+            return _resolve_inconclusive_tensorflow_flax_overlap(file_path, size)
         return "flax_msgpack"
 
     if _could_be_content_routed_jax_json_checkpoint(file_path):
@@ -3207,6 +3350,11 @@ def detect_file_format(path: str) -> str:
         if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
             return "onnx"
 
+        if renamed_tensorflow_format == "oversized":
+            return "tf_metagraph"
+        if renamed_tensorflow_format in {"oversized_candidate", "inconclusive"}:
+            return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+
         # Otherwise, assume raw binary format (PyTorch weights)
         return "pytorch_binary"
 
@@ -3219,6 +3367,11 @@ def detect_file_format(path: str) -> str:
         return "rknn"
     if ext not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(magic8):
         return "tflite"
+
+    if renamed_tensorflow_format == "oversized":
+        return "tf_metagraph"
+    if renamed_tensorflow_format in {"oversized_candidate", "inconclusive"}:
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
 
     # Extension-based detection for non-.bin files
     # For .pt/.pth/.ckpt files, check if they're ZIP format first
