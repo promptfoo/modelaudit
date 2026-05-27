@@ -7,6 +7,9 @@ import re
 from contextlib import suppress
 from typing import Any, ClassVar
 
+from ..scanner_results import mark_inconclusive_scan_result
+from ..utils.file.detection import has_inconclusive_renamed_flax_msgpack_routing, is_flax_msgpack_checkpoint_file
+
 try:
     import msgpack
 
@@ -239,7 +242,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 ]:
                     return True
 
-        return False
+        return is_flax_msgpack_checkpoint_file(path)
 
     def _extract_jax_metadata(
         self,
@@ -1053,6 +1056,24 @@ class FlaxMsgpackScanner(BaseScanner):
         self.add_file_integrity_check(path, result)
 
         self.current_file_path = path
+
+        if has_inconclusive_renamed_flax_msgpack_routing(path):
+            mark_inconclusive_scan_result(result, "flax_msgpack_routing_incomplete")
+            result.add_check(
+                name="MessagePack Routing Analysis Incomplete",
+                passed=False,
+                message="Flax MessagePack analysis incomplete because bounded routing inspection could not complete",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "flax_msgpack_routing_incomplete",
+                },
+                rule_code="S902",
+            )
+            result.bytes_scanned = file_size
+            result.finish(success=False)
+            return result
 
         if not HAS_MSGPACK:
             result.add_check(

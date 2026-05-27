@@ -1,5 +1,6 @@
 """Tests for the ModelAudit rule system."""
 
+import logging
 import tempfile
 from pathlib import Path
 
@@ -432,6 +433,55 @@ class TestScanResultIntegration:
 
         assert len(result.issues) == 1
         assert result.issues[0].rule_code == "S103"
+
+    def test_failed_check_payload_is_retained_but_not_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Finding messages remain reportable without being copied into logs."""
+        sensitive_message = "detected credential=production-secret"
+        result = ScanResult("test_scanner")
+
+        with caplog.at_level(logging.CRITICAL, logger="modelaudit.scanners"):
+            result.add_check(
+                name="Credential Check",
+                passed=False,
+                message=sensitive_message,
+                severity=IssueSeverity.CRITICAL,
+            )
+
+        assert result.issues[0].message == sensitive_message
+        assert "production-secret" not in caplog.text
+        assert "Security finding recorded" in caplog.text
+
+    def test_suppressed_check_payload_is_not_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Suppressed findings must not disclose their payload through debug logs."""
+        config = ModelAuditConfig()
+        config.suppress = {"S301"}
+        set_config(config)
+        result = ScanResult("test_scanner")
+
+        with caplog.at_level(logging.DEBUG, logger="modelaudit.scanners"):
+            result.add_check(
+                name="Suppressed Check",
+                passed=False,
+                message="sensitive-token=production-secret",
+                severity=IssueSeverity.WARNING,
+                rule_code="S301",
+            )
+
+        assert not result.issues
+        assert "production-secret" not in caplog.text
+        assert "Suppressed security finding" in caplog.text
+
+    def test_passed_check_payload_is_retained_but_not_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Successful check details remain structured data rather than log output."""
+        sensitive_message = "checked path containing production-secret"
+        result = ScanResult("test_scanner")
+
+        with caplog.at_level(logging.DEBUG, logger="modelaudit.scanners"):
+            result.add_check(name="Path Check", passed=True, message=sensitive_message)
+
+        assert result.checks[0].message == sensitive_message
+        assert "production-secret" not in caplog.text
+        assert "Security check passed" in caplog.text
 
     def test_issue_string_representation(self):
         """Test that issues display with rule codes."""

@@ -237,6 +237,10 @@ class PyTorchZipScanner(BaseScanner):
     MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE: ClassVar[int] = 1024 * 1024
     MAX_ARCHIVE_ENTRIES: ClassVar[int] = 10000  # Maximum number of entries in archive
     DEFAULT_MAX_NESTED_ZIP_DEPTH: ClassVar[int] = 5
+    DEFAULT_MAX_BLACKLIST_SCAN_BYTES: ClassVar[int] = 100 * 1024 * 1024
+    BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_blacklist_member_size_limit"
+    BLACKLIST_READ_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_blacklist_member_read_failed"
+    SCAN_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_scan_incomplete"
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -301,6 +305,7 @@ class PyTorchZipScanner(BaseScanner):
         # Start timeout tracking
         self._start_scan_timer()
         self._relaxed_crc_tracker.reset()
+        result: ScanResult | None = None
 
         try:
             # Initial validation and setup
@@ -353,6 +358,8 @@ class PyTorchZipScanner(BaseScanner):
 
         except TimeoutError as e:
             # Handle timeout gracefully
+            if result is None:
+                result = self._create_result()
             mark_inconclusive_scan_result(result, "pytorch_zip_scan_timeout")
             result.add_check(
                 name="Scan Timeout",
@@ -367,8 +374,9 @@ class PyTorchZipScanner(BaseScanner):
         except zipfile.BadZipFile:
             return self._handle_bad_zip_error(path)
         except Exception as e:
-            return self._handle_scan_error(path, e)
+            return self._handle_scan_error(path, e, result)
 
+        assert result is not None
         result.finish(success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME)
         return result
 
@@ -650,7 +658,7 @@ class PyTorchZipScanner(BaseScanner):
 
         # Validate ZIP format
         header = read_zip_header(path)
-        if not header.startswith(b"PK"):
+        if not header.startswith(b"PK") and not zipfile.is_zipfile(path):
             result.add_check(
                 name="ZIP Format Validation",
                 passed=False,
@@ -1731,7 +1739,10 @@ class PyTorchZipScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         """Scan files for blacklisted patterns"""
-        max_blacklist_scan_size = self.config.get("max_blacklist_scan_size", 100 * 1024 * 1024)  # 100MB default
+        max_blacklist_scan_size = self._normalize_positive_int_config(
+            self.config.get("max_blacklist_scan_size"),
+            self.DEFAULT_MAX_BLACKLIST_SCAN_BYTES,
+        )
 
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
@@ -1740,11 +1751,12 @@ class PyTorchZipScanner(BaseScanner):
 
                 # Skip files that are too large
                 if info.file_size > max_blacklist_scan_size:
+                    mark_inconclusive_scan_result(result, self.BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON)
                     result.add_check(
                         name="Blacklist Pattern Check",
-                        passed=True,
+                        passed=False,
                         message=(
-                            f"File {name} too large for blacklist scanning "
+                            f"Skipped configured blacklist scanning for oversized file {name} "
                             f"(size: {info.file_size}, limit: {max_blacklist_scan_size})"
                         ),
                         severity=IssueSeverity.INFO,
@@ -1754,6 +1766,8 @@ class PyTorchZipScanner(BaseScanner):
                             "scan_limit": max_blacklist_scan_size,
                             "zip_entry": name,
                             "reason": "size_limit_exceeded",
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": self.BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON,
                         },
                     )
                     continue
@@ -1910,27 +1924,21 @@ class PyTorchZipScanner(BaseScanner):
 
     def _handle_blacklist_scan_error(self, name: str, error: Exception, result: ScanResult) -> None:
         """Handle errors during blacklist pattern scanning"""
-        if isinstance(error, zipfile.BadZipFile):
-            severity = IssueSeverity.WARNING
-            error_type = "BadZipFile"
-        elif isinstance(error, MemoryError):
-            severity = IssueSeverity.WARNING
-            error_type = "MemoryError"
-        else:
-            severity = IssueSeverity.DEBUG
-            error_type = type(error).__name__
+        mark_inconclusive_scan_result(result, self.BLACKLIST_READ_INCONCLUSIVE_REASON)
 
         result.add_check(
             name="ZIP Entry Read",
             passed=False,
             message=f"Error reading file {name}: {error!s}",
-            severity=severity,
+            severity=IssueSeverity.INFO,
             location=f"{self.current_file_path} ({name})",
             details={
                 "zip_entry": name,
                 "exception": str(error),
-                "exception_type": error_type,
+                "exception_type": type(error).__name__,
                 "scan_phase": "blacklist_check",
+                "analysis_incomplete": True,
+                "scan_outcome_reason": self.BLACKLIST_READ_INCONCLUSIVE_REASON,
             },
         )
 
@@ -1948,16 +1956,23 @@ class PyTorchZipScanner(BaseScanner):
         result.finish(success=False)
         return result
 
-    def _handle_scan_error(self, path: str, error: Exception) -> ScanResult:
-        """Handle general scan errors"""
-        result = self._create_result()
+    def _handle_scan_error(self, path: str, error: Exception, result: ScanResult | None = None) -> ScanResult:
+        """Report incomplete analysis without discarding findings recovered before a failure."""
+        if result is None:
+            result = self._create_result()
+        mark_inconclusive_scan_result(result, self.SCAN_INCONCLUSIVE_REASON)
         result.add_check(
             name="PyTorch ZIP Scan",
             passed=False,
-            message=f"Error scanning PyTorch zip file: {error!s}",
-            severity=IssueSeverity.CRITICAL,
+            message=f"PyTorch ZIP analysis could not be completed: {error!s}",
+            severity=IssueSeverity.INFO,
             location=path,
-            details={"exception": str(error), "exception_type": type(error).__name__},
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": self.SCAN_INCONCLUSIVE_REASON,
+            },
         )
         result.finish(success=False)
         return result

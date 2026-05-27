@@ -1,6 +1,7 @@
 """Standalone pickle scanning API."""
 
 from .api import PickleScanner, scan_bytes, scan_file, scan_stream
+from .call_graph import shared_source_sensitive_caches
 from .options import ScanOptions
 from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
 
@@ -18,4 +19,5 @@ __all__ = [
     "scan_bytes",
     "scan_file",
     "scan_stream",
+    "shared_source_sensitive_caches",
 ]
