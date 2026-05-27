@@ -96,14 +96,12 @@ class SafeTensorsScanner(BaseScanner):
         result.metadata["file_size"] = file_size
         structural_validation_failed = False
 
-        # Add file integrity check for compliance
-        self.add_file_integrity_check(path, result)
-
         try:
             self.current_file_path = path
             with open(path, "rb") as f:
                 header_len_bytes = f.read(8)
                 if len(header_len_bytes) != 8:
+                    self.add_file_integrity_check(path, result)
                     result.add_check(
                         name="SafeTensors Header Size Check",
                         passed=False,
@@ -119,6 +117,7 @@ class SafeTensorsScanner(BaseScanner):
                 header_len = struct.unpack("<Q", header_len_bytes)[0]
                 max_header_bytes = int(self.config.get("max_safetensors_header_bytes", MAX_HEADER_BYTES))
                 if header_len <= 0 or header_len > file_size - 8:
+                    self.add_file_integrity_check(path, result)
                     result.add_check(
                         name="Header Length Validation",
                         passed=False,
@@ -167,6 +166,9 @@ class SafeTensorsScanner(BaseScanner):
                     location=path,
                     details={"header_len": header_len, "max_allowed": max_header_bytes},
                 )
+
+                # Do not hash an artifact that has already failed the bounded header gate.
+                self.add_file_integrity_check(path, result)
 
                 header_bytes = f.read(header_len)
                 if len(header_bytes) != header_len:

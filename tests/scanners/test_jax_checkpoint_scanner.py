@@ -9,6 +9,10 @@ import pytest
 
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
+from modelaudit.utils.file.detection import (
+    JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+)
 
 
 def _write_orbax_metadata(checkpoint_dir: Path, metadata: dict[str, object]) -> None:
@@ -668,6 +672,60 @@ def test_can_handle_json_checkpoint_with_jax_metadata(tmp_path: Path) -> None:
 
     assert result.success
     assert result.metadata["checkpoint_type"] == "file"
+
+
+def test_can_handle_renamed_jax_json_checkpoint_without_routing_ajax_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "model.jpg"
+    native_checkpoint_path = tmp_path / "model.checkpoint"
+    near_match_path = tmp_path / "ajax.jpg"
+    payload = (" " * 1024) + json.dumps({"framework": "jax", "orbax_version": "0.1.0"})
+    checkpoint_path.write_text(payload, encoding="utf-8")
+    native_checkpoint_path.write_text(payload, encoding="utf-8")
+    near_match_path.write_text(json.dumps({"framework": "ajax", "format": "checkpoint"}), encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+    assert JaxCheckpointScanner.can_handle(str(native_checkpoint_path)) is True
+    assert JaxCheckpointScanner.can_handle(str(near_match_path)) is False
+
+
+def test_oversized_renamed_jax_json_checkpoint_fails_closed_without_routing_ajax_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "large-model.jpg"
+    near_match_path = tmp_path / "large-ajax.jpg"
+    padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
+    checkpoint_path.write_text(json.dumps({"padding": padding, "framework": "jax"}), encoding="utf-8")
+    near_match_path.write_text(json.dumps({"padding": padding, "framework": "ajax"}), encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+    assert JaxCheckpointScanner.can_handle(str(near_match_path)) is False
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_json_checkpoint_analysis_size_limit" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "JSON Checkpoint Analysis Limit"
+        and check.status == CheckStatus.FAILED
+        and check.message == "JSON checkpoint analysis incomplete because the file exceeds the bounded parsing limit"
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+
+
+def test_renamed_jax_json_with_root_after_routing_budget_fails_closed(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "late-root.jpg"
+    checkpoint_path.write_text(
+        (" " * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1)) + json.dumps({"framework": "jax"}),
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_json_checkpoint_analysis_size_limit" in result.metadata["scan_outcome_reasons"]
 
 
 def test_zero_max_file_size_config_does_not_flag_small_json_checkpoint_as_too_large(tmp_path: Path) -> None:

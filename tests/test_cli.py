@@ -208,7 +208,7 @@ def test_scan_does_not_auto_load_untrusted_local_config(tmp_path: Path) -> None:
 
 
 def test_scan_json_subprocess_separates_logs_from_stdout_for_findings(tmp_path: Path) -> None:
-    """Real process execution should keep JSON stdout parseable even when findings are logged."""
+    """Real process execution keeps JSON parseable without leaking finding payloads to logs."""
     import tarfile
 
     model_file = tmp_path / "evil.tar"
@@ -228,7 +228,8 @@ def test_scan_json_subprocess_separates_logs_from_stdout_for_findings(tmp_path: 
     assert completed.stdout.lstrip().startswith("{")
     output_payload = json.loads(completed.stdout)
     assert any(issue.get("rule_code") == "S405" for issue in output_payload.get("issues", []))
-    assert "[S405]" in completed.stderr
+    assert "Security finding recorded" in completed.stderr
+    assert "../evil.txt" not in completed.stderr
 
 
 def test_scan_json_subprocess_single_skipped_file_keeps_stdout_parseable(tmp_path: Path) -> None:

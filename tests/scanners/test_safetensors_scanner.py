@@ -14,7 +14,7 @@ pytest.importorskip("safetensors")
 
 from safetensors.numpy import save_file
 
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
 
@@ -139,17 +139,23 @@ def test_oversized_header_returns_operational_exit2(tmp_path: Path) -> None:
     assert limit_check.severity == IssueSeverity.INFO
 
 
-def test_oversized_header_triggers_limit_check(tmp_path: Path) -> None:
+def test_oversized_header_triggers_limit_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     file_path = tmp_path / "oversized_header.safetensors"
     max_header_bytes = 1 * 1024 * 1024
     _write_oversized_header_safetensors(file_path, header_len=max_header_bytes + 1)
 
     scanner = SafeTensorsScanner({"max_safetensors_header_bytes": max_header_bytes})
+    monkeypatch.setattr(
+        scanner,
+        "calculate_file_hashes",
+        lambda _path: pytest.fail("oversized SafeTensors headers must be rejected before hashing"),
+    )
     result = scanner.scan(str(file_path))
 
     header_limit_check = next((check for check in result.checks if check.name == "Header Size Limit"), None)
     assert header_limit_check is not None
     assert header_limit_check.status.value == "failed"
+    assert all(check.name != "File Integrity Hash" for check in result.checks)
     assert "exceeds maximum allowed size" in header_limit_check.message
     assert result.success is False
     assert result.metadata["analysis_incomplete"] is True
@@ -382,6 +388,26 @@ def test_safetensors_security_finding_takes_precedence_over_inconclusive_structu
 
     assert direct.has_errors is True
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_safetensors_with_torch7_like_metadata_keeps_safetensors_routing(tmp_path: Path) -> None:
+    file_path = tmp_path / "torch-marker-metadata.safetensors"
+    header = {
+        "__metadata__": {
+            "framework": "torch",
+            "kind": "tensor nn.Sequential",
+            "description": "<script>alert('xss')</script>",
+        },
+        "t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+    }
+    write_raw_safetensors(file_path, header, b"\x00" * 4)
+
+    direct = scan_file(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path))
+
+    assert direct.scanner_name == "safetensors"
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
     assert determine_exit_code(aggregate) == 1
 

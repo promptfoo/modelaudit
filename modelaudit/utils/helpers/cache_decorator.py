@@ -17,6 +17,18 @@ logger = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
 
 
+def _should_bypass_cache_for_safetensors_header_limit(file_path: str, config: dict[str, Any]) -> bool:
+    """Do not key or store a scan that is already boundedly inconclusive by SafeTensors header size."""
+    try:
+        from ...scanners.safetensors_scanner import MAX_HEADER_BYTES
+        from ..file.detection import should_defer_safetensors_header_limit_hash
+
+        max_header_bytes = int(config.get("max_safetensors_header_bytes", MAX_HEADER_BYTES))
+    except (ImportError, TypeError, ValueError):
+        return False
+    return should_defer_safetensors_header_limit_hash(file_path, max_header_bytes)
+
+
 def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "cache_dir") -> Callable[[F], F]:
     """
     Cache decorator for scan functions that take (path, config) arguments.
@@ -67,6 +79,11 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                 if not cache_config.should_cache_file(file_stat.st_size, file_ext):
                     logger.debug(f"File {file_path} not suitable for caching, calling function directly")
+                    return func(*args, **kwargs)
+
+                raw_config, _ = _extract_config_and_path(args, kwargs)
+                if _should_bypass_cache_for_safetensors_header_limit(file_path, raw_config or {}):
+                    logger.debug(f"Bypassing cache for bounded SafeTensors header failure: {file_path}")
                     return func(*args, **kwargs)
 
             except OSError:
