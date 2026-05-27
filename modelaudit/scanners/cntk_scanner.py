@@ -6,6 +6,7 @@ import os
 import re
 from typing import ClassVar
 
+from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
@@ -288,6 +289,7 @@ class CntkScanner(BaseScanner):
     @staticmethod
     def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
         mark_inconclusive_scan_result(result, "cntk_read_failed")
+        mark_operational_scan_error(result, "cntk_read_failed")
         result.add_check(
             name="CNTK File Read",
             passed=False,

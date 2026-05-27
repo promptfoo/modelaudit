@@ -781,12 +781,14 @@ def scan_model_directory_or_file(
         if not os.path.exists(path):
             raise FileNotFoundError(f"Path does not exist: {path}")
 
-        # Check if path is readable
-        if not os.access(path, os.R_OK):
-            raise PermissionError(f"Path is not readable: {path}")
-
         # Check if path is a directory
         if os.path.isdir(path):
+            # Directory scans require root traversal before scanner dispatch.
+            # Single files must reach their owning scanner so unreadable model
+            # inputs can produce a format-specific operational outcome.
+            if not os.access(path, os.R_OK):
+                raise PermissionError(f"Path is not readable: {path}")
+
             if progress_callback:
                 progress_callback(f"Scanning directory: {path}", 0.0)
 

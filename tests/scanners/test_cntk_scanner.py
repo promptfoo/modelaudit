@@ -204,6 +204,8 @@ def test_cntk_read_failure_is_inconclusive_not_security_finding(
     assert read_checks[0].details["scan_outcome_reason"] == "cntk_read_failed"
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "cntk_read_failed" in direct.metadata["scan_outcome_reasons"]
+    assert direct.metadata["operational_error"] is True
+    assert direct.metadata["operational_error_reason"] == "cntk_read_failed"
     metadata = aggregate.file_metadata[str(path)]
     assert "cntk_read_failed" in metadata["scan_outcome_reasons"]
     assert not [
@@ -261,6 +263,9 @@ def test_cntk_unreadable_path_preflight_is_inconclusive_not_security_finding(
     assert read_checks[0].severity == IssueSeverity.INFO
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "cntk_read_failed" in direct.metadata["scan_outcome_reasons"]
+    metadata = aggregate.file_metadata[str(path)]
+    assert "cntk_read_failed" in metadata["scan_outcome_reasons"]
+    assert metadata["operational_error"] is True
     assert not [
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]

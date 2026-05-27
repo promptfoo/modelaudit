@@ -8,6 +8,7 @@ import re
 from typing import Any, ClassVar
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
+from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
@@ -170,6 +171,7 @@ class LightGBMScanner(BaseScanner):
     @staticmethod
     def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
         mark_inconclusive_scan_result(result, "lightgbm_read_failed")
+        mark_operational_scan_error(result, "lightgbm_read_failed")
         result.add_check(
             name="LightGBM File Read",
             passed=False,

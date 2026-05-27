@@ -13,6 +13,8 @@ from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanRes
 
 logger = logging.getLogger(__name__)
 
+_READ_FAILURE_AWARE_EXTENSION_SCANNERS = frozenset({"cntk", "lightgbm"})
+
 
 def _check_numpy_compatibility() -> tuple[bool, str]:
     """Check NumPy version compatibility and return status with message"""
@@ -255,16 +257,19 @@ class ScannerRegistry:
             candidate_extensions.append("")
 
         is_zip_file = False
+        zip_probe_failed = False
         try:
             is_zip_file = os.path.isfile(path) and zipfile.is_zipfile(path)
         except OSError:
-            # A failed generic ZIP probe must not prevent the owning scanner
-            # from recording an explicit inconclusive read outcome.
-            is_zip_file = False
+            # Continue only into scanners that explicitly translate unreadable
+            # owned inputs into an operationally incomplete outcome.
+            zip_probe_failed = True
 
         for candidate_extension in candidate_extensions:
             for scanner_id, scanner_info in sorted_scanners:
                 if scanner_selection is not None and not scanner_selection.allows(scanner_id):
+                    continue
+                if zip_probe_failed and scanner_id not in _READ_FAILURE_AWARE_EXTENSION_SCANNERS:
                     continue
                 extensions = scanner_info.get("extensions", [])
                 content_routed_extensions = scanner_info.get("content_routed_extensions", [])
@@ -290,6 +295,9 @@ class ScannerRegistry:
                             if torch7_class and torch7_class.can_handle(path):
                                 return torch7_class
                     return scanner_class
+
+        if zip_probe_failed:
+            return None
 
         # Some ZIP-backed artifacts intentionally use pickle/checkpoint suffixes.
         # If stricter extension-specific scanners all decline, fall back to the
