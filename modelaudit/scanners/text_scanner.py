@@ -3,6 +3,7 @@
 import os
 from typing import Any, ClassVar
 
+from modelaudit.core_results import mark_operational_scan_error
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 
@@ -145,6 +146,7 @@ class TextScanner(BaseScanner):
 
         except OSError as e:
             mark_inconclusive_scan_result(result, "text_metadata_read_failed")
+            mark_operational_scan_error(result, "text_metadata_read_failed")
             result.add_check(
                 name="Text File Metadata Read",
                 passed=False,
@@ -157,7 +159,6 @@ class TextScanner(BaseScanner):
                     "analysis_incomplete": True,
                     "scan_outcome_reason": "text_metadata_read_failed",
                 },
-                rule_code="S902",
             )
             result.finish(success=False)
         except Exception as e:

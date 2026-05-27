@@ -9,6 +9,7 @@ from types import ModuleType
 from typing import Any, Final
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
+from modelaudit.core_results import mark_operational_scan_error, scan_result_has_operational_error
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
@@ -625,6 +626,9 @@ class ManifestScanner(BaseScanner):
 
             # Check the raw file content for blacklisted terms
             self._check_file_for_blacklist(path, result)
+            if scan_result_has_operational_error(result):
+                self._finish_manifest_result(result)
+                return result
             self._check_timeout()
 
             # Check for cloud storage URLs (external resource references)
@@ -793,12 +797,13 @@ class ManifestScanner(BaseScanner):
                 )
         except TimeoutError:
             raise
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             self._mark_inconclusive_scan_result(result, "manifest_blacklist_read_failed")
+            mark_operational_scan_error(result, "manifest_blacklist_read_failed")
             result.add_check(
                 name="Blacklist Pattern Check",
                 passed=False,
-                message=f"Unable to read manifest for blacklist analysis: {e!s}",
+                message=f"Unable to load manifest text for configured policy analysis: {e!s}",
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={
@@ -807,7 +812,6 @@ class ManifestScanner(BaseScanner):
                     "analysis_incomplete": True,
                     "scan_outcome_reason": "manifest_blacklist_read_failed",
                 },
-                rule_code="S902",
             )
         except Exception as e:
             result.add_check(

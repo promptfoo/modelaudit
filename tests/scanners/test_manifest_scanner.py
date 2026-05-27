@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
 from modelaudit.scanners import manifest_scanner
@@ -120,15 +121,59 @@ def test_manifest_blacklist_read_failure_is_inconclusive_not_security_finding(
     assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert SCAN_OUTCOME_MESSAGE_METADATA_KEY in direct.metadata
     assert "manifest_blacklist_read_failed" in direct.metadata.get("scan_outcome_reasons", [])
+    assert direct.metadata.get("operational_error") is True
+    assert direct.metadata.get("operational_error_reason") == "manifest_blacklist_read_failed"
     assert any(
         check.name == "Blacklist Pattern Check"
         and check.severity == IssueSeverity.INFO
         and check.details.get("scan_outcome_reason") == "manifest_blacklist_read_failed"
+        and check.rule_code is None
         for check in direct.checks
     )
+    assert all(check.rule_code != "S1001" for check in direct.checks)
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
     assert aggregate.file_metadata[str(test_file)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert determine_exit_code(aggregate) == 2
+
+
+def test_manifest_blacklist_invalid_utf8_is_operational_not_security_finding(tmp_path: Path) -> None:
+    test_file = tmp_path / "config.json"
+    test_file.write_bytes(b'{"model_type": "bert", "label": "\xff"}')
+    cache_dir = tmp_path / "cache"
+
+    direct = ManifestScanner(config={"blacklist_patterns": ["blocked"]}).scan(str(test_file))
+    reset_cache_manager()
+    try:
+        aggregates = [
+            scan_model_directory_or_file(
+                str(test_file),
+                blacklist_patterns=["blocked"],
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            for _ in range(2)
+        ]
+
+        assert direct.success is False
+        assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert direct.metadata.get("operational_error_reason") == "manifest_blacklist_read_failed"
+        assert any(
+            check.name == "Blacklist Pattern Check"
+            and check.details.get("exception_type") == "UnicodeDecodeError"
+            and check.severity == IssueSeverity.INFO
+            and check.rule_code is None
+            for check in direct.checks
+        )
+        assert all(check.rule_code not in {"S902", "S1001"} for check in direct.checks)
+        for aggregate in aggregates:
+            assert not any(
+                issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues
+            )
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_manifest_scanner_case_insensitive_blacklist(tmp_path):
