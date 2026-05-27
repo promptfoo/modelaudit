@@ -551,6 +551,7 @@ class NemoScanner(BaseScanner):
                 result=result,
                 max_python_analysis_bytes=NEMO_MAX_PYTHON_ANALYSIS_BYTES,
                 python_analysis_incomplete_reason="nemo_python_member_analysis_incomplete",
+                executable_analysis_incomplete_reason="nemo_executable_member_analysis_incomplete",
             )
             return
 
@@ -564,6 +565,7 @@ class NemoScanner(BaseScanner):
                 result=result,
                 max_python_analysis_bytes=NEMO_MAX_PYTHON_ANALYSIS_BYTES,
                 python_analysis_incomplete_reason="nemo_python_member_analysis_incomplete",
+                executable_analysis_incomplete_reason="nemo_executable_member_analysis_incomplete",
             )
             return
 
@@ -588,6 +590,7 @@ class NemoScanner(BaseScanner):
                 result=result,
                 max_python_analysis_bytes=NEMO_MAX_PYTHON_ANALYSIS_BYTES,
                 python_analysis_incomplete_reason="nemo_python_member_analysis_incomplete",
+                executable_analysis_incomplete_reason="nemo_executable_member_analysis_incomplete",
             )
         finally:
             try:

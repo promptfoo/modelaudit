@@ -12,6 +12,7 @@ Tests the 7-Zip archive scanning functionality including:
 import io
 import os
 import pickle
+import struct
 import tarfile
 import tempfile
 import zipfile
@@ -1849,6 +1850,85 @@ class TestSevenZipScannerHardening:
         assert "Executable file found in 7z archive: assets/payload.py" in security_messages
         aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
         assert determine_exit_code(aggregate) == 1
+
+    def test_probed_executable_finding_survives_nested_extraction_size_limit(self, tmp_path: Path) -> None:
+        """A positive content probe must be reported before nested extraction is rejected."""
+        scanner = SevenZipScanner(config={"max_7z_extract_size": 8})
+        archive_path = tmp_path / "mock_oversized_executable.7z"
+        archive_path.write_bytes(scanner._SEVENZIP_MAGIC + b"\0" * 26)
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(
+                scanner,
+                "_probe_extensionless_members",
+                return_value={"payload.py": _NestedMemberProbeResult(None, executable_content=True)},
+            ),
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["payload.py"]
+            mock_archive.getinfo.return_value = MagicMock(is_directory=False, uncompressed=32)
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(str(archive_path))
+
+        assert any(
+            check.name == "Executable Archive Member Detection"
+            and check.message == "Executable file found in 7z archive: payload.py"
+            for check in result.checks
+        )
+        assert any(check.name == "Extracted File Size" for check in result.checks)
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_benign_llamafile_member_is_scanned_without_generic_executable_warning(self, tmp_path: Path) -> None:
+        """An explicit Llamafile member is a model artifact, not an executable sidecar."""
+        import py7zr  # type: ignore[import-untyped]
+
+        archive_path = tmp_path / "llamafile_model.7z"
+        source_path = tmp_path / "safe.llamafile"
+        source_path.write_bytes(
+            b"\x7fELF\x02\x01\x01\x00"
+            + (b"\x00" * 56)
+            + b"llamafile runtime\n--threads 4\n--ctx-size 2048"
+            + (b"\x00" * 256)
+            + (b"\x00" * 8192)
+            + b"GGUF"
+            + struct.pack("<IQQ", 3, 0, 0)
+        )
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(source_path, "models/safe.llamafile")
+
+        result = SevenZipScanner().scan(str(archive_path))
+
+        assert not any(check.name == "Executable Archive Member Detection" for check in result.checks)
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_unconfirmed_pe_pointer_marks_disguised_member_probe_inconclusive(self, tmp_path: Path) -> None:
+        """An MZ near-match beyond the PE budget must not become a confirmed finding."""
+        import py7zr  # type: ignore[import-untyped]
+
+        payload = bytearray(64)
+        payload[:2] = b"MZ"
+        payload[0x3C:0x40] = ((1024 * 1024) + 1).to_bytes(4, "little")
+        archive_path = tmp_path / "ambiguous_pe_sidecar.7z"
+        payload_path = tmp_path / "loader.dat"
+        payload_path.write_bytes(payload)
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, "assets/loader.dat")
+
+        result = SevenZipScanner().scan(str(archive_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "sevenzip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Executable 7z Probe: assets/loader.dat" and check.details["analysis_incomplete"] is True
+            for check in result.checks
+        )
+        assert not any(check.name == "Executable Archive Member Detection" for check in result.checks)
 
     # -- cumulative entry count -----------------------------------------------
 

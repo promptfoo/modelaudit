@@ -583,6 +583,27 @@ def test_scan_npz_flags_extensionless_pe_member_with_late_header(tmp_path: Path)
     assert executable_checks[0].details["entry"] == "bin/runme"
 
 
+def test_scan_npz_marks_unconfirmed_pe_pointer_inconclusive(tmp_path: Path) -> None:
+    """A bounded PE probe cannot report an executable without confirmation bytes."""
+    archive_path = tmp_path / "model_bundle.npz"
+    payload = bytearray(64)
+    payload[:2] = b"MZ"
+    payload[0x3C:0x40] = ((1024 * 1024) + 1).to_bytes(4, "little")
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/runme", payload)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "zip_executable_member_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert not any(
+        check.name == "Executable Archive Member Detection" and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize(
     "payload",
     [

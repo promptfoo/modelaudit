@@ -22,7 +22,11 @@ from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTE
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
-from .archive_member_security import has_executable_archive_member_signature, is_executable_archive_member_name
+from .archive_member_security import (
+    ExecutableArchiveMemberProbeOutcome,
+    is_executable_archive_member_name,
+    probe_executable_archive_member_signature,
+)
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 from .picklescan_adapter import apply_pickle_member_context
@@ -377,7 +381,9 @@ class PyTorchZipScanner(BaseScanner):
             return self._handle_scan_error(path, e, result)
 
         assert result is not None
-        result.finish(success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME)
+        result.finish(
+            success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors
+        )
         return result
 
     @staticmethod
@@ -1446,12 +1452,38 @@ class PyTorchZipScanner(BaseScanner):
         return trusted_members
 
     @classmethod
-    def _trusted_pytorch_storage_blob_members(cls, safe_entries: list[zipfile.ZipInfo]) -> set[str]:
-        """Return normalized tensor storage blob members from validated PyTorch ZIP layouts."""
+    def _pytorch_storage_layout_blob_members(cls, safe_entries: list[zipfile.ZipInfo]) -> set[str]:
+        """Return numeric blob members in structurally valid PyTorch storage layouts."""
+        storage_keys_by_data_pkl = cls._trusted_pytorch_storage_data_pkl_members(safe_entries)
+        return {
+            f"{data_pkl_member[: -len('data.pkl')]}data/{storage_key}"
+            for data_pkl_member, storage_keys in storage_keys_by_data_pkl.items()
+            for storage_key in storage_keys
+        }
+
+    @classmethod
+    def _trusted_pytorch_storage_blob_members(
+        cls,
+        safe_entries: list[zipfile.ZipInfo],
+        result: ScanResult,
+    ) -> set[str]:
+        """Return only storage blobs referenced by a validated ``data.pkl`` persistent ID."""
+        storage_keys_by_data_pkl = cls._trusted_pytorch_storage_data_pkl_members(safe_entries)
         trusted_blobs: set[str] = set()
-        for data_pkl_member, storage_keys in cls._trusted_pytorch_storage_data_pkl_members(safe_entries).items():
+        referenced_keys_by_data_pkl: dict[str, set[str]] = {}
+        for check in result.checks:
+            details = check.details
+            if details.get("trusted_pytorch_archive_context") is not True:
+                continue
+            data_pkl_member = details.get("pickle_filename")
+            storage_key = details.get("pytorch_storage_key")
+            if isinstance(data_pkl_member, str) and isinstance(storage_key, str):
+                referenced_keys_by_data_pkl.setdefault(data_pkl_member, set()).add(storage_key)
+
+        for data_pkl_member, storage_keys in storage_keys_by_data_pkl.items():
             prefix = data_pkl_member[: -len("data.pkl")]
-            trusted_blobs.update(f"{prefix}data/{storage_key}" for storage_key in storage_keys)
+            referenced_keys = referenced_keys_by_data_pkl.get(data_pkl_member, set())
+            trusted_blobs.update(f"{prefix}data/{storage_key}" for storage_key in storage_keys & referenced_keys)
         return trusted_blobs
 
     @staticmethod
@@ -1512,7 +1544,7 @@ class PyTorchZipScanner(BaseScanner):
         # instead of one INFO finding per entry in the checks list.
         size_limited_entries: list[dict[str, Any]] = []
         read_failed_entries: list[dict[str, Any]] = []
-        trusted_storage_blob_members = self._trusted_pytorch_storage_blob_members(safe_entries)
+        trusted_storage_blob_members = self._pytorch_storage_layout_blob_members(safe_entries)
 
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
@@ -1641,7 +1673,7 @@ class PyTorchZipScanner(BaseScanner):
         executable_files_found = False
         executable_probe_failures: list[dict[str, str]] = []
         member_names = {self._get_zip_member_name(entry).replace("\\", "/").lstrip("/") for entry in safe_entries}
-        trusted_storage_blob_members = self._trusted_pytorch_storage_blob_members(safe_entries)
+        trusted_storage_blob_members = self._trusted_pytorch_storage_blob_members(safe_entries, result)
         entries_by_normalized_name = {
             self._get_zip_member_name(entry).replace("\\", "/").lstrip("/"): entry for entry in safe_entries
         }
@@ -1650,55 +1682,64 @@ class PyTorchZipScanner(BaseScanner):
             name = self._get_zip_member_name(entry)
             normalized_name = name.replace("\\", "/").lstrip("/")
             normalized_name_lower = normalized_name.lower()
-            # Check for Python code files
+            # Check for Python code files independently of native-content detection.
             if normalized_name_lower.endswith(".py"):
                 debug_member_name = self._torchscript_debug_member_name(name, member_names)
                 debug_entry = entries_by_normalized_name.get(debug_member_name or "")
-                if debug_entry is not None and self._is_torchscript_generated_python(
+                is_generated_torchscript_source = debug_entry is not None and self._is_torchscript_generated_python(
                     zip_file,
                     entry,
                     debug_entry,
                     result,
-                ):
-                    continue
-                result.add_check(
-                    name="Python Code File Detection",
-                    passed=False,
-                    message=f"Python code file found in PyTorch model: {name}",
-                    severity=IssueSeverity.WARNING,
-                    location=f"{path}:{name}",
-                    details={"file": name},
                 )
-                python_files_found = True
-            else:
-                executable_by_name = is_executable_archive_member_name(normalized_name_lower)
-                executable_by_content = False
-                # Raw numbered tensor storage members are arbitrary bytes
-                # rather than loadable files, so content signatures there are
-                # not executable evidence.
-                if not executable_by_name and normalized_name not in trusted_storage_blob_members:
-                    try:
-                        executable_by_content = self._has_executable_member_signature(zip_file, entry, result)
-                    except Exception as exc:
-                        executable_probe_failures.append(
-                            {
-                                "zip_entry": name,
-                                "exception": str(exc),
-                                "exception_type": type(exc).__name__,
-                            }
-                        )
-                        continue
-
-                if executable_by_name or executable_by_content:
+                if not is_generated_torchscript_source:
                     result.add_check(
-                        name="Executable File Detection",
+                        name="Python Code File Detection",
                         passed=False,
-                        message=f"Executable file found in PyTorch model: {name}",
-                        severity=IssueSeverity.CRITICAL,
+                        message=f"Python code file found in PyTorch model: {name}",
+                        severity=IssueSeverity.WARNING,
                         location=f"{path}:{name}",
                         details={"file": name},
                     )
-                    executable_files_found = True
+                    python_files_found = True
+
+            executable_by_name = is_executable_archive_member_name(normalized_name_lower)
+            executable_by_content = False
+            # A referenced raw tensor storage member is arbitrary bytes rather
+            # than a loadable sidecar, so signature bytes are not evidence of
+            # an executable. Unreferenced lookalikes must still be inspected.
+            if not executable_by_name and normalized_name not in trusted_storage_blob_members:
+                try:
+                    executable_probe_outcome = self._executable_member_probe_outcome(zip_file, entry, result)
+                except Exception as exc:
+                    executable_probe_failures.append(
+                        {
+                            "zip_entry": name,
+                            "exception": str(exc),
+                            "exception_type": type(exc).__name__,
+                        }
+                    )
+                else:
+                    executable_by_content = executable_probe_outcome == "detected"
+                    if executable_probe_outcome == "incomplete":
+                        executable_probe_failures.append(
+                            {
+                                "zip_entry": name,
+                                "exception": "PE header pointer exceeds bounded executable-content probe budget",
+                                "exception_type": "BoundedProbeIncomplete",
+                            }
+                        )
+
+            if executable_by_name or executable_by_content:
+                result.add_check(
+                    name="Executable File Detection",
+                    passed=False,
+                    message=f"Executable file found in PyTorch model: {name}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{path}:{name}",
+                    details={"file": name},
+                )
+                executable_files_found = True
 
         if executable_probe_failures:
             mark_inconclusive_scan_result(result, "pytorch_zip_executable_member_probe_failed")
@@ -1735,14 +1776,14 @@ class PyTorchZipScanner(BaseScanner):
                 location=path,
             )
 
-    def _has_executable_member_signature(
+    def _executable_member_probe_outcome(
         self,
         zip_file: zipfile.ZipFile,
         entry: zipfile.ZipInfo,
         result: ScanResult,
-    ) -> bool:
-        """Inspect a member for strong executable bytes through bounded reads."""
-        return has_executable_archive_member_signature(
+    ) -> ExecutableArchiveMemberProbeOutcome:
+        """Classify executable bytes in a member through bounded reads."""
+        return probe_executable_archive_member_signature(
             lambda limit: self._read_member_prefix(
                 zip_file,
                 entry,
@@ -2493,7 +2534,7 @@ class PyTorchZipScanner(BaseScanner):
 
         # Collect actual blob sizes from data/ directory
         data_blob_sizes: dict[str, int] = {}
-        trusted_storage_blob_members = self._trusted_pytorch_storage_blob_members(safe_entries)
+        trusted_storage_blob_members = self._pytorch_storage_layout_blob_members(safe_entries)
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
             normalized_name = name.replace("\\", "/").lstrip("/")

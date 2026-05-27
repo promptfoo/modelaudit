@@ -20,9 +20,9 @@ from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from .archive_member_security import (
-    has_executable_archive_member_signature,
     is_executable_archive_member_name,
     is_python_archive_member_name,
+    probe_executable_archive_member_signature,
     scan_archive_member_for_known_risks,
 )
 from .base import BaseScanner, IssueSeverity, ScanResult
@@ -111,6 +111,7 @@ class _RecursiveScanBudget:
 class _NestedMemberProbeResult:
     detected_format: str | None
     executable_content: bool = False
+    executable_probe_incomplete: bool = False
 
 
 class SevenZipScanner(BaseScanner):
@@ -135,6 +136,7 @@ class SevenZipScanner(BaseScanner):
     _NESTED_CORE_EXTENSION_EXCLUSIONS: ClassVar[frozenset[str]] = frozenset(
         {".txt", ".md", ".markdown", ".rst", ".j2", ".jinja", ".template"},
     )
+    _EXECUTABLE_MODEL_EXTENSIONS: ClassVar[frozenset[str]] = frozenset({".llamafile"})
     _LOW_VALUE_NESTED_PROBE_EXTENSIONS: ClassVar[frozenset[str]] = frozenset(
         {
             ".txt",
@@ -456,8 +458,12 @@ class SevenZipScanner(BaseScanner):
             scannable_files = self._identify_scannable_files(safe_file_names)
             named_security_files = self._identify_named_member_security_files(safe_file_names)
             # Nested model targets still need generic executable-content inspection.
-            member_security_files = list(dict.fromkeys([*scannable_files, *named_security_files]))
-            nested_archive_files, probed_security_files, nested_probe_formats, probes_complete = (
+            member_security_files = [
+                file_name
+                for file_name in dict.fromkeys([*scannable_files, *named_security_files])
+                if not self._is_explicit_executable_model_member(file_name)
+            ]
+            nested_archive_files, probed_executable_files, nested_probe_formats, probes_complete = (
                 self._identify_probed_nested_and_security_files(
                     archive,
                     safe_file_names,
@@ -466,7 +472,6 @@ class SevenZipScanner(BaseScanner):
                     named_security_files=frozenset(named_security_files),
                 )
             )
-            member_security_files.extend(probed_security_files)
             nested_scan_targets = list(dict.fromkeys([*scannable_files, *nested_archive_files]))
             extraction_targets = list(dict.fromkeys([*nested_scan_targets, *member_security_files]))
             if not probes_complete:
@@ -490,6 +495,7 @@ class SevenZipScanner(BaseScanner):
                         depth,
                         budget=budget,
                         member_security_files=frozenset(member_security_files),
+                        prechecked_executable_files=frozenset(probed_executable_files),
                         nested_scan_files=frozenset(nested_scan_targets),
                         nested_probe_formats=nested_probe_formats,
                     )
@@ -498,7 +504,7 @@ class SevenZipScanner(BaseScanner):
 
             result.metadata["total_files"] = len(file_names)
             result.metadata["scannable_files"] = len(nested_scan_targets)
-            result.metadata["security_files"] = len(set(member_security_files))
+            result.metadata["security_files"] = len({*member_security_files, *probed_executable_files})
             result.metadata["unsafe_entries"] = len(file_names) - len(safe_file_names)
             result.metadata["file_size"] = os.path.getsize(path)
 
@@ -527,6 +533,24 @@ class SevenZipScanner(BaseScanner):
             if is_python_archive_member_name(file_name) or is_executable_archive_member_name(file_name)
         ]
 
+    @classmethod
+    def _is_explicit_executable_model_member(cls, file_name: str) -> bool:
+        """Return True for unambiguous nested formats that are intentionally executable."""
+        return any(
+            extension in cls._EXECUTABLE_MODEL_EXTENSIONS for extension in cls._candidate_archive_extensions(file_name)
+        )
+
+    @staticmethod
+    def _add_probed_executable_member_check(result: ScanResult, archive_path: str, file_name: str) -> None:
+        result.add_check(
+            name="Executable Archive Member Detection",
+            passed=False,
+            message=f"Executable file found in 7z archive: {file_name}",
+            severity=IssueSeverity.WARNING,
+            location=f"{archive_path}:{file_name}",
+            details={"entry": file_name},
+        )
+
     def _identify_probed_nested_and_security_files(
         self,
         archive: Any,
@@ -539,6 +563,7 @@ class SevenZipScanner(BaseScanner):
         """Probe unsupported members for nested formats and hidden executables."""
         nested_archives: list[str] = []
         executable_members: list[str] = []
+        incomplete_executable_members: list[str] = []
         nested_probe_formats: dict[str, str] = {}
         probes_complete = True
         probe_candidates: list[tuple[int, int, str]] = []
@@ -594,6 +619,11 @@ class SevenZipScanner(BaseScanner):
                     nested_probe_formats[file_name] = probe_result.detected_format
                 if probe_result.executable_content:
                     executable_members.append(file_name)
+                    self._add_probed_executable_member_check(result, archive_path, file_name)
+                if probe_result.executable_probe_incomplete:
+                    incomplete_executable_members.append(file_name)
+                    probes_complete = False
+            self._add_incomplete_executable_probe_checks(result, archive_path, incomplete_executable_members)
             return nested_archives, executable_members, nested_probe_formats, probes_complete
         except Exception:
             # Fall back to per-member probing if the fast path fails against a
@@ -608,6 +638,10 @@ class SevenZipScanner(BaseScanner):
                     nested_probe_formats[file_name] = probe_result.detected_format
                 if probe_result.executable_content:
                     executable_members.append(file_name)
+                    self._add_probed_executable_member_check(result, archive_path, file_name)
+                if probe_result.executable_probe_incomplete:
+                    incomplete_executable_members.append(file_name)
+                    probes_complete = False
             except Exception as e:
                 probes_complete = False
                 result.add_check(
@@ -619,7 +653,24 @@ class SevenZipScanner(BaseScanner):
                     details={"error": str(e)},
                 )
 
+        self._add_incomplete_executable_probe_checks(result, archive_path, incomplete_executable_members)
         return nested_archives, executable_members, nested_probe_formats, probes_complete
+
+    @staticmethod
+    def _add_incomplete_executable_probe_checks(
+        result: ScanResult,
+        archive_path: str,
+        member_names: list[str],
+    ) -> None:
+        for member_name in member_names:
+            result.add_check(
+                name=f"Executable 7z Probe: {member_name}",
+                passed=False,
+                message=f"Executable content probe was inconclusive for 7z member {member_name}",
+                severity=IssueSeverity.INFO,
+                location=f"{archive_path}:{member_name}",
+                details={"analysis_incomplete": True},
+            )
 
     @classmethod
     def _nested_probe_priority(cls, file_name: str) -> int:
@@ -747,9 +798,11 @@ class SevenZipScanner(BaseScanner):
                 prefix_cache = expanded_prefix
             return prefix_cache[:limit]
 
+        executable_probe_outcome = probe_executable_archive_member_signature(read_prefix)
         return _NestedMemberProbeResult(
             detected_format=None,
-            executable_content=has_executable_archive_member_signature(read_prefix),
+            executable_content=executable_probe_outcome == "detected",
+            executable_probe_incomplete=executable_probe_outcome == "incomplete",
         )
 
     def _member_probe_detected_format(self, archive: Any, file_name: str) -> str | None:
@@ -813,6 +866,7 @@ class SevenZipScanner(BaseScanner):
         depth: int,
         budget: _RecursiveScanBudget,
         member_security_files: frozenset[str] = frozenset(),
+        prechecked_executable_files: frozenset[str] = frozenset(),
         nested_scan_files: frozenset[str] | None = None,
         nested_probe_formats: dict[str, str] | None = None,
     ) -> bool:
@@ -911,7 +965,7 @@ class SevenZipScanner(BaseScanner):
                                 )
                                 return False
 
-                            if file_name in member_security_files:
+                            if file_name in member_security_files and file_name not in prechecked_executable_files:
                                 scan_archive_member_for_known_risks(
                                     archive_kind="7z",
                                     archive_path=archive_path,
@@ -921,6 +975,7 @@ class SevenZipScanner(BaseScanner):
                                     result=result,
                                     max_python_analysis_bytes=self._MAX_PYTHON_MEMBER_ANALYSIS_BYTES,
                                     python_analysis_incomplete_reason="sevenzip_python_member_analysis_incomplete",
+                                    executable_analysis_incomplete_reason="sevenzip_executable_member_analysis_incomplete",
                                     analyze_python_source=file_name not in nested_scan_files,
                                 )
                                 if member_scan_incomplete(result):

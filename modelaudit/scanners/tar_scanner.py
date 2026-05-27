@@ -604,6 +604,7 @@ class TarScanner(BaseScanner):
                                 result=result,
                                 max_python_analysis_bytes=MAX_TAR_PYTHON_ANALYSIS_BYTES,
                                 python_analysis_incomplete_reason="tar_python_member_analysis_incomplete",
+                                executable_analysis_incomplete_reason="tar_executable_member_analysis_incomplete",
                             )
 
                             if name in security_only_nested_entries:
