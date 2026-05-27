@@ -199,7 +199,7 @@ def test_non_numeric_hdf5_weight_metadata_is_not_a_security_finding(
 
     original_array = np.array
 
-    def fail_if_non_numeric_dataset_is_materialized(obj: object, *args: object, **kwargs: object) -> Any:
+    def fail_if_non_numeric_dataset_is_materialized(obj: Any, *args: Any, **kwargs: Any) -> Any:
         if isinstance(obj, h5py.Dataset) and obj.name.endswith("metadata/weight_names"):
             raise AssertionError("non-numeric HDF5 weight metadata should not be materialized")
         return original_array(obj, *args, **kwargs)
