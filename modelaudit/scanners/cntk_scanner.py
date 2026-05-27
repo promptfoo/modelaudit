@@ -7,7 +7,7 @@ import re
 from typing import ClassVar
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 # Discovery assumptions captured from upstream CNTK sources:
 # 1) Legacy CNTK models begin with UTF-16LE "BCN" marker bytes and contain
@@ -281,9 +281,38 @@ class CntkScanner(BaseScanner):
         variant, _reason = _detect_cntk_variant(prefix, extension)
         return variant in {"legacy_v1", "cntk_v2"}
 
+    @staticmethod
+    def _is_unreadable_path_result(result: ScanResult) -> bool:
+        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    @staticmethod
+    def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
+        mark_inconclusive_scan_result(result, "cntk_read_failed")
+        result.add_check(
+            name="CNTK File Read",
+            passed=False,
+            message=f"Error reading CNTK file: {error}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "cntk_read_failed",
+            },
+        )
+        result.finish(success=False)
+        return result
+
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
+            if self._is_unreadable_path_result(path_check_result):
+                return self._finish_read_failure(
+                    self._create_result(),
+                    path,
+                    PermissionError(f"Path is not readable: {path}"),
+                )
             return path_check_result
 
         size_check = self._check_size_limit(path)
@@ -299,22 +328,7 @@ class CntkScanner(BaseScanner):
         try:
             signature_prefix = _read_prefix(path)
         except OSError as e:
-            mark_inconclusive_scan_result(result, "cntk_read_failed")
-            result.add_check(
-                name="CNTK File Read",
-                passed=False,
-                message=f"Error reading CNTK file: {e}",
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={
-                    "exception": str(e),
-                    "exception_type": type(e).__name__,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": "cntk_read_failed",
-                },
-            )
-            result.finish(success=False)
-            return result
+            return self._finish_read_failure(result, path, e)
         variant, variant_reason = _detect_cntk_variant(signature_prefix, extension)
         result.metadata["cntk_variant"] = variant
         result.metadata["variant_reason"] = variant_reason
@@ -344,22 +358,7 @@ class CntkScanner(BaseScanner):
         try:
             data, truncated = _read_bounded(path, _MAX_SCAN_BYTES)
         except OSError as e:
-            mark_inconclusive_scan_result(result, "cntk_read_failed")
-            result.add_check(
-                name="CNTK File Read",
-                passed=False,
-                message=f"Error reading CNTK file: {e}",
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={
-                    "exception": str(e),
-                    "exception_type": type(e).__name__,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": "cntk_read_failed",
-                },
-            )
-            result.finish(success=False)
-            return result
+            return self._finish_read_failure(result, path, e)
 
         result.bytes_scanned = len(data)
         result.metadata["scan_truncated"] = truncated

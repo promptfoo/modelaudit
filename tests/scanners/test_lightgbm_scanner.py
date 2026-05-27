@@ -198,6 +198,37 @@ def test_lightgbm_read_failure_is_inconclusive_not_security_finding(
     assert determine_exit_code(aggregate) == 2
 
 
+def test_lightgbm_unreadable_path_preflight_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "permission-denied.lightgbm"
+    path.write_text(_build_lightgbm_text(), encoding="utf-8")
+
+    def deny_access(_path: str, _mode: int) -> bool:
+        return False
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated permission-denied read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", deny_access)
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_os_error)
+    monkeypatch.setattr("modelaudit.scanners.lightgbm_scanner.open", raise_os_error, raising=False)
+
+    direct = LightGBMScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    read_checks = _check_by_name(direct, "LightGBM File Read")
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "lightgbm_read_failed" in direct.metadata["scan_outcome_reasons"]
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
+
+
 def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
     path = tmp_path / "network_secret.model"
     path.write_text(

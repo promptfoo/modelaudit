@@ -232,6 +232,37 @@ def test_cntk_signature_read_failure_still_routes_to_inconclusive_scan(
     assert determine_exit_code(aggregate) == 2
 
 
+def test_cntk_unreadable_path_preflight_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "permission-denied.cmf"
+    _write_cntkv2(path, payload=b" safe metadata ")
+
+    def deny_access(_path: str, _mode: int) -> bool:
+        return False
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> bytes:
+        raise OSError("simulated permission-denied read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", deny_access)
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_os_error)
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._read_prefix", raise_os_error)
+
+    direct = CntkScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    read_checks = [check for check in direct.checks if check.name == "CNTK File Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "cntk_read_failed" in direct.metadata["scan_outcome_reasons"]
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
+
+
 def test_cntk_scanner_records_scope_assumptions(tmp_path: Path) -> None:
     path = tmp_path / "safe.cmf"
     _write_cntkv2(path, payload=b" version uid inputs outputs ")
