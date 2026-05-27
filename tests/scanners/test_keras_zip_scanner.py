@@ -10,6 +10,7 @@ The new .keras format is a ZIP archive containing:
 import base64
 import json
 import marshal
+import stat
 import warnings
 import zipfile
 from pathlib import Path
@@ -23,6 +24,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import keras_zip_scanner as keras_zip_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner, _has_get_file_reference
+from modelaudit.utils.file import detection as file_detection
 
 try:
     import h5py
@@ -507,6 +509,40 @@ class TestKerasZipScanner:
         assert "keras_zip_embedded_weights_too_large" in result.metadata["scan_outcome_reasons"]
         assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
 
+    def test_embedded_weights_size_skip_preserves_zip_bomb_detection(self, tmp_path: Path) -> None:
+        keras_path = tmp_path / "compressed_oversized_weights.keras"
+        with zipfile.ZipFile(keras_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.12.0"}))
+            zf.writestr("model.weights.h5", b"0" * ((1024 * 1024) + 1))
+
+        result = KerasZipScanner({"max_embedded_weights_bytes": 1024}).scan(str(keras_path))
+
+        assert any(
+            check.name == "Compression Ratio Check"
+            and check.status == CheckStatus.FAILED
+            and check.details["entry"] == "model.weights.h5"
+            and check.rule_code == "S410"
+            for check in result.checks
+        )
+
+    def test_configured_recursive_member_skip_is_never_clean(self, tmp_path: Path) -> None:
+        keras_path = tmp_path / "configured_skip.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.12.0"}))
+
+        result = KerasZipScanner({"skip_archive_entries": ["metadata.json"]}).scan(str(keras_path))
+
+        assert result.success is False
+        assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "ZIP Member Analysis Coverage"
+            and check.status == CheckStatus.FAILED
+            and check.details["entry"] == "metadata.json"
+            for check in result.checks
+        )
+
     def test_embedded_weights_size_limit_runs_without_h5py(
         self,
         tmp_path: Path,
@@ -871,8 +907,8 @@ class TestKerasZipScanner:
         )
         assert result.success is False
 
-    def test_scan_skips_oversized_metadata_json_without_warning_noise(self, tmp_path: Path) -> None:
-        """Oversized optional metadata.json should be bounded and ignored without adding noisy findings."""
+    def test_scan_marks_oversized_metadata_json_incomplete_without_false_security_finding(self, tmp_path: Path) -> None:
+        """Oversized optional metadata cannot safely exclude hidden nested payloads."""
         scanner = KerasZipScanner()
         keras_path = tmp_path / "oversized_metadata.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:
@@ -884,10 +920,243 @@ class TestKerasZipScanner:
 
         result = scanner.scan(str(keras_path))
 
-        assert result.success is True
+        assert result.success is False
         assert result.metadata.get("model_class") == "Sequential"
         assert "keras_version" not in result.metadata
+        assert any(
+            check.name == "MXNet Symbol Routing" and check.status == CheckStatus.FAILED for check in result.checks
+        )
         assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+    def test_scan_validates_symlink_metadata_before_skipping_recursive_content(self, tmp_path: Path) -> None:
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "symlink_metadata.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            metadata = zipfile.ZipInfo("metadata.json")
+            metadata.create_system = 3
+            metadata.external_attr = (stat.S_IFLNK | 0o777) << 16
+            zf.writestr(metadata, "../external-metadata.json")
+
+        result = scanner.scan(str(keras_path))
+
+        assert any(
+            check.name == "Symlink Safety Validation"
+            and check.status == CheckStatus.FAILED
+            and check.details["entry"] == "metadata.json"
+            for check in result.checks
+        )
+
+    def test_scan_recurses_pickle_payload_disguised_as_metadata(self, tmp_path: Path) -> None:
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "pickle_metadata.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", b"cos\nsystem\n(S'echo pwned'\ntR.")
+
+        result = scanner.scan(str(keras_path))
+
+        assert any(
+            issue.rule_code == "S201"
+            and issue.details.get("zip_entry") == "metadata.json"
+            and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system", "nt.system"))
+            for issue in result.issues
+        )
+
+    def test_scan_recurses_mxnet_symbol_disguised_as_metadata(self, tmp_path: Path) -> None:
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "mxnet_metadata.keras"
+        symbol_graph = {
+            "nodes": [
+                {"op": "null", "name": "data", "inputs": []},
+                {
+                    "op": "Custom",
+                    "name": "custom_loader",
+                    "attrs": {"library": "../../tmp/libevil.so", "op_type": "unsafe_loader"},
+                    "inputs": [[0, 0, 0]],
+                },
+            ],
+            "arg_nodes": [0],
+            "heads": [[1, 0, 0]],
+        }
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps(symbol_graph))
+
+        result = scanner.scan(str(keras_path))
+
+        assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+    def test_scan_fails_closed_for_ambiguous_mxnet_symbol_disguised_as_metadata(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+        keras_path = tmp_path / "ambiguous_mxnet_metadata.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr(
+                "metadata.json",
+                '{"nodes":[{"op":"Custom","name":"load","attrs":"'
+                + ("x" * 129)
+                + '"},{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+                '"arg_nodes":[0],"heads":[[1,0,0]]}',
+            )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "MXNet Symbol Routing" and check.status == CheckStatus.FAILED for check in result.checks
+        )
+
+    def test_scan_fails_closed_for_mxnet_node_object_before_metadata_padding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+        keras_path = tmp_path / "padded_node_mxnet_metadata.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr(
+                "metadata.json",
+                '{"nodes":[{"attrs":"'
+                + ("x" * 129)
+                + '","op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+                '"arg_nodes":[0],"heads":[[0,0,0]]}',
+            )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "MXNet Symbol Routing" and check.status == CheckStatus.FAILED for check in result.checks
+        )
+
+    @pytest.mark.parametrize("initial_nodes", ["[]", "null"])
+    def test_scan_fails_closed_for_duplicate_mxnet_nodes_after_truncated_metadata_prefix(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        initial_nodes: str,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+        keras_path = tmp_path / "duplicate_mxnet_metadata.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr(
+                "metadata.json",
+                '{"nodes":'
+                + initial_nodes
+                + ',"padding":"'
+                + ("x" * 129)
+                + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+                '"arg_nodes":[0],"heads":[[0,0,0]]}',
+            )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "MXNet Symbol Routing" and check.status == CheckStatus.FAILED for check in result.checks
+        )
+
+    def test_scan_fails_closed_for_mxnet_nodes_after_visible_head_metadata_padding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+        keras_path = tmp_path / "padded_mxnet_metadata.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr(
+                "metadata.json",
+                '{"heads":[[0,0,0]],"padding":"'
+                + ("x" * 129)
+                + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+                '"arg_nodes":[0]}',
+            )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "MXNet Symbol Routing" and check.status == CheckStatus.FAILED for check in result.checks
+        )
+
+    def test_scan_fails_closed_for_mxnet_nodes_hidden_after_metadata_padding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+        keras_path = tmp_path / "hidden_mxnet_metadata.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr(
+                "metadata.json",
+                '{"padding":"'
+                + ("x" * 129)
+                + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+                '"arg_nodes":[0],"heads":[[0,0,0]]}',
+            )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "MXNet Symbol Routing" and check.status == CheckStatus.FAILED for check in result.checks
+        )
+
+    def test_scan_does_not_suppress_mxnet_ambiguity_in_nested_archive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+        nested_path = tmp_path / "payload.zip"
+        with zipfile.ZipFile(nested_path, "w") as nested_zip:
+            nested_zip.writestr(
+                "metadata.json",
+                '{"heads":[[0,0,0]],"nodes":[{"attrs":"' + ("x" * 129) + '"}],"arg_nodes":[0]}',
+            )
+
+        keras_path = tmp_path / "nested_mxnet_metadata.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+            zf.write(nested_path, "payload.zip")
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "MXNet Symbol Routing" and check.status == CheckStatus.FAILED for check in result.checks
+        )
+
+    def test_oversized_root_weights_skip_does_not_hide_nested_pickle_weights(self, tmp_path: Path) -> None:
+        nested_path = tmp_path / "payload.zip"
+        with zipfile.ZipFile(nested_path, "w") as nested_zip:
+            nested_zip.writestr("model.weights.h5", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+        keras_path = tmp_path / "nested_weights.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+            zf.writestr("model.weights.h5", b"0" * 4096)
+            zf.write(nested_path, "payload.zip")
+
+        result = KerasZipScanner({"max_embedded_weights_bytes": 1024}).scan(str(keras_path))
+
+        assert any(
+            issue.rule_code == "S201"
+            and issue.details.get("zip_entry") == "payload.zip:model.weights.h5"
+            and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system", "nt.system"))
+            for issue in result.issues
+        )
 
     def test_lambda_layer_with_exec(self, tmp_path: Path) -> None:
         """Test detection of Lambda layer with exec() call."""

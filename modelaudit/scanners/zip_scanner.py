@@ -11,7 +11,10 @@ from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
-from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
+from .archive_dispatch import (
+    NESTED_SCAN_CALLBACK_CONFIG_KEY,
+    scan_nested_file,
+)
 from .archive_member_security import scan_archive_member_for_known_risks
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -536,6 +539,18 @@ class ZipScanner(BaseScanner):
                             rule_code=None,  # Passing check
                         )
 
+                if self._should_skip_archive_entry(name):
+                    scan_complete = False
+                    result.add_check(
+                        name="ZIP Member Analysis Coverage",
+                        passed=False,
+                        message=f"Skipped ZIP member analysis by configured request: {name}",
+                        severity=IssueSeverity.INFO,
+                        location=f"{path}:{name}",
+                        details={"entry": name, "reason": "configured_archive_member_skip"},
+                    )
+                    continue
+
                 # Extract and scan the file
                 tmp_path: str | None = None
                 try:
@@ -592,6 +607,7 @@ class ZipScanner(BaseScanner):
                             )
 
                         nested_config = dict(self.config)
+                        nested_config.pop("skip_archive_entries", None)
                         nested_config["_archive_depth"] = depth + 1
                         if zipfile.is_zipfile(tmp_path):
                             nested_config["_zip_depth"] = depth + 1
