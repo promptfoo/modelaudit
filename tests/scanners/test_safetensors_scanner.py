@@ -14,7 +14,7 @@ pytest.importorskip("safetensors")
 
 from safetensors.numpy import save_file
 
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.safetensors_scanner import SAFETENSORS_READ_INCONCLUSIVE_REASON, SafeTensorsScanner
 
@@ -400,6 +400,26 @@ def test_safetensors_security_finding_takes_precedence_over_inconclusive_structu
 
     assert direct.has_errors is True
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_safetensors_with_torch7_like_metadata_keeps_safetensors_routing(tmp_path: Path) -> None:
+    file_path = tmp_path / "torch-marker-metadata.safetensors"
+    header = {
+        "__metadata__": {
+            "framework": "torch",
+            "kind": "tensor nn.Sequential",
+            "description": "<script>alert('xss')</script>",
+        },
+        "t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+    }
+    write_raw_safetensors(file_path, header, b"\x00" * 4)
+
+    direct = scan_file(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path))
+
+    assert direct.scanner_name == "safetensors"
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
     assert determine_exit_code(aggregate) == 1
 

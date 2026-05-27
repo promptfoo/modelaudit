@@ -31,6 +31,7 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
+from .archive_dispatch import SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY
 from .archive_member_security import is_executable_archive_member_name
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
@@ -364,6 +365,9 @@ class KerasZipScanner(BaseScanner):
 
     def _merge_recursive_archive_scan(self, path: str, result: ScanResult) -> None:
         """Recursively scan every ZIP member through the generic archive scanner."""
+        if self.config.get(SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY):
+            return
+
         from .zip_scanner import ZipScanner
 
         has_embedded_weights_limit = self._has_embedded_weights_limit_reason(result)
