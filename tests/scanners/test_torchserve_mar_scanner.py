@@ -6,6 +6,7 @@ import ast
 import json
 import pickle
 import stat
+import tempfile
 import zipfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -265,6 +266,94 @@ def test_scan_flags_name_disguised_executable_extra_file(tmp_path: Path) -> None
     assert len(executable_checks) == 1
     assert executable_checks[0].rule_code == "S502"
     assert executable_checks[0].details["entry"] == "native/payload.so"
+    assert core.determine_exit_code(aggregate) == 1
+
+
+def test_scan_flags_oversized_named_executable_extra_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = {
+        "model": {
+            "handler": "handler.py",
+            "serializedFile": "weights.bin",
+            "extraFiles": "native/payload.so",
+        },
+    }
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return data\n",
+            "weights.bin": b"weights",
+            "native/payload.so": b"x" * 257,
+        },
+        filename="oversized_named_executable_extra_file.mar",
+    )
+    extracted_temp_paths: list[Path] = []
+    real_named_temporary_file = tempfile.NamedTemporaryFile
+
+    def named_temporary_file_in_tmp_path(*args: Any, **kwargs: Any) -> Any:
+        kwargs["dir"] = tmp_path
+        temporary_file = real_named_temporary_file(*args, **kwargs)
+        extracted_temp_paths.append(Path(temporary_file.name))
+        return temporary_file
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", named_temporary_file_in_tmp_path)
+
+    result = TorchServeMarScanner(config={"max_mar_member_bytes": 256}).scan(str(mar_path))
+    aggregate = core.scan_model_directory_or_file(
+        str(mar_path),
+        cache_enabled=False,
+        max_mar_member_bytes=256,
+    )
+
+    executable_checks = _failed_checks(result, "TorchServe Executable Extra File Detection")
+    member_limit_checks = _failed_checks(result, "TorchServe MAR Member Size Limit")
+    assert len(executable_checks) == 1
+    assert executable_checks[0].rule_code == "S502"
+    assert executable_checks[0].details["entry"] == "native/payload.so"
+    assert any(check.details["entry"] == "native/payload.so" for check in member_limit_checks)
+    assert "torchserve_mar_member_size_limit" in result.metadata["scan_outcome_reasons"]
+    assert core.determine_exit_code(aggregate) == 1
+    assert extracted_temp_paths
+    assert all(not path.exists() for path in extracted_temp_paths)
+
+
+def test_scan_flags_named_executable_extra_file_when_byte_budget_prevents_extraction(tmp_path: Path) -> None:
+    manifest = {
+        "model": {
+            "handler": "handler.py",
+            "serializedFile": "weights.bin",
+            "extraFiles": "native/payload.so",
+        },
+    }
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("native/payload.so", b"compiled sidecar metadata\n"),
+            ("handler.py", b"def handle(data, context):\n    return data\n"),
+            ("weights.bin", b"weights"),
+        ],
+        filename="budgeted_named_executable_extra_file.mar",
+    )
+    with zipfile.ZipFile(mar_path) as archive:
+        manifest_size = archive.getinfo("MAR-INF/MANIFEST.json").file_size
+
+    result = TorchServeMarScanner(config={"max_mar_uncompressed_bytes": manifest_size}).scan(str(mar_path))
+    aggregate = core.scan_model_directory_or_file(
+        str(mar_path),
+        cache_enabled=False,
+        max_mar_uncompressed_bytes=manifest_size,
+    )
+
+    executable_checks = _failed_checks(result, "TorchServe Executable Extra File Detection")
+    budget_checks = _failed_checks(result, "TorchServe MAR Uncompressed Size Budget")
+    assert len(executable_checks) == 1
+    assert executable_checks[0].rule_code == "S502"
+    assert len(budget_checks) == 1
+    assert "torchserve_mar_uncompressed_budget" in result.metadata["scan_outcome_reasons"]
     assert core.determine_exit_code(aggregate) == 1
 
 

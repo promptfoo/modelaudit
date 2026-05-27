@@ -21,7 +21,7 @@ from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
-from .archive_member_security import executable_archive_member_rule_code
+from .archive_member_security import executable_archive_member_name_rule_code, executable_archive_member_rule_code
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -301,20 +301,27 @@ class TorchServeMarScanner(BaseScanner):
         safe_basename = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(member_info.filename))
         suffix = f"_{safe_basename}" if safe_basename else ".bin"
 
+        temp_path = ""
         total_size = 0
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-            temp_path = temp_file.name
-            with archive.open(member_info, "r") as entry_file:
-                while True:
-                    chunk = entry_file.read(64 * 1024)
-                    if not chunk:
-                        break
-                    total_size += len(chunk)
-                    if total_size > max_bytes:
-                        raise ValueError(
-                            f"Archive member {member_info.filename} exceeds max allowed bytes ({max_bytes})",
-                        )
-                    temp_file.write(chunk)
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+                temp_path = temp_file.name
+                with archive.open(member_info, "r") as entry_file:
+                    while True:
+                        chunk = entry_file.read(64 * 1024)
+                        if not chunk:
+                            break
+                        total_size += len(chunk)
+                        if total_size > max_bytes:
+                            raise ValueError(
+                                f"Archive member {member_info.filename} exceeds max allowed bytes ({max_bytes})",
+                            )
+                        temp_file.write(chunk)
+        except Exception:
+            if temp_path:
+                with contextlib.suppress(OSError):
+                    os.unlink(temp_path)
+            raise
 
         return temp_path, total_size
 
@@ -1381,6 +1388,24 @@ class TorchServeMarScanner(BaseScanner):
 
         return self._find_high_risk_calls_from_tree(tree), None
 
+    @staticmethod
+    def _add_executable_extra_file_finding(
+        result: ScanResult,
+        *,
+        archive_path: str,
+        member_name: str,
+        rule_code: str,
+    ) -> None:
+        result.add_check(
+            name="TorchServe Executable Extra File Detection",
+            passed=False,
+            message=f"Executable file found in TorchServe MAR extraFiles member: {member_name}",
+            severity=IssueSeverity.WARNING,
+            rule_code=rule_code,
+            location=f"{archive_path}:{member_name}",
+            details={"entry": member_name, "manifest_field": "extraFiles"},
+        )
+
     def _scan_archive_members(
         self,
         archive_path: str,
@@ -1457,6 +1482,12 @@ class TorchServeMarScanner(BaseScanner):
             if not member_name or member_name.endswith("/"):
                 continue
 
+            named_executable_rule_code = (
+                executable_archive_member_name_rule_code(normalized_member)
+                if normalized_member in extra_file_refs
+                else None
+            )
+
             if PurePosixPath(normalized_member).name == "requirements.txt":
                 self._analyze_requirements_txt(
                     archive_path=archive_path,
@@ -1486,6 +1517,13 @@ class TorchServeMarScanner(BaseScanner):
                     },
                 )
                 mark_inconclusive_scan_result(result, "torchserve_mar_uncompressed_budget")
+                if named_executable_rule_code is not None:
+                    self._add_executable_extra_file_finding(
+                        result,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        rule_code=named_executable_rule_code,
+                    )
                 break
 
             if member_info.compress_size > 0:
@@ -1572,6 +1610,13 @@ class TorchServeMarScanner(BaseScanner):
                     },
                 )
                 mark_inconclusive_scan_result(result, "torchserve_mar_member_size_limit")
+                if named_executable_rule_code is not None:
+                    self._add_executable_extra_file_finding(
+                        result,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        rule_code=named_executable_rule_code,
+                    )
                 continue
             except Exception as exc:
                 result.add_check(
@@ -1588,6 +1633,13 @@ class TorchServeMarScanner(BaseScanner):
                     },
                 )
                 mark_inconclusive_scan_result(result, "torchserve_mar_member_extraction_failed")
+                if named_executable_rule_code is not None:
+                    self._add_executable_extra_file_finding(
+                        result,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        rule_code=named_executable_rule_code,
+                    )
                 continue
 
             try:
@@ -1599,14 +1651,11 @@ class TorchServeMarScanner(BaseScanner):
                     else None
                 )
                 if executable_rule_code is not None:
-                    result.add_check(
-                        name="TorchServe Executable Extra File Detection",
-                        passed=False,
-                        message=f"Executable file found in TorchServe MAR extraFiles member: {member_name}",
-                        severity=IssueSeverity.WARNING,
+                    self._add_executable_extra_file_finding(
+                        result,
+                        archive_path=archive_path,
+                        member_name=member_name,
                         rule_code=executable_rule_code,
-                        location=f"{archive_path}:{member_name}",
-                        details={"entry": member_name, "manifest_field": "extraFiles"},
                     )
 
                 nested_config = dict(self.config)
