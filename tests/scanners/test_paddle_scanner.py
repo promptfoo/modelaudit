@@ -1,5 +1,7 @@
+import builtins
 import struct
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -116,7 +118,15 @@ def test_paddle_read_failure_is_inconclusive_not_security_finding(
     def raise_os_error(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated Paddle read failure")
 
+    def raise_detection_error(_path: str) -> str:
+        raise OSError("simulated Paddle detection read failure")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
     monkeypatch.setattr("modelaudit.scanners.paddle_scanner.open", raise_os_error, raising=False)
+    monkeypatch.setattr("modelaudit.core.detect_file_format", raise_detection_error)
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
 
     with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
         direct = PaddleScanner().scan(str(path))
@@ -128,12 +138,58 @@ def test_paddle_read_failure_is_inconclusive_not_security_finding(
     assert read_checks[0].details["analysis_incomplete"] is True
     assert read_checks[0].details["scan_outcome_reason"] == "paddle_read_failed"
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "paddle_read_failed"
     assert "paddle_read_failed" in direct.metadata["scan_outcome_reasons"]
     metadata = aggregate.file_metadata[str(path)]
     assert "paddle_read_failed" in metadata["scan_outcome_reasons"]
+    assert metadata["operational_error_reason"] == "paddle_read_failed"
     assert not [
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_paddle_unreadable_path_preflight_is_operational_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "permission-denied.pdmodel"
+    path.write_bytes(b"safe paddle model metadata")
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
+
+    with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
+        direct = PaddleScanner().scan(str(path))
+        aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert direct.metadata["scan_outcome_reasons"] == ["paddle_read_failed"]
+    assert direct.metadata["operational_error_reason"] == "paddle_read_failed"
+    assert aggregate.file_metadata[str(path)]["operational_error_reason"] == "paddle_read_failed"
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_paddle_read_failure_takes_precedence_over_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    malicious = tmp_path / "malicious.pdmodel"
+    malicious.write_bytes(b"os.system('ls')")
+    unreadable = tmp_path / "unreadable.pdmodel"
+    unreadable.write_bytes(b"safe paddle model metadata")
+    real_open = builtins.open
+
+    def fail_selected_read(path: str, *args: Any, **kwargs: Any) -> Any:
+        if path == str(unreadable):
+            raise OSError("simulated Paddle read failure")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("modelaudit.scanners.paddle_scanner.open", fail_selected_read, raising=False)
+
+    with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
+        aggregate = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert any(issue.severity == IssueSeverity.WARNING for issue in aggregate.issues)
+    assert aggregate.file_metadata[str(unreadable)]["operational_error_reason"] == "paddle_read_failed"
     assert determine_exit_code(aggregate) == 2
 
 

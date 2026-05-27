@@ -1,4 +1,5 @@
 import base64
+import builtins
 import pickle
 import shutil
 from pathlib import Path
@@ -88,13 +89,82 @@ def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
     assert read_checks[0].details["analysis_incomplete"] is True
     assert read_checks[0].details["scan_outcome_reason"] == "savedmodel_read_failed"
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "savedmodel_read_failed"
     assert "savedmodel_read_failed" in direct.metadata["scan_outcome_reasons"]
     metadata = aggregate.file_metadata[str(Path(path) / "saved_model.pb")].model_dump()
     assert "savedmodel_read_failed" in metadata["scan_outcome_reasons"]
+    assert metadata["operational_error_reason"] == "savedmodel_read_failed"
     assert not [
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]
     assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_unreadable_file_preflight_is_operational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = Path(_create_test_savedmodel_with_op(tmp_path, "Const", "permission_denied_model"))
+    path = model_dir / "saved_model.pb"
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
+
+    direct = TensorFlowSavedModelScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert direct.metadata["operational_error_reason"] == "savedmodel_read_failed"
+    assert aggregate.file_metadata[str(path)].model_dump()["operational_error_reason"] == "savedmodel_read_failed"
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_unreadable_keras_metadata_is_operational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(b"safe metadata")
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated Keras metadata read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner.open", raise_os_error, raising=False)
+
+    result = TensorFlowSavedModelScanner().scan(str(metadata_path))
+    aggregate = scan_model_directory_or_file(str(metadata_path), cache_scan_results=False)
+
+    assert result.metadata["operational_error_reason"] == "savedmodel_read_failed"
+    assert result.metadata["scan_outcome_reasons"] == ["savedmodel_read_failed"]
+    assert any(check.name == "SavedModel File Read" for check in result.checks)
+    assert (
+        aggregate.file_metadata[str(metadata_path)].model_dump()["operational_error_reason"] == "savedmodel_read_failed"
+    )
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_directory_keeps_keras_metadata_read_failure_operational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = Path(_create_test_savedmodel_with_op(tmp_path, "Const", "metadata_failure_model"))
+    metadata_path = model_dir / "keras_metadata.pb"
+    metadata_path.write_bytes(b"safe metadata")
+    real_open = builtins.open
+
+    def fail_metadata_read(file: str, *args: Any, **kwargs: Any) -> Any:
+        if file == str(metadata_path):
+            raise OSError("simulated Keras metadata read failure")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner.open", fail_metadata_read, raising=False)
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    assert result.metadata["operational_error_reason"] == "savedmodel_read_failed"
+    assert result.metadata["scan_outcome_reasons"] == ["savedmodel_read_failed"]
+    assert any(check.name == "SavedModel File Read" and check.location == str(metadata_path) for check in result.checks)
 
 
 def test_suspicious_function_name_reuses_precompiled_patterns(monkeypatch: pytest.MonkeyPatch) -> None:

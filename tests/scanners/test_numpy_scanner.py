@@ -89,11 +89,31 @@ def test_numpy_read_failure_is_operational_not_security_finding(
     assert read_checks[0].details["operational_error"] is True
     assert read_checks[0].details["operational_error_reason"] == "numpy_read_failed"
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error"] is True
     assert direct.metadata["operational_error_reason"] == "numpy_read_failed"
     assert "numpy_read_failed" in direct.metadata["scan_outcome_reasons"]
+    assert aggregate.file_metadata[str(path)]["operational_error_reason"] == "numpy_read_failed"
     assert not [
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_numpy_unreadable_path_preflight_is_operational_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "permission-denied.npy"
+    np.save(path, np.arange(3))
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
+
+    direct = NumPyScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert direct.metadata["scan_outcome_reasons"] == ["numpy_read_failed"]
+    assert direct.metadata["operational_error_reason"] == "numpy_read_failed"
+    assert aggregate.file_metadata[str(path)]["operational_error_reason"] == "numpy_read_failed"
     assert determine_exit_code(aggregate) == 2
 
 
