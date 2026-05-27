@@ -91,6 +91,7 @@ Use **[`modelaudit`](https://pypi.org/project/modelaudit/)** if you want the ful
 from modelaudit_picklescan import (
     PickleScanner, ScanOptions,
     scan_file, scan_bytes, scan_stream,
+    shared_source_sensitive_caches,
     PickleReport, Finding, Notice, ScanError,
     Severity, ScanStatus, SafetyVerdict, CoverageSummary,
 )
@@ -103,6 +104,18 @@ Three convenience entry points, each returning a `PickleReport`:
 - `scan_stream(stream, *, source="<stream>", size=None, options=None)` — scan a binary file-like object; falls back to bounded spooling when `size` is unknown.
 
 For long-running services, construct `PickleScanner(options=...)` once and reuse it across calls.
+
+When scanning a related batch of files, use `shared_source_sensitive_caches()` to
+reuse bounded call-graph source analysis. Analyzed source content is validated
+before each later report; changes observed at final validation fail closed as
+inconclusive, and later scan batches remain isolated:
+
+```python
+from modelaudit_picklescan import scan_file, shared_source_sensitive_caches
+
+with shared_source_sensitive_caches():
+    reports = [scan_file(path) for path in model_paths]
+```
 
 ### Resource controls — `ScanOptions`
 
