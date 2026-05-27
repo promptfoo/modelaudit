@@ -154,6 +154,29 @@ def test_cntk_scanner_marks_bounded_prefix_analysis_inconclusive(
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "cntk_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
 
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            assert "cntk_bounded_read_incomplete" in aggregate.file_metadata[str(path)]["scan_outcome_reasons"]
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
 
 def test_cntk_scanner_file_read_failure_is_inconclusive_not_security_finding(
     tmp_path: Path,
@@ -208,7 +231,7 @@ def test_cntk_scanner_signature_read_failure_is_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    path = tmp_path / "signature-unreadable.cmf"
+    path = tmp_path / "signature-unreadable.jpg"
     _write_cntkv2(path)
 
     def raise_os_error(*_args: object, **_kwargs: object) -> bytes:
@@ -222,6 +245,29 @@ def test_cntk_scanner_signature_read_failure_is_inconclusive(
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "cntk_read_failed" in result.metadata["scan_outcome_reasons"]
     assert any(check.name == "CNTK File Read" and check.severity == IssueSeverity.INFO for check in result.checks)
+
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            assert "cntk_read_failed" in aggregate.file_metadata[str(path)]["scan_outcome_reasons"]
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_cntk_scanner_marks_late_string_payload_inconclusive(

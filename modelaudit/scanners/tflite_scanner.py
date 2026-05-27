@@ -19,6 +19,24 @@ _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_SIZE = 4
 _TFLITE_MIN_HEADER_SIZE = _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE
 _TFLITE_MAGIC_BYTES = b"TFL3"
+_CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset(
+    {
+        ".bin",
+        ".cmf",
+        ".dnn",
+        ".exe",
+        ".lgb",
+        ".lightgbm",
+        ".llamafile",
+        ".meta",
+        ".model",
+        ".net",
+        ".pb",
+        ".rknn",
+        ".t7",
+        ".th",
+    }
+)
 TFLITE_MAGIC_INCONCLUSIVE_REASON = "tflite_magic_validation_failed"
 TFLITE_PARSE_INCONCLUSIVE_REASON = "tflite_parse_incomplete"
 TFLITE_STRUCTURE_INCONCLUSIVE_REASON = "tflite_structure_validation_failed"
@@ -55,8 +73,11 @@ class TFLiteScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        if os.path.splitext(path)[1].lower() in cls.supported_extensions:
+        ext = os.path.splitext(path)[1].lower()
+        if ext in cls.supported_extensions:
             return True
+        if ext in _CONTENT_ROUTE_BLOCKED_EXTENSIONS:
+            return False
 
         try:
             with open(path, "rb") as f:

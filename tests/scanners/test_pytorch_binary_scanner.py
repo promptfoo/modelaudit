@@ -180,6 +180,46 @@ def test_pytorch_binary_scanner_no_false_positive_mz(tmp_path):
     assert not found_pe, "Should NOT detect Windows executable when MZ is in middle of file"
 
 
+def test_pytorch_binary_scanner_detects_structurally_valid_embedded_pe(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "embedded_pe.bin"
+    pe_payload = bytearray(b"\x00" * 196)
+    pe_payload[:2] = b"MZ"
+    pe_payload[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    pe_payload[0x80:0x84] = b"PE\x00\x00"
+    binary_file.write_bytes(b"\x00" * 512 + bytes(pe_payload))
+
+    result = scanner.scan(str(binary_file))
+
+    assert any(
+        issue.rule_code == "S501"
+        and "Windows executable" in issue.message
+        and "(offset: 512)" in (issue.location or "")
+        for issue in result.issues
+    )
+
+
+def test_pytorch_binary_scanner_detects_embedded_pe_across_chunk_boundary(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "boundary_embedded_pe.bin"
+    chunk_size = 1024 * 1024
+    pe_offset = chunk_size - 0x50
+    pe_payload = bytearray(b"\x00" * (chunk_size + 0x80))
+    pe_payload[pe_offset : pe_offset + 2] = b"MZ"
+    pe_payload[pe_offset + 0x3C : pe_offset + 0x40] = (0x80).to_bytes(4, "little")
+    pe_payload[pe_offset + 0x80 : pe_offset + 0x84] = b"PE\x00\x00"
+    binary_file.write_bytes(pe_payload)
+
+    result = scanner.scan(str(binary_file))
+
+    assert any(
+        issue.rule_code == "S501"
+        and "Windows executable" in issue.message
+        and f"(offset: {pe_offset})" in (issue.location or "")
+        for issue in result.issues
+    )
+
+
 @pytest.mark.skip(
     reason="ML context filtering now ignores executable signatures in weight-like data to reduce false positives"
 )
