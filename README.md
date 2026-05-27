@@ -64,42 +64,47 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 
 ModelAudit includes 44 registered scanners covering model, archive, and configuration formats:
 
-| Format                  | Extensions                                                                              | Risk   |
-| ----------------------- | --------------------------------------------------------------------------------------- | ------ |
-| **Pickle**              | `.pkl`, `.pickle`, `.dill`                                                              | HIGH   |
-| **PyTorch**             | `.pt`, `.pth`, `.ckpt`, `.bin`                                                          | HIGH   |
-| **Joblib**              | `.joblib`                                                                               | HIGH   |
-| **NumPy**               | `.npy`, `.npz`                                                                          | HIGH   |
-| **R Serialized**        | `.rds`, `.rda`, `.rdata`                                                                | HIGH   |
-| **TensorFlow**          | `.pb`, `.meta`, SavedModel dirs                                                         | MEDIUM |
-| **Keras**               | `.h5`, `.hdf5`, `.keras`                                                                | MEDIUM |
-| **ONNX**                | `.onnx`                                                                                 | MEDIUM |
-| **CoreML**              | `.mlmodel`                                                                              | LOW    |
-| **MXNet**               | `*-symbol.json`, `*-NNNN.params`, structurally valid renamed symbol JSON                | LOW    |
-| **NeMo**                | `.nemo`, renamed archives with root config                                              | MEDIUM |
-| **CNTK**                | `.dnn`, `.cmf`, signature-valid renamed artifacts                                       | MEDIUM |
-| **RKNN**                | `.rknn`                                                                                 | MEDIUM |
-| **Torch7**              | Serialized artifacts (`.t7`, `.th`, `.net` or renamed)                                  | HIGH   |
-| **CatBoost**            | `.cbm`                                                                                  | MEDIUM |
-| **XGBoost**             | `.bst`, `.model`, `.json`, `.ubj`, extensionless UBJSON                                 | MEDIUM |
-| **LightGBM**            | `.lgb`, `.lightgbm`, `.model`, signature-valid renamed artifacts                        | MEDIUM |
-| **Llamafile**           | Executable wrappers (`.llamafile`, `.exe`, extensionless or renamed)                    | MEDIUM |
-| **TorchServe**          | `.mar`                                                                                  | HIGH   |
-| **SafeTensors**         | `.safetensors`                                                                          | LOW    |
-| **GGUF/GGML**           | `.gguf`, `.ggml`, `.ggmf`, `.ggjt`, `.ggla`, `.ggsa`, signature-valid renamed artifacts | LOW    |
-| **JAX/Flax**            | `.msgpack`, `.flax`, `.orbax`, `.jax`, `.checkpoint`, `.orbax-checkpoint`               | LOW    |
-| **TFLite**              | `.tflite`                                                                               | LOW    |
-| **ExecuTorch**          | `.ptl`, `.pte`                                                                          | LOW    |
-| **TensorRT**            | `.engine`, `.plan`, `.trt`                                                              | LOW    |
-| **PaddlePaddle**        | `.pdmodel`, `.pdiparams`                                                                | LOW    |
-| **OpenVINO**            | `.xml`                                                                                  | LOW    |
-| **Skops**               | `.skops`                                                                                | HIGH   |
-| **PMML**                | `.pmml`                                                                                 | LOW    |
-| **Compressed Wrappers** | `.gz`, `.bz2`, `.xz`, `.lz4`, `.zlib`                                                   | MEDIUM |
+| Format                  | Extensions                                                                                  | Risk   |
+| ----------------------- | ------------------------------------------------------------------------------------------- | ------ |
+| **Pickle**              | `.pkl`, `.pickle`, `.dill`                                                                  | HIGH   |
+| **PyTorch**             | `.pt`, `.pth`, `.ckpt`, `.bin`                                                              | HIGH   |
+| **Joblib**              | `.joblib`                                                                                   | HIGH   |
+| **NumPy**               | `.npy`, `.npz`                                                                              | HIGH   |
+| **R Serialized**        | `.rds`, `.rda`, `.rdata`                                                                    | HIGH   |
+| **TensorFlow**          | `.pb`, `.meta`, SavedModel dirs                                                             | MEDIUM |
+| **Keras**               | `.h5`, `.hdf5`, `.keras`                                                                    | MEDIUM |
+| **ONNX**                | `.onnx`                                                                                     | MEDIUM |
+| **CoreML**              | `.mlmodel`                                                                                  | LOW    |
+| **MXNet**               | `*-symbol.json`, `*-NNNN.params`, structurally valid renamed symbol JSON                    | LOW    |
+| **NeMo**                | `.nemo`, renamed archives with root config                                                  | MEDIUM |
+| **CNTK**                | `.dnn`, `.cmf`, signature-valid renamed artifacts                                           | MEDIUM |
+| **RKNN**                | `.rknn`, signature-valid artifacts under non-conflicting renamed suffixes                   | MEDIUM |
+| **Torch7**              | Serialized artifacts (`.t7`, `.th`, `.net` or renamed)                                      | HIGH   |
+| **CatBoost**            | `.cbm`                                                                                      | MEDIUM |
+| **XGBoost**             | `.bst`, `.model`, `.json`, `.ubj`, extensionless UBJSON                                     | MEDIUM |
+| **LightGBM**            | `.lgb`, `.lightgbm`, `.model`, signature-valid renamed artifacts                            | MEDIUM |
+| **Llamafile**           | Executable wrappers (`.llamafile`, `.exe`, extensionless or renamed)                        | MEDIUM |
+| **TorchServe**          | `.mar`                                                                                      | HIGH   |
+| **SafeTensors**         | `.safetensors`                                                                              | LOW    |
+| **GGUF/GGML**           | `.gguf`, `.ggml`, `.ggmf`, `.ggjt`, `.ggla`, `.ggsa`, signature-valid renamed artifacts     | LOW    |
+| **JAX/Flax**            | `.msgpack`, `.flax`, `.orbax`, `.jax`, `.checkpoint`, `.orbax-checkpoint`                   | LOW    |
+| **TFLite**              | `.tflite`, signature-valid artifacts under non-conflicting renamed suffixes                 | LOW    |
+| **ExecuTorch**          | `.ptl`, `.pte`, signature-valid standalone artifacts under non-conflicting renamed suffixes | LOW    |
+| **TensorRT**            | `.engine`, `.plan`, `.trt`                                                                  | LOW    |
+| **PaddlePaddle**        | `.pdmodel`, `.pdiparams`                                                                    | LOW    |
+| **OpenVINO**            | `.xml`                                                                                      | LOW    |
+| **Skops**               | `.skops`                                                                                    | HIGH   |
+| **PMML**                | `.pmml`                                                                                     | LOW    |
+| **Compressed Wrappers** | `.gz`, `.bz2`, `.xz`, `.lz4`, `.zlib`                                                       | MEDIUM |
 
 Plus scanners for ZIP, TAR, 7-Zip, OCI layers, Jinja2 templates, JSON/YAML metadata, manifests, model cards, text files, and RAR recognition. RAR archives are reported as unsupported/fail-closed instead of being skipped.
 
-Structurally valid TensorFlow SavedModel and MetaGraph protobufs are also recognized when renamed to non-model suffixes.
+Structurally valid TensorFlow SavedModel and MetaGraph protobufs are also recognized under otherwise unclaimed
+suffixes such as `.jpg`.
+Structurally plausible Flax/JAX MessagePack checkpoints are also recognized when renamed to non-model suffixes;
+renamed structures that cannot be fully classified are reported as incomplete coverage.
+Structured JAX/Orbax JSON checkpoint metadata is likewise recognized when renamed; oversized ambiguous
+candidates are reported as incomplete coverage.
 
 [View complete format documentation](https://www.promptfoo.dev/docs/model-audit/scanners/)
 

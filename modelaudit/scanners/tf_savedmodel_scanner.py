@@ -49,6 +49,7 @@ _ASSET_MACHO_HEADERS = (
 _ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
 _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
+_MAX_PARSE_BYTES = 20 * 1024 * 1024
 _MAX_COLLECTION_VALUE_BYTES = 256 * 1024
 _CORE_ROOT_MODEL_FILES = frozenset({"saved_model.pb", "keras_metadata.pb", "fingerprint.pb"})
 _CORE_ROOT_MODEL_DIRS = frozenset({"assets", "assets.extra", "variables"})
@@ -256,6 +257,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
+        result.metadata["scan_byte_limit"] = _MAX_PARSE_BYTES
 
         # Add file integrity check for compliance
         self.add_file_integrity_check(path, result)
@@ -276,8 +278,25 @@ class TensorFlowSavedModelScanner(BaseScanner):
             from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
             with open(path, "rb") as f:
-                content = f.read()
+                content = f.read(_MAX_PARSE_BYTES + 1)
+                truncated = len(content) > _MAX_PARSE_BYTES
+                content = content[:_MAX_PARSE_BYTES]
                 result.bytes_scanned = len(content)
+                result.metadata["scan_truncated"] = truncated
+
+                if truncated:
+                    result.metadata["operational_error"] = True
+                    result.metadata["operational_error_reason"] = "savedmodel_parse_budget_exceeded"
+                    result.add_check(
+                        name="SavedModel Parse Budget",
+                        passed=False,
+                        message="SavedModel exceeds bounded parse budget",
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={"max_parse_bytes": _MAX_PARSE_BYTES},
+                    )
+                    result.finish(success=False)
+                    return result
 
                 saved_model = SavedModel()
                 saved_model.ParseFromString(content)
