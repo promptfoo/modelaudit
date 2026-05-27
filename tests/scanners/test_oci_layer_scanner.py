@@ -11,6 +11,7 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanner_results import mark_inconclusive_scan_result
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.scanners.oci_layer_scanner import OciLayerScanner
 
@@ -215,6 +216,31 @@ class TestOciLayerScanner:
             "oci_layer_missing",
             tmp_path / "missing-cache",
         )
+
+    def test_scan_manifest_preserves_layer_and_nested_incomplete_reasons(self, tmp_path: Path) -> None:
+        """Nested inconclusive results must not replace OCI-level coverage reasons."""
+        member_path = tmp_path / "nested.pkl"
+        member_path.write_bytes(b"safe nested member")
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(member_path, arcname="nested.pkl")
+
+        manifest_path = tmp_path / "mixed-incomplete.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["missing.tar.gz", "layer.tar.gz"]}))
+
+        nested_result = ScanResult(scanner_name="pickle")
+        mark_inconclusive_scan_result(nested_result, "nested_scan_incomplete")
+        nested_result.finish(success=False)
+
+        with patch("modelaudit.core.scan_file", return_value=nested_result) as mock_scan:
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        assert mock_scan.call_count == 1
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "oci_layer_missing" in result.metadata["scan_outcome_reasons"]
+        assert "nested_scan_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
     def test_scan_manifest_with_multiple_layers(self, tmp_path):
         """Test scanning manifest with multiple layers."""

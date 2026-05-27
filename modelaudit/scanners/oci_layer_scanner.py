@@ -472,7 +472,11 @@ class OciLayerScanner(BaseScanner):
                                 if issue.details is None:
                                     issue.details = {}
                                 issue.details["layer"] = layer_ref
+                            existing_reasons = list(result.metadata.get("scan_outcome_reasons", []))
                             result.merge(file_result)
+                            # A nested incomplete scan must not erase incomplete OCI-layer coverage.
+                            for reason in existing_reasons:
+                                self._mark_incomplete_coverage(result, reason)
                             if not file_result.success or file_result.has_errors:
                                 scan_complete = False
                         finally:
