@@ -268,6 +268,43 @@ def test_scan_flags_name_disguised_executable_extra_file(tmp_path: Path) -> None
     assert core.determine_exit_code(aggregate) == 1
 
 
+def test_scan_preserves_executable_extra_file_finding_when_a_later_entry_is_skipped(tmp_path: Path) -> None:
+    manifest = {
+        "model": {
+            "handler": "handler.py",
+            "serializedFile": "weights.bin",
+            "extraFiles": "native/payload.dat",
+        },
+    }
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("native/payload.dat", b"\x7fELF" + b"\x00" * 64),
+            ("handler.py", b"def handle(data, context):\n    return data\n"),
+            ("weights.bin", b"weights"),
+            ("late.txt", b"ordinary skipped content"),
+        ],
+        filename="detected_executable_before_entry_limit.mar",
+    )
+
+    result = TorchServeMarScanner(config={"max_mar_entries": 3}).scan(str(mar_path))
+    aggregate = core.scan_model_directory_or_file(
+        str(mar_path),
+        cache_enabled=False,
+        max_mar_entries=3,
+    )
+
+    executable_checks = _failed_checks(result, "TorchServe Executable Extra File Detection")
+    entry_limit_checks = _failed_checks(result, "TorchServe MAR Entry Limit")
+    assert len(executable_checks) == 1
+    assert executable_checks[0].rule_code == "S502"
+    assert len(entry_limit_checks) == 1
+    assert entry_limit_checks[0].severity == IssueSeverity.INFO
+    assert "torchserve_mar_entry_limit" in result.metadata["scan_outcome_reasons"]
+    assert core.determine_exit_code(aggregate) == 1
+
+
 def test_scan_allows_benign_ordinary_named_extra_file(tmp_path: Path) -> None:
     manifest = {
         "model": {
