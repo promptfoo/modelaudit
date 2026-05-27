@@ -9,14 +9,21 @@ import tempfile
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ..utils.file.detection import (
+    LLAMAFILE_MARKER,
+    LLAMAFILE_ROUTE_SCAN_BYTES,
+    LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    is_llamafile_executable,
+)
 from ._evidence_redaction import redact_evidence_string
+from .archive_dispatch import merge_executable_zip_container_findings
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
-LLAMAFILE_MARKER = b"llamafile"
-LLAMAFILE_ROUTE_SCAN_BYTES = 8 * 1024 * 1024
-LLAMAFILE_ROUTE_TAIL_SCAN_BYTES = 2 * 1024 * 1024
+__all__ = ["LLAMAFILE_MARKER", "LLAMAFILE_ROUTE_SCAN_BYTES", "LLAMAFILE_ROUTE_TAIL_SCAN_BYTES", "LlamafileScanner"]
+
 GGUF_MARKER = b"GGUF"
 LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON = "llamafile_payload_scan_limited"
+LLAMAFILE_RUNTIME_PREVIEW_READ_REASON = "llamafile_runtime_preview_read_failed"
 
 ELF_MAGIC = b"\x7fELF"
 PE_MAGIC = b"MZ"
@@ -125,32 +132,7 @@ class LlamafileScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        path_obj = Path(path)
-        if not path_obj.is_file():
-            return False
-
-        suffix = path_obj.suffix.lower()
-        if suffix not in cls.supported_extensions:
-            return False
-
-        executable_format = cls._detect_executable_format(path_obj)
-        if executable_format is None:
-            return False
-
-        try:
-            marker_offset = cls._find_casefolded_marker_offset(
-                path_obj,
-                LLAMAFILE_MARKER,
-                LLAMAFILE_ROUTE_SCAN_BYTES,
-            )
-            if marker_offset is None:
-                tail = cls._read_suffix(path_obj, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES).lower()
-                tail_marker_index = tail.find(LLAMAFILE_MARKER)
-                marker_offset = tail_marker_index if tail_marker_index != -1 else None
-        except OSError:
-            return False
-
-        return marker_offset is not None
+        return is_llamafile_executable(path)
 
     @classmethod
     def _detect_executable_format(cls, path: Path) -> str | None:
@@ -206,16 +188,21 @@ class LlamafileScanner(BaseScanner):
             details={"executable_format": executable_format},
         )
 
+        runtime_blobs: list[bytes] = []
+        marker_probe = b""
         runtime_preview_bytes = 0
         try:
             head = self._read_prefix(path_obj, self.preview_bytes)
+            runtime_blobs.append(head)
+            runtime_preview_bytes += len(head)
             tail = self._read_suffix(path_obj, self.preview_bytes)
-            runtime_blobs = [head, tail]
-            runtime_preview_bytes = len(head) + len(tail)
-            marker_offset = self._find_casefolded_marker_offset(
+            runtime_blobs.append(tail)
+            runtime_preview_bytes += len(tail)
+            marker_offset, marker_probe = self._find_casefolded_marker_offset(
                 path_obj,
                 LLAMAFILE_MARKER,
                 LLAMAFILE_ROUTE_SCAN_BYTES,
+                self.preview_bytes,
             )
             if marker_offset is not None and not self._offset_is_in_preview_windows(
                 marker_offset,
@@ -226,14 +213,27 @@ class LlamafileScanner(BaseScanner):
                 runtime_blobs.append(middle)
                 runtime_preview_bytes += len(middle)
         except OSError as exc:
+            if marker_probe:
+                runtime_blobs.append(marker_probe)
+                runtime_preview_bytes += len(marker_probe)
+            result.bytes_scanned = runtime_preview_bytes
+            if runtime_blobs:
+                self._scan_runtime_strings(path, b"\n".join(runtime_blobs), result)
+            self._mark_inconclusive(result, LLAMAFILE_RUNTIME_PREVIEW_READ_REASON)
             result.add_check(
                 name="Llamafile Runtime Preview Read",
                 passed=False,
                 message=f"Failed reading runtime preview bytes: {exc!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(exc), "exception_type": type(exc).__name__},
+                details={
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": LLAMAFILE_RUNTIME_PREVIEW_READ_REASON,
+                },
             )
+            self._merge_container_findings(path_obj, result)
             result.finish(success=False)
             return result
 
@@ -242,6 +242,7 @@ class LlamafileScanner(BaseScanner):
 
         payload_bytes_scanned = self._scan_embedded_payload(path_obj, result)
         result.bytes_scanned += payload_bytes_scanned
+        self._merge_container_findings(path_obj, result)
 
         result.finish(
             success=not result.has_errors and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
@@ -430,7 +431,7 @@ class LlamafileScanner(BaseScanner):
 
     @staticmethod
     def _mark_inconclusive(result: ScanResult, reason: str) -> None:
-        """Mark bounded Llamafile payload analysis as explicitly incomplete."""
+        """Mark Llamafile analysis coverage as explicitly incomplete."""
         result.metadata["analysis_incomplete"] = True
         result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
 
@@ -440,6 +441,15 @@ class LlamafileScanner(BaseScanner):
             result.metadata["scan_outcome_reasons"] = reasons
         if reason not in reasons:
             reasons.append(reason)
+
+    def _merge_container_findings(self, path: Path, result: ScanResult) -> None:
+        """Preserve trusted container coverage for executable ZIP polyglots."""
+        merge_executable_zip_container_findings(
+            str(path),
+            result,
+            self.config,
+            context="embedded executable ZIP polyglot",
+        )
 
     def _carve_payload(self, path: Path, offset: int, size: int) -> Path | None:
         try:
@@ -484,12 +494,18 @@ class LlamafileScanner(BaseScanner):
         return None
 
     @staticmethod
-    def _find_casefolded_marker_offset(path: Path, marker: bytes, max_scan_bytes: int) -> int | None:
+    def _find_casefolded_marker_offset(
+        path: Path,
+        marker: bytes,
+        max_scan_bytes: int,
+        evidence_bytes: int,
+    ) -> tuple[int | None, bytes]:
         marker_len = len(marker)
         search_limit = min(path.stat().st_size, max_scan_bytes)
         overlap = marker_len - 1
         scanned = 0
         carry = b""
+        evidence_carry = b""
         normalized_marker = marker.lower()
 
         with path.open("rb") as handle:
@@ -500,14 +516,16 @@ class LlamafileScanner(BaseScanner):
                     break
 
                 haystack = carry + chunk.lower()
+                evidence_window = (evidence_carry + chunk)[-evidence_bytes:]
                 relative_index = haystack.find(normalized_marker)
                 if relative_index != -1:
-                    return scanned - len(carry) + relative_index
+                    return scanned - len(carry) + relative_index, evidence_window
 
                 carry = haystack[-overlap:] if overlap > 0 else b""
+                evidence_carry = evidence_window
                 scanned += len(chunk)
 
-        return None
+        return None, b""
 
     @staticmethod
     def _read_prefix(path: Path, num_bytes: int) -> bytes:

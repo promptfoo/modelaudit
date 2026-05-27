@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
+from ..utils.file.detection import JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES, is_jax_json_checkpoint_file
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 try:
@@ -208,6 +210,7 @@ class JaxCheckpointScanner(BaseScanner):
         re.IGNORECASE,
     )
     DEFAULT_MAX_PICKLE_SCAN_BYTES: ClassVar[int] = 16 * 1024 * 1024
+    _JSON_ANALYSIS_SIZE_LIMIT_REASON: ClassVar[str] = "jax_json_checkpoint_analysis_size_limit"
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         """Initialize JAX checkpoint scanning limits and regex detectors."""
@@ -464,7 +467,8 @@ class JaxCheckpointScanner(BaseScanner):
         if os.path.isfile(path):
             ext = os.path.splitext(path)[1].lower()
             if ext in cls.supported_extensions:
-                return cls._is_likely_jax_file(path)
+                return cls._is_likely_jax_file(path) or is_jax_json_checkpoint_file(path)
+            return is_jax_json_checkpoint_file(path)
 
         return False
 
@@ -671,7 +675,7 @@ class JaxCheckpointScanner(BaseScanner):
                 self._scan_pickle_checkpoint(path, result)
             elif header.startswith(b"\x93NUMPY"):  # NumPy format
                 self._scan_numpy_checkpoint(path, result)
-            elif self._header_looks_like_json(header):  # JSON format
+            elif self._header_looks_like_json(header) or is_jax_json_checkpoint_file(path):  # JSON format
                 self._scan_json_checkpoint(path, result)
             else:
                 result.add_check(
@@ -1004,6 +1008,25 @@ class JaxCheckpointScanner(BaseScanner):
 
     def _scan_json_checkpoint(self, path: str, result: ScanResult) -> None:
         """Scan JSON-based checkpoint metadata."""
+        file_size = os.path.getsize(path)
+        if file_size > JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+            mark_inconclusive_scan_result(result, self._JSON_ANALYSIS_SIZE_LIMIT_REASON)
+            result.add_check(
+                name="JSON Checkpoint Analysis Limit",
+                passed=False,
+                message="JSON checkpoint analysis incomplete because the file exceeds the bounded parsing limit",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "file_size": file_size,
+                    "max_json_analysis_bytes": JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self._JSON_ANALYSIS_SIZE_LIMIT_REASON,
+                },
+                rule_code="S902",
+            )
+            return
+
         try:
             with open(path, encoding="utf-8-sig") as f:
                 data = json.load(f)
@@ -1103,5 +1126,5 @@ class JaxCheckpointScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        result.finish(success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME)
         return result

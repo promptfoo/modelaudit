@@ -9,16 +9,16 @@ def extract_bounded_printable_strings(
     payload: bytes,
     pattern: re.Pattern[bytes],
     max_strings: int,
-) -> list[str]:
-    """Extract decoded printable string candidates up to the configured cap."""
+) -> tuple[list[str], bool]:
+    """Extract candidates and report whether qualifying strings remain uninspected."""
     strings: list[str] = []
     for match in pattern.finditer(payload):
         text = match.group(0).decode("utf-8", errors="ignore").strip()
         if not text:
             continue
 
-        strings.append(text)
         if len(strings) >= max_strings:
-            break
+            return strings, True
+        strings.append(text)
 
-    return strings
+    return strings, False

@@ -9,6 +9,7 @@ from types import ModuleType
 from typing import Any, Final
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
+from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
 
 try:
@@ -874,6 +875,18 @@ class ManifestScanner(BaseScanner):
     def _scan_embedded_jinja_templates(self, path: str, content: Any, result: ScanResult) -> None:
         templates = self._collect_jinja_template_fields(content)
         if not templates:
+            return
+
+        scanner_selection = policy_from_config(self.config)
+        if not scanner_selection.allows("jinja2_template"):
+            if scanner_selection.active:
+                add_scanner_selection_skip_check(
+                    result,
+                    path,
+                    "jinja2_template",
+                    scanner_selection,
+                    context="embedded Jinja template analysis",
+                )
             return
 
         from .jinja2_template_scanner import Jinja2TemplateScanner
