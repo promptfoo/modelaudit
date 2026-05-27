@@ -1,11 +1,10 @@
-"""Scanner for Rockchip RKNN model artifacts (.rknn)."""
+"""Scanner for Rockchip RKNN model artifacts."""
 
 from __future__ import annotations
 
 import ipaddress
 import os
 import re
-from pathlib import Path
 from typing import Any, ClassVar
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
@@ -18,6 +17,7 @@ MIN_RKNN_SIZE = 16
 MAX_SIGNATURE_BYTES = 64
 MAX_SCAN_BYTES = 12 * 1024 * 1024
 MAX_EXTRACTED_STRINGS = 4000
+CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset({".bin", ".meta", ".pb"})
 PRINTABLE_TEXT_PATTERN = re.compile(rb"[ -~]{6,512}")
 
 ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[a-zA-Z]:[\\/]|/|~)")
@@ -70,7 +70,7 @@ class RknnScanner(BaseScanner):
     """Static scanner for RKNN models."""
 
     name = "rknn"
-    description = "Scans RKNN .rknn model files for suspicious metadata references and command/network indicators"
+    description = "Scans RKNN model files for suspicious metadata references and command/network indicators"
     supported_extensions: ClassVar[list[str]] = [".rknn"]
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
@@ -86,7 +86,7 @@ class RknnScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         if not os.path.isfile(path):
             return False
-        if Path(path).suffix.lower() not in cls.supported_extensions:
+        if os.path.splitext(path)[1].lower() in CONTENT_ROUTE_BLOCKED_EXTENSIONS:
             return False
 
         try:

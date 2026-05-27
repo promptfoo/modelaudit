@@ -111,7 +111,7 @@ class ScannerRegistry:
                     scanner_class = getattr(module, scanner_info["class"])
 
                 self._loaded_scanners[scanner_id] = scanner_class
-                logger.debug(f"Loaded scanner: {scanner_id}")
+                logger.debug("Scanner loaded successfully")
                 return scanner_class
 
             except ImportError as e:
@@ -131,9 +131,9 @@ class ScannerRegistry:
 
                 # For expected dependency issues, use debug level
                 if scanner_deps or (is_numpy_sensitive and _is_numpy_compatibility_error(e)):
-                    logger.debug(error_msg)
+                    logger.debug("Scanner unavailable due to an optional dependency or compatibility issue")
                 else:
-                    logger.debug(error_msg)
+                    logger.debug("Scanner unavailable during lazy loading")
 
                 return None
 
@@ -148,16 +148,16 @@ class ScannerRegistry:
                             f"Scanner {scanner_id} failed due to NumPy compatibility issue. "
                             f"{self._numpy_status} Consider using 'pip install numpy<2.0' if needed."
                         )
-                        logger.debug(error_msg)  # Debug level - expected NumPy compatibility issues
+                        logger.debug("Scanner unavailable due to a NumPy compatibility issue")
                     else:
                         error_msg = f"Scanner {scanner_id} failed with NumPy compatibility error: {e}"
-                        logger.warning(error_msg)  # Warning - unexpected NumPy issue
+                        logger.warning("Scanner failed with an unexpected NumPy compatibility issue")
                 elif isinstance(e, AttributeError):
                     error_msg = f"Scanner class {scanner_info['class']} not found in {scanner_info['module']}: {e}"
-                    logger.warning(error_msg)  # Warning - code structure issue
+                    logger.warning("Scanner class could not be loaded")
                 else:
                     error_msg = f"Scanner {scanner_id} failed to load: {e}"
-                    logger.warning(error_msg)  # Warning - unexpected error
+                    logger.warning("Scanner failed to load unexpectedly")
 
                 self._failed_scanners[scanner_id] = error_msg
                 return None

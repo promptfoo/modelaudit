@@ -4,6 +4,7 @@ This module tests the enhanced error handling capabilities implemented in Task 7
 ensuring that missing dependencies disable specific scanners without breaking the tool.
 """
 
+import logging
 import tempfile
 import unittest.mock
 from unittest.mock import patch
@@ -81,6 +82,45 @@ class TestGracefulDegradation:
             assert "keras_h5" in failed_scanners
             error_msg = failed_scanners["keras_h5"]
             assert "numpy" in error_msg.lower() or "compatibility" in error_msg.lower()
+
+    def test_successful_lazy_load_does_not_log_scanner_identifier(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Lazy-load logging records the event without copying descriptor content."""
+        fresh_registry = ScannerRegistry()
+
+        with caplog.at_level(logging.DEBUG, logger="modelaudit.scanners"):
+            scanner_class = fresh_registry.load_scanner_by_id("pickle")
+
+        assert scanner_class is not None
+        assert "pickle" not in caplog.text
+        assert "Scanner loaded successfully" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("exception_type", "expected_log"),
+        [
+            (ImportError, "Scanner unavailable during lazy loading"),
+            (RuntimeError, "Scanner failed to load unexpectedly"),
+        ],
+    )
+    def test_lazy_load_error_payload_is_retained_but_not_logged(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        exception_type: type[Exception],
+        expected_log: str,
+    ) -> None:
+        """Registry diagnostics may retain errors while logs omit their payload."""
+        secret = "loader-production-secret"
+        fresh_registry = ScannerRegistry()
+
+        with (
+            patch("importlib.import_module", side_effect=exception_type(secret)),
+            caplog.at_level(logging.DEBUG, logger="modelaudit.scanners"),
+        ):
+            scanner_class = fresh_registry.load_scanner_by_id("pickle")
+
+        assert scanner_class is None
+        assert secret in fresh_registry.get_failed_scanners()["pickle"]
+        assert secret not in caplog.text
+        assert expected_log in caplog.text
 
     def test_core_functionality_works_with_failed_scanners(self):
         """Test that core functionality works even when some scanners fail"""

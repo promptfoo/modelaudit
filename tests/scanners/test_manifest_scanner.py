@@ -418,6 +418,19 @@ def test_manifest_scanner_delegates_templates_from_parsed_content(
     assert captured[str(config_path)] == {"chat_template": "{{ harmless }}"}
 
 
+def test_manifest_scanner_honors_excluded_embedded_jinja_selection(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        '{"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}',
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner(config={"scanners": ["manifest"]}).scan(str(config_path))
+
+    assert "jinja2_template" in result.metadata["skipped_scanner_ids"]
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+
+
 def test_manifest_scanner_redacts_untrusted_url_credentials(tmp_path: Path) -> None:
     """Untrusted URL findings should not store userinfo, query strings, or fragments."""
     test_file = tmp_path / "config.json"

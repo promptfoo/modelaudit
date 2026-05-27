@@ -5,9 +5,11 @@ import re
 import struct
 import tarfile
 import zipfile
+from io import BytesIO
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
-from ...scanner_registry_metadata import get_extension_format_map
+from ...scanner_registry_metadata import get_extension_format_map, get_registered_scanner_extensions
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
 from ._compression import is_zlib_header
 
@@ -139,13 +141,75 @@ _XML_MODEL_ROOT_FORMATS = {
     "pmml": "pmml",
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
+JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES = 1024 * 1024
+JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES = 2 * JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES
+_JAX_JSON_CHECKPOINT_IDENTITY_KEYS = frozenset(
+    {"framework", "library", "backend", "serialization", "format", "type", "checkpoint_type"}
+)
+_JAX_JSON_CHECKPOINT_MARKER_KEYS = frozenset({"orbax_version", "__orbax_metadata__"})
+_JAX_JSON_CHECKPOINT_SCANNER_SUFFIXES = frozenset({".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle"})
+_JAX_JSON_CHECKPOINT_CONTENT_ROUTE_EXCLUDED_SUFFIXES = frozenset({".json", ".py", ".pyw"})
+_JAX_JSON_CHECKPOINT_DECLARED_SUFFIXES = frozenset(get_registered_scanner_extensions())
+_JAX_JSON_CHECKPOINT_IDENTITY_RE = re.compile(
+    r"(?<![a-z0-9])(?:jax|flax|haiku|orbax|jaxlib|arrayimpl|device_array)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_STRUCTURED_JSON_TRAILING_READ_BYTES = 64 * 1024
+FLAX_MSGPACK_STRUCTURE_READ_BYTES = 1024 * 1024
+_FLAX_MSGPACK_ROUTING_KEYS = frozenset({"params", "opt_state", "model_state"})
+_FLAX_MSGPACK_STATE_WRAPPER_KEY = "state"
+_FLAX_MSGPACK_SCANNER_SUFFIXES = frozenset({".msgpack", ".flax", ".orbax", ".jax"})
+_FLAX_MSGPACK_OVERLAP_SUFFIXES = frozenset({".ckpt", ".checkpoint", ".orbax-checkpoint"})
+_FLAX_MSGPACK_CONTENT_ROUTE_EXCLUDED_SUFFIXES = frozenset({".py", ".pyw"})
+_FLAX_MSGPACK_DECLARED_SUFFIXES = frozenset(get_registered_scanner_extensions())
+_FLAX_MSGPACK_NATIVE_SUFFIXES = _FLAX_MSGPACK_SCANNER_SUFFIXES
+_FLAX_MSGPACK_PROBE_MAX_NODES = 4096
+_FLAX_MSGPACK_PROBE_MAX_DEPTH = 32
+_FLAX_MSGPACK_PROBE_MAX_KEY_BYTES = 64
+# Keep cheap top-level padding bounded without treating ordinary 1 MiB data
+# as an incomplete nested structure walk.
+_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS = FLAX_MSGPACK_STRUCTURE_READ_BYTES
+_FLAX_MSGPACK_PROBE_SCALAR_SIZES = {
+    0xCA: 4,
+    0xCB: 8,
+    0xCC: 1,
+    0xCD: 2,
+    0xCE: 4,
+    0xCF: 8,
+    0xD0: 1,
+    0xD1: 2,
+    0xD2: 4,
+    0xD3: 8,
+    0xD4: 2,
+    0xD5: 3,
+    0xD6: 5,
+    0xD7: 9,
+    0xD8: 17,
+}
+_FLAX_MSGPACK_PROBE_LENGTH_SIZES = {
+    0xC4: (1, 0),
+    0xC5: (2, 0),
+    0xC6: (4, 0),
+    0xC7: (1, 1),
+    0xC8: (2, 1),
+    0xC9: (4, 1),
+    0xD9: (1, 0),
+    0xDA: (2, 0),
+    0xDB: (4, 0),
+}
 MXNET_SYMBOL_SIGNATURE_READ_BYTES = 10 * 1024 * 1024
+MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT = "mxnet_symbol_routing_inconclusive"
+_UTF8_BOM = b"\xef\xbb\xbf"
+_JSON_NUMBER_PREFIX_RE = re.compile(rb"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
+_MXNET_SYMBOL_PREFIX_MAX_VALUES = 4096
+_MXNET_SYMBOL_MAX_KEY_BYTES = 64
+_MXNET_SYMBOL_ROOT_KEYS = frozenset({"nodes", "arg_nodes", "heads"})
+_MXNET_SYMBOL_STREAM_CHUNK_BYTES = 64 * 1024
 LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
 NEMO_ROUTING_INCONCLUSIVE_FORMAT = "nemo_routing_inconclusive"
 XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT = "xgboost_ubjson_routing_inconclusive"
 EXECUTABLE_ZIP_POLYGLOT_FORMAT = "executable_zip_polyglot"
 _XGBOOST_UBJSON_ROUTE_READ_BYTES = 256 * 1024
-_MXNET_SYMBOL_REQUIRED_ARRAY_KEYS = frozenset({"nodes", "arg_nodes", "heads"})
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -338,121 +402,420 @@ def has_mxnet_symbol_graph_structure(payload: object) -> bool:
     )
 
 
-def _top_level_json_array_keys(prefix: bytes) -> set[str]:
-    """Return top-level JSON object keys whose sampled values begin with arrays."""
-    keys: set[str] = set()
-    cursor = 0
-    prefix_length = len(prefix)
-    while cursor < prefix_length and chr(prefix[cursor]).isspace():
-        cursor += 1
-    if cursor >= prefix_length or prefix[cursor] != ord("{"):
-        return keys
+def inspect_mxnet_symbol_root_keys(handle: BinaryIO) -> set[str]:
+    """Return duplicate MXNet graph root keys using constant parser state."""
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    started = False
+    depth = 0
+    in_string = False
+    escaped = False
+    collecting_key = False
+    key_overflow = False
+    raw_key = bytearray()
+    expecting_key = False
+    decoder = json.JSONDecoder()
 
-    cursor += 1
-    depth = 1
-    expecting_key = True
+    initial = handle.read(3)
+    if initial != b"\xef\xbb\xbf":
+        handle.seek(0)
 
-    while cursor < prefix_length and depth > 0:
-        byte = prefix[cursor]
-        if chr(byte).isspace():
-            cursor += 1
-            continue
+    while chunk := handle.read(_MXNET_SYMBOL_STREAM_CHUNK_BYTES):
+        for byte in chunk:
+            if in_string:
+                if collecting_key:
+                    if len(raw_key) < _MXNET_SYMBOL_MAX_KEY_BYTES:
+                        raw_key.append(byte)
+                    else:
+                        key_overflow = True
 
-        if byte == ord('"'):
-            raw_key = bytearray()
-            cursor += 1
-            escaped = False
-            while cursor < prefix_length:
-                current = prefix[cursor]
                 if escaped:
-                    raw_key.append(current)
                     escaped = False
-                elif current == ord("\\"):
+                elif byte == ord("\\"):
                     escaped = True
-                elif current == ord('"'):
-                    break
-                else:
-                    raw_key.append(current)
-                cursor += 1
-            if cursor >= prefix_length:
-                break
-
-            cursor += 1
-            if depth == 1 and expecting_key:
-                value_cursor = cursor
-                while value_cursor < prefix_length and chr(prefix[value_cursor]).isspace():
-                    value_cursor += 1
-                if value_cursor < prefix_length and prefix[value_cursor] == ord(":"):
-                    value_cursor += 1
-                    while value_cursor < prefix_length and chr(prefix[value_cursor]).isspace():
-                        value_cursor += 1
-                    if value_cursor < prefix_length and prefix[value_cursor] == ord("["):
-                        try:
-                            keys.add(raw_key.decode("utf-8"))
-                            if _MXNET_SYMBOL_REQUIRED_ARRAY_KEYS.issubset(keys):
-                                return keys
-                        except UnicodeDecodeError:
-                            pass
-                    cursor = value_cursor
-                    expecting_key = False
+                elif byte == ord('"'):
+                    in_string = False
+                    if collecting_key:
+                        if not key_overflow:
+                            try:
+                                key = decoder.decode(raw_key.decode("utf-8"))
+                            except (UnicodeDecodeError, json.JSONDecodeError):
+                                key = None
+                            if key in _MXNET_SYMBOL_ROOT_KEYS:
+                                if key in seen:
+                                    duplicates.add(key)
+                                seen.add(key)
+                        collecting_key = False
+                        key_overflow = False
+                        expecting_key = False
                 continue
-            continue
 
-        if byte in {ord("{"), ord("[")}:
-            depth += 1
-            expecting_key = False
-        elif byte in {ord("}"), ord("]")}:
-            depth -= 1
-        elif depth == 1 and byte == ord(","):
-            expecting_key = True
-        cursor += 1
+            if not started:
+                if byte in b" \t\r\n":
+                    continue
+                if byte != ord("{"):
+                    return set()
+                started = True
+                depth = 1
+                expecting_key = True
+                continue
 
-    return keys
+            if byte == ord('"'):
+                if depth == 1 and expecting_key:
+                    collecting_key = True
+                    raw_key = bytearray(b'"')
+                in_string = True
+                escaped = False
+                continue
+
+            if byte in {ord("{"), ord("[")}:
+                depth += 1
+            elif byte == ord("}") and depth == 1:
+                return duplicates if seen >= _MXNET_SYMBOL_ROOT_KEYS else set()
+            elif byte in {ord("}"), ord("]")}:
+                if depth > 1:
+                    depth -= 1
+                else:
+                    return set()
+            elif byte == ord(",") and depth == 1:
+                expecting_key = True
+
+    return duplicates if seen >= _MXNET_SYMBOL_ROOT_KEYS else set()
 
 
-def _has_mxnet_symbol_top_level_array_keys(prefix: bytes) -> bool:
-    return _MXNET_SYMBOL_REQUIRED_ARRAY_KEYS.issubset(_top_level_json_array_keys(prefix))
+def _detect_mxnet_symbol_prefix_route(
+    prefix: bytes,
+    *,
+    sample_is_prefix: bool = True,
+    fail_closed_without_hint: bool = False,
+    enforce_value_budget: bool = True,
+) -> str | None:
+    """Return a definite or bounded-inconclusive MXNet JSON route."""
+
+    class IncompleteJSON(Exception):
+        pass
+
+    class BoundedJSON(Exception):
+        pass
+
+    class ValueBudgetExceeded(Exception):
+        pass
+
+    class InvalidJSON(Exception):
+        pass
+
+    root_array_keys: set[str] = set()
+    saw_root_nodes_key = False
+    saw_mxnet_heads_shape = False
+    saw_direct_node_object = False
+    saw_direct_node_contract = False
+    parsed_values = 0
+
+    def saw_mxnet_routing_hint() -> bool:
+        visible_graph_arrays = root_array_keys & {"nodes", "arg_nodes", "heads"}
+        return (
+            saw_root_nodes_key
+            or saw_mxnet_heads_shape
+            or saw_direct_node_object
+            or saw_direct_node_contract
+            or len(visible_graph_arrays) >= 2
+        )
+
+    def skip_whitespace(offset: int) -> int:
+        while offset < len(prefix) and prefix[offset] in b" \t\r\n":
+            offset += 1
+        return offset
+
+    def skip_string(offset: int) -> int:
+        if offset >= len(prefix) or prefix[offset] != ord('"'):
+            raise InvalidJSON
+        index = offset + 1
+        while index < len(prefix):
+            marker = prefix[index]
+            if marker == ord('"'):
+                return index + 1
+            if marker == ord("\\"):
+                index += 1
+                if index >= len(prefix):
+                    raise IncompleteJSON
+            index += 1
+        raise IncompleteJSON
+
+    def read_key(offset: int) -> tuple[str | None, int]:
+        end_offset = skip_string(offset)
+        if end_offset - offset > _MXNET_SYMBOL_MAX_KEY_BYTES:
+            return None, end_offset
+        try:
+            value = json.JSONDecoder().decode(prefix[offset:end_offset].decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise InvalidJSON from exc
+        return (value if isinstance(value, str) else None), end_offset
+
+    def has_mxnet_heads_shape(offset: int) -> bool:
+        """Recognize a visible numeric MXNet output triplet."""
+        offset = skip_whitespace(offset + 1)
+        if offset >= len(prefix) or prefix[offset] != ord("["):
+            return False
+        offset = skip_whitespace(offset + 1)
+        for position in range(3):
+            number_match = _JSON_NUMBER_PREFIX_RE.match(prefix, offset)
+            if number_match is None:
+                return False
+            token = prefix[offset : number_match.end()]
+            if b"." in token or b"e" in token.lower():
+                return False
+            offset = skip_whitespace(number_match.end())
+            expected = ord("]") if position == 2 else ord(",")
+            if offset >= len(prefix) or prefix[offset] != expected:
+                return False
+            offset = skip_whitespace(offset + 1)
+        return True
+
+    def parse_value(offset: int, depth: int, *, root_array_key: str | None = None) -> int:
+        nonlocal parsed_values, saw_mxnet_heads_shape
+        parsed_values += 1
+        if enforce_value_budget and parsed_values > _MXNET_SYMBOL_PREFIX_MAX_VALUES:
+            raise ValueBudgetExceeded
+        offset = skip_whitespace(offset)
+        if offset >= len(prefix):
+            raise IncompleteJSON
+        marker = prefix[offset]
+        if marker == ord("{"):
+            return parse_object(offset, depth + 1)
+        if marker == ord("["):
+            if root_array_key in {"nodes", "arg_nodes", "heads"}:
+                root_array_keys.add(root_array_key)
+            if root_array_key == "heads" and has_mxnet_heads_shape(offset):
+                saw_mxnet_heads_shape = True
+            return parse_array(offset, depth + 1, nodes_array=root_array_key == "nodes")
+        if marker == ord('"'):
+            return skip_string(offset)
+        for literal in (b"true", b"false", b"null", b"NaN", b"Infinity", b"-Infinity"):
+            if prefix.startswith(literal, offset):
+                return offset + len(literal)
+            if literal.startswith(prefix[offset:]):
+                raise IncompleteJSON
+        if offset + 1 == len(prefix) and prefix[offset] == ord("-"):
+            raise IncompleteJSON
+        number_match = _JSON_NUMBER_PREFIX_RE.match(prefix, offset)
+        if number_match is None:
+            raise InvalidJSON
+        remainder_length = len(prefix) - number_match.end()
+        if remainder_length in {1, 2} and prefix[number_match.end() :] in {
+            b".",
+            b"e",
+            b"E",
+            b"e+",
+            b"e-",
+            b"E+",
+            b"E-",
+        }:
+            raise IncompleteJSON
+        return number_match.end()
+
+    def parse_array(offset: int, depth: int, *, nodes_array: bool = False) -> int:
+        nonlocal saw_direct_node_object
+        if depth > 64:
+            raise BoundedJSON
+        offset = skip_whitespace(offset + 1)
+        if offset >= len(prefix):
+            raise IncompleteJSON
+        if prefix[offset] == ord("]"):
+            return offset + 1
+        while True:
+            if nodes_array and prefix[offset] == ord("{"):
+                saw_direct_node_object = True
+                offset = parse_object(offset, depth + 1, direct_node=True)
+            else:
+                offset = parse_value(offset, depth + 1)
+            offset = skip_whitespace(offset)
+            if offset >= len(prefix):
+                raise IncompleteJSON
+            if prefix[offset] == ord("]"):
+                return offset + 1
+            if prefix[offset] != ord(","):
+                raise InvalidJSON
+            offset = skip_whitespace(offset + 1)
+            if offset >= len(prefix):
+                raise IncompleteJSON
+
+    def parse_object(offset: int, depth: int, *, root: bool = False, direct_node: bool = False) -> int:
+        nonlocal saw_direct_node_contract, saw_root_nodes_key
+        if depth > 64:
+            raise BoundedJSON
+        direct_node_string_keys: set[str] = set()
+        offset = skip_whitespace(offset + 1)
+        if offset >= len(prefix):
+            raise IncompleteJSON
+        if prefix[offset] == ord("}"):
+            return offset + 1
+        while True:
+            key, offset = read_key(offset)
+            offset = skip_whitespace(offset)
+            if offset >= len(prefix):
+                raise IncompleteJSON
+            if prefix[offset] != ord(":"):
+                raise InvalidJSON
+            if root and key == "nodes":
+                saw_root_nodes_key = True
+            value_offset = skip_whitespace(offset + 1)
+            offset = parse_value(
+                value_offset,
+                depth + 1,
+                root_array_key=key if root and key is not None else None,
+            )
+            if direct_node and key in {"op", "name"} and prefix[value_offset] == ord('"'):
+                direct_node_string_keys.add(key)
+                if {"op", "name"} <= direct_node_string_keys:
+                    saw_direct_node_contract = True
+            offset = skip_whitespace(offset)
+            if offset >= len(prefix):
+                raise IncompleteJSON
+            if prefix[offset] == ord("}"):
+                return offset + 1
+            if prefix[offset] != ord(","):
+                raise InvalidJSON
+            offset = skip_whitespace(offset + 1)
+            if offset >= len(prefix):
+                raise IncompleteJSON
+
+    try:
+        root_offset = skip_whitespace(0)
+        if root_offset >= len(prefix):
+            return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if sample_is_prefix and fail_closed_without_hint else None
+        if prefix[root_offset] != ord("{"):
+            return None
+        parse_object(root_offset, 0, root=True)
+    except IncompleteJSON:
+        if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
+            return "mxnet"
+        if saw_mxnet_routing_hint():
+            return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+        if not sample_is_prefix:
+            return None
+        return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if fail_closed_without_hint else None
+    except ValueBudgetExceeded:
+        if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
+            return "mxnet"
+        if not sample_is_prefix and not fail_closed_without_hint:
+            # Resolve a graph hidden behind scalar padding with parser state only;
+            # the byte and nesting limits still bound this second traversal.
+            rescanned_route = _detect_mxnet_symbol_prefix_route(
+                prefix,
+                sample_is_prefix=False,
+                fail_closed_without_hint=False,
+                enforce_value_budget=False,
+            )
+            if rescanned_route == "mxnet" and inspect_mxnet_symbol_root_keys(BytesIO(prefix)):
+                return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+            return rescanned_route
+        return (
+            MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if saw_mxnet_routing_hint() or fail_closed_without_hint else None
+        )
+    except BoundedJSON:
+        if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
+            return "mxnet"
+        if not sample_is_prefix:
+            return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+        return (
+            MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if saw_mxnet_routing_hint() or fail_closed_without_hint else None
+        )
+    except InvalidJSON:
+        if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
+            return "mxnet"
+        if saw_mxnet_routing_hint():
+            return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+        return None
+
+    if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
+        return "mxnet"
+    return None
 
 
-def is_mxnet_symbol_graph_file(path: str | Path) -> bool:
-    """Recognize JSON MXNet symbol graphs under misleading filenames.
+def detect_mxnet_symbol_content_route(path: str | Path) -> str | None:
+    """Return a definite or bounded-inconclusive JSON MXNet symbol route.
 
-    Large graph-like JSON files are preserved for the MXNet scanner, which
-    already fails closed when its bounded parser cannot complete analysis.
+    JSON objects with visible MXNet-specific root keys or a symbol node
+    contract that do not resolve within the bounded probe remain inconclusive.
+    Complete generic JSON without MXNet evidence remains with its established
+    filename owner; oversized unresolved JSON cannot safely rule out a hidden
+    graph and therefore fails closed.
     """
     file_path = Path(path)
     if not file_path.is_file():
-        return False
+        return None
 
     try:
         file_size = file_path.stat().st_size
         if file_size < 4:
-            return False
+            return None
 
         read_size = min(file_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
         with file_path.open("rb") as handle:
             prefix = handle.read(read_size)
-            if not prefix.lstrip().startswith(b"{"):
-                return False
+            normalized_prefix = prefix[len(_UTF8_BOM) :] if prefix.startswith(_UTF8_BOM) else prefix
+            trimmed_prefix = normalized_prefix.lstrip()
+            if trimmed_prefix and not trimmed_prefix.startswith(b"{"):
+                return None
     except OSError:
-        return False
+        return None
 
-    if not _has_mxnet_symbol_top_level_array_keys(prefix):
-        return False
+    is_disguised_non_json = file_path.suffix.lower() != ".json"
+    prefix = prefix[len(_UTF8_BOM) :] if prefix.startswith(_UTF8_BOM) else prefix
     if file_size > MXNET_SYMBOL_SIGNATURE_READ_BYTES:
-        return True
+        return _detect_mxnet_symbol_prefix_route(
+            prefix[:MXNET_SYMBOL_SIGNATURE_READ_BYTES],
+            fail_closed_without_hint=True,
+        )
 
-    try:
-        payload = json.loads(prefix)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    return has_mxnet_symbol_graph_structure(payload)
+    return _detect_mxnet_symbol_prefix_route(
+        prefix,
+        sample_is_prefix=False,
+        fail_closed_without_hint=is_disguised_non_json,
+    )
+
+
+def is_mxnet_symbol_graph_file(path: str | Path) -> bool:
+    """Return whether bounded content conclusively identifies an MXNet graph."""
+    return detect_mxnet_symbol_content_route(path) == "mxnet"
 
 
 def _could_be_renamed_mxnet_symbol(file_path: Path, prefix: bytes) -> bool:
     """Return whether content-based MXNet routing is needed for this path."""
+    prefix = prefix[len(_UTF8_BOM) :] if prefix.startswith(_UTF8_BOM) else prefix
     trimmed_prefix = prefix.lstrip()
-    return file_path.suffix.lower() != ".json" and (trimmed_prefix.startswith(b"{") or not trimmed_prefix)
+    return bool(file_path.name) and (trimmed_prefix.startswith(b"{") or not trimmed_prefix)
+
+
+def _detect_content_routed_mxnet_symbol(file_path: Path, prefix: bytes) -> str | None:
+    """Route plausible JSON symbol content or preserve bounded ambiguity."""
+    if file_path.name.lower().endswith("-symbol.json"):
+        # Canonical symbol names already belong to MXNetScanner; do not let a
+        # discovery budget prevent its bounded fail-closed analysis from running.
+        return None
+    if not _could_be_renamed_mxnet_symbol(file_path, prefix):
+        return None
+    mxnet_route = detect_mxnet_symbol_content_route(file_path)
+    if file_path.suffix.lower() != ".json":
+        try:
+            is_oversized_candidate = file_path.stat().st_size > MXNET_SYMBOL_SIGNATURE_READ_BYTES
+        except OSError:
+            return mxnet_route
+        if mxnet_route != "mxnet" or is_oversized_candidate:
+            return mxnet_route
+
+    # Structurally overlapping JSON must be scanned as XGBoost so its full JSON
+    # checks run; the scanner then marks MXNet overlap as incomplete coverage.
+    from ...scanners.xgboost_scanner import XGBoostScanner
+
+    xgboost_probe_bytes = None if file_path.suffix.lower() == ".json" else MXNET_SYMBOL_SIGNATURE_READ_BYTES
+    if XGBoostScanner._is_xgboost_json(str(file_path), max_bytes=xgboost_probe_bytes):
+        return "xgboost"
+    if (
+        file_path.suffix.lower() == ".json" or mxnet_route == "mxnet"
+    ) and XGBoostScanner._is_probable_mxnet_overlap_candidate(str(file_path), max_bytes=xgboost_probe_bytes):
+        return "xgboost"
+    return mxnet_route
 
 
 _MIN_BINARY_PICKLE_PROTOCOL = 1
@@ -801,6 +1164,58 @@ def _looks_like_tflite_header(header: bytes) -> bool:
         len(header) >= _TFLITE_MIN_HEADER_SIZE
         and header[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE] == _TFLITE_MAGIC_BYTES
     )
+
+
+_RENAMED_BINARY_CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset({".bin", ".meta", ".pb"})
+_TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset(
+    {
+        ".bin",
+        ".cmf",
+        ".dnn",
+        ".exe",
+        ".lgb",
+        ".lightgbm",
+        ".llamafile",
+        ".meta",
+        ".model",
+        ".net",
+        ".pb",
+        ".rknn",
+        ".t7",
+        ".th",
+    }
+)
+
+
+def _allows_renamed_binary_content_route(file_path: Path | None) -> bool:
+    return file_path is None or file_path.suffix.lower() not in _RENAMED_BINARY_CONTENT_ROUTE_BLOCKED_EXTENSIONS
+
+
+def detect_pytorch_binary_supplemental_format(path: str) -> str | None:
+    """Return a strict secondary scanner for a content-identified `.bin` file."""
+    file_path = Path(path)
+    if file_path.suffix.lower() != ".bin" or not file_path.is_file():
+        return None
+
+    try:
+        size = file_path.stat().st_size
+        if size < 4:
+            return None
+        prefix = read_magic_bytes(path, max(_TORCH7_SIGNATURE_READ_BYTES, 8))
+    except OSError:
+        return None
+
+    magic4 = prefix[:4]
+    magic8 = prefix[:8]
+    if magic4 == b"RKNN":
+        return "rknn"
+    if _is_torch7_signature(prefix):
+        return "torch7"
+    if _detect_executorch_content_route(file_path, magic8) == "executorch":
+        return "executorch"
+    if _looks_like_tflite_header(magic8):
+        return "tflite"
+    return None
 
 
 def _looks_like_safetensors_structure(path: Path | None, magic8: bytes, file_size: int) -> bool:
@@ -1495,7 +1910,7 @@ def _is_executorch_binary_signature(prefix: bytes) -> bool:
     return len(prefix) >= 8 and prefix[4:6] == b"ET" and prefix[6:8].isdigit()
 
 
-def _is_valid_executorch_binary(path: str | Path) -> bool:
+def _is_valid_executorch_binary(path: str | Path, *, propagate_io_errors: bool = False) -> bool:
     """Validate the minimal FlatBuffers structure for ExecuTorch binaries."""
     file_path = Path(path)
     if not file_path.is_file():
@@ -1540,10 +1955,26 @@ def _is_valid_executorch_binary(path: str | Path) -> bool:
                 return False
             if root_table_offset + object_size > file_size:
                 return False
-    except (OSError, struct.error):
+    except OSError:
+        if propagate_io_errors:
+            raise
+        return False
+    except struct.error:
         return False
 
     return True
+
+
+def _detect_executorch_content_route(file_path: Path, magic8: bytes) -> str | None:
+    """Preserve signature-valid candidates when structure probing cannot complete."""
+    if not _is_executorch_binary_signature(magic8):
+        return None
+    try:
+        if _is_valid_executorch_binary(file_path, propagate_io_errors=True):
+            return "executorch"
+    except OSError:
+        return "executorch"
+    return None
 
 
 def _detect_compression_format(prefix: bytes) -> str | None:
@@ -1560,6 +1991,407 @@ def _detect_compression_format(prefix: bytes) -> str | None:
     return None
 
 
+def _could_start_json_object(prefix: bytes) -> bool:
+    """Return True when a bounded prefix begins a JSON object after whitespace/BOM."""
+    normalized_prefix = prefix.lstrip()
+    if normalized_prefix.startswith(b"\xef\xbb\xbf"):
+        normalized_prefix = normalized_prefix[3:].lstrip()
+    return normalized_prefix.startswith(b"{")
+
+
+def _has_jax_json_checkpoint_structure(payload: object) -> bool:
+    """Return whether parsed metadata explicitly identifies a JAX-family checkpoint."""
+    if not isinstance(payload, dict):
+        return False
+
+    if _JAX_JSON_CHECKPOINT_MARKER_KEYS & payload.keys():
+        return True
+
+    for key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and _JAX_JSON_CHECKPOINT_IDENTITY_RE.search(value):
+            return True
+    return False
+
+
+def _probe_jax_json_checkpoint_file(file_path: Path) -> bool | None:
+    """Return True for JAX JSON, None for bounded ambiguity, else False."""
+    try:
+        if not file_path.is_file():
+            return False
+        file_size = file_path.stat().st_size
+        with file_path.open("rb") as stream:
+            prefix = stream.read(min(file_size, JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1))
+    except OSError:
+        return None
+
+    if not _could_start_json_object(prefix):
+        normalized_prefix = prefix.lstrip()
+        if normalized_prefix.startswith(b"\xef\xbb\xbf"):
+            normalized_prefix = normalized_prefix[3:].lstrip()
+        if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES and not normalized_prefix:
+            return None
+        return False
+
+    try:
+        payload = json.loads(prefix.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
+            return None
+        return False
+    return _has_jax_json_checkpoint_structure(payload)
+
+
+def is_jax_json_checkpoint_file(path: str | Path) -> bool:
+    """Preserve confirmed and bounded-inconclusive JAX JSON candidates for scanning."""
+    return _probe_jax_json_checkpoint_file(Path(path)) is not False
+
+
+def _probe_content_routed_jax_json_checkpoint(file_path: Path) -> bool | None:
+    """Return the bounded JAX JSON probe state for content-routable suffixes."""
+    ext = file_path.suffix.lower()
+    if ext in _JAX_JSON_CHECKPOINT_CONTENT_ROUTE_EXCLUDED_SUFFIXES:
+        return False
+    if not (ext in _JAX_JSON_CHECKPOINT_SCANNER_SUFFIXES or ext not in _JAX_JSON_CHECKPOINT_DECLARED_SUFFIXES):
+        return False
+    return _probe_jax_json_checkpoint_file(file_path)
+
+
+def _is_confirmed_content_routed_jax_json_checkpoint(file_path: Path) -> bool:
+    """Return whether bounded routing positively identifies JAX JSON metadata."""
+    return _probe_content_routed_jax_json_checkpoint(file_path) is True
+
+
+def _could_be_content_routed_jax_json_checkpoint(file_path: Path) -> bool:
+    """Route JAX-owned or renamed JSON candidates without claiming foreign suffixes."""
+    return _probe_content_routed_jax_json_checkpoint(file_path) is not False
+
+
+class _MsgpackProbeInvalid(ValueError):
+    """Raised when bounded MessagePack structure probing sees invalid data."""
+
+
+class _MsgpackProbeLimit(ValueError):
+    """Raised when bounded MessagePack structure probing cannot finish safely."""
+
+
+def _read_msgpack_probe_bytes(stream: BinaryIO, size: int) -> bytes:
+    data = stream.read(size)
+    if len(data) != size:
+        raise _MsgpackProbeInvalid
+    return data
+
+
+def _read_msgpack_probe_uint(stream: BinaryIO, size: int) -> int:
+    return int.from_bytes(_read_msgpack_probe_bytes(stream, size), "big")
+
+
+def _skip_msgpack_probe_bytes(stream: BinaryIO, size: int, file_size: int) -> None:
+    if size < 0 or stream.tell() + size > file_size:
+        raise _MsgpackProbeInvalid
+    stream.seek(size, 1)
+
+
+def _consume_msgpack_probe_node(remaining_nodes: list[int]) -> None:
+    remaining_nodes[0] -= 1
+    if remaining_nodes[0] < 0:
+        raise _MsgpackProbeLimit
+
+
+def _skip_msgpack_probe_value(
+    stream: BinaryIO,
+    file_size: int,
+    remaining_nodes: list[int],
+    depth: int,
+) -> None:
+    marker = _read_msgpack_probe_bytes(stream, 1)[0]
+    _consume_msgpack_probe_node(remaining_nodes)
+    _skip_msgpack_probe_value_after_marker(stream, marker, file_size, remaining_nodes, depth)
+
+
+def _skip_msgpack_probe_value_after_marker(
+    stream: BinaryIO,
+    marker: int,
+    file_size: int,
+    remaining_nodes: list[int],
+    depth: int,
+) -> None:
+    if marker <= 0x7F or marker >= 0xE0 or marker in {0xC0, 0xC2, 0xC3}:
+        return
+    if 0xA0 <= marker <= 0xBF:
+        _skip_msgpack_probe_bytes(stream, marker & 0x1F, file_size)
+        return
+
+    if marker in _FLAX_MSGPACK_PROBE_SCALAR_SIZES:
+        _skip_msgpack_probe_bytes(stream, _FLAX_MSGPACK_PROBE_SCALAR_SIZES[marker], file_size)
+        return
+
+    if marker in _FLAX_MSGPACK_PROBE_LENGTH_SIZES:
+        length_size, type_size = _FLAX_MSGPACK_PROBE_LENGTH_SIZES[marker]
+        _skip_msgpack_probe_bytes(stream, _read_msgpack_probe_uint(stream, length_size) + type_size, file_size)
+        return
+
+    if depth >= _FLAX_MSGPACK_PROBE_MAX_DEPTH:
+        raise _MsgpackProbeLimit
+
+    if 0x90 <= marker <= 0x9F:
+        child_count = marker & 0x0F
+    elif marker == 0xDC:
+        child_count = _read_msgpack_probe_uint(stream, 2)
+    elif marker == 0xDD:
+        child_count = _read_msgpack_probe_uint(stream, 4)
+    elif 0x80 <= marker <= 0x8F:
+        child_count = (marker & 0x0F) * 2
+    elif marker == 0xDE:
+        child_count = _read_msgpack_probe_uint(stream, 2) * 2
+    elif marker == 0xDF:
+        child_count = _read_msgpack_probe_uint(stream, 4) * 2
+    else:
+        raise _MsgpackProbeInvalid
+
+    for _ in range(child_count):
+        _skip_msgpack_probe_value(stream, file_size, remaining_nodes, depth + 1)
+
+
+def _is_inline_msgpack_probe_scalar(marker: int) -> bool:
+    """Return whether a marker is a complete single-byte scalar value."""
+    return marker <= 0x7F or marker >= 0xE0 or marker in {0xC0, 0xC2, 0xC3}
+
+
+def _read_msgpack_probe_map_count_after_marker(stream: BinaryIO, marker: int) -> int | None:
+    if 0x80 <= marker <= 0x8F:
+        return marker & 0x0F
+    if marker == 0xDE:
+        return _read_msgpack_probe_uint(stream, 2)
+    if marker == 0xDF:
+        return _read_msgpack_probe_uint(stream, 4)
+    return None
+
+
+def _read_msgpack_probe_key(
+    stream: BinaryIO,
+    file_size: int,
+    remaining_nodes: list[int],
+) -> str | None:
+    marker = _read_msgpack_probe_bytes(stream, 1)[0]
+    _consume_msgpack_probe_node(remaining_nodes)
+    if 0xA0 <= marker <= 0xBF:
+        length = marker & 0x1F
+    elif marker in {0xD9, 0xC4}:
+        length = _read_msgpack_probe_uint(stream, 1)
+    elif marker in {0xDA, 0xC5}:
+        length = _read_msgpack_probe_uint(stream, 2)
+    elif marker in {0xDB, 0xC6}:
+        length = _read_msgpack_probe_uint(stream, 4)
+    else:
+        _skip_msgpack_probe_value_after_marker(stream, marker, file_size, remaining_nodes, 1)
+        return None
+
+    if length > _FLAX_MSGPACK_PROBE_MAX_KEY_BYTES:
+        _skip_msgpack_probe_bytes(stream, length, file_size)
+        return None
+    try:
+        return _read_msgpack_probe_bytes(stream, length).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _has_bounded_flax_msgpack_state_root(
+    stream: BinaryIO,
+    file_size: int,
+    remaining_nodes: list[int],
+    recognized_checkpoint_root: list[bool],
+) -> bool:
+    """Recognize a standard state wrapper without accepting generic state maps."""
+    marker = _read_msgpack_probe_bytes(stream, 1)[0]
+    _consume_msgpack_probe_node(remaining_nodes)
+    map_count = _read_msgpack_probe_map_count_after_marker(stream, marker)
+    if map_count is None:
+        _skip_msgpack_probe_value_after_marker(stream, marker, file_size, remaining_nodes, 1)
+        return False
+
+    has_checkpoint_root = False
+    for _ in range(map_count):
+        if _read_msgpack_probe_key(stream, file_size, remaining_nodes) in _FLAX_MSGPACK_ROUTING_KEYS:
+            recognized_checkpoint_root[0] = True
+            _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 2)
+            has_checkpoint_root = True
+        else:
+            _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 2)
+    return has_checkpoint_root
+
+
+def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | None:
+    """Inspect streamed maps, returning None when safe routing cannot complete."""
+    remaining_nodes = [_FLAX_MSGPACK_PROBE_MAX_NODES]
+    inline_scalars_seen = 0
+    recognized_checkpoint_root = [False]
+    try:
+        with path.open("rb") as stream:
+            while stream.tell() < file_size:
+                marker = _read_msgpack_probe_bytes(stream, 1)[0]
+                map_count = _read_msgpack_probe_map_count_after_marker(stream, marker)
+                if map_count is None and _is_inline_msgpack_probe_scalar(marker):
+                    inline_scalars_seen += 1
+                    if inline_scalars_seen > _FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS:
+                        raise _MsgpackProbeLimit
+                    continue
+
+                _consume_msgpack_probe_node(remaining_nodes)
+                if map_count is None:
+                    _skip_msgpack_probe_value_after_marker(stream, marker, file_size, remaining_nodes, 0)
+                    continue
+                has_checkpoint_root = False
+                for _ in range(map_count):
+                    key = _read_msgpack_probe_key(stream, file_size, remaining_nodes)
+                    if key in _FLAX_MSGPACK_ROUTING_KEYS:
+                        recognized_checkpoint_root[0] = True
+                        _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
+                        has_checkpoint_root = True
+                    if key == _FLAX_MSGPACK_STATE_WRAPPER_KEY:
+                        if _has_bounded_flax_msgpack_state_root(
+                            stream,
+                            file_size,
+                            remaining_nodes,
+                            recognized_checkpoint_root,
+                        ):
+                            has_checkpoint_root = True
+                    elif key not in _FLAX_MSGPACK_ROUTING_KEYS:
+                        _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
+                if has_checkpoint_root:
+                    return True
+    except _MsgpackProbeLimit:
+        # Once a root is recognized, run the scanner so it can analyze sibling
+        # security fields even if routing validation exhausts its budget.
+        return True if recognized_checkpoint_root[0] else None
+    except OSError:
+        return None
+    except _MsgpackProbeInvalid:
+        return False
+    return False
+
+
+def _probe_flax_msgpack_checkpoint_file(file_path: Path) -> bool | None:
+    """Return True for Flax structure, None for incomplete inspection, else False."""
+    try:
+        if not file_path.is_file():
+            return False
+        file_size = file_path.stat().st_size
+        if file_size < 2:
+            return False
+    except OSError:
+        return None
+
+    return _has_bounded_flax_msgpack_routing_key(file_path, file_size)
+
+
+def is_flax_msgpack_checkpoint_file(path: str | Path) -> bool:
+    """Preserve recognized and inconclusive Flax candidates for scanning."""
+    return _probe_flax_msgpack_checkpoint_file(Path(path)) is not False
+
+
+def has_inconclusive_renamed_flax_msgpack_routing(path: str | Path) -> bool:
+    """Return whether renamed MessagePack routing could not complete safely."""
+    file_path = Path(path)
+    if file_path.suffix.lower() in _FLAX_MSGPACK_NATIVE_SUFFIXES:
+        return False
+    try:
+        if _probe_complete_structured_json_document(file_path, file_path.stat().st_size) is None:
+            return True
+    except OSError:
+        return True
+    return _probe_flax_msgpack_checkpoint_file(file_path) is None
+
+
+def _probe_complete_structured_json_document(file_path: Path, file_size: int) -> bool | None:
+    """Return whether bounded inspection proves a renamed JSON document complete."""
+    read_size = min(file_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
+    prefix = read_magic_bytes(str(file_path), read_size)
+    normalized_prefix = prefix[len(_UTF8_BOM) :] if prefix.startswith(_UTF8_BOM) else prefix
+    try:
+        decoded_prefix = normalized_prefix.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+
+    stripped_prefix = decoded_prefix.lstrip()
+    if not stripped_prefix.startswith(("{", "[")):
+        return False
+    try:
+        _, end_offset = json.JSONDecoder().raw_decode(stripped_prefix)
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        return False
+    if stripped_prefix[end_offset:].strip():
+        return False
+    if read_size == file_size:
+        return True
+
+    try:
+        with file_path.open("rb") as stream:
+            stream.seek(read_size)
+            trailing_read_size = min(file_size - read_size, _STRUCTURED_JSON_TRAILING_READ_BYTES)
+            trailing_bytes = stream.read(trailing_read_size)
+    except OSError:
+        return None
+    if len(trailing_bytes) != trailing_read_size:
+        return None
+    if trailing_bytes.strip(b" \t\r\n"):
+        return False
+    return True if read_size + trailing_read_size == file_size else None
+
+
+def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
+    """Route declared Flax formats and renamed candidates without claiming overlaps."""
+    ext = file_path.suffix.lower()
+    if ext in _FLAX_MSGPACK_CONTENT_ROUTE_EXCLUDED_SUFFIXES:
+        return False
+    try:
+        size = file_path.stat().st_size
+    except OSError:
+        return False
+    if ext not in _FLAX_MSGPACK_SCANNER_SUFFIXES:
+        json_document_probe = _probe_complete_structured_json_document(file_path, size)
+        if json_document_probe is True:
+            return False
+        if json_document_probe is None:
+            return True
+    if ext == "":
+        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
+            read_magic_bytes(str(file_path), min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
+        )
+        if xgboost_route is not None:
+            return False
+    return (
+        ext in _FLAX_MSGPACK_SCANNER_SUFFIXES
+        or ext in _FLAX_MSGPACK_OVERLAP_SUFFIXES
+        or ext not in _FLAX_MSGPACK_DECLARED_SUFFIXES
+    ) and is_flax_msgpack_checkpoint_file(file_path)
+
+
+def detect_flax_msgpack_overlap_routes(path: str) -> tuple[str, ...]:
+    """Return trusted foreign content routes that also occur in a Flax candidate."""
+    file_path = Path(path)
+    try:
+        if not file_path.is_file() or not is_flax_msgpack_checkpoint_file(file_path):
+            return ()
+        size = file_path.stat().st_size
+    except OSError:
+        return ()
+
+    prefix = read_magic_bytes(
+        path, min(size, max(_TORCH7_SIGNATURE_READ_BYTES, _CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
+    )
+    routes: list[str] = []
+    if _allows_renamed_binary_content_route(file_path) and prefix[:4] == b"RKNN":
+        routes.append("rknn")
+    if _is_torch7_signature(prefix[:_TORCH7_SIGNATURE_READ_BYTES]):
+        routes.append("torch7")
+    if file_path.suffix.lower() != ".model" and _is_cntk_signature(prefix[:_CNTK_SIGNATURE_READ_BYTES]):
+        routes.append("cntk")
+    if _is_content_routed_lightgbm_signature(prefix[:_LIGHTGBM_SIGNATURE_READ_BYTES]):
+        routes.append("lightgbm")
+    return tuple(routes)
+
+
 def detect_format_from_magic_bytes(
     magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes, file_size: int, file_path: Path | None = None
 ) -> FileFormat:
@@ -1572,9 +2404,9 @@ def detect_format_from_magic_bytes(
     match magic4:
         case b"CBM1":
             return "catboost"
-        case b"RKNN":
+        case b"RKNN" if _allows_renamed_binary_content_route(file_path):
             return "rknn"
-        case b"T7\x00\x00":
+        case b"T7\x00\x00" if _allows_renamed_binary_content_route(file_path):
             return "torch7"
         case b"GGUF":
             return "gguf"
@@ -1585,14 +2417,12 @@ def detect_format_from_magic_bytes(
         case _:
             pass
 
+    if file_path is not None:
+        mxnet_route = _detect_content_routed_mxnet_symbol(file_path, magic16)
+        if mxnet_route is not None:
+            return mxnet_route
     if file_path is not None and _looks_like_onnx_model_candidate_file(file_path, file_size, magic4):
         return "onnx"
-    if (
-        file_path is not None
-        and _could_be_renamed_mxnet_symbol(file_path, magic16)
-        and is_mxnet_symbol_graph_file(file_path)
-    ):
-        return "mxnet"
 
     # Check longer magic sequences
     match magic8:
@@ -1622,6 +2452,23 @@ def detect_format_from_magic_bytes(
     if b'"__metadata__"' in magic16 and _looks_like_safetensors_structure(file_path, magic8, file_size):
         return "safetensors"
 
+    if file_path is not None:
+        pickle_probe_sample = _read_pickle_probe_sample(file_path, file_size, magic16)
+        if _looks_like_proto0_or_1_pickle(
+            pickle_probe_sample,
+            sample_is_prefix=file_size > len(pickle_probe_sample),
+        ):
+            return "pickle"
+
+    if file_path is not None and _is_confirmed_content_routed_jax_json_checkpoint(file_path):
+        return "jax_checkpoint"
+
+    if file_path is not None and _could_be_content_routed_flax_msgpack(file_path):
+        return "flax_msgpack"
+
+    if file_path is not None and _could_be_content_routed_jax_json_checkpoint(file_path):
+        return "jax_checkpoint"
+
     return "unknown"
 
 
@@ -1642,7 +2489,10 @@ def detect_file_format_from_magic(path: str) -> str:
             return "unknown"
 
         if file_path.suffix.lower() == ".meta":
-            return "tf_metagraph" if _is_tensorflow_metagraph_file(path) else "unknown"
+            if _is_tensorflow_metagraph_file(path):
+                return "tf_metagraph"
+            mxnet_route = _detect_content_routed_mxnet_symbol(file_path, b"{")
+            return mxnet_route or "unknown"
 
         with file_path.open("rb") as f:
             header = f.read(min(size, _TAR_BLOCK_SIZE))
@@ -1653,12 +2503,6 @@ def detect_file_format_from_magic(path: str) -> str:
             magic4 = header[:4]
             magic8 = header[:8]
             magic16 = header[:16]
-
-            if _looks_like_tflite_header(magic8):
-                return "tflite"
-
-            if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
-                return "executorch"
 
             llamafile_format = _detect_llamafile_route_format(file_path, magic4)
             if llamafile_format is not None:
@@ -1674,8 +2518,6 @@ def detect_file_format_from_magic(path: str) -> str:
                     return tar_route
             if format_result != "unknown":
                 return format_result
-            if _could_be_renamed_mxnet_symbol(file_path, header) and is_mxnet_symbol_graph_file(file_path):
-                return "mxnet"
 
             # Protocol 0/1 pickle payloads can evade short magic-byte checks.
             # Probe a bounded prefix and require a valid opcode stream.
@@ -1688,7 +2530,7 @@ def detect_file_format_from_magic(path: str) -> str:
 
             f.seek(0)
             torch7_prefix = f.read(_TORCH7_SIGNATURE_READ_BYTES)
-            if _is_torch7_signature(torch7_prefix):
+            if _allows_renamed_binary_content_route(file_path) and _is_torch7_signature(torch7_prefix):
                 return "torch7"
 
             # CNTKv2 has protobuf-style serialization without a fixed first-8-byte magic.
@@ -1711,6 +2553,16 @@ def detect_file_format_from_magic(path: str) -> str:
                 if xgboost_route is not None:
                     return xgboost_route
 
+            if (
+                _allows_renamed_binary_content_route(file_path)
+                and _detect_executorch_content_route(file_path, magic8) == "executorch"
+            ):
+                return "executorch"
+            if file_path.suffix.lower() not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(
+                magic8
+            ):
+                return "tflite"
+
             # Check for XML-based formats (OpenVINO and PMML) using the first
             # structural root tag rather than a short raw-byte substring.
             if _could_be_xml_prefix(header):
@@ -1730,16 +2582,14 @@ def detect_file_format_from_magic(path: str) -> str:
     magic4 = header[:4]
     magic8 = header[:8]
 
-    if _looks_like_tflite_header(magic8):
-        return "tflite"
-
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
     if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
         return "onnx"
-    if _could_be_renamed_mxnet_symbol(file_path, magic8) and is_mxnet_symbol_graph_file(file_path):
-        return "mxnet"
+
+    if file_path.suffix.lower() not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(magic8):
+        return "tflite"
 
     return "unknown"
 
@@ -1784,9 +2634,8 @@ def detect_file_format_for_skip_filter(path: str) -> str:
     """Cheap content detection for skipped-extension preservation.
 
     This intentionally recognizes only content-derived format signals. It avoids
-    extension-based routing and uses one bounded prefix read for common skipped
-    files. Executable-header candidates may receive bounded Llamafile marker
-    prefix/tail probes so disguised executable payloads reach full scans.
+    extension-based routing and uses bounded content probes so disguised payloads
+    reach full scans without unbounded prefilter reads.
     """
     file_path = Path(path)
     if file_path.is_dir():
@@ -1812,10 +2661,6 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if _looks_like_uncompressed_tar_header(prefix):
             return _detect_tar_route(path) or "tar"
 
-        if _looks_like_tflite_header(magic8):
-            return "tflite"
-        if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
-            return "executorch"
         llamafile_format = _detect_llamafile_route_format(file_path, magic4)
         if llamafile_format is not None:
             return llamafile_format
@@ -1829,8 +2674,6 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             return format_result
         if format_result != "unknown":
             return format_result
-        if _could_be_renamed_mxnet_symbol(file_path, prefix) and is_mxnet_symbol_graph_file(file_path):
-            return "mxnet"
 
         if _could_start_proto0_or_1_pickle(prefix):
             max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES)
@@ -1845,7 +2688,7 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         torch7_probe_size = min(size, _TORCH7_SIGNATURE_READ_BYTES)
         if len(prefix) < torch7_probe_size:
             prefix += f.read(torch7_probe_size - len(prefix))
-        if _is_torch7_signature(prefix):
+        if _allows_renamed_binary_content_route(file_path) and _is_torch7_signature(prefix):
             return "torch7"
 
         cntk_probe_size = min(size, _CNTK_SIGNATURE_READ_BYTES)
@@ -1867,6 +2710,16 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             xgboost_route = _detect_extensionless_xgboost_ubjson_route(prefix[:xgboost_probe_size])
             if xgboost_route is not None:
                 return xgboost_route
+
+        if (
+            _allows_renamed_binary_content_route(file_path)
+            and _detect_executorch_content_route(file_path, magic8) == "executorch"
+        ):
+            return "executorch"
+        if file_path.suffix.lower() not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(
+            magic8
+        ):
+            return "tflite"
 
         if _could_be_xml_prefix(prefix):
             xml_probe_size = min(size, _XML_MODEL_SIGNATURE_READ_BYTES)
@@ -1916,10 +2769,11 @@ def detect_file_format(path: str) -> str:
 
     if magic8.startswith(b"\x93NUMPY"):
         return "numpy"
+    mxnet_route = _detect_content_routed_mxnet_symbol(file_path, header)
+    if mxnet_route is not None:
+        return mxnet_route
     if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
         return "onnx"
-    if _could_be_renamed_mxnet_symbol(file_path, header) and is_mxnet_symbol_graph_file(file_path):
-        return "mxnet"
 
     # Check first 8 bytes for HDF5 magic
     hdf5_magic = b"\x89HDF\r\n\x1a\n"
@@ -2001,8 +2855,17 @@ def detect_file_format(path: str) -> str:
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
+    if _is_confirmed_content_routed_jax_json_checkpoint(file_path):
+        return "jax_checkpoint"
+
+    if ext in _FLAX_MSGPACK_SCANNER_SUFFIXES or _could_be_content_routed_flax_msgpack(file_path):
+        return "flax_msgpack"
+
+    if _could_be_content_routed_jax_json_checkpoint(file_path):
+        return "jax_checkpoint"
+
     torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
-    if _is_torch7_signature(torch7_prefix):
+    if _allows_renamed_binary_content_route(file_path) and _is_torch7_signature(torch7_prefix):
         return "torch7"
 
     signature_prefix = read_magic_bytes(path, max(_CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
@@ -2011,11 +2874,15 @@ def detect_file_format(path: str) -> str:
     if _is_content_routed_lightgbm_signature(signature_prefix[:_LIGHTGBM_SIGNATURE_READ_BYTES]):
         return "lightgbm"
 
+    if ext == "":
+        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
+            read_magic_bytes(path, min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
+        )
+        if xgboost_route is not None:
+            return xgboost_route
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
         magic64 = read_magic_bytes(path, 64)
-        if _looks_like_tflite_header(magic8):
-            return "tflite"
         # IMPORTANT: Check ZIP format first (PyTorch models saved with torch.save())
         if _has_zip_magic(magic4):
             return "zip"
@@ -2042,6 +2909,16 @@ def detect_file_format(path: str) -> str:
 
         # Otherwise, assume raw binary format (PyTorch weights)
         return "pytorch_binary"
+
+    if (
+        _allows_renamed_binary_content_route(file_path)
+        and _detect_executorch_content_route(file_path, magic8) == "executorch"
+    ):
+        return "executorch"
+    if _allows_renamed_binary_content_route(file_path) and magic4 == b"RKNN":
+        return "rknn"
+    if ext not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(magic8):
+        return "tflite"
 
     # Extension-based detection for non-.bin files
     # For .pt/.pth/.ckpt files, check if they're ZIP format first
@@ -2141,12 +3018,6 @@ def detect_file_format(path: str) -> str:
         ".txz",
     ):
         return "tar"
-    if ext == "":
-        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
-            read_magic_bytes(path, min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
-        )
-        if xgboost_route is not None:
-            return xgboost_route
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
     return "unknown"
@@ -2209,14 +3080,13 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
         # before doing the unknown header check
 
         # Pickle files can be stored in various ways
-        if ext_format == "pickle" and header_format in {"pickle", "zip"}:
+        if ext_format == "pickle" and header_format in {"pickle", "zip", "jax_checkpoint"}:
             return True
 
         # PyTorch binary files are flexible in format
         if ext_format == "pytorch_binary" and header_format in {
             "pytorch_binary",
             "pickle",
-            "tflite",
             "zip",
             "unknown",  # .bin files can contain arbitrary binary data
         }:

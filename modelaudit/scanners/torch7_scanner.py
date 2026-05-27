@@ -15,6 +15,7 @@ TORCH7_SIGNATURE_READ_BYTES = 4096
 MAX_SCAN_BYTES = 12 * 1024 * 1024
 MAX_EXTRACTED_STRINGS = 5000
 MIN_TORCH7_SIZE = 8
+CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset({".bin", ".meta", ".pb"})
 
 PRINTABLE_TEXT_PATTERN = re.compile(rb"[\t\n\r -~]{6,512}")
 
@@ -66,8 +67,10 @@ class Torch7Scanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        """Recognize Torch7 by bounded serialized-content markers, regardless of suffix."""
+        """Recognize Torch7 content unless a conflicting suffix retains primary ownership."""
         if not os.path.isfile(path):
+            return False
+        if os.path.splitext(path)[1].lower() in CONTENT_ROUTE_BLOCKED_EXTENSIONS:
             return False
 
         try:
