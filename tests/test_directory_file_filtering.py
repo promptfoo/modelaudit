@@ -11,6 +11,7 @@ import sys
 import tarfile
 import tempfile
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -18,6 +19,7 @@ import pytest
 
 from modelaudit import core as core_module
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
@@ -69,6 +71,11 @@ def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
         handle.write(struct.pack("<Q", header_len))
         handle.write(b"{")
         handle.truncate(8 + header_len + 1)
+
+
+def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
+    field = b"z " + (b"x" * 32)
+    return field * ((min_bytes // len(field)) + 1)
 
 
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
@@ -292,28 +299,6 @@ class TestDirectoryFileFiltering:
         assert results["files_scanned"] == 1
         assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
 
-    def test_disguised_malicious_tf_metagraph_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
-        disguised_payload = tmp_path / "payload.jpg"
-        disguised_payload.write_bytes(b"\xa2\x06\x80\x08" + (b"x" * 1024) + _build_malicious_tf_metagraph())
-
-        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
-
-        assert results["files_scanned"] == 1
-        assert "tf_metagraph" in results.scanner_names
-        assert determine_exit_code(results) == 1
-        assert any(issue.message == "Dangerous TensorFlow operation: PyFunc" for issue in results.issues)
-
-    def test_disguised_malicious_tf_savedmodel_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
-        disguised_payload = tmp_path / "saved.jpg"
-        disguised_payload.write_bytes(_build_malicious_tf_savedmodel())
-
-        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
-
-        assert results["files_scanned"] == 1
-        assert "tf_savedmodel" in results.scanner_names
-        assert determine_exit_code(results) == 1
-        assert any("PyFunc operation detected" in issue.message for issue in results.issues)
-
     def test_disguised_oversized_safetensors_with_skipped_extension_fails_closed(
         self,
         tmp_path: Path,
@@ -504,6 +489,71 @@ class TestDirectoryFileFiltering:
         assert "flax_msgpack" in results.scanner_names
         assert results.file_metadata[str(ambiguous_payload)]["scan_outcome"] == "inconclusive"
         assert determine_exit_code(results) == 2
+
+    def test_disguised_malicious_tf_metagraph_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        disguised_payload = tmp_path / "payload.jpg"
+        disguised_payload.write_bytes(b"\xa2\x06\x80\x08" + (b"x" * 1024) + _build_malicious_tf_metagraph())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "tf_metagraph" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Dangerous TensorFlow operation: PyFunc" for issue in results.issues)
+
+    def test_disguised_malicious_tf_savedmodel_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        disguised_payload = tmp_path / "saved.jpg"
+        disguised_payload.write_bytes(_build_malicious_tf_savedmodel())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "tf_savedmodel" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any("PyFunc operation detected" in issue.message for issue in results.issues)
+
+    @pytest.mark.parametrize(
+        ("filename", "payload", "expected_scanner"),
+        [
+            ("prefixed-graph.jpg", _build_malicious_tf_metagraph, "tf_metagraph"),
+            ("prefixed-saved.jpg", _build_malicious_tf_savedmodel, "tf_savedmodel"),
+        ],
+    )
+    def test_printable_prefixed_malicious_tf_payload_with_skipped_extension_is_scanned(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        filename: str,
+        payload: Callable[[], bytes],
+        expected_scanner: str,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES", 64)
+        disguised_payload = tmp_path / filename
+        disguised_payload.write_bytes(_printable_unknown_proto_prefix(65) + payload())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert expected_scanner in results.scanner_names
+        assert determine_exit_code(results) == 1
+
+    def test_budget_prefixed_malicious_tf_payload_with_skipped_extension_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_FIELDS", 2)
+        disguised_payload = tmp_path / "budget-prefixed.jpg"
+        disguised_payload.write_bytes(
+            b"{" + (b"\x18\x00" * 3) + b"|" + b"z\x09\x81\xa6params\x80" + _build_malicious_tf_metagraph()
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "tf_metagraph" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Dangerous TensorFlow operation: PyFunc" for issue in results.issues)
 
     def test_disguised_cntk_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         disguised_payload = tmp_path / "cntk.jpg"

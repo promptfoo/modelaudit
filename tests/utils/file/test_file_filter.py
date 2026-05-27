@@ -10,6 +10,7 @@ from typing import cast
 
 import pytest
 
+from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file import filtering
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
@@ -65,6 +66,11 @@ def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
         handle.write(struct.pack("<Q", header_len))
         handle.write(b"{")
         handle.truncate(8 + header_len + 1)
+
+
+def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
+    field = b"z " + (b"x" * 32)
+    return field * ((min_bytes // len(field)) + 1)
 
 
 def _build_lightgbm_text() -> str:
@@ -362,16 +368,47 @@ class TestFileFilter:
         assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
         assert should_skip_file(str(generic_protobuf))
 
-    def test_disguised_tf_savedmodel_bypasses_skip_without_promoting_generic_protobuf(self, tmp_path: Path) -> None:
+    def test_disguised_tf_metagraph_after_printable_unknown_prefix_bypasses_skip(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES", 64)
+        disguised_metagraph = tmp_path / "prefixed-graph.jpg"
+        disguised_metagraph.write_bytes(_printable_unknown_proto_prefix(65) + _build_tf_metagraph_bytes())
+
+        assert detect_file_format_for_skip_filter(str(disguised_metagraph)) == "tf_metagraph"
+        assert not should_skip_file(str(disguised_metagraph))
+
+    def test_disguised_tf_savedmodel_bypasses_skip_without_promoting_generic_protobuf(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES", 64)
         disguised_savedmodel = tmp_path / "saved.jpg"
         generic_protobuf = tmp_path / "generic.jpg"
-        disguised_savedmodel.write_bytes(_build_tf_savedmodel_bytes())
+        disguised_savedmodel.write_bytes(_printable_unknown_proto_prefix(65) + _build_tf_savedmodel_bytes())
         generic_protobuf.write_bytes(b"\x12\x02\x08\x01")
 
         assert detect_file_format_for_skip_filter(str(disguised_savedmodel)) == "tf_savedmodel"
         assert not should_skip_file(str(disguised_savedmodel))
         assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
         assert should_skip_file(str(generic_protobuf))
+
+    def test_bounded_unknown_prefix_before_tf_graph_is_not_skipped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_FIELDS", 2)
+        disguised_metagraph = tmp_path / "budget-prefixed.jpg"
+        disguised_metagraph.write_bytes(
+            b"{" + (b"\x18\x00" * 3) + b"|" + b"z\x09\x81\xa6params\x80" + _build_tf_metagraph_bytes()
+        )
+
+        assert detect_file_format_for_skip_filter(str(disguised_metagraph)) == "tf_metagraph"
+        assert not should_skip_file(str(disguised_metagraph))
 
     def test_disguised_torch7_bypasses_default_skip(self, tmp_path: Path) -> None:
         disguised_torch7 = tmp_path / "payload.jpg"
