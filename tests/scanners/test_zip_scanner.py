@@ -46,6 +46,9 @@ def _assert_inconclusive_zip_aggregate_not_cached(
     path: Path,
     expected_reason: str,
     cache_dir: Path,
+    *,
+    expected_exit_code: int = 2,
+    expected_security_findings: bool = False,
     **scan_kwargs: Any,
 ) -> None:
     reset_cache_manager()
@@ -69,10 +72,11 @@ def _assert_inconclusive_zip_aggregate_not_cached(
             metadata = aggregate.file_metadata[str(path)]
             assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
             assert expected_reason in metadata["scan_outcome_reasons"]
-            assert not [
+            security_findings = [
                 issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
             ]
-            assert core.determine_exit_code(aggregate) == 2
+            assert bool(security_findings) is expected_security_findings
+            assert core.determine_exit_code(aggregate) == expected_exit_code
 
         top_level_config = normalize_scanner_selection_config(
             {
@@ -2479,7 +2483,8 @@ class TestZipScanner:
         assert len(depth_checks) == 1
         assert "maximum zip nesting depth (2) exceeded" in depth_checks[0].message.lower()
         assert depth_checks[0].location == f"{outer_zip}:middle.tar:inner.zip"
-        assert depth_checks[0].severity == IssueSeverity.INFO
+        assert depth_checks[0].severity == IssueSeverity.WARNING
+        assert depth_checks[0].rule_code == "S410"
         assert "zip_depth_limit" in result.metadata["scan_outcome_reasons"]
 
     def test_scan_nested_mar_enforces_shared_depth_limit(self, tmp_path: Path) -> None:
@@ -2767,7 +2772,8 @@ class TestZipScanner:
         assert result.success is False
         assert any(
             issue.message == "Maximum ZIP nesting depth (2) exceeded"
-            and issue.severity == IssueSeverity.INFO
+            and issue.severity == IssueSeverity.WARNING
+            and issue.rule_code == "S410"
             and issue.location == f"{archive_path}:level0:level1"
             and issue.details.get("zip_entry") == "level0:level1"
             and issue.details.get("depth") == 2
@@ -2784,6 +2790,8 @@ class TestZipScanner:
             archive_path,
             "zip_depth_limit",
             tmp_path / "depth-limit-cache",
+            expected_exit_code=1,
+            expected_security_findings=True,
             max_zip_depth=2,
         )
 
@@ -2957,7 +2965,8 @@ class TestZipScanner:
             assert result.success is False
             depth_issues = [i for i in result.issues if "depth" in i.message.lower()]
             assert len(depth_issues) >= 1
-            assert depth_issues[0].severity == IssueSeverity.INFO
+            assert depth_issues[0].severity == IssueSeverity.WARNING
+            assert depth_issues[0].rule_code == "S410"
             assert "zip_depth_limit" in result.metadata["scan_outcome_reasons"]
         finally:
             for path in paths_to_delete:

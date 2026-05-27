@@ -386,6 +386,15 @@ class KerasZipScanner(BaseScanner):
             result.metadata["contents"] = nested_contents
         result.success = result.success and nested_result.success
 
+    def _merge_recursive_archive_scan_after_primary_failure(self, path: str, result: ScanResult) -> None:
+        """Preserve independently detectable archive findings when Keras analysis is unavailable."""
+        try:
+            self._merge_recursive_archive_scan(path, result)
+        except Exception:
+            # The primary failure already makes this scan inconclusive; a
+            # failing fallback must not replace that explicit outcome.
+            return
+
     def scan(self, path: str) -> ScanResult:
         """Scan a ZIP-based Keras model file for suspicious configurations"""
         # Initialize context for this file
@@ -524,6 +533,7 @@ class KerasZipScanner(BaseScanner):
                     "scan_outcome_reason": "keras_zip_read_failed",
                 },
             )
+            self._merge_recursive_archive_scan_after_primary_failure(path, result)
             self._finish_scan_result(result)
             return result
         except Exception as e:
@@ -541,6 +551,7 @@ class KerasZipScanner(BaseScanner):
                     "scan_outcome_reason": "keras_zip_scan_failed",
                 },
             )
+            self._merge_recursive_archive_scan_after_primary_failure(path, result)
             self._finish_scan_result(result)
             return result
 

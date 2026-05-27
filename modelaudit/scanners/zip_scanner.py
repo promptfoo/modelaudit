@@ -373,7 +373,8 @@ class ZipScanner(BaseScanner):
                 name="ZIP Depth Bomb Protection",
                 passed=False,
                 message=f"Maximum ZIP nesting depth ({self.max_depth}) exceeded",
-                severity=IssueSeverity.INFO,
+                severity=IssueSeverity.WARNING,
+                rule_code="S410",  # Archive bomb
                 location=path,
                 details={
                     "depth": depth,

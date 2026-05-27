@@ -379,6 +379,52 @@ class TestKerasZipScanner:
             tmp_path / "read-failure-cache",
         )
 
+    @pytest.mark.parametrize(
+        ("failure_kind", "expected_reason"),
+        [("read", "keras_zip_read_failed"), ("scan", "keras_zip_scan_failed")],
+    )
+    def test_primary_failure_still_recurses_detectable_payload(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure_kind: str,
+        expected_reason: str,
+    ) -> None:
+        """Unavailable Keras analysis must not hide independently detectable ZIP payloads."""
+        keras_path = tmp_path / "unavailable_config_with_payload.keras"
+        with zipfile.ZipFile(keras_path, "w") as archive:
+            archive.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+        if failure_kind == "read":
+
+            def raise_os_error(
+                _self: KerasZipScanner,
+                _archive: zipfile.ZipFile,
+                _member_name: str,
+            ) -> None:
+                raise OSError("simulated Keras ZIP member read failure")
+
+            monkeypatch.setattr(KerasZipScanner, "_get_archive_member_info", raise_os_error)
+        else:
+
+            def raise_runtime_error(_self: KerasZipScanner, _model_config: dict[str, Any], _result: Any) -> None:
+                raise RuntimeError("simulated unexpected Keras ZIP scan failure")
+
+            monkeypatch.setattr(KerasZipScanner, "_scan_model_config", raise_runtime_error)
+
+        result = scan_model_directory_or_file(str(keras_path), cache_enabled=False)
+        metadata = result.file_metadata[str(keras_path)]
+
+        assert expected_reason in metadata["scan_outcome_reasons"]
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("zip_entry") == "payload.pkl"
+            and any(symbol in issue.message.lower() for symbol in ("os.system", "posix.system"))
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
+
     def test_unexpected_scan_failure_returns_inconclusive_exit2_without_cache(
         self,
         tmp_path: Path,
