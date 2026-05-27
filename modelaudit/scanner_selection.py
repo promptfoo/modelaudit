@@ -315,10 +315,16 @@ def selected_scanner_extensions(
         scanner_info = metadata.get(scanner_id, {})
         if conservative and (scanner_id in _GENERIC_CONTAINER_SCANNER_IDS or scanner_info.get("header_formats")):
             return None
+        remote_excluded_extensions = (
+            {str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])}
+            if conservative
+            else set()
+        )
         for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
             for extension in scanner_info.get(key, []):
                 extension_text = str(extension).lower()
-                extensions.add(extension_text)
+                if extension_text not in remote_excluded_extensions:
+                    extensions.add(extension_text)
     return frozenset(extensions)
 
 

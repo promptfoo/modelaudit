@@ -516,7 +516,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                         )
 
                     if any(hint in key_lower for hint in _COLLECTION_EXEC_HINTS):
-                        decoded = value[:_MAX_ATTR_VALUE_BYTES].decode("utf-8", errors="ignore")
+                        decoded = value[:_MAX_COLLECTION_VALUE_BYTES].decode("utf-8", errors="ignore")
                         if _COMMAND_RE.search(decoded) and _NETWORK_RE.search(decoded):
                             result.add_check(
                                 name="MetaGraph Collection Executable Pattern",

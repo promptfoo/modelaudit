@@ -216,6 +216,52 @@ def prefix_mock_onnx_with_unknown_field(
     return path
 
 
+def prefix_mock_onnx_with_unknown_group(
+    path: Path,
+    *,
+    field_number: int = 100,
+    nested_field_count: int = 513,
+) -> Path:
+    """Prefix an ONNX model with a legal unknown protobuf group."""
+    if field_number <= 0:
+        raise ValueError("field_number must be positive")
+    if nested_field_count <= 0:
+        raise ValueError("nested_field_count must be positive")
+
+    start_group = _encode_protobuf_varint((field_number << 3) | 3)
+    end_group = _encode_protobuf_varint((field_number << 3) | 4)
+    nested_field = _encode_protobuf_varint((1 << 3) | 0) + b"\x01"
+    path.write_bytes(start_group + (nested_field * nested_field_count) + end_group + path.read_bytes())
+    return path
+
+
+def create_mock_mxnet_symbol(path: Path, *, custom_library: str | None = None) -> Path:
+    """Create a minimal MXNet symbol graph, optionally with a custom library reference."""
+    nodes: list[dict[str, Any]] = [{"op": "null", "name": "data", "inputs": []}]
+    if custom_library is not None:
+        nodes.append(
+            {
+                "op": "Custom",
+                "name": "custom_loader",
+                "attrs": {"library": custom_library, "op_type": "unsafe_loader"},
+                "inputs": [[0, 0, 0]],
+            }
+        )
+
+    path.write_text(
+        json.dumps(
+            {
+                "nodes": nodes,
+                "arg_nodes": [0],
+                "heads": [[len(nodes) - 1, 0, 0]],
+                "attrs": {"metadata": "benign metadata"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def create_mock_manifest(path: Path, content: dict[str, Any] | None = None) -> Path:
     """Create a mock model manifest JSON file.
 

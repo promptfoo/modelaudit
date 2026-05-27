@@ -110,25 +110,32 @@ def _is_python_operator(op_type: str) -> bool:
     return False
 
 
+def _iter_attribute_graphs(attribute: Any) -> Any:
+    """Yield graph values declared by an ONNX attribute."""
+    yield from attribute.graphs
+    try:
+        if attribute.HasField("g"):
+            yield attribute.g
+    except (ValueError, AttributeError):  # pragma: no cover - proto edge case
+        pass
+
+
 def _iter_graph_nodes(graph: Any) -> Any:
     """Yield every node in an ONNX graph or function, recursing into subgraphs."""
     for node in graph.node:
         yield node
         for attribute in node.attribute:
-            subgraphs = list(attribute.graphs)
-            try:
-                if attribute.HasField("g"):
-                    subgraphs.append(attribute.g)
-            except (ValueError, AttributeError):  # pragma: no cover - proto edge case
-                pass
-            for subgraph in subgraphs:
+            for subgraph in _iter_attribute_graphs(attribute):
                 yield from _iter_graph_nodes(subgraph)
 
 
 def _iter_model_graphs(model: Any) -> Any:
     """Yield graph-bearing ONNX model fields that may declare operators."""
     yield model.graph
-    yield from getattr(model, "functions", [])
+    for function in getattr(model, "functions", []):
+        yield function
+        for attribute in getattr(function, "attribute_proto", []):
+            yield from _iter_attribute_graphs(attribute)
     for training_info in getattr(model, "training_info", []):
         yield training_info.initialization
         yield training_info.algorithm
