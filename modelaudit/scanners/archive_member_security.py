@@ -118,7 +118,7 @@ class PythonArchiveMemberParseError(Exception):
 _AliasValue = frozenset[str] | None
 _AliasScope = dict[str, _AliasValue]
 _AliasScopes = list[_AliasScope]
-_MISSING_ALIAS = object()
+_GLOBALS_MAPPING_ALIAS = "<globals mapping>"
 
 
 def is_executable_archive_member_name(member_name: str) -> bool:
@@ -221,6 +221,19 @@ def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str]
     return frozenset(f"{resolved_head}.{suffix}" for resolved_head in resolved_heads)
 
 
+def _normalize_implicit_builtins_names(
+    names: frozenset[str] | None, alias_scopes: _AliasScopes
+) -> frozenset[str] | None:
+    if names is None or _resolve_aliases("__builtins__", alias_scopes) != frozenset({"__builtins__"}):
+        return names
+    return frozenset(
+        f"builtins{name.removeprefix('__builtins__')}"
+        if name == "__builtins__" or name.startswith("__builtins__.")
+        else name
+        for name in names
+    )
+
+
 _MAX_STATIC_STRING_LENGTH = 1024
 _MAX_STATIC_STRING_PARTS = 256
 
@@ -277,7 +290,29 @@ def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> fr
         return None
 
     resolved_helper_names = _apply_aliases(helper_name, alias_scopes)
-    if resolved_helper_names is None or not (resolved_helper_names & {"getattr", "builtins.getattr"}):
+    if resolved_helper_names is None:
+        return None
+
+    normalized_helper_names: set[str] = set()
+    for resolved_helper_name in resolved_helper_names:
+        while resolved_helper_name.endswith(".__call__"):
+            resolved_helper_name = resolved_helper_name.removesuffix(".__call__")
+        normalized_helper_names.add(resolved_helper_name)
+
+    accessor_names = frozenset(
+        normalized_helper_name.removesuffix(".__getattribute__")
+        for normalized_helper_name in normalized_helper_names
+        if normalized_helper_name.endswith(".__getattribute__")
+    )
+    if accessor_names:
+        if len(node.args) != 1 or node.keywords:
+            return None
+        attr_name = _resolve_static_string(node.args[0])
+        if attr_name is None:
+            return None
+        return frozenset(f"{target_root}.{attr_name}" for target_root in accessor_names)
+
+    if not (normalized_helper_names & {"getattr", "builtins.getattr"}):
         return None
 
     target_root_node: ast.AST | None = node.args[0] if node.args else None
@@ -291,15 +326,11 @@ def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> fr
     if target_root_node is None or attr_name_node is None:
         return None
 
-    target_root = _resolve_call_name(target_root_node)
-    if target_root is None:
-        return None
-
     attr_name = _resolve_static_string(attr_name_node)
     if attr_name is None:
         return None
 
-    resolved_target_roots = _apply_aliases(target_root, alias_scopes)
+    resolved_target_roots = _resolve_static_reference_names(target_root_node, alias_scopes)
     if resolved_target_roots is None:
         return None
     return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
@@ -311,12 +342,31 @@ def _resolve_namespace_mapping_roots(node: ast.AST, alias_scopes: _AliasScopes) 
     if implicit_builtins_roots is not None:
         return implicit_builtins_roots
 
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and len(node.args) == 2
+        and not node.keywords
+    ):
+        fallback_roots = _resolve_namespace_mapping_roots(node.args[1], alias_scopes)
+        if fallback_roots is not None:
+            return fallback_roots
+
+    if isinstance(node, ast.Attribute) and node.attr == "__dict__":
+        nested_roots = _resolve_namespace_mapping_roots(node.value, alias_scopes)
+        if nested_roots is not None:
+            return nested_roots
+
     mapping_name = _resolve_call_name(node)
     if mapping_name is not None:
         resolved_mapping_names = _apply_aliases(mapping_name, alias_scopes)
         if resolved_mapping_names is not None:
             if mapping_name == "__builtins__" and resolved_mapping_names == frozenset({"__builtins__"}):
                 return frozenset({"builtins"})
+            resolved_mapping_names = _normalize_implicit_builtins_names(resolved_mapping_names, alias_scopes)
+            if resolved_mapping_names is None:
+                return None
             namespace_roots = frozenset(
                 name.removesuffix(".__dict__") for name in resolved_mapping_names if name.endswith(".__dict__")
             )
@@ -325,6 +375,9 @@ def _resolve_namespace_mapping_roots(node: ast.AST, alias_scopes: _AliasScopes) 
 
     getattr_names = _resolve_getattr_call_names(node, alias_scopes)
     if getattr_names is not None:
+        getattr_names = _normalize_implicit_builtins_names(getattr_names, alias_scopes)
+        if getattr_names is None:
+            return None
         namespace_roots = frozenset(
             name.removesuffix(".__dict__") for name in getattr_names if name.endswith(".__dict__")
         )
@@ -344,7 +397,30 @@ def _resolve_namespace_mapping_roots(node: ast.AST, alias_scopes: _AliasScopes) 
         return None
 
     target_root = _resolve_call_name(node.args[0])
-    return _apply_aliases(target_root, alias_scopes) if target_root is not None else None
+    resolved_roots = _apply_aliases(target_root, alias_scopes) if target_root is not None else None
+    if resolved_roots is None:
+        return None
+    return _normalize_implicit_builtins_names(resolved_roots, alias_scopes)
+
+
+def _resolve_globals_mapping_alias(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    """Resolve an unshadowed ``globals()`` call or a statically bound alias to it."""
+    if isinstance(node, ast.Call):
+        if node.args or node.keywords:
+            return None
+        helper_name = _resolve_call_name(node.func)
+        resolved_helpers = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
+        if resolved_helpers is not None and resolved_helpers & {"globals", "builtins.globals"}:
+            return frozenset({_GLOBALS_MAPPING_ALIAS})
+        return None
+
+    reference_name = _resolve_call_name(node)
+    if reference_name is None:
+        return None
+    resolved_names = _apply_aliases(reference_name, alias_scopes)
+    if resolved_names is not None and _GLOBALS_MAPPING_ALIAS in resolved_names:
+        return frozenset({_GLOBALS_MAPPING_ALIAS})
+    return None
 
 
 def _resolve_globals_builtins_mapping_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
@@ -370,15 +446,11 @@ def _resolve_globals_builtins_mapping_roots(node: ast.AST, alias_scopes: _AliasS
     else:
         return None
 
-    if _resolve_static_string(key_node) != "__builtins__" or not isinstance(mapping_node, ast.Call):
+    if _resolve_static_string(key_node) != "__builtins__":
         return None
-    if mapping_node.args or mapping_node.keywords:
+    if _resolve_aliases("__builtins__", alias_scopes[:1]) != frozenset({"__builtins__"}):
         return None
-    helper_name = _resolve_call_name(mapping_node.func)
-    if helper_name is None:
-        return None
-    resolved_helpers = _apply_aliases(helper_name, alias_scopes)
-    if resolved_helpers is None or not (resolved_helpers & {"globals", "builtins.globals"}):
+    if _resolve_globals_mapping_alias(mapping_node, alias_scopes) is None:
         return None
     return frozenset({"builtins"})
 
@@ -388,8 +460,9 @@ def _resolve_namespace_mapping_lookup_names(node: ast.AST, alias_scopes: _AliasS
     if isinstance(node, ast.Attribute) and node.attr == "__call__":
         return _resolve_namespace_mapping_lookup_names(node.value, alias_scopes)
 
-    mapping_node: ast.AST
+    mapping_node: ast.AST | None = None
     key_node: ast.AST
+    resolved_roots: frozenset[str] | None = None
     if isinstance(node, ast.Subscript):
         mapping_node = node.value
         key_node = node.slice
@@ -406,14 +479,36 @@ def _resolve_namespace_mapping_lookup_names(node: ast.AST, alias_scopes: _AliasS
             return None
         mapping_node = node.func.value
         key_node = node.args[0]
+    elif isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords:
+        getitem_names = _resolve_getattr_call_names(node.func, alias_scopes)
+        if getitem_names is None:
+            return None
+        resolved_roots = frozenset(
+            name.removesuffix(".__getitem__") for name in getitem_names if name.endswith(".__getitem__")
+        )
+        if not resolved_roots:
+            return None
+        key_node = node.args[0]
     else:
         return None
 
-    resolved_roots = _resolve_namespace_mapping_roots(mapping_node, alias_scopes)
+    if resolved_roots is None and mapping_node is not None:
+        resolved_roots = _resolve_namespace_mapping_roots(mapping_node, alias_scopes)
+    default_names: frozenset[str] | None = None
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and len(node.args) == 2
+    ):
+        default_names = _resolve_static_reference_names(node.args[1], alias_scopes)
     key = _resolve_static_string(key_node)
     if resolved_roots is None or key is None:
-        return None
-    return frozenset(f"{resolved_root}.{key}" for resolved_root in resolved_roots)
+        return default_names
+    resolved_names = frozenset(f"{resolved_root}.{key}" for resolved_root in resolved_roots)
+    if default_names is not None:
+        resolved_names = resolved_names | default_names
+    return resolved_names
 
 
 def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
@@ -421,17 +516,24 @@ def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -
     if call_name is not None:
         resolved_names = _apply_aliases(call_name, alias_scopes)
         if call_name == "__builtins__" and resolved_names == frozenset({"__builtins__"}):
-            return frozenset({"builtins.__dict__"})
-        return resolved_names
+            return frozenset({"builtins", "builtins.__dict__"})
+        return _normalize_implicit_builtins_names(resolved_names, alias_scopes)
     getattr_names = _resolve_getattr_call_names(node, alias_scopes)
     if getattr_names is not None:
-        return getattr_names
+        return _normalize_implicit_builtins_names(getattr_names, alias_scopes)
+    if isinstance(node, ast.Attribute):
+        attribute_roots = _resolve_namespace_mapping_roots(node.value, alias_scopes)
+        if attribute_roots is not None:
+            return frozenset(f"{root}.{node.attr}" for root in attribute_roots)
     mapping_lookup_names = _resolve_namespace_mapping_lookup_names(node, alias_scopes)
     if mapping_lookup_names is not None:
         return mapping_lookup_names
     mapping_roots = _resolve_namespace_mapping_roots(node, alias_scopes)
     if mapping_roots is not None:
-        return frozenset(f"{root}.__dict__" for root in mapping_roots)
+        return frozenset(name for root in mapping_roots for name in (root, f"{root}.__dict__"))
+    globals_mapping_alias = _resolve_globals_mapping_alias(node, alias_scopes)
+    if globals_mapping_alias is not None:
+        return globals_mapping_alias
     return None
 
 
@@ -469,6 +571,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
         self.alias_scopes[-1][name] = resolved_names
+
+    def _push_alias_scope(self, scope: _AliasScope | None = None) -> None:
+        self.alias_scopes.append(scope if scope is not None else {})
+
+    def _pop_alias_scope(self) -> None:
+        self.alias_scopes.pop()
 
     def _bind_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         if isinstance(target, ast.Name):
@@ -526,17 +634,17 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self._record_import(alias, f"{node.module}.{alias.name}")
 
     def _visit_child_scope(self, body: list[ast.stmt]) -> None:
-        self.alias_scopes.append({})
+        self._push_alias_scope()
         try:
             for statement in body:
                 self.visit(statement)
         finally:
-            self.alias_scopes.pop()
+            self._pop_alias_scope()
 
     def _visit_conditional_branch(self, body: list[ast.stmt]) -> _AliasScope:
         branch_scope: _AliasScope = {}
         parent_is_class_scope = id(self.alias_scopes[-1]) in self._class_scope_ids
-        self.alias_scopes.append(branch_scope)
+        self._push_alias_scope(branch_scope)
         if parent_is_class_scope:
             self._class_scope_ids.add(id(branch_scope))
         try:
@@ -546,7 +654,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         finally:
             if parent_is_class_scope:
                 self._class_scope_ids.discard(id(branch_scope))
-            self.alias_scopes.pop()
+            self._pop_alias_scope()
 
     @staticmethod
     def _constant_bool(node: ast.AST) -> bool | None:
@@ -568,7 +676,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         current_scope = self.alias_scopes[-1]
         branch_names = {name for scope in branch_scopes for name in scope}
         for name in branch_names:
-            base_value = current_scope.get(name, _MISSING_ALIAS)
+            implicit_builtins = name == "__builtins__" and len(self.alias_scopes) == 1
+            base_value = current_scope.get(name, frozenset({name}) if implicit_builtins else None)
             values = [scope.get(name, base_value) for scope in branch_scopes]
             concrete_aliases = frozenset(alias for value in values if isinstance(value, frozenset) for alias in value)
             if concrete_aliases:
@@ -587,14 +696,14 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _visit_class_scope(self, body: list[ast.stmt]) -> None:
         class_scope: _AliasScope = {}
-        self.alias_scopes.append(class_scope)
+        self._push_alias_scope(class_scope)
         self._class_scope_ids.add(id(class_scope))
         try:
             for statement in body:
                 self.visit(statement)
         finally:
             self._class_scope_ids.discard(id(class_scope))
-            self.alias_scopes.pop()
+            self._pop_alias_scope()
 
     def _visit_function_scope(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         for decorator in node.decorator_list:
@@ -604,12 +713,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 self.visit(default)
         if node.returns is not None:
             self.visit(node.returns)
-        self.alias_scopes.append({})
+        self._push_alias_scope()
         try:
             self._bind_arguments(node.args)
             self._visit_child_scope_without_class_locals(node.body)
         finally:
-            self.alias_scopes.pop()
+            self._pop_alias_scope()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._visit_function_scope(node)
@@ -633,12 +742,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for default in [*node.args.defaults, *node.args.kw_defaults]:
             if default is not None:
                 self.visit(default)
-        self.alias_scopes.append({})
+        self._push_alias_scope()
         try:
             self._bind_arguments(node.args)
             self.visit(node.body)
         finally:
-            self.alias_scopes.pop()
+            self._pop_alias_scope()
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
@@ -675,7 +784,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             return
 
         body_scope: _AliasScope = {}
-        self.alias_scopes.append(body_scope)
+        self._push_alias_scope(body_scope)
         try:
             self._shadow_binding_target(node.target)
             self.visit(node.target)
@@ -683,7 +792,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 self.visit(statement)
             body_scope = dict(body_scope)
         finally:
-            self.alias_scopes.pop()
+            self._pop_alias_scope()
         branch_scopes = [body_scope]
         if iter_truth is not True:
             branch_scopes.append({})
@@ -734,7 +843,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if handler.type is not None:
                 self.visit(handler.type)
             branch_scope: _AliasScope = {}
-            self.alias_scopes.append(branch_scope)
+            self._push_alias_scope(branch_scope)
             try:
                 if handler.name is not None:
                     self._bind_name(handler.name, None)
@@ -742,7 +851,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     self.visit(statement)
                 branch_scope = dict(branch_scope)
             finally:
-                self.alias_scopes.pop()
+                self._pop_alias_scope()
             branch_scopes.append(branch_scope)
         self._merge_conditional_branch_scopes(branch_scopes)
         for statement in node.finalbody:

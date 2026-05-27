@@ -239,6 +239,15 @@ def test_scan_zip_flags_concatenated_getattr_name_dangerous_python_member(tmp_pa
         "import os\nnamespace = vars(os)\nnamespace.get('sys' + 'tem')('echo hidden')\n",
         "import os\ngetattr(os, '__dict__')['sys' + 'tem']('echo hidden')\n",
         "import os\nos.__getattribute__('sys' + 'tem')('echo hidden')\n",
+        "import os\nlookup = os.__getattribute__\nlookup('sys' + 'tem')('echo hidden')\n",
+        "import os\nlookup = os.__getattribute__\nlookup.__call__('sys' + 'tem')('echo hidden')\n",
+        "import os\nlookup = os.__getattribute__.__call__.__call__\nlookup('sys' + 'tem')('echo hidden')\n",
+        "import os\nos.__dict__.get('not_present', os.system)('echo hidden')\n",
+        "import os\nname = 'not_present'\nos.__dict__.get(name, os.system)('echo hidden')\n",
+        "import os\nos.__dict__.get('not_present', os.__dict__)['sys' + 'tem']('echo hidden')\n",
+        "import os\nrunner = os.system\nos.__dict__['system'] = print\nrunner('echo hidden')\n",
+        "import os\nos.system = getattr\nos.system(os, 'popen')('echo hidden')\n",
+        "import os\nos.__dict__['system'] = vars\nos.__dict__['system'](os)['popen']('echo hidden')\n",
     ],
 )
 def test_scan_zip_flags_namespace_mapping_dangerous_python_member(tmp_path: Path, source: str) -> None:
@@ -290,6 +299,12 @@ def test_scan_zip_ignores_shadowed_namespace_mapping_helper(tmp_path: Path) -> N
         "__builtins__['ev' + 'al']('1 + 1')\n",
         "__builtins__.get('ev' + 'al')('1 + 1')\n",
         "namespace = __builtins__\nnamespace['ev' + 'al']('1 + 1')\n",
+        "__builtins__.__dict__['ev' + 'al']('1 + 1')\n",
+        "vars(__builtins__)['ev' + 'al']('1 + 1')\n",
+        "__builtins__.eval('1 + 1')\n",
+        "getattr(__builtins__, 'ev' + 'al')('1 + 1')\n",
+        "namespace = __builtins__\nnamespace.eval('1 + 1')\n",
+        "flag = False\nif flag:\n    __builtins__ = {'eval': print}\n__builtins__['ev' + 'al']('1 + 1')\n",
     ],
 )
 def test_scan_zip_flags_implicit_builtins_mapping_dangerous_python_member(tmp_path: Path, source: str) -> None:
@@ -328,6 +343,13 @@ def test_scan_zip_ignores_shadowed_implicit_builtins_mapping(tmp_path: Path) -> 
         "globals()['__builtins__']['ev' + 'al']('1 + 1')\n",
         "globals().get('__builtins__').get('ev' + 'al')('1 + 1')\n",
         "namespace = globals()['__builtins__']\nnamespace['ev' + 'al']('1 + 1')\n",
+        "globals()['__builtins__'].__dict__['ev' + 'al']('1 + 1')\n",
+        "globals()['__builtins__'].eval('1 + 1')\n",
+        "getattr(globals()['__builtins__'], 'ev' + 'al')('1 + 1')\n",
+        "getattr(globals()['__builtins__'], '__getitem__')('ev' + 'al')('1 + 1')\n",
+        "namespace = globals()['__builtins__']\nnamespace.eval('1 + 1')\n",
+        "namespace = globals()\nnamespace['__builtins__']['ev' + 'al']('1 + 1')\n",
+        "def run():\n    __builtins__ = {'eval': print}\n    globals()['__builtins__']['eval']('1 + 1')\nrun()\n",
     ],
 )
 def test_scan_zip_flags_globals_builtins_mapping_dangerous_python_member(tmp_path: Path, source: str) -> None:
@@ -347,9 +369,15 @@ def test_scan_zip_flags_globals_builtins_mapping_dangerous_python_member(tmp_pat
     assert python_checks[0].details["reason"] == "high-risk calls: builtins.eval"
 
 
-def test_scan_zip_ignores_shadowed_globals_builtins_mapping(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "source",
+    [
+        "globals = lambda: {'__builtins__': {'eval': print}}\nglobals()['__builtins__']['eval']('safe')\n",
+        "__builtins__ = {'eval': print}\nglobals()['__builtins__']['eval']('safe')\n",
+    ],
+)
+def test_scan_zip_ignores_shadowed_globals_builtins_mapping(tmp_path: Path, source: str) -> None:
     archive_path = tmp_path / "model_bundle.zip"
-    source = "globals = lambda: {'__builtins__': {'eval': print}}\nglobals()['__builtins__']['eval']('safe')\n"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
 
@@ -357,6 +385,78 @@ def test_scan_zip_ignores_shadowed_globals_builtins_mapping(tmp_path: Path) -> N
 
     assert not any(
         check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_zip_ignores_conditionally_bound_local_namespace_without_global_fallback(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "def run(flag, safe):\n    if flag:\n        os = safe\n    os.system('safe')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_zip_ignores_conditionally_bound_local_builtins_without_global_fallback(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "def run(flag):\n    if flag:\n        __builtins__ = {'eval': print}\n    __builtins__['eval']('safe')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "import os\n"
+            "namespace = os.__dict__\n"
+            "namespace['system'] = print\n"
+            "namespace['system'] = os.system\n"
+            "namespace['system']('echo hidden')\n"
+        ),
+        (
+            "import os\n"
+            "namespace = os.__dict__\n"
+            "namespace['system'] = print\n"
+            "for _ in (1,):\n"
+            "    namespace['system'] = os.system\n"
+            "namespace['system']('echo hidden')\n"
+        ),
+        (
+            "import os\n"
+            "namespace = os.__dict__\n"
+            "namespace['system'] = print\n"
+            "class Rebind:\n"
+            "    namespace['system'] = os.system\n"
+            "namespace['system']('echo hidden')\n"
+        ),
+        "import os\nos.__dict__['system'] = print\nos.system = os.popen\nos.system('echo hidden')\n",
+        "import os\nfor _ in (1,):\n    break\n    os.system = print\nos.system('echo hidden')\n",
+        "import os\nfor _ in (1,):\n    continue\n    os.__dict__['system'] = print\nos.system('echo hidden')\n",
+    ],
+)
+def test_scan_zip_flags_namespace_member_rebound_to_dangerous_callable(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert any(
+        check.name == "Python Archive Member Security"
+        and check.status == CheckStatus.FAILED
+        and check.details["reason"] == "high-risk calls: os.system"
+        for check in result.checks
     )
 
 
