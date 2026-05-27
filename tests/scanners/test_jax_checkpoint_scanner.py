@@ -11,7 +11,10 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
-from modelaudit.utils.file.detection import JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES
+from modelaudit.utils.file.detection import (
+    JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+)
 
 
 def _write_orbax_metadata(checkpoint_dir: Path, metadata: dict[str, object]) -> None:
@@ -610,6 +613,7 @@ def test_truncated_large_pickle_prefix_keeps_dangerous_global_without_scan_error
         + b"\x93"
         + b"0"
         + _proto4_binunicode("a" * 4096)
+        + b"."
     )
     pickle_path.write_bytes(payload)
 
@@ -635,10 +639,19 @@ def test_truncated_large_pickle_prefix_keeps_dangerous_global_without_scan_error
     )
     assert all(check.name != "Pickle Checkpoint Scan" for check in result.checks)
 
+    aggregate = scan_model_directory_or_file(
+        str(pickle_path),
+        cache_scan_results=False,
+        jax_pickle_max_scan_bytes=1024,
+    )
+    assert determine_exit_code(aggregate) == 1
+    assert aggregate.file_metadata[str(pickle_path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_pickle_scan_limit_exceeded" in aggregate.file_metadata[str(pickle_path)]["scan_outcome_reasons"]
+
 
 def test_truncated_benign_large_pickle_prefix_does_not_emit_scan_error(tmp_path: Path) -> None:
     pickle_path = tmp_path / "truncated_benign_prefix.pickle"
-    payload = b"\x80\x04" + _proto4_short_unicode("jax") + b"0" + _proto4_binunicode("safe" * 1024)
+    payload = b"\x80\x04" + _proto4_short_unicode("jax") + b"0" + _proto4_binunicode("safe" * 1024) + b"."
     pickle_path.write_bytes(payload)
 
     scanner = JaxCheckpointScanner(config={"jax_pickle_max_scan_bytes": 1024})
@@ -658,6 +671,12 @@ def test_truncated_benign_large_pickle_prefix_does_not_emit_scan_error(tmp_path:
     )
     assert all(
         check.name != "Pickle Opcode Security Check" or check.status != CheckStatus.FAILED for check in result.checks
+    )
+    _assert_file_inconclusive_not_cached(
+        pickle_path,
+        "jax_pickle_scan_limit_exceeded",
+        tmp_path / "pickle-prefix-cache",
+        jax_pickle_max_scan_bytes=1024,
     )
 
 
@@ -784,6 +803,7 @@ def test_oversized_renamed_jax_json_checkpoint_fails_closed_without_routing_ajax
     assert any(
         check.name == "JSON Checkpoint Analysis Limit"
         and check.status == CheckStatus.FAILED
+        and check.message == "JSON checkpoint analysis incomplete because the file exceeds the bounded parsing limit"
         and check.details["analysis_incomplete"] is True
         for check in result.checks
     )
@@ -792,6 +812,22 @@ def test_oversized_renamed_jax_json_checkpoint_fails_closed_without_routing_ajax
         "jax_json_checkpoint_analysis_size_limit",
         tmp_path / "json-size-cache",
     )
+
+
+def test_renamed_jax_json_with_root_after_routing_budget_fails_closed(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "late-root.jpg"
+    checkpoint_path.write_text(
+        (" " * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1)) + json.dumps({"framework": "jax"}),
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_json_checkpoint_analysis_size_limit" in result.metadata["scan_outcome_reasons"]
 
 
 def test_zero_max_file_size_config_does_not_flag_small_json_checkpoint_as_too_large(tmp_path: Path) -> None:
@@ -1242,7 +1278,7 @@ def test_pickle_opcode_parse_failure_is_inconclusive_not_security_finding(
     )
 
 
-def test_object_numpy_file_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
+def test_object_numpy_file_is_inconclusive(tmp_path: Path) -> None:
     np = pytest.importorskip("numpy")
     checkpoint_path = tmp_path / "jax_object.ckpt"
     with checkpoint_path.open("wb") as checkpoint_file:
@@ -1263,7 +1299,7 @@ def test_object_numpy_file_is_inconclusive_and_not_cached(tmp_path: Path) -> Non
     )
 
 
-def test_numpy_dependency_unavailable_is_inconclusive_and_not_cached(
+def test_numpy_dependency_unavailable_is_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
