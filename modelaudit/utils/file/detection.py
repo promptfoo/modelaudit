@@ -2037,6 +2037,8 @@ def _probe_jax_json_checkpoint_file(file_path: Path) -> bool | None:
         payload = json.loads(prefix.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
+            # A visible non-JAX value cannot prove the unseen tail has no later
+            # JAX identity field; preserve bounded ambiguity instead of skipping.
             return None
         return False
     return _has_jax_json_checkpoint_structure(payload)
