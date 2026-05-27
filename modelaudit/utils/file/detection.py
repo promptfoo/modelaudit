@@ -1891,6 +1891,7 @@ def _classify_tensorflow_field_two_payload(
         ):
             savedmodel_signal = True
     except (DecodeError, ValueError, TypeError, AttributeError):
+        # Invalid MetaGraph wrappers can still be valid GraphDef payloads.
         pass
     try:
         graph_def = GraphDef()
@@ -1900,6 +1901,7 @@ def _classify_tensorflow_field_two_payload(
                 return "tf_savedmodel"
             return "tf_metagraph"
     except Exception:
+        # GraphDef parsing is opportunistic; preserve SavedModel or unknown fallback.
         pass
     return "tf_savedmodel" if savedmodel_signal else "unknown"
 
