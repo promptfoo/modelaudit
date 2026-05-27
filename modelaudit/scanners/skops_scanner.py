@@ -468,23 +468,25 @@ class SkopsScanner(BaseScanner):
         if self.config.get(SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY):
             return
 
-        from .zip_scanner import ZipScanner
+        from .zip_scanner import KNOWN_UNREADABLE_ARCHIVE_ENTRIES_CONFIG_KEY, ZipScanner
 
         nested_config = dict(self.config)
         unreadable_entries = result.metadata.get(self._UNREADABLE_ENTRY_METADATA_KEY, ())
-        skipped_entries = (
+        known_unreadable_entries = (
             {entry for entry in unreadable_entries if isinstance(entry, str)}
             if isinstance(unreadable_entries, list)
             else set()
         )
 
-        if skipped_entries:
+        if known_unreadable_entries:
+            skipped_entries = set(known_unreadable_entries)
             configured_entries = nested_config.get("skip_archive_entries", ())
             if isinstance(configured_entries, str):
                 skipped_entries.add(configured_entries)
             elif isinstance(configured_entries, (list, tuple, set, frozenset)):
                 skipped_entries.update(entry for entry in configured_entries if isinstance(entry, str))
             nested_config["skip_archive_entries"] = sorted(skipped_entries)
+            nested_config[KNOWN_UNREADABLE_ARCHIVE_ENTRIES_CONFIG_KEY] = sorted(known_unreadable_entries)
 
         existing_reasons = result.metadata.get("scan_outcome_reasons")
         preserved_reasons = (

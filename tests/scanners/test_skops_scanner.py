@@ -1,6 +1,7 @@
 """Tests for SkopsScanner covering CVE-2025-54412, CVE-2025-54413, CVE-2025-54886."""
 
 import os
+import stat
 import textwrap
 import zipfile
 from pathlib import Path
@@ -775,6 +776,44 @@ class TestSkopsScannerEdgeCases:
             for issue in result.issues
         )
         assert determine_exit_code(result) == 1
+
+    def test_unreadable_symlink_member_remains_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A known unreadable symlink must not be reopened by nested ZIP metadata checks."""
+        skops_file = tmp_path / "unreadable_symlink.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            symlink_info = zipfile.ZipInfo("weights_link")
+            symlink_info.create_system = 3
+            symlink_info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            zf.writestr(symlink_info, "safe-target.bin")
+
+        original_open = zipfile.ZipFile.open
+
+        def open_with_failure(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            filename = name.filename if isinstance(name, zipfile.ZipInfo) else name
+            if filename == "weights_link":
+                raise zipfile.BadZipFile("CRC mismatch")
+            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+
+        result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
+
+        metadata = result.file_metadata[str(skops_file)]
+        _assert_inconclusive_reason(metadata, "skops_zip_entry_read_failed")
+        assert not any("Unable to read symlink target" in issue.message for issue in result.issues)
+        assert determine_exit_code(result) == 2
 
     def test_oversized_entry_core_exits_two_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
         """Aggregate scans should preserve fail-closed exit and avoid reusing incomplete outer results."""
