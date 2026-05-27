@@ -31,6 +31,7 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
+from .archive_dispatch import SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY
 from .archive_member_security import is_executable_archive_member_name
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
@@ -41,6 +42,7 @@ from .keras_utils import (
     find_case_insensitive_substrings,
     is_known_safe_keras_layer_class,
 )
+from .zip_scanner import ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY
 
 # CVE-2025-1550: Keras safe_mode bypass via arbitrary module references in config.json
 # Allowlist of top-level module names that are safe in Keras model configs.
@@ -356,17 +358,28 @@ class KerasZipScanner(BaseScanner):
             skip_entry_values = [entry for entry in skip_entries if isinstance(entry, str)]
         else:
             skip_entry_values = []
-        owned_entries = [_KERAS_CONFIG_ENTRY, _KERAS_METADATA_ENTRY]
+        raw_security_only_entries = recursive_config.get(ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY, ())
+        if isinstance(raw_security_only_entries, str):
+            security_only_entries: list[str] = [raw_security_only_entries]
+        elif isinstance(raw_security_only_entries, (list, tuple, set, frozenset)):
+            security_only_entries = [entry for entry in raw_security_only_entries if isinstance(entry, str)]
+        else:
+            security_only_entries = []
+        owned_entries = [_KERAS_CONFIG_ENTRY]
         if skip_weights_entry:
             owned_entries.append(_KERAS_WEIGHTS_ENTRY)
         for owned_entry in owned_entries:
-            if owned_entry not in skip_entry_values:
-                skip_entry_values.append(owned_entry)
+            if owned_entry not in security_only_entries:
+                security_only_entries.append(owned_entry)
         recursive_config["skip_archive_entries"] = skip_entry_values
+        recursive_config[ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY] = security_only_entries
         return recursive_config
 
     def _merge_recursive_archive_scan(self, path: str, result: ScanResult) -> None:
         """Recursively scan every ZIP member through the generic archive scanner."""
+        if self.config.get(SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY):
+            return
+
         from .zip_scanner import ZipScanner
 
         has_embedded_weights_limit = self._has_embedded_weights_limit_reason(result)

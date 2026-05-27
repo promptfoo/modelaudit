@@ -62,6 +62,7 @@ ONNX_STRUCTURE_INCONCLUSIVE_REASON = "onnx_structure_validation_failed"
 ONNX_RAW_DETECTION_INCONCLUSIVE_REASON = "onnx_raw_detection_analysis_incomplete"
 ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
 ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON = "onnx_tentative_candidate_analysis_unavailable"
+ONNX_TENTATIVE_CANDIDATE_PARSE_INCOMPLETE_REASON = "onnx_tentative_candidate_parse_incomplete"
 _PYTHON_OPERATOR_TYPES: frozenset[str] = frozenset(
     {
         "pyfunc",
@@ -112,25 +113,32 @@ def _is_python_operator(op_type: str) -> bool:
     return False
 
 
+def _iter_attribute_graphs(attribute: Any) -> Any:
+    """Yield graph values declared by an ONNX attribute."""
+    yield from attribute.graphs
+    try:
+        if attribute.HasField("g"):
+            yield attribute.g
+    except (ValueError, AttributeError):  # pragma: no cover - proto edge case
+        pass
+
+
 def _iter_graph_nodes(graph: Any) -> Any:
     """Yield every node in an ONNX graph or function, recursing into subgraphs."""
     for node in graph.node:
         yield node
         for attribute in node.attribute:
-            subgraphs = list(attribute.graphs)
-            try:
-                if attribute.HasField("g"):
-                    subgraphs.append(attribute.g)
-            except (ValueError, AttributeError):  # pragma: no cover - proto edge case
-                pass
-            for subgraph in subgraphs:
+            for subgraph in _iter_attribute_graphs(attribute):
                 yield from _iter_graph_nodes(subgraph)
 
 
 def _iter_model_graphs(model: Any) -> Any:
     """Yield graph-bearing ONNX model fields that may declare operators."""
     yield model.graph
-    yield from getattr(model, "functions", [])
+    for function in getattr(model, "functions", []):
+        yield function
+        for attribute in getattr(function, "attribute_proto", []):
+            yield from _iter_attribute_graphs(attribute)
     for training_info in getattr(model, "training_info", []):
         yield training_info.initialization
         yield training_info.algorithm
@@ -307,6 +315,7 @@ class OnnxScanner(BaseScanner):
 
         if not _check_onnx():
             if self._is_tentative_protobuf_route():
+                result.bytes_scanned = file_size
                 result.scanner_name = "unknown"
                 result.metadata["tentative_protobuf_candidate_unanalyzed"] = "onnx_dependency_unavailable"
                 _mark_inconclusive_scan_result(result, ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON)
@@ -375,10 +384,26 @@ class OnnxScanner(BaseScanner):
             # Re-raise keyboard interrupt for graceful shutdown
             raise
         except Exception as e:  # pragma: no cover - unexpected parse errors
+            result.bytes_scanned = file_size
             if self._is_tentative_protobuf_route():
                 result.scanner_name = "unknown"
-                result.metadata["tentative_protobuf_candidate_rejected"] = True
-                result.finish(success=True)
+                result.metadata["tentative_protobuf_candidate_unanalyzed"] = "onnx_parse_failed"
+                _mark_inconclusive_scan_result(result, ONNX_TENTATIVE_CANDIDATE_PARSE_INCOMPLETE_REASON)
+                result.add_check(
+                    name="ONNX Candidate Analysis",
+                    passed=False,
+                    message=f"ONNX tentative candidate parsing failed; analysis incomplete: {e}",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "exception": str(e),
+                        "exception_type": type(e).__name__,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": ONNX_TENTATIVE_CANDIDATE_PARSE_INCOMPLETE_REASON,
+                    },
+                    rule_code="S902",
+                )
+                _finish_scan_result(result)
                 return result
             result.add_check(
                 name="ONNX Model Parsing",

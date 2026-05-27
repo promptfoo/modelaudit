@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from pathlib import Path
 
+from modelaudit.core import scan_file
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, IssueSeverity
 from modelaudit.scanners.coreml_scanner import CoreMLScanner
 from modelaudit.utils.file.detection import (
@@ -583,6 +584,26 @@ def test_coreml_scanner_detects_custom_model_nested_in_pipeline_models(tmp_path:
         and "CoreML custom model class detected" in issue.message
         and issue.details.get("class_name") == "NestedPipelineRuntime"
         and "][1:0][555].className" in issue.details.get("field_path", "")
+        for issue in result.issues
+    )
+
+
+def test_coreml_routing_is_not_stolen_by_tensorflow_content_probe(tmp_path: Path) -> None:
+    model_path = _write_model(
+        tmp_path / "custom_model.mlmodel",
+        _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            custom_model_class="EvilRuntimeModel",
+        ),
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "coreml"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and "CoreML custom model class detected" in issue.message
+        and issue.details.get("class_name") == "EvilRuntimeModel"
         for issue in result.issues
     )
 
