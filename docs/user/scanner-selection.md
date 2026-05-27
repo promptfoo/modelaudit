@@ -48,4 +48,4 @@ for entry in collect_suppressed_preferred_scanners(result.checks):
     print(entry["scanner_id"], entry["location"])
 ```
 
-For remote sources, selective downloads use the enabled scanners' known extensions when it is safe to do so. ModelAudit keeps remote filtering conservative for container and header-routed scanners so extension-spoofed artifacts are not filtered out before download.
+For remote sources, selective downloads use the enabled scanners' known extensions when it is safe to do so. Content-based routing applies after acquisition, so direct file URLs are the reliable path when repository filenames may be intentionally misleading.
