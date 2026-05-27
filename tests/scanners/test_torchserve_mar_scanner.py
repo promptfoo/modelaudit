@@ -269,6 +269,33 @@ def test_scan_flags_name_disguised_executable_extra_file(tmp_path: Path) -> None
     assert core.determine_exit_code(aggregate) == 1
 
 
+def test_scan_prefers_extracted_extra_file_content_over_executable_name(tmp_path: Path) -> None:
+    manifest = {
+        "model": {
+            "handler": "handler.py",
+            "serializedFile": "weights.bin",
+            "extraFiles": "native/payload.exe",
+        },
+    }
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return data\n",
+            "weights.bin": b"weights",
+            "native/payload.exe": b"\x7fELF" + b"\x00" * 64,
+        },
+        filename="content_first_executable_extra_file.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    executable_checks = _failed_checks(result, "TorchServe Executable Extra File Detection")
+    assert len(executable_checks) == 1
+    assert executable_checks[0].rule_code == "S502"
+    assert executable_checks[0].details["entry"] == "native/payload.exe"
+
+
 def test_scan_flags_oversized_named_executable_extra_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -354,6 +381,80 @@ def test_scan_flags_named_executable_extra_file_when_byte_budget_prevents_extrac
     assert executable_checks[0].rule_code == "S502"
     assert len(budget_checks) == 1
     assert "torchserve_mar_uncompressed_budget" in result.metadata["scan_outcome_reasons"]
+    assert core.determine_exit_code(aggregate) == 1
+
+
+def test_scan_flags_named_executable_extra_file_after_byte_budget_stop(tmp_path: Path) -> None:
+    manifest = {
+        "model": {
+            "handler": "handler.py",
+            "serializedFile": "weights.bin",
+            "extraFiles": "native/payload.so",
+        },
+    }
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return data\n"),
+            ("weights.bin", b"weights"),
+            ("native/payload.so", b"compiled sidecar metadata\n"),
+        ],
+        filename="late_budgeted_named_executable_extra_file.mar",
+    )
+    with zipfile.ZipFile(mar_path) as archive:
+        manifest_size = archive.getinfo("MAR-INF/MANIFEST.json").file_size
+
+    result = TorchServeMarScanner(config={"max_mar_uncompressed_bytes": manifest_size}).scan(str(mar_path))
+    aggregate = core.scan_model_directory_or_file(
+        str(mar_path),
+        cache_enabled=False,
+        max_mar_uncompressed_bytes=manifest_size,
+    )
+
+    executable_checks = _failed_checks(result, "TorchServe Executable Extra File Detection")
+    budget_checks = _failed_checks(result, "TorchServe MAR Uncompressed Size Budget")
+    assert len(executable_checks) == 1
+    assert executable_checks[0].rule_code == "S502"
+    assert executable_checks[0].details["entry"] == "native/payload.so"
+    assert len(budget_checks) == 1
+    assert "torchserve_mar_uncompressed_budget" in result.metadata["scan_outcome_reasons"]
+    assert core.determine_exit_code(aggregate) == 1
+
+
+def test_scan_flags_named_executable_extra_file_after_entry_limit(tmp_path: Path) -> None:
+    manifest = {
+        "model": {
+            "handler": "handler.py",
+            "serializedFile": "weights.bin",
+            "extraFiles": "native/payload.so",
+        },
+    }
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return data\n"),
+            ("weights.bin", b"weights"),
+            ("native/payload.so", b"compiled sidecar metadata\n"),
+        ],
+        filename="limited_named_executable_extra_file.mar",
+    )
+
+    result = TorchServeMarScanner(config={"max_mar_entries": 3}).scan(str(mar_path))
+    aggregate = core.scan_model_directory_or_file(
+        str(mar_path),
+        cache_enabled=False,
+        max_mar_entries=3,
+    )
+
+    executable_checks = _failed_checks(result, "TorchServe Executable Extra File Detection")
+    entry_limit_checks = _failed_checks(result, "TorchServe MAR Entry Limit")
+    assert len(executable_checks) == 1
+    assert executable_checks[0].rule_code == "S502"
+    assert executable_checks[0].details["entry"] == "native/payload.so"
+    assert len(entry_limit_checks) == 1
+    assert "torchserve_mar_entry_limit" in result.metadata["scan_outcome_reasons"]
     assert core.determine_exit_code(aggregate) == 1
 
 

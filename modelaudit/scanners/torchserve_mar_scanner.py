@@ -1406,6 +1406,30 @@ class TorchServeMarScanner(BaseScanner):
             details={"entry": member_name, "manifest_field": "extraFiles"},
         )
 
+    @classmethod
+    def _add_skipped_named_executable_extra_file_findings(
+        cls,
+        result: ScanResult,
+        *,
+        archive_path: str,
+        member_infos: list[zipfile.ZipInfo],
+        extra_file_refs: set[str],
+    ) -> None:
+        for member_info in member_infos:
+            member_name = member_info.filename
+            normalized_member = cls._normalize_member_name(member_name)
+            if not member_name or member_name.endswith("/") or normalized_member not in extra_file_refs:
+                continue
+
+            rule_code = executable_archive_member_name_rule_code(normalized_member)
+            if rule_code is not None:
+                cls._add_executable_extra_file_finding(
+                    result,
+                    archive_path=archive_path,
+                    member_name=member_name,
+                    rule_code=rule_code,
+                )
+
     def _scan_archive_members(
         self,
         archive_path: str,
@@ -1460,6 +1484,12 @@ class TorchServeMarScanner(BaseScanner):
             )
             mark_inconclusive_scan_result(result, "torchserve_mar_entry_limit")
             entries_to_process = member_infos[: self.max_entries]
+            self._add_skipped_named_executable_extra_file_findings(
+                result,
+                archive_path=archive_path,
+                member_infos=member_infos[self.max_entries :],
+                extra_file_refs=extra_file_refs,
+            )
         else:
             result.add_check(
                 name="TorchServe MAR Entry Limit",
@@ -1473,7 +1503,7 @@ class TorchServeMarScanner(BaseScanner):
         processed_uncompressed = 0
         analyzable_member_lookup: dict[str, list[zipfile.ZipInfo]] = {}
         requirements_member_lookup = self._build_requirements_member_lookup(member_infos)
-        for member_info in entries_to_process:
+        for member_index, member_info in enumerate(entries_to_process):
             self.check_interrupted()
 
             member_name = member_info.filename
@@ -1517,13 +1547,12 @@ class TorchServeMarScanner(BaseScanner):
                     },
                 )
                 mark_inconclusive_scan_result(result, "torchserve_mar_uncompressed_budget")
-                if named_executable_rule_code is not None:
-                    self._add_executable_extra_file_finding(
-                        result,
-                        archive_path=archive_path,
-                        member_name=member_name,
-                        rule_code=named_executable_rule_code,
-                    )
+                self._add_skipped_named_executable_extra_file_findings(
+                    result,
+                    archive_path=archive_path,
+                    member_infos=entries_to_process[member_index:],
+                    extra_file_refs=extra_file_refs,
+                )
                 break
 
             if member_info.compress_size > 0:
