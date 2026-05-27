@@ -252,6 +252,89 @@ def test_openvino_scanner_custom_layer(tmp_path: Path) -> None:
     assert all(i.severity == IssueSeverity.CRITICAL for i in security_issues)
 
 
+def test_openvino_scanner_detects_namespaced_custom_layer(tmp_path: Path) -> None:
+    xml_path = tmp_path / "namespaced.xml"
+    xml_path.write_text(
+        """
+        <net xmlns='urn:openvino-test' version='10'>
+          <layers>
+            <layer id='1' name='evil' type='Python' library='evil.so'/>
+          </layers>
+        </net>
+        """,
+        encoding="utf-8",
+    )
+    (tmp_path / "namespaced.bin").write_bytes(b"\x00")
+
+    direct = OpenVinoScanner().scan(str(xml_path))
+    aggregate = scan_model_directory_or_file(str(xml_path), cache_scan_results=False)
+
+    assert OpenVinoScanner.can_handle(str(xml_path)) is True
+    assert any(check.name == "Suspicious Layer Type Detection" for check in direct.checks)
+    assert any(check.name == "External Library Reference Check" for check in direct.checks)
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_openvino_scanner_allows_benign_namespaced_layer(tmp_path: Path) -> None:
+    xml_path = tmp_path / "benign-namespaced.xml"
+    xml_path.write_text(
+        """
+        <net xmlns='urn:openvino-test' version='10'>
+          <layers>
+            <layer id='0' name='data' type='Input'/>
+          </layers>
+        </net>
+        """,
+        encoding="utf-8",
+    )
+    (tmp_path / "benign-namespaced.bin").write_bytes(b"\x00")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert result.success is True
+    assert not any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in result.checks)
+
+
+def test_openvino_scanner_detects_layer_in_namespace_distinct_from_root(tmp_path: Path) -> None:
+    xml_path = tmp_path / "mixed-namespaces.xml"
+    xml_path.write_text(
+        """
+        <net xmlns:custom='urn:untrusted-layer' version='10'>
+          <layers>
+            <custom:layer id='1' name='evil' type='Python' library='evil.so'/>
+          </layers>
+        </net>
+        """,
+        encoding="utf-8",
+    )
+    (tmp_path / "mixed-namespaces.bin").write_bytes(b"\x00")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert any(check.name == "Suspicious Layer Type Detection" for check in result.checks)
+    assert any(check.name == "External Library Reference Check" for check in result.checks)
+
+
+def test_openvino_scanner_detects_mixed_case_namespaced_layer(tmp_path: Path) -> None:
+    xml_path = tmp_path / "mixed-case-layer.xml"
+    xml_path.write_text(
+        """
+        <net xmlns:custom='urn:untrusted-layer' version='10'>
+          <layers>
+            <custom:Layer id='1' name='evil' type='Python' library='evil.so'/>
+          </layers>
+        </net>
+        """,
+        encoding="utf-8",
+    )
+    (tmp_path / "mixed-case-layer.bin").write_bytes(b"\x00")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert any(check.name == "Suspicious Layer Type Detection" for check in result.checks)
+    assert any(check.name == "External Library Reference Check" for check in result.checks)
+
+
 def test_openvino_scanner_respects_configured_file_size_limit(tmp_path: Path) -> None:
     """scan() should fail closed before parsing XML that exceeds max_file_read_size."""
     xml_path = create_basic_model(tmp_path)

@@ -29,6 +29,18 @@ def test_cntk_scanner_can_handle_cntkv2_signature(tmp_path: Path) -> None:
     assert CntkScanner.can_handle(str(path))
 
 
+def test_cntk_scanner_can_handle_signature_with_misleading_suffix(tmp_path: Path) -> None:
+    path = tmp_path / "renamed.jpg"
+    _write_cntkv2(path, payload=b" inputs outputs ")
+    assert CntkScanner.can_handle(str(path))
+
+
+def test_cntk_scanner_rejects_renamed_structure_near_match(tmp_path: Path) -> None:
+    path = tmp_path / "near_match.jpg"
+    _write_cntkv2(path, payload=b" inputs outputs ", include_structure=False)
+    assert not CntkScanner.can_handle(str(path))
+
+
 def test_cntk_scanner_rejects_misnamed_non_cntk_file(tmp_path: Path) -> None:
     path = tmp_path / "not_cntk.dnn"
     path.write_text("plain text that should not match CNTK signatures")

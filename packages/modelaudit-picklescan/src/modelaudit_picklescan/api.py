@@ -14,7 +14,9 @@ from .call_graph import (
     CallGraphFinding,
     StartupHookWriteFinding,
     UnanalyzedCallGraphReference,
+    _begin_shared_source_report,
     _CallGraphAnalysisLimitError,
+    _ensure_shared_source_snapshot_stable,
     find_dangerous_call_graphs,
     find_startup_hook_write_call_graphs,
     find_unanalyzed_callable_call_graph_references,
@@ -1008,9 +1010,10 @@ def _report_from_native_dict(raw_report: Mapping[str, Any]) -> PickleReport:
 def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     import_references = report.metadata.get("import_references")
     callable_invocations = report.metadata.get("callable_invocations", ())
-    call_graph_limit_exceeded = has_unanalyzed_call_graph_import_references(import_references)
     enrichment_errors: list[tuple[str, Exception]] = []
     with shared_source_sensitive_caches():
+        report_generation = _begin_shared_source_report()
+        call_graph_limit_exceeded = has_unanalyzed_call_graph_import_references(import_references)
         try:
             call_graph_findings = find_dangerous_call_graphs(import_references, callable_invocations)
         except _CallGraphAnalysisLimitError as error:
@@ -1035,6 +1038,10 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         except Exception as error:
             unanalyzed_references = ()
             enrichment_errors.append(("python_call_graph_source_unavailable", error))
+        try:
+            _ensure_shared_source_snapshot_stable(report_generation)
+        except _CallGraphAnalysisLimitError as error:
+            enrichment_errors.append(("python_call_graph_source_stability", error))
 
     updated_report = (
         _with_unanalyzed_call_graph_notices(report, unanalyzed_references) if unanalyzed_references else report
