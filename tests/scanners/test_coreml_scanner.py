@@ -155,6 +155,23 @@ def test_coreml_scanner_benign_model(tmp_path: Path) -> None:
     assert detect_format_from_extension(str(safe_model_path)) == "coreml"
 
 
+def test_coreml_can_handle_stat_failure_for_owned_extension(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = _write_model(
+        tmp_path / "unreadable.mlmodel",
+        _build_model(description=_build_description(metadata=_build_metadata())),
+    )
+
+    def raise_os_error(_path: str) -> int:
+        raise OSError("simulated CoreML stat failure")
+
+    monkeypatch.setattr("modelaudit.scanners.coreml_scanner.os.path.getsize", raise_os_error)
+
+    assert CoreMLScanner.can_handle(str(model_path)) is True
+
+
 def test_coreml_unavailable_read_is_inconclusive_not_security_finding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -167,7 +184,16 @@ def test_coreml_unavailable_read_is_inconclusive_not_security_finding(
     def raise_os_error(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated CoreML read failure")
 
+    def raise_detection_error(_path: str) -> str:
+        raise OSError("simulated CoreML detection read failure")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
     monkeypatch.setattr("modelaudit.scanners.coreml_scanner.open", raise_os_error, raising=False)
+    monkeypatch.setattr("modelaudit.core.detect_file_format", raise_detection_error)
+    monkeypatch.setattr("modelaudit.core.detect_file_format_from_magic", lambda _path: "unknown")
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
 
     direct = CoreMLScanner().scan(str(model_path))
     aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
@@ -179,8 +205,33 @@ def test_coreml_unavailable_read_is_inconclusive_not_security_finding(
     assert read_checks[0].details["scan_outcome_reason"] == "coreml_read_failed"
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "coreml_read_failed" in direct.metadata["scan_outcome_reasons"]
+    assert direct.metadata["operational_error_reason"] == "coreml_read_failed"
     metadata = aggregate.file_metadata[str(model_path)]
     assert "coreml_read_failed" in metadata["scan_outcome_reasons"]
+    assert metadata["operational_error_reason"] == "coreml_read_failed"
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_coreml_unreadable_path_preflight_is_operational_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = _write_model(
+        tmp_path / "permission-denied.mlmodel",
+        _build_model(description=_build_description(metadata=_build_metadata())),
+    )
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
+
+    direct = CoreMLScanner().scan(str(model_path))
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert direct.metadata["scan_outcome_reasons"] == ["coreml_read_failed"]
+    assert direct.metadata["operational_error_reason"] == "coreml_read_failed"
+    assert aggregate.file_metadata[str(model_path)]["operational_error_reason"] == "coreml_read_failed"
     assert not [
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]

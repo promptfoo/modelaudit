@@ -83,7 +83,16 @@ def test_tensorrt_unavailable_read_is_inconclusive_not_security_finding(
     def raise_os_error(_self: TensorRTScanner, _path: str) -> bytes:
         raise OSError("simulated TensorRT read failure")
 
+    def raise_detection_error(_path: str) -> str:
+        raise OSError("simulated TensorRT detection read failure")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
     monkeypatch.setattr(TensorRTScanner, "_read_file_safely", raise_os_error)
+    monkeypatch.setattr("modelaudit.core.detect_file_format", raise_detection_error)
+    monkeypatch.setattr("modelaudit.core.detect_file_format_from_magic", lambda _path: "unknown")
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
 
     direct = TensorRTScanner().scan(str(path))
     aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
@@ -95,11 +104,58 @@ def test_tensorrt_unavailable_read_is_inconclusive_not_security_finding(
     assert read_checks[0].details["scan_outcome_reason"] == "tensorrt_read_failed"
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "tensorrt_read_failed" in direct.metadata["scan_outcome_reasons"]
+    assert direct.metadata["operational_error_reason"] == "tensorrt_read_failed"
     metadata = aggregate.file_metadata[str(path)]
     assert "tensorrt_read_failed" in metadata["scan_outcome_reasons"]
+    assert metadata["operational_error_reason"] == "tensorrt_read_failed"
     assert not [
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_tensorrt_unreadable_path_preflight_is_operational_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "permission-denied.engine"
+    path.write_bytes(b"TensorRT safe engine metadata")
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
+
+    direct = TensorRTScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert direct.metadata["scan_outcome_reasons"] == ["tensorrt_read_failed"]
+    assert direct.metadata["operational_error_reason"] == "tensorrt_read_failed"
+    assert aggregate.file_metadata[str(path)]["operational_error_reason"] == "tensorrt_read_failed"
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_tensorrt_read_failure_takes_precedence_over_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    malicious = tmp_path / "malicious.engine"
+    malicious.write_bytes(b"python import eval")
+    unreadable = tmp_path / "unreadable.plan"
+    unreadable.write_bytes(b"TensorRT safe engine metadata")
+    original_read = TensorRTScanner._read_file_safely
+
+    def fail_selected_read(self: TensorRTScanner, path: str) -> bytes:
+        if path == str(unreadable):
+            raise OSError("simulated TensorRT read failure")
+        return original_read(self, path)
+
+    monkeypatch.setattr(TensorRTScanner, "_read_file_safely", fail_selected_read)
+
+    aggregate = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+    assert aggregate.file_metadata[str(unreadable)]["operational_error_reason"] == "tensorrt_read_failed"
     assert determine_exit_code(aggregate) == 2
 
 

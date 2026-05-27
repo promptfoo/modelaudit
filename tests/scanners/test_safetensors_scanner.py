@@ -294,7 +294,15 @@ def test_unavailable_read_is_inconclusive_not_security_finding(
     def raise_os_error(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated SafeTensors read failure")
 
-    monkeypatch.setattr(SafeTensorsScanner, "can_handle", classmethod(lambda _cls, _path: True))
+    def raise_detection_error(_path: str) -> str:
+        raise OSError("simulated SafeTensors detection read failure")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.core.detect_file_format", raise_detection_error)
+    monkeypatch.setattr("modelaudit.core.detect_file_format_from_magic", lambda _path: "unknown")
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
     monkeypatch.setattr("modelaudit.scanners.safetensors_scanner.open", raise_os_error, raising=False)
 
     direct = SafeTensorsScanner().scan(str(file_path))
@@ -307,8 +315,31 @@ def test_unavailable_read_is_inconclusive_not_security_finding(
     assert read_checks[0].details["scan_outcome_reason"] == SAFETENSORS_READ_INCONCLUSIVE_REASON
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert SAFETENSORS_READ_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert direct.metadata["operational_error_reason"] == SAFETENSORS_READ_INCONCLUSIVE_REASON
     metadata = aggregate.file_metadata[str(file_path)]
     assert SAFETENSORS_READ_INCONCLUSIVE_REASON in metadata["scan_outcome_reasons"]
+    assert metadata["operational_error_reason"] == SAFETENSORS_READ_INCONCLUSIVE_REASON
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_unreadable_path_preflight_is_operational_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = tmp_path / "permission-denied.safetensors"
+    write_raw_safetensors(file_path, {"t": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}, b"\x00")
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
+
+    direct = SafeTensorsScanner().scan(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path), cache_scan_results=False)
+
+    assert direct.metadata["scan_outcome_reasons"] == [SAFETENSORS_READ_INCONCLUSIVE_REASON]
+    assert direct.metadata["operational_error_reason"] == SAFETENSORS_READ_INCONCLUSIVE_REASON
+    assert aggregate.file_metadata[str(file_path)]["operational_error_reason"] == SAFETENSORS_READ_INCONCLUSIVE_REASON
     assert not [
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]
