@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import os
 import sys
 import sysconfig
@@ -11,11 +12,11 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib.machinery import EXTENSION_SUFFIXES, BuiltinImporter, FrozenImporter, ModuleSpec, PathFinder
 from pathlib import Path
-from typing import Protocol, TypeVar, cast
+from typing import Any, Protocol, TypeVar, cast
 
 # Bound per-pass import/callable fan-out for untrusted inputs. The 32-reference
 # cap has kept call-graph enrichment useful while preventing pathological scan
@@ -55,6 +56,10 @@ _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH: ContextVar[int] = ContextVar(
     "_SHARED_SOURCE_SENSITIVE_CACHE_DEPTH",
     default=0,
 )
+_SHARED_SOURCE_SENSITIVE_SNAPSHOT: ContextVar[_SharedSourceSnapshot | None] = ContextVar(
+    "_SHARED_SOURCE_SENSITIVE_SNAPSHOT",
+    default=None,
+)
 _SHARED_SOURCE_SENSITIVE_CACHE_LOCK = threading.RLock()
 _CachedFunctionT = TypeVar("_CachedFunctionT", bound=Callable[..., object])
 
@@ -82,6 +87,15 @@ class _CallGraphAnalysisLimitError(RuntimeError):
         self.partial_findings = partial_findings
         self.partial_startup_hook_write_findings = partial_startup_hook_write_findings
         self.partial_path = partial_path
+
+
+@dataclass
+class _SharedSourceSnapshot:
+    search_context: tuple[str, ...]
+    fingerprints: dict[str, bytes | None] = field(default_factory=dict)
+    generation: int = 0
+    reusable: bool = True
+    lock: Any = field(default_factory=threading.RLock)
 
 
 def _register_source_sensitive_cache(function: _CachedFunctionT) -> _CachedFunctionT:
@@ -554,16 +568,36 @@ def find_unanalyzed_callable_call_graph_references(
 
 @contextmanager
 def shared_source_sensitive_caches() -> Iterator[None]:
-    """Share one fresh cache generation across related enrichment passes."""
+    """Share source analysis until a bounded source snapshot changes."""
+    depth = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get()
+    if depth > 0:
+        snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+        if snapshot is None:
+            token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(depth + 1)
+            try:
+                yield
+            finally:
+                _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.reset(token)
+        else:
+            with snapshot.lock:
+                token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(depth + 1)
+                try:
+                    yield
+                finally:
+                    _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.reset(token)
+        return
+
     with _SHARED_SOURCE_SENSITIVE_CACHE_LOCK:
-        depth = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get()
-        if depth == 0:
-            _clear_source_sensitive_caches_now()
-        token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(depth + 1)
+        _clear_source_sensitive_caches_now()
+        snapshot_token = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.set(
+            _SharedSourceSnapshot(search_context=_source_search_context())
+        )
+        token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(1)
         try:
             yield
         finally:
             _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.reset(token)
+            _SHARED_SOURCE_SENSITIVE_SNAPSHOT.reset(snapshot_token)
 
 
 @_register_source_sensitive_cache
@@ -856,15 +890,104 @@ def has_unanalyzed_call_graph_import_references(import_references: object) -> bo
 
 
 def _clear_source_sensitive_caches() -> None:
-    with _SHARED_SOURCE_SENSITIVE_CACHE_LOCK:
-        if _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get() > 0:
+    if _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get() > 0:
+        snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+        if snapshot is None:
             return
+        with snapshot.lock:
+            if _shared_source_snapshot_is_current(snapshot):
+                return
+            _clear_source_sensitive_caches_now()
+            _reset_shared_source_snapshot(snapshot)
+        return
+
+    with _SHARED_SOURCE_SENSITIVE_CACHE_LOCK:
         _clear_source_sensitive_caches_now()
 
 
 def _clear_source_sensitive_caches_now() -> None:
     for function in _SOURCE_SENSITIVE_CACHED_FUNCTIONS:
         function.cache_clear()
+
+
+def _source_search_context() -> tuple[str, ...]:
+    return tuple(str(Path(entry or os.getcwd()).absolute()) for entry in sys.path)
+
+
+def _source_candidate_fingerprint(path: Path) -> tuple[bool, bytes | None]:
+    if not path.is_file():
+        return True, None
+    try:
+        with path.open("rb") as source_file:
+            source = source_file.read(_MAX_SOURCE_BYTES + 1)
+    except OSError:
+        return False, None
+    if len(source) > _MAX_SOURCE_BYTES:
+        return False, None
+    return True, hashlib.sha256(source).digest()
+
+
+def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
+    snapshot.search_context = _source_search_context()
+    snapshot.fingerprints.clear()
+    snapshot.generation += 1
+    snapshot.reusable = True
+
+
+def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:
+    if not snapshot.reusable or snapshot.search_context != _source_search_context():
+        return False
+    for path, expected_fingerprint in snapshot.fingerprints.items():
+        reusable, fingerprint = _source_candidate_fingerprint(Path(path))
+        if not reusable or fingerprint != expected_fingerprint:
+            return False
+    return True
+
+
+def _begin_shared_source_report() -> int | None:
+    snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+    if snapshot is None:
+        return None
+    with snapshot.lock:
+        if not _shared_source_snapshot_is_current(snapshot):
+            _clear_source_sensitive_caches_now()
+            _reset_shared_source_snapshot(snapshot)
+        return snapshot.generation
+
+
+def _ensure_shared_source_snapshot_stable(report_generation: int | None) -> None:
+    snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+    if snapshot is None or report_generation is None:
+        return
+    with snapshot.lock:
+        if snapshot.generation != report_generation:
+            raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+        if _shared_source_snapshot_is_current(snapshot):
+            return
+        _clear_source_sensitive_caches_now()
+        _reset_shared_source_snapshot(snapshot)
+    raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+
+def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
+    snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+    if snapshot is None:
+        return
+    candidates: set[Path] = set()
+    for entry in sys.path:
+        root = Path(entry or os.getcwd())
+        candidates.add(root.joinpath(*parts).with_suffix(".py").absolute())
+        candidates.add(root.joinpath(*parts, "__init__.py").absolute())
+    with snapshot.lock:
+        if snapshot.search_context != _source_search_context():
+            snapshot.reusable = False
+            return
+        for candidate in candidates:
+            reusable, fingerprint = _source_candidate_fingerprint(candidate)
+            if not reusable:
+                snapshot.reusable = False
+                return
+            snapshot.fingerprints[str(candidate)] = fingerprint
 
 
 def _call_graph_source_unavailable_reason(module_name: str) -> str | None:
@@ -3361,6 +3484,7 @@ def _resolve_module_source(module_name: str) -> Path | None:
     parts = module_name.split(".")
     if not parts or any(not part or "/" in part or "\\" in part for part in parts):
         return None
+    _track_shared_source_candidates(tuple(parts))
     for entry in sys.path:
         root = Path(entry or os.getcwd())
         current = root
