@@ -395,7 +395,7 @@ def test_gguf_scanner_scans_malicious_template_before_truncated_metadata(tmp_pat
     aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
 
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "gguf_parse_incomplete" in direct.metadata["scan_outcome_reasons"]
+    assert GGUF_PARSE_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
     assert any(
         check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
         for check in direct.checks
@@ -605,6 +605,27 @@ def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -
     _assert_inconclusive_exit2(aggregate, "jinja2_template_size_limit_exceeded")
 
 
+def test_gguf_scanner_preserves_duplicate_reason_with_oversized_chat_template(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-large-template.gguf"
+    _write_gguf_string_metadata_entries(
+        path,
+        [
+            ("tokenizer.chat_template", "{{ content }}" * 10000),
+            ("tokenizer.chat_template", "{{ message['content'] }}"),
+        ],
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    reasons = direct.metadata["scan_outcome_reasons"]
+    assert GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON in reasons
+    assert "jinja2_template_size_limit_exceeded" in reasons
+    assert any(check.name == "Template Size Limit" and check.status == CheckStatus.FAILED for check in direct.checks)
+    _assert_inconclusive_exit2(aggregate, GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON)
+    assert "jinja2_template_size_limit_exceeded" in _single_file_metadata(aggregate)["scan_outcome_reasons"]
+
+
 def test_gguf_oversized_chat_template_uncached_rerun_preserves_exit2(tmp_path: Path) -> None:
     path = create_mock_gguf(
         tmp_path / "large-template.gguf",
@@ -729,7 +750,7 @@ def test_gguf_truncated_metadata_returns_exit2(tmp_path: Path) -> None:
     assert direct.success is False
     assert direct.has_errors is False
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "gguf_parse_incomplete" in direct.metadata["scan_outcome_reasons"]
+    assert GGUF_PARSE_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
     assert aggregate.success is False
     assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert determine_exit_code(aggregate) == 2
@@ -749,7 +770,7 @@ def test_gguf_truncated_metadata_uncached_rerun_preserves_exit2(
     _assert_uncached_rerun_preserves_inconclusive_exit2(
         path,
         tmp_path / "cache",
-        "gguf_parse_incomplete",
+        GGUF_PARSE_INCONCLUSIVE_REASON,
     )
 
 
