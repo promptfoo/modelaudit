@@ -6,7 +6,9 @@ from typing import Any, cast
 
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_metagraph_scanner import (
     _MAX_ATTR_VALUE_BYTES,
@@ -129,6 +131,21 @@ def test_tf_metagraph_scanner_can_handle_oversized_meta_for_fail_closed_scan(tmp
     assert determine_exit_code(audit_result) == 2
 
 
+def test_tf_metagraph_scanner_can_handle_stat_failure_for_owned_extension(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable_meta = tmp_path / "unreadable.meta"
+    unreadable_meta.write_bytes(_build_metagraph(graph_nodes=[{"name": "input", "op": "Placeholder"}]))
+
+    def raise_os_error(_path: str) -> int:
+        raise OSError("simulated MetaGraph stat failure")
+
+    monkeypatch.setattr("modelaudit.scanners.tf_metagraph_scanner.os.path.getsize", raise_os_error)
+
+    assert TensorFlowMetaGraphScanner.can_handle(str(unreadable_meta)) is True
+
+
 def test_tf_metagraph_scanner_read_failure_is_operational_not_security_finding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -148,13 +165,132 @@ def test_tf_metagraph_scanner_read_failure_is_operational_not_security_finding(
     assert len(read_checks) == 1
     assert read_checks[0].severity == IssueSeverity.INFO
     assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "metagraph_read_failed"
     assert read_checks[0].details["operational_error_reason"] == "metagraph_read_failed"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["metagraph_read_failed"]
     assert result.metadata["operational_error"] is True
     assert result.metadata["operational_error_reason"] == "metagraph_read_failed"
+    assert audit_result.file_metadata[str(unreadable_meta)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert not [
         issue for issue in audit_result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]
     assert determine_exit_code(audit_result) == 2
+
+
+def test_tf_metagraph_probe_failures_still_route_to_operational_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable_meta = tmp_path / "unreadable.meta"
+    unreadable_meta.write_bytes(_build_metagraph(graph_nodes=[{"name": "input", "op": "Placeholder"}]))
+
+    def raise_detection_error(_path: str) -> str:
+        raise OSError("simulated MetaGraph detection read failure")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    def raise_read_error(_path: str, _limit: int) -> tuple[bytes, bool]:
+        raise OSError("simulated MetaGraph scanner read failure")
+
+    monkeypatch.setattr("modelaudit.core.detect_file_format", raise_detection_error)
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+    monkeypatch.setattr("modelaudit.scanners.tf_metagraph_scanner._read_bounded", raise_read_error)
+
+    aggregate = scan_model_directory_or_file(str(unreadable_meta), cache_scan_results=False)
+    metadata = aggregate.file_metadata[str(unreadable_meta)]
+
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert metadata["scan_outcome_reasons"] == ["metagraph_read_failed"]
+    assert metadata["operational_error_reason"] == "metagraph_read_failed"
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_tf_metagraph_read_failure_result_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable_meta = tmp_path / "unreadable.meta"
+    unreadable_meta.write_bytes(_build_metagraph(graph_nodes=[{"name": "input", "op": "Placeholder"}]))
+    cache_dir = tmp_path / "cache"
+
+    def raise_read_error(_path: str, _limit: int) -> tuple[bytes, bool]:
+        raise OSError("simulated MetaGraph scanner read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.tf_metagraph_scanner._read_bounded", raise_read_error)
+
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(unreadable_meta),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(unreadable_meta),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(unreadable_meta)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert metadata["operational_error_reason"] == "metagraph_read_failed"
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_tf_metagraph_unreadable_path_preflight_is_operational_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable_meta = tmp_path / "permission-denied.meta"
+    unreadable_meta.write_bytes(_build_metagraph(graph_nodes=[{"name": "input", "op": "Placeholder"}]))
+
+    def deny_access(_path: str, _mode: int) -> bool:
+        return False
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", deny_access)
+
+    direct = TensorFlowMetaGraphScanner().scan(str(unreadable_meta))
+    aggregate = scan_model_directory_or_file(str(unreadable_meta), cache_scan_results=False)
+
+    assert direct.metadata["scan_outcome_reasons"] == ["metagraph_read_failed"]
+    assert direct.metadata["operational_error_reason"] == "metagraph_read_failed"
+    assert aggregate.file_metadata[str(unreadable_meta)]["operational_error_reason"] == "metagraph_read_failed"
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_tf_metagraph_read_failure_takes_precedence_over_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    malicious_meta = tmp_path / "malicious.meta"
+    malicious_meta.write_bytes(_build_metagraph(graph_nodes=[{"name": "payload", "op": "PyFunc"}]))
+    unreadable_meta = tmp_path / "unreadable.meta"
+    unreadable_meta.write_bytes(_build_metagraph(graph_nodes=[{"name": "input", "op": "Placeholder"}]))
+    original_read_bounded = importlib.import_module("modelaudit.scanners.tf_metagraph_scanner")._read_bounded
+
+    def fail_selected_read(path: str, limit: int) -> tuple[bytes, bool]:
+        if path == str(unreadable_meta):
+            raise OSError("simulated MetaGraph read failure")
+        return cast(tuple[bytes, bool], original_read_bounded(path, limit))
+
+    monkeypatch.setattr("modelaudit.scanners.tf_metagraph_scanner._read_bounded", fail_selected_read)
+
+    aggregate = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+    assert aggregate.file_metadata[str(unreadable_meta)]["operational_error_reason"] == "metagraph_read_failed"
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_tf_metagraph_scanner_benign_graph_has_no_security_findings(tmp_path: Path) -> None:

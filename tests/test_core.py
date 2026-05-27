@@ -4487,6 +4487,34 @@ def test_scan_file_does_not_fail_closed_for_extension_only_recognized_format(
     assert not any(check.name == "Format Detection" for check in result.checks)
 
 
+def test_scan_file_fails_closed_when_format_detection_read_fails_without_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable = tmp_path / "unowned.payload"
+    unreadable.write_bytes(b"payload whose owning format cannot be read")
+
+    def raise_read_error(_path: str) -> str:
+        raise OSError("simulated format detection read failure")
+
+    monkeypatch.setattr(core_module, "detect_file_format", raise_read_error)
+
+    result = scan_file(str(unreadable))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["operational_error_reason"] == "format_detection_read_failed"
+    assert "format_detection_read_failed" in result.metadata["scan_outcome_reasons"]
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.severity == IssueSeverity.INFO
+    assert check.details["analysis_incomplete"] is True
+
+    aggregate = core_module.scan_model_directory_or_file(str(unreadable))
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
 def test_scan_file_unavailable_recognized_format_result_is_not_cached(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

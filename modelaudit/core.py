@@ -135,6 +135,7 @@ _R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
 _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
 _XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
+_FORMAT_DETECTION_READ_FAILED_REASON = "format_detection_read_failed"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
@@ -355,6 +356,23 @@ def _make_unavailable_recognized_format_result(path: str, format_: str, scanner_
     )
     _mark_inconclusive_scan_outcome(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
     _mark_operational_scan_error(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_format_detection_read_result(path: str, error: OSError) -> ScanResult:
+    """Fail closed when no owning scanner can classify a file after a read failure."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="Format Detection",
+        passed=False,
+        message=f"File format could not be determined because the file could not be read: {error}",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"path": path, "error": str(error), "analysis_incomplete": True},
+    )
+    _mark_inconclusive_scan_outcome(result, _FORMAT_DETECTION_READ_FAILED_REASON)
+    _mark_operational_scan_error(result, _FORMAT_DETECTION_READ_FAILED_REASON)
     result.finish(success=False)
     return result
 
@@ -763,12 +781,14 @@ def scan_model_directory_or_file(
         if not os.path.exists(path):
             raise FileNotFoundError(f"Path does not exist: {path}")
 
-        # Check if path is readable
-        if not os.access(path, os.R_OK):
-            raise PermissionError(f"Path is not readable: {path}")
-
         # Check if path is a directory
         if os.path.isdir(path):
+            # Directory scans require root traversal before scanner dispatch.
+            # Single files must reach their owning scanner so unreadable model
+            # inputs can produce a format-specific operational outcome.
+            if not os.access(path, os.R_OK):
+                raise PermissionError(f"Path is not readable: {path}")
+
             if progress_callback:
                 progress_callback(f"Scanning directory: {path}", 0.0)
 
@@ -1580,7 +1600,14 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     logger.debug(f"Processing: {path}")
 
-    header_format = detect_file_format(path)
+    format_probe_error: OSError | None = None
+    try:
+        header_format = detect_file_format(path)
+    except OSError as e:
+        # Dedicated scanners can produce a format-specific inconclusive result
+        # once extension routing selects their ownership.
+        header_format = "unknown"
+        format_probe_error = e
     ext_format = detect_format_from_extension(path)
     ext = os.path.splitext(path)[1].lower()
     magic_format = (
@@ -1692,7 +1719,16 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             sr.bytes_scanned = file_size
         return sr
 
-    file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
+    if format_probe_error is not None:
+        # A failed content read is not evidence of spoofing. Let an owning
+        # scanner produce a precise read-failure outcome when one exists.
+        file_type_valid = True
+    else:
+        try:
+            file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
+        except OSError as e:
+            file_type_valid = True
+            format_probe_error = e
     discrepancy_msg = None
 
     if not file_type_valid:
@@ -1884,7 +1920,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                         result.bytes_scanned = file_size
                     return result
 
-            if magic_format == XML_MODEL_INCONCLUSIVE_FORMAT:
+            if format_probe_error is not None and magic_format == "unknown":
+                sr = _make_incomplete_format_detection_read_result(path, format_probe_error)
+            elif magic_format == XML_MODEL_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_xml_model_result(path)
             elif magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_llamafile_routing_result(path, config)
