@@ -9,15 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- route renamed structured JAX/Orbax JSON checkpoints and fail closed for oversized identified metadata
+- route renamed structurally valid Flax/JAX MessagePack checkpoints through bounded, fail-closed security analysis
+- avoid emitting sensitive scanner finding or loader error payloads in logs
+- fail closed when PyTorch ZIP analysis cannot complete configured blacklist inspection or a required scan phase
+- fail closed when standalone Jinja2 templates exceed the configured analysis size limit or cannot be decoded as UTF-8 text
+- classify bounded, unreadable, or malformed PMML analysis gaps as inconclusive instead of security findings
+- classify unavailable Joblib reads as inconclusive rather than security findings
 - avoid repeatedly scanning sharded model families during directory scans
 - keep shard sibling discovery within the requested scan root
 - preserve per-shard metadata when aggregating sharded model families
 - prevent picklescan call-graph alias cycles from hanging scans
 - preserve HuggingFace snapshot shard paths while grouping cache-backed families
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
-- detect Python operators declared in nested ONNX graphs and functions
+- detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
 - classify unavailable Skops member and schema coverage as inconclusive rather than security findings
+- detect and scan signature-valid CNTK and LightGBM payloads even when renamed with misleading suffixes
+- detect and scan signature-valid RKNN, TFLite, and ExecuTorch payloads under non-conflicting renamed suffixes while preserving owned routes, and classify unavailable ExecuTorch reads as inconclusive
+- mark CatBoost text-fragment extraction limits and unavailable reads as inconclusive analysis
+- mark RKNN and Torch7 string-extraction limits and unavailable reads as inconclusive analysis
+- classify unavailable TFLite parsing coverage as inconclusive rather than a security finding
+- classify unavailable MXNet artifact reads as inconclusive rather than security findings
+- detect dangerous OpenVINO layers inside namespace-qualified IR models
+- classify unavailable pickle reads and stream coverage as inconclusive rather than security findings
+- route renamed structurally valid MXNet symbol graphs through existing suspicious-reference analysis
+- harden renamed MXNet symbol routing with fail-closed bounded ambiguity and XGBoost overlap handling
+- restore content routing for extensionless XGBoost UBJSON models and classify unavailable or undecodable XGBoost reads as inconclusive
+- route renamed TAR-backed NeMo archives with relative archive-root model configs through Hydra `_target_` analysis while retaining generic embedded-member checks
+- honor descriptor-owned header aliases during helper scanner selection for renamed HDF5, GGML, and compressed payloads
+- detect and scan signature-valid CNTK and LightGBM payloads even when renamed with misleading suffixes
+- detect signature-valid Torch7 payloads even when renamed with misleading suffixes
+- detect acquired executable Llamafile payloads with misleading suffixes, retain archive-polyglot coverage, and classify unavailable runtime previews as inconclusive
+
+### Performance Improvements
+
+- reuse source-validated pickle call-graph analysis across multiple directory dispatches when supported by installed picklescan
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 
