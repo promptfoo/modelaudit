@@ -443,6 +443,7 @@ def test_flax_msgpack_deep_nesting_is_inconclusive(tmp_path: Path) -> None:
     depth_checks = [check for check in result.checks if check.name == "Recursion Depth Check"]
     assert depth_checks
     assert all(check.severity == IssueSeverity.INFO for check in depth_checks)
+    assert all(check.rule_code == "S902" for check in depth_checks)
     assert all(check.details["analysis_incomplete"] is True for check in depth_checks)
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
@@ -458,8 +459,7 @@ def test_flax_msgpack_renamed_hidden_pattern_beyond_recursion_limit_is_inconclus
     path = tmp_path / "hidden_payload.jpg"
     create_msgpack_file(path, {"params": {"layer": {"deep": {"payload": 'os.system("id")'}}}})
 
-    config = {"max_recursion_depth": 2}
-    result = FlaxMsgpackScanner(config=config).scan(str(path))
+    result = FlaxMsgpackScanner(config={"max_recursion_depth": 2}).scan(str(path))
 
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
@@ -721,9 +721,12 @@ def test_flax_msgpack_ambiguous_renamed_probe_limit_fails_closed_without_unpacki
     assert result.success is False
     assert result.metadata["scan_outcome"] == "inconclusive"
     assert result.metadata["analysis_incomplete"] is True
-    check = next(check for check in result.checks if check.name == "MessagePack Routing Analysis Limit")
+    assert result.metadata["scan_outcome_message"] == (
+        "Scan analysis incomplete; failed closed because full coverage was not available."
+    )
+    check = next(check for check in result.checks if check.name == "MessagePack Routing Analysis Incomplete")
     assert check.status == CheckStatus.FAILED
-    assert check.details["scan_outcome_reason"] == "flax_msgpack_routing_probe_limit_exceeded"
+    assert check.details["scan_outcome_reason"] == "flax_msgpack_routing_incomplete"
 
 
 @pytest.mark.slow
