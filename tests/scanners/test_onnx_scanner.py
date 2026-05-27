@@ -547,6 +547,77 @@ def test_onnx_scanner_subgraph_snake_python_op_still_flagged(tmp_path: Path) -> 
     )
 
 
+def test_onnx_scanner_function_default_graph_python_op_still_flagged(tmp_path: Path) -> None:
+    """A Python op in a graph-valued function default must be inspected."""
+    then_branch = helper.make_graph(
+        [helper.make_node("Python_Op", ["X"], ["Y"])],
+        "then",
+        [],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+    )
+    else_branch = helper.make_graph(
+        [helper.make_node("Identity", ["X"], ["Y"])],
+        "else",
+        [],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+    )
+    if_node = helper.make_node("If", ["cond"], ["Y"])
+    if_node.attribute.extend(
+        [
+            onnx.AttributeProto(
+                name="then_branch",
+                ref_attr_name="then_graph",
+                type=onnx.AttributeProto.GRAPH,
+            ),
+            onnx.AttributeProto(
+                name="else_branch",
+                ref_attr_name="else_graph",
+                type=onnx.AttributeProto.GRAPH,
+            ),
+        ]
+    )
+    function = helper.make_function(
+        "local",
+        "Select",
+        ["cond", "X"],
+        ["Y"],
+        [if_node],
+        [helper.make_opsetid("", 13)],
+        attribute_protos=[
+            helper.make_attribute("then_graph", then_branch),
+            helper.make_attribute("else_graph", else_branch),
+        ],
+    )
+    graph = helper.make_graph(
+        [helper.make_node("Select", ["cond", "X"], ["Y"], domain="local")],
+        "graph",
+        [
+            helper.make_tensor_value_info("cond", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, [1]),
+        ],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+    )
+    model = helper.make_model(
+        graph,
+        functions=[function],
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+    )
+    model.ir_version = 9
+    onnx.checker.check_model(model)
+    model_path = tmp_path / "function_default_graph_python_op.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Python Operator Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("op_type") == "Python_Op"
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize("training_graph_field", ["initialization", "algorithm"])
 def test_onnx_scanner_training_graph_pyop_still_flagged(tmp_path: Path, training_graph_field: str) -> None:
     """A PyOp in either training graph must not be discarded as weight-data noise."""
