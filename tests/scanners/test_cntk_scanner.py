@@ -222,6 +222,7 @@ def test_cntk_signature_read_failure_still_routes_to_inconclusive_scan(
     def raise_os_error(*_args: object, **_kwargs: object) -> bytes:
         raise OSError("simulated CNTK signature read failure")
 
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_os_error)
     monkeypatch.setattr("modelaudit.scanners.cntk_scanner._read_prefix", raise_os_error)
 
     aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)

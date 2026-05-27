@@ -177,6 +177,7 @@ def test_lightgbm_read_failure_is_inconclusive_not_security_finding(
     def raise_os_error(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated LightGBM read failure")
 
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_os_error)
     monkeypatch.setattr("modelaudit.scanners.lightgbm_scanner.open", raise_os_error, raising=False)
 
     direct = LightGBMScanner().scan(str(path))

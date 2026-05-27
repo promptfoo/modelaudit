@@ -258,7 +258,9 @@ class ScannerRegistry:
         try:
             is_zip_file = os.path.isfile(path) and zipfile.is_zipfile(path)
         except OSError:
-            return None
+            # A failed generic ZIP probe must not prevent the owning scanner
+            # from recording an explicit inconclusive read outcome.
+            is_zip_file = False
 
         for candidate_extension in candidate_extensions:
             for scanner_id, scanner_info in sorted_scanners:
