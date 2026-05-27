@@ -571,6 +571,23 @@ def test_get_scanner_for_file_does_not_override_r_serialized_suffix_with_compres
     assert get_scanner_for_file(str(path)) is None
 
 
+def test_get_scanner_for_path_preserves_r_serialized_owner_after_failed_zip_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_gzip_r_serialized(tmp_path / "workspace.rds", "workspace\nmodel")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+
+    scanner_class = ScannerRegistry().get_scanner_for_path(str(path))
+
+    assert scanner_class is not None
+    assert scanner_class.name == "r_serialized"
+
+
 def test_get_scanner_for_path_routes_valid_mar_archive_to_torchserve_mar(tmp_path: Path) -> None:
     mar_path = _write_zip_archive(
         tmp_path / "model.mar",
