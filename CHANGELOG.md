@@ -84,6 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - restore content routing for extensionless XGBoost UBJSON models and classify unavailable or undecodable XGBoost reads as inconclusive
 - detect NeMo Hydra targets that invoke PyTorch C++ extension loaders
 - route renamed TAR-backed NeMo archives with relative archive-root model configs through Hydra `_target_` analysis while retaining generic embedded-member checks
+- avoid reporting non-extractable forward-hardlinked NeMo config or checkpoint aliases as executable findings
 - honor descriptor-owned header aliases during helper scanner selection for renamed HDF5, GGML, and compressed payloads
 - detect signature-valid Torch7 payloads even when renamed with misleading suffixes
 - detect acquired executable Llamafile payloads with misleading suffixes, retain archive-polyglot coverage, and classify unavailable runtime previews as inconclusive
