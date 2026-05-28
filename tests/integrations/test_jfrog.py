@@ -118,6 +118,26 @@ class TestJFrogDownload:
         assert call_args[1]["headers"]["Authorization"] == "Bearer test-access-token"
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_explicit_access_token_precedes_environment_api_token(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Explicit caller credentials should not be shadowed by ambient env tokens."""
+        mock_response = mock_get.return_value
+        mock_response.raise_for_status.return_value = None
+        mock_response.iter_content.return_value = [b"data"]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        monkeypatch.setenv("JFROG_API_TOKEN", "env-api-token")
+
+        download_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            cache_dir=tmp_path,
+            access_token="explicit-access-token",
+        )
+
+        call_args = mock_get.call_args
+        assert call_args[1]["headers"] == {"Authorization": "Bearer explicit-access-token"}
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_environment_variables(self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test authentication via environment variables."""
         mock_response = mock_get.return_value
@@ -192,6 +212,25 @@ class TestJFrogDownload:
 
         assert result["type"] == "file"
         assert mock_get.call_args[1]["headers"] == {}
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_storage_api_explicit_access_token_precedes_environment_api_token(
+        self, mock_get: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Explicit Storage API access tokens should not be shadowed by env API tokens."""
+        mock_response = mock_get.return_value
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {"repo": "repo", "path": "/model.bin", "size": 12}
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        monkeypatch.setenv("JFROG_API_TOKEN", "env-api-token")
+
+        result = detect_jfrog_target_type(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            access_token="explicit-access-token",
+        )
+
+        assert result["type"] == "file"
+        assert mock_get.call_args[1]["headers"] == {"Authorization": "Bearer explicit-access-token"}
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_no_authentication(self, mock_get, tmp_path, caplog):
