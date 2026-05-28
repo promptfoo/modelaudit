@@ -1697,7 +1697,13 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     format_probe_error: OSError | None = None
     try:
-        header_format = detect_file_format(path)
+        if os.path.isfile(path) and not os.access(path, os.R_OK):
+            format_probe_error = PermissionError(f"Path is not readable: {path}")
+    except OSError as e:
+        format_probe_error = e
+
+    try:
+        header_format = "unknown" if format_probe_error is not None else detect_file_format(path)
     except OSError as e:
         # Dedicated scanners can produce a format-specific inconclusive result
         # once extension routing selects their ownership.
@@ -1705,11 +1711,16 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         format_probe_error = e
     ext_format = detect_format_from_extension(path)
     ext = os.path.splitext(path)[1].lower()
-    magic_format = (
-        header_format
-        if header_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}
-        else detect_file_format_from_magic(path)
-    )
+    if format_probe_error is not None:
+        magic_format = "unknown"
+    elif header_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}:
+        magic_format = header_format
+    else:
+        try:
+            magic_format = detect_file_format_from_magic(path)
+        except OSError as e:
+            magic_format = "unknown"
+            format_probe_error = e
     skipped_overlap_scanner_id: str | None = None
     if (
         header_format == "xgboost"
@@ -1827,13 +1838,15 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             sr.bytes_scanned = file_size
         return sr
 
-    try:
-        file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
-    except OSError as e:
-        # Do not turn an unreadable model into a spoofing finding before its
-        # scanner gets a chance to emit its precise read-failure outcome.
+    if format_probe_error is not None:
+        # A failed content read is not evidence of spoofing. Let an owning
+        # scanner produce a precise read-failure outcome when one exists.
         file_type_valid = True
-        if format_probe_error is None:
+    else:
+        try:
+            file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
+        except OSError as e:
+            file_type_valid = True
             format_probe_error = e
     discrepancy_msg = None
 

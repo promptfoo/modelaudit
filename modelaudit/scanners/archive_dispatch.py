@@ -11,6 +11,7 @@ from ..core_results import mark_operational_scan_error
 from ..scanner_registry_metadata import get_scanner_registry_metadata
 from ..scanner_results import (
     SCAN_OUTCOME_REASONS_METADATA_KEY,
+    Issue,
     IssueSeverity,
     ScanResult,
     mark_inconclusive_scan_result,
@@ -82,6 +83,13 @@ _ONNX_ROUTING_INCOMPLETE_REASON = "onnx_routing_incomplete"
 _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_incomplete"
 SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY = "_skip_composed_archive_member_scan"
 KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY = "_known_unreadable_archive_entry_offsets"
+
+
+def _is_pickle_parse_only_overlap_issue(issue: Issue) -> bool:
+    """Return whether a Pickle overlap issue is only parser fallout."""
+    return (issue.rule_code == "S901" and issue.details.get("category") == "parse_error") or (
+        issue.rule_code == "S902" and issue.details.get("notice_code") == "parse_incomplete"
+    )
 
 
 def _select_nested_scanner_id(path: str, header_format_override: str | None = None) -> str | None:
@@ -379,7 +387,7 @@ def merge_flax_msgpack_overlap_findings(
     from . import _registry
 
     scanner_selection = policy_from_config(config)
-    for scanner_id in detect_flax_msgpack_overlap_routes(path):
+    for scanner_id in detect_flax_msgpack_overlap_routes(path, include_unvalidated_pickle=True):
         if scanner_id in scanned_scanner_ids:
             continue
         if scanner_selection.allows(scanner_id):
@@ -388,6 +396,19 @@ def merge_flax_msgpack_overlap_findings(
                 overlap_result = _make_unavailable_recognized_format_result(path, scanner_id, scanner_id)
             else:
                 overlap_result = scanner_class(config=config).scan(path)
+            # Binary-looking Flax prefixes may be invalid Pickle near-matches;
+            # merge substantive findings, including structural-tamper S902.
+            if (
+                scanner_id == "pickle"
+                and overlap_result.metadata.get("parsing_failed") is True
+                and overlap_result.metadata.get("failure_reason") == "unknown_opcode_or_format_error"
+                and not any(
+                    issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+                    and not _is_pickle_parse_only_overlap_issue(issue)
+                    for issue in overlap_result.issues
+                )
+            ):
+                continue
             _merge_composed_scan_result(result, overlap_result)
         else:
             add_scanner_selection_skip_check(

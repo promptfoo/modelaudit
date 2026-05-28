@@ -25,6 +25,7 @@ from modelaudit.utils.file.detection import (
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
 )
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
@@ -431,9 +432,75 @@ class TestDirectoryFileFiltering:
         assert determine_exit_code(results) == 1
         assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
 
-    def test_scalar_padded_disguised_flax_stream_fails_closed_at_analysis_limit(self, tmp_path: Path) -> None:
+    def test_disguised_flax_msgpack_stream_with_xml_looking_scalar_is_scanned(self, tmp_path: Path) -> None:
         msgpack = pytest.importorskip("msgpack")
-        disguised_payload = tmp_path / "stream-scalar-padding.jpg"
+        disguised_payload = tmp_path / "xml-looking-scalar.txt"
+        disguised_payload.write_bytes(
+            msgpack.packb(60, use_bin_type=True)
+            + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    @pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"])
+    def test_disguised_flax_msgpack_under_default_skipped_suffix_is_scanned(
+        self,
+        tmp_path: Path,
+        suffix: str,
+    ) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / f"stream{suffix}"
+        disguised_payload.write_bytes(
+            msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    def test_oversized_plain_text_document_suffix_fails_closed_in_directory_scan(self, tmp_path: Path) -> None:
+        document = tmp_path / "notes.txt"
+        document.write_bytes(b" " * (2 * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1) + 2))
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 2
+
+    def test_small_plain_text_document_remains_skipped_in_directory_scan(self, tmp_path: Path) -> None:
+        document = tmp_path / "notes.txt"
+        document.write_text("ordinary project documentation\n", encoding="utf-8")
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 0
+        assert "flax_msgpack" not in results.scanner_names
+
+    def test_large_json_array_under_skipped_suffix_is_scanned_fail_closed(self, tmp_path: Path) -> None:
+        json_array = tmp_path / "metadata.jpg"
+        json_array.write_bytes(b"[" + b"0," * ((MXNET_SYMBOL_SIGNATURE_READ_BYTES // 2) + 100) + b"0]")
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 2
+
+    @pytest.mark.parametrize("suffix", [".jpg", ".txt"])
+    def test_scalar_padded_disguised_flax_stream_fails_closed_at_analysis_limit(
+        self, tmp_path: Path, suffix: str
+    ) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / f"stream-scalar-padding{suffix}"
         disguised_payload.write_bytes(
             msgpack.packb(None, use_bin_type=True) * 4097
             + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
