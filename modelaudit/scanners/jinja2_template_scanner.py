@@ -60,6 +60,16 @@ _INCONCLUSIVE_METADATA_KEY = "scan_outcome"
 _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
 _JINJA_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
 _JINJA_TEMPLATE_INDICATOR_BYTES = tuple(indicator.encode("utf-8") for indicator in _JINJA_TEMPLATE_INDICATORS)
+_TEMPLATE_FIELD_KEYS = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
+_DETECTION_MESSAGE_LABELS = {
+    "critical_injection": "critical injection",
+    "object_traversal": "object hierarchy access",
+    "global_access": "global namespace access",
+    "obfuscation": "obfuscation",
+    "control_flow": "control flow",
+    "environment_access": "environment access",
+    "sandbox_violation": "sandbox violation",
+}
 _RAW_PARSE_FALLBACK_CONTEXT_BYTES = 1024
 _RAW_PARSE_FALLBACK_MAX_WINDOWS = 8
 _RAW_PARSE_FALLBACK_READ_BYTES = 256 * 1024
@@ -339,7 +349,10 @@ class Jinja2TemplateScanner(BaseScanner):
                 result.add_check(
                     name="Jinja2 Template Injection Detection",
                     passed=False,
-                    message=f"Potential SSTI vulnerability detected: {detection.pattern_type}",
+                    message=(
+                        "Potential SSTI vulnerability detected: "
+                        f"{_DETECTION_MESSAGE_LABELS.get(detection.pattern_type, detection.pattern_type)}"
+                    ),
                     severity=severity,
                     location=detection.location or f"{path}:{template_location}",
                     details={
@@ -534,7 +547,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 data = json.load(f)
 
             # Recursively search for template fields
-            self._find_json_templates(data, templates, "")
+            self._find_json_templates(data, templates, "", extraction_failures, "json")
 
         except Exception as e:
             logger.debug(f"Error extracting JSON templates: {e}")
@@ -543,35 +556,47 @@ class Jinja2TemplateScanner(BaseScanner):
 
         return templates, extraction_failures
 
-    def _find_json_templates(self, data: Any, templates: dict[str, str], path: str) -> None:
+    def _find_json_templates(
+        self,
+        data: Any,
+        templates: dict[str, str],
+        path: str,
+        extraction_failures: list[dict[str, Any]],
+        config_format: str,
+    ) -> None:
         """Recursively find template strings in JSON data"""
         if isinstance(data, dict):
             for key, value in data.items():
                 current_path = f"{path}.{key}" if path else key
 
                 # Check for known template fields
-                if (
-                    key in ["chat_template", "template", "jinja_template", "custom_chat_template"]
-                    and isinstance(value, str)
-                    and value.strip()
-                    and len(value) <= self.max_template_size
-                ):
-                    templates[current_path] = value
+                if key in _TEMPLATE_FIELD_KEYS and isinstance(value, str) and value.strip():
+                    self._add_template_candidate(
+                        value,
+                        templates,
+                        current_path,
+                        extraction_failures,
+                        config_format,
+                    )
 
                 # Recursively check nested structures
                 elif isinstance(value, dict | list):
-                    self._find_json_templates(value, templates, current_path)
+                    self._find_json_templates(value, templates, current_path, extraction_failures, config_format)
 
                 # Check for template-like strings (contain Jinja2 syntax)
-                elif (
-                    isinstance(value, str) and self._looks_like_template(value) and len(value) <= self.max_template_size
-                ):
-                    templates[current_path] = value
+                elif isinstance(value, str) and self._looks_like_template(value):
+                    self._add_template_candidate(
+                        value,
+                        templates,
+                        current_path,
+                        extraction_failures,
+                        config_format,
+                    )
 
         elif isinstance(data, list):
             for i, item in enumerate(data):
                 current_path = f"{path}[{i}]" if path else f"[{i}]"
-                self._find_json_templates(item, templates, current_path)
+                self._find_json_templates(item, templates, current_path, extraction_failures, config_format)
 
     def _extract_yaml_templates(self, path: str) -> tuple[dict[str, str], list[dict[str, Any]]]:
         """Extract templates from YAML configuration files"""
@@ -594,7 +619,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 data = yaml.safe_load(f)
 
             if data:
-                self._find_json_templates(data, templates, "")  # Reuse JSON logic
+                self._find_json_templates(data, templates, "", extraction_failures, "yaml")  # Reuse JSON logic
 
         except Exception as e:
             logger.debug(f"Error extracting YAML templates: {e}")
@@ -610,6 +635,28 @@ class Jinja2TemplateScanner(BaseScanner):
             "exception": str(error),
             "exception_type": type(error).__name__,
         }
+
+    def _add_template_candidate(
+        self,
+        value: str,
+        templates: dict[str, str],
+        template_path: str,
+        extraction_failures: list[dict[str, Any]],
+        config_format: str,
+    ) -> None:
+        if len(value) <= self.max_template_size:
+            templates[template_path] = value
+            return
+
+        extraction_failures.append(
+            {
+                "format": config_format,
+                "reason": "jinja2_template_size_limit_exceeded",
+                "max_template_size": self.max_template_size,
+                "skipped_template_locations": [template_path],
+                "template_size": len(value),
+            }
+        )
 
     def _extract_raw_template_fallback(self, path: str, templates: dict[str, str], template_key: str) -> None:
         for index, fallback_text in enumerate(self._raw_template_fallback_windows_from_file(path)):
