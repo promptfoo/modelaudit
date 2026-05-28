@@ -255,18 +255,19 @@ class TestNetworkCommDetector:
         assert url_finding["url"] == "https://example.com/path/<redacted>;v=1/model.bin"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
 
-    def test_ampersand_delimited_path_tokens_are_redacted(self) -> None:
-        """HTML-escaped path suffixes should not hide capability token prefixes."""
+    @pytest.mark.parametrize("separator", ["&", "&amp;"])
+    def test_ampersand_delimited_path_tokens_are_redacted(self, separator: str) -> None:
+        """Ampersand-style path suffixes should not hide capability token prefixes."""
         detector = NetworkCommDetector()
         path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
 
         findings = detector.scan(
-            f"https://example.com/path/{path_token}&amp;download=1".encode(),
+            f"https://example.com/path/{path_token}{separator}download=1".encode(),
             "metadata.txt",
         )
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
 
-        assert url_finding["url"] == "https://example.com/path/<redacted>&amp;download=1"
+        assert url_finding["url"] == f"https://example.com/path/<redacted>{separator}download=1"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
 
     def test_public_revision_hash_paths_are_preserved(self) -> None:
