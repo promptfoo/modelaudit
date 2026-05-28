@@ -8,7 +8,7 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.llamafile_scanner import (
     LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON,
     LLAMAFILE_ROUTE_SCAN_BYTES,
@@ -166,6 +166,23 @@ def test_llamafile_torch7_polyglot_preserves_outer_integrity_metadata(tmp_path: 
 
     assert result.metadata["file_size"] == expected_size
     assert result.metadata["file_hashes"]["sha256"] == expected_sha256
+
+
+def test_llamafile_detects_appended_torch7_after_valid_gguf_payload(tmp_path: Path) -> None:
+    binary = tmp_path / "valid-gguf-then-torch7.llamafile"
+    valid_gguf = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    torch7_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id')\n"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=valid_gguf + (b"\x00" * 1024) + torch7_payload))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["embedded_payload_offset"] < result.metadata["embedded_torch7_offset"]
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
 
 
 def test_llamafile_ignores_truncated_embedded_torch7_marker(tmp_path: Path) -> None:

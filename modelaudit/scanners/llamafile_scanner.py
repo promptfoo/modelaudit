@@ -254,12 +254,12 @@ class LlamafileScanner(BaseScanner):
         self._scan_runtime_strings(path, b"\n".join(runtime_blobs), result)
 
         gguf_offset, torch7_offset = self._find_embedded_payload_offsets(path_obj, self.max_payload_scan_bytes)
-        payload_bytes_scanned, valid_gguf_payload = self._scan_embedded_payload(path_obj, result, gguf_offset)
-        if gguf_offset is not None and torch7_offset is None and not valid_gguf_payload:
-            _, torch7_offset = self._find_embedded_payload_offsets(
+        payload_bytes_scanned, _valid_gguf_payload = self._scan_embedded_payload(path_obj, result, gguf_offset)
+        if gguf_offset is not None and torch7_offset is None:
+            torch7_offset = self._find_embedded_torch7_offset(
                 path_obj,
                 self.max_payload_scan_bytes,
-                stop_at_gguf=False,
+                start_offset=gguf_offset + len(GGUF_MARKER),
             )
         result.bytes_scanned += payload_bytes_scanned
         self._merge_polyglot_findings(path_obj, result, torch7_offset)
@@ -604,6 +604,37 @@ class LlamafileScanner(BaseScanner):
                 scanned += len(chunk)
 
         return gguf_offset, torch7_offset
+
+    @staticmethod
+    def _find_embedded_torch7_offset(path: Path, max_scan_bytes: int, *, start_offset: int = 0) -> int | None:
+        """Find a Torch7 payload signature after a known payload boundary."""
+        file_size = path.stat().st_size
+        search_limit = min(file_size, max_scan_bytes)
+        if start_offset >= search_limit:
+            return None
+
+        overlap = TORCH7_SIGNATURE_WINDOW_BYTES - 1
+        scanned = start_offset
+        carry = b""
+
+        with path.open("rb") as handle:
+            handle.seek(start_offset)
+            while scanned < search_limit:
+                to_read = min(1024 * 1024, search_limit - scanned)
+                chunk = handle.read(to_read)
+                if not chunk:
+                    break
+
+                haystack = carry + chunk
+                window_offset = scanned - len(carry)
+                torch7_relative_index = find_structural_torch7_offset(haystack)
+                if torch7_relative_index is not None:
+                    return window_offset + torch7_relative_index
+
+                carry = haystack[-overlap:] if overlap > 0 else b""
+                scanned += len(chunk)
+
+        return None
 
     @staticmethod
     def _find_casefolded_marker_offset(
