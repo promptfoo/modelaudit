@@ -188,7 +188,10 @@ class TestKerasZipScanner:
             for check in result.checks
         )
 
-    @pytest.mark.parametrize("keras_version", ["3.12.1rc1", "3.12.1a0", "3.12.1.dev0", "3.13.2rc1"])
+    @pytest.mark.parametrize(
+        "keras_version",
+        ["3.12.1rc1", "3.12.1a0", "3.12.1.dev0", "3.13.2rc1", "3.13.2dev0"],
+    )
     def test_embedded_hdf5_external_references_prerelease_fixes_are_vulnerable(
         self, tmp_path: Path, keras_version: str
     ) -> None:
@@ -208,7 +211,10 @@ class TestKerasZipScanner:
         assert cve_issues[0].details["keras_version"] == keras_version
         assert cve_issues[0].severity == IssueSeverity.WARNING
 
-    @pytest.mark.parametrize("keras_version", ["3.12.1", "3.12.1+cpu", "3.13.2", "3.13.2.post1"])
+    @pytest.mark.parametrize(
+        "keras_version",
+        ["3.12.1", "3.12.1+cpu", "3.12.1+rc1", "3.13.2", "3.13.2.post1", "3.13.2+dev0"],
+    )
     def test_embedded_hdf5_external_references_stable_fixed_versions_pass(
         self, tmp_path: Path, keras_version: str
     ) -> None:

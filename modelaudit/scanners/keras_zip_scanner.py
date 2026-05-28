@@ -2025,8 +2025,9 @@ class KerasZipScanner(BaseScanner):
         except ValueError:
             return False
 
-        suffix = (version_match.group(4) or "").lstrip("._-")
-        is_prerelease = bool(_KERAS_PRERELEASE_SUFFIX_PATTERN.match(suffix))
+        suffix = (version_match.group(4) or "").strip().lower()
+        public_suffix = suffix.lstrip("._-")
+        is_prerelease = not suffix.startswith("+") and bool(_KERAS_PRERELEASE_SUFFIX_PATTERN.match(public_suffix))
         parsed = (major, minor, patch)
         if (3, 0, 0) <= parsed < (3, 12, 1) or (3, 13, 0) <= parsed < (3, 13, 2):
             return True
