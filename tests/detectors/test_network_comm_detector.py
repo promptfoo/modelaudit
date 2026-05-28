@@ -270,6 +270,24 @@ class TestNetworkCommDetector:
         assert url_finding["url"] == f"https://example.com/path/<redacted>{separator}download=1"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
 
+    @pytest.mark.parametrize(
+        ("encoded_suffix", "expected_suffix"),
+        [("%3Fdownload=1", "?download=1"), ("%20download", " download")],
+    )
+    def test_encoded_delimited_path_tokens_are_redacted(self, encoded_suffix: str, expected_suffix: str) -> None:
+        """Encoded URL delimiters should not hide capability token prefixes."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/path/{path_token}{encoded_suffix}".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://example.com/path/<redacted>{expected_suffix}"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
     def test_public_revision_hash_paths_are_preserved(self) -> None:
         """Public model revision hashes should remain useful for audit follow-up."""
         detector = NetworkCommDetector()
@@ -326,6 +344,17 @@ class TestNetworkCommDetector:
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
 
         assert url_finding["url"] == f"https://huggingface.co/meta-llama/{repo_id}"
+
+    def test_single_segment_huggingface_model_ids_are_preserved(self) -> None:
+        """Single-component public Hugging Face model URLs should stay useful."""
+        detector = NetworkCommDetector()
+        repo_id = "Llama-3.1-70B-Instruct"
+        data = f"https://huggingface.co/{repo_id}".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://huggingface.co/{repo_id}"
 
     def test_huggingface_api_repository_ids_are_preserved(self) -> None:
         """Hugging Face API paths should keep public repo IDs for audit follow-up."""
@@ -824,6 +853,18 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == "https://example.com/download/<redacted>/malware.bin"
         assert path_token not in json.dumps([cc_finding, url_finding], sort_keys=True)
+
+    def test_cc_pattern_snippet_url_expansion_is_bounded(self) -> None:
+        """Long whitespace-free binary regions should not force unbounded URL scans."""
+        detector = NetworkCommDetector()
+        long_prefix = "a" * 6000
+        data = f"https://example.com/{long_prefix}/malware.bin".encode()
+
+        findings = detector.scan(data, "hook.py")
+        cc_finding = next(finding for finding in findings if finding["type"] == "cc_pattern")
+
+        assert cc_finding["pattern"] == "malware"
+        assert len(cc_finding["snippet"]) < 200
 
     def test_network_functions_not_flagged_in_documentation_metadata_context(self) -> None:
         """Documentation prose should not report raw network library/function token mentions."""

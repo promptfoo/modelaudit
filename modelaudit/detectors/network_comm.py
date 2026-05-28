@@ -65,8 +65,9 @@ _KNOWN_ARTIFACT_FILENAME_EXTENSIONS = frozenset(
 )
 _TRAILING_PATH_DELIMITERS = ".,;:)]}'\""
 _URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>`"
-_PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"]")
+_PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
 _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
+_MAX_SNIPPET_URL_EXPANSION_BYTES = 4096
 _MIN_CAPABILITY_TOKEN_ENTROPY = 3.5
 _MIN_URLSAFE_FILENAME_STEM_ENTROPY = 4.0
 _PUBLIC_MODEL_REPOSITORY_HOSTS = frozenset({"huggingface.co", "hf.co"})
@@ -230,6 +231,8 @@ def _is_public_model_repository_segment(hostname: str, segments: list[str], inde
     if len(segments) > 1 and segments[1].lower() in _PUBLIC_MODEL_REPOSITORY_PREFIXES:
         repository_indexes.add(3)
 
+    if len(non_empty_segments) == 1:
+        return index == 1
     if len(non_empty_segments) == len(repository_indexes) and (
         non_empty_segments[0] in _PUBLIC_MODEL_REPOSITORY_PREFIXES
     ) == (3 in repository_indexes):
@@ -425,24 +428,26 @@ def _redact_urls_in_text(text: str) -> str:
 def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *, before: int, after: int) -> str:
     start = max(0, match_start - before)
     end = min(len(data), match_end + after)
+    scan_start = max(0, start - _MAX_SNIPPET_URL_EXPANSION_BYTES)
+    scan_end = min(len(data), end + _MAX_SNIPPET_URL_EXPANSION_BYTES)
 
     url_start = match_start
-    while url_start > 0 and data[url_start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
+    while url_start > scan_start and data[url_start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
         url_start -= 1
     if b"://" in data[url_start:match_start]:
         start = min(start, url_start)
         url_end = match_end
-        while url_end < len(data) and data[url_end] not in _URL_TEXT_BOUNDARY_BYTES:
+        while url_end < scan_end and data[url_end] not in _URL_TEXT_BOUNDARY_BYTES:
             url_end += 1
         end = max(end, url_end)
     else:
         scheme_marker = data.find(b"://", match_end, min(len(data), match_end + after))
         if scheme_marker >= 0:
             url_start = scheme_marker
-            while url_start > 0 and data[url_start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
+            while url_start > scan_start and data[url_start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
                 url_start -= 1
             url_end = scheme_marker + 3
-            while url_end < len(data) and data[url_end] not in _URL_TEXT_BOUNDARY_BYTES:
+            while url_end < scan_end and data[url_end] not in _URL_TEXT_BOUNDARY_BYTES:
                 url_end += 1
             start = min(start, url_start)
             end = max(end, url_end)
