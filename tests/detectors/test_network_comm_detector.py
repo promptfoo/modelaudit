@@ -828,6 +828,18 @@ class TestNetworkCommDetector:
         assert url_finding["url"].endswith(f"/{long_prefix}/<redacted>/model.bin")
         assert path_token not in json.dumps([network_finding, url_finding], sort_keys=True)
 
+    def test_network_function_snippet_expansion_is_bounded_without_nearby_url_scheme(self) -> None:
+        """Incidental matches in long binary blobs should not expand snippets across megabytes."""
+        detector = NetworkCommDetector()
+        data = b"https://example.com/" + (b"a" * 6000) + b"requests.get("
+
+        findings = detector.scan(data, "hook.py")
+        network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+        snippet = network_finding["snippet"]
+
+        assert len(snippet) <= 200
+        assert "https://example.com" not in snippet
+
     def test_single_quoted_call_tail_does_not_prevent_path_token_redaction(self) -> None:
         """Call syntax after a URL should not stay attached to the secret token."""
         detector = NetworkCommDetector()

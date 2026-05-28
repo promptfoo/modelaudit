@@ -156,8 +156,10 @@ def _looks_like_capability_path_token(segment: str) -> bool:
         return False
     if _HEX_PATH_TOKEN_PATTERN.fullmatch(decoded):
         return _shannon_entropy_per_char(decoded) >= _MIN_CAPABILITY_TOKEN_ENTROPY
-    if not re.fullmatch(r"[A-Za-z0-9._~+/=\-]+", decoded):
-        return False
+    invalid_character_match = re.search(r"[^A-Za-z0-9._~+/=\-]", decoded)
+    if invalid_character_match is not None:
+        prefix = decoded[: invalid_character_match.start()]
+        return bool(prefix and _looks_like_capability_path_token(prefix))
 
     character_classes = sum(bool(pattern.search(decoded)) for pattern in _PATH_TOKEN_CHARACTER_CLASS_PATTERNS)
     return character_classes >= 2 and _shannon_entropy_per_char(decoded) >= _MIN_CAPABILITY_TOKEN_ENTROPY
@@ -226,16 +228,13 @@ def _is_public_model_repository_segment(hostname: str, segments: list[str], inde
     if hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS:
         return False
 
-    non_empty_segments = [segment.lower() for segment in segments[1:] if segment]
-    repository_indexes = {1, 2}
-    if len(segments) > 1 and segments[1].lower() in _PUBLIC_MODEL_REPOSITORY_PREFIXES:
-        repository_indexes.add(3)
-
-    if len(non_empty_segments) == 1:
+    path_segments = [segment.lower() for segment in segments[1:] if segment]
+    if len(path_segments) == 1:
         return index == 1
-    if len(non_empty_segments) == len(repository_indexes) and (
-        non_empty_segments[0] in _PUBLIC_MODEL_REPOSITORY_PREFIXES
-    ) == (3 in repository_indexes):
+
+    has_repository_prefix = bool(path_segments and path_segments[0] in _PUBLIC_MODEL_REPOSITORY_PREFIXES)
+    repository_indexes = {1, 2, 3} if has_repository_prefix else {1, 2}
+    if len(path_segments) == len(repository_indexes):
         return index in repository_indexes
 
     if not any(segment.lower() in _PUBLIC_MODEL_REPOSITORY_MARKERS for segment in segments[index + 1 :]):
@@ -425,16 +424,25 @@ def _redact_urls_in_text(text: str) -> str:
     return _URL_IN_TEXT_PATTERN.sub(lambda match: _redact_url_for_finding(match.group()), text)
 
 
+def _bounded_url_start_before_match(data: bytes, match_start: int, scan_start: int) -> int | None:
+    scheme_marker = data.rfind(b"://", scan_start, match_start)
+    if scheme_marker < 0:
+        return None
+
+    url_start = scheme_marker
+    while url_start > scan_start and data[url_start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
+        url_start -= 1
+    return url_start
+
+
 def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *, before: int, after: int) -> str:
     start = max(0, match_start - before)
     end = min(len(data), match_end + after)
     scan_start = max(0, start - _MAX_SNIPPET_URL_EXPANSION_BYTES)
     scan_end = min(len(data), end + _MAX_SNIPPET_URL_EXPANSION_BYTES)
 
-    url_start = match_start
-    while url_start > scan_start and data[url_start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
-        url_start -= 1
-    if b"://" in data[url_start:match_start]:
+    url_start = _bounded_url_start_before_match(data, match_start, scan_start)
+    if url_start is not None:
         start = min(start, url_start)
         url_end = match_end
         while url_end < scan_end and data[url_end] not in _URL_TEXT_BOUNDARY_BYTES:
