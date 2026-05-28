@@ -6,6 +6,7 @@ import importlib
 import json
 import lzma
 import pickle
+import struct
 import sys
 import tarfile
 import tempfile
@@ -16,6 +17,7 @@ from typing import cast
 
 import pytest
 
+from modelaudit import core as core_module
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
@@ -23,6 +25,7 @@ from modelaudit.utils.file.detection import (
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
 )
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
@@ -60,6 +63,14 @@ def _build_malicious_tf_savedmodel() -> bytes:
     node.name = "pyfunc_node"
     node.op = "PyFunc"
     return cast(bytes, saved_model.SerializeToString())
+
+
+def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
+    header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.write(b"{")
+        handle.truncate(8 + header_len + 1)
 
 
 def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
@@ -287,6 +298,34 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 1
         assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
+
+    def test_disguised_oversized_safetensors_with_skipped_extension_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        disguised_payload = tmp_path / "weights.jpg"
+        _write_sparse_oversized_safetensors_candidate(disguised_payload)
+        from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
+
+        monkeypatch.setattr(
+            SafeTensorsScanner,
+            "calculate_file_hashes",
+            lambda _self, _path: pytest.fail("oversized SafeTensors headers must fail before hashing"),
+        )
+        monkeypatch.setattr(
+            core_module,
+            "_calculate_file_hash",
+            lambda _path: pytest.fail("oversized SafeTensors directory entries must fail before dedup hashing"),
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "safetensors" in results.scanner_names
+        assert results["success"] is False
+        assert determine_exit_code(results) == 2
+        assert any(check.name == "Header Size Limit" for check in results.checks)
 
     def test_disguised_malicious_jax_json_checkpoint_is_scanned_without_ajax_near_match(self, tmp_path: Path) -> None:
         """Directory scans should preserve JAX metadata content but not `ajax` lookalikes."""

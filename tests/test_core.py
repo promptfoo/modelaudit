@@ -7,6 +7,7 @@ import gzip
 import importlib
 import json
 import pickle
+import struct
 import sys
 import zipfile
 from collections.abc import Iterator
@@ -20,7 +21,7 @@ from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.core import scan_file, scan_model_directory_or_file
-from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner, mxnet_scanner
+from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner, mxnet_scanner, safetensors_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
 from modelaudit.utils.file import detection as file_detection
@@ -30,8 +31,10 @@ from modelaudit.utils.file.detection import (
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
+    TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
 )
-from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
+from modelaudit.utils.helpers.secure_hasher import SecureFileHasher, compute_aggregate_hash
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers import create_mock_gguf, create_mock_mxnet_symbol, create_mock_onnx, create_mock_pytorch_zip
 
@@ -237,6 +240,22 @@ def _build_malicious_skops_schema() -> bytes:
             "content": {},
         }
     ).encode("utf-8")
+
+
+def _write_sparse_oversized_safetensors_candidate(
+    path: Path,
+    header_len: int = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1,
+) -> None:
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.write(b"{")
+        handle.truncate(8 + header_len + 1)
+
+
+def _write_tensorflow_overlap_safetensors_candidate(path: Path, header_prefix: bytes) -> None:
+    header_len = 0x212
+    header = header_prefix + (b" " * (header_len - len(header_prefix)))
+    path.write_bytes(struct.pack("<Q", header_len) + header + b"\x00")
 
 
 def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
@@ -2862,6 +2881,112 @@ def test_scan_file_routes_misnamed_keras_hdf5_by_header(tmp_path: Path) -> None:
     assert any("CVE-2025-9905" in issue.message for issue in result.issues)
 
 
+def test_scan_file_routes_oversized_renamed_safetensors_to_inconclusive_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disguised_safetensors = tmp_path / "weights.jpg"
+    _write_sparse_oversized_safetensors_candidate(disguised_safetensors)
+    monkeypatch.setattr(
+        safetensors_scanner.SafeTensorsScanner,
+        "calculate_file_hashes",
+        lambda _self, _path: pytest.fail("oversized SafeTensors headers must fail before hashing"),
+    )
+
+    result = scan_file(str(disguised_safetensors), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "safetensors_header_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    limit_check = next(check for check in result.checks if check.name == "Header Size Limit")
+    assert limit_check.status == CheckStatus.FAILED
+    assert limit_check.severity == IssueSeverity.INFO
+
+
+def test_scan_top_level_oversized_renamed_safetensors_fails_before_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disguised_safetensors = tmp_path / "weights.jpg"
+    _write_sparse_oversized_safetensors_candidate(disguised_safetensors)
+    monkeypatch.setattr(
+        safetensors_scanner.SafeTensorsScanner,
+        "calculate_file_hashes",
+        lambda _self, _path: pytest.fail("oversized SafeTensors headers must fail before scanner hashing"),
+    )
+    monkeypatch.setattr(
+        core_module,
+        "_calculate_file_hash",
+        lambda _path: pytest.fail("oversized SafeTensors top-level inputs must fail before aggregate hashing"),
+    )
+
+    result = scan_model_directory_or_file(str(disguised_safetensors), cache_scan_results=False)
+
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 2
+    assert "safetensors" in result.scanner_names
+    assert any(check.name == "Header Size Limit" for check in result.checks)
+
+
+@pytest.mark.parametrize(
+    ("filename", "header_prefix"),
+    [("overlap.jpg", b"{}"), ("overlap.safetensors", b"x")],
+)
+def test_tensorflow_inconclusive_safetensors_overlap_fails_closed_without_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    header_prefix: bytes,
+) -> None:
+    payload = tmp_path / filename
+    _write_tensorflow_overlap_safetensors_candidate(payload, header_prefix)
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+        "max_safetensors_header_bytes": 16,
+    }
+    monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_VALIDATE_BYTES", 1)
+    monkeypatch.setattr(
+        core_module,
+        "_calculate_file_hash",
+        lambda _path: pytest.fail("bounded routing overlap must not trigger aggregate hashing"),
+    )
+    monkeypatch.setattr(
+        SecureFileHasher,
+        "hash_file",
+        lambda _self, _path: pytest.fail("bounded routing overlap must not trigger cache-key hashing"),
+    )
+    monkeypatch.setattr(
+        SecureFileHasher,
+        "hash_file_with_stat",
+        lambda _self, _path, _stat: pytest.fail("bounded routing overlap must not trigger cache validation hashing"),
+    )
+
+    assert file_detection.detect_file_format(str(payload)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert file_detection.should_defer_safetensors_header_limit_hash(str(payload), 16)
+
+    reset_cache_manager()
+    try:
+        direct = scan_file(str(payload), config=config)
+        aggregate = scan_model_directory_or_file(
+            str(payload),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            max_safetensors_header_bytes=16,
+        )
+
+        assert direct.metadata["operational_error_reason"] == "tensorflow_protobuf_routing_incomplete"
+        assert aggregate.success is False
+        assert core_module.determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def test_scan_file_routes_misnamed_gguf_by_header(tmp_path: Path) -> None:
     disguised_gguf = create_mock_gguf(tmp_path / "model.payload")
 
@@ -4878,6 +5003,49 @@ def test_scan_file_incomplete_xml_routing_result_is_not_cached(tmp_path: Path) -
     try:
         first = scan_file(str(ambiguous_xml), config=config)
         second = scan_file(str(ambiguous_xml), config=config)
+
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_inconclusive_safetensors_header_limit_result_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = tmp_path / "oversized.safetensors"
+    _write_sparse_oversized_safetensors_candidate(payload, header_len=(1024 * 1024) + 1)
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+        "max_safetensors_header_bytes": 1024 * 1024,
+    }
+    monkeypatch.setattr(
+        safetensors_scanner.SafeTensorsScanner,
+        "calculate_file_hashes",
+        lambda _self, _path: pytest.fail("inconclusive SafeTensors scans must bypass scanner hashing"),
+    )
+    monkeypatch.setattr(
+        SecureFileHasher,
+        "hash_file",
+        lambda _self, _path: pytest.fail("bounded SafeTensors failures must bypass cache-key hashing"),
+    )
+    monkeypatch.setattr(
+        SecureFileHasher,
+        "hash_file_with_stat",
+        lambda _self, _path, _stat: pytest.fail("bounded SafeTensors failures must bypass cache validation hashing"),
+    )
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(payload), config=config)
+        second = scan_file(str(payload), config=config)
 
         assert first.success is False
         assert second.success is False

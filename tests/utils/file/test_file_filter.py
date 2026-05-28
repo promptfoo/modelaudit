@@ -3,6 +3,7 @@
 import importlib
 import json
 import pickle
+import struct
 import zipfile
 from pathlib import Path
 from typing import cast
@@ -17,6 +18,7 @@ from modelaudit.utils.file.detection import (
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     detect_file_format_for_skip_filter,
 )
@@ -57,6 +59,14 @@ def _build_tf_savedmodel_bytes() -> bytes:
     node.name = "const_node"
     node.op = "Const"
     return cast(bytes, saved_model.SerializeToString())
+
+
+def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
+    header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.write(b"{")
+        handle.truncate(8 + header_len + 1)
 
 
 def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
@@ -601,6 +611,23 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_openvino))
         assert not should_skip_file(str(disguised_pmml))
         assert should_skip_file(str(benign_xml))
+
+    def test_oversized_disguised_safetensors_candidate_bypasses_default_skip(self, tmp_path: Path) -> None:
+        """Oversized framing must survive filtering for scanner-level bounded handling."""
+        disguised_safetensors = tmp_path / "weights.jpg"
+        malformed_near_match = tmp_path / "framing-only.jpg"
+        _write_sparse_oversized_safetensors_candidate(disguised_safetensors)
+        # Keep the negative fixture outside the unrelated MessagePack route.
+        header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 0xC1
+        with malformed_near_match.open("wb") as handle:
+            handle.write(struct.pack("<Q", header_len))
+            handle.write(b"\x00")
+            handle.truncate(8 + header_len + 1)
+
+        assert detect_file_format_for_skip_filter(str(disguised_safetensors)) == "safetensors"
+        assert not should_skip_file(str(disguised_safetensors))
+        assert detect_file_format_for_skip_filter(str(malformed_near_match)) == "unknown"
+        assert should_skip_file(str(malformed_near_match))
 
     def test_disguised_pmml_with_oversized_doctype_subset_fails_closed(self, tmp_path: Path) -> None:
         """Incomplete oversized XML prologs should survive filtering for fail-closed handling."""

@@ -1104,7 +1104,7 @@ def _looks_like_binary_pickle_protocol(header: bytes) -> bool:
     )
 
 
-SAFETENSORS_MAX_HEADER_BYTES: int = 100 * 1024 * 1024
+SAFETENSORS_ROUTING_HEADER_PARSE_BYTES: int = 16 * 1024 * 1024
 
 
 def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool = False) -> bool:
@@ -1236,8 +1236,8 @@ def detect_pytorch_binary_supplemental_format(path: str) -> str | None:
     return None
 
 
-def _looks_like_safetensors_structure(path: Path | None, magic8: bytes, file_size: int) -> bool:
-    """Validate safetensors framing: <u64 header_len><JSON header><tensor data>."""
+def _is_safetensors_routing_candidate(path: Path | None, magic8: bytes, file_size: int) -> bool:
+    """Recognize SafeTensors framing or retain oversized plausible headers."""
     if file_size <= 8 or len(magic8) < 8:
         return False
 
@@ -1248,13 +1248,21 @@ def _looks_like_safetensors_structure(path: Path | None, magic8: bytes, file_siz
 
     if header_len <= 0:
         return False
-    if header_len >= SAFETENSORS_MAX_HEADER_BYTES:
-        return False
     if header_len > file_size - 8:
         return False
 
     if path is None:
         return False
+
+    # The scanner fails closed on headers above this bounded parse budget.
+    # Retain plausible object headers without parsing attacker-sized metadata.
+    if header_len > SAFETENSORS_ROUTING_HEADER_PARSE_BYTES:
+        try:
+            with path.open("rb") as handle:
+                handle.seek(8)
+                return handle.read(1) == b"{"
+        except OSError:
+            return False
 
     try:
         with path.open("rb") as handle:
@@ -1272,6 +1280,31 @@ def _looks_like_safetensors_structure(path: Path | None, magic8: bytes, file_siz
         return False
 
     return isinstance(parsed_header, dict)
+
+
+def should_defer_safetensors_header_limit_hash(path: str, max_header_bytes: int) -> bool:
+    """Return whether recognized bounded routing will fail before full-file hashing is useful."""
+    file_path = Path(path)
+    try:
+        file_size = file_path.stat().st_size
+        if file_size <= 8:
+            return False
+        with file_path.open("rb") as handle:
+            magic8 = handle.read(8)
+        if len(magic8) != 8:
+            return False
+        header_len = struct.unpack("<Q", magic8)[0]
+    except (OSError, struct.error):
+        return False
+
+    if header_len <= max_header_bytes or header_len > file_size - 8:
+        return False
+    detected_format = detect_file_format(path)
+    if detected_format == "safetensors":
+        return True
+    return detected_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT and (
+        file_path.suffix.lower() == ".safetensors" or _is_safetensors_routing_candidate(file_path, magic8, file_size)
+    )
 
 
 def _normalize_archive_member_name(member_name: str) -> str:
@@ -2866,10 +2899,7 @@ def detect_format_from_magic_bytes(
 
     if _looks_like_binary_pickle_protocol(magic4):
         return "pickle"
-    if _looks_like_safetensors_structure(file_path, magic8, file_size):
-        return "safetensors"
-
-    if b'"__metadata__"' in magic16 and _looks_like_safetensors_structure(file_path, magic8, file_size):
+    if _is_safetensors_routing_candidate(file_path, magic8, file_size):
         return "safetensors"
 
     if file_path is not None:
@@ -3031,7 +3061,7 @@ def detect_file_format_from_magic(path: str) -> str:
     magic4 = header[:4]
     magic8 = header[:8]
 
-    if _looks_like_safetensors_structure(file_path, magic8, size):
+    if _is_safetensors_routing_candidate(file_path, magic8, size):
         return "safetensors"
 
     if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
@@ -3324,7 +3354,7 @@ def detect_file_format(path: str) -> str:
     if renamed_tensorflow_format not in {"unknown", "inconclusive"}:
         return renamed_tensorflow_format
 
-    if _looks_like_safetensors_structure(file_path, magic8, size):
+    if _is_safetensors_routing_candidate(file_path, magic8, size):
         return "safetensors"
 
     if _is_confirmed_content_routed_jax_json_checkpoint(file_path):
@@ -3374,7 +3404,7 @@ def detect_file_format(path: str) -> str:
         if MARKED_PROTOCOL0_GLOBAL_RE.match(magic64):
             return "pickle"
         # Check for safetensors format (<u64 header_len> + JSON header).
-        if _looks_like_safetensors_structure(file_path, magic8, size):
+        if _is_safetensors_routing_candidate(file_path, magic8, size):
             return "safetensors"
 
         # Check for ONNX format (protobuf)
@@ -3500,7 +3530,7 @@ def detect_file_format(path: str) -> str:
         ".txz",
     ):
         return "tar"
-    if _looks_like_safetensors_structure(file_path, magic8, size):
+    if _is_safetensors_routing_candidate(file_path, magic8, size):
         return "safetensors"
     return "unknown"
 
