@@ -162,6 +162,7 @@ def test_download_from_cloud(mock_fs: MagicMock, tmp_path: Path) -> None:
 
     fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
 
     mock_fs.side_effect = [fs_meta, fs]
 
@@ -179,6 +180,62 @@ def test_download_from_cloud(mock_fs: MagicMock, tmp_path: Path) -> None:
     assert result.name == "model.pt"
 
     # Note: fsspec filesystems don't need explicit cleanup according to implementation
+
+
+@patch("fsspec.filesystem")
+def test_download_from_cloud_reuses_cache_with_matching_etag(mock_fs: MagicMock, tmp_path: Path) -> None:
+    url = "s3://bucket/model.pt"
+
+    first_meta = make_fs_mock()
+    first_meta.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+
+    downloader = make_fs_mock()
+    downloader.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+    downloader.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+
+    second_meta = make_fs_mock()
+    second_meta.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+
+    mock_fs.side_effect = [first_meta, downloader, second_meta]
+
+    first = download_from_cloud(url, cache_dir=tmp_path, show_progress=False)
+    second = download_from_cloud(url, cache_dir=tmp_path, show_progress=False)
+
+    assert isinstance(first, Path)
+    assert second == first
+    assert first.read_bytes() == b"data"
+    downloader.get.assert_called_once()
+    assert mock_fs.call_count == 3
+
+
+@patch("fsspec.filesystem")
+def test_download_from_cloud_clears_stale_directory_cache(mock_fs: MagicMock, tmp_path: Path) -> None:
+    url = "s3://bucket/models"
+    cache = GCSCache(cache_dir=tmp_path / "cache")
+    stale_dir = tmp_path / "stale"
+    stale_dir.mkdir()
+    (stale_dir / "old-model.bin").write_bytes(b"old")
+    cache.cache_file(url, stale_dir, etag="etag-v1")
+
+    fs_meta = make_fs_mock()
+    fs_meta.info.return_value = {"type": "directory", "ETag": "etag-v2"}
+    fs_meta.glob.return_value = ["s3://bucket/models/new-model.bin"]
+    fs_meta.info.side_effect = [
+        {"type": "directory", "ETag": "etag-v2"},
+        {"type": "file", "size": 3, "ETag": "file-etag-v2"},
+    ]
+
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 3}
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"new")
+
+    mock_fs.side_effect = [fs_meta, fs]
+
+    result = download_from_cloud(url, cache_dir=tmp_path / "cache", show_progress=False, selective=False)
+
+    assert isinstance(result, Path)
+    assert not (result / "old-model.bin").exists()
+    assert (result / "new-model.bin").read_bytes() == b"new"
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
@@ -741,13 +798,90 @@ class TestCloudCacheSafety:
         source_file = sibling_dir / "artifact.bin"
         source_file.write_bytes(b"artifact")
 
-        cache.cache_file("s3://bucket/model.bin", source_file)
+        url = "s3://bucket/model.bin"
+        cache.cache_file(url, source_file, etag="etag-v1")
 
-        cached_path = cache.get_cached_path("s3://bucket/model.bin")
+        cached_path = cache.get_cached_path(url, etag="etag-v1")
         assert cached_path is not None
         assert cached_path.resolve() != source_file.resolve()
         assert cached_path.resolve().is_relative_to(cache.cache_dir.resolve())
         assert source_file.exists()
+
+    def test_cache_without_etag_is_stale_miss(self, tmp_path: Path) -> None:
+        """Cache entries without validators must not be reused as fresh remote objects."""
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        source_file = tmp_path / "artifact.bin"
+        source_file.write_bytes(b"artifact")
+        url = "s3://bucket/model.bin"
+
+        cache.cache_file(url, source_file)
+
+        assert cache.get_cached_path(url) is None
+        assert cache.get_cached_path(url, etag="etag-v1") is None
+
+    def test_cache_with_matching_etag_hits(self, tmp_path: Path) -> None:
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        source_file = tmp_path / "artifact.bin"
+        source_file.write_bytes(b"artifact")
+        url = "s3://bucket/model.bin"
+
+        cache.cache_file(url, source_file, etag="etag-v1")
+
+        cached_path = cache.get_cached_path(url, etag="etag-v1")
+
+        assert cached_path is not None
+        assert cached_path.read_bytes() == b"artifact"
+
+    def test_cache_with_mismatched_etag_misses(self, tmp_path: Path) -> None:
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        source_file = tmp_path / "artifact.bin"
+        source_file.write_bytes(b"artifact")
+        url = "s3://bucket/model.bin"
+
+        cache.cache_file(url, source_file, etag="etag-v1")
+
+        assert cache.get_cached_path(url, etag="etag-v2") is None
+
+    def test_legacy_cache_without_etag_is_stale_miss_and_migrates_metadata(self, tmp_path: Path) -> None:
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        cached_file = cache_dir / "aa" / "bb" / "model.bin"
+        cached_file.parent.mkdir(parents=True)
+        cached_file.write_bytes(b"artifact")
+        signed_url = (
+            "https://user:pass@bucket.s3.amazonaws.com/path/model.bin"
+            "?X-Amz-Credential=secret&X-Amz-Signature=sig#fragment"
+        )
+
+        cache = GCSCache(cache_dir=cache_dir)
+        cache_key = cache.get_cache_key(signed_url)
+        cache.metadata_file.write_text(
+            json.dumps(
+                {
+                    cache_key: {
+                        "url": signed_url,
+                        "path": str(cached_file),
+                        "size": cached_file.stat().st_size,
+                        "cached_at": "2026-01-01T00:00:00",
+                        "last_accessed": "2026-01-01T00:00:00",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cache = GCSCache(cache_dir=cache_dir)
+
+        assert cache.get_cached_path(signed_url) is None
+        raw_metadata = cache.metadata_file.read_text(encoding="utf-8")
+        metadata = json.loads(raw_metadata)
+        entry = metadata[cache_key]
+        assert "url" not in entry
+        assert entry["url_sha256"] == cache_key
+        assert entry["url_display"] == "https://bucket.s3.amazonaws.com/path/model.bin"
+        assert "X-Amz-Credential" not in raw_metadata
+        assert "X-Amz-Signature" not in raw_metadata
+        assert "user:pass" not in raw_metadata
 
     def test_clean_old_cache_does_not_delete_outside_cache(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
