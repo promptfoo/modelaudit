@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
 - classify bounded, unreadable, or unparseable TorchServe MAR analysis gaps as inconclusive rather than security findings
-- detect manifest-declared TorchServe extra files disguised with executable content
+- detect manifest-declared TorchServe extra files and PyTorch ZIP members disguised with executable content
 - classify incomplete SevenZip coverage as inconclusive and avoid caching temporary extracted members
 - classify uninspected OCI layers and members as inconclusive analysis instead of security findings, without caching extracted temporary members
 - route renamed ONNX protobuf models with prefixed unknown fields through content analysis and fail closed on unresolved or incomplete structure

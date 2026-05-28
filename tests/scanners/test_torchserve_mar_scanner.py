@@ -21,6 +21,7 @@ from modelaudit.scanner_selection import normalize_scanner_selection_config
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.torchserve_mar_scanner import TorchServeMarScanner
 from modelaudit.scanners.zip_scanner import ZipScanner
+from tests.helpers import create_mock_pytorch_zip
 
 
 def _create_mar_archive(
@@ -2006,6 +2007,78 @@ def test_scan_detects_nested_zip_payloads(tmp_path: Path) -> None:
 
     result = TorchServeMarScanner().scan(str(mar_path))
     assert any(".mar:nested.zip" in (issue.location or "") for issue in result.issues)
+
+
+def test_scan_does_not_cache_temporary_nested_archive_members(tmp_path: Path) -> None:
+    nested_zip = tmp_path / "nested-cache.zip"
+    with zipfile.ZipFile(nested_zip, "w") as nested:
+        nested.writestr("payload.pkl", _build_malicious_pickle())
+
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest={
+            "model": {
+                "handler": "handler.py",
+                "serializedFile": "weights.bin",
+                "extraFiles": "nested-cache.zip",
+            },
+        },
+        entries={
+            "handler.py": b"def handle(data, context):\n    return data\n",
+            "weights.bin": b"weights",
+            "nested-cache.zip": nested_zip.read_bytes(),
+        },
+        filename="nested-cache.mar",
+    )
+    cache_dir = tmp_path / "nested-member-cache"
+
+    reset_cache_manager()
+    try:
+        for _ in range(2):
+            aggregate = core.scan_model_directory_or_file(
+                str(mar_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert core.determine_exit_code(aggregate) == 1
+            assert any(".mar:nested-cache.zip" in (issue.location or "") for issue in aggregate.issues)
+
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_detects_executable_content_inside_pytorch_extra_file(tmp_path: Path) -> None:
+    nested_pytorch = create_mock_pytorch_zip(tmp_path / "bundle.pt")
+    with zipfile.ZipFile(nested_pytorch, "a") as archive:
+        archive.writestr("archive/data/7", b"\x7fELF" + b"\x00" * 64)
+
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest={
+            "model": {
+                "handler": "handler.py",
+                "serializedFile": "weights.bin",
+                "extraFiles": "bundle.pt",
+            },
+        },
+        entries={
+            "handler.py": b"def handle(data, context):\n    return data\n",
+            "weights.bin": b"weights",
+            "bundle.pt": nested_pytorch.read_bytes(),
+        },
+        filename="nested-pytorch-executable.mar",
+    )
+
+    aggregate = core.scan_model_directory_or_file(str(mar_path), cache_enabled=False)
+
+    assert core.determine_exit_code(aggregate) == 1
+    assert any(
+        issue.location == f"{mar_path}:bundle.pt:archive/data/7"
+        and "Executable file found in PyTorch model" in issue.message
+        for issue in aggregate.issues
+    )
 
 
 def test_core_routes_mar_to_dedicated_scanner(tmp_path: Path) -> None:

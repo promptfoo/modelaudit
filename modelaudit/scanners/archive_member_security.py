@@ -123,7 +123,7 @@ def executable_archive_member_name_rule_code(member_name: str) -> str | None:
     return None
 
 
-def _looks_like_portable_executable(prefix: bytes, *, path: str) -> bool:
+def _looks_like_portable_executable(prefix: bytes, *, path: str | None = None) -> bool:
     if not prefix.startswith(b"MZ"):
         return False
     if b"This program cannot be run in DOS mode" in prefix[:512]:
@@ -141,6 +141,9 @@ def _looks_like_portable_executable(prefix: bytes, *, path: str) -> bool:
 
     if pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE) <= len(prefix):
         return prefix[pe_offset : pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE)] == _PORTABLE_EXECUTABLE_SIGNATURE
+
+    if path is None:
+        return False
 
     try:
         with open(path, "rb") as member_file:
@@ -179,6 +182,15 @@ def executable_archive_member_content_rule_code(path: str) -> str | None:
     except OSError:
         return None
 
+    return _executable_archive_member_content_rule_code(prefix, path=path)
+
+
+def executable_archive_member_content_rule_code_from_bytes(content: bytes) -> str | None:
+    """Return the executable rule code implied by bounded member bytes."""
+    return _executable_archive_member_content_rule_code(content)
+
+
+def _executable_archive_member_content_rule_code(prefix: bytes, *, path: str | None = None) -> str | None:
     if _looks_like_portable_executable(prefix, path=path):
         return "S501"
     if prefix.startswith(b"\x7fELF"):

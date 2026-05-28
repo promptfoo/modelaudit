@@ -1690,6 +1690,8 @@ class TorchServeMarScanner(BaseScanner):
                 nested_config = dict(self.config)
                 nested_config["_mar_depth"] = current_depth + 1
                 nested_config["_archive_depth"] = current_depth + 1
+                # Extracted members are deleted below, so their temporary paths cannot be reused as cache keys.
+                nested_config["cache_enabled"] = False
                 file_result = core.scan_file(temp_path, nested_config)
                 self._rewrite_scan_locations(
                     file_result=file_result,
