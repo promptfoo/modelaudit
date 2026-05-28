@@ -404,6 +404,21 @@ def test_jax_text_checkpoint_with_legacy_opcode_prefix_does_not_scan_as_pickle(t
     assert "jax_pickle_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
 
 
+def test_orbax_text_checkpoint_sidecar_with_global_shape_does_not_scan_as_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_plain_text"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "metadata.json").write_text("{}", encoding="utf-8")
+    (checkpoint_dir / "checkpoint").write_text("configuration\nmetadata\n", encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(check.name == "Pickle Checkpoint Scan" for check in result.checks)
+    assert "jax_pickle_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
+
+
 def test_empty_orbax_checkpoint_file_does_not_scan_as_pickle(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "empty_orbax"
     checkpoint_dir.mkdir()

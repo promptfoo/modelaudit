@@ -774,6 +774,8 @@ class JaxCheckpointScanner(BaseScanner):
             memo_indices: set[int] = set()
             next_memo_index = 0
             parsed_opcode = False
+            parsed_opcode_count = 0
+            saw_dangerous_global = False
 
             def _memo_index(value: Any) -> int | None:
                 try:
@@ -816,6 +818,14 @@ class JaxCheckpointScanner(BaseScanner):
             try:
                 for opcode, arg, _pos in pickletools.genops(data):
                     parsed_opcode = True
+                    parsed_opcode_count += 1
+                    if opcode.name == "GLOBAL" and isinstance(arg, str):
+                        parsed_global = self._parse_pickle_global_reference(arg)
+                        if parsed_global is not None:
+                            module_name, global_name = parsed_global
+                            saw_dangerous_global = saw_dangerous_global or self._is_dangerous_pickle_global(
+                                module_name, global_name
+                            )
                     if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
                         if not stack:
                             return False
@@ -838,6 +848,8 @@ class JaxCheckpointScanner(BaseScanner):
                         return True
             except ValueError as e:
                 if "pickle exhausted before seeing STOP" in str(e):
+                    if parsed_opcode_count == 1 and not saw_dangerous_global:
+                        return False
                     return parsed_opcode
                 if file_size > len(data) and self._is_truncated_pickle_parse_error(e):
                     return parsed_opcode or self._header_starts_with_legacy_pickle_opcode(header)
