@@ -226,8 +226,9 @@ class JaxCheckpointScanner(BaseScanner):
     _JSON_PREFIX_PATTERN_READ_FAILED_REASON: ClassVar[str] = "jax_json_checkpoint_prefix_pattern_read_failed"
     _METADATA_TRAVERSAL_LIMIT_REASON: ClassVar[str] = "jax_metadata_traversal_depth_limit"
     _PICKLE_SCAN_LIMIT_REASON: ClassVar[str] = "jax_pickle_scan_limit_exceeded"
-    _LEGACY_PICKLE_INITIAL_OPCODES: ClassVar[bytes] = b"()cFGIJKLMNPSTUVX]}"
-    _LEGACY_PICKLE_LINE_ARGUMENT_OPCODES: ClassVar[bytes] = b"PSV"
+    _LEGACY_PICKLE_INITIAL_OPCODES: ClassVar[bytes] = (
+        b"()BCcFGIJKLMNPSTUVX]}\x82\x83\x84\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x96\x97"
+    )
     _LEGACY_PICKLE_PREFIX_PROBE_BYTES: ClassVar[int] = 8192
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
@@ -839,7 +840,7 @@ class JaxCheckpointScanner(BaseScanner):
                 if "pickle exhausted before seeing STOP" in str(e):
                     return parsed_opcode
                 if file_size > len(data) and self._is_truncated_pickle_parse_error(e):
-                    return parsed_opcode or header[:1] in self._LEGACY_PICKLE_LINE_ARGUMENT_OPCODES
+                    return parsed_opcode or self._header_starts_with_legacy_pickle_opcode(header)
 
         return False
 
