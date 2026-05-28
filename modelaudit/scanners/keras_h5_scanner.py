@@ -85,17 +85,8 @@ class KerasH5Scanner(BaseScanner):
             "system",
         }
     )
-    _WEIGHTS_LIKE_ROOT_KEYS: ClassVar[frozenset[str]] = frozenset(
-        {
-            "layer_names",
-            "layers",
-            "model_weights",
-            "optimizer_weights",
-            "vars",
-            "weights",
-            "weight_names",
-        }
-    )
+    _KERAS_WEIGHT_ROOT_GROUPS: ClassVar[frozenset[str]] = frozenset({"model_weights", "optimizer_weights"})
+    _KERAS_WEIGHT_ROOT_ATTRS: ClassVar[frozenset[str]] = frozenset({"layer_names", "weight_names"})
     _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
     _WRAPPED_LAYER_SCAN_MODEL: ClassVar[dict[str, Any]] = {"class_name": "Sequential", "config": {"layers": []}}
 
@@ -353,10 +344,10 @@ class KerasH5Scanner(BaseScanner):
     @classmethod
     def _has_weights_like_hdf5_layout(cls, h5_file: Any) -> bool:
         """Return True for HDF5 layouts that resemble Keras weights-only files."""
-        if any(str(key).lower() in cls._WEIGHTS_LIKE_ROOT_KEYS for key in h5_file):
+        if any(str(key).lower() in cls._KERAS_WEIGHT_ROOT_GROUPS for key in h5_file):
             return True
 
-        return any(str(key).lower() in cls._WEIGHTS_LIKE_ROOT_KEYS for key in h5_file.attrs)
+        return any(str(key).lower() in cls._KERAS_WEIGHT_ROOT_ATTRS for key in h5_file.attrs)
 
     def _check_hdf5_external_references(self, h5_file: Any, result: ScanResult, source_path: str) -> None:
         """Detect HDF5 external links/storage before any Keras-specific parsing short-circuits."""

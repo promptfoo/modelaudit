@@ -638,6 +638,19 @@ def test_keras_h5_scanner_skips_generic_nested_weight_like_groups(tmp_path: Path
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
+def test_keras_h5_scanner_skips_generic_root_weight_like_groups(tmp_path: Path) -> None:
+    """Generic root vars/weights groups are common outside Keras and should stay quiet."""
+    generic_path = tmp_path / "generic_root_vars.h5"
+    with h5py.File(generic_path, "w") as f:
+        f["vars"] = h5py.ExternalLink("external_source.h5", "/payload")
+
+    result = KerasH5Scanner().scan(str(generic_path))
+
+    assert result.success is True
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
 def test_keras_h5_scanner_flags_weights_only_external_link_without_keras_metadata(tmp_path: Path) -> None:
     """Weights-only HDF5 files can still be Keras load inputs and must not skip external references."""
     external_source = tmp_path / "external_source.h5"
@@ -646,7 +659,10 @@ def test_keras_h5_scanner_flags_weights_only_external_link_without_keras_metadat
 
     weights_path = tmp_path / "weights_only.h5"
     with h5py.File(weights_path, "w") as f:
-        f["weights"] = h5py.ExternalLink(external_source.name, "/payload")
+        f.attrs["layer_names"] = [b"dense"]
+        dense = f.create_group("dense")
+        dense.attrs["weight_names"] = [b"kernel:0"]
+        dense["kernel:0"] = h5py.ExternalLink(external_source.name, "/payload")
 
     result = KerasH5Scanner().scan(str(weights_path))
 
@@ -657,7 +673,7 @@ def test_keras_h5_scanner_flags_weights_only_external_link_without_keras_metadat
     assert cve_issues[0].details["external_references"] == [
         {
             "kind": "ExternalLink",
-            "hdf5_path": "/weights",
+            "hdf5_path": "/dense/kernel:0",
             "filename": "external_source.h5",
             "path": "/payload",
         },
