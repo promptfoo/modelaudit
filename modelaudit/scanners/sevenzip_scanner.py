@@ -277,12 +277,14 @@ class SevenZipScanner(BaseScanner):
                     "py7zr library not installed. "
                     "Install with 'pip install py7zr' or 'pip install modelaudit[sevenzip]'"
                 ),
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={
                     "error_type": "missing_dependency",
                     "required_package": "py7zr",
                     "install_command": "pip install py7zr",
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "sevenzip_analysis_incomplete",
                 },
             )
             mark_archive_scan_incomplete(result, "sevenzip_analysis_incomplete")
@@ -1001,6 +1003,8 @@ class SevenZipScanner(BaseScanner):
             else:
                 nested_config = dict(self.config)
                 nested_config["_archive_depth"] = depth + 1
+                # Extracted members are deleted below, so their temporary paths cannot be reused as cache keys.
+                nested_config["cache_enabled"] = False
                 file_result = self._scan_nested_archive_entry(scan_path, nested_config)
 
             self._rewrite_nested_result_context(file_result, scan_path, archive_path, original_name)
