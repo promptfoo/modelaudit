@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit.config.rule_config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import jinja2_template_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
@@ -728,6 +729,23 @@ class TestJinja2TemplateScannerEdgeCases:
         assert "scan_outcome" not in result.metadata
         assert not [c for c in result.checks if c.name == "Template Size Limit"]
         assert [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+
+    def test_path_traversal_suppression_does_not_hide_object_traversal_ssti(self, tmp_path: Path) -> None:
+        tokenizer_file = tmp_path / "tokenizer_config.json"
+        tokenizer_file.write_text(
+            json.dumps({"chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}"}),
+            encoding="utf-8",
+        )
+
+        set_config(ModelAuditConfig(suppress={"S405"}))
+        try:
+            result = Jinja2TemplateScanner().scan(str(tokenizer_file))
+        finally:
+            reset_config()
+
+        failed_checks = [check for check in result.checks if check.name == "Jinja2 Template Injection Detection"]
+        assert any(check.details.get("pattern_type") == "object_traversal" for check in failed_checks)
+        assert not any(check.rule_code == "S405" for check in failed_checks)
 
     def test_invalid_utf8_standalone_template_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
         """Unreadable standalone templates must not look clean."""

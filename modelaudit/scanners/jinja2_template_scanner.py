@@ -61,6 +61,15 @@ _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
 _JINJA_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
 _JINJA_TEMPLATE_INDICATOR_BYTES = tuple(indicator.encode("utf-8") for indicator in _JINJA_TEMPLATE_INDICATORS)
 _TEMPLATE_FIELD_KEYS = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
+_DETECTION_MESSAGE_LABELS = {
+    "critical_injection": "critical injection",
+    "object_traversal": "object hierarchy access",
+    "global_access": "global namespace access",
+    "obfuscation": "obfuscation",
+    "control_flow": "control flow",
+    "environment_access": "environment access",
+    "sandbox_violation": "sandbox violation",
+}
 _RAW_PARSE_FALLBACK_CONTEXT_BYTES = 1024
 _RAW_PARSE_FALLBACK_MAX_WINDOWS = 8
 _RAW_PARSE_FALLBACK_READ_BYTES = 256 * 1024
@@ -340,7 +349,10 @@ class Jinja2TemplateScanner(BaseScanner):
                 result.add_check(
                     name="Jinja2 Template Injection Detection",
                     passed=False,
-                    message=f"Potential SSTI vulnerability detected: {detection.pattern_type}",
+                    message=(
+                        "Potential SSTI vulnerability detected: "
+                        f"{_DETECTION_MESSAGE_LABELS.get(detection.pattern_type, detection.pattern_type)}"
+                    ),
                     severity=severity,
                     location=detection.location or f"{path}:{template_location}",
                     details={
