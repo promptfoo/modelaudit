@@ -886,7 +886,11 @@ class JaxCheckpointScanner(BaseScanner):
         checkpoint_files = list(path_obj.glob("checkpoint*"))
         for checkpoint_file in checkpoint_files:
             if checkpoint_file.is_file():
-                self._scan_checkpoint_file(str(checkpoint_file), result)
+                self._scan_checkpoint_file(
+                    str(checkpoint_file),
+                    result,
+                    treat_legacy_pickle_header_as_checkpoint=True,
+                )
 
     def _analyze_orbax_metadata(self, metadata: dict[str, Any], path: str, result: ScanResult) -> None:
         """Analyze Orbax metadata for security issues."""
@@ -943,7 +947,13 @@ class JaxCheckpointScanner(BaseScanner):
                 }
             )
 
-    def _scan_checkpoint_file(self, path: str, result: ScanResult) -> None:
+    def _scan_checkpoint_file(
+        self,
+        path: str,
+        result: ScanResult,
+        *,
+        treat_legacy_pickle_header_as_checkpoint: bool = False,
+    ) -> None:
         """Scan individual checkpoint file."""
         try:
             file_size = os.path.getsize(path)
@@ -963,7 +973,12 @@ class JaxCheckpointScanner(BaseScanner):
                 header = f.read(1024)
 
             # Check file format
-            if header.startswith(b"\x80") or self._legacy_pickle_header_has_jax_indicator(path, header):
+            legacy_pickle_header = header[:1] in self._LEGACY_PICKLE_INITIAL_OPCODES
+            if (
+                header.startswith(b"\x80")
+                or (legacy_pickle_header and treat_legacy_pickle_header_as_checkpoint)
+                or self._legacy_pickle_header_has_jax_indicator(path, header)
+            ):
                 self._scan_pickle_checkpoint(path, result)
             elif header.startswith(b"\x93NUMPY"):  # NumPy format
                 self._scan_numpy_checkpoint(path, result)

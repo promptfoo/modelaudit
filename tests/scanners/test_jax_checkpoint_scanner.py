@@ -336,6 +336,28 @@ def test_protocol_zero_jax_checkpoint_pickle_global_opcode_is_detected(tmp_path:
     )
 
 
+def test_orbax_protocol_zero_checkpoint_without_jax_marker_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_protocol0"
+    _write_orbax_metadata(checkpoint_dir, {"type": "orbax_checkpoint"})
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
 def test_benign_protocol_zero_jax_checkpoint_is_scanned_as_pickle(tmp_path: Path) -> None:
     pickle_path = tmp_path / "benign_protocol0_state.checkpoint"
     pickle_path.write_bytes(pickle.dumps({"framework": "jax", "params": {"dense": [1, 2, 3]}}, protocol=0))
