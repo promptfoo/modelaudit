@@ -875,6 +875,9 @@ def test_get_scanner_for_path_routes_generic_pkl_zip_without_pytorch_markers_to_
 @pytest.mark.parametrize(
     ("filename", "scanner_name"),
     [
+        ("README", "metadata"),
+        ("README.md", "metadata"),
+        ("model_card", "metadata"),
         ("unreadable.npy", "numpy"),
         ("unreadable.pdmodel", "paddle"),
         ("unreadable.bin", "pytorch_binary"),
@@ -928,6 +931,21 @@ def test_get_scanner_for_path_does_not_claim_pickle_after_failed_zip_probe(
 ) -> None:
     path = tmp_path / "unreadable.pkl"
     path.write_bytes(b"unreadable generic pickle candidate")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+
+    assert ScannerRegistry().get_scanner_for_path(str(path)) is None
+
+
+def test_get_scanner_for_path_does_not_claim_generic_text_after_failed_zip_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "notes.txt"
+    path.write_text("ordinary notes\n", encoding="utf-8")
 
     def raise_zip_error(_path: str) -> bool:
         raise OSError("simulated ZIP probe read failure")

@@ -6268,6 +6268,31 @@ def test_scan_file_fails_closed_when_format_detection_read_fails_without_owner(
     assert core_module.determine_exit_code(aggregate) == 2
 
 
+@pytest.mark.parametrize("filename", ["README.md", "README", "model_card"])
+def test_scan_file_preserves_metadata_outcome_after_failed_read_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+) -> None:
+    readme_path = tmp_path / filename
+    readme_path.write_text("# metadata\n", encoding="utf-8")
+
+    def raise_read_error(*_args: object, **_kwargs: object) -> str:
+        raise OSError("simulated read failure")
+
+    monkeypatch.setattr(core_module, "detect_file_format", raise_read_error)
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_read_error)
+    monkeypatch.setattr("modelaudit.scanners.metadata_scanner.open", raise_read_error, raising=False)
+
+    result = scan_file(str(readme_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "metadata"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["operational_error_reason"] == "metadata_read_failed"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
 def test_scan_file_unavailable_recognized_format_result_is_not_cached(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -41,11 +41,16 @@ _READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS = frozenset(
 def _is_read_failure_aware_scanner_path(file_path: str) -> bool:
     try:
         from ...scanners.manifest_scanner import ManifestScanner
+        from ...scanners.metadata_scanner import MetadataScanner
         from ...scanners.text_scanner import TextScanner
     except Exception:
         return False
 
-    return ManifestScanner.can_handle(file_path) or TextScanner.can_handle(file_path)
+    return (
+        ManifestScanner.can_handle(file_path)
+        or MetadataScanner.can_handle(file_path)
+        or TextScanner.can_handle(file_path)
+    )
 
 
 def should_bypass_cache_for_read_failure_aware_file(file_path: str) -> bool:

@@ -19,6 +19,7 @@ _READ_FAILURE_AWARE_EXTENSION_SCANNERS = frozenset(
         "coreml",
         "lightgbm",
         "manifest",
+        "metadata",
         "numpy",
         "paddle",
         "pytorch_binary",
@@ -312,7 +313,20 @@ class ScannerRegistry:
                                 return torch7_class
                     return scanner_class
 
+        # Filename-owned scanners still need to retain ownership when a failed
+        # ZIP probe prevents later content-routing fallback.
         if zip_probe_failed:
+            for scanner_id, scanner_info in sorted_scanners:
+                if scanner_selection is not None and not scanner_selection.allows(scanner_id):
+                    continue
+                if scanner_id not in _READ_FAILURE_AWARE_EXTENSION_SCANNERS:
+                    continue
+                if not self._is_content_routed_filename(filename, scanner_info):
+                    continue
+
+                scanner_class = self._load_scanner(scanner_id)
+                if scanner_class and scanner_class.can_handle(path):
+                    return scanner_class
             return None
 
         # Some ZIP-backed artifacts intentionally use pickle/checkpoint suffixes.
