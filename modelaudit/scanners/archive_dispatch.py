@@ -22,6 +22,7 @@ from ..utils.file.detection import (
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
+    ONNX_ROUTING_INCONCLUSIVE_FORMAT,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
@@ -66,6 +67,7 @@ _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unava
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
+_ONNX_ROUTING_INCOMPLETE_REASON = "onnx_routing_incomplete"
 _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_incomplete"
 SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY = "_skip_composed_archive_member_scan"
 
@@ -482,6 +484,23 @@ def _make_incomplete_tensorflow_protobuf_routing_result(path: str) -> ScanResult
     return result
 
 
+def _make_incomplete_onnx_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded nested ONNX protobuf routing cannot decide."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="ONNX Routing",
+        passed=False,
+        message="ONNX routing was inconclusive because the bounded structural probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": ONNX_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    mark_inconclusive_scan_result(result, _ONNX_ROUTING_INCOMPLETE_REASON)
+    mark_operational_scan_error(result, _ONNX_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
 def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     """Scan an extracted archive member without importing `modelaudit.core`."""
     from . import _registry
@@ -566,6 +585,8 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         return result
     if trusted_content_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
         return _make_incomplete_xgboost_ubjson_routing_result(path)
+    if trusted_content_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
+        return _make_incomplete_onnx_routing_result(path)
     if trusted_content_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
         return _make_incomplete_tensorflow_protobuf_routing_result(path)
     if trusted_content_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:

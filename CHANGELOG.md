@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
+- route renamed ONNX protobuf models with prefixed unknown fields through content analysis and fail closed on unresolved or incomplete structure
 - mark compressed-wrapper partial-analysis outcomes explicitly inconclusive
 - retain oversized renamed SafeTensors candidates for bounded fail-closed analysis
 - route renamed TensorFlow SavedModel and MetaGraph protobufs through unsafe-operation analysis

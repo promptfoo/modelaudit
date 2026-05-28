@@ -183,6 +183,86 @@ def create_mock_onnx(
     return path
 
 
+def _encode_protobuf_varint(value: int) -> bytes:
+    if value < 0:
+        raise ValueError("protobuf varints cannot encode negative values")
+
+    encoded = bytearray()
+    while value > 0x7F:
+        encoded.append((value & 0x7F) | 0x80)
+        value >>= 7
+    encoded.append(value)
+    return bytes(encoded)
+
+
+def prefix_mock_onnx_with_unknown_field(
+    path: Path,
+    *,
+    value_size: int = 4,
+    field_number: int = 100,
+    count: int = 1,
+) -> Path:
+    """Prefix a serialized ONNX model with legal unknown protobuf fields."""
+    if field_number <= 0:
+        raise ValueError("field_number must be positive")
+    if value_size < 0:
+        raise ValueError("value_size cannot be negative")
+    if count <= 0:
+        raise ValueError("count must be positive")
+
+    payload = path.read_bytes()
+    field = _encode_protobuf_varint((field_number << 3) | 2) + _encode_protobuf_varint(value_size) + (b"x" * value_size)
+    path.write_bytes((field * count) + payload)
+    return path
+
+
+def prefix_mock_onnx_with_unknown_group(
+    path: Path,
+    *,
+    field_number: int = 100,
+    nested_field_count: int = 513,
+) -> Path:
+    """Prefix an ONNX model with a legal unknown protobuf group."""
+    if field_number <= 0:
+        raise ValueError("field_number must be positive")
+    if nested_field_count <= 0:
+        raise ValueError("nested_field_count must be positive")
+
+    start_group = _encode_protobuf_varint((field_number << 3) | 3)
+    end_group = _encode_protobuf_varint((field_number << 3) | 4)
+    nested_field = _encode_protobuf_varint((1 << 3) | 0) + b"\x01"
+    path.write_bytes(start_group + (nested_field * nested_field_count) + end_group + path.read_bytes())
+    return path
+
+
+def prefix_mock_onnx_with_branching_unknown_groups(
+    path: Path,
+    *,
+    field_number: int = 100,
+    depth: int = 2,
+    branch_count: int = 3,
+    leaf_field_count: int = 60,
+) -> Path:
+    """Prefix ONNX with one group whose nested branches collectively exceed a probe budget."""
+    if field_number <= 0:
+        raise ValueError("field_number must be positive")
+    if depth < 0 or branch_count <= 0 or leaf_field_count <= 0:
+        raise ValueError("branching group dimensions must be positive")
+
+    start_group = _encode_protobuf_varint((field_number << 3) | 3)
+    end_group = _encode_protobuf_varint((field_number << 3) | 4)
+    nested_field = _encode_protobuf_varint((1 << 3) | 0) + b"\x01"
+
+    def build_group_body(remaining_depth: int) -> bytes:
+        if remaining_depth == 0:
+            return nested_field * leaf_field_count
+        child = start_group + build_group_body(remaining_depth - 1) + end_group
+        return child * branch_count
+
+    path.write_bytes(start_group + build_group_body(depth) + end_group + path.read_bytes())
+    return path
+
+
 def create_mock_mxnet_symbol(path: Path, *, custom_library: str | None = None) -> Path:
     """Create a minimal MXNet symbol graph, optionally with a custom library reference."""
     nodes: list[dict[str, Any]] = [{"op": "null", "name": "data", "inputs": []}]

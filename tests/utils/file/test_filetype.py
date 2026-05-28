@@ -24,6 +24,7 @@ from modelaudit.utils.file.detection import (
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
+    ONNX_ROUTING_INCONCLUSIVE_FORMAT,
     PROTO0_1_MAX_PROBE_BYTES,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
@@ -37,7 +38,13 @@ from modelaudit.utils.file.detection import (
     validate_file_type,
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
-from tests.helpers import create_mock_mxnet_symbol, create_mock_onnx
+from tests.helpers import (
+    create_mock_mxnet_symbol,
+    create_mock_onnx,
+    prefix_mock_onnx_with_branching_unknown_groups,
+    prefix_mock_onnx_with_unknown_field,
+    prefix_mock_onnx_with_unknown_group,
+)
 from tests.helpers.file_creators import create_v7_tar_archive
 
 
@@ -545,6 +552,99 @@ def test_detect_file_format_onnx_pb_content_hint_preempts_protobuf_extension(tmp
     assert detect_file_format(str(model_path)) == "onnx"
     assert detect_file_format_from_magic(str(model_path)) == "onnx"
     assert validate_file_type(str(model_path)) is True
+
+
+def test_detect_file_format_routes_prefixed_renamed_onnx_by_bounded_structure(tmp_path: Path) -> None:
+    """Unknown protobuf fields before ONNX content must not defeat content routing."""
+    pytest.importorskip("onnx")
+    model_path = tmp_path / "model.jpg"
+    create_mock_onnx(model_path)
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=(1024 * 1024) + 32)
+
+    assert detect_file_format(str(model_path)) == "onnx"
+    assert detect_file_format_from_magic(str(model_path)) == "onnx"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "onnx"
+
+
+@pytest.mark.parametrize("field_number", [2, 9, 63])
+def test_detect_file_format_reports_inconclusive_budget_exhausted_prefixed_renamed_onnx(
+    tmp_path: Path,
+    field_number: int,
+) -> None:
+    """Legal known or unknown padding must fail closed when routing exhausts its budget."""
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / f"many-prefixes-{field_number}.jpg")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=field_number)
+
+    assert detect_file_format(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_budget_exhausted_onnx_flax_overlap_keeps_existing_flax_owner(tmp_path: Path) -> None:
+    """An ambiguous MessagePack overlap must remain on its fail-closed owner route."""
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "flax-overlap.jpg")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=100)
+
+    assert detect_file_format(str(model_path)) == "flax_msgpack"
+    assert detect_file_format_from_magic(str(model_path)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "flax_msgpack"
+
+
+def test_detect_file_format_routes_group_prefixed_renamed_onnx_by_bounded_structure(tmp_path: Path) -> None:
+    """Deprecated but legal unknown protobuf groups must not hide ONNX content."""
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "group-model.jpg")
+    prefix_mock_onnx_with_unknown_group(model_path, nested_field_count=1)
+
+    assert detect_file_format(str(model_path)) == "onnx"
+    assert detect_file_format_from_magic(str(model_path)) == "onnx"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "onnx"
+
+
+def test_detect_file_format_reports_inconclusive_budget_exhausted_group_prefixed_renamed_onnx(
+    tmp_path: Path,
+) -> None:
+    """A bounded group walk must fail closed rather than skip renamed ONNX."""
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "group-budget-model.jpg")
+    prefix_mock_onnx_with_unknown_group(model_path)
+
+    assert detect_file_format(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_reports_inconclusive_branching_group_budget_exhaustion(tmp_path: Path) -> None:
+    """Nested legal groups share one bounded routing budget across branches."""
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "branching-groups.jpg")
+    prefix_mock_onnx_with_branching_unknown_groups(model_path)
+
+    assert detect_file_format(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_rejects_unknown_prefixed_generic_protobuf(tmp_path: Path) -> None:
+    """A legal unknown prefix is insufficient without ONNX graph structure."""
+    generic_path = tmp_path / "metadata.jpg"
+    generic_path.write_bytes(b"\xa2\x06\x04xxxx\x12\x02\x08\x01")
+
+    assert detect_file_format(str(generic_path)) == "unknown"
+    assert detect_file_format_from_magic(str(generic_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(generic_path)) == "unknown"
+
+
+def test_detect_file_format_rejects_group_prefixed_generic_protobuf(tmp_path: Path) -> None:
+    """Skipping an unknown group still requires ONNX graph structure afterward."""
+    generic_path = tmp_path / "group-metadata.jpg"
+    generic_path.write_bytes(b"\xa3\x06\x08\x01\xa4\x06\x12\x02\x08\x01")
+
+    assert detect_file_format(str(generic_path)) == "unknown"
+    assert detect_file_format_from_magic(str(generic_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(generic_path)) == "unknown"
 
 
 def test_detect_file_format_rejects_incidental_onnx_pb_string(tmp_path: Path) -> None:

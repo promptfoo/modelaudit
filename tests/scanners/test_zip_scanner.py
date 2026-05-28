@@ -26,8 +26,14 @@ from modelaudit.scanners.archive_dispatch import (
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.zip_scanner import ZipScanner
 from modelaudit.utils.file import detection as file_detection
+from modelaudit.utils.file.detection import ONNX_ROUTING_INCONCLUSIVE_FORMAT
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
-from tests.helpers import create_mock_mxnet_symbol, create_mock_onnx
+from tests.helpers import (
+    create_mock_mxnet_symbol,
+    create_mock_onnx,
+    prefix_mock_onnx_with_unknown_field,
+    prefix_mock_onnx_with_unknown_group,
+)
 
 
 def _npy_payload() -> bytes:
@@ -2889,6 +2895,55 @@ class TestZipScanner:
             entry["path"] == f"{archive_path}:model.payload" and entry["type"] == "onnx"
             for entry in result.metadata["contents"]
         )
+
+    def test_nested_member_routes_prefixed_misnamed_onnx_by_structure(self, tmp_path: Path) -> None:
+        """Unknown leading protobuf content must not hide a nested ONNX member."""
+        pytest.importorskip("onnx")
+        archive_path = tmp_path / "outer.zip"
+        onnx_path = create_mock_onnx(tmp_path / "model.onnx", op_type="PythonOp")
+        prefix_mock_onnx_with_unknown_field(onnx_path, value_size=(1024 * 1024) + 32)
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.jpg", onnx_path.read_bytes())
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            entry["path"] == f"{archive_path}:model.jpg" and entry["type"] == "onnx"
+            for entry in result.metadata["contents"]
+        )
+        assert any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+
+    def test_nested_member_fails_closed_for_group_budget_prefixed_misnamed_onnx(self, tmp_path: Path) -> None:
+        """A nested ONNX candidate hidden beyond the group budget must be inconclusive."""
+        pytest.importorskip("onnx")
+        archive_path = tmp_path / "outer.zip"
+        onnx_path = create_mock_onnx(tmp_path / "model.onnx", op_type="PythonOp")
+        prefix_mock_onnx_with_unknown_group(onnx_path)
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.jpg", onnx_path.read_bytes())
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            entry["path"] == f"{archive_path}:model.jpg" and entry["type"] == "unknown"
+            for entry in result.metadata["contents"]
+        )
+        assert any(issue.details.get("format") == ONNX_ROUTING_INCONCLUSIVE_FORMAT for issue in result.issues)
+        assert not any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+
+    def test_nested_member_does_not_route_prefixed_generic_protobuf_as_onnx(self, tmp_path: Path) -> None:
+        """An unknown protobuf prefix alone must not promote a nested member."""
+        archive_path = tmp_path / "outer.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("metadata.jpg", b"\xa2\x06\x04xxxx\x12\x02\x08\x01")
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            entry["path"] == f"{archive_path}:metadata.jpg" and entry["type"] == "unknown"
+            for entry in result.metadata["contents"]
+        )
+        assert not any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
 
     def test_max_depth_limit(self):
         """Test that maximum nesting depth is enforced"""
