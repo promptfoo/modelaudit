@@ -28,7 +28,7 @@ _PATH_TOKEN_CHARACTER_CLASS_PATTERNS = (
     re.compile(r"[a-z]"),
     re.compile(r"[A-Z]"),
     re.compile(r"\d"),
-    re.compile(r"[._~+/=-]"),
+    re.compile(r"[._~+/=\-]"),
 )
 _ARTIFACT_FILENAME_PATTERN = re.compile(r"(?i)^.+\.[a-z0-9]{1,10}$")
 _TRAILING_PATH_DELIMITERS = ".,;:)]}'\""
@@ -46,21 +46,60 @@ def _shannon_entropy_per_char(value: str) -> float:
     return -sum((count / length) * math.log2(count / length) for count in counts.values())
 
 
+def _redact_known_token_filename(segment: str) -> str | None:
+    token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+    decoded = unquote(token_candidate)
+    if not _ARTIFACT_FILENAME_PATTERN.fullmatch(decoded):
+        return None
+
+    stem, separator, suffix = decoded.rpartition(".")
+    if separator and _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(stem):
+        return f"{_REDACTED_PATH_TOKEN}.{suffix}{trailing_delimiters}"
+    return None
+
+
 def _looks_like_capability_path_token(segment: str) -> bool:
     token_candidate, _trailing_delimiters = _split_trailing_path_delimiters(segment)
     decoded = unquote(token_candidate)
     if _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded):
+        return True
+    if _redact_known_token_filename(segment) is not None:
         return True
 
     if _ARTIFACT_FILENAME_PATTERN.fullmatch(decoded):
         return False
     if len(decoded) < 20:
         return False
-    if not re.fullmatch(r"[A-Za-z0-9._~+/=-]+", decoded):
+    if not re.fullmatch(r"[A-Za-z0-9._~+/=\-]+", decoded):
         return False
 
     character_classes = sum(bool(pattern.search(decoded)) for pattern in _PATH_TOKEN_CHARACTER_CLASS_PATTERNS)
     return character_classes >= 3 and _shannon_entropy_per_char(decoded) >= _MIN_CAPABILITY_TOKEN_ENTROPY
+
+
+def _redact_path_parameter_tokens(segment: str) -> str | None:
+    token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+    if ";" not in token_candidate:
+        return None
+
+    parts = token_candidate.split(";")
+    changed = False
+    for index, part in enumerate(parts[1:], start=1):
+        if not part:
+            continue
+        if "=" not in part:
+            if _looks_like_capability_path_token(part):
+                parts[index] = _REDACTED_PATH_TOKEN
+                changed = True
+            continue
+        key, value = part.split("=", 1)
+        if _looks_like_capability_path_token(value):
+            parts[index] = f"{key}={_REDACTED_PATH_TOKEN}"
+            changed = True
+
+    if changed:
+        return f"{';'.join(parts)}{trailing_delimiters}"
+    return None
 
 
 def _redact_url_path_tokens(hostname: str, path: str) -> str:
@@ -71,6 +110,14 @@ def _redact_url_path_tokens(hostname: str, path: str) -> str:
         is_slack_webhook_secret = (
             hostname == "hooks.slack.com" and len(segments) > 2 and segments[1].lower() == "services" and index > 1
         )
+        parameter_redaction = _redact_path_parameter_tokens(segment)
+        if parameter_redaction is not None:
+            segments[index] = parameter_redaction
+            continue
+        filename_redaction = _redact_known_token_filename(segment)
+        if filename_redaction is not None:
+            segments[index] = filename_redaction
+            continue
         if is_slack_webhook_secret or _looks_like_capability_path_token(segment):
             _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
             segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"

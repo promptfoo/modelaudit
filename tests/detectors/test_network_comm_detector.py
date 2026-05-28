@@ -154,6 +154,17 @@ class TestNetworkCommDetector:
         assert url_finding["url"] == "https://example.com/download/<redacted>"
         assert encoded_token not in json.dumps(url_finding, sort_keys=True)
 
+    def test_base64url_path_capability_tokens_with_hyphen_are_redacted(self) -> None:
+        """Base64url path tokens can contain hyphens as data."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz123456-_"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
     def test_long_base64_path_capability_tokens_use_entropy_not_unique_ratio(self) -> None:
         """Long signed-CDN style path tokens should still be redacted."""
         detector = NetworkCommDetector()
@@ -163,6 +174,32 @@ class TestNetworkCommDetector:
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
 
         assert url_finding["url"] == "https://example.com/download/<redacted>"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_known_path_tokens_with_filename_suffix_are_redacted(self) -> None:
+        """Known token formats must win over filename preservation."""
+        detector = NetworkCommDetector()
+        github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        segment = f"{github_token}.json"
+
+        findings = detector.scan(f"https://example.com/path/{segment}".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/path/<redacted>.json"
+        assert github_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_path_parameter_tokens_are_redacted(self) -> None:
+        """Matrix-style path parameters can carry capability tokens."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/download;token={path_token}/model.bin".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download;token=<redacted>/model.bin"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
 
     def test_public_revision_hash_paths_are_preserved(self) -> None:
