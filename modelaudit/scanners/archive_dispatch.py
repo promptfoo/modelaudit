@@ -9,7 +9,12 @@ from typing import Any
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_registry_metadata import get_scanner_registry_metadata
-from ..scanner_results import IssueSeverity, ScanResult, mark_inconclusive_scan_result
+from ..scanner_results import (
+    SCAN_OUTCOME_REASONS_METADATA_KEY,
+    IssueSeverity,
+    ScanResult,
+    mark_inconclusive_scan_result,
+)
 from ..scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
     add_scanner_selection_skip_check,
@@ -18,10 +23,13 @@ from ..scanner_selection import (
 )
 from ..utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
+    ONNX_ROUTING_INCONCLUSIVE_FORMAT,
+    TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
@@ -30,6 +38,7 @@ from ..utils.file.detection import (
     detect_mxnet_symbol_content_route,
     detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
+    has_inconclusive_renamed_flax_msgpack_routing,
     is_executorch_archive,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
@@ -65,7 +74,10 @@ _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unava
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
+_ONNX_ROUTING_INCOMPLETE_REASON = "onnx_routing_incomplete"
+_TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_incomplete"
 SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY = "_skip_composed_archive_member_scan"
+KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY = "_known_unreadable_archive_entry_offsets"
 
 
 def _select_nested_scanner_id(path: str, header_format_override: str | None = None) -> str | None:
@@ -241,6 +253,25 @@ def _deduplicate_exact_merged_findings(result: ScanResult) -> None:
     result.checks = unique_checks
 
 
+def _merge_composed_scan_result(result: ScanResult, other: ScanResult) -> None:
+    """Merge analyses while retaining all incomplete-coverage reasons."""
+    prior_reasons = result.metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY, [])
+    additional_reasons = other.metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY, [])
+    combined_reasons = list(
+        dict.fromkeys(
+            [
+                *(prior_reasons if isinstance(prior_reasons, list) else []),
+                *(additional_reasons if isinstance(additional_reasons, list) else []),
+            ]
+        )
+    )
+    primary_bytes_scanned = result.bytes_scanned
+    result.merge(other)
+    result.bytes_scanned = max(primary_bytes_scanned, other.bytes_scanned)
+    if combined_reasons:
+        result.metadata[SCAN_OUTCOME_REASONS_METADATA_KEY] = combined_reasons
+
+
 def merge_executable_zip_container_findings(
     path: str,
     result: ScanResult,
@@ -274,11 +305,19 @@ def merge_executable_zip_container_findings(
 
     subtype_config = dict(config or {})
     subtype_config[SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY] = True
+    zip_config = dict(config or {})
+    known_unreadable_offsets: set[int] = set()
     for subtype_id in subtype_ids:
         if scanner_selection.allows(subtype_id):
             subtype_scanner = _registry.load_scanner_by_id(subtype_id)
             if subtype_scanner:
-                result.merge(subtype_scanner(config=subtype_config).scan(path))
+                subtype_result = subtype_scanner(config=subtype_config).scan(path)
+                raw_offsets = subtype_result.metadata.pop(KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, ())
+                if isinstance(raw_offsets, (list, tuple, set, frozenset)):
+                    known_unreadable_offsets.update(
+                        offset for offset in raw_offsets if isinstance(offset, int) and not isinstance(offset, bool)
+                    )
+                _merge_composed_scan_result(result, subtype_result)
         else:
             add_scanner_selection_skip_check(
                 result,
@@ -289,7 +328,9 @@ def merge_executable_zip_container_findings(
             )
 
     if scanner_selection.allows("zip"):
-        result.merge(ZipScanner(config=config).scan_archive_members(path))
+        if known_unreadable_offsets:
+            zip_config[KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY] = sorted(known_unreadable_offsets)
+        _merge_composed_scan_result(result, ZipScanner(config=zip_config).scan_archive_members(path))
     else:
         add_scanner_selection_skip_check(
             result,
@@ -323,9 +364,7 @@ def merge_flax_msgpack_overlap_findings(
                 overlap_result = _make_unavailable_recognized_format_result(path, scanner_id, scanner_id)
             else:
                 overlap_result = scanner_class(config=config).scan(path)
-            primary_bytes_scanned = result.bytes_scanned
-            result.merge(overlap_result)
-            result.bytes_scanned = max(primary_bytes_scanned, overlap_result.bytes_scanned)
+            _merge_composed_scan_result(result, overlap_result)
         else:
             add_scanner_selection_skip_check(
                 result,
@@ -334,6 +373,34 @@ def merge_flax_msgpack_overlap_findings(
                 scanner_selection,
                 context=context,
             )
+    _deduplicate_exact_merged_findings(result)
+
+
+def merge_inconclusive_flax_msgpack_outcome(
+    path: str,
+    result: ScanResult,
+    config: dict[str, Any] | None,
+    *,
+    context: str,
+) -> None:
+    """Preserve ambiguous Flax coverage when a strict overlapping owner is primary."""
+    from . import _registry
+
+    if result.scanner_name not in detect_flax_msgpack_overlap_routes(
+        path
+    ) or not has_inconclusive_renamed_flax_msgpack_routing(path):
+        return
+
+    scanner_selection = policy_from_config(config)
+    if scanner_selection.allows("flax_msgpack"):
+        scanner_class = _registry.load_scanner_by_id("flax_msgpack")
+        if scanner_class is None:
+            flax_result = _make_unavailable_recognized_format_result(path, "flax_msgpack", "flax_msgpack")
+        else:
+            flax_result = scanner_class(config=config).scan(path)
+        _merge_composed_scan_result(result, flax_result)
+    else:
+        add_scanner_selection_skip_check(result, path, "flax_msgpack", scanner_selection, context=context)
     _deduplicate_exact_merged_findings(result)
 
 
@@ -393,6 +460,7 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
     mark_inconclusive_scan_result(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)
     mark_operational_scan_error(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)
 
+    from .jax_checkpoint_scanner import JaxCheckpointScanner
     from .jinja2_template_scanner import Jinja2TemplateScanner
     from .manifest_scanner import ManifestScanner
     from .mxnet_scanner import MXNetScanner
@@ -415,6 +483,18 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
                 "mxnet",
                 scanner_selection,
                 context="inconclusive MXNet params byte analysis",
+            )
+
+    if os.path.getsize(path) <= JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+        if scanner_selection.allows("jax_checkpoint"):
+            merge_owner_result(JaxCheckpointScanner(config=config).scan(path))
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "jax_checkpoint",
+                scanner_selection,
+                context="overlapping JAX JSON analysis",
             )
 
     manifest_covered_templates = False
@@ -459,6 +539,40 @@ def _make_incomplete_xgboost_ubjson_routing_result(path: str) -> ScanResult:
     )
     mark_inconclusive_scan_result(result, "xgboost_ubjson_routing_incomplete")
     mark_operational_scan_error(result, "xgboost_ubjson_routing_incomplete")
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_tensorflow_protobuf_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded nested TensorFlow protobuf routing cannot decide."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="TensorFlow Protobuf Routing",
+        passed=False,
+        message="TensorFlow protobuf routing was inconclusive because the bounded structural probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    mark_inconclusive_scan_result(result, _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON)
+    mark_operational_scan_error(result, _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_onnx_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded nested ONNX protobuf routing cannot decide."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="ONNX Routing",
+        passed=False,
+        message="ONNX routing was inconclusive because the bounded structural probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": ONNX_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    mark_inconclusive_scan_result(result, _ONNX_ROUTING_INCOMPLETE_REASON)
+    mark_operational_scan_error(result, _ONNX_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -547,6 +661,10 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         return result
     if trusted_content_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
         return _make_incomplete_xgboost_ubjson_routing_result(path)
+    if trusted_content_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
+        return _make_incomplete_onnx_routing_result(path)
+    if trusted_content_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
+        return _make_incomplete_tensorflow_protobuf_routing_result(path)
     if trusted_content_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:
         result = ScanResult(scanner_name="zip")
         merge_executable_zip_container_findings(
@@ -645,6 +763,13 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
             config,
             context="nested Flax MessagePack overlapping content analysis",
             scanned_scanner_ids=frozenset({result.scanner_name}),
+        )
+    elif result.scanner_name != "flax_msgpack":
+        merge_inconclusive_flax_msgpack_outcome(
+            path,
+            result,
+            config,
+            context="nested strict content owner overlapping ambiguous Flax analysis",
         )
     if skipped_overlap_scanner_id:
         add_scanner_selection_skip_check(

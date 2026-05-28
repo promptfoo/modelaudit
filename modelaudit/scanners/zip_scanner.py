@@ -12,10 +12,11 @@ from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import (
+    KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY,
     NESTED_SCAN_CALLBACK_CONFIG_KEY,
     scan_nested_file,
 )
-from .archive_member_security import scan_archive_member_for_known_risks
+from .archive_member_security import is_executable_archive_member_name, scan_archive_member_for_known_risks
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -61,14 +62,10 @@ class ZipScanner(BaseScanner):
             self.config.get("zip_min_compression_bomb_uncompressed_size"),
             self.MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE,
         )
-        raw_skip_entries = self.config.get("skip_archive_entries", ())
-        if isinstance(raw_skip_entries, str):
-            raw_skip_entries = (raw_skip_entries,)
-        if not isinstance(raw_skip_entries, (list, tuple, set, frozenset)):
-            raw_skip_entries = ()
-        self.skip_archive_entries = {
-            self._normalize_skip_entry_name(entry) for entry in raw_skip_entries if isinstance(entry, str)
-        }
+        self.skip_archive_entries = self._normalize_archive_entry_names(self.config.get("skip_archive_entries", ()))
+        self.known_unreadable_archive_entry_offsets = self._normalize_archive_entry_offsets(
+            self.config.get(KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, ())
+        )
 
     def _get_zip_depth(self) -> int:
         """Return the current nested ZIP depth from config."""
@@ -128,8 +125,27 @@ class ZipScanner(BaseScanner):
             normalized = normalized[2:]
         return normalized.lstrip("/")
 
+    @classmethod
+    def _normalize_archive_entry_names(cls, entries: Any) -> set[str]:
+        if isinstance(entries, str):
+            entries = (entries,)
+        if not isinstance(entries, (list, tuple, set, frozenset)):
+            return set()
+        return {cls._normalize_skip_entry_name(entry) for entry in entries if isinstance(entry, str)}
+
+    @staticmethod
+    def _normalize_archive_entry_offsets(offsets: Any) -> set[int]:
+        if isinstance(offsets, int) and not isinstance(offsets, bool):
+            offsets = (offsets,)
+        if not isinstance(offsets, (list, tuple, set, frozenset)):
+            return set()
+        return {offset for offset in offsets if isinstance(offset, int) and not isinstance(offset, bool)}
+
     def _should_skip_archive_entry(self, name: str) -> bool:
         return self._normalize_skip_entry_name(name) in self.skip_archive_entries
+
+    def _is_known_unreadable_archive_entry(self, info: zipfile.ZipInfo) -> bool:
+        return info.header_offset in self.known_unreadable_archive_entry_offsets
 
     def _read_symlink_target(self, archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
         """Read a symlink target with a hard cap to avoid materializing large archive members."""
@@ -292,6 +308,17 @@ class ZipScanner(BaseScanner):
 
         is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
         if is_symlink:
+            if self._is_known_unreadable_archive_entry(info):
+                result.add_check(
+                    name="ZIP Member Analysis Coverage",
+                    passed=False,
+                    message=f"Skipped ZIP symlink target validation for known unreadable member: {name}",
+                    severity=IssueSeverity.INFO,
+                    location=f"{archive_path}:{name}",
+                    details={"entry": name, "reason": "known_unreadable_archive_member_skip"},
+                )
+                return False, False
+
             try:
                 target = self._read_symlink_target(archive, info)
             except Exception as exc:
@@ -540,15 +567,34 @@ class ZipScanner(BaseScanner):
                             rule_code=None,  # Passing check
                         )
 
-                if self._should_skip_archive_entry(name):
+                is_known_unreadable = self._is_known_unreadable_archive_entry(info)
+                is_configured_skip = self._should_skip_archive_entry(name)
+                if is_known_unreadable or is_configured_skip:
                     scan_complete = False
+                    if is_executable_archive_member_name(name):
+                        scan_archive_member_for_known_risks(
+                            archive_kind="ZIP",
+                            archive_path=path,
+                            member_name=name,
+                            tmp_path=None,
+                            total_size=info.file_size,
+                            result=result,
+                            max_python_analysis_bytes=self._max_python_member_analysis_bytes(),
+                            python_analysis_incomplete_reason="zip_python_member_analysis_incomplete",
+                        )
+                    if is_known_unreadable:
+                        skip_message = f"Skipped ZIP member analysis for known unreadable member: {name}"
+                        skip_reason = "known_unreadable_archive_member_skip"
+                    else:
+                        skip_message = f"Skipped ZIP member analysis by configured request: {name}"
+                        skip_reason = "configured_archive_member_skip"
                     result.add_check(
                         name="ZIP Member Analysis Coverage",
                         passed=False,
-                        message=f"Skipped ZIP member analysis by configured request: {name}",
+                        message=skip_message,
                         severity=IssueSeverity.INFO,
                         location=f"{path}:{name}",
-                        details={"entry": name, "reason": "configured_archive_member_skip"},
+                        details={"entry": name, "reason": skip_reason},
                     )
                     continue
 
@@ -609,6 +655,7 @@ class ZipScanner(BaseScanner):
 
                         nested_config = dict(self.config)
                         nested_config.pop("skip_archive_entries", None)
+                        nested_config.pop(KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, None)
                         nested_config["_archive_depth"] = depth + 1
                         if zipfile.is_zipfile(tmp_path):
                             nested_config["_zip_depth"] = depth + 1

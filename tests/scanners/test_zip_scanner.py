@@ -1,6 +1,8 @@
 import bz2
 import gzip
+import importlib
 import io
+import json
 import lzma
 import os
 import stat
@@ -10,7 +12,7 @@ import zipfile
 import zlib
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import pytest
 
@@ -29,9 +31,17 @@ from modelaudit.scanners.archive_dispatch import (
     scan_nested_file,
 )
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.zip_scanner import ZipScanner
+from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
+from modelaudit.scanners.zip_scanner import KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, ZipScanner
 from modelaudit.utils.file import detection as file_detection
-from tests.helpers import create_mock_mxnet_symbol, create_mock_onnx
+from modelaudit.utils.file.detection import ONNX_ROUTING_INCONCLUSIVE_FORMAT
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
+from tests.helpers import (
+    create_mock_mxnet_symbol,
+    create_mock_onnx,
+    prefix_mock_onnx_with_unknown_field,
+    prefix_mock_onnx_with_unknown_group,
+)
 
 
 def _npy_payload() -> bytes:
@@ -133,6 +143,37 @@ def _assert_inconclusive_zip_scan_not_cached(
         assert cached_parent is None
     finally:
         reset_cache_manager()
+
+
+def _build_malicious_tf_metagraph() -> bytes:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph.meta_info_def.meta_graph_version = "zip_metagraph"
+    function = metagraph.graph_def.library.function.add()
+    function.signature.name = "danger"
+    node = function.node_def.add()
+    node.name = "pyfunc_node"
+    node.op = "PyFunc"
+    return cast(bytes, metagraph.SerializeToString())
+
+
+def _build_malicious_tf_savedmodel() -> bytes:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+    import modelaudit.protos  # noqa: F401
+
+    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
+    saved_model = saved_model_pb2.SavedModel()
+    saved_model.saved_model_schema_version = 1
+    metagraph = saved_model.meta_graphs.add()
+    metagraph.meta_info_def.meta_graph_version = "owner"
+    node = metagraph.graph_def.node.add()
+    node.op = "PyFunc"
+    return cast(bytes, saved_model.SerializeToString())
 
 
 def test_rewrite_extracted_member_location_preserves_scanner_specific_suffix_policy() -> None:
@@ -1025,6 +1066,84 @@ def test_scan_nested_file_fails_closed_when_xml_root_is_beyond_bounded_probe(tmp
     assert result.metadata["operational_error_reason"] == "xml_model_routing_incomplete"
     check = next(check for check in result.checks if check.name == "XML Model Routing")
     assert "bounded probe ended before the first structural root element" in check.message
+
+
+def test_scan_nested_file_fails_closed_when_tensorflow_protobuf_routing_budget_is_exhausted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_FIELDS", 2)
+    extracted_member = tmp_path / "ambiguous-routing.jpg"
+    extracted_member.write_bytes(b"\x08\x01" + (b"\x18\x00" * 4))
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "tensorflow_protobuf_routing_incomplete"
+    check = next(check for check in result.checks if check.name == "TensorFlow Protobuf Routing")
+    assert "bounded structural probe reached its limit" in check.message
+
+
+def test_scan_nested_file_fails_closed_when_unknown_prefix_hides_tensorflow_after_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_FIELDS", 2)
+    extracted_member = tmp_path / "budget-prefixed.jpg"
+    extracted_member.write_bytes(
+        b"{" + (b"\x18\x00" * 3) + b"|" + b"z\x09\x81\xa6params\x80" + _build_malicious_tf_metagraph()
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "tensorflow_protobuf_routing_incomplete"
+
+
+def test_scan_nested_file_fails_closed_for_ambiguous_savedmodel_flax_overlap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_FIELDS", 2)
+    extracted_member = tmp_path / "saved-flax-overlap.jpg"
+    extracted_member.write_bytes(
+        b"{" + (b"\x18\x00" * 3) + b"|" + b"z\x09\x81\xa6params\x80" + _build_malicious_tf_savedmodel()
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "tensorflow_protobuf_routing_incomplete"
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload", "expected_scanner"),
+    [
+        ("prefixed-graph.jpg", _build_malicious_tf_metagraph, "tf_metagraph"),
+        ("prefixed-saved.jpg", _build_malicious_tf_savedmodel, "tf_savedmodel"),
+    ],
+)
+def test_scan_nested_file_routes_tensorflow_after_printable_unknown_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    payload: Callable[[], bytes],
+    expected_scanner: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES", 64)
+    extracted_member = tmp_path / filename
+    printable_field = b"z " + (b"x" * 32)
+    extracted_member.write_bytes((printable_field * 3) + payload())
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == expected_scanner
+    assert result.success is False
+    assert any("PyFunc" in issue.message for issue in result.issues)
 
 
 def test_scan_nested_file_routes_renamed_flax_msgpack_by_structure(tmp_path: Path) -> None:
@@ -1940,6 +2059,113 @@ def test_scan_nested_file_fails_closed_when_mxnet_structure_is_beyond_bounded_pr
     assert "bounded JSON probe reached its limit" in check.message
 
 
+def test_scan_nested_file_inconclusive_mxnet_route_composes_jax_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "ambiguous-jax.dat"
+    extracted_member.write_text(
+        '{"framework":"jax","nodes":[{"attrs":"'
+        + ("x" * 129)
+        + '","op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        '"payload":"jax.experimental.host_callback.call(os.system, \'id\')"}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_nested_file_inconclusive_mxnet_route_composes_escaped_suffix_owned_jax_payload_without_root_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "ambiguous-jax.checkpoint"
+    extracted_member.write_text(
+        json.dumps(
+            {
+                "nodes": [{"attrs": "x" * 129, "op": "Custom", "name": "load"}],
+                "arg_nodes": [0],
+                "heads": [[0, 0, 0]],
+                "payload": "jax.experimental.io_callback",
+            }
+        ).replace("jax.experimental.io_callback", r"j\u0061x.experimental.io_callback"),
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_nested_file_inconclusive_mxnet_route_does_not_compose_ambiguous_large_foreign_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "ambiguous-large-foreign.dat"
+    extracted_member.write_text(
+        json.dumps(
+            {
+                "nodes": [{"attrs": "x" * 129, "op": "Custom", "name": "load"}],
+                "arg_nodes": [0],
+                "heads": [[0, 0, 0]],
+                "padding": "x" * (file_detection.JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome_reasons"] == ["mxnet_symbol_routing_incomplete"]
+    assert not any(check.name == "JSON Checkpoint Analysis Limit" for check in result.checks)
+
+
+def test_scan_nested_file_inconclusive_mxnet_route_preserves_jax_incomplete_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    nested_payload: dict[str, Any] = {"value": "safe"}
+    for _ in range(2 * JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH):
+        nested_payload = {"nested": nested_payload}
+    extracted_member = tmp_path / "ambiguous-deep-jax.dat"
+    extracted_member.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "nodes": [{"attrs": "x" * 129, "op": "Custom", "name": "load"}],
+                "arg_nodes": [0],
+                "heads": [[0, 0, 0]],
+                "payload": nested_payload,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome_reasons"] == [
+        "jax_metadata_traversal_depth_limit",
+        "mxnet_symbol_routing_incomplete",
+    ]
+    assert any(check.name == "JSON Metadata Traversal Depth Limit" for check in result.checks)
+
+
 def test_scan_nested_file_fails_closed_when_mxnet_prefix_exceeds_nesting_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2219,6 +2445,22 @@ def test_zip_scanner_marks_configured_skipped_archive_entries_incomplete(tmp_pat
     assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
 
 
+def test_zip_scanner_preserves_executable_name_finding_for_skipped_archive_entry(tmp_path: Path) -> None:
+    archive_path = tmp_path / "skipped-executable.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("bin/run.sh", "#!/bin/sh\necho hidden\n")
+
+    result = ZipScanner({"skip_archive_entries": ["bin/run.sh"], "cache_enabled": False}).scan(str(archive_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Executable Archive Member Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "bin/run.sh"
+        for check in result.checks
+    )
+
+
 def test_zip_scanner_checks_compression_ratio_before_skipping_archive_entry(tmp_path: Path) -> None:
     archive_path = tmp_path / "skipped-bomb.zip"
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -2246,6 +2488,87 @@ def test_zip_scanner_validates_traversal_before_skipping_archive_entry(tmp_path:
         check.name == "Path Traversal Protection"
         and check.status == CheckStatus.FAILED
         and check.details["entry"] == "../metadata.json"
+        for check in result.checks
+    )
+
+
+def test_zip_scanner_validates_readable_symlink_target_before_regular_skip(tmp_path: Path) -> None:
+    archive_path = tmp_path / "skipped-symlink.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        info = zipfile.ZipInfo("weights_link")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(info, "../outside.bin")
+
+    result = ZipScanner({"skip_archive_entries": ["weights_link"], "cache_enabled": False}).scan(str(archive_path))
+
+    assert any(
+        check.name == "Symlink Safety Validation"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "weights_link"
+        for check in result.checks
+    )
+
+
+def test_zip_scanner_does_not_reopen_known_unreadable_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "unreadable-symlink.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        info = zipfile.ZipInfo("weights_link")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(info, "safe-target.bin")
+
+    with zipfile.ZipFile(archive_path) as archive:
+        unreadable_offset = archive.getinfo("weights_link").header_offset
+
+    def fail_read(_archive: zipfile.ZipFile, _info: zipfile.ZipInfo) -> str:
+        raise AssertionError("known unreadable symlink target should not be reopened")
+
+    monkeypatch.setattr(ZipScanner, "_read_symlink_target", fail_read)
+
+    result = ZipScanner(
+        {
+            KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY: [unreadable_offset],
+            "cache_enabled": False,
+        }
+    ).scan(str(archive_path))
+
+    assert result.success is False
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert not any(check.name == "Symlink Safety Validation" for check in result.checks)
+    assert any(
+        check.name == "ZIP Member Analysis Coverage"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "weights_link"
+        for check in result.checks
+    )
+
+
+def test_zip_scanner_validates_traversal_before_known_unreadable_symlink_skip(tmp_path: Path) -> None:
+    archive_path = tmp_path / "unreadable-traversal-symlink.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        info = zipfile.ZipInfo("../weights_link")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(info, "safe-target.bin")
+
+    with zipfile.ZipFile(archive_path) as archive:
+        unreadable_offset = archive.getinfo("../weights_link").header_offset
+
+    result = ZipScanner(
+        {
+            KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY: [unreadable_offset],
+            "cache_enabled": False,
+        }
+    ).scan(str(archive_path))
+
+    assert any(
+        check.name == "Path Traversal Protection"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "../weights_link"
         for check in result.checks
     )
 
@@ -2938,6 +3261,55 @@ class TestZipScanner:
             entry["path"] == f"{archive_path}:model.payload" and entry["type"] == "onnx"
             for entry in result.metadata["contents"]
         )
+
+    def test_nested_member_routes_prefixed_misnamed_onnx_by_structure(self, tmp_path: Path) -> None:
+        """Unknown leading protobuf content must not hide a nested ONNX member."""
+        pytest.importorskip("onnx")
+        archive_path = tmp_path / "outer.zip"
+        onnx_path = create_mock_onnx(tmp_path / "model.onnx", op_type="PythonOp")
+        prefix_mock_onnx_with_unknown_field(onnx_path, value_size=(1024 * 1024) + 32)
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.jpg", onnx_path.read_bytes())
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            entry["path"] == f"{archive_path}:model.jpg" and entry["type"] == "onnx"
+            for entry in result.metadata["contents"]
+        )
+        assert any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+
+    def test_nested_member_fails_closed_for_group_budget_prefixed_misnamed_onnx(self, tmp_path: Path) -> None:
+        """A nested ONNX candidate hidden beyond the group budget must be inconclusive."""
+        pytest.importorskip("onnx")
+        archive_path = tmp_path / "outer.zip"
+        onnx_path = create_mock_onnx(tmp_path / "model.onnx", op_type="PythonOp")
+        prefix_mock_onnx_with_unknown_group(onnx_path)
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.jpg", onnx_path.read_bytes())
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            entry["path"] == f"{archive_path}:model.jpg" and entry["type"] == "unknown"
+            for entry in result.metadata["contents"]
+        )
+        assert any(issue.details.get("format") == ONNX_ROUTING_INCONCLUSIVE_FORMAT for issue in result.issues)
+        assert not any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+
+    def test_nested_member_does_not_route_prefixed_generic_protobuf_as_onnx(self, tmp_path: Path) -> None:
+        """An unknown protobuf prefix alone must not promote a nested member."""
+        archive_path = tmp_path / "outer.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("metadata.jpg", b"\xa2\x06\x04xxxx\x12\x02\x08\x01")
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            entry["path"] == f"{archive_path}:metadata.jpg" and entry["type"] == "unknown"
+            for entry in result.metadata["contents"]
+        )
+        assert not any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
 
     def test_max_depth_limit(self):
         """Test that maximum nesting depth is enforced"""
