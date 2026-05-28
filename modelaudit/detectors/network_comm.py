@@ -9,7 +9,53 @@ import re
 from collections.abc import Iterator
 from contextlib import suppress
 from typing import Any, ClassVar
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
+
+_REDACTED_PATH_TOKEN = "<redacted>"
+_SENSITIVE_PATH_TOKEN_PATTERN = re.compile(
+    r"(?i)^(?:"
+    r"AKIA[0-9A-Z]{16}|"
+    r"gh[ps]_[A-Za-z0-9]{36}|"
+    r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|"
+    r"sk-(?:proj-)?[A-Za-z0-9]{24,}|"
+    r"xox[baprs]-[0-9A-Za-z-]{20,}"
+    r")$"
+)
+_HEX_CAPABILITY_TOKEN_PATTERN = re.compile(r"(?i)^[a-f0-9]{32,}$")
+_PATH_TOKEN_CHARACTER_CLASS_PATTERNS = (
+    re.compile(r"[a-z]"),
+    re.compile(r"[A-Z]"),
+    re.compile(r"\d"),
+    re.compile(r"[._~-]"),
+)
+
+
+def _looks_like_capability_path_token(segment: str) -> bool:
+    decoded = unquote(segment)
+    if _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded) or _HEX_CAPABILITY_TOKEN_PATTERN.fullmatch(decoded):
+        return True
+
+    if len(decoded) < 20:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9._~-]+", decoded):
+        return False
+
+    character_classes = sum(bool(pattern.search(decoded)) for pattern in _PATH_TOKEN_CHARACTER_CLASS_PATTERNS)
+    unique_ratio = len(set(decoded)) / len(decoded)
+    return character_classes >= 3 and unique_ratio >= 0.45
+
+
+def _redact_url_path_tokens(hostname: str, path: str) -> str:
+    segments = path.split("/")
+    for index, segment in enumerate(segments):
+        if not segment:
+            continue
+        is_slack_webhook_secret = (
+            hostname == "hooks.slack.com" and len(segments) > 2 and segments[1].lower() == "services" and index > 1
+        )
+        if is_slack_webhook_secret or _looks_like_capability_path_token(segment):
+            segments[index] = _REDACTED_PATH_TOKEN
+    return "/".join(segments)
 
 
 def _redact_url_for_finding(url: str) -> str:
@@ -33,7 +79,8 @@ def _redact_url_for_finding(url: str) -> str:
         port = None
 
     netloc = f"{hostname}:{port}" if port is not None else hostname
-    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    safe_path = _redact_url_path_tokens(hostname.lower(), parsed.path)
+    return urlunsplit((parsed.scheme, netloc, safe_path, "", ""))
 
 
 _DOC_CONTEXT_EXTENSIONS: tuple[str, ...] = (

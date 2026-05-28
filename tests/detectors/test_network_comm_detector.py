@@ -1,5 +1,6 @@
 """Tests for network communication detection."""
 
+import json
 import os
 from pathlib import Path
 from urllib.parse import urlparse
@@ -88,6 +89,56 @@ class TestNetworkCommDetector:
         assert "SECRET_CREDENTIAL" not in serialized
         assert "SECRET_SIGNATURE" not in serialized
         assert cloud_finding["provider"] == "s3"
+
+    def test_slack_webhook_path_tokens_are_redacted(self) -> None:
+        """Slack webhook capability tokens should not survive URL findings."""
+        detector = NetworkCommDetector()
+        webhook_token = "SECRETWEBHOOKTOKEN123456"
+        data = f"https://hooks.slack.com/services/T00000000/B00000000/{webhook_token}".encode()
+
+        findings = detector.scan(data, "model.pkl")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://hooks.slack.com/services/<redacted>/<redacted>/<redacted>"
+        assert webhook_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_cloud_storage_path_capability_tokens_are_redacted(self) -> None:
+        """Signed object URLs can carry capability tokens in path segments."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+        data = (
+            f"https://storage.googleapis.com/model-bucket/{path_token}/weights.bin?X-Goog-Signature=QUERYSECRET"
+        ).encode()
+
+        findings = detector.scan(data, "model.bin")
+        url_findings = [finding for finding in findings if finding["type"] in {"url_detected", "cloud_storage_url"}]
+
+        assert url_findings
+        serialized = json.dumps(url_findings, sort_keys=True)
+        assert path_token not in serialized
+        assert "QUERYSECRET" not in serialized
+        assert "storage.googleapis.com/model-bucket/<redacted>/weights.bin" in serialized
+
+    def test_github_path_tokens_are_redacted(self) -> None:
+        """Known token formats embedded in URL paths should be removed."""
+        detector = NetworkCommDetector()
+        github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        data = f"https://raw.githubusercontent.com/org/repo/{github_token}/model.py".encode()
+
+        findings = detector.scan(data, "model.pkl")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://raw.githubusercontent.com/org/repo/<redacted>/model.py"
+        assert github_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_benign_short_url_paths_are_preserved(self) -> None:
+        """Ordinary URL paths should remain readable after redaction."""
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(b"https://example.com/models/v1/model.bin", "model.pkl")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/models/v1/model.bin"
 
     def test_detect_ipv4_addresses(self) -> None:
         """Test detection of IPv4 addresses."""
