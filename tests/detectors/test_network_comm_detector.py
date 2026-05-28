@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 import pytest
 
+from modelaudit.detectors import network_comm
 from modelaudit.detectors.network_comm import NetworkCommDetector, detect_network_communication
 
 
@@ -270,6 +271,36 @@ class TestNetworkCommDetector:
         assert url_finding["url"] == f"https://example.com/path/<redacted>{separator}download=1"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
 
+    @pytest.mark.parametrize("separator", ["&", "&amp;"])
+    def test_ampersand_suffix_path_tokens_are_redacted(self, separator: str) -> None:
+        """Ampersand-delimited suffix tokens should not survive after benign prefixes."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/path/download=1{separator}{path_token}/model.bin".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://example.com/path/download=1{separator}<redacted>/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    @pytest.mark.parametrize("separator", ["&", "&amp;"])
+    def test_ampersand_key_value_suffix_path_tokens_are_redacted(self, separator: str) -> None:
+        """Ampersand-delimited key/value suffix tokens should be redacted too."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/path/download=1{separator}token={path_token}/model.bin".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://example.com/path/download=1{separator}token=<redacted>/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
     @pytest.mark.parametrize(
         ("encoded_suffix", "expected_suffix"),
         [("%3Fdownload=1", "?download=1"), ("%20download", " download")],
@@ -455,6 +486,43 @@ class TestNetworkCommDetector:
 
         assert "https://example.com/download/<redacted>/model.bin" in serialized
         assert path_token not in serialized
+
+    def test_parenthesized_dotted_path_tokens_do_not_leak_as_domain_findings(self) -> None:
+        """Parenthesized call URLs should still suppress redacted path-token domain hits."""
+        detector = NetworkCommDetector()
+        path_token = "0123456789abcdefghjkmnpqrstvwxyz.com"
+
+        findings = detector.scan(
+            f"requests.get(https://example.com/download/{path_token}/model.bin)".encode(), "metadata.txt"
+        )
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert "https://example.com/download/<redacted>/model.bin" in serialized
+        assert path_token not in serialized
+
+    def test_markdown_link_dotted_path_tokens_do_not_leak_as_domain_findings(self) -> None:
+        """Markdown-link parentheses should bound URL domain suppression."""
+        detector = NetworkCommDetector()
+        path_token = "0123456789abcdefghjkmnpqrstvwxyz.com"
+
+        findings = detector.scan(
+            f"[model](https://example.com/download/{path_token}/model.bin)".encode(), "metadata.txt"
+        )
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert "https://example.com/download/<redacted>/model.bin" in serialized
+        assert path_token not in serialized
+
+    def test_domain_suppression_url_lookup_is_bounded(self) -> None:
+        """Domain suppression should not scan unbounded whitespace-free buffers."""
+        path_token = "0123456789abcdefghjkmnpqrstvwxyz.com"
+        data = (
+            b"https://example.com/"
+            + b"a" * (network_comm._MAX_URL_TEXT_LOOKUP_BYTES + 1)
+            + f"/{path_token}/model.bin".encode()
+        )
+
+        assert network_comm._url_text_containing_offset(data, data.index(path_token.encode())) is None
 
     def test_encoded_path_separator_tokens_are_redacted(self) -> None:
         """Encoded separators should not make a token and following artifact look benign."""

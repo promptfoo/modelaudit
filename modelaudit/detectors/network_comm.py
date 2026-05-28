@@ -64,9 +64,10 @@ _KNOWN_ARTIFACT_FILENAME_EXTENSIONS = frozenset(
     }
 )
 _TRAILING_PATH_DELIMITERS = ".,;:)]}'\""
-_URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>`"
+_URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>`()"
 _PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
 _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
+_MAX_URL_TEXT_LOOKUP_BYTES = 4096
 _MAX_SNIPPET_URL_EXPANSION_BYTES = 4096
 _MIN_CAPABILITY_TOKEN_ENTROPY = 3.5
 _MIN_URLSAFE_FILENAME_STEM_ENTROPY = 4.0
@@ -211,17 +212,49 @@ def _redact_colon_delimited_path_tokens(segment: str) -> str | None:
     return f"{':'.join(parts)}{trailing_delimiters}"
 
 
+def _redact_boundary_component(component: str) -> tuple[str, bool]:
+    if not component:
+        return component, False
+
+    key, separator, value = component.partition("=")
+    if separator:
+        changed = False
+        if key and _looks_like_capability_path_token(key):
+            key = _REDACTED_PATH_TOKEN
+            changed = True
+        if value and _looks_like_capability_path_token(value):
+            value = _REDACTED_PATH_TOKEN
+            changed = True
+        if changed:
+            return f"{key}{separator}{value}", True
+
+    if _looks_like_capability_path_token(component):
+        return _REDACTED_PATH_TOKEN, True
+    return component, False
+
+
 def _redact_boundary_delimited_path_tokens(segment: str) -> str | None:
     token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
     decoded = unquote(token_candidate)
-    boundary_parts = _split_path_token_boundary(decoded)
-    if boundary_parts is None:
+    if _PATH_TOKEN_BOUNDARY_PATTERN.search(decoded) is None:
         return None
 
-    prefix, suffix = boundary_parts
-    if not _looks_like_capability_path_token(prefix):
+    changed = False
+    redacted_parts: list[str] = []
+    cursor = 0
+    for match in _PATH_TOKEN_BOUNDARY_PATTERN.finditer(decoded):
+        redacted_component, component_changed = _redact_boundary_component(decoded[cursor : match.start()])
+        redacted_parts.append(redacted_component)
+        redacted_parts.append(match.group())
+        changed = changed or component_changed
+        cursor = match.end()
+
+    redacted_component, component_changed = _redact_boundary_component(decoded[cursor:])
+    redacted_parts.append(redacted_component)
+    changed = changed or component_changed
+    if not changed:
         return None
-    return f"{_REDACTED_PATH_TOKEN}{suffix}{trailing_delimiters}"
+    return f"{''.join(redacted_parts)}{trailing_delimiters}"
 
 
 def _is_public_model_repository_segment(hostname: str, segments: list[str], index: int) -> bool:
@@ -464,12 +497,20 @@ def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *
 
 
 def _url_text_containing_offset(data: bytes, offset: int) -> str | None:
+    scan_start = max(0, offset - _MAX_URL_TEXT_LOOKUP_BYTES)
+    scan_end = min(len(data), offset + _MAX_URL_TEXT_LOOKUP_BYTES)
+
     start = offset
-    while start > 0 and data[start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
+    while start > scan_start and data[start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
         start -= 1
+    if start == scan_start and start > 0 and data[start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
+        return None
+
     end = offset
-    while end < len(data) and data[end] not in _URL_TEXT_BOUNDARY_BYTES:
+    while end < scan_end and data[end] not in _URL_TEXT_BOUNDARY_BYTES:
         end += 1
+    if end == scan_end and end < len(data) and data[end] not in _URL_TEXT_BOUNDARY_BYTES:
+        return None
 
     candidate = data[start:end]
     if b"://" not in candidate:
