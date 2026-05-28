@@ -107,6 +107,7 @@ def _assert_inconclusive_zip_aggregate_not_cached(
             version_context=build_cache_version_context(top_level_config),
         )
         assert cached_parent is None
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
 
@@ -141,6 +142,7 @@ def _assert_inconclusive_zip_scan_not_cached(
             version_context=build_cache_version_context(scan_config),
         )
         assert cached_parent is None
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
 
@@ -2516,35 +2518,67 @@ def test_zip_scanner_does_not_reopen_known_unreadable_symlink(
 ) -> None:
     archive_path = tmp_path / "unreadable-symlink.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
-        info = zipfile.ZipInfo("weights_link")
+        info = zipfile.ZipInfo("symlink.txt")
         info.create_system = 3
         info.external_attr = (stat.S_IFLNK | 0o777) << 16
         archive.writestr(info, "safe-target.bin")
 
     with zipfile.ZipFile(archive_path) as archive:
-        unreadable_offset = archive.getinfo("weights_link").header_offset
+        unreadable_offset = archive.getinfo("symlink.txt").header_offset
 
     def fail_read(_archive: zipfile.ZipFile, _info: zipfile.ZipInfo) -> str:
         raise AssertionError("known unreadable symlink target should not be reopened")
 
     monkeypatch.setattr(ZipScanner, "_read_symlink_target", fail_read)
 
-    result = ZipScanner(
-        {
-            KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY: [unreadable_offset],
-            "cache_enabled": False,
-        }
-    ).scan(str(archive_path))
+    set_config(ModelAuditConfig(severity={"S406": Severity.CRITICAL}))
+    try:
+        result = ZipScanner(
+            {
+                KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY: [unreadable_offset],
+                "cache_enabled": False,
+            }
+        ).scan(str(archive_path))
+    finally:
+        reset_config()
 
     assert result.success is False
     assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
     assert not any(check.name == "Symlink Safety Validation" for check in result.checks)
-    assert any(
-        check.name == "ZIP Member Analysis Coverage"
-        and check.status == CheckStatus.FAILED
-        and check.details["entry"] == "weights_link"
+    coverage_checks = [
+        check
         for check in result.checks
-    )
+        if check.name == "ZIP Member Analysis Coverage" and check.status == CheckStatus.FAILED
+    ]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["entry"] == "symlink.txt"
+    assert coverage_checks[0].rule_code == "S902"
+    assert coverage_checks[0].severity == IssueSeverity.INFO
+    assert not any(check.rule_code == "S406" for check in result.checks)
+
+
+def test_zip_scanner_configured_skip_name_cannot_inherit_symlink_severity_override(tmp_path: Path) -> None:
+    archive_path = tmp_path / "configured-skipped-symlink-name.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("symlink.txt", b"ordinary bytes")
+
+    set_config(ModelAuditConfig(severity={"S406": Severity.CRITICAL}))
+    try:
+        result = ZipScanner({"skip_archive_entries": ["symlink.txt"], "cache_enabled": False}).scan(str(archive_path))
+    finally:
+        reset_config()
+
+    coverage_checks = [
+        check
+        for check in result.checks
+        if check.name == "ZIP Member Analysis Coverage"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "symlink.txt"
+    ]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].rule_code == "S902"
+    assert coverage_checks[0].severity == IssueSeverity.INFO
+    assert not any(check.rule_code == "S406" for check in result.checks)
 
 
 def test_zip_scanner_validates_traversal_before_known_unreadable_symlink_skip(tmp_path: Path) -> None:
@@ -3616,6 +3650,34 @@ class TestZipScanner:
         assert len(entry_issues) == 1
         assert entry_issues[0].severity == IssueSeverity.INFO
         assert core.determine_exit_code(audit_result) == 2
+
+    def test_nested_scan_exception_name_cannot_inherit_symlink_severity_override(self, tmp_path: Path) -> None:
+        """Coverage gaps remain scan errors even when an entry name resembles a symlink signal."""
+        archive_path = tmp_path / "nested_failure_named_symlink.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("symlink.txt", b"ordinary member")
+
+        def nested_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
+            raise RuntimeError("nested scanner unavailable")
+
+        scan_kwargs: dict[str, Any] = {NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan}
+        set_config(ModelAuditConfig(severity={"S406": Severity.CRITICAL}))
+        try:
+            result = ZipScanner(config=scan_kwargs).scan(str(archive_path))
+            aggregate = core.scan_model_directory_or_file(
+                str(archive_path),
+                cache_enabled=False,
+                **scan_kwargs,
+            )
+        finally:
+            reset_config()
+
+        entry_checks = [check for check in result.checks if check.name == "ZIP Entry Scan"]
+        assert len(entry_checks) == 1
+        assert entry_checks[0].rule_code == "S902"
+        assert entry_checks[0].severity == IssueSeverity.INFO
+        assert not any(check.rule_code == "S406" for check in result.checks)
+        assert core.determine_exit_code(aggregate) == 2
 
     def test_zip_nested_critical_finding_does_not_mark_archive_incomplete(self, tmp_path: Path) -> None:
         """Real nested findings should fail the archive without claiming partial traversal."""

@@ -425,6 +425,46 @@ class TestKerasZipScanner:
         )
         assert determine_exit_code(result) == 1
 
+    @pytest.mark.parametrize(
+        ("failure_kind", "expected_reason"),
+        [("read", "keras_zip_read_failed"), ("scan", "keras_zip_scan_failed")],
+    )
+    def test_primary_failure_does_not_cache_temporary_recursive_member(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure_kind: str,
+        expected_reason: str,
+    ) -> None:
+        """Fallback recursion must not cache extracted members that are immediately deleted."""
+        keras_path = tmp_path / f"{failure_kind}_failure_with_benign_payload.keras"
+        with zipfile.ZipFile(keras_path, "w") as archive:
+            archive.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            archive.writestr("payload.pkl", b"\x80\x04N.")
+
+        if failure_kind == "read":
+
+            def raise_os_error(
+                _self: KerasZipScanner,
+                _archive: zipfile.ZipFile,
+                _member_name: str,
+            ) -> None:
+                raise OSError("simulated Keras ZIP member read failure")
+
+            monkeypatch.setattr(KerasZipScanner, "_get_archive_member_info", raise_os_error)
+        else:
+
+            def raise_runtime_error(_self: KerasZipScanner, _model_config: dict[str, Any], _result: Any) -> None:
+                raise RuntimeError("simulated unexpected Keras ZIP scan failure")
+
+            monkeypatch.setattr(KerasZipScanner, "_scan_model_config", raise_runtime_error)
+
+        _assert_inconclusive_keras_zip_scan_not_cached(
+            keras_path,
+            expected_reason,
+            tmp_path / f"{failure_kind}-recursive-member-cache",
+        )
+
     def test_unexpected_scan_failure_returns_inconclusive_exit2_without_cache(
         self,
         tmp_path: Path,

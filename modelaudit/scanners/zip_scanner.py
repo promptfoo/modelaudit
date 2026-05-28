@@ -314,6 +314,7 @@ class ZipScanner(BaseScanner):
                     passed=False,
                     message=f"Skipped ZIP symlink target validation for known unreadable member: {name}",
                     severity=IssueSeverity.INFO,
+                    rule_code="S902",
                     location=f"{archive_path}:{name}",
                     details={"entry": name, "reason": "known_unreadable_archive_member_skip"},
                 )
@@ -593,6 +594,7 @@ class ZipScanner(BaseScanner):
                         passed=False,
                         message=skip_message,
                         severity=IssueSeverity.INFO,
+                        rule_code="S902",
                         location=f"{path}:{name}",
                         details={"entry": name, "reason": skip_reason},
                     )
@@ -656,6 +658,9 @@ class ZipScanner(BaseScanner):
                         nested_config = dict(self.config)
                         nested_config.pop("skip_archive_entries", None)
                         nested_config.pop(KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, None)
+                        # Extracted members are deleted below and cannot provide
+                        # stable cache keys for a subsequent scan.
+                        nested_config["cache_enabled"] = False
                         nested_config["_archive_depth"] = depth + 1
                         if zipfile.is_zipfile(tmp_path):
                             nested_config["_zip_depth"] = depth + 1
@@ -694,6 +699,7 @@ class ZipScanner(BaseScanner):
                         passed=False,
                         message=f"Error scanning ZIP entry {name}: {e!s}",
                         severity=IssueSeverity.INFO,
+                        rule_code="S902",
                         location=f"{path}:{name}",
                         details={
                             "entry": name,
