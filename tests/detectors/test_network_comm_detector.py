@@ -318,6 +318,17 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == url
 
+    def test_public_github_ref_names_are_preserved(self) -> None:
+        """Public GitHub source refs should remain visible for audit follow-up."""
+        detector = NetworkCommDetector()
+        ref = "ReleaseCandidate2025-05-abcdef"
+        url = f"https://raw.githubusercontent.com/org/repo/{ref}/model.py"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == url
+
     def test_public_github_release_repository_names_are_preserved(self) -> None:
         """Public GitHub release repository identities should remain visible for audit follow-up."""
         detector = NetworkCommDetector()
@@ -382,6 +393,21 @@ class TestNetworkCommDetector:
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
 
         assert url_finding["url"] == "https://example.com/download/<redacted>%2Fweights.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    @pytest.mark.parametrize("separator", [":", "%3A"])
+    def test_colon_delimited_path_tokens_are_redacted(self, separator: str) -> None:
+        """Colon-delimited keyed capabilities should have the token component removed."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/download/token{separator}{path_token}/model.bin".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/token:<redacted>/model.bin"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
 
     def test_high_entropy_artifact_filename_stems_are_redacted(self) -> None:
@@ -714,6 +740,20 @@ class TestNetworkCommDetector:
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
 
         assert url_finding["url"] == "https://example.com/path/<redacted>/model.bin"
+        assert path_token not in json.dumps([network_finding, url_finding], sort_keys=True)
+
+    def test_network_function_snippets_expand_forward_urls_before_redaction(self) -> None:
+        """Long URL tails after the function token should be included before URL redaction."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+        long_prefix = "a" * 90
+        data = f'requests.get("https://example.com/{long_prefix}/{path_token}/model.bin")'.encode()
+
+        findings = detector.scan(data, "hook.py")
+        network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"].endswith(f"/{long_prefix}/<redacted>/model.bin")
         assert path_token not in json.dumps([network_finding, url_finding], sort_keys=True)
 
     def test_cc_pattern_snippets_redact_partial_url_path_tokens(self) -> None:
