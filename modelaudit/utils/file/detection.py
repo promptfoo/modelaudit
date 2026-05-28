@@ -44,6 +44,9 @@ _TF_METAGRAPH_MAX_ROUTING_FIELDS = 32768
 _TF_METAGRAPH_MAX_ROUTING_DEPTH = 64
 _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES = 2 * 1024 * 1024
 _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES = b"\t\n\r" + bytes(range(0x20, 0x7F))
+_CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES = (
+    bytes(byte for byte in range(0x20) if byte not in {0x09, 0x0A, 0x0C, 0x0D}) + b"\x7f"
+)
 _TensorFlowProtoRoute = Literal[
     "unknown",
     "tf_metagraph",
@@ -1280,7 +1283,7 @@ def _is_safetensors_routing_candidate(path: Path | None, magic8: bytes, file_siz
 
 
 def should_defer_safetensors_header_limit_hash(path: str, max_header_bytes: int) -> bool:
-    """Return whether a SafeTensors-routed file will fail before content hashing is safe."""
+    """Return whether recognized bounded routing will fail before full-file hashing is useful."""
     file_path = Path(path)
     try:
         file_size = file_path.stat().st_size
@@ -1296,7 +1299,12 @@ def should_defer_safetensors_header_limit_hash(path: str, max_header_bytes: int)
 
     if header_len <= max_header_bytes or header_len > file_size - 8:
         return False
-    return detect_file_format(path) == "safetensors"
+    detected_format = detect_file_format(path)
+    if detected_format == "safetensors":
+        return True
+    return detected_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT and (
+        file_path.suffix.lower() == ".safetensors" or _is_safetensors_routing_candidate(file_path, magic8, file_size)
+    )
 
 
 def _normalize_archive_member_name(member_name: str) -> str:
@@ -1844,9 +1852,6 @@ def _is_tensorflow_metagraph_file(path: str) -> bool:
         metagraph = MetaGraphDef()
         metagraph.ParseFromString(content)
 
-        if not metagraph.HasField("graph_def"):
-            return False
-
         graph_node_count = len(metagraph.graph_def.node)
         function_node_count = sum(len(function.node_def) for function in metagraph.graph_def.library.function)
         collection_count = len(metagraph.collection_def)
@@ -1872,11 +1877,13 @@ def _is_tensorflow_saved_model_file(path: str) -> bool:
         saved_model = SavedModel()
         saved_model.ParseFromString(file_path.read_bytes())
         return any(
-            metagraph.HasField("graph_def")
-            and (
-                len(metagraph.graph_def.node) > 0
-                or any(function.node_def for function in metagraph.graph_def.library.function)
-                or len(metagraph.collection_def) > 0
+            len(metagraph.collection_def) > 0
+            or (
+                metagraph.HasField("graph_def")
+                and (
+                    len(metagraph.graph_def.node) > 0
+                    or any(function.node_def for function in metagraph.graph_def.library.function)
+                )
             )
             for metagraph in saved_model.meta_graphs
         )
@@ -2059,6 +2066,7 @@ def _classify_bounded_tensorflow_protobuf(path: Path, file_size: int) -> _Tensor
         remaining_fields = [_TF_METAGRAPH_MAX_ROUTING_FIELDS]
         parsed_payload_bytes = 0
         outer_hint: _TensorFlowOuterHint = "unknown"
+        saw_tensorflow_wrapper_hint = False
         saw_tensorflow_candidate = False
         saw_structured_unknown = False
         with path.open("rb") as stream:
@@ -2078,7 +2086,10 @@ def _classify_bounded_tensorflow_protobuf(path: Path, file_size: int) -> _Tensor
                 if field_number == 1 and wire_type == 0:
                     if _read_proto_varint_stream(stream) is None:
                         return "unknown"
-                    saw_tensorflow_candidate = True
+                    # SavedModel stores its version here, but field 1 varints
+                    # are common in unrelated protobuf messages. Keep this as
+                    # an interpretation hint until a TensorFlow structure is seen.
+                    saw_tensorflow_wrapper_hint = True
                     outer_hint = "tf_savedmodel"
                     continue
                 if field_number == 1 and wire_type == 2:
@@ -2091,6 +2102,7 @@ def _classify_bounded_tensorflow_protobuf(path: Path, file_size: int) -> _Tensor
                     if len(payload) != length:
                         return "unknown"
                     if _is_tensorflow_metainfo_payload(payload):
+                        saw_tensorflow_wrapper_hint = True
                         saw_tensorflow_candidate = True
                         outer_hint = "tf_metagraph"
                     continue
@@ -2134,11 +2146,28 @@ def _classify_bounded_tensorflow_protobuf(path: Path, file_size: int) -> _Tensor
                     remaining_fields=remaining_fields,
                 ):
                     if remaining_fields[0] <= 0:
-                        return "inconclusive" if saw_tensorflow_candidate or saw_structured_unknown else "unknown"
+                        return (
+                            "inconclusive"
+                            if saw_tensorflow_wrapper_hint or saw_tensorflow_candidate or saw_structured_unknown
+                            else "unknown"
+                        )
                     return "unknown"
     except OSError:
         return "unknown"
-    return "inconclusive" if saw_tensorflow_candidate or saw_structured_unknown else "unknown"
+    return (
+        "inconclusive"
+        if saw_tensorflow_wrapper_hint or saw_tensorflow_candidate or saw_structured_unknown
+        else "unknown"
+    )
+
+
+def _has_bounded_non_source_control_signal(file_path: Path, file_size: int) -> bool:
+    """Return whether a bounded prefix contains bytes invalid in ordinary source text."""
+    try:
+        payload = read_magic_bytes(str(file_path), min(file_size, _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES))
+    except OSError:
+        return False
+    return any(byte in _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES for byte in payload)
 
 
 def _detect_renamed_tensorflow_protobuf(
@@ -2148,11 +2177,18 @@ def _detect_renamed_tensorflow_protobuf(
     fail_closed_on_inconclusive: bool = True,
 ) -> str:
     """Recognize renamed MetaGraph/SavedModel protobufs after bounded field discovery."""
-    if file_path.suffix.lower() in {".json", ".py", ".pyw"}:
+    suffix = file_path.suffix.lower()
+    if suffix == ".json":
         return "unknown"
     if _is_complete_bounded_printable_text(file_path, file_size):
         return "unknown"
     route = _classify_bounded_tensorflow_protobuf(file_path, file_size)
+    if (
+        suffix in {".py", ".pyw"}
+        and route not in {"tf_metagraph", "tf_savedmodel"}
+        and not _has_bounded_non_source_control_signal(file_path, file_size)
+    ):
+        return "unknown"
     if route == "unknown":
         return "unknown"
     if route == "oversized":

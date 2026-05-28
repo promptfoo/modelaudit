@@ -133,7 +133,7 @@ def _collect_structure(metagraph: Any) -> _MetaGraphStructure:
     function_node_count = sum(len(function.node_def) for function in metagraph.graph_def.library.function)
     collection_count = len(metagraph.collection_def)
 
-    if not has_graph:
+    if not has_graph and collection_count == 0:
         return _MetaGraphStructure(
             valid=False,
             reason="missing_graph_def",

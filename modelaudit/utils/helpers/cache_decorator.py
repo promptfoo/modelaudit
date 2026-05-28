@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-def _should_bypass_cache_for_safetensors_header_limit(file_path: str, config: dict[str, Any]) -> bool:
-    """Do not key or store a scan that is already boundedly inconclusive by SafeTensors header size."""
+def should_bypass_cache_for_safetensors_header_limit(file_path: str, config: dict[str, Any]) -> bool:
+    """Do not key or store terminal bounded outcomes from oversized SafeTensors framing."""
     try:
         from ...scanners.safetensors_scanner import MAX_HEADER_BYTES
         from ..file.detection import should_defer_safetensors_header_limit_hash
@@ -82,7 +82,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     return func(*args, **kwargs)
 
                 raw_config, _ = _extract_config_and_path(args, kwargs)
-                if _should_bypass_cache_for_safetensors_header_limit(file_path, raw_config or {}):
+                if should_bypass_cache_for_safetensors_header_limit(file_path, raw_config or {}):
                     logger.debug(f"Bypassing cache for bounded SafeTensors header failure: {file_path}")
                     return func(*args, **kwargs)
 

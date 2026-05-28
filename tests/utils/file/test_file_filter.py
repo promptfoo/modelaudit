@@ -19,6 +19,7 @@ from modelaudit.utils.file.detection import (
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
+    TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     detect_file_format_for_skip_filter,
 )
 from modelaudit.utils.file.filtering import (
@@ -357,8 +358,13 @@ class TestFileFilter:
 
         assert should_skip_file(str(near_match))
 
-    def test_disguised_tf_metagraph_bypasses_skip_without_promoting_generic_protobuf(self, tmp_path: Path) -> None:
-        disguised_metagraph = tmp_path / "graph.jpg"
+    @pytest.mark.parametrize("filename", ["graph.jpg", "graph.py", "graph.pyw"])
+    def test_disguised_tf_metagraph_bypasses_skip_without_promoting_generic_protobuf(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        disguised_metagraph = tmp_path / filename
         generic_protobuf = tmp_path / "generic.jpg"
         disguised_metagraph.write_bytes(b"\xa2\x06\x80\x08" + (b"x" * 1024) + _build_tf_metagraph_bytes())
         generic_protobuf.write_bytes(b"\x12\x02\x08\x01")
@@ -380,13 +386,15 @@ class TestFileFilter:
         assert detect_file_format_for_skip_filter(str(disguised_metagraph)) == "tf_metagraph"
         assert not should_skip_file(str(disguised_metagraph))
 
+    @pytest.mark.parametrize("filename", ["saved.jpg", "saved.py", "saved.pyw"])
     def test_disguised_tf_savedmodel_bypasses_skip_without_promoting_generic_protobuf(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        filename: str,
     ) -> None:
         monkeypatch.setattr(file_detection, "JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES", 64)
-        disguised_savedmodel = tmp_path / "saved.jpg"
+        disguised_savedmodel = tmp_path / filename
         generic_protobuf = tmp_path / "generic.jpg"
         disguised_savedmodel.write_bytes(_printable_unknown_proto_prefix(65) + _build_tf_savedmodel_bytes())
         generic_protobuf.write_bytes(b"\x12\x02\x08\x01")
@@ -395,6 +403,23 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_savedmodel))
         assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
         assert should_skip_file(str(generic_protobuf))
+
+    @pytest.mark.parametrize("comment", ["#" * 31, "# cafe\u00e9" + ("#" * 24)])
+    def test_large_python_source_shaped_like_unknown_protobuf_stays_skipped(self, tmp_path: Path, comment: str) -> None:
+        source = tmp_path / "large_source.py"
+        source_line = f"z {comment}\n"
+        source.write_text(source_line * ((2 * 1024 * 1024 // len(source_line.encode())) + 2), encoding="utf-8")
+
+        compile(source.read_text(encoding="utf-8"), str(source), "exec")
+        assert detect_file_format_for_skip_filter(str(source)) == "unknown"
+        assert should_skip_file(str(source))
+
+    def test_binary_python_suffix_with_oversized_tensorflow_candidate_is_preserved(self, tmp_path: Path) -> None:
+        payload = tmp_path / "oversized-candidate.py"
+        payload.write_bytes(b"\x08\x01" + b"\x12\x81\x80\x80\x0a" + (b"x" * (20 * 1024 * 1024 + 1)))
+
+        assert detect_file_format_for_skip_filter(str(payload)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+        assert not should_skip_file(str(payload))
 
     def test_bounded_unknown_prefix_before_tf_graph_is_not_skipped(
         self,

@@ -490,8 +490,13 @@ class TestDirectoryFileFiltering:
         assert results.file_metadata[str(ambiguous_payload)]["scan_outcome"] == "inconclusive"
         assert determine_exit_code(results) == 2
 
-    def test_disguised_malicious_tf_metagraph_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
-        disguised_payload = tmp_path / "payload.jpg"
+    @pytest.mark.parametrize("filename", ["payload.jpg", "payload.py", "payload.pyw"])
+    def test_disguised_malicious_tf_metagraph_with_skipped_extension_is_scanned(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        disguised_payload = tmp_path / filename
         disguised_payload.write_bytes(b"\xa2\x06\x80\x08" + (b"x" * 1024) + _build_malicious_tf_metagraph())
 
         results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
@@ -501,8 +506,13 @@ class TestDirectoryFileFiltering:
         assert determine_exit_code(results) == 1
         assert any(issue.message == "Dangerous TensorFlow operation: PyFunc" for issue in results.issues)
 
-    def test_disguised_malicious_tf_savedmodel_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
-        disguised_payload = tmp_path / "saved.jpg"
+    @pytest.mark.parametrize("filename", ["saved.jpg", "saved.py", "saved.pyw"])
+    def test_disguised_malicious_tf_savedmodel_with_skipped_extension_is_scanned(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        disguised_payload = tmp_path / filename
         disguised_payload.write_bytes(_build_malicious_tf_savedmodel())
 
         results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)

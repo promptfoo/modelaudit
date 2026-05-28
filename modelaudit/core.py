@@ -554,7 +554,7 @@ def _calculate_file_hash(file_path: str) -> str:
 
 
 def _should_defer_hash_for_safetensors_header_limit(file_path: str, config: dict[str, Any]) -> bool:
-    """Avoid full-file hashing when SafeTensors analysis will fail at its bounded header gate."""
+    """Avoid full-file hashing for terminal bounded outcomes from oversized SafeTensors framing."""
     try:
         max_header_bytes = int(config.get("max_safetensors_header_bytes", SAFETENSORS_MAX_HEADER_BYTES))
     except (TypeError, ValueError):
