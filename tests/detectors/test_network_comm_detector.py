@@ -119,6 +119,52 @@ class TestNetworkCommDetector:
         assert "QUERYSECRET" not in serialized
         assert "storage.googleapis.com/model-bucket/<redacted>/weights.bin" in serialized
 
+    def test_trailing_path_delimiters_do_not_prevent_token_redaction(self) -> None:
+        """Punctuation included by URL matching should not keep path tokens raw."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+        data = f"https://example.com/path/{path_token},".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/path/<redacted>,"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_base64_path_capability_tokens_are_redacted(self) -> None:
+        """Base64/base64url path tokens may contain encoded separators or padding."""
+        detector = NetworkCommDetector()
+        encoded_token = "AbCdEfGhIjKlMnOpQrStUvWxYz1234567890%2B%2F%3D"
+
+        findings = detector.scan(f"https://example.com/download/{encoded_token}".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>"
+        assert encoded_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_public_revision_hash_paths_are_preserved(self) -> None:
+        """Public model revision hashes should remain useful for audit follow-up."""
+        detector = NetworkCommDetector()
+        revision = "0123456789abcdef0123456789abcdef01234567"
+        data = f"https://huggingface.co/org/repo/resolve/{revision}/model.safetensors".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert revision in url_finding["url"]
+        assert url_finding["url"].endswith(f"/{revision}/model.safetensors")
+
+    def test_long_artifact_filenames_are_preserved(self) -> None:
+        """Ordinary model artifact filenames should not be treated as capability tokens."""
+        detector = NetworkCommDetector()
+        filename = "pytorch_model-00001-of-00002.bin"
+        data = f"https://huggingface.co/org/repo/resolve/main/{filename}".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert filename in url_finding["url"]
+
     def test_github_path_tokens_are_redacted(self) -> None:
         """Known token formats embedded in URL paths should be removed."""
         detector = NetworkCommDetector()

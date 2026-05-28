@@ -17,27 +17,37 @@ _SENSITIVE_PATH_TOKEN_PATTERN = re.compile(
     r"AKIA[0-9A-Z]{16}|"
     r"gh[ps]_[A-Za-z0-9]{36}|"
     r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|"
+    r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_.+/=-]*|"
     r"sk-(?:proj-)?[A-Za-z0-9]{24,}|"
     r"xox[baprs]-[0-9A-Za-z-]{20,}"
     r")$"
 )
-_HEX_CAPABILITY_TOKEN_PATTERN = re.compile(r"(?i)^[a-f0-9]{32,}$")
 _PATH_TOKEN_CHARACTER_CLASS_PATTERNS = (
     re.compile(r"[a-z]"),
     re.compile(r"[A-Z]"),
     re.compile(r"\d"),
-    re.compile(r"[._~-]"),
+    re.compile(r"[._~+/=-]"),
 )
+_ARTIFACT_FILENAME_PATTERN = re.compile(r"(?i)^.+\.[a-z0-9]{1,10}$")
+_TRAILING_PATH_DELIMITERS = ".,;:)]}"
+
+
+def _split_trailing_path_delimiters(segment: str) -> tuple[str, str]:
+    stripped = segment.rstrip(_TRAILING_PATH_DELIMITERS)
+    return stripped, segment[len(stripped) :]
 
 
 def _looks_like_capability_path_token(segment: str) -> bool:
-    decoded = unquote(segment)
-    if _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded) or _HEX_CAPABILITY_TOKEN_PATTERN.fullmatch(decoded):
+    token_candidate, _trailing_delimiters = _split_trailing_path_delimiters(segment)
+    decoded = unquote(token_candidate)
+    if _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded):
         return True
 
+    if _ARTIFACT_FILENAME_PATTERN.fullmatch(decoded):
+        return False
     if len(decoded) < 20:
         return False
-    if not re.fullmatch(r"[A-Za-z0-9._~-]+", decoded):
+    if not re.fullmatch(r"[A-Za-z0-9._~+/=-]+", decoded):
         return False
 
     character_classes = sum(bool(pattern.search(decoded)) for pattern in _PATH_TOKEN_CHARACTER_CLASS_PATTERNS)
@@ -54,7 +64,8 @@ def _redact_url_path_tokens(hostname: str, path: str) -> str:
             hostname == "hooks.slack.com" and len(segments) > 2 and segments[1].lower() == "services" and index > 1
         )
         if is_slack_webhook_secret or _looks_like_capability_path_token(segment):
-            segments[index] = _REDACTED_PATH_TOKEN
+            _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+            segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
     return "/".join(segments)
 
 
