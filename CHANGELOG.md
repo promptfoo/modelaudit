@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
 - mark compressed-wrapper partial-analysis outcomes explicitly inconclusive
+- retain oversized renamed SafeTensors candidates for bounded fail-closed analysis
+- route renamed TensorFlow SavedModel and MetaGraph protobufs through unsafe-operation analysis
 - detect and scan signature-valid CNTK and LightGBM payloads even when renamed with misleading suffixes
 - detect and scan signature-valid RKNN, TFLite, and ExecuTorch payloads under non-conflicting renamed suffixes while preserving owned routes, and classify unavailable ExecuTorch reads as inconclusive
 - mark CatBoost text-fragment extraction limits and unavailable reads as inconclusive analysis
