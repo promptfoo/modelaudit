@@ -870,3 +870,66 @@ def test_get_scanner_for_path_routes_generic_pkl_zip_without_pytorch_markers_to_
     model_path = _write_zip_archive(tmp_path / "generic.pkl", {"payload.txt": b"not a pytorch archive"})
 
     _assert_scanner_for_path(model_path, "zip")
+
+
+@pytest.mark.parametrize(
+    ("filename", "scanner_name"),
+    [
+        ("unreadable.npy", "numpy"),
+        ("unreadable.pdmodel", "paddle"),
+        ("unreadable.bin", "pytorch_binary"),
+        ("unreadable.pb", "tf_savedmodel"),
+    ],
+)
+def test_get_scanner_for_path_preserves_read_failure_aware_owner_after_failed_zip_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    scanner_name: str,
+) -> None:
+    path = tmp_path / filename
+    path.write_bytes(b"owned unreadable model payload")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+    monkeypatch.setattr("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True)
+
+    scanner_class = ScannerRegistry().get_scanner_for_path(str(path))
+
+    assert scanner_class is not None
+    assert scanner_class.name == scanner_name
+
+
+def test_get_scanner_for_path_preserves_npz_zip_owner_after_failed_zip_probe_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_zip_archive(tmp_path / "unreadable.npz", {"weights.npy": b"safe array payload"})
+
+    def raise_zip_error(*_args: object, **_kwargs: object) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+    monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", raise_zip_error)
+
+    scanner_class = ScannerRegistry().get_scanner_for_path(str(path))
+
+    assert scanner_class is not None
+    assert scanner_class.name == "zip"
+
+
+def test_get_scanner_for_path_does_not_claim_pickle_after_failed_zip_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.pkl"
+    path.write_bytes(b"unreadable generic pickle candidate")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+
+    assert ScannerRegistry().get_scanner_for_path(str(path)) is None

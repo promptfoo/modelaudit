@@ -19,6 +19,7 @@ from modelaudit.scanners.tf_metagraph_scanner import (
     _attr_strings_with_lowered_values,
     _AttrString,
 )
+from modelaudit.utils.helpers import cache_decorator
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 
 pytestmark = pytest.mark.skipif(not _has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -256,12 +257,18 @@ def test_tf_metagraph_single_file_scan_bypasses_stale_cache_when_read_fails(
 
     reset_cache_manager()
     try:
-        first = scan_model_directory_or_file(
-            str(cached_clean),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
+        with monkeypatch.context() as cache_setup:
+            cache_setup.setattr(
+                cache_decorator,
+                "should_bypass_cache_for_read_failure_aware_file",
+                lambda _path: False,
+            )
+            first = scan_model_directory_or_file(
+                str(cached_clean),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
         assert determine_exit_code(first) == 0
         cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
         assert cached_entries > 0
@@ -308,12 +315,18 @@ def test_tf_metagraph_directory_scan_bypasses_stale_cache_when_read_fails_with_s
 
     reset_cache_manager()
     try:
-        first = scan_model_directory_or_file(
-            str(cached_clean),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
+        with monkeypatch.context() as cache_setup:
+            cache_setup.setattr(
+                cache_decorator,
+                "should_bypass_cache_for_read_failure_aware_file",
+                lambda _path: False,
+            )
+            first = scan_model_directory_or_file(
+                str(cached_clean),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
         assert determine_exit_code(first) == 0
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
 

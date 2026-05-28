@@ -17,22 +17,30 @@ logger = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
 
 _READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS = frozenset(
-    {".cmf", ".dnn", ".engine", ".lgb", ".lightgbm", ".meta", ".mlmodel", ".plan", ".safetensors", ".trt"}
+    {
+        ".bin",
+        ".cmf",
+        ".dnn",
+        ".engine",
+        ".lgb",
+        ".lightgbm",
+        ".meta",
+        ".mlmodel",
+        ".npy",
+        ".npz",
+        ".pb",
+        ".pdiparams",
+        ".pdmodel",
+        ".plan",
+        ".safetensors",
+        ".trt",
+    }
 )
 
 
 def should_bypass_cache_for_read_failure_aware_file(file_path: str) -> bool:
-    """Bypass stale clean cache entries when dedicated read-failure-aware files stop reading."""
-    if os.path.splitext(file_path)[1].lower() not in _READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS:
-        return False
-
-    try:
-        with open(file_path, "rb") as handle:
-            handle.read(1)
-    except OSError:
-        return True
-
-    return False
+    """Bypass stale clean cache entries for formats with explicit read-failure outcomes."""
+    return os.path.splitext(file_path)[1].lower() in _READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS
 
 
 def should_bypass_cache_for_safetensors_header_limit(file_path: str, config: dict[str, Any]) -> bool:

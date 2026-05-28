@@ -14,7 +14,19 @@ from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanRes
 logger = logging.getLogger(__name__)
 
 _READ_FAILURE_AWARE_EXTENSION_SCANNERS = frozenset(
-    {"cntk", "coreml", "lightgbm", "safetensors", "tensorrt", "tf_metagraph"}
+    {
+        "cntk",
+        "coreml",
+        "lightgbm",
+        "numpy",
+        "paddle",
+        "pytorch_binary",
+        "safetensors",
+        "tensorrt",
+        "tf_metagraph",
+        "tf_savedmodel",
+        "zip",
+    }
 )
 
 

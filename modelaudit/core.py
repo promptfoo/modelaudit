@@ -1705,11 +1705,16 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         format_probe_error = e
     ext_format = detect_format_from_extension(path)
     ext = os.path.splitext(path)[1].lower()
-    magic_format = (
-        header_format
-        if header_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}
-        else detect_file_format_from_magic(path)
-    )
+    if format_probe_error is not None:
+        magic_format = "unknown"
+    elif header_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}:
+        magic_format = header_format
+    else:
+        try:
+            magic_format = detect_file_format_from_magic(path)
+        except OSError as e:
+            magic_format = "unknown"
+            format_probe_error = e
     skipped_overlap_scanner_id: str | None = None
     if (
         header_format == "xgboost"

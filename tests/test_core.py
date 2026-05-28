@@ -280,6 +280,36 @@ def _write_safe_tensorrt(path: Path) -> None:
     path.write_bytes(b"TensorRT safe engine metadata")
 
 
+def _write_minimal_numpy(path: Path) -> None:
+    header = "{'descr': '<f4', 'fortran_order': False, 'shape': (1,), }"
+    header_bytes = header.encode("latin1")
+    padding = b" " * ((16 - ((10 + len(header_bytes) + 1) % 16)) % 16)
+    payload = b"\x93NUMPY\x01\x00" + struct.pack("<H", len(header_bytes) + len(padding) + 1)
+    path.write_bytes(payload + header_bytes + padding + b"\n" + struct.pack("<f", 1.0))
+
+
+def _write_safe_npz(path: Path) -> None:
+    header = "{'descr': '<f4', 'fortran_order': False, 'shape': (1,), }"
+    header_bytes = header.encode("latin1")
+    padding = b" " * ((16 - ((10 + len(header_bytes) + 1) % 16)) % 16)
+    payload = b"\x93NUMPY\x01\x00" + struct.pack("<H", len(header_bytes) + len(padding) + 1)
+    array_bytes = payload + header_bytes + padding + b"\n" + struct.pack("<f", 1.0)
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("weights.npy", array_bytes)
+
+
+def _write_safe_paddle(path: Path) -> None:
+    path.write_bytes(b"safe paddle model metadata")
+
+
+def _write_safe_pytorch_binary(path: Path) -> None:
+    path.write_bytes(b"benign binary tensor weights" * 10)
+
+
+def _write_safe_savedmodel(path: Path) -> None:
+    path.write_bytes(_build_collection_only_tf_savedmodel(value=b"documentation: https://example.invalid/runtime"))
+
+
 def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
     """Write a ZIP archive at an intentionally misleading file path."""
     with zipfile.ZipFile(path, "w") as archive:
@@ -6446,9 +6476,26 @@ def test_directory_scan_bypasses_stale_cache_when_owner_read_fails_with_access(
             "TensorRT Engine Read",
             "Error reading TensorRT engine",
         ),
+        ("cached.npy", _write_minimal_numpy, "numpy_read_failed", "NumPy File Read", "Unable to read NumPy file"),
+        ("cached.npz", _write_safe_npz, "zip_analysis_incomplete", "ZIP File Scan", "Error scanning zip file"),
+        ("cached.pdmodel", _write_safe_paddle, "paddle_read_failed", "Paddle File Read", "Error reading file"),
+        (
+            "cached.bin",
+            _write_safe_pytorch_binary,
+            "pytorch_binary_read_failed",
+            "Binary File Read",
+            "Unable to read binary file",
+        ),
+        (
+            "saved_model.pb",
+            _write_safe_savedmodel,
+            "savedmodel_read_failed",
+            "SavedModel File Read",
+            "Unable to read TF SavedModel file",
+        ),
     ],
 )
-def test_single_file_scan_bypasses_stale_cache_when_binary_owner_read_fails(
+def test_single_file_scan_bypasses_stale_cache_when_read_failure_aware_owner_read_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     filename: str,
@@ -6463,12 +6510,18 @@ def test_single_file_scan_bypasses_stale_cache_when_binary_owner_read_fails(
 
     reset_cache_manager()
     try:
-        first = core_module.scan_model_directory_or_file(
-            str(model_path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
+        with monkeypatch.context() as cache_setup:
+            cache_setup.setattr(
+                cache_decorator,
+                "should_bypass_cache_for_read_failure_aware_file",
+                lambda _path: False,
+            )
+            first = core_module.scan_model_directory_or_file(
+                str(model_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
         assert core_module.determine_exit_code(first) == 0
         assert first.success is True
         cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
@@ -6486,6 +6539,19 @@ def test_single_file_scan_bypasses_stale_cache_when_binary_owner_read_fails(
             return real_open(candidate, *args, **kwargs)
 
         monkeypatch.setattr("builtins.open", fail_cached_binary_read)
+        if filename.endswith(".npz"):
+            real_zip_file = zipfile.ZipFile
+
+            def fail_cached_zip_read(
+                candidate: str | os.PathLike[str],
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                if str(candidate) == str(model_path):
+                    raise OSError(f"simulated transient {reason} read")
+                return real_zip_file(candidate, *args, **kwargs)
+
+            monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", fail_cached_zip_read)
 
         second = core_module.scan_model_directory_or_file(
             str(model_path),
@@ -6499,6 +6565,57 @@ def test_single_file_scan_bypasses_stale_cache_when_binary_owner_read_fails(
         assert metadata["operational_error_reason"] == reason
         assert reason in metadata["scan_outcome_reasons"]
         assert any(check.name == check_name and message_fragment in check.message for check in second.checks)
+        assert core_module.determine_exit_code(second) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
+    finally:
+        reset_cache_manager()
+
+
+def test_single_file_scan_bypasses_stale_cache_when_numpy_header_read_fails_after_cache_warm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "cached.npy"
+    _write_minimal_numpy(model_path)
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        with monkeypatch.context() as cache_setup:
+            cache_setup.setattr(
+                cache_decorator,
+                "should_bypass_cache_for_read_failure_aware_file",
+                lambda _path: False,
+            )
+            first = core_module.scan_model_directory_or_file(
+                str(model_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+        assert core_module.determine_exit_code(first) == 0
+        cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        assert cached_entries > 0
+
+        def raise_header_oserror(*_args: object, **_kwargs: object) -> None:
+            raise OSError("simulated NumPy header read failure")
+
+        monkeypatch.setattr("modelaudit.scanners.numpy_scanner.fmt.read_array_header_1_0", raise_header_oserror)
+
+        second = core_module.scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        metadata = second.file_metadata[str(model_path)]
+        assert second.success is False
+        assert metadata["operational_error_reason"] == "numpy_read_failed"
+        assert "numpy_read_failed" in metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "NumPy File Read" and "Unable to read NumPy file" in check.message for check in second.checks
+        )
         assert core_module.determine_exit_code(second) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
     finally:
@@ -6523,9 +6640,26 @@ def test_single_file_scan_bypasses_stale_cache_when_binary_owner_read_fails(
             "TensorRT Engine Read",
             "Error reading TensorRT engine",
         ),
+        ("cached.npy", _write_minimal_numpy, "numpy_read_failed", "NumPy File Read", "Unable to read NumPy file"),
+        ("cached.npz", _write_safe_npz, "zip_analysis_incomplete", "ZIP File Scan", "Error scanning zip file"),
+        ("cached.pdmodel", _write_safe_paddle, "paddle_read_failed", "Paddle File Read", "Error reading file"),
+        (
+            "cached.bin",
+            _write_safe_pytorch_binary,
+            "pytorch_binary_read_failed",
+            "Binary File Read",
+            "Unable to read binary file",
+        ),
+        (
+            "saved_model.pb",
+            _write_safe_savedmodel,
+            "savedmodel_read_failed",
+            "SavedModel File Read",
+            "Unable to read TF SavedModel file",
+        ),
     ],
 )
-def test_directory_scan_bypasses_stale_cache_when_binary_owner_read_fails_with_security_finding(
+def test_directory_scan_bypasses_stale_cache_when_read_failure_aware_owner_read_fails_with_security_finding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     filename: str,
@@ -6544,12 +6678,18 @@ def test_directory_scan_bypasses_stale_cache_when_binary_owner_read_fails_with_s
 
     reset_cache_manager()
     try:
-        warm = core_module.scan_model_directory_or_file(
-            str(cached_clean),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
+        with monkeypatch.context() as cache_setup:
+            cache_setup.setattr(
+                cache_decorator,
+                "should_bypass_cache_for_read_failure_aware_file",
+                lambda _path: False,
+            )
+            warm = core_module.scan_model_directory_or_file(
+                str(cached_clean),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
         assert core_module.determine_exit_code(warm) == 0
         assert warm.success is True
         cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
@@ -6567,6 +6707,19 @@ def test_directory_scan_bypasses_stale_cache_when_binary_owner_read_fails_with_s
             return real_open(candidate, *args, **kwargs)
 
         monkeypatch.setattr("builtins.open", fail_cached_binary_read)
+        if filename.endswith(".npz"):
+            real_zip_file = zipfile.ZipFile
+
+            def fail_cached_zip_read(
+                candidate: str | os.PathLike[str],
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                if str(candidate) == str(cached_clean):
+                    raise OSError(f"simulated transient {reason} read")
+                return real_zip_file(candidate, *args, **kwargs)
+
+            monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", fail_cached_zip_read)
 
         result = core_module.scan_model_directory_or_file(
             str(model_dir),
