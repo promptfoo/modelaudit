@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- detect external references in weights-only Keras HDF5 layouts without Keras metadata
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - classify unavailable metadata document reads and timed-out metadata scans as operationally incomplete rather than security findings
 - route renamed structured JAX/Orbax JSON checkpoints, conservatively report observable bounded-prefix threats, and fail closed for oversized identified metadata
