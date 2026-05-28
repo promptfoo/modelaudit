@@ -1026,8 +1026,12 @@ def test_scan_savedmodel_directory_detects_probe_boundary_padded_pickle_asset(tm
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
-def test_scan_savedmodel_directory_trivial_probe_boundary_padding_stays_clean(tmp_path: Path) -> None:
+def test_scan_savedmodel_directory_trivial_probe_boundary_padding_stays_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Large trivial opcode prefixes without STOP should not be routed as pickle payloads."""
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
     model_dir = Path(create_tf_savedmodel(tmp_path))
     asset_path = model_dir / "assets" / "probe-boundary-notes.txt"
     asset_path.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1))
