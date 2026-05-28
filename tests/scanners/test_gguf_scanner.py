@@ -177,6 +177,10 @@ def _assert_inconclusive_exit2(aggregate: Any, reason: str) -> None:
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
 
 
+def _assert_no_warning_or_critical_issues(result: Any) -> None:
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
 def _assert_uncached_rerun_preserves_inconclusive_exit2(
     path: Path,
     cache_dir: Path,
@@ -411,6 +415,40 @@ def test_gguf_scanner_duplicate_benign_chat_template_ignores_s902_severity_overr
     _assert_inconclusive_exit2(aggregate, GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON)
 
 
+def test_gguf_scanner_duplicate_and_key_limit_ignore_s902_severity_override(tmp_path: Path) -> None:
+    path = tmp_path / "benign-duplicate-template-key-limit-severity-override.gguf"
+    _write_gguf_string_metadata_entries(
+        path,
+        [
+            ("tokenizer.chat_template", "{{ message['content'] }}"),
+            ("tokenizer.chat_template", "{{ message['role'] }}"),
+        ],
+        declared_count=3,
+    )
+
+    set_config(ModelAuditConfig(severity={"S902": Severity.CRITICAL}))
+    try:
+        direct = GgufScanner(config={"gguf_max_metadata_keys": 2}).scan(str(path))
+        aggregate = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=False,
+            gguf_max_metadata_keys=2,
+        )
+    finally:
+        reset_config()
+
+    checks_by_name = {check.name: check for check in direct.checks}
+    assert checks_by_name["GGUF Duplicate Metadata Keys"].rule_code is None
+    assert checks_by_name["GGUF Duplicate Metadata Keys"].severity == IssueSeverity.INFO
+    assert checks_by_name["GGUF Metadata Resource Limits"].rule_code is None
+    assert checks_by_name["GGUF Metadata Resource Limits"].severity == IssueSeverity.INFO
+    _assert_no_warning_or_critical_issues(direct)
+    assert GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    _assert_inconclusive_exit2(aggregate, GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON)
+    assert GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON in _single_file_metadata(aggregate)["scan_outcome_reasons"]
+
+
 def test_gguf_scanner_scans_malicious_template_before_truncated_metadata(tmp_path: Path) -> None:
     path = tmp_path / "trailing-truncated-template.gguf"
     _write_gguf_string_metadata_entries(
@@ -503,6 +541,32 @@ def test_gguf_metadata_byte_limit_is_inconclusive(tmp_path: Path) -> None:
         check.name == "GGUF Metadata Resource Limits" and check.details["max_metadata_bytes"] == 8
         for check in direct.checks
     )
+    _assert_inconclusive_exit2(aggregate, GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON)
+
+
+def test_gguf_metadata_limit_ignores_s902_severity_override(tmp_path: Path) -> None:
+    path = tmp_path / "bounded-array-severity-override.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [("test.array", 9, _encode_gguf_array(0, b"\x01\x02", 2))],
+    )
+
+    set_config(ModelAuditConfig(severity={"S902": Severity.CRITICAL}))
+    try:
+        direct = GgufScanner(config={"gguf_max_metadata_array_items": 1}).scan(str(path))
+        aggregate = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=False,
+            gguf_max_metadata_array_items=1,
+        )
+    finally:
+        reset_config()
+
+    limit_checks = [check for check in direct.checks if check.name == "GGUF Metadata Resource Limits"]
+    assert len(limit_checks) == 1
+    assert limit_checks[0].severity == IssueSeverity.INFO
+    assert limit_checks[0].rule_code is None
+    _assert_no_warning_or_critical_issues(direct)
     _assert_inconclusive_exit2(aggregate, GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON)
 
 
@@ -625,6 +689,105 @@ def test_gguf_tensor_information_byte_limit_is_inconclusive(tmp_path: Path) -> N
         check.name == "GGUF Tensor Resource Limits" and check.details["max_tensor_info_bytes"] == 4
         for check in direct.checks
     )
+    _assert_inconclusive_exit2(aggregate, GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON)
+
+
+def test_gguf_default_tensor_count_limit_blocks_compact_resource_exhaustion(tmp_path: Path) -> None:
+    path = tmp_path / "too-many-compact-tensors.gguf"
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", GgufScanner.DEFAULT_MAX_TENSORS + 1))
+        f.write(struct.pack("<Q", 0))
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert direct.success is False
+    assert "tensors" not in direct.metadata
+    assert any(
+        check.name == "GGUF Tensor Resource Limits"
+        and check.details["declared_tensors"] == GgufScanner.DEFAULT_MAX_TENSORS + 1
+        for check in direct.checks
+    )
+    _assert_inconclusive_exit2(aggregate, GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON)
+
+
+def test_gguf_tensor_metadata_summary_is_capped_without_skipping_validation(tmp_path: Path) -> None:
+    path = tmp_path / "capped-tensor-summary.gguf"
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", 3))
+        f.write(struct.pack("<Q", 0))
+
+        for index in range(3):
+            name = f"tensor{index}".encode()
+            f.write(struct.pack("<Q", len(name)))
+            f.write(name)
+            f.write(struct.pack("<I", 1))
+            f.write(struct.pack("<Q", 8))
+            f.write(struct.pack("<I", 0))
+            f.write(struct.pack("<Q", index * 32))
+
+        pad_to_tensor_data = (32 - (f.tell() % 32)) % 32
+        if pad_to_tensor_data:
+            f.write(b"\0" * pad_to_tensor_data)
+        f.write(b"\0" * 96)
+
+    result = GgufScanner(config={"gguf_max_reported_tensors": 1}).scan(str(path))
+
+    assert result.success
+    assert result.metadata["tensors"] == [{"name": "tensor0", "type": 0, "dims": [8]}]
+    assert result.metadata["tensor_count_reported"] == 1
+    assert result.metadata["tensor_metadata_truncated"] is True
+    assert result.metadata["max_reported_tensors"] == 1
+    assert not any("size mismatch" in issue.message.lower() for issue in result.issues)
+
+
+def test_gguf_streaming_tensor_parse_preserves_excessive_dimension_finding(tmp_path: Path) -> None:
+    path = tmp_path / "excessive-dimensions-missing-data.gguf"
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", 1))
+        f.write(struct.pack("<Q", 0))
+        name = b"huge_rank"
+        f.write(struct.pack("<Q", len(name)))
+        f.write(name)
+        f.write(struct.pack("<I", 1001))
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert any(
+        check.name == "Tensor Dimension Validation" and check.severity == IssueSeverity.CRITICAL
+        for check in direct.checks
+    )
+    assert any(check.name == "Tensor Data Section Bounds" for check in direct.checks)
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_gguf_tensor_limit_ignores_s902_severity_override(tmp_path: Path) -> None:
+    path = tmp_path / "bounded-tensor-info-severity-override.gguf"
+    _write_gguf_with_tensor_type(path, tensor_type=0)
+
+    set_config(ModelAuditConfig(severity={"S902": Severity.CRITICAL}))
+    try:
+        direct = GgufScanner(config={"gguf_max_tensor_info_bytes": 4}).scan(str(path))
+        aggregate = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=False,
+            gguf_max_tensor_info_bytes=4,
+        )
+    finally:
+        reset_config()
+
+    limit_checks = [check for check in direct.checks if check.name == "GGUF Tensor Resource Limits"]
+    assert len(limit_checks) == 1
+    assert limit_checks[0].severity == IssueSeverity.INFO
+    assert limit_checks[0].rule_code is None
+    _assert_no_warning_or_critical_issues(direct)
     _assert_inconclusive_exit2(aggregate, GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON)
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import struct
-from typing import Any, BinaryIO, ClassVar
+from typing import Any, BinaryIO, ClassVar, NamedTuple
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
@@ -62,8 +62,15 @@ class _GgufByteBudget:
 
     def consume(self, size: int) -> None:
         if size > self.limit - self.consumed:
-            raise self.error_type(f"GGUF {self.section} bytes exceed limit {self.limit}")
+            raise self.error_type(f"{self.section.capitalize()} bytes exceed limit {self.limit}")
         self.consumed += size
+
+
+class _GgufTensorInfo(NamedTuple):
+    name: str
+    dims: tuple[int, ...]
+    tensor_type: int
+    offset: int
 
 
 class GgufScanner(BaseScanner):
@@ -77,8 +84,9 @@ class GgufScanner(BaseScanner):
     DEFAULT_MAX_METADATA_ARRAY_ITEMS: ClassVar[int] = 1_000_000
     DEFAULT_MAX_TOTAL_METADATA_ARRAY_ITEMS: ClassVar[int] = 2_000_000
     DEFAULT_MAX_METADATA_ARRAY_DEPTH: ClassVar[int] = 32
-    DEFAULT_MAX_TENSORS: ClassVar[int] = 1_000_000
-    DEFAULT_MAX_TENSOR_INFO_BYTES: ClassVar[int] = 256 * 1024 * 1024
+    DEFAULT_MAX_TENSORS: ClassVar[int] = 50_000
+    DEFAULT_MAX_TENSOR_INFO_BYTES: ClassVar[int] = 16 * 1024 * 1024
+    DEFAULT_MAX_REPORTED_TENSORS: ClassVar[int] = 1024
     # Include common GGML variant extensions as well
     supported_extensions: ClassVar[list[str]] = [
         ".gguf",
@@ -122,6 +130,10 @@ class GgufScanner(BaseScanner):
         self.max_tensor_info_bytes = self._normalize_positive_int_config(
             self.config.get("gguf_max_tensor_info_bytes"),
             self.DEFAULT_MAX_TENSOR_INFO_BYTES,
+        )
+        self.max_reported_tensors = self._normalize_positive_int_config(
+            self.config.get("gguf_max_reported_tensors"),
+            self.DEFAULT_MAX_REPORTED_TENSORS,
         )
 
     @staticmethod
@@ -285,7 +297,7 @@ class GgufScanner(BaseScanner):
         if metadata_key_limit_exceeded:
             self._report_metadata_limit(
                 result,
-                f"GGUF declares {n_kv} metadata keys, exceeding limit {self.max_metadata_keys}",
+                f"File declares {n_kv} metadata keys, exceeding limit {self.max_metadata_keys}",
                 declared_metadata_keys=n_kv,
             )
 
@@ -401,8 +413,10 @@ class GgufScanner(BaseScanner):
                     rule_code="S902",
                 )
 
-        # Parse tensor information
-        tensors = []
+        # Parse tensor information once to establish section bounds and retain a capped summary.
+        tensor_info_start = f.tell()
+        reported_tensors: list[dict[str, Any]] = []
+        tensor_metadata_truncated = False
         tensor_byte_budget = _GgufByteBudget(
             self.max_tensor_info_bytes,
             "tensor information",
@@ -410,50 +424,19 @@ class GgufScanner(BaseScanner):
         )
         try:
             for _i in range(n_tensors):
-                t_name = self._read_string(f, budget=tensor_byte_budget)
-                (nd,) = struct.unpack("<I", self._read_bytes(f, 4, tensor_byte_budget))
-
-                # Hard limit on dimensions to prevent DoS attacks
-                if nd > 1000:
-                    result.add_check(
-                        name="Tensor Dimension Validation",
-                        passed=False,
-                        message=f"Tensor {t_name} has excessive dimensions ({nd}), skipping for security",
-                        rule_code="S804",
-                        severity=IssueSeverity.CRITICAL,
-                        location=self.current_file_path,
-                        details={"tensor_name": t_name, "dimensions": nd, "max_allowed": 1000},
-                    )
-                    # Skip the rest of this tensor's data to prevent DoS
-                    tensor_byte_budget.consume(nd * 8 + 4 + 8)
-                    f.seek(nd * 8 + 4 + 8, os.SEEK_CUR)  # Skip dims + type + offset
+                tensor = self._read_tensor_info(f, tensor_byte_budget, result, record_checks=False)
+                if tensor is None:
                     continue
+                if len(reported_tensors) < self.max_reported_tensors:
+                    reported_tensors.append(self._tensor_metadata_summary(tensor))
+                else:
+                    tensor_metadata_truncated = True
 
-                if nd > 8:
-                    result.add_check(
-                        name="Tensor Dimension Count Check",
-                        passed=False,
-                        message=f"Tensor {t_name} has suspicious number of dimensions: {nd}",
-                        severity=IssueSeverity.WARNING,
-                        location=self.current_file_path,
-                        details={"tensor_name": t_name, "dimensions": nd, "max_normal": 8},
-                        rule_code="S804",
-                    )
-
-                dims = [struct.unpack("<Q", self._read_bytes(f, 8, tensor_byte_budget))[0] for _ in range(nd)]
-                (t_type,) = struct.unpack("<I", self._read_bytes(f, 4, tensor_byte_budget))
-                (offset,) = struct.unpack("<Q", self._read_bytes(f, 8, tensor_byte_budget))
-
-                tensors.append(
-                    {
-                        "name": t_name,
-                        "dims": dims,
-                        "type": t_type,
-                        "offset": offset,
-                    },
-                )
-
-            result.metadata["tensors"] = [{"name": t["name"], "type": t["type"], "dims": t["dims"]} for t in tensors]
+            result.metadata["tensors"] = reported_tensors
+            result.metadata["tensor_count_reported"] = len(reported_tensors)
+            if tensor_metadata_truncated:
+                result.metadata["tensor_metadata_truncated"] = True
+                result.metadata["max_reported_tensors"] = self.max_reported_tensors
         except _GgufTensorLimitExceeded as e:
             self._report_tensor_limit(result, n_tensors, message=str(e))
             return
@@ -478,7 +461,8 @@ class GgufScanner(BaseScanner):
         pad_to_tensor_data = (tensor_data_alignment - (tensor_info_end % tensor_data_alignment)) % tensor_data_alignment
         tensor_data_start = tensor_info_end + pad_to_tensor_data
         # Only check bounds if there are tensors (empty models don't have tensor data)
-        if n_tensors > 0 and tensor_data_start > file_size:
+        tensor_data_section_out_of_bounds = n_tensors > 0 and tensor_data_start > file_size
+        if tensor_data_section_out_of_bounds:
             result.add_check(
                 name="Tensor Data Section Bounds",
                 passed=False,
@@ -488,162 +472,254 @@ class GgufScanner(BaseScanner):
                 details={"tensor_data_start": tensor_data_start, "file_size": file_size},
             )
             self._mark_inconclusive(result, GGUF_STRUCTURE_INCONCLUSIVE_REASON)
+
+        # Validate tensor sizes and offsets in a second streaming pass so large
+        # GGUFs do not require retaining every tensor record in memory.
+        f.seek(tensor_info_start)
+        validation_budget = _GgufByteBudget(
+            self.max_tensor_info_bytes,
+            "tensor information",
+            _GgufTensorLimitExceeded,
+        )
+        previous_tensor: _GgufTensorInfo | None = None
+        try:
+            for _i in range(n_tensors):
+                tensor = self._read_tensor_info(f, validation_budget, result, record_checks=True)
+                if tensor is None:
+                    continue
+                if tensor_data_section_out_of_bounds:
+                    continue
+                if previous_tensor is not None:
+                    self._validate_tensor_info(
+                        previous_tensor,
+                        next_offset=tensor.offset,
+                        tensor_data_start=tensor_data_start,
+                        file_size=file_size,
+                        tensor_data_alignment=tensor_data_alignment,
+                        result=result,
+                    )
+                previous_tensor = tensor
+
+            if previous_tensor is not None:
+                self._validate_tensor_info(
+                    previous_tensor,
+                    next_offset=None,
+                    tensor_data_start=tensor_data_start,
+                    file_size=file_size,
+                    tensor_data_alignment=tensor_data_alignment,
+                    result=result,
+                )
+        except _GgufTensorLimitExceeded as e:
+            self._report_tensor_limit(result, n_tensors, message=str(e))
+            return
+        except Exception as e:
+            result.add_check(
+                name="GGUF Tensor Parsing",
+                passed=False,
+                message=f"GGUF tensor parse error: {e}",
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={"error": str(e), "error_type": type(e).__name__},
+                rule_code="S902",
+            )
+            self._mark_inconclusive(result, GGUF_PARSE_INCONCLUSIVE_REASON)
             return
 
-        # Validate tensor sizes and offsets
-        for idx, tensor in enumerate(tensors):
-            try:
-                nelements = 1
-                has_invalid_dimension = False
-                for d in tensor["dims"]:
-                    if d <= 0 or d > 2**31:
-                        result.add_check(
-                            name="Tensor Dimension Value Validation",
-                            passed=False,
-                            message=f"Tensor {tensor['name']} has invalid dimension: {d}",
-                            severity=IssueSeverity.INFO,
-                            location=self.current_file_path,
-                            details={"tensor_name": tensor["name"], "invalid_dimension": d},
-                            rule_code="S902",
-                        )
-                        self._mark_inconclusive(result, GGUF_STRUCTURE_INCONCLUSIVE_REASON)
-                        has_invalid_dimension = True
-                        break
-                    nelements *= d
+        if tensor_data_section_out_of_bounds:
+            return
 
-                # Skip tensor validation if any dimension is invalid
-                if has_invalid_dimension:
-                    continue
+        result.bytes_scanned = f.tell()
 
-                # Check for extremely large tensors using correct size calculation
-                # For quantized types, use the actual type information
-                info = _GGML_TYPE_INFO.get(tensor["type"])
-                if info is None:
+    @staticmethod
+    def _tensor_metadata_summary(tensor: _GgufTensorInfo) -> dict[str, Any]:
+        return {"name": tensor.name, "type": tensor.tensor_type, "dims": list(tensor.dims)}
+
+    def _read_tensor_info(
+        self,
+        f: BinaryIO,
+        budget: _GgufByteBudget,
+        result: ScanResult,
+        *,
+        record_checks: bool,
+    ) -> _GgufTensorInfo | None:
+        t_name = self._read_string(f, budget=budget)
+        (nd,) = struct.unpack("<I", self._read_bytes(f, 4, budget))
+
+        if nd > 1000:
+            if record_checks:
+                result.add_check(
+                    name="Tensor Dimension Validation",
+                    passed=False,
+                    message=f"Tensor {t_name} has excessive dimensions ({nd}), skipping for security",
+                    rule_code="S804",
+                    severity=IssueSeverity.CRITICAL,
+                    location=self.current_file_path,
+                    details={"tensor_name": t_name, "dimensions": nd, "max_allowed": 1000},
+                )
+            budget.consume(nd * 8 + 4 + 8)
+            f.seek(nd * 8 + 4 + 8, os.SEEK_CUR)
+            return None
+
+        if nd > 8 and record_checks:
+            result.add_check(
+                name="Tensor Dimension Count Check",
+                passed=False,
+                message=f"Tensor {t_name} has suspicious number of dimensions: {nd}",
+                severity=IssueSeverity.WARNING,
+                location=self.current_file_path,
+                details={"tensor_name": t_name, "dimensions": nd, "max_normal": 8},
+                rule_code="S804",
+            )
+
+        dims = tuple(struct.unpack("<Q", self._read_bytes(f, 8, budget))[0] for _ in range(nd))
+        (tensor_type,) = struct.unpack("<I", self._read_bytes(f, 4, budget))
+        (offset,) = struct.unpack("<Q", self._read_bytes(f, 8, budget))
+        return _GgufTensorInfo(name=t_name, dims=dims, tensor_type=tensor_type, offset=offset)
+
+    def _validate_tensor_info(
+        self,
+        tensor: _GgufTensorInfo,
+        *,
+        next_offset: int | None,
+        tensor_data_start: int,
+        file_size: int,
+        tensor_data_alignment: int,
+        result: ScanResult,
+    ) -> None:
+        try:
+            nelements = 1
+            for dimension in tensor.dims:
+                if dimension <= 0 or dimension > 2**31:
                     result.add_check(
-                        name="Tensor Type Validation",
+                        name="Tensor Dimension Value Validation",
                         passed=False,
-                        message=f"Tensor {tensor['name']} uses unknown GGML type {tensor['type']}",
+                        message=f"Tensor {tensor.name} has invalid dimension: {dimension}",
                         severity=IssueSeverity.INFO,
                         location=self.current_file_path,
-                        details={"tensor_name": tensor["name"], "tensor_type": tensor["type"]},
+                        details={"tensor_name": tensor.name, "invalid_dimension": dimension},
                         rule_code="S902",
                     )
                     self._mark_inconclusive(result, GGUF_STRUCTURE_INCONCLUSIVE_REASON)
-                    continue
+                    return
+                nelements *= dimension
 
-                # For quantized types, calculate based on block and type size
-                blck, ts = info
-                estimated_size = ((nelements + blck - 1) // blck) * ts
-
-                if estimated_size > self.max_uncompressed:
-                    result.add_check(
-                        name="Tensor Size Limit Check",
-                        passed=False,
-                        message=f"Tensor {tensor['name']} estimated size ({estimated_size}) exceeds limit",
-                        rule_code="S902",
-                        severity=IssueSeverity.CRITICAL,
-                        location=self.current_file_path,
-                        details={
-                            "tensor_name": tensor["name"],
-                            "estimated_size": estimated_size,
-                            "limit": self.max_uncompressed,
-                        },
-                    )
-
-                # Validate tensor type and size.
-                # Note: tensor offsets are relative to tensor_data_start, not file start.
-                if nelements % blck != 0:
-                    result.add_check(
-                        name="Tensor Block Alignment Check",
-                        passed=False,
-                        message=f"Tensor {tensor['name']} not aligned to block size {blck}",
-                        severity=IssueSeverity.WARNING,
-                        location=self.current_file_path,
-                        details={"tensor_name": tensor["name"], "block_size": blck, "elements": nelements},
-                        rule_code="S804",
-                    )
-
-                expected = ((nelements + blck - 1) // blck) * ts
-                tensor_abs_start = tensor_data_start + tensor["offset"]
-                tensor_abs_end = tensor_abs_start + expected
-                offset_overflows_uint64 = tensor["offset"] > _UINT64_MAX - tensor_data_start
-                end_overflows_uint64 = tensor_abs_start > _UINT64_MAX - expected
-
-                if (
-                    offset_overflows_uint64
-                    or end_overflows_uint64
-                    or tensor_abs_start > file_size
-                    or tensor_abs_end > file_size
-                ):
-                    result.add_check(
-                        name="Tensor Data Bounds Check",
-                        passed=False,
-                        message=f"Tensor {tensor['name']} data extends outside file bounds",
-                        severity=IssueSeverity.WARNING,
-                        location=self.current_file_path,
-                        details={
-                            "tensor_name": tensor["name"],
-                            "offset": tensor["offset"],
-                            "expected": expected,
-                            "tensor_data_start": tensor_data_start,
-                            "tensor_abs_start": tensor_abs_start,
-                            "tensor_abs_end": tensor_abs_end,
-                            "file_size": file_size,
-                            "offset_overflows_uint64": offset_overflows_uint64,
-                            "end_overflows_uint64": end_overflows_uint64,
-                        },
-                        rule_code="S902",
-                    )
-                    continue
-
-                # Calculate actual size: use next tensor's offset, or file size for last tensor
-                if idx + 1 < len(tensors):
-                    next_offset = tensors[idx + 1]["offset"]
-                    if next_offset < tensor["offset"]:
-                        result.add_check(
-                            name="Tensor Offset Order Validation",
-                            passed=False,
-                            message=f"Non-monotonic offsets for tensor {tensor['name']}",
-                            severity=IssueSeverity.WARNING,
-                            location=self.current_file_path,
-                            details={"current_offset": tensor["offset"], "next_offset": next_offset},
-                        )
-                        continue
-                    actual = next_offset - tensor["offset"]
-                else:
-                    # Last tensor: calculate from absolute position to end of file
-                    actual = file_size - tensor_abs_start
-
-                # Allow for alignment padding (tensors may be aligned to 32 bytes)
-                # Only flag if difference is more than alignment padding
-                if abs(expected - actual) > tensor_data_alignment:
-                    result.add_check(
-                        name="Tensor Size Consistency Check",
-                        passed=False,
-                        message=f"Size mismatch for tensor {tensor['name']}",
-                        severity=IssueSeverity.WARNING,
-                        location=self.current_file_path,
-                        details={
-                            "tensor_name": tensor["name"],
-                            "expected": expected,
-                            "actual": actual,
-                            "alignment_tolerance": tensor_data_alignment,
-                        },
-                        rule_code="S902",
-                    )
-            except (OverflowError, ValueError) as e:
+            info = _GGML_TYPE_INFO.get(tensor.tensor_type)
+            if info is None:
                 result.add_check(
-                    name="Tensor Validation Error",
+                    name="Tensor Type Validation",
                     passed=False,
-                    message=f"Error validating tensor {tensor['name']}: {e}",
+                    message=f"Tensor {tensor.name} uses unknown GGML type {tensor.tensor_type}",
                     severity=IssueSeverity.INFO,
                     location=self.current_file_path,
-                    details={"tensor_name": tensor["name"], "error": str(e)},
-                    rule_code="S804",
+                    details={"tensor_name": tensor.name, "tensor_type": tensor.tensor_type},
+                    rule_code="S902",
                 )
                 self._mark_inconclusive(result, GGUF_STRUCTURE_INCONCLUSIVE_REASON)
+                return
 
-        result.bytes_scanned = f.tell()
+            blck, ts = info
+            estimated_size = ((nelements + blck - 1) // blck) * ts
+
+            if estimated_size > self.max_uncompressed:
+                result.add_check(
+                    name="Tensor Size Limit Check",
+                    passed=False,
+                    message=f"Tensor {tensor.name} estimated size ({estimated_size}) exceeds limit",
+                    rule_code="S902",
+                    severity=IssueSeverity.CRITICAL,
+                    location=self.current_file_path,
+                    details={
+                        "tensor_name": tensor.name,
+                        "estimated_size": estimated_size,
+                        "limit": self.max_uncompressed,
+                    },
+                )
+
+            if nelements % blck != 0:
+                result.add_check(
+                    name="Tensor Block Alignment Check",
+                    passed=False,
+                    message=f"Tensor {tensor.name} not aligned to block size {blck}",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={"tensor_name": tensor.name, "block_size": blck, "elements": nelements},
+                    rule_code="S804",
+                )
+
+            expected = ((nelements + blck - 1) // blck) * ts
+            tensor_abs_start = tensor_data_start + tensor.offset
+            tensor_abs_end = tensor_abs_start + expected
+            offset_overflows_uint64 = tensor.offset > _UINT64_MAX - tensor_data_start
+            end_overflows_uint64 = tensor_abs_start > _UINT64_MAX - expected
+
+            if (
+                offset_overflows_uint64
+                or end_overflows_uint64
+                or tensor_abs_start > file_size
+                or tensor_abs_end > file_size
+            ):
+                result.add_check(
+                    name="Tensor Data Bounds Check",
+                    passed=False,
+                    message=f"Tensor {tensor.name} data extends outside file bounds",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={
+                        "tensor_name": tensor.name,
+                        "offset": tensor.offset,
+                        "expected": expected,
+                        "tensor_data_start": tensor_data_start,
+                        "tensor_abs_start": tensor_abs_start,
+                        "tensor_abs_end": tensor_abs_end,
+                        "file_size": file_size,
+                        "offset_overflows_uint64": offset_overflows_uint64,
+                        "end_overflows_uint64": end_overflows_uint64,
+                    },
+                    rule_code="S902",
+                )
+                return
+
+            if next_offset is not None:
+                if next_offset < tensor.offset:
+                    result.add_check(
+                        name="Tensor Offset Order Validation",
+                        passed=False,
+                        message=f"Non-monotonic offsets for tensor {tensor.name}",
+                        severity=IssueSeverity.WARNING,
+                        location=self.current_file_path,
+                        details={"current_offset": tensor.offset, "next_offset": next_offset},
+                    )
+                    return
+                actual = next_offset - tensor.offset
+            else:
+                actual = file_size - tensor_abs_start
+
+            if abs(expected - actual) > tensor_data_alignment:
+                result.add_check(
+                    name="Tensor Size Consistency Check",
+                    passed=False,
+                    message=f"Size mismatch for tensor {tensor.name}",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={
+                        "tensor_name": tensor.name,
+                        "expected": expected,
+                        "actual": actual,
+                        "alignment_tolerance": tensor_data_alignment,
+                    },
+                    rule_code="S902",
+                )
+        except (OverflowError, ValueError) as e:
+            result.add_check(
+                name="Tensor Validation Error",
+                passed=False,
+                message=f"Error validating tensor {tensor.name}: {e}",
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={"tensor_name": tensor.name, "error": str(e)},
+                rule_code="S804",
+            )
+            self._mark_inconclusive(result, GGUF_STRUCTURE_INCONCLUSIVE_REASON)
 
     def _scan_ggml(
         self,
@@ -745,18 +821,18 @@ class GgufScanner(BaseScanner):
             next_depth = array_depth + 1
             if next_depth > self.max_metadata_array_depth:
                 raise _GgufMetadataLimitExceeded(
-                    f"GGUF metadata array depth {next_depth} exceeds limit {self.max_metadata_array_depth}"
+                    f"Metadata array depth {next_depth} exceeds limit {self.max_metadata_array_depth}"
                 )
             if count > self.max_metadata_array_items:
                 raise _GgufMetadataLimitExceeded(
-                    f"GGUF metadata array item count {count} exceeds per-array limit {self.max_metadata_array_items}"
+                    f"Metadata array item count {count} exceeds per-array limit {self.max_metadata_array_items}"
                 )
 
             if array_items_read is None:
                 array_items_read = [0]
             if count > self.max_total_metadata_array_items - array_items_read[0]:
                 raise _GgufMetadataLimitExceeded(
-                    f"GGUF metadata array item count exceeds aggregate limit {self.max_total_metadata_array_items}"
+                    f"Metadata array item count exceeds aggregate limit {self.max_total_metadata_array_items}"
                 )
             array_items_read[0] += count
             return [
@@ -834,7 +910,7 @@ class GgufScanner(BaseScanner):
                 "scan_outcome_reason": GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON,
                 **details,
             },
-            rule_code="S902",
+            rule_code=None,
         )
 
     def _report_tensor_limit(self, result: ScanResult, declared_tensors: int, *, message: str | None = None) -> None:
@@ -842,7 +918,7 @@ class GgufScanner(BaseScanner):
         result.add_check(
             name="GGUF Tensor Resource Limits",
             passed=False,
-            message=message or f"GGUF declares {declared_tensors} tensors, exceeding limit {self.max_tensors}",
+            message=message or f"File declares {declared_tensors} tensors, exceeding limit {self.max_tensors}",
             severity=IssueSeverity.INFO,
             location=self.current_file_path,
             details={
@@ -852,7 +928,7 @@ class GgufScanner(BaseScanner):
                 "analysis_incomplete": True,
                 "scan_outcome_reason": GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON,
             },
-            rule_code="S902",
+            rule_code=None,
         )
 
     def _scan_embedded_chat_templates(self, templates: dict[str, str], result: ScanResult) -> None:
@@ -896,7 +972,7 @@ class GgufScanner(BaseScanner):
                 gguf_metadata = {}
                 if metadata_count > self.max_metadata_keys:
                     metadata["error_reading_metadata"] = (
-                        f"GGUF declares {metadata_count} metadata keys, exceeding limit {self.max_metadata_keys}"
+                        f"File declares {metadata_count} metadata keys, exceeding limit {self.max_metadata_keys}"
                     )
                     return metadata
                 metadata_array_items_read = [0]
