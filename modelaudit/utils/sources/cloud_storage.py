@@ -630,6 +630,17 @@ def _build_safe_local_path(base_url: str, file_url: str, download_path: Path) ->
     return local_path
 
 
+def _clear_directory_contents(path: Path) -> None:
+    """Remove stale cache directory contents without deleting the directory itself."""
+    if not path.exists():
+        return
+    for child in path.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
 def download_from_cloud(
     url: str,
     cache_dir: Path | None = None,
@@ -745,6 +756,9 @@ def download_from_cloud(
 
         # Download based on type
         if metadata["type"] == "directory":
+            if cache:
+                _clear_directory_contents(download_path)
+
             # Handle directory download
             raw_files = metadata.get("files")
             if raw_files is None:

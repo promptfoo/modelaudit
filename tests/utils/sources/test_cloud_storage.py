@@ -208,6 +208,36 @@ def test_download_from_cloud_reuses_cache_with_matching_etag(mock_fs: MagicMock,
     assert mock_fs.call_count == 3
 
 
+@patch("fsspec.filesystem")
+def test_download_from_cloud_clears_stale_directory_cache(mock_fs: MagicMock, tmp_path: Path) -> None:
+    url = "s3://bucket/models"
+    cache = GCSCache(cache_dir=tmp_path / "cache")
+    stale_dir = tmp_path / "stale"
+    stale_dir.mkdir()
+    (stale_dir / "old-model.bin").write_bytes(b"old")
+    cache.cache_file(url, stale_dir, etag="etag-v1")
+
+    fs_meta = make_fs_mock()
+    fs_meta.info.return_value = {"type": "directory", "ETag": "etag-v2"}
+    fs_meta.glob.return_value = ["s3://bucket/models/new-model.bin"]
+    fs_meta.info.side_effect = [
+        {"type": "directory", "ETag": "etag-v2"},
+        {"type": "file", "size": 3, "ETag": "file-etag-v2"},
+    ]
+
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 3}
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"new")
+
+    mock_fs.side_effect = [fs_meta, fs]
+
+    result = download_from_cloud(url, cache_dir=tmp_path / "cache", show_progress=False, selective=False)
+
+    assert isinstance(result, Path)
+    assert not (result / "old-model.bin").exists()
+    assert (result / "new-model.bin").read_bytes() == b"new"
+
+
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
 @patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
 @patch("fsspec.filesystem")
