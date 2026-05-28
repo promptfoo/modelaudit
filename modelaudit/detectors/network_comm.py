@@ -31,8 +31,37 @@ _PATH_TOKEN_CHARACTER_CLASS_PATTERNS = (
     re.compile(r"[._~+/=\-]"),
 )
 _ARTIFACT_FILENAME_PATTERN = re.compile(r"(?i)^.+\.[a-z0-9]{1,10}$")
+_KNOWN_ARTIFACT_FILENAME_EXTENSIONS = frozenset(
+    {
+        "bin",
+        "ckpt",
+        "gguf",
+        "h5",
+        "hdf5",
+        "index",
+        "json",
+        "jsonl",
+        "md",
+        "mlmodel",
+        "npy",
+        "npz",
+        "onnx",
+        "pb",
+        "pickle",
+        "pkl",
+        "pt",
+        "pth",
+        "safetensors",
+        "tflite",
+        "txt",
+        "yaml",
+        "yml",
+    }
+)
 _TRAILING_PATH_DELIMITERS = ".,;:)]}'\""
 _MIN_CAPABILITY_TOKEN_ENTROPY = 3.5
+_PUBLIC_MODEL_REPOSITORY_HOSTS = frozenset({"huggingface.co", "hf.co"})
+_PUBLIC_MODEL_REPOSITORY_MARKERS = frozenset({"blob", "resolve", "tree"})
 
 
 def _split_trailing_path_delimiters(segment: str) -> tuple[str, str]:
@@ -58,6 +87,14 @@ def _redact_known_token_filename(segment: str) -> str | None:
     return None
 
 
+def _looks_like_known_artifact_filename(decoded: str) -> bool:
+    if not _ARTIFACT_FILENAME_PATTERN.fullmatch(decoded):
+        return False
+
+    _stem, separator, suffix = decoded.rpartition(".")
+    return bool(separator and suffix.lower() in _KNOWN_ARTIFACT_FILENAME_EXTENSIONS)
+
+
 def _looks_like_capability_path_token(segment: str) -> bool:
     token_candidate, _trailing_delimiters = _split_trailing_path_delimiters(segment)
     decoded = unquote(token_candidate)
@@ -66,7 +103,7 @@ def _looks_like_capability_path_token(segment: str) -> bool:
     if _redact_known_token_filename(segment) is not None:
         return True
 
-    if _ARTIFACT_FILENAME_PATTERN.fullmatch(decoded):
+    if _looks_like_known_artifact_filename(decoded):
         return False
     if len(decoded) < 20:
         return False
@@ -77,6 +114,13 @@ def _looks_like_capability_path_token(segment: str) -> bool:
     return character_classes >= 3 and _shannon_entropy_per_char(decoded) >= _MIN_CAPABILITY_TOKEN_ENTROPY
 
 
+def _is_public_model_repository_segment(hostname: str, segments: list[str], index: int) -> bool:
+    if hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS or index not in {1, 2}:
+        return False
+
+    return any(segment.lower() in _PUBLIC_MODEL_REPOSITORY_MARKERS for segment in segments[index + 1 :])
+
+
 def _redact_path_parameter_tokens(segment: str) -> str | None:
     token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
     if ";" not in token_candidate:
@@ -84,6 +128,10 @@ def _redact_path_parameter_tokens(segment: str) -> str | None:
 
     parts = token_candidate.split(";")
     changed = False
+    if parts[0] and _looks_like_capability_path_token(parts[0]):
+        parts[0] = _REDACTED_PATH_TOKEN
+        changed = True
+
     for index, part in enumerate(parts[1:], start=1):
         if not part:
             continue
@@ -110,6 +158,9 @@ def _redact_url_path_tokens(hostname: str, path: str) -> str:
         is_slack_webhook_secret = (
             hostname == "hooks.slack.com" and len(segments) > 2 and segments[1].lower() == "services" and index > 1
         )
+        if _is_public_model_repository_segment(hostname, segments, index):
+            continue
+
         parameter_redaction = _redact_path_parameter_tokens(segment)
         if parameter_redaction is not None:
             segments[index] = parameter_redaction

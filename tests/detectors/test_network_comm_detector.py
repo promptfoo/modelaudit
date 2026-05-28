@@ -188,6 +188,17 @@ class TestNetworkCommDetector:
         assert url_finding["url"] == "https://example.com/path/<redacted>.json"
         assert github_token not in json.dumps(url_finding, sort_keys=True)
 
+    def test_dotted_opaque_path_capability_tokens_are_redacted(self) -> None:
+        """Unknown dotted opaque tokens should not hide behind broad filename parsing."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWx.Yz1234567890abcdefGhij.Klmn"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
     def test_path_parameter_tokens_are_redacted(self) -> None:
         """Matrix-style path parameters can carry capability tokens."""
         detector = NetworkCommDetector()
@@ -202,6 +213,20 @@ class TestNetworkCommDetector:
         assert url_finding["url"] == "https://example.com/download;token=<redacted>/model.bin"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
 
+    def test_path_segment_tokens_before_matrix_parameters_are_redacted(self) -> None:
+        """A token segment followed by benign matrix params should still be redacted."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/path/{path_token};v=1/model.bin".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/path/<redacted>;v=1/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
     def test_public_revision_hash_paths_are_preserved(self) -> None:
         """Public model revision hashes should remain useful for audit follow-up."""
         detector = NetworkCommDetector()
@@ -213,6 +238,17 @@ class TestNetworkCommDetector:
 
         assert revision in url_finding["url"]
         assert url_finding["url"].endswith(f"/{revision}/model.safetensors")
+
+    def test_public_model_repository_ids_are_preserved(self) -> None:
+        """Known public model hosts should keep repo IDs for audit follow-up."""
+        detector = NetworkCommDetector()
+        repo_id = "Llama-3.1-70B-Instruct"
+        data = f"https://huggingface.co/meta-llama/{repo_id}/resolve/main/model.safetensors".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://huggingface.co/meta-llama/{repo_id}/resolve/main/model.safetensors"
 
     def test_long_artifact_filenames_are_preserved(self) -> None:
         """Ordinary model artifact filenames should not be treated as capability tokens."""
