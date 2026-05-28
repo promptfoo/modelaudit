@@ -42,6 +42,7 @@ from modelaudit.scanners.archive_dispatch import (
     NESTED_SCAN_CALLBACK_CONFIG_KEY,
     merge_executable_zip_container_findings,
     merge_flax_msgpack_overlap_findings,
+    merge_inconclusive_flax_msgpack_outcome,
 )
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
 from modelaudit.scanners.mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
@@ -2014,6 +2015,13 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             config,
             context="Flax MessagePack overlapping content analysis",
             scanned_scanner_ids=frozenset({result.scanner_name}),
+        )
+    elif result.scanner_name != "flax_msgpack":
+        merge_inconclusive_flax_msgpack_outcome(
+            path,
+            result,
+            config,
+            context="strict content owner overlapping ambiguous Flax analysis",
         )
 
     if ext == ".bin" and header_format == "pytorch_binary" and result.scanner_name == "pytorch_binary":

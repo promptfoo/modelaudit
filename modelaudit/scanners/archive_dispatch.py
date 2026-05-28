@@ -9,7 +9,12 @@ from typing import Any
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_registry_metadata import get_scanner_registry_metadata
-from ..scanner_results import IssueSeverity, ScanResult, mark_inconclusive_scan_result
+from ..scanner_results import (
+    SCAN_OUTCOME_REASONS_METADATA_KEY,
+    IssueSeverity,
+    ScanResult,
+    mark_inconclusive_scan_result,
+)
 from ..scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
     add_scanner_selection_skip_check,
@@ -32,6 +37,7 @@ from ..utils.file.detection import (
     detect_mxnet_symbol_content_route,
     detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
+    has_inconclusive_renamed_flax_msgpack_routing,
     is_executorch_archive,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
@@ -245,6 +251,25 @@ def _deduplicate_exact_merged_findings(result: ScanResult) -> None:
     result.checks = unique_checks
 
 
+def _merge_composed_scan_result(result: ScanResult, other: ScanResult) -> None:
+    """Merge analyses while retaining all incomplete-coverage reasons."""
+    prior_reasons = result.metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY, [])
+    additional_reasons = other.metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY, [])
+    combined_reasons = list(
+        dict.fromkeys(
+            [
+                *(prior_reasons if isinstance(prior_reasons, list) else []),
+                *(additional_reasons if isinstance(additional_reasons, list) else []),
+            ]
+        )
+    )
+    primary_bytes_scanned = result.bytes_scanned
+    result.merge(other)
+    result.bytes_scanned = max(primary_bytes_scanned, other.bytes_scanned)
+    if combined_reasons:
+        result.metadata[SCAN_OUTCOME_REASONS_METADATA_KEY] = combined_reasons
+
+
 def merge_executable_zip_container_findings(
     path: str,
     result: ScanResult,
@@ -327,9 +352,7 @@ def merge_flax_msgpack_overlap_findings(
                 overlap_result = _make_unavailable_recognized_format_result(path, scanner_id, scanner_id)
             else:
                 overlap_result = scanner_class(config=config).scan(path)
-            primary_bytes_scanned = result.bytes_scanned
-            result.merge(overlap_result)
-            result.bytes_scanned = max(primary_bytes_scanned, overlap_result.bytes_scanned)
+            _merge_composed_scan_result(result, overlap_result)
         else:
             add_scanner_selection_skip_check(
                 result,
@@ -338,6 +361,34 @@ def merge_flax_msgpack_overlap_findings(
                 scanner_selection,
                 context=context,
             )
+    _deduplicate_exact_merged_findings(result)
+
+
+def merge_inconclusive_flax_msgpack_outcome(
+    path: str,
+    result: ScanResult,
+    config: dict[str, Any] | None,
+    *,
+    context: str,
+) -> None:
+    """Preserve ambiguous Flax coverage when a strict overlapping owner is primary."""
+    from . import _registry
+
+    if result.scanner_name not in detect_flax_msgpack_overlap_routes(
+        path
+    ) or not has_inconclusive_renamed_flax_msgpack_routing(path):
+        return
+
+    scanner_selection = policy_from_config(config)
+    if scanner_selection.allows("flax_msgpack"):
+        scanner_class = _registry.load_scanner_by_id("flax_msgpack")
+        if scanner_class is None:
+            flax_result = _make_unavailable_recognized_format_result(path, "flax_msgpack", "flax_msgpack")
+        else:
+            flax_result = scanner_class(config=config).scan(path)
+        _merge_composed_scan_result(result, flax_result)
+    else:
+        add_scanner_selection_skip_check(result, path, "flax_msgpack", scanner_selection, context=context)
     _deduplicate_exact_merged_findings(result)
 
 
@@ -687,6 +738,13 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
             config,
             context="nested Flax MessagePack overlapping content analysis",
             scanned_scanner_ids=frozenset({result.scanner_name}),
+        )
+    elif result.scanner_name != "flax_msgpack":
+        merge_inconclusive_flax_msgpack_outcome(
+            path,
+            result,
+            config,
+            context="nested strict content owner overlapping ambiguous Flax analysis",
         )
     if skipped_overlap_scanner_id:
         add_scanner_selection_skip_check(

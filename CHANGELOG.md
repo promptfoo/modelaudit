@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - retain oversized renamed SafeTensors candidates for bounded fail-closed analysis
 - route renamed TensorFlow SavedModel and MetaGraph protobufs through unsafe-operation analysis
 - detect and scan signature-valid CNTK and LightGBM payloads even when renamed with misleading suffixes
+- mark CNTK read failures and string-extraction limits as inconclusive analysis while retaining strict CNTK ownership and fail-closed ambiguous Flax overlap coverage
 - detect and scan signature-valid RKNN, TFLite, and ExecuTorch payloads under non-conflicting renamed suffixes while preserving owned routes, and classify unavailable ExecuTorch reads as inconclusive
 - mark CatBoost text-fragment extraction limits and unavailable reads as inconclusive analysis
 - mark RKNN and Torch7 string-extraction limits and unavailable reads as inconclusive analysis
@@ -41,7 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - restore content routing for extensionless XGBoost UBJSON models and classify unavailable or undecodable XGBoost reads as inconclusive
 - route renamed TAR-backed NeMo archives with relative archive-root model configs through Hydra `_target_` analysis while retaining generic embedded-member checks
 - honor descriptor-owned header aliases during helper scanner selection for renamed HDF5, GGML, and compressed payloads
-- detect and scan signature-valid CNTK and LightGBM payloads even when renamed with misleading suffixes
 - detect signature-valid Torch7 payloads even when renamed with misleading suffixes
 - detect acquired executable Llamafile payloads with misleading suffixes, retain archive-polyglot coverage, and classify unavailable runtime previews as inconclusive
 
