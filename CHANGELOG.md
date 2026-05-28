@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - scan dangerous RKNN safe-key metadata values instead of suppressing the whole key-value string
+- scan ONNX external data initializers in nested graphs, functions, and training graphs
 - route protocol-0 JAX checkpoint pickles through pickle opcode security checks
 - detect dangerous Python calls retrieved or installed through module namespace dictionaries in ZIP and TAR members, while avoiding comprehension-local false positives
 - preflight and stream-enforce cumulative SevenZip extraction budgets before writing oversized archives
@@ -51,6 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - classify unavailable manifest cloud-reference inspection as inconclusive rather than reporting complete coverage
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
+- detect executable PyTorch ZIP sidecars hidden behind ordinary filenames while excluding raw tensor-storage bytes
+- scan 7-Zip Python members and content-disguised executable sidecars through shared archive security checks
 - skip non-numeric weight metadata and report incomplete weight-distribution analysis accurately
 - report incomplete R serialized coverage without treating extraction ceilings alone as suspicious payloads, and preserve detection across printable-chunk boundaries
 - classify unavailable Paddle, NumPy, PyTorch binary, and SavedModel reads as inconclusive rather than security findings

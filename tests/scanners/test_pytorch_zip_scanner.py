@@ -343,63 +343,224 @@ def test_pytorch_zip_scanner_native_library_near_match_extension_stays_clean(tmp
     )
 
 
-@pytest.mark.parametrize(
-    ("payload", "expected_rule_code"),
-    [
-        (b"\x7fELF" + b"\x00" * 64, "S502"),
-        (b"MZ" + b"\x00" * 58 + (1536).to_bytes(4, "little") + b"\x00" * (1536 - 64) + b"PE\x00\x00", "S501"),
-    ],
-)
-def test_pytorch_zip_scanner_detects_executable_content_with_benign_name(
+def test_pytorch_zip_scanner_detects_disguised_executable_sidecar_by_content(tmp_path: Path) -> None:
+    """Strong executable bytes must not disappear behind an ordinary sidecar suffix."""
+    model_path = create_mock_pytorch_zip(tmp_path / "disguised_executable.pt", prefix="archive")
+    distant_pe_header = bytearray(b"\x00" * 2052)
+    distant_pe_header[:2] = b"MZ"
+    distant_pe_header[0x3C:0x40] = (2048).to_bytes(4, "little")
+    distant_pe_header[2048:2052] = b"PE\x00\x00"
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/weights/payload.bin", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+        zip_file.writestr("archive/weights/loader.dat", bytes(distant_pe_header))
+
+    direct_result = PyTorchZipScanner().scan(str(model_path))
+    assert direct_result.success is False
+    executable_checks = {
+        check.details.get("file"): check
+        for check in direct_result.checks
+        if check.name == "Executable File Detection" and check.status == CheckStatus.FAILED
+    }
+    assert {"archive/weights/payload.bin", "archive/weights/loader.dat"}.issubset(executable_checks)
+    assert executable_checks["archive/weights/payload.bin"].rule_code == "S502"
+    assert executable_checks["archive/weights/loader.dat"].rule_code == "S501"
+    assert all(check.severity == IssueSeverity.CRITICAL for check in executable_checks.values())
+
+    aggregate_result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    assert determine_exit_code(aggregate_result) == 1
+    finding_messages = {issue.message for issue in aggregate_result.issues}
+    assert "Executable file found in PyTorch model: archive/weights/payload.bin" in finding_messages
+    assert "Executable file found in PyTorch model: archive/weights/loader.dat" in finding_messages
+
+
+def test_pytorch_zip_scanner_detects_executable_bytes_hidden_behind_python_name(tmp_path: Path) -> None:
+    """A Python suffix must not reduce a native payload to a warning-only finding."""
+    model_path = create_mock_pytorch_zip(tmp_path / "python_named_executable.pt", prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/code/payload.py", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("file") == "archive/code/payload.py"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_detects_executable_sidecar_under_untrusted_data_path(tmp_path: Path) -> None:
+    """Only validated tensor storage blobs should skip executable-content probing."""
+    model_path = create_mock_pytorch_zip(tmp_path / "untrusted_data_path.pt", prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/weights/data/0", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("file") == "archive/weights/data/0"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_marks_over_budget_pe_header_offset_inconclusive(
     tmp_path: Path,
-    payload: bytes,
-    expected_rule_code: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "content_hidden_executable.pt")
+    """An unconfirmed PE pointer must not become a fabricated executable finding."""
+    model_path = create_mock_pytorch_zip(tmp_path / "oversized_pe_offset.pt", prefix="archive")
+    sidecar = bytearray(b"\x00" * 64)
+    sidecar[:2] = b"MZ"
+    sidecar[0x3C:0x40] = ((1024 * 1024) + 1).to_bytes(4, "little")
     with zipfile.ZipFile(model_path, "a") as zip_file:
-        zip_file.writestr("archive/data/payload.dat", payload)
+        zip_file.writestr("archive/weights/loader.dat", bytes(sidecar))
+
+    original = PyTorchZipScanner._read_member_prefix
+    content_probe_limits: list[int] = []
+
+    def record_content_probe(
+        self: PyTorchZipScanner,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        limit: int,
+        *,
+        phase: str,
+        result: ScanResult,
+    ) -> bytes:
+        if phase == "executable member content probe" and entry.filename.endswith("loader.dat"):
+            content_probe_limits.append(limit)
+        return original(self, zip_file, entry, limit, phase=phase, result=result)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_read_member_prefix", record_content_probe)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
-    executable_issues = [
-        issue for issue in result.issues if issue.message and "Executable file found in PyTorch model" in issue.message
-    ]
-    assert any(
-        issue.details.get("file") == "archive/data/payload.dat" and issue.rule_code == expected_rule_code
-        for issue in executable_issues
+    assert content_probe_limits == [1024]
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_executable_member_probe_failed" in result.metadata["scan_outcome_reasons"]
+    assert not any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("file") == "archive/weights/loader.dat"
+        for check in result.checks
     )
-    assert all(issue.severity == IssueSeverity.CRITICAL for issue in executable_issues)
+    probe_checks = [check for check in result.checks if check.name == "Executable Content Probe"]
+    assert len(probe_checks) == 1
+    assert probe_checks[0].details["entries"][0]["exception_type"] == "BoundedProbeIncomplete"
 
 
-def test_pytorch_zip_scanner_detects_executable_magic_in_unreferenced_numeric_member(tmp_path: Path) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "unreferenced_numeric_member.pt")
-    with zipfile.ZipFile(model_path, "a") as zip_file:
-        zip_file.writestr("archive/data/0", b"\x7fELF" + b"\x00" * 64)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert any(
-        issue.details.get("file") == "archive/data/0"
-        and issue.message
-        and "Executable file found in PyTorch model" in issue.message
-        for issue in result.issues
-    )
-
-
-def test_pytorch_zip_scanner_ignores_executable_magic_in_referenced_tensor_storage(tmp_path: Path) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "referenced_tensor_bytes.pt", with_pickle=False, prefix="archive")
+def test_pytorch_zip_scanner_does_not_treat_tensor_storage_bytes_as_executable_sidecar(tmp_path: Path) -> None:
+    """Arbitrary tensor storage bytes are not evidence of an executable archive member."""
+    model_path = create_mock_pytorch_zip(tmp_path / "tensor_bytes.pt", with_pickle=False, prefix="archive")
     with zipfile.ZipFile(model_path, "a") as zip_file:
         zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
-        zip_file.writestr("archive/data/0", b"\x7fELF" + b"\x00" * 64)
+        zip_file.writestr("archive/data/0", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
 
     result = PyTorchZipScanner().scan(str(model_path))
 
     assert any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
     assert not any(
-        issue.details.get("file") == "archive/data/0"
-        and issue.message
-        and "Executable file found in PyTorch model" in issue.message
-        for issue in result.issues
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("file") == "archive/data/0"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_keeps_tensor_storage_trust_when_pickle_scanner_is_disabled(tmp_path: Path) -> None:
+    """Scanner-only PyTorch ZIP scans still need trusted storage IDs to avoid tensor-byte false positives."""
+    model_path = create_mock_pytorch_zip(tmp_path / "scanner_only_tensor_bytes.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner(config={"scanners": ["pytorch_zip"]}).scan(str(model_path))
+
+    assert result.success is True
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pickle"
+        for check in result.checks
+    )
+    assert any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
+    assert not any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("file") == "archive/data/0"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_probes_unreferenced_numeric_storage_lookalike(tmp_path: Path) -> None:
+    """An unreferenced canonical-looking data member remains an executable sidecar."""
+    model_path = create_mock_pytorch_zip(tmp_path / "unreferenced_tensor_bytes.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", b"\x00" * 8)
+        zip_file.writestr("archive/data/999", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("file") == "archive/data/999"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_fails_closed_when_executable_content_probe_cannot_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unreadable ordinary sidecars leave executable-content coverage incomplete."""
+    model_path = create_mock_pytorch_zip(tmp_path / "unreadable_sidecar.pt", prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/weights/sidecar.bin", b"ordinary metadata")
+
+    original = PyTorchZipScanner._read_member_prefix
+
+    def fail_content_probe(
+        self: PyTorchZipScanner,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        limit: int,
+        *,
+        phase: str,
+        result: ScanResult,
+    ) -> bytes:
+        if phase == "executable member content probe" and entry.filename.endswith("sidecar.bin"):
+            raise OSError("simulated executable probe read failure")
+        return original(self, zip_file, entry, limit, phase=phase, result=result)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_read_member_prefix", fail_content_probe)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_executable_member_probe_failed" in result.metadata["scan_outcome_reasons"]
+    probe_checks = [check for check in result.checks if check.name == "Executable Content Probe"]
+    assert len(probe_checks) == 1
+    assert probe_checks[0].severity == IssueSeverity.INFO
+    assert probe_checks[0].details["entries"][0]["zip_entry"] == "archive/weights/sidecar.bin"
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Executable File Detection" and check.status == CheckStatus.PASSED
+    ]
+    _assert_pytorch_zip_inconclusive_not_cached(
+        model_path,
+        tmp_path / "cache",
+        "pytorch_zip_executable_member_probe_failed",
+        expected_success=False,
+        expected_exit_code=2,
     )
 
 
@@ -412,7 +573,7 @@ def test_pytorch_zip_scanner_relaxes_crc_for_pickle_scan(tmp_path: Path) -> None
 
     crc_checks = [check for check in result.checks if check.name == "PyTorch ZIP CRC Handling"]
 
-    assert result.success is True
+    assert result.success is False
     assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
     assert len(crc_checks) == 1
     assert crc_checks[0].status == CheckStatus.FAILED
@@ -2819,7 +2980,7 @@ def test_pytorch_zip_tensor_metadata_large_auxiliary_pickle_stays_clean(tmp_path
     )
 
 
-def _assert_tensor_metadata_inconclusive_not_cached(
+def _assert_pytorch_zip_inconclusive_not_cached(
     path: Path,
     cache_dir: Path,
     reason: str,
@@ -2860,7 +3021,7 @@ def test_pytorch_zip_tensor_metadata_parse_failure_is_exit1_and_not_cached(tmp_p
         zipf.writestr("archive/data.pkl", b"\x80\x02B")
         zipf.writestr("archive/data/0", b"\x00" * 24)
 
-    _assert_tensor_metadata_inconclusive_not_cached(
+    _assert_pytorch_zip_inconclusive_not_cached(
         zip_path,
         tmp_path / "parse-failure-cache",
         "pytorch_zip_tensor_metadata_validation_failed",
@@ -2886,7 +3047,7 @@ def test_pytorch_zip_tensor_metadata_truncation_is_exit2_and_not_cached(tmp_path
         )
         zipf.writestr("archive/data/0", b"\x00" * 24)
 
-    _assert_tensor_metadata_inconclusive_not_cached(
+    _assert_pytorch_zip_inconclusive_not_cached(
         zip_path,
         tmp_path / "truncation-cache",
         "pytorch_zip_tensor_metadata_validation_truncated",

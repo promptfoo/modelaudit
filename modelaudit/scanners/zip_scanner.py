@@ -611,6 +611,7 @@ class ZipScanner(BaseScanner):
                             result=result,
                             max_python_analysis_bytes=self._max_python_member_analysis_bytes(),
                             python_analysis_incomplete_reason="zip_python_member_analysis_incomplete",
+                            executable_analysis_incomplete_reason="zip_executable_member_analysis_incomplete",
                         )
                     if is_known_unreadable:
                         skip_message = f"Skipped ZIP member analysis for known unreadable member: {name}"
@@ -685,6 +686,7 @@ class ZipScanner(BaseScanner):
                                 result=result,
                                 max_python_analysis_bytes=self._max_python_member_analysis_bytes(),
                                 python_analysis_incomplete_reason="zip_python_member_analysis_incomplete",
+                                executable_analysis_incomplete_reason="zip_executable_member_analysis_incomplete",
                             )
 
                         nested_config = dict(self.config)

@@ -704,6 +704,28 @@ class TestTarScanner:
         assert executable_checks[0].severity == IssueSeverity.WARNING
         assert executable_checks[0].details["entry"] == "bin/runme"
 
+    def test_scan_tar_marks_unconfirmed_pe_pointer_inconclusive(self, tmp_path: Path) -> None:
+        """A bounded PE probe should report incomplete coverage without a PE signature."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = bytearray(64)
+        payload[:2] = b"MZ"
+        payload[0x3C:0x40] = ((1024 * 1024) + 1).to_bytes(4, "little")
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("bin/runme")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "tar_executable_member_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert not any(
+            check.name == "Executable Archive Member Detection" and check.severity == IssueSeverity.WARNING
+            for check in result.checks
+        )
+
     @pytest.mark.parametrize(
         ("source", "expected_rule_code", "expected_call"),
         [
