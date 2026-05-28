@@ -18,6 +18,7 @@ from modelaudit.utils.file.detection import (
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
@@ -344,6 +345,71 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_checkpoint))
         assert detect_file_format_for_skip_filter(str(generic_map)) == "unknown"
         assert should_skip_file(str(generic_map))
+
+    @pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"])
+    def test_flax_checkpoint_under_default_skipped_suffix_bypasses_skip(
+        self,
+        tmp_path: Path,
+        suffix: str,
+    ) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        checkpoint = tmp_path / f"checkpoint{suffix}"
+        generic_map = tmp_path / f"metadata{suffix}"
+        checkpoint.write_bytes(
+            msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+        generic_map.write_bytes(
+            msgpack.packb({"state": {"selected": True}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        assert detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+        assert not should_skip_file(str(checkpoint))
+        assert detect_file_format_for_skip_filter(str(generic_map)) == "unknown"
+        if suffix in {".txt", ".rst"}:
+            assert should_skip_file(str(generic_map))
+
+    def test_oversized_ambiguous_text_suffix_fails_closed_as_flax(self, tmp_path: Path) -> None:
+        document = tmp_path / "notes.txt"
+        document.write_bytes(b" " * (2 * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1) + 2))
+
+        assert detect_file_format_for_skip_filter(str(document)) == "flax_msgpack"
+        assert not should_skip_file(str(document))
+
+    def test_small_plain_text_document_stays_skipped_instead_of_routing_as_flax(self, tmp_path: Path) -> None:
+        document = tmp_path / "notes.txt"
+        document.write_text("ordinary project documentation\n", encoding="utf-8")
+
+        assert detect_file_format_for_skip_filter(str(document)) == "unknown"
+        assert should_skip_file(str(document))
+
+    def test_xml_looking_scalar_flax_checkpoint_bypasses_skip(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        checkpoint = tmp_path / "xml-looking-scalar.txt"
+        checkpoint.write_bytes(
+            msgpack.packb(60, use_bin_type=True)
+            + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        assert detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+        assert not should_skip_file(str(checkpoint))
+
+    def test_inconclusive_document_suffix_flax_candidate_bypasses_skip(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        checkpoint = tmp_path / "delayed-root.txt"
+        checkpoint.write_bytes(
+            msgpack.packb(None, use_bin_type=True) * 4097
+            + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        assert detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+        assert not should_skip_file(str(checkpoint))
+
+    def test_large_json_array_under_skipped_suffix_is_preserved_fail_closed(self, tmp_path: Path) -> None:
+        json_array = tmp_path / "metadata.jpg"
+        json_array.write_bytes(b"[" + b"0," * ((MXNET_SYMBOL_SIGNATURE_READ_BYTES // 2) + 100) + b"0]")
+
+        assert detect_file_format_for_skip_filter(str(json_array)) == "flax_msgpack"
+        assert not should_skip_file(str(json_array))
 
     def test_incomplete_disguised_flax_probe_bypasses_skip_filter(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

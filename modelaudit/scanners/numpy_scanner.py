@@ -6,8 +6,9 @@ import sys
 import warnings
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
+from ..core_results import mark_operational_scan_error
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 
 # Import NumPy with compatibility handling
@@ -80,6 +81,33 @@ class NumPyScanner(BaseScanner):
         if not NUMPY_AVAILABLE or not NUMPY_FORMAT_AVAILABLE:
             return False
         return super().can_handle(path)
+
+    @staticmethod
+    def _is_unreadable_path_result(result: ScanResult) -> bool:
+        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    @staticmethod
+    def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
+        mark_operational_scan_error(result, "numpy_read_failed")
+        _mark_inconclusive_scan_result(result, "numpy_read_failed")
+        result.add_check(
+            name="NumPy File Read",
+            passed=False,
+            message=f"Unable to read NumPy file: {error}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "numpy_version": NUMPY_VERSION,
+                "analysis_incomplete": True,
+                "operational_error": True,
+                "operational_error_reason": "numpy_read_failed",
+                "scan_outcome_reason": "numpy_read_failed",
+            },
+        )
+        _finish_with_inconclusive_contract(result, default_success=False)
+        return result
 
     def _validate_array_dimensions(self, shape: tuple[int, ...]) -> None:
         """Validate array dimensions for security"""
@@ -232,6 +260,12 @@ class NumPyScanner(BaseScanner):
 
         path_check_result = self._check_path(path)
         if path_check_result:
+            if self._is_unreadable_path_result(path_check_result):
+                return self._finish_read_failure(
+                    self._create_result(),
+                    path,
+                    PermissionError(f"Path is not readable: {path}"),
+                )
             return path_check_result
 
         size_check = self._check_size_limit(path)
@@ -290,6 +324,8 @@ class NumPyScanner(BaseScanner):
                             else:
                                 # Fallback for newer NumPy versions
                                 shape, fortran, dtype = fmt.read_array_header_2_0(f)
+                    except OSError:
+                        raise
                     except Exception as header_error:
                         result.add_check(
                             name="NumPy Header Read",
@@ -567,6 +603,8 @@ class NumPyScanner(BaseScanner):
                     result.metadata.update(
                         {"shape": shape, "dtype": str(dtype), "fortran_order": fortran},
                     )
+        except OSError as e:
+            return self._finish_read_failure(result, path, e)
         except Exception as e:  # pragma: no cover - unexpected errors
             result.add_check(
                 name="NumPy File Scan",

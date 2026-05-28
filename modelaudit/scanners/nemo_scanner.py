@@ -51,7 +51,6 @@ _SAFE_TARGET_PREFIXES = (
     "lightning.",
     "torch.optim.",
     "torch.nn.",
-    "torch.utils.",
     "transformers.",
     "omegaconf.",
     "hydra.",
@@ -60,6 +59,28 @@ _SAFE_TARGET_PREFIXES = (
     "numpy.",
     "dataclasses.",
 )
+
+# Exact safe _target_ values for utility namespaces that also contain unsafe
+# callables. Keep this list narrow instead of trusting whole namespaces.
+_SAFE_TARGETS = {
+    "torch.utils.data.BatchSampler",
+    "torch.utils.data.ConcatDataset",
+    "torch.utils.data.DataLoader",
+    "torch.utils.data.RandomSampler",
+    "torch.utils.data.SequentialSampler",
+    "torch.utils.data.Subset",
+    "torch.utils.data.TensorDataset",
+    "torch.utils.data.WeightedRandomSampler",
+    "torch.utils.data.distributed.DistributedSampler",
+    "torch.utils.data.dataloader.DataLoader",
+    "torch.utils.data.dataset.ConcatDataset",
+    "torch.utils.data.dataset.Subset",
+    "torch.utils.data.dataset.TensorDataset",
+    "torch.utils.data.sampler.BatchSampler",
+    "torch.utils.data.sampler.RandomSampler",
+    "torch.utils.data.sampler.SequentialSampler",
+    "torch.utils.data.sampler.WeightedRandomSampler",
+}
 
 # Dangerous _target_ values that indicate exploitation
 _DANGEROUS_TARGETS = {
@@ -106,6 +127,11 @@ _DANGEROUS_TARGETS = {
     "torch.package.PackageImporter",
     "torch.package.PackageImporter.load_pickle",
     "torch.serialization.load",
+    "torch.utils.cpp_extension._import_module_from_library",
+    "torch.utils.cpp_extension._jit_compile",
+    "torch.utils.cpp_extension._run_ninja_build",
+    "torch.utils.cpp_extension.load",
+    "torch.utils.cpp_extension.load_inline",
     "torch.utils.model_zoo.load_url",
     "shutil.rmtree",
     "pathlib.Path.unlink",
@@ -1290,7 +1316,7 @@ class NemoScanner(BaseScanner):
             return
 
         # Trusted namespaces can still hide obviously dangerous leaf names.
-        if any(target.startswith(prefix) for prefix in _SAFE_TARGET_PREFIXES):
+        if target in _SAFE_TARGETS or any(target.startswith(prefix) for prefix in _SAFE_TARGET_PREFIXES):
             pattern = _find_suspicious_safe_prefixed_target_pattern(target)
             if pattern is not None:
                 self._add_suspicious_target_check(
