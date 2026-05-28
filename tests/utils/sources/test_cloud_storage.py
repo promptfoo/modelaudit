@@ -741,13 +741,90 @@ class TestCloudCacheSafety:
         source_file = sibling_dir / "artifact.bin"
         source_file.write_bytes(b"artifact")
 
-        cache.cache_file("s3://bucket/model.bin", source_file)
+        url = "s3://bucket/model.bin"
+        cache.cache_file(url, source_file, etag="etag-v1")
 
-        cached_path = cache.get_cached_path("s3://bucket/model.bin")
+        cached_path = cache.get_cached_path(url, etag="etag-v1")
         assert cached_path is not None
         assert cached_path.resolve() != source_file.resolve()
         assert cached_path.resolve().is_relative_to(cache.cache_dir.resolve())
         assert source_file.exists()
+
+    def test_cache_without_etag_is_stale_miss(self, tmp_path: Path) -> None:
+        """Cache entries without validators must not be reused as fresh remote objects."""
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        source_file = tmp_path / "artifact.bin"
+        source_file.write_bytes(b"artifact")
+        url = "s3://bucket/model.bin"
+
+        cache.cache_file(url, source_file)
+
+        assert cache.get_cached_path(url) is None
+        assert cache.get_cached_path(url, etag="etag-v1") is None
+
+    def test_cache_with_matching_etag_hits(self, tmp_path: Path) -> None:
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        source_file = tmp_path / "artifact.bin"
+        source_file.write_bytes(b"artifact")
+        url = "s3://bucket/model.bin"
+
+        cache.cache_file(url, source_file, etag="etag-v1")
+
+        cached_path = cache.get_cached_path(url, etag="etag-v1")
+
+        assert cached_path is not None
+        assert cached_path.read_bytes() == b"artifact"
+
+    def test_cache_with_mismatched_etag_misses(self, tmp_path: Path) -> None:
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        source_file = tmp_path / "artifact.bin"
+        source_file.write_bytes(b"artifact")
+        url = "s3://bucket/model.bin"
+
+        cache.cache_file(url, source_file, etag="etag-v1")
+
+        assert cache.get_cached_path(url, etag="etag-v2") is None
+
+    def test_legacy_cache_without_etag_is_stale_miss_and_migrates_metadata(self, tmp_path: Path) -> None:
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        cached_file = cache_dir / "aa" / "bb" / "model.bin"
+        cached_file.parent.mkdir(parents=True)
+        cached_file.write_bytes(b"artifact")
+        signed_url = (
+            "https://user:pass@bucket.s3.amazonaws.com/path/model.bin"
+            "?X-Amz-Credential=secret&X-Amz-Signature=sig#fragment"
+        )
+
+        cache = GCSCache(cache_dir=cache_dir)
+        cache_key = cache.get_cache_key(signed_url)
+        cache.metadata_file.write_text(
+            json.dumps(
+                {
+                    cache_key: {
+                        "url": signed_url,
+                        "path": str(cached_file),
+                        "size": cached_file.stat().st_size,
+                        "cached_at": "2026-01-01T00:00:00",
+                        "last_accessed": "2026-01-01T00:00:00",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cache = GCSCache(cache_dir=cache_dir)
+
+        assert cache.get_cached_path(signed_url) is None
+        raw_metadata = cache.metadata_file.read_text(encoding="utf-8")
+        metadata = json.loads(raw_metadata)
+        entry = metadata[cache_key]
+        assert "url" not in entry
+        assert entry["url_sha256"] == cache_key
+        assert entry["url_display"] == "https://bucket.s3.amazonaws.com/path/model.bin"
+        assert "X-Amz-Credential" not in raw_metadata
+        assert "X-Amz-Signature" not in raw_metadata
+        assert "user:pass" not in raw_metadata
 
     def test_clean_old_cache_does_not_delete_outside_cache(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture

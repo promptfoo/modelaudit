@@ -467,8 +467,12 @@ class GCSCache:
                 self._save_metadata()
                 return None
 
-            # Check if etag matches (if provided)
-            if etag and cached.get("etag") != etag:
+            cached_etag = cached.get("etag")
+            if etag is None or not cached_etag:
+                self._save_metadata()
+                return None
+
+            if cached_etag != etag:
                 return None
 
             # Update last accessed time
