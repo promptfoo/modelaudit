@@ -310,6 +310,10 @@ def _write_safe_savedmodel(path: Path) -> None:
     path.write_bytes(_build_collection_only_tf_savedmodel(value=b"documentation: https://example.invalid/runtime"))
 
 
+def _write_safe_r_serialized(path: Path) -> None:
+    path.write_bytes(b"X\nsafe\nmodel\nweights")
+
+
 def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
     """Write a ZIP archive at an intentionally misleading file path."""
     with zipfile.ZipFile(path, "w") as archive:
@@ -6268,6 +6272,92 @@ def test_scan_file_fails_closed_when_format_detection_read_fails_without_owner(
     assert core_module.determine_exit_code(aggregate) == 2
 
 
+def test_scan_file_unreadable_non_read_failure_aware_suffix_is_operational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable = tmp_path / "unavailable.onnx"
+    unreadable.write_bytes(b"unreadable ONNX-like payload")
+    real_access = os.access
+
+    def deny_file_access(candidate: str | bytes | os.PathLike[str], mode: int) -> bool:
+        if str(candidate) == str(unreadable):
+            return False
+        return real_access(candidate, mode)
+
+    monkeypatch.setattr(core_module.os, "access", deny_file_access)
+    monkeypatch.setattr(core_module, "detect_file_format", lambda _path: "unknown")
+    monkeypatch.setattr(core_module, "detect_file_format_from_magic", lambda _path: "unknown")
+
+    result = scan_file(str(unreadable), config={"cache_enabled": False})
+    aggregate = core_module.scan_model_directory_or_file(str(unreadable), cache_enabled=False)
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "format_detection_read_failed"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_preserves_r_serialized_outcome_after_failed_read_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    r_path = tmp_path / "unavailable.rds"
+    r_path.write_bytes(b"X\nsafe\nmodel")
+
+    def raise_route_read_error(*_args: object, **_kwargs: object) -> str:
+        raise OSError("simulated routing read failure")
+
+    def raise_r_read_error(*_args: object, **_kwargs: object) -> tuple[bytes, str, bool, int]:
+        raise PermissionError(13, "simulated R payload read failure")
+
+    monkeypatch.setattr(core_module, "detect_file_format", raise_route_read_error)
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_route_read_error)
+    monkeypatch.setattr(
+        "modelaudit.scanners.r_serialized_scanner.RSerializedScanner._read_payload_for_analysis",
+        raise_r_read_error,
+    )
+
+    result = scan_file(str(r_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "r_serialized"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["operational_error_reason"] == "r_serialized_read_failed"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_file_unreadable_suffix_only_candidate_does_not_emit_path_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "unavailable.onnx"
+    model_path.write_bytes(b"unreadable onnx candidate")
+    real_access = os.access
+
+    def unreadable_path(candidate: str, mode: int) -> bool:
+        return False if candidate == str(model_path) and mode == os.R_OK else real_access(candidate, mode)
+
+    def raise_read_error(*_args: object, **_kwargs: object) -> str:
+        raise OSError("simulated unreadable model payload")
+
+    monkeypatch.setattr(os, "access", unreadable_path)
+    monkeypatch.setattr(core_module, "detect_file_format", raise_read_error)
+
+    direct = scan_file(str(model_path), config={"cache_scan_results": False})
+    aggregate = core_module.scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert direct.scanner_name == "unknown"
+    assert direct.success is False
+    assert direct.metadata["operational_error_reason"] == "format_detection_read_failed"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in direct.issues)
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+
+
 @pytest.mark.parametrize("filename", ["README.md", "README", "model_card"])
 def test_scan_file_preserves_metadata_outcome_after_failed_read_probes(
     tmp_path: Path,
@@ -6518,6 +6608,13 @@ def test_directory_scan_bypasses_stale_cache_when_owner_read_fails_with_access(
             "SavedModel File Read",
             "Unable to read TF SavedModel file",
         ),
+        (
+            "cached.rds",
+            _write_safe_r_serialized,
+            "r_serialized_read_failed",
+            "R Serialized Read",
+            "Unable to read R serialized payload",
+        ),
     ],
 )
 def test_single_file_scan_bypasses_stale_cache_when_read_failure_aware_owner_read_fails(
@@ -6560,6 +6657,8 @@ def test_single_file_scan_bypasses_stale_cache_when_read_failure_aware_owner_rea
             **kwargs: Any,
         ) -> Any:
             if str(candidate) == str(model_path):
+                if reason == "r_serialized_read_failed":
+                    raise PermissionError(13, f"simulated transient {reason} read")
                 raise OSError(f"simulated transient {reason} read")
             return real_open(candidate, *args, **kwargs)
 
@@ -6682,6 +6781,13 @@ def test_single_file_scan_bypasses_stale_cache_when_numpy_header_read_fails_afte
             "SavedModel File Read",
             "Unable to read TF SavedModel file",
         ),
+        (
+            "cached.rds",
+            _write_safe_r_serialized,
+            "r_serialized_read_failed",
+            "R Serialized Read",
+            "Unable to read R serialized payload",
+        ),
     ],
 )
 def test_directory_scan_bypasses_stale_cache_when_read_failure_aware_owner_read_fails_with_security_finding(
@@ -6728,6 +6834,8 @@ def test_directory_scan_bypasses_stale_cache_when_read_failure_aware_owner_read_
             **kwargs: Any,
         ) -> Any:
             if str(candidate) == str(cached_clean):
+                if reason == "r_serialized_read_failed":
+                    raise PermissionError(13, f"simulated transient {reason} read")
                 raise OSError(f"simulated transient {reason} read")
             return real_open(candidate, *args, **kwargs)
 

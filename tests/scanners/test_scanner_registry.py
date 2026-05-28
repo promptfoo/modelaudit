@@ -3,6 +3,7 @@ import gzip
 import io
 import json
 import lzma
+import os
 import pickle
 import tarfile
 import zipfile
@@ -571,6 +572,23 @@ def test_get_scanner_for_file_does_not_override_r_serialized_suffix_with_compres
     assert get_scanner_for_file(str(path)) is None
 
 
+def test_get_scanner_for_path_preserves_r_serialized_owner_after_failed_zip_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_gzip_r_serialized(tmp_path / "workspace.rds", "workspace\nmodel")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+
+    scanner_class = ScannerRegistry().get_scanner_for_path(str(path))
+
+    assert scanner_class is not None
+    assert scanner_class.name == "r_serialized"
+
+
 def test_get_scanner_for_path_routes_valid_mar_archive_to_torchserve_mar(tmp_path: Path) -> None:
     mar_path = _write_zip_archive(
         tmp_path / "model.mar",
@@ -953,3 +971,35 @@ def test_get_scanner_for_path_does_not_claim_generic_text_after_failed_zip_probe
     monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
 
     assert ScannerRegistry().get_scanner_for_path(str(path)) is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "scanner_name"),
+    [
+        ("unavailable.mlmodel", "coreml"),
+        ("unavailable.onnx", None),
+        ("unavailable.rds", "r_serialized"),
+    ],
+)
+def test_get_scanner_for_path_limits_unreadable_extension_routing_to_read_failure_aware_scanners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    scanner_name: str | None,
+) -> None:
+    path = tmp_path / filename
+    path.write_bytes(b"X\nsafe\nmodel")
+    real_access = os.access
+
+    def unreadable_path(candidate: str, mode: int) -> bool:
+        return False if candidate == str(path) and mode == os.R_OK else real_access(candidate, mode)
+
+    monkeypatch.setattr(os, "access", unreadable_path)
+
+    scanner_class = ScannerRegistry().get_scanner_for_path(str(path))
+
+    if scanner_name is None:
+        assert scanner_class is None
+    else:
+        assert scanner_class is not None
+        assert scanner_class.name == scanner_name
