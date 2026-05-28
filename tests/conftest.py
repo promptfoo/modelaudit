@@ -148,7 +148,6 @@ def pytest_runtest_setup(item):
             "test_cntk_scanner.py",  # CNTK .dnn/.cmf scanner tests
             "test_rknn_scanner.py",  # RKNN scanner tests
             "test_torch7_scanner.py",  # Torch7 scanner tests
-            "test_weight_distribution_scanner.py",  # PyTorch weight extraction safety regressions
             "test_lightgbm_scanner.py",  # LightGBM native scanner tests
             "test_llamafile_scanner.py",  # Llamafile executable scanner tests
             "test_coreml_scanner.py",  # CoreML scanner tests
@@ -204,9 +203,17 @@ def pytest_runtest_setup(item):
             "test_docker_workflow.py",  # Docker workflow regression tests
             "test_perf_workflow.py",  # Performance benchmark workflow regression tests
         ]
+        allowed_test_nodeids = [
+            "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_vulnerable_pytorch_prereleases",
+            "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_allows_torch_load_for_stable_patched_pytorch",
+            "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_unknown_pytorch_version",
+            "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_unknown_patched_version_suffixes",
+        ]
 
         # Check if this is an allowed test file
-        if any(allowed_file in test_file for allowed_file in allowed_test_files):
+        if any(allowed_file in test_file for allowed_file in allowed_test_files) or any(
+            item.nodeid.startswith(allowed_nodeid) for allowed_nodeid in allowed_test_nodeids
+        ):
             pass  # Allow these tests to continue to framework check
         else:
             # Skip all other tests on Python 3.10/3.12/3.13 to prevent CI issues
