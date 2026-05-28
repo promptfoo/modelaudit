@@ -13,6 +13,8 @@ from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanRes
 
 logger = logging.getLogger(__name__)
 
+_READ_FAILURE_AWARE_EXTENSION_SCANNERS = frozenset({"r_serialized"})
+
 
 def _check_numpy_compatibility() -> tuple[bool, str]:
     """Check NumPy version compatibility and return status with message"""
@@ -111,7 +113,7 @@ class ScannerRegistry:
                     scanner_class = getattr(module, scanner_info["class"])
 
                 self._loaded_scanners[scanner_id] = scanner_class
-                logger.debug(f"Loaded scanner: {scanner_id}")
+                logger.debug("Scanner loaded successfully")
                 return scanner_class
 
             except ImportError as e:
@@ -131,9 +133,9 @@ class ScannerRegistry:
 
                 # For expected dependency issues, use debug level
                 if scanner_deps or (is_numpy_sensitive and _is_numpy_compatibility_error(e)):
-                    logger.debug(error_msg)
+                    logger.debug("Scanner unavailable due to an optional dependency or compatibility issue")
                 else:
-                    logger.debug(error_msg)
+                    logger.debug("Scanner unavailable during lazy loading")
 
                 return None
 
@@ -148,16 +150,16 @@ class ScannerRegistry:
                             f"Scanner {scanner_id} failed due to NumPy compatibility issue. "
                             f"{self._numpy_status} Consider using 'pip install numpy<2.0' if needed."
                         )
-                        logger.debug(error_msg)  # Debug level - expected NumPy compatibility issues
+                        logger.debug("Scanner unavailable due to a NumPy compatibility issue")
                     else:
                         error_msg = f"Scanner {scanner_id} failed with NumPy compatibility error: {e}"
-                        logger.warning(error_msg)  # Warning - unexpected NumPy issue
+                        logger.warning("Scanner failed with an unexpected NumPy compatibility issue")
                 elif isinstance(e, AttributeError):
                     error_msg = f"Scanner class {scanner_info['class']} not found in {scanner_info['module']}: {e}"
-                    logger.warning(error_msg)  # Warning - code structure issue
+                    logger.warning("Scanner class could not be loaded")
                 else:
                     error_msg = f"Scanner {scanner_id} failed to load: {e}"
-                    logger.warning(error_msg)  # Warning - unexpected error
+                    logger.warning("Scanner failed to load unexpectedly")
 
                 self._failed_scanners[scanner_id] = error_msg
                 return None
@@ -255,14 +257,19 @@ class ScannerRegistry:
             candidate_extensions.append("")
 
         is_zip_file = False
+        zip_probe_failed = False
         try:
             is_zip_file = os.path.isfile(path) and zipfile.is_zipfile(path)
         except OSError:
-            return None
+            # Only scanners with explicit unreadable-input outcomes can safely
+            # retain extension ownership after a failed container probe.
+            zip_probe_failed = True
 
         for candidate_extension in candidate_extensions:
             for scanner_id, scanner_info in sorted_scanners:
                 if scanner_selection is not None and not scanner_selection.allows(scanner_id):
+                    continue
+                if zip_probe_failed and scanner_id not in _READ_FAILURE_AWARE_EXTENSION_SCANNERS:
                     continue
                 extensions = scanner_info.get("extensions", [])
                 content_routed_extensions = scanner_info.get("content_routed_extensions", [])
@@ -271,7 +278,26 @@ class ScannerRegistry:
 
                 scanner_class = self._load_scanner(scanner_id)
                 if scanner_class and scanner_class.can_handle(path):
+                    if scanner_id != "llamafile" and (
+                        scanner_selection is None or scanner_selection.allows("llamafile")
+                    ):
+                        from modelaudit.utils.file.detection import is_llamafile_executable
+
+                        if is_llamafile_executable(path):
+                            llamafile_class = self._load_scanner("llamafile")
+                            if llamafile_class:
+                                return llamafile_class
+                    if scanner_id != "torch7" and (scanner_selection is None or scanner_selection.allows("torch7")):
+                        from modelaudit.utils.file.detection import is_torch7_suffix_override_candidate
+
+                        if is_torch7_suffix_override_candidate(path):
+                            torch7_class = self._load_scanner("torch7")
+                            if torch7_class and torch7_class.can_handle(path):
+                                return torch7_class
                     return scanner_class
+
+        if zip_probe_failed:
+            return None
 
         # Some ZIP-backed artifacts intentionally use pickle/checkpoint suffixes.
         # If stricter extension-specific scanners all decline, fall back to the
@@ -282,18 +308,26 @@ class ScannerRegistry:
                 return scanner_class
 
         try:
-            from modelaudit.utils.file.detection import detect_file_format
+            from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
 
             header_format = detect_file_format(path)
+            extension_format = detect_format_from_extension(path)
         except Exception:
             header_format = "unknown"
+            extension_format = "unknown"
 
         header_scanner_id = self.get_scanner_id_for_header_format(header_format)
         header_scanner_info = self._scanners.get(header_scanner_id or "")
+        extension_scanner_id = self.get_scanner_id_for_header_format(extension_format)
+        compatible_header_route = (
+            header_format == header_scanner_id
+            or extension_format == "unknown"
+            or extension_scanner_id == header_scanner_id
+        )
         if (
             header_scanner_id
             and header_scanner_info
-            and header_format == header_scanner_id
+            and compatible_header_route
             and (scanner_selection is None or scanner_selection.allows(header_scanner_id))
         ):
             scanner_class = self._load_scanner(header_scanner_id)

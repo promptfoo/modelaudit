@@ -11,6 +11,7 @@ import msgpack
 
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner, _matching_jax_transforms
+from modelaudit.utils.file.detection import FLAX_MSGPACK_STRUCTURE_READ_BYTES
 
 
 def create_msgpack_file(path: Path, data: Any) -> None:
@@ -593,6 +594,48 @@ def test_flax_msgpack_can_handle_extensions(tmp_path):
         test_file.write_bytes(b"\x81\xa4test\xa5value")  # Simple msgpack
 
         assert FlaxMsgpackScanner.can_handle(str(test_file))
+
+
+def test_flax_msgpack_can_handle_large_renamed_checkpoint_root_after_metadata_without_promoting_generic_map(
+    tmp_path: Path,
+) -> None:
+    disguised_checkpoint = tmp_path / "checkpoint.jpg"
+    generic_map = tmp_path / "metadata.jpg"
+    large_metadata = "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+    create_msgpack_file(disguised_checkpoint, {"metadata": large_metadata, "params": {"w": [1, 2, 3]}})
+    create_msgpack_file(
+        generic_map, {"metadata": large_metadata, "state": {"selected": True}, "__reduce__": "os.system"}
+    )
+
+    assert FlaxMsgpackScanner.can_handle(str(disguised_checkpoint)) is True
+    assert FlaxMsgpackScanner.can_handle(str(generic_map)) is False
+
+
+def test_flax_msgpack_ambiguous_renamed_probe_limit_fails_closed_without_unpacking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ambiguous_map = tmp_path / "metadata.jpg"
+    large_metadata: dict[str, object] = {f"field{i}": i for i in range(2100)}
+    large_metadata["blob"] = "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+    create_msgpack_file(ambiguous_map, {"metadata": large_metadata, "state": {"selected": True}})
+
+    def fail_unpack(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("ambiguous renamed maps must not be fully unpacked")
+
+    monkeypatch.setattr(msgpack, "unpackb", fail_unpack)
+
+    result = FlaxMsgpackScanner().scan(str(ambiguous_map))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome_message"] == (
+        "Scan analysis incomplete; failed closed because full coverage was not available."
+    )
+    check = next(check for check in result.checks if check.name == "MessagePack Routing Analysis Incomplete")
+    assert check.status == CheckStatus.FAILED
+    assert check.details["scan_outcome_reason"] == "flax_msgpack_routing_incomplete"
 
 
 @pytest.mark.slow
