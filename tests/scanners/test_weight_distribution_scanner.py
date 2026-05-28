@@ -649,6 +649,42 @@ class TestWeightDistributionScanner:
         assert scanner.extraction_unsafe
         assert load_called is False
 
+    @pytest.mark.parametrize("torch_version", ["2.6.0-custom", "2.6.0-unknown", "2.10.0-custom"])
+    def test_blocks_torch_load_for_unknown_patched_version_suffixes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        torch_version: str,
+    ) -> None:
+        load_called = False
+
+        fake_torch: Any = types.ModuleType("torch")
+        fake_torch.__version__ = torch_version
+
+        class FakeTensor:  # pragma: no cover - simple test double
+            pass
+
+        fake_torch.Tensor = FakeTensor
+        fake_torch.device = lambda value: value
+
+        def fake_load(_path: str, *, map_location: object, weights_only: bool) -> dict[str, object]:
+            nonlocal load_called
+            load_called = True
+            return {}
+
+        fake_torch.load = fake_load
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+        model_path = tmp_path / f"{torch_version}.pt"
+        model_path.write_bytes(b"not-a-valid-pytorch-model")
+
+        scanner = WeightDistributionScanner()
+        weights = scanner._extract_pytorch_weights(str(model_path))
+
+        assert weights == {}
+        assert scanner.extraction_unsafe
+        assert load_called is False
+
     def test_multiple_anomalies(self):
         """Test detection of multiple types of anomalies in one layer"""
         import numpy as np

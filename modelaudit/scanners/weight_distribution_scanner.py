@@ -12,6 +12,7 @@ from .base import BaseScanner, IssueSeverity, ScanResult, logger
 _PATCHED_TORCH_WEIGHTS_ONLY_VERSION = (2, 6, 0)
 _TORCH_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?")
 _TORCH_PRERELEASE_MARKER_PATTERN = re.compile(r"(?i)^(?:a|b|c|rc|alpha|beta|pre|preview|dev)")
+_TORCH_STABLE_SUFFIX_PATTERN = re.compile(r"(?i)^post\d*(?:\+.*)?$")
 
 
 class WeightDistributionScanner(BaseScanner):
@@ -211,8 +212,11 @@ class WeightDistributionScanner(BaseScanner):
             return False
 
         release = tuple(int(part or 0) for part in match.groups())
-        suffix = version_text[match.end() :].lstrip("._-")
-        if _TORCH_PRERELEASE_MARKER_PATTERN.match(suffix):
+        suffix = version_text[match.end() :].strip()
+        normalized_suffix = suffix.lstrip("._-")
+        if _TORCH_PRERELEASE_MARKER_PATTERN.match(normalized_suffix):
+            return False
+        if suffix and not suffix.startswith("+") and _TORCH_STABLE_SUFFIX_PATTERN.fullmatch(normalized_suffix) is None:
             return False
         return release >= _PATCHED_TORCH_WEIGHTS_ONLY_VERSION
 
