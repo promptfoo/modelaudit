@@ -207,12 +207,35 @@ def test_non_numeric_hdf5_weight_metadata_is_not_a_security_finding(
         return original_array(obj, *args, **kwargs)
 
     monkeypatch.setattr(np, "array", fail_if_non_numeric_dataset_is_materialized)
+    set_config(ModelAuditConfig(severity={"S801": Severity.CRITICAL}))
 
-    result = core.scan_model_directory_or_file(str(path), scanners=["weight_distribution"], cache_enabled=False)
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = core.scan_model_directory_or_file(
+            str(path),
+            scanners=["weight_distribution"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = core.scan_model_directory_or_file(
+            str(path),
+            scanners=["weight_distribution"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
 
-    assert result.scanner_names == ["weight_distribution"]
-    assert core.determine_exit_code(result) == 0
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+        for result in (first, second):
+            assert result.scanner_names == ["weight_distribution"]
+            assert core.determine_exit_code(result) == 0
+            assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+            assert all(issue.rule_code != "S801" for issue in result.issues)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] >= 1
+    finally:
+        reset_cache_manager()
+        reset_config()
 
 
 @pytest.mark.skipif(not has_h5py(), reason="h5py required")

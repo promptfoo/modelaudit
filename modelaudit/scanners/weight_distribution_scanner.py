@@ -164,18 +164,20 @@ class WeightDistributionScanner(BaseScanner):
                     result.finish(success=False)
                     return result
 
-                message = "Failed to extract weights from model"
+                message = "No numeric model tensors available for distribution analysis"
                 severity = IssueSeverity.DEBUG
+                rule_code = None
                 if self.extraction_unsafe:
                     message = self.extraction_unsafe_reason or "Unsafe to extract weights from model"
                     severity = IssueSeverity.WARNING
+                    rule_code = "S801"
                 result.add_check(
                     name="Weight Extraction",
                     passed=False,
                     message=message,
                     severity=severity,
                     location=path,
-                    rule_code="S801",
+                    rule_code=rule_code,
                 )
                 result.finish(success=True)
                 return result
