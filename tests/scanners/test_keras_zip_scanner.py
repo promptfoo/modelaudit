@@ -188,6 +188,50 @@ class TestKerasZipScanner:
             for check in result.checks
         )
 
+    @pytest.mark.parametrize(
+        "keras_version",
+        ["3.12.1rc1", "3.12.1a0", "3.12.1.dev0", "3.13.2rc1", "3.13.2dev0"],
+    )
+    def test_embedded_hdf5_external_references_prerelease_fixes_are_vulnerable(
+        self, tmp_path: Path, keras_version: str
+    ) -> None:
+        """Prereleases of the fixed CVE-2026-1669 versions are still vulnerable."""
+        scanner = KerasZipScanner()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version=keras_version,
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["keras_version"] == keras_version
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+
+    @pytest.mark.parametrize(
+        "keras_version",
+        ["3.12.1", "3.12.1+cpu", "3.12.1+rc1", "3.13.2", "3.13.2.post1", "3.13.2+dev0"],
+    )
+    def test_embedded_hdf5_external_references_stable_fixed_versions_pass(
+        self, tmp_path: Path, keras_version: str
+    ) -> None:
+        """Stable fixed CVE-2026-1669 versions should not emit warning noise."""
+        scanner = KerasZipScanner()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version=keras_version,
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
     def test_benign_embedded_weights_do_not_emit_warning_noise(self, tmp_path: Path) -> None:
         """Benign embedded weights should not produce warning or critical noise."""
         scanner = KerasZipScanner()
