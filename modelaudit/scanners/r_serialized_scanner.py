@@ -358,36 +358,48 @@ class RSerializedScanner(BaseScanner):
         longest_string = 0
         current_parts: list[str] = []
         current_offset = 0
-        current_printable_bytes = 0
         previous_match_end: int | None = None
 
         def append_current_run() -> bool:
             nonlocal total_printable_bytes, longest_string
             if not current_parts:
                 return True
-            longest_string = max(longest_string, current_printable_bytes)
             text = "".join(current_parts).strip()
             if not text:
                 return True
+            longest_string = max(longest_string, len(text))
             if len(strings) >= self.max_extracted_strings:
                 return False
             strings.append(_ExtractedString(text=text, offset=current_offset))
             total_printable_bytes += len(text)
             return True
 
+        def append_printable_tail(start: int, end: int) -> None:
+            if not current_parts or start >= end:
+                return
+            tail_end = start
+            while tail_end < end and 0x20 <= payload[tail_end] <= 0x7E:
+                tail_end += 1
+            if tail_end == start:
+                return
+            tail = payload[start:tail_end]
+            current_parts.append(tail.decode("utf-8", errors="ignore"))
+
         for match in self._PRINTABLE_RE.finditer(payload):
             if previous_match_end != match.start():
+                if previous_match_end is not None:
+                    append_printable_tail(previous_match_end, match.start())
                 if not append_current_run():
                     truncated = True
                     break
                 current_parts = []
                 current_offset = match.start()
-                current_printable_bytes = 0
 
             current_parts.append(match.group().decode("utf-8", errors="ignore"))
-            current_printable_bytes += len(match.group())
             previous_match_end = match.end()
         else:
+            if previous_match_end is not None:
+                append_printable_tail(previous_match_end, len(payload))
             if not append_current_run():
                 truncated = True
 
