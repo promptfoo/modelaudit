@@ -12,9 +12,10 @@ use crate::expansion::{
 use crate::nested::{
     decode_possible_encoded_pickle, detect_oversized_encoded_pickle_prefixes,
     encoded_literal_may_contain_pickle, encoded_nested_literal_probe_coverage_incomplete,
-    encoded_nested_literal_probe_windows, encoded_nested_window_char_limit, has_execution_opcode,
-    has_pickle_prefix, looks_like_pickle_payload, nested_pickle_probe_offsets,
-    pickle_payload_extent, truncated_pickle_prefix_requires_fail_closed, MAX_NESTED_PAYLOAD_PROBES,
+    encoded_nested_literal_probe_windows_with_limit, encoded_nested_window_char_limit,
+    has_execution_opcode, has_pickle_prefix, looks_like_pickle_payload,
+    nested_pickle_probe_offsets, pickle_payload_extent,
+    truncated_pickle_prefix_requires_fail_closed, MAX_NESTED_PAYLOAD_PROBES,
 };
 use crate::nested_surface::{
     encoded_nested_payload_finding, is_allowlisted_nested_constructor_ref,
@@ -4056,7 +4057,11 @@ impl<'a> ScanState<'a> {
             found_candidate |= self.scan_encoded_nested_pickle_candidate(value, position);
         }
 
-        for candidate in encoded_nested_literal_probe_windows(value, max_window_chars) {
+        let probe_windows =
+            encoded_nested_literal_probe_windows_with_limit(value, max_window_chars);
+        let probe_limit_exceeded = probe_windows.limit_exceeded;
+        let probe_limit_exceeded_encoding = probe_windows.limit_exceeded_encoding;
+        for candidate in probe_windows.windows {
             if found_candidate && candidate == value {
                 continue;
             }
@@ -4072,11 +4077,15 @@ impl<'a> ScanState<'a> {
             );
         }
 
+        if let Some(encoding) = probe_limit_exceeded_encoding {
+            self.record_nested_probe_limit_exceeded(encoding, string_char_len(value), position);
+        }
+
         if found_candidate {
             return;
         }
 
-        if probe_coverage_incomplete {
+        if probe_coverage_incomplete || probe_limit_exceeded {
             return;
         }
 
@@ -5454,6 +5463,16 @@ mod tests {
     use crate::report::{detail_string, detail_usize};
     use std::time::Duration;
 
+    fn encoded_probe_limit_decoy_literal() -> String {
+        let mut value = String::new();
+        for index in 0..MAX_NESTED_PAYLOAD_PROBES {
+            value.push_str(&format!("gAR9Lg==-decoy-{index}|"));
+        }
+        value.push_str("Y29zCnN5c3RlbQopUi4");
+        value.push_str(&"A".repeat(65));
+        value
+    }
+
     #[test]
     fn integer_stack_values_preserve_text_and_long_byte_operands() {
         for (arg, expected) in [
@@ -6119,6 +6138,50 @@ mod tests {
             .notices
             .iter()
             .any(|notice| notice.code == Some("nested_payload_truncated")));
+    }
+
+    #[test]
+    fn encoded_nested_probe_limit_fails_closed_after_decoys() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let literal = encoded_probe_limit_decoy_literal();
+        let mut payload = b"\x80\x04X".to_vec();
+        payload.extend_from_slice(&(literal.len() as u32).to_le_bytes());
+        payload.extend_from_slice(literal.as_bytes());
+        payload.push(b'.');
+        let mut scan = ScanState::new(
+            "encoded-nested-probe-limit.pkl".to_string(),
+            &payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.verdict, "malicious");
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("S601")
+                && detail_string(&finding.details, "encoding").as_deref() == Some("base64")
+                && detail_usize(&finding.details, "max_nested_payload_probes")
+                    == Some(MAX_NESTED_PAYLOAD_PROBES)
+                && finding.details.iter().any(|(key, value)| {
+                    key == "analysis_incomplete" && matches!(value, DetailValue::Bool(true))
+                })
+        }));
+        assert!(scan
+            .notices
+            .iter()
+            .any(|notice| notice.code == Some("nested_probe_limit")));
     }
 
     #[test]
