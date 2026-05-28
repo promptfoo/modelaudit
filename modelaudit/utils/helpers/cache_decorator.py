@@ -16,6 +16,22 @@ from ...cache.optimized_config import get_config_extractor
 logger = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
 
+_READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS = frozenset({".cmf", ".dnn", ".lgb", ".lightgbm"})
+
+
+def should_bypass_cache_for_read_failure_aware_file(file_path: str) -> bool:
+    """Bypass stale clean cache entries when dedicated read-failure-aware files stop reading."""
+    if os.path.splitext(file_path)[1].lower() not in _READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS:
+        return False
+
+    try:
+        with open(file_path, "rb") as handle:
+            handle.read(1)
+    except OSError:
+        return True
+
+    return False
+
 
 def should_bypass_cache_for_safetensors_header_limit(file_path: str, config: dict[str, Any]) -> bool:
     """Do not key or store terminal bounded outcomes from oversized SafeTensors framing."""
@@ -76,6 +92,14 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
             try:
                 file_stat = os.stat(file_path)
                 file_ext = os.path.splitext(file_path)[1]
+
+                if not os.access(file_path, os.R_OK):
+                    logger.debug(f"Bypassing cache for unreadable file: {file_path}")
+                    return func(*args, **kwargs)
+
+                if should_bypass_cache_for_read_failure_aware_file(file_path):
+                    logger.debug(f"Bypassing cache for read-failure-aware scanner: {file_path}")
+                    return func(*args, **kwargs)
 
                 if not cache_config.should_cache_file(file_stat.st_size, file_ext):
                     logger.debug(f"File {file_path} not suitable for caching, calling function directly")
