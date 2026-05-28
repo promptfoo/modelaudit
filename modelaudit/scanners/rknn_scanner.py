@@ -290,11 +290,13 @@ class RknnScanner(BaseScanner):
         return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast)
 
     @staticmethod
-    def _is_safe_metadata_string(text: str) -> bool:
+    def _metadata_value_for_scanning(text: str) -> str:
         if "=" not in text:
-            return False
-        key = text.split("=", 1)[0].strip().lower()
-        return key in KNOWN_SAFE_KEYS
+            return text
+        key, value = text.split("=", 1)
+        if key.strip().lower() in KNOWN_SAFE_KEYS:
+            return value.strip()
+        return text
 
     @staticmethod
     def _snippet(text: str, max_chars: int = 180) -> str:
@@ -303,21 +305,22 @@ class RknnScanner(BaseScanner):
     def _check_path_references(self, path: str, extracted_strings: list[str], result: ScanResult) -> None:
         risky_references: list[dict[str, str]] = []
         for text in extracted_strings:
-            if self._is_safe_metadata_string(text):
+            scan_text = self._metadata_value_for_scanning(text)
+            if not scan_text:
                 continue
 
-            if TRAVERSAL_PATH_PATTERN.search(text):
-                risky_references.append({"reference": self._snippet(text), "type": "filesystem_path"})
+            if TRAVERSAL_PATH_PATTERN.search(scan_text):
+                risky_references.append({"reference": self._snippet(scan_text), "type": "filesystem_path"})
                 continue
-            if REAL_FS_PREFIX_PATTERN.search(text):
+            if REAL_FS_PREFIX_PATTERN.search(scan_text):
                 # Short strings matching ~/ are likely binary noise, not real
                 # home-directory references — require a minimum length.
-                if text.startswith("~/") and len(text) < 8:
+                if scan_text.startswith("~/") and len(scan_text) < 8:
                     continue
-                risky_references.append({"reference": self._snippet(text), "type": "filesystem_path"})
+                risky_references.append({"reference": self._snippet(scan_text), "type": "filesystem_path"})
                 continue
-            if URL_PATTERN.search(text):
-                risky_references.append({"reference": self._snippet(text), "type": "url_reference"})
+            if URL_PATTERN.search(scan_text):
+                risky_references.append({"reference": self._snippet(scan_text), "type": "url_reference"})
 
         if risky_references:
             result.add_check(
@@ -346,16 +349,17 @@ class RknnScanner(BaseScanner):
         command_network_hits: list[str] = []
 
         for text in extracted_strings:
-            if self._is_safe_metadata_string(text):
+            scan_text = self._metadata_value_for_scanning(text)
+            if not scan_text:
                 continue
 
-            command_match = COMMAND_PATTERN.search(text)
+            command_match = COMMAND_PATTERN.search(scan_text)
             if not command_match:
                 continue
 
-            snippet = self._snippet(text)
-            has_network_context = bool(NETWORK_CONTEXT_PATTERN.search(text) or URL_PATTERN.search(text))
-            has_public_ip = any(self._is_public_ip(candidate) for candidate in IP_PATTERN.findall(text))
+            snippet = self._snippet(scan_text)
+            has_network_context = bool(NETWORK_CONTEXT_PATTERN.search(scan_text) or URL_PATTERN.search(scan_text))
+            has_public_ip = any(self._is_public_ip(candidate) for candidate in IP_PATTERN.findall(scan_text))
 
             if has_network_context or has_public_ip:
                 command_network_hits.append(snippet)
@@ -392,13 +396,14 @@ class RknnScanner(BaseScanner):
         obfuscated_hits: list[str] = []
 
         for text in extracted_strings:
-            if not BASE64_BLOB_PATTERN.search(text):
+            scan_text = self._metadata_value_for_scanning(text)
+            if not BASE64_BLOB_PATTERN.search(scan_text):
                 continue
-            if not DECODE_CONTEXT_PATTERN.search(text):
+            if not DECODE_CONTEXT_PATTERN.search(scan_text):
                 continue
-            if not (EXEC_CONTEXT_PATTERN.search(text) or COMMAND_PATTERN.search(text)):
+            if not (EXEC_CONTEXT_PATTERN.search(scan_text) or COMMAND_PATTERN.search(scan_text)):
                 continue
-            obfuscated_hits.append(self._snippet(text))
+            obfuscated_hits.append(self._snippet(scan_text))
 
         if obfuscated_hits:
             result.add_check(
