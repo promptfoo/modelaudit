@@ -6,8 +6,9 @@ import os
 import re
 from typing import ClassVar
 
+from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 # Discovery assumptions captured from upstream CNTK sources:
 # 1) Legacy CNTK models begin with UTF-16LE "BCN" marker bytes and contain
@@ -265,25 +266,6 @@ class CntkScanner(BaseScanner):
     description = "Scans signature-validated CNTK model artifacts for load-time execution indicators"
     supported_extensions: ClassVar[list[str]] = [".dnn", ".cmf"]
 
-    @staticmethod
-    def _finish_read_failure(result: ScanResult, path: str, exc: OSError) -> ScanResult:
-        mark_inconclusive_scan_result(result, "cntk_read_failed")
-        result.add_check(
-            name="CNTK File Read",
-            passed=False,
-            message=f"Error reading CNTK file: {exc}",
-            severity=IssueSeverity.INFO,
-            location=path,
-            details={
-                "exception": str(exc),
-                "exception_type": type(exc).__name__,
-                "analysis_incomplete": True,
-                "scan_outcome_reason": "cntk_read_failed",
-            },
-        )
-        result.finish(success=False)
-        return result
-
     @classmethod
     def can_handle(cls, path: str) -> bool:
         if not os.path.isfile(path):
@@ -296,13 +278,43 @@ class CntkScanner(BaseScanner):
         try:
             prefix = _read_prefix(path)
         except OSError:
-            return False
+            return extension in _CNTK_SUPPORTED_EXTENSIONS
         variant, _reason = _detect_cntk_variant(prefix, extension)
         return variant in {"legacy_v1", "cntk_v2"}
+
+    @staticmethod
+    def _is_unreadable_path_result(result: ScanResult) -> bool:
+        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    @staticmethod
+    def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
+        mark_inconclusive_scan_result(result, "cntk_read_failed")
+        mark_operational_scan_error(result, "cntk_read_failed")
+        result.add_check(
+            name="CNTK File Read",
+            passed=False,
+            message=f"Error reading CNTK file: {error}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "cntk_read_failed",
+            },
+        )
+        result.finish(success=False)
+        return result
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
+            if self._is_unreadable_path_result(path_check_result):
+                return self._finish_read_failure(
+                    self._create_result(),
+                    path,
+                    PermissionError(f"Path is not readable: {path}"),
+                )
             return path_check_result
 
         size_check = self._check_size_limit(path)

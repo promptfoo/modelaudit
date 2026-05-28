@@ -6,6 +6,7 @@ import base64
 import gzip
 import importlib
 import json
+import os
 import pickle
 import struct
 import sys
@@ -36,6 +37,7 @@ from modelaudit.utils.file.detection import (
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
 )
+from modelaudit.utils.helpers import cache_decorator
 from modelaudit.utils.helpers.secure_hasher import SecureFileHasher, compute_aggregate_hash
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers import (
@@ -6198,6 +6200,34 @@ def test_scan_file_does_not_fail_closed_for_extension_only_recognized_format(
     assert not any(check.name == "Format Detection" for check in result.checks)
 
 
+def test_scan_file_fails_closed_when_format_detection_read_fails_without_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable = tmp_path / "unowned.payload"
+    unreadable.write_bytes(b"payload whose owning format cannot be read")
+
+    def raise_read_error(_path: str) -> str:
+        raise OSError("simulated format detection read failure")
+
+    monkeypatch.setattr(core_module, "detect_file_format", raise_read_error)
+
+    result = scan_file(str(unreadable))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["operational_error_reason"] == "format_detection_read_failed"
+    assert "format_detection_read_failed" in result.metadata["scan_outcome_reasons"]
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.severity == IssueSeverity.INFO
+    assert check.details["analysis_incomplete"] is True
+
+    aggregate = core_module.scan_model_directory_or_file(str(unreadable))
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
 def test_scan_file_unavailable_recognized_format_result_is_not_cached(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6227,6 +6257,163 @@ def test_scan_file_unavailable_recognized_format_result_is_not_cached(
         assert first.metadata["scan_outcome"] == "inconclusive"
         assert second.metadata["scan_outcome"] == "inconclusive"
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_single_file_scan_bypasses_stale_cache_when_owner_becomes_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "cached.lightgbm"
+    model_path.write_text(
+        "\n".join(
+            [
+                "tree",
+                "version=v4",
+                "num_class=1",
+                "num_tree_per_iteration=1",
+                "max_feature_idx=2",
+                "feature_names=f0 f1 f2",
+                "feature_infos=[0:1] [0:1] [0:1]",
+                "tree_sizes=12",
+                "Tree=0",
+                "num_leaves=2",
+                "split_feature=0",
+                "split_gain=1.0",
+                "threshold=0.5",
+                "decision_type=<=",
+                "left_child=-1",
+                "right_child=-2",
+                "leaf_value=0.1 0.2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        with monkeypatch.context() as cache_setup:
+            cache_setup.setattr(
+                cache_decorator,
+                "should_bypass_cache_for_read_failure_aware_file",
+                lambda _path: False,
+            )
+            first = core_module.scan_model_directory_or_file(
+                str(model_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+        assert core_module.determine_exit_code(first) == 0
+        cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        assert cached_entries > 0
+
+        real_access = os.access
+
+        def deny_model_access(candidate: str | bytes | os.PathLike[str], mode: int) -> bool:
+            if str(candidate) == str(model_path):
+                return False
+            return real_access(candidate, mode)
+
+        monkeypatch.setattr("modelaudit.utils.helpers.cache_decorator.os.access", deny_model_access)
+
+        second = core_module.scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        metadata = second.file_metadata[str(model_path)]
+        assert metadata["operational_error_reason"] == "lightgbm_read_failed"
+        assert "lightgbm_read_failed" in metadata["scan_outcome_reasons"]
+        assert core_module.determine_exit_code(second) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
+    finally:
+        reset_cache_manager()
+
+
+def test_directory_scan_bypasses_stale_cache_when_owner_read_fails_with_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    cached_clean = model_dir / "cached.lightgbm"
+    cached_clean.write_text(
+        "\n".join(
+            [
+                "tree",
+                "version=v4",
+                "num_class=1",
+                "num_tree_per_iteration=1",
+                "max_feature_idx=2",
+                "feature_names=f0 f1 f2",
+                "feature_infos=[0:1] [0:1] [0:1]",
+                "tree_sizes=12",
+                "Tree=0",
+                "num_leaves=2",
+                "split_feature=0",
+                "split_gain=1.0",
+                "threshold=0.5",
+                "decision_type=<=",
+                "left_child=-1",
+                "right_child=-2",
+                "leaf_value=0.1 0.2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    malicious = model_dir / "malicious.lightgbm"
+    _write_malicious_lightgbm(malicious)
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        with monkeypatch.context() as cache_setup:
+            cache_setup.setattr(
+                cache_decorator,
+                "should_bypass_cache_for_read_failure_aware_file",
+                lambda _path: False,
+            )
+            warm = core_module.scan_model_directory_or_file(
+                str(cached_clean),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+        assert core_module.determine_exit_code(warm) == 0
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+
+        real_open = open
+
+        def fail_cached_lightgbm_read(
+            candidate: str | bytes | os.PathLike[str],
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            if str(candidate) == str(cached_clean):
+                raise OSError("simulated transient LightGBM read failure")
+            return real_open(candidate, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fail_cached_lightgbm_read)
+
+        result = core_module.scan_model_directory_or_file(
+            str(model_dir),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        metadata = result.file_metadata[str(cached_clean)]
+        assert metadata["operational_error_reason"] == "lightgbm_read_failed"
+        assert "lightgbm_read_failed" in metadata["scan_outcome_reasons"]
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert core_module.determine_exit_code(result) == 2
     finally:
         reset_cache_manager()
 
