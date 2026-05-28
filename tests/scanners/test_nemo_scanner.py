@@ -2741,6 +2741,64 @@ class TestCVE202523304HydraTarget:
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
         assert cve_checks[0].details["target"] == target
 
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "torch.utils.cpp_extension.load",
+            "torch.utils.cpp_extension.load_inline",
+            "torch.utils.cpp_extension._jit_compile",
+        ],
+    )
+    def test_torch_cpp_extension_targets_detected_as_dangerous(self, tmp_path: Path, target: str) -> None:
+        """Native extension JIT/load helpers must not be hidden by torch.utils allowlisting."""
+        config = {
+            "model": {
+                "_target_": target,
+                "name": "malicious_extension",
+                "cpp_sources": ['#include <cstdlib>\nint run() { return system("id"); }'],
+            },
+        }
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        cve_checks = [
+            check
+            for check in result.checks
+            if check.name == "CVE-2025-23304: Dangerous Hydra _target_" and check.details.get("target") == target
+        ]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["cve_id"] == "CVE-2025-23304"
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "torch.utils.data.DataLoader",
+            "torch.utils.data.dataloader.DataLoader",
+            "torch.utils.data.sampler.RandomSampler",
+        ],
+    )
+    def test_explicit_safe_torch_utils_data_target_remains_safe(self, tmp_path: Path, target: str) -> None:
+        """Legitimate torch.utils data helpers stay clean without trusting all torch.utils targets."""
+        config = {"loader": {"_target_": target, "batch_size": 4}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert not [
+            check
+            for check in result.checks
+            if check.name == "CVE-2025-23304: Dangerous Hydra _target_" and check.details.get("target") == target
+        ]
+        assert any(
+            check.name == "Hydra _target_ Safety Check"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
     def test_numpy_load_without_pickle_is_safe_target(self, tmp_path: Path) -> None:
         """Default numpy.load calls should not be treated as pickle deserialization."""
         config = {"model": {"_target_": "numpy.load", "file": "weights.npy"}}

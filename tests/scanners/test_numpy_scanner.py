@@ -6,8 +6,10 @@ from typing import Any
 import numpy as np
 import pytest
 
+from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, IssueSeverity, ScanResult
+from modelaudit.rules import Severity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.numpy_scanner import NumPyScanner
 
 
@@ -63,6 +65,121 @@ def test_numpy_format_module_unavailable_is_operational_not_critical(
     assert check.details["analysis_incomplete"] is True
     assert check.details["operational_error"] is True
     assert all(issue.severity != IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_numpy_read_failure_is_operational_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.npy"
+    np.save(path, np.arange(3))
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated NumPy read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.numpy_scanner.open", raise_os_error, raising=False)
+
+    direct = NumPyScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    read_checks = [check for check in direct.checks if check.name == "NumPy File Read"]
+    assert direct.success is False
+    assert aggregate.success is False
+    assert len(read_checks) == 1
+    assert read_checks[0].status == CheckStatus.FAILED
+    assert "Unable to read NumPy file" in read_checks[0].message
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["operational_error"] is True
+    assert read_checks[0].details["operational_error_reason"] == "numpy_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error"] is True
+    assert direct.metadata["operational_error_reason"] == "numpy_read_failed"
+    assert "numpy_read_failed" in direct.metadata["scan_outcome_reasons"]
+    assert aggregate.file_metadata[str(path)]["operational_error_reason"] == "numpy_read_failed"
+    assert any(
+        check.name == "NumPy File Read" and "Unable to read NumPy file" in check.message for check in aggregate.checks
+    )
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_numpy_unreadable_path_preflight_is_operational_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "permission-denied.npy"
+    np.save(path, np.arange(3))
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
+
+    direct = NumPyScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert direct.metadata["scan_outcome_reasons"] == ["numpy_read_failed"]
+    assert direct.metadata["operational_error_reason"] == "numpy_read_failed"
+    assert aggregate.file_metadata[str(path)]["operational_error_reason"] == "numpy_read_failed"
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_numpy_header_read_oserror_is_operational_not_header_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "header-read-failure.npy"
+    np.save(path, np.arange(3))
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated NumPy header read failure")
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner.fmt.read_array_header_1_0",
+        raise_os_error,
+    )
+
+    result = NumPyScanner().scan(str(path))
+
+    read_checks = [check for check in result.checks if check.name == "NumPy File Read"]
+    assert len(read_checks) == 1
+    assert not [check for check in result.checks if check.name == "NumPy Header Read"]
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].rule_code is None
+    assert read_checks[0].details["exception_type"] == "OSError"
+    assert read_checks[0].details["operational_error_reason"] == "numpy_read_failed"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "numpy_read_failed"
+
+
+def test_numpy_read_failure_ignores_s902_severity_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable-with-severity-override.npy"
+    np.save(path, np.arange(3))
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated NumPy read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.numpy_scanner.open", raise_os_error, raising=False)
+    config = ModelAuditConfig()
+    config.severity = {"S902": Severity.CRITICAL}
+    set_config(config)
+
+    try:
+        result = NumPyScanner().scan(str(path))
+    finally:
+        reset_config()
+
+    read_checks = [check for check in result.checks if check.name == "NumPy File Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].rule_code is None
+    assert all(issue.severity == IssueSeverity.INFO for issue in result.issues)
+    assert all(issue.rule_code != "S902" for issue in result.issues)
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
 
 
 class TestCVE20196446ObjectDtype:

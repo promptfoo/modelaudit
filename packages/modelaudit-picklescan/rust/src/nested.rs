@@ -12,6 +12,12 @@ pub(crate) struct NestedProbeOffsets {
     pub(crate) limit_exceeded: bool,
 }
 
+pub(crate) struct EncodedNestedProbeWindows {
+    pub(crate) windows: Vec<String>,
+    pub(crate) limit_exceeded: bool,
+    pub(crate) limit_exceeded_encoding: Option<&'static str>,
+}
+
 pub(crate) fn decode_possible_encoded_pickle(
     value: &str,
     max_nested_pickle_bytes: usize,
@@ -551,17 +557,31 @@ fn nested_pickle_probe_offsets_with_limit(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn encoded_nested_literal_probe_windows(
     value: &str,
     max_window_chars: usize,
 ) -> Vec<String> {
+    encoded_nested_literal_probe_windows_with_limit(value, max_window_chars).windows
+}
+
+pub(crate) fn encoded_nested_literal_probe_windows_with_limit(
+    value: &str,
+    max_window_chars: usize,
+) -> EncodedNestedProbeWindows {
     let mut windows = Vec::new();
+    let mut limit_exceeded = false;
+    let mut limit_exceeded_encoding = None;
     let prefix_has_base64_pickle = base64_prefix_has_pickle_prefix(value);
     let prefix_has_hex_pickle = !prefix_has_base64_pickle && hex_prefix_has_pickle_prefix(value);
     if prefix_has_base64_pickle || prefix_has_hex_pickle {
         push_unique_window(&mut windows, take_chars(value, max_window_chars));
         if encoded_prefix_consumes_literal(value, prefix_has_base64_pickle, prefix_has_hex_pickle) {
-            return windows;
+            return EncodedNestedProbeWindows {
+                windows,
+                limit_exceeded,
+                limit_exceeded_encoding,
+            };
         }
     }
     let suffix_probe = take_last_chars(value, ENCODED_LITERAL_PROBE_CHARS);
@@ -572,15 +592,16 @@ pub(crate) fn encoded_nested_literal_probe_windows(
     let bytes = value.as_bytes();
     let mid_scan_len = bytes.len().min(MAX_ENCODED_LITERAL_MID_SCAN_BYTES);
     for index in 0..mid_scan_len {
-        if windows.len() >= MAX_NESTED_PAYLOAD_PROBES {
-            break;
-        }
-        let candidate_starts_encoded_pickle = starts_encoded_pickle_at(bytes, index);
-        if !candidate_starts_encoded_pickle {
+        let Some(candidate_encoding) = encoded_pickle_kind_at(bytes, index) else {
             continue;
-        }
+        };
         if !value.is_char_boundary(index) {
             continue;
+        }
+        if windows.len() >= MAX_NESTED_PAYLOAD_PROBES {
+            limit_exceeded = true;
+            limit_exceeded_encoding = Some(candidate_encoding);
+            break;
         }
         push_unique_window(
             &mut windows,
@@ -588,7 +609,11 @@ pub(crate) fn encoded_nested_literal_probe_windows(
         );
     }
 
-    windows
+    EncodedNestedProbeWindows {
+        windows,
+        limit_exceeded,
+        limit_exceeded_encoding,
+    }
 }
 
 pub(crate) fn encoded_nested_literal_probe_coverage_incomplete(value: &str) -> bool {
@@ -626,22 +651,29 @@ pub(crate) fn encoded_literal_may_contain_pickle(value: &str) -> bool {
 }
 
 fn starts_encoded_pickle_at(bytes: &[u8], index: usize) -> bool {
+    encoded_pickle_kind_at(bytes, index).is_some()
+}
+
+fn encoded_pickle_kind_at(bytes: &[u8], index: usize) -> Option<&'static str> {
     let suffix = &bytes[index..];
     let starts_base64_pickle =
         encoded_base64_first_byte(suffix).is_some_and(is_pickle_prefix_start_byte);
     let starts_hex_pickle = encoded_hex_first_byte(suffix).is_some_and(is_pickle_prefix_start_byte);
     if !starts_base64_pickle && !starts_hex_pickle {
-        return false;
+        return None;
     }
 
     let probe_len = suffix.len().min(ENCODED_LITERAL_PROBE_CHARS * 4);
     let Ok(probe) = std::str::from_utf8(&suffix[..probe_len]) else {
-        return false;
+        return None;
     };
     if starts_base64_pickle && base64_prefix_has_pickle_prefix(probe) {
-        return true;
+        return Some("base64");
     }
-    starts_hex_pickle && hex_prefix_has_pickle_prefix(probe)
+    if starts_hex_pickle && hex_prefix_has_pickle_prefix(probe) {
+        return Some("hex");
+    }
+    None
 }
 
 fn encoded_prefix_has_pickle_prefix(value: &str) -> bool {
@@ -1068,6 +1100,27 @@ mod tests {
 
         assert!(encoded_literal_may_contain_pickle(&value));
         assert!(windows.iter().any(|window| window.starts_with("gAR9Lg==")));
+    }
+
+    #[test]
+    fn encoded_probe_windows_report_limit_after_decoys_exhaust_cap() {
+        let mut value = String::new();
+        for index in 0..MAX_NESTED_PAYLOAD_PROBES {
+            value.push_str(&format!("gAR9Lg==-decoy-{index}|"));
+        }
+        let hidden_payload = "Y29zCnN5c3RlbQopUi4";
+        value.push_str(hidden_payload);
+        value.push_str(&"A".repeat(ENCODED_LITERAL_PROBE_CHARS + 1));
+
+        let probed = encoded_nested_literal_probe_windows_with_limit(&value, 64);
+
+        assert!(probed.limit_exceeded);
+        assert_eq!(probed.limit_exceeded_encoding, Some("base64"));
+        assert_eq!(probed.windows.len(), MAX_NESTED_PAYLOAD_PROBES);
+        assert!(!probed
+            .windows
+            .iter()
+            .any(|window| window.starts_with(hidden_payload)));
     }
 
     #[test]
