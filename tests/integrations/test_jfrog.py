@@ -36,6 +36,7 @@ class TestJFrogURLDetection:
             "https://example.com/model",
             "https://evil.example/artifactory/repo/model.bin",
             "https://my-jfrog.com/artifactory/libs-release/model.pt",
+            "http://attacker.jfrog.io/artifactory/repo/model.bin",
             "hf://model",
             "",
         ]
@@ -61,11 +62,12 @@ class TestJFrogDownload:
         assert "fragment" not in redacted
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
-    def test_download_success(self, mock_get, tmp_path):
+    def test_download_success(self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # Mock successful response
         mock_response = mock_get.return_value
         mock_response.raise_for_status.return_value = None
         mock_response.iter_content.return_value = [b"data"]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
 
         result = download_artifact(
             "https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=tmp_path, api_token="test-token"
@@ -94,11 +96,12 @@ class TestJFrogDownload:
         mock_rmtree.assert_called()
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
-    def test_authentication_methods(self, mock_get, tmp_path):
+    def test_authentication_methods(self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test different authentication methods."""
         mock_response = mock_get.return_value
         mock_response.raise_for_status.return_value = None
         mock_response.iter_content.return_value = [b"data"]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
 
         # Test API token
         download_artifact(
@@ -115,11 +118,12 @@ class TestJFrogDownload:
         assert call_args[1]["headers"]["Authorization"] == "Bearer test-access-token"
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
-    def test_environment_variables(self, mock_get, tmp_path, monkeypatch):
+    def test_environment_variables(self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test authentication via environment variables."""
         mock_response = mock_get.return_value
         mock_response.raise_for_status.return_value = None
         mock_response.iter_content.return_value = [b"data"]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
 
         # Test JFROG_API_TOKEN
         monkeypatch.setenv("JFROG_API_TOKEN", "env-api-token")
@@ -133,6 +137,61 @@ class TestJFrogDownload:
         download_artifact("https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=tmp_path)
         call_args = mock_get.call_args
         assert call_args[1]["headers"]["Authorization"] == "Bearer env-access-token"
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_unconfigured_jfrog_host_receives_no_credentials(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Credentials should not be sent to arbitrary JFrog SaaS tenants."""
+        mock_response = mock_get.return_value
+        mock_response.raise_for_status.return_value = None
+        mock_response.iter_content.return_value = [b"data"]
+        monkeypatch.setenv("JFROG_API_TOKEN", "env-api-token")
+        monkeypatch.setenv("JFROG_ACCESS_TOKEN", "env-access-token")
+
+        with caplog.at_level(logging.WARNING, logger="modelaudit.utils.sources.jfrog"):
+            download_artifact(
+                "https://attacker.jfrog.io/artifactory/repo/model.bin",
+                cache_dir=tmp_path,
+                api_token="explicit-api-token",
+                access_token="explicit-access-token",
+            )
+
+        call_args = mock_get.call_args
+        assert call_args[1]["headers"] == {}
+        assert "Skipping JFrog credentials" in caplog.text
+        assert "explicit-api-token" not in caplog.text
+        assert "env-api-token" not in caplog.text
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_http_jfrog_saas_url_is_rejected_before_credentials(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-local HTTP JFrog URLs must not receive credentials."""
+        monkeypatch.setenv("JFROG_API_TOKEN", "env-api-token")
+
+        with pytest.raises(ValueError, match="Not a JFrog URL"):
+            download_artifact("http://attacker.jfrog.io/artifactory/repo/model.bin", cache_dir=tmp_path)
+
+        mock_get.assert_not_called()
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_storage_api_skips_credentials_for_unconfigured_host(
+        self, mock_get: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Storage API probing should share the same credential forwarding policy."""
+        mock_response = mock_get.return_value
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {"repo": "public-repo", "path": "/model.bin", "size": 12}
+        monkeypatch.setenv("JFROG_API_TOKEN", "env-api-token")
+
+        result = detect_jfrog_target_type(
+            "https://attacker.jfrog.io/artifactory/repo/model.bin",
+            api_token="explicit-api-token",
+        )
+
+        assert result["type"] == "file"
+        assert mock_get.call_args[1]["headers"] == {}
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_no_authentication(self, mock_get, tmp_path, caplog):
