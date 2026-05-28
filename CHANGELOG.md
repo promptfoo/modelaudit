@@ -65,6 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - route renamed structurally valid MXNet symbol graphs through existing suspicious-reference analysis
 - harden renamed MXNet symbol routing with fail-closed bounded ambiguity and XGBoost overlap handling
 - restore content routing for extensionless XGBoost UBJSON models and classify unavailable or undecodable XGBoost reads as inconclusive
+- detect NeMo Hydra targets that invoke PyTorch C++ extension loaders
 - route renamed TAR-backed NeMo archives with relative archive-root model configs through Hydra `_target_` analysis while retaining generic embedded-member checks
 - honor descriptor-owned header aliases during helper scanner selection for renamed HDF5, GGML, and compressed payloads
 - detect signature-valid Torch7 payloads even when renamed with misleading suffixes
