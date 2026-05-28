@@ -16,7 +16,7 @@ from safetensors.numpy import save_file
 
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
+from modelaudit.scanners.safetensors_scanner import SAFETENSORS_READ_INCONCLUSIVE_REASON, SafeTensorsScanner
 
 
 def create_safetensors_file(path: Path) -> None:
@@ -301,6 +301,76 @@ def test_invalid_utf8_header_is_inconclusive_not_scanner_crash(tmp_path: Path) -
     assert "safetensors_header_validation_failed" in direct.metadata["scan_outcome_reasons"]
     assert any(check.name == "SafeTensors JSON Parse" and check.status == CheckStatus.FAILED for check in direct.checks)
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
+
+
+def test_unavailable_read_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = tmp_path / "unreadable.safetensors"
+    write_raw_safetensors(file_path, {"t": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}, b"\x00")
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated SafeTensors read failure")
+
+    def raise_detection_error(_path: str) -> str:
+        raise OSError("simulated SafeTensors detection read failure")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.core.detect_file_format", raise_detection_error)
+    monkeypatch.setattr("modelaudit.core.detect_file_format_from_magic", lambda _path: "unknown")
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+    monkeypatch.setattr("modelaudit.scanners.safetensors_scanner.open", raise_os_error, raising=False)
+
+    direct = SafeTensorsScanner().scan(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path), cache_scan_results=False)
+
+    read_checks = [check for check in direct.checks if check.name == "SafeTensors File Read"]
+    assert direct.success is False
+    assert aggregate.success is False
+    assert len(read_checks) == 1
+    assert read_checks[0].status == CheckStatus.FAILED
+    assert "Unable to read SafeTensors file" in read_checks[0].message
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == SAFETENSORS_READ_INCONCLUSIVE_REASON
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert SAFETENSORS_READ_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert direct.metadata["operational_error_reason"] == SAFETENSORS_READ_INCONCLUSIVE_REASON
+    metadata = aggregate.file_metadata[str(file_path)]
+    assert SAFETENSORS_READ_INCONCLUSIVE_REASON in metadata["scan_outcome_reasons"]
+    assert metadata["operational_error_reason"] == SAFETENSORS_READ_INCONCLUSIVE_REASON
+    assert any(
+        check.name == "SafeTensors File Read" and "Unable to read SafeTensors file" in check.message
+        for check in aggregate.checks
+    )
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_unreadable_path_preflight_is_operational_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = tmp_path / "permission-denied.safetensors"
+    write_raw_safetensors(file_path, {"t": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}, b"\x00")
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
+
+    direct = SafeTensorsScanner().scan(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path), cache_scan_results=False)
+
+    assert direct.metadata["scan_outcome_reasons"] == [SAFETENSORS_READ_INCONCLUSIVE_REASON]
+    assert direct.metadata["operational_error_reason"] == SAFETENSORS_READ_INCONCLUSIVE_REASON
+    assert aggregate.file_metadata[str(file_path)]["operational_error_reason"] == SAFETENSORS_READ_INCONCLUSIVE_REASON
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_bad_offsets(tmp_path: Path) -> None:

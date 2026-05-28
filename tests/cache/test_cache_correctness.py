@@ -39,7 +39,7 @@ def reset_cache_state() -> Iterator[None]:
     extractor._last_cleanup = time.monotonic()
 
 
-def _make_cacheable_file(tmp_path: Path, name: str = "model.bin") -> Path:
+def _make_cacheable_file(tmp_path: Path, name: str = "model.cache") -> Path:
     file_path = tmp_path / name
     file_path.write_bytes(b"x" * 2048)
     return file_path
@@ -262,6 +262,28 @@ def test_cached_scan_normalizes_and_skips_persisting_bare_unsuccessful_scan_resu
     assert first.metadata["scan_outcome_reasons"] == ["scanner_reported_unsuccessful_without_outcome"]
     assert second.metadata["scan_outcome_reasons"] == ["scanner_reported_unsuccessful_without_outcome"]
     assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_cached_scan_does_not_serialize_known_uncacheable_scan_result(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+
+    class UnserializableFailedResult(ScanResult):
+        def to_dict(self) -> dict[str, Any]:
+            raise AssertionError("known uncacheable results should not be serialized")
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        result = UnserializableFailedResult(scanner_name="pickle")
+        result.finish(success=False)
+        return result
+
+    result = scan(str(file_path), config)
+
+    assert isinstance(result, ScanResult)
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
 
@@ -601,7 +623,7 @@ def test_cache_key_is_none_when_scanner_versions_unavailable(tmp_path: Path, mon
 def test_cache_key_generation_avoids_full_hash_for_medium_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    file_path = _make_cacheable_file(tmp_path, name="medium.bin")
+    file_path = _make_cacheable_file(tmp_path, name="medium.cache")
     file_path.write_bytes(b"x" * (2 * 1024 * 1024))
     cache = ScanResultsCache(str(tmp_path / "scan-cache"))
 
@@ -616,7 +638,7 @@ def test_cache_key_generation_avoids_full_hash_for_medium_files(
 
 
 def test_large_file_store_reuses_cache_key_content_hash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    file_path = _make_cacheable_file(tmp_path, name="large.bin")
+    file_path = _make_cacheable_file(tmp_path, name="large.cache")
     file_path.write_bytes(b"x" * (11 * 1024 * 1024))
     cache = ScanResultsCache(str(tmp_path / "scan-cache"))
     version_context = build_cache_version_context({"timeout": 30})
@@ -641,7 +663,7 @@ def test_large_file_store_reuses_cache_key_content_hash(tmp_path: Path, monkeypa
 
 
 def test_same_size_rewrite_with_high_resolution_mtime_invalidates_cache(tmp_path: Path) -> None:
-    file_path = _make_cacheable_file(tmp_path, name="medium.bin")
+    file_path = _make_cacheable_file(tmp_path, name="medium.cache")
     cache = ScanResultsCache(str(tmp_path / "scan-cache"))
     version_context = build_cache_version_context({"timeout": 30})
     expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
@@ -661,7 +683,7 @@ def test_same_size_rewrite_with_high_resolution_mtime_invalidates_cache(tmp_path
 
 
 def test_same_size_rewrite_with_restored_mtime_invalidates_cache(tmp_path: Path) -> None:
-    file_path = _make_cacheable_file(tmp_path, name="small.bin")
+    file_path = _make_cacheable_file(tmp_path, name="small.cache")
     cache = ScanResultsCache(str(tmp_path / "scan-cache"))
     version_context = build_cache_version_context({"timeout": 30})
     expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
