@@ -138,6 +138,7 @@ def pytest_runtest_setup(item):
             "test_weight_distribution_scanner.py",  # Weight-distribution false-positive and coverage tests
             "test_rule_mapper.py",  # Rule mapper validity and network mapping tests
             "test_rule_code_registry_consistency.py",  # Scanner literal rule-code registry consistency
+            "test_secrets_detector.py",  # Embedded secret detector redaction tests
             "test_keras_h5_scanner.py",  # Keras H5 scanner CVE-2025-9905 tests
             "test_cve_detection.py",  # CVE detection tests
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
