@@ -2,6 +2,7 @@ import bz2
 import gzip
 import importlib
 import io
+import json
 import lzma
 import os
 import stat
@@ -24,6 +25,7 @@ from modelaudit.scanners.archive_dispatch import (
     scan_nested_file,
 )
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 from modelaudit.scanners.zip_scanner import ZipScanner
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import ONNX_ROUTING_INCONCLUSIVE_FORMAT
@@ -1956,6 +1958,113 @@ def test_scan_nested_file_fails_closed_when_mxnet_structure_is_beyond_bounded_pr
     assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
     check = next(check for check in result.checks if check.name == "MXNet Symbol Routing")
     assert "bounded JSON probe reached its limit" in check.message
+
+
+def test_scan_nested_file_inconclusive_mxnet_route_composes_jax_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "ambiguous-jax.dat"
+    extracted_member.write_text(
+        '{"framework":"jax","nodes":[{"attrs":"'
+        + ("x" * 129)
+        + '","op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        '"payload":"jax.experimental.host_callback.call(os.system, \'id\')"}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_nested_file_inconclusive_mxnet_route_composes_escaped_suffix_owned_jax_payload_without_root_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "ambiguous-jax.checkpoint"
+    extracted_member.write_text(
+        json.dumps(
+            {
+                "nodes": [{"attrs": "x" * 129, "op": "Custom", "name": "load"}],
+                "arg_nodes": [0],
+                "heads": [[0, 0, 0]],
+                "payload": "jax.experimental.io_callback",
+            }
+        ).replace("jax.experimental.io_callback", r"j\u0061x.experimental.io_callback"),
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_nested_file_inconclusive_mxnet_route_does_not_compose_ambiguous_large_foreign_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "ambiguous-large-foreign.dat"
+    extracted_member.write_text(
+        json.dumps(
+            {
+                "nodes": [{"attrs": "x" * 129, "op": "Custom", "name": "load"}],
+                "arg_nodes": [0],
+                "heads": [[0, 0, 0]],
+                "padding": "x" * (file_detection.JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome_reasons"] == ["mxnet_symbol_routing_incomplete"]
+    assert not any(check.name == "JSON Checkpoint Analysis Limit" for check in result.checks)
+
+
+def test_scan_nested_file_inconclusive_mxnet_route_preserves_jax_incomplete_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    nested_payload: dict[str, Any] = {"value": "safe"}
+    for _ in range(2 * JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH):
+        nested_payload = {"nested": nested_payload}
+    extracted_member = tmp_path / "ambiguous-deep-jax.dat"
+    extracted_member.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "nodes": [{"attrs": "x" * 129, "op": "Custom", "name": "load"}],
+                "arg_nodes": [0],
+                "heads": [[0, 0, 0]],
+                "payload": nested_payload,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome_reasons"] == [
+        "jax_metadata_traversal_depth_limit",
+        "mxnet_symbol_routing_incomplete",
+    ]
+    assert any(check.name == "JSON Metadata Traversal Depth Limit" for check in result.checks)
 
 
 def test_scan_nested_file_fails_closed_when_mxnet_prefix_exceeds_nesting_budget(

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- classify incomplete JAX/Orbax metadata, pickle, and NumPy analysis as inconclusive coverage
 - route renamed structured JAX/Orbax JSON checkpoints and fail closed for oversized identified metadata
 - route renamed structurally valid Flax/JAX MessagePack checkpoints through bounded, fail-closed security analysis
 - avoid emitting sensitive scanner finding or loader error payloads in logs

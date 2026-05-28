@@ -56,6 +56,7 @@ from modelaudit.telemetry import record_file_type_detected, record_issue_found, 
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
@@ -442,6 +443,7 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
     _mark_inconclusive_scan_outcome(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)
     _mark_operational_scan_error(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)
 
+    from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
     from modelaudit.scanners.jinja2_template_scanner import Jinja2TemplateScanner
     from modelaudit.scanners.manifest_scanner import ManifestScanner
     from modelaudit.scanners.mxnet_scanner import MXNetScanner
@@ -464,6 +466,18 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
                 "mxnet",
                 scanner_selection,
                 context="inconclusive MXNet params byte analysis",
+            )
+
+    if os.path.getsize(path) <= JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+        if scanner_selection.allows("jax_checkpoint"):
+            merge_owner_result(JaxCheckpointScanner(config=config).scan(path))
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "jax_checkpoint",
+                scanner_selection,
+                context="overlapping JAX JSON analysis",
             )
 
     manifest_covered_templates = False

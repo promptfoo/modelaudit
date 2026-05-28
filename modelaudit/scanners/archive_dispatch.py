@@ -23,6 +23,7 @@ from ..scanner_selection import (
 )
 from ..utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
@@ -448,6 +449,7 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
     mark_inconclusive_scan_result(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)
     mark_operational_scan_error(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)
 
+    from .jax_checkpoint_scanner import JaxCheckpointScanner
     from .jinja2_template_scanner import Jinja2TemplateScanner
     from .manifest_scanner import ManifestScanner
     from .mxnet_scanner import MXNetScanner
@@ -470,6 +472,18 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
                 "mxnet",
                 scanner_selection,
                 context="inconclusive MXNet params byte analysis",
+            )
+
+    if os.path.getsize(path) <= JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+        if scanner_selection.allows("jax_checkpoint"):
+            merge_owner_result(JaxCheckpointScanner(config=config).scan(path))
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "jax_checkpoint",
+                scanner_selection,
+                context="overlapping JAX JSON analysis",
             )
 
     manifest_covered_templates = False

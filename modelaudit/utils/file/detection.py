@@ -2417,7 +2417,7 @@ def _could_start_json_object(prefix: bytes) -> bool:
     return normalized_prefix.startswith(b"{")
 
 
-def _has_jax_json_checkpoint_structure(payload: object) -> bool:
+def has_jax_json_checkpoint_structure(payload: object) -> bool:
     """Return whether parsed metadata explicitly identifies a JAX-family checkpoint."""
     if not isinstance(payload, dict):
         return False
@@ -2453,11 +2453,11 @@ def _probe_jax_json_checkpoint_file(file_path: Path) -> bool | None:
 
     try:
         payload = json.loads(prefix.decode("utf-8-sig"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
             return None
         return False
-    return _has_jax_json_checkpoint_structure(payload)
+    return has_jax_json_checkpoint_structure(payload)
 
 
 def is_jax_json_checkpoint_file(path: str | Path) -> bool:
