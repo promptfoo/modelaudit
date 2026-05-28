@@ -10,6 +10,11 @@ from typing import Any
 
 import pytest
 
+from modelaudit import core
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.config import ModelAuditConfig, reset_config, set_config
+from modelaudit.rules import Severity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 from modelaudit.utils.tensorflow_compat import DataType, tensor_proto_to_ndarray
 
@@ -180,6 +185,190 @@ def _has_h5py_cached():
 @lru_cache(maxsize=1)
 def _has_tensorflow_cached():
     return has_tensorflow()
+
+
+@pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
+def test_non_numeric_hdf5_weight_metadata_is_not_a_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "metadata_weight.h5"
+    with h5py.File(path, "w") as hdf5_file:
+        hdf5_file.create_dataset("metadata/weight_names", data=np.array([[b"a", b"b"], [b"c", b"d"]]))
+
+    original_array = np.array
+
+    def fail_if_non_numeric_dataset_is_materialized(obj: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(obj, h5py.Dataset) and obj.name.endswith("metadata/weight_names"):
+            raise AssertionError("non-numeric HDF5 weight metadata should not be materialized")
+        return original_array(obj, *args, **kwargs)
+
+    monkeypatch.setattr(np, "array", fail_if_non_numeric_dataset_is_materialized)
+    set_config(ModelAuditConfig(severity={"S801": Severity.CRITICAL}))
+
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = core.scan_model_directory_or_file(
+            str(path),
+            scanners=["weight_distribution"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = core.scan_model_directory_or_file(
+            str(path),
+            scanners=["weight_distribution"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for result in (first, second):
+            assert result.scanner_names == ["weight_distribution"]
+            assert core.determine_exit_code(result) == 0
+            assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+            assert all(issue.rule_code != "S801" for issue in result.issues)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] >= 1
+    finally:
+        reset_cache_manager()
+        reset_config()
+
+
+@pytest.mark.skipif(not has_h5py(), reason="h5py required")
+def test_zip_backed_keras_weight_distribution_stays_optional(tmp_path: Path) -> None:
+    path = tmp_path / "model.keras"
+    with zipfile.ZipFile(path, "w") as keras_archive:
+        keras_archive.writestr("metadata.json", "{}")
+        keras_archive.writestr("config.json", "{}")
+
+    direct = WeightDistributionScanner().scan(str(path))
+    assert direct.success is True
+    assert direct.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+
+    aggregate = core.scan_model_directory_or_file(str(path), scanners=["weight_distribution"], cache_enabled=False)
+    assert aggregate.success is True
+    assert core.determine_exit_code(aggregate) == 0
+    assert aggregate.file_metadata[str(path)].get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+
+
+@pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
+def test_analysis_failure_is_inconclusive_and_not_cached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "numeric_weights.h5"
+    with h5py.File(path, "w") as hdf5_file:
+        hdf5_file.create_dataset("model_weights/dense/kernel:0", data=np.zeros((2, 2)))
+
+    def fail_analysis(_self: WeightDistributionScanner, _weights_info: dict[str, Any]) -> list[dict[str, Any]]:
+        raise RuntimeError("simulated weight analysis failure")
+
+    monkeypatch.setattr(WeightDistributionScanner, "_analyze_weight_distributions", fail_analysis)
+    set_config(ModelAuditConfig(severity={"S801": Severity.CRITICAL}))
+
+    try:
+        direct = WeightDistributionScanner().scan(str(path))
+        assert direct.success is False
+        assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert direct.metadata["scan_outcome_reasons"] == ["weight_distribution_analysis_incomplete"]
+        analysis_check = next(check for check in direct.checks if check.name == "Weight Distribution Analysis")
+        assert analysis_check.details["analysis_incomplete"] is True
+        assert analysis_check.details["scan_outcome_reason"] == "weight_distribution_analysis_incomplete"
+        assert analysis_check.rule_code is None
+        assert all(check.severity not in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in direct.checks)
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            first = core.scan_model_directory_or_file(
+                str(path),
+                scanners=["weight_distribution"],
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            second = core.scan_model_directory_or_file(
+                str(path),
+                scanners=["weight_distribution"],
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            for aggregate in (first, second):
+                metadata = aggregate.file_metadata[str(path)]
+                assert aggregate.success is False
+                assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+                assert metadata["scan_outcome_reasons"] == ["weight_distribution_analysis_incomplete"]
+                assert core.determine_exit_code(aggregate) == 2
+                assert not any(
+                    issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues
+                )
+                assert all(issue.rule_code != "S801" for issue in aggregate.issues)
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+    finally:
+        reset_config()
+
+
+@pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
+def test_weight_extraction_failure_is_inconclusive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "unreadable_weights.h5"
+    with h5py.File(path, "w") as hdf5_file:
+        hdf5_file.create_dataset("model_weights/dense/kernel:0", data=np.zeros((2, 2)))
+
+    def fail_open(*_args: object, **_kwargs: object) -> object:
+        raise OSError("simulated HDF5 extraction read failure")
+
+    monkeypatch.setattr(h5py, "File", fail_open)
+
+    result = WeightDistributionScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["weight_distribution_analysis_incomplete"]
+    analysis_check = next(check for check in result.checks if check.name == "Weight Distribution Analysis")
+    assert analysis_check.details["analysis_incomplete"] is True
+    assert analysis_check.details["scan_outcome_reason"] == "weight_distribution_analysis_incomplete"
+    assert not any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in result.checks)
+
+
+@pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
+def test_partial_hdf5_weight_extraction_preserves_analyzed_findings(tmp_path: Path) -> None:
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "partial_external_weights.h5"
+    anomalous_weights = np.zeros((2, 10), dtype=np.float32)
+    anomalous_weights[0, 0] = 1000.0
+
+    with h5py.File(path, "w") as hdf5_file:
+        hdf5_file.create_dataset("model_weights/a_dense/weight:0", data=anomalous_weights)
+        hdf5_file.create_dataset(
+            "model_weights/z_dense/weight_external:0",
+            shape=(2, 2),
+            dtype=np.float32,
+            external=[("missing-external-weights.bin", 0, h5py.h5f.UNLIMITED)],
+        )
+
+    result = WeightDistributionScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["weight_distribution_analysis_incomplete"]
+    assert any(check.name == "Weight Distribution Anomaly Detection" for check in result.checks)
+    analysis_check = next(check for check in result.checks if check.name == "Weight Distribution Analysis")
+    assert analysis_check.details["analysis_incomplete"] is True
+    assert analysis_check.details["tensor_read_failures"] == 1
+    assert analysis_check.details["failed_tensors"] == ["model_weights/z_dense/weight_external:0"]
 
 
 @pytest.mark.skipif(not HAS_NUMPY, reason="numpy not available")

@@ -4,6 +4,7 @@ import json
 import os
 import re
 from contextlib import suppress
+from pathlib import Path
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import (
@@ -85,6 +86,8 @@ class KerasH5Scanner(BaseScanner):
             "system",
         }
     )
+    _KERAS_WEIGHT_ROOT_GROUPS: ClassVar[frozenset[str]] = frozenset({"model_weights", "optimizer_weights"})
+    _KERAS_WEIGHT_ROOT_ATTRS: ClassVar[frozenset[str]] = frozenset({"layer_names", "weight_names"})
     _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
     _WRAPPED_LAYER_SCAN_MODEL: ClassVar[dict[str, Any]] = {"class_name": "Sequential", "config": {"layers": []}}
 
@@ -167,9 +170,14 @@ class KerasH5Scanner(BaseScanner):
                 if isinstance(keras_version_attr, str) and keras_version_attr.strip():
                     result.metadata["keras_version"] = keras_version_attr.strip()
 
-                # CVE-2026-1669 only applies to Keras weight loading. Skip generic HDF5
-                # files to avoid warning on benign non-Keras artifacts.
-                if "model_config" in f.attrs or "keras_version" in result.metadata:
+                # CVE-2026-1669 applies to weight loading too. Inspect full
+                # Keras files and weights-like HDF5 layouts while leaving
+                # unrelated generic HDF5 artifacts quiet.
+                if (
+                    "model_config" in f.attrs
+                    or "keras_version" in result.metadata
+                    or self._has_weights_like_hdf5_layout(f, path)
+                ):
                     self._check_hdf5_external_references(f, result, path)
 
                 # Check if this is a Keras model file
@@ -333,6 +341,98 @@ class KerasH5Scanner(BaseScanner):
                 rule_code="S902",
             )
             return self._JSON_ATTRIBUTE_PARSE_FAILED
+
+    @classmethod
+    def _has_weights_like_hdf5_layout(cls, h5_file: Any, path: str) -> bool:
+        """Return True for HDF5 layouts that resemble Keras weights-only files."""
+        if any(str(key).lower() in cls._KERAS_WEIGHT_ROOT_GROUPS for key in h5_file):
+            return True
+
+        if cls._has_legacy_weights_layout(h5_file):
+            return True
+
+        return Path(path).name.lower().endswith(".weights.h5") and cls._has_keras3_weights_layout(h5_file)
+
+    @classmethod
+    def _has_legacy_weights_layout(cls, h5_file: Any) -> bool:
+        layer_names = cls._decode_hdf5_names(h5_file.attrs.get("layer_names"))
+        if not layer_names:
+            return False
+
+        for layer_name in layer_names:
+            link = h5_file.get(layer_name, getlink=True)
+            if isinstance(link, h5py.ExternalLink):
+                return True
+            if not isinstance(link, h5py.HardLink):
+                continue
+
+            layer = h5_file.get(layer_name, getlink=False)
+            if isinstance(layer, h5py.Group) and "weight_names" in layer.attrs:
+                return True
+
+        return False
+
+    @classmethod
+    def _has_keras3_weights_layout(cls, h5_file: Any) -> bool:
+        """Detect Keras 3 H5IOStore weights-only layouts without generic HDF5 overreach."""
+        if cls._has_group_or_external_link(h5_file, "vars"):
+            return True
+
+        layers_link = h5_file.get("layers", getlink=True)
+        if isinstance(layers_link, h5py.ExternalLink):
+            return True
+        if not isinstance(layers_link, h5py.HardLink):
+            return False
+
+        layers = h5_file.get("layers", getlink=False)
+        if not isinstance(layers, h5py.Group):
+            return False
+
+        for layer_name in layers:
+            layer_link = layers.get(layer_name, getlink=True)
+            if isinstance(layer_link, h5py.ExternalLink):
+                return True
+            if not isinstance(layer_link, h5py.HardLink):
+                continue
+
+            layer = layers.get(layer_name, getlink=False)
+            if isinstance(layer, h5py.Group) and cls._has_group_or_external_link(layer, "vars"):
+                return True
+
+        return False
+
+    @staticmethod
+    def _has_group_or_external_link(group: Any, name: str) -> bool:
+        link = group.get(name, getlink=True)
+        if isinstance(link, h5py.ExternalLink):
+            return True
+        if not isinstance(link, h5py.HardLink):
+            return False
+        return isinstance(group.get(name, getlink=False), h5py.Group)
+
+    @staticmethod
+    def _decode_hdf5_names(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, bytes):
+            return [value.decode("utf-8", errors="ignore")]
+        if isinstance(value, str):
+            return [value]
+
+        try:
+            items = list(value)
+        except TypeError:
+            items = [value]
+
+        names = []
+        for item in items:
+            if isinstance(item, bytes):
+                names.append(item.decode("utf-8", errors="ignore"))
+            elif isinstance(item, str):
+                names.append(item)
+        return [name for name in names if name]
 
     def _check_hdf5_external_references(self, h5_file: Any, result: ScanResult, source_path: str) -> None:
         """Detect HDF5 external links/storage before any Keras-specific parsing short-circuits."""
