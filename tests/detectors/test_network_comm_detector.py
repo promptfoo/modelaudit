@@ -339,6 +339,18 @@ class TestNetworkCommDetector:
         assert "model-bucket-1234567890abcdef" in serialized
         assert "<redacted>" not in serialized
 
+    def test_gcs_object_key_tokens_after_b_directory_are_redacted(self) -> None:
+        """Only GCS API /b/{bucket}/ routes should preserve the segment after b."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+        url = f"https://storage.googleapis.com/model-bucket/b/{path_token}/weights.bin"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        cloud_finding = next(finding for finding in findings if finding["type"] == "cloud_storage_url")
+
+        assert cloud_finding["url"] == "https://storage.googleapis.com/model-bucket/b/<redacted>/weights.bin"
+        assert path_token not in json.dumps(cloud_finding, sort_keys=True)
+
     def test_long_artifact_filenames_are_preserved(self) -> None:
         """Ordinary model artifact filenames should not be treated as capability tokens."""
         detector = NetworkCommDetector()

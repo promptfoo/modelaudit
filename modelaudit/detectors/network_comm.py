@@ -157,7 +157,11 @@ def _is_path_style_cloud_bucket_segment(scheme: str, hostname: str, index: int) 
 
 
 def _is_gcs_api_bucket_segment(hostname: str, segments: list[str], index: int) -> bool:
-    return hostname == "storage.googleapis.com" and index > 0 and segments[index - 1].lower() == "b"
+    if hostname != "storage.googleapis.com" or index == 0 or segments[index - 1].lower() != "b":
+        return False
+
+    route = [segment.lower() for segment in segments[1 : index - 1] if segment]
+    return route in (["storage", "v1"], ["download", "storage", "v1"])
 
 
 def _is_azure_authority_container(container: str) -> bool:
