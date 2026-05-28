@@ -203,6 +203,7 @@ _KERAS_CONFIG_PREFIX_HINT_RE = re.compile(
 )
 _NEMO_CONFIG_ENTRIES = frozenset({"model_config.yaml", "model_config.yml"})
 _NEMO_ROUTE_MAX_ENTRIES = 10_000
+_NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS = 100_000
 _PYTORCH_ZIP_METADATA_MAX_BYTES = 64
 _SKOPS_SCHEMA_ENTRIES = frozenset({"schema", "schema.json"})
 _SKOPS_SCHEMA_MAX_BYTES = 4 * 1024 * 1024
@@ -2121,9 +2122,36 @@ def _resolve_safe_tar_symlink_target_at_destination(member: tarfile.TarInfo, des
     return _normalize_safe_tar_member_name(target_name)
 
 
+class _NemoRouteResolutionLimitExceeded(Exception):
+    """Raised when bounded NeMo TAR link routing cannot safely continue."""
+
+
+def _consume_nemo_route_link_visit(member_visit_budget: list[int]) -> None:
+    if member_visit_budget[0] <= 0:
+        raise _NemoRouteResolutionLimitExceeded
+    member_visit_budget[0] -= 1
+
+
+def _consume_nemo_route_prefix_probe_budget(
+    components: list[str],
+    maximum_length: int,
+    member_visit_budget: list[int],
+) -> None:
+    """Bound total prefix-string work before resolving symlink components."""
+    prefix_length = 0
+    probe_cost = 0
+    for index, component in enumerate(components[:maximum_length]):
+        prefix_length += len(component) + (1 if index else 0)
+        probe_cost += prefix_length
+        if probe_cost > member_visit_budget[0]:
+            raise _NemoRouteResolutionLimitExceeded
+    member_visit_budget[0] -= probe_cost
+
+
 def _resolve_safe_tar_path_through_symlinks(
     member_name: str,
     symlink_targets: dict[str, str],
+    member_visit_budget: list[int],
     *,
     follow_final_symlink: bool = True,
 ) -> str | None:
@@ -2134,8 +2162,15 @@ def _resolve_safe_tar_path_through_symlinks(
     seen: set[str] = set()
     while current_name not in seen:
         seen.add(current_name)
+        if not symlink_targets:
+            return current_name
         components = current_name.split("/")
         maximum_length = len(components) if follow_final_symlink else len(components) - 1
+        _consume_nemo_route_prefix_probe_budget(
+            components,
+            maximum_length,
+            member_visit_budget,
+        )
         for length in range(maximum_length, 0, -1):
             prefix = "/".join(components[:length])
             target_name = symlink_targets.get(prefix)
@@ -2165,6 +2200,7 @@ def _tar_member_materializes_file_content(member: tarfile.TarInfo) -> bool:
 def _tar_links_resolve_to_regular_member(
     root_links: list[tarfile.TarInfo],
     members_by_normalized_name: dict[str, list[tarfile.TarInfo]],
+    member_visit_budget: list[int],
 ) -> bool:
     """Return whether a TAR link chain can materialize a regular config member."""
     pending = list(root_links)
@@ -2179,6 +2215,7 @@ def _tar_links_resolve_to_regular_member(
             return True
         if not (member.issym() or member.islnk()):
             continue
+        _consume_nemo_route_link_visit(member_visit_budget)
         target_member = _effective_safe_tar_link_target_member(member, members_by_normalized_name)
         if target_member is not None:
             pending.append(target_member)
@@ -2202,11 +2239,13 @@ def _effective_safe_tar_link_target_member(
 def _resolve_tar_hardlink_fallback_member(
     hardlink: tarfile.TarInfo,
     members_by_normalized_name: dict[str, list[tarfile.TarInfo]],
+    member_visit_budget: list[int],
 ) -> tarfile.TarInfo | None:
     """Resolve the member tarfile extracts after a colliding hardlink."""
     pending = hardlink
     seen: set[tuple[str, int]] = set()
     while pending.islnk():
+        _consume_nemo_route_link_visit(member_visit_budget)
         identity = (pending.name, pending.offset)
         if identity in seen:
             return None
@@ -2234,21 +2273,31 @@ def _detect_tar_route(path: str) -> str | None:
             root_config_links: list[tarfile.TarInfo] = []
             symlink_targets: dict[str, str] = {}
             occupied_names: set[str] = set()
+            link_resolution_budget = [_NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS]
             for entry_count, member in enumerate(archive, start=1):
                 if entry_count > _NEMO_ROUTE_MAX_ENTRIES:
-                    if _tar_links_resolve_to_regular_member(root_config_links, members_by_normalized_name):
+                    if _tar_links_resolve_to_regular_member(
+                        root_config_links,
+                        members_by_normalized_name,
+                        link_resolution_budget,
+                    ):
                         return "nemo"
                     return NEMO_ROUTING_INCONCLUSIVE_FORMAT
                 normalized_member_name = _normalize_safe_tar_member_name(member.name)
                 if normalized_member_name is not None:
                     members_by_normalized_name.setdefault(normalized_member_name, []).append(member)
                 if _tar_member_materializes_file_content(member):
-                    resolved_destination = _resolve_safe_tar_path_through_symlinks(member.name, symlink_targets)
+                    resolved_destination = _resolve_safe_tar_path_through_symlinks(
+                        member.name,
+                        symlink_targets,
+                        link_resolution_budget,
+                    )
                     if resolved_destination is not None and _is_nemo_root_config_member(resolved_destination):
                         return "nemo"
                     physical_destination = _resolve_safe_tar_path_through_symlinks(
                         member.name,
                         symlink_targets,
+                        link_resolution_budget,
                         follow_final_symlink=False,
                     )
                     if physical_destination is not None:
@@ -2257,6 +2306,7 @@ def _detect_tar_route(path: str) -> str | None:
                     destination_name = _resolve_safe_tar_path_through_symlinks(
                         member.name,
                         symlink_targets,
+                        link_resolution_budget,
                         follow_final_symlink=False,
                     )
                     if destination_name is None:
@@ -2272,6 +2322,7 @@ def _detect_tar_route(path: str) -> str | None:
                     destination_name = _resolve_safe_tar_path_through_symlinks(
                         member.name,
                         symlink_targets,
+                        link_resolution_budget,
                         follow_final_symlink=False,
                     )
                     target_name = _resolve_safe_tar_link_target_name(member)
@@ -2284,7 +2335,11 @@ def _detect_tar_route(path: str) -> str | None:
                     if destination_name is None or target_name is None:
                         continue
                     if destination_name in occupied_names:
-                        fallback_member = _resolve_tar_hardlink_fallback_member(member, members_by_normalized_name)
+                        fallback_member = _resolve_tar_hardlink_fallback_member(
+                            member,
+                            members_by_normalized_name,
+                            link_resolution_budget,
+                        )
                         if fallback_member is None:
                             continue
                         if fallback_member.issym():
@@ -2296,13 +2351,25 @@ def _detect_tar_route(path: str) -> str | None:
                             if fallback_target is not None:
                                 symlink_targets[destination_name] = fallback_target
                             continue
-                        resolved_write = _resolve_safe_tar_path_through_symlinks(destination_name, symlink_targets)
+                        resolved_write = _resolve_safe_tar_path_through_symlinks(
+                            destination_name,
+                            symlink_targets,
+                            link_resolution_budget,
+                        )
                         if resolved_write is not None and _is_nemo_root_config_member(resolved_write):
                             return "nemo"
                         continue
                     occupied_names.add(destination_name)
-                    fallback_member = _resolve_tar_hardlink_fallback_member(member, members_by_normalized_name)
-                    redirected_target = _resolve_safe_tar_path_through_symlinks(target_name, symlink_targets)
+                    fallback_member = _resolve_tar_hardlink_fallback_member(
+                        member,
+                        members_by_normalized_name,
+                        link_resolution_budget,
+                    )
+                    redirected_target = _resolve_safe_tar_path_through_symlinks(
+                        target_name,
+                        symlink_targets,
+                        link_resolution_budget,
+                    )
                     if (
                         fallback_member is not None
                         and fallback_member.issym()
@@ -2317,10 +2384,23 @@ def _detect_tar_route(path: str) -> str | None:
                             symlink_targets[destination_name] = fallback_target
                     if _is_nemo_root_config_member(member.name):
                         root_config_links.append(member)
+    except _NemoRouteResolutionLimitExceeded:
+        return NEMO_ROUTING_INCONCLUSIVE_FORMAT
     except (EOFError, OSError, tarfile.TarError):
         return None
 
-    return "nemo" if _tar_links_resolve_to_regular_member(root_config_links, members_by_normalized_name) else "tar"
+    try:
+        return (
+            "nemo"
+            if _tar_links_resolve_to_regular_member(
+                root_config_links,
+                members_by_normalized_name,
+                link_resolution_budget,
+            )
+            else "tar"
+        )
+    except _NemoRouteResolutionLimitExceeded:
+        return NEMO_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def is_nemo_archive(path: str) -> bool:

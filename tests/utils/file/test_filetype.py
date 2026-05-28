@@ -3036,6 +3036,50 @@ def test_detect_file_format_fails_closed_when_nemo_route_probe_limit_is_reached(
     assert detect_file_format_for_skip_filter(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
 
 
+def test_detect_file_format_fails_closed_when_nemo_link_resolution_budget_is_reached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.utils.file.detection._NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS", 1)
+    archive_path = tmp_path / "link-resolution-budget.jpg"
+    with tarfile.open(archive_path, "w") as archive:
+        first_alias = tarfile.TarInfo("alias-1")
+        first_alias.type = tarfile.SYMTYPE
+        first_alias.linkname = "."
+        archive.addfile(first_alias)
+        second_alias = tarfile.TarInfo("alias-2")
+        second_alias.type = tarfile.SYMTYPE
+        second_alias.linkname = "alias-1"
+        archive.addfile(second_alias)
+        info = tarfile.TarInfo("alias-2/payload.bin")
+        info.size = 1
+        archive.addfile(info, io.BytesIO(b"x"))
+
+    assert detect_file_format(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_charges_nemo_component_prefix_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.utils.file.detection._NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS", 3)
+    archive_path = tmp_path / "component-prefix-budget.jpg"
+    with tarfile.open(archive_path, "w") as archive:
+        alias = tarfile.TarInfo("alias")
+        alias.type = tarfile.SYMTYPE
+        alias.linkname = "."
+        archive.addfile(alias)
+        info = tarfile.TarInfo("one/two/three/four/payload.bin")
+        info.size = 1
+        archive.addfile(info, io.BytesIO(b"x"))
+
+    assert detect_file_format(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+
+
 def test_detect_file_format_propagates_inconclusive_compressed_nemo_route(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

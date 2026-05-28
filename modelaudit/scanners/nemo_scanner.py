@@ -381,6 +381,7 @@ class NemoScanner(BaseScanner):
         yaml_config_files_found = 0
         scanned_member_entries: set[str] = set()
         scanned_regular_checkpoint_sources: set[tuple[str, int]] = set()
+        referenced_member_contexts: dict[str, tuple[str, str]] = {}
         scanned_yaml_sources: set[tuple[str, int]] = set()
         link_resolution_budget = [NEMO_MAX_LINK_RESOLUTION_MEMBER_VISITS]
         link_resolution_budget_reported = False
@@ -390,7 +391,10 @@ class NemoScanner(BaseScanner):
             archive_members = tar.getmembers()
             members_by_normalized_name: dict[str, list[tarfile.TarInfo]] = {}
             linked_loaded_paths: set[str] = set()
-            loaded_path_link_present = self._archive_has_link_mediated_loaded_path(archive_members)
+            loaded_path_link_present = self._archive_has_link_mediated_loaded_path(
+                archive_members,
+                link_resolution_budget,
+            )
             for archive_member in archive_members:
                 normalized_member_name = self._normalize_safe_archive_member_name(archive_member.name)
                 if normalized_member_name is not None:
@@ -420,6 +424,15 @@ class NemoScanner(BaseScanner):
 
             if loaded_path_link_present:
                 mark_linked_loaded_path_inconclusive()
+            if link_resolution_budget[0] < 0:
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_link_resolution_budget_exceeded",
+                    check_name="NeMo Link Resolution",
+                    message="NeMo link analysis exceeded the member-visit safety limit",
+                    location=path,
+                )
+                link_resolution_budget_reported = True
 
             for member in tar:
                 self.check_interrupted()
@@ -552,6 +565,7 @@ class NemoScanner(BaseScanner):
                                     nemo_owned_entries,
                                     scanned_member_entries,
                                     scanned_regular_checkpoint_sources,
+                                    referenced_member_contexts,
                                 ):
                                     yaml_configs_found += 1
                                 scanned_yaml_sources.add(target_identity)
@@ -610,6 +624,7 @@ class NemoScanner(BaseScanner):
                         nemo_owned_entries,
                         scanned_member_entries,
                         scanned_regular_checkpoint_sources,
+                        referenced_member_contexts,
                     ):
                         yaml_configs_found += 1
                     scanned_yaml_sources.add(member_identity)
@@ -624,6 +639,36 @@ class NemoScanner(BaseScanner):
                         continue
                     self._scan_checkpoint_member(tar, member, path, result)
                     scanned_regular_checkpoint_sources.add(member_identity)
+
+        if referenced_member_contexts:
+            referenced_link_mutation = self._archive_has_link_mediated_loaded_path(
+                archive_members,
+                link_resolution_budget,
+                additional_loaded_member_names=set(referenced_member_contexts),
+                include_default_loaded_member_names=False,
+            )
+            if referenced_link_mutation:
+                referenced_entries = sorted(referenced_member_contexts)
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_referenced_link_semantics_incomplete",
+                    check_name="NeMo Referenced Link Semantics",
+                    message=("NeMo referenced content can be mutated through archive links; analysis is conservative"),
+                    location=path,
+                    details={
+                        "entries": referenced_entries[:20],
+                        "entry_count": len(referenced_entries),
+                    },
+                )
+            elif link_resolution_budget[0] < 0:
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_link_resolution_budget_exceeded",
+                    check_name="NeMo Link Resolution",
+                    message="NeMo link analysis exceeded the member-visit safety limit",
+                    location=path,
+                    details={"entry_count": len(referenced_member_contexts)},
+                )
 
         if yaml_configs_found == 0:
             message = (
@@ -737,6 +782,7 @@ class NemoScanner(BaseScanner):
         nemo_owned_entries: set[str],
         scanned_member_entries: set[str],
         scanned_regular_checkpoint_sources: set[tuple[str, int]],
+        referenced_member_contexts: dict[str, tuple[str, str]],
     ) -> bool:
         """Analyze one YAML config entry, including a safe root-config link target."""
         if member.size > self.MAX_CONFIG_SIZE:
@@ -807,6 +853,7 @@ class NemoScanner(BaseScanner):
         self._check_hydra_targets(config, config_file, archive_path, result)
         for config_path, referenced_member_name in self._collect_nemo_member_references(config):
             nemo_owned_entries.add(referenced_member_name)
+            referenced_member_contexts.setdefault(referenced_member_name, (config_file, config_path))
             if referenced_member_name in scanned_member_entries:
                 continue
             referenced_member_scanned = self._scan_config_referenced_member(
@@ -839,8 +886,25 @@ class NemoScanner(BaseScanner):
     def _archive_has_link_mediated_loaded_path(
         cls,
         archive_members: list[tarfile.TarInfo],
+        member_visit_budget: list[int],
+        *,
+        additional_loaded_member_names: set[str] | None = None,
+        include_default_loaded_member_names: bool = True,
     ) -> bool:
         """Return whether extracted link behavior can mutate loaded NeMo content."""
+        additional_loaded_names = {
+            normalized_name
+            for member_name in additional_loaded_member_names or set()
+            if (normalized_name := cls._normalize_safe_archive_member_name(member_name)) is not None
+        }
+
+        def is_loaded_member_name(member_name: str) -> bool:
+            normalized_name = cls._normalize_safe_archive_member_name(member_name)
+            return normalized_name is not None and (
+                (include_default_loaded_member_names and cls._is_loaded_member_name(normalized_name))
+                or normalized_name in additional_loaded_names
+            )
+
         members_by_normalized_name: dict[str, list[tarfile.TarInfo]] = {}
         for archive_member in archive_members:
             normalized_name = cls._normalize_safe_archive_member_name(archive_member.name)
@@ -858,6 +922,7 @@ class NemoScanner(BaseScanner):
                 destination_name = cls._resolve_archive_path_through_symlinks(
                     normalized_name,
                     symlink_targets,
+                    member_visit_budget,
                     follow_final_symlink=False,
                 )
                 if destination_name is None:
@@ -865,7 +930,7 @@ class NemoScanner(BaseScanner):
                 target_name = cls._resolve_archive_symlink_target_at_destination(member, destination_name)
                 if target_name is None:
                     continue
-                if cls._is_loaded_member_name(destination_name):
+                if is_loaded_member_name(destination_name):
                     return True
                 loaded_inode_paths.discard(destination_name)
                 occupied_names.add(destination_name)
@@ -875,26 +940,28 @@ class NemoScanner(BaseScanner):
                 destination_name = cls._resolve_archive_path_through_symlinks(
                     normalized_name,
                     symlink_targets,
+                    member_visit_budget,
                     follow_final_symlink=False,
                 )
                 redirected_destination = cls._resolve_archive_path_through_symlinks(
                     normalized_name,
                     symlink_targets,
+                    member_visit_budget,
                 )
                 target_name = cls._resolve_archive_link_member_name(member)
                 if destination_name is None or target_name is None:
                     continue
-                if cls._is_loaded_member_name(destination_name):
+                if is_loaded_member_name(destination_name):
                     return True
                 if destination_name in occupied_names:
                     fallback_member = cls._resolve_hardlink_fallback_member(
                         member,
                         members_by_normalized_name,
-                        [NEMO_MAX_LINK_RESOLUTION_MEMBER_VISITS],
+                        member_visit_budget,
                     )
                     if fallback_member is None:
                         if redirected_destination is not None and (
-                            cls._is_loaded_member_name(redirected_destination)
+                            is_loaded_member_name(redirected_destination)
                             or redirected_destination in loaded_inode_paths
                         ):
                             return True
@@ -912,20 +979,25 @@ class NemoScanner(BaseScanner):
                     redirected_write = cls._resolve_archive_path_through_symlinks(
                         destination_name,
                         symlink_targets,
+                        member_visit_budget,
                     )
                     if redirected_write is not None and (
-                        cls._is_loaded_member_name(redirected_write) or redirected_write in loaded_inode_paths
+                        is_loaded_member_name(redirected_write) or redirected_write in loaded_inode_paths
                     ):
                         return True
                     continue
                 occupied_names.add(destination_name)
-                redirected_target = cls._resolve_archive_path_through_symlinks(target_name, symlink_targets)
+                redirected_target = cls._resolve_archive_path_through_symlinks(
+                    target_name,
+                    symlink_targets,
+                    member_visit_budget,
+                )
                 if redirected_target is None:
                     continue
                 fallback_member = cls._resolve_hardlink_fallback_member(
                     member,
                     members_by_normalized_name,
-                    [NEMO_MAX_LINK_RESOLUTION_MEMBER_VISITS],
+                    member_visit_budget,
                 )
                 if fallback_member is not None and fallback_member.issym() and redirected_target not in occupied_names:
                     fallback_target = cls._resolve_archive_symlink_target_at_destination(
@@ -940,21 +1012,26 @@ class NemoScanner(BaseScanner):
                 continue
             if not cls._tar_member_materializes_file_content(member):
                 continue
-            destination_name = cls._resolve_archive_path_through_symlinks(normalized_name, symlink_targets)
+            destination_name = cls._resolve_archive_path_through_symlinks(
+                normalized_name,
+                symlink_targets,
+                member_visit_budget,
+            )
             if destination_name is None:
                 continue
             physical_destination = cls._resolve_archive_path_through_symlinks(
                 normalized_name,
                 symlink_targets,
+                member_visit_budget,
                 follow_final_symlink=False,
             )
             if physical_destination is not None:
                 occupied_names.add(physical_destination)
-            if (destination_name != normalized_name and cls._is_loaded_member_name(destination_name)) or (
-                destination_name in loaded_inode_paths and not cls._is_loaded_member_name(normalized_name)
+            if (destination_name != normalized_name and is_loaded_member_name(destination_name)) or (
+                destination_name in loaded_inode_paths and not is_loaded_member_name(normalized_name)
             ):
                 return True
-            if cls._is_loaded_member_name(destination_name):
+            if is_loaded_member_name(destination_name):
                 loaded_inode_paths.add(destination_name)
         return False
 
@@ -963,6 +1040,7 @@ class NemoScanner(BaseScanner):
         cls,
         member_name: str,
         symlink_targets: dict[str, str],
+        member_visit_budget: list[int],
         *,
         follow_final_symlink: bool = True,
     ) -> str | None:
@@ -973,8 +1051,16 @@ class NemoScanner(BaseScanner):
         seen: set[str] = set()
         while current_name not in seen:
             seen.add(current_name)
+            if not symlink_targets:
+                return current_name
             components = current_name.split("/")
             maximum_length = len(components) if follow_final_symlink else len(components) - 1
+            if not cls._consume_archive_prefix_probe_budget(
+                components,
+                maximum_length,
+                member_visit_budget,
+            ):
+                return None
             for length in range(maximum_length, 0, -1):
                 prefix = "/".join(components[:length])
                 target_name = symlink_targets.get(prefix)
@@ -992,6 +1078,24 @@ class NemoScanner(BaseScanner):
             else:
                 return current_name
         return None
+
+    @staticmethod
+    def _consume_archive_prefix_probe_budget(
+        components: list[str],
+        maximum_length: int,
+        member_visit_budget: list[int],
+    ) -> bool:
+        """Bound total prefix-string work before resolving symlink components."""
+        prefix_length = 0
+        probe_cost = 0
+        for index, component in enumerate(components[:maximum_length]):
+            prefix_length += len(component) + (1 if index else 0)
+            probe_cost += prefix_length
+            if probe_cost > member_visit_budget[0]:
+                member_visit_budget[0] = -1
+                return False
+        member_visit_budget[0] -= probe_cost
+        return True
 
     @classmethod
     def _resolve_archive_symlink_target_at_destination(
@@ -1099,6 +1203,9 @@ class NemoScanner(BaseScanner):
                 return member
             if not (member.issym() or member.islnk()):
                 continue
+            if member.issym() and hardlink_members and root_link.islnk():
+                member_visit_budget[0] = -2
+                return None
             if member.islnk():
                 hardlink_members.append(member)
             linked_member = cls._effective_archive_link_target_member(member, members_by_normalized_name)
@@ -1126,11 +1233,19 @@ class NemoScanner(BaseScanner):
             if member_name is None:
                 continue
             if archive_member.issym():
-                target_name = cls._resolve_archive_link_member_name(archive_member)
+                destination_name = cls._resolve_archive_path_through_symlinks(
+                    member_name,
+                    symlink_targets,
+                    member_visit_budget,
+                    follow_final_symlink=False,
+                )
+                if destination_name is None:
+                    return None
+                target_name = cls._resolve_symlink_at_destination(archive_member, destination_name)
                 if target_name is None:
                     return None
-                symlink_targets[member_name] = target_name
-                content_by_name.pop(member_name, None)
+                symlink_targets[destination_name] = target_name
+                content_by_name.pop(destination_name, None)
                 continue
             if archive_member.islnk():
                 member_visit_budget[0] = -2
@@ -1172,35 +1287,96 @@ class NemoScanner(BaseScanner):
             return None
         member_visit_budget[0] -= len(archive_members)
 
-        active_names = {initial_name}
-        occupied_names = {
-            normalized_name
-            for archive_member in archive_members
-            if archive_member.offset <= initial_content.offset
-            if (normalized_name := cls._normalize_safe_archive_member_name(archive_member.name)) is not None
-        }
         symlink_targets: dict[str, str] = {}
+        ambiguous_fallback_symlink_destinations: set[str] = set()
+        occupied_names: set[str] = set()
         for archive_member in archive_members:
             if archive_member.offset > initial_content.offset:
                 break
             member_name = cls._normalize_safe_archive_member_name(archive_member.name)
             if member_name is None:
                 continue
+            destination_name = cls._resolve_archive_path_through_symlinks(
+                member_name,
+                symlink_targets,
+                member_visit_budget,
+                follow_final_symlink=False,
+            )
+            if destination_name is None:
+                return None
             if archive_member.issym():
-                symlink_target_name = cls._resolve_archive_link_member_name(archive_member)
-                if symlink_target_name is not None:
-                    symlink_targets[member_name] = symlink_target_name
-            elif archive_member.islnk() or cls._tar_member_materializes_file_content(archive_member):
-                symlink_targets.pop(member_name, None)
+                symlink_target_name = cls._resolve_symlink_at_destination(
+                    archive_member,
+                    destination_name,
+                )
+                if symlink_target_name is None:
+                    return None
+                symlink_targets[destination_name] = symlink_target_name
+                ambiguous_fallback_symlink_destinations.discard(destination_name)
+            elif archive_member.islnk():
+                fallback_member = cls._resolve_hardlink_fallback_member(
+                    archive_member,
+                    members_by_normalized_name,
+                    member_visit_budget,
+                )
+                if fallback_member is None:
+                    return None
+                if fallback_member.issym():
+                    symlink_targets.pop(destination_name, None)
+                    symlink_target_name = cls._resolve_symlink_at_destination(
+                        fallback_member,
+                        destination_name,
+                    )
+                    if symlink_target_name is None:
+                        return None
+                    symlink_targets[destination_name] = symlink_target_name
+                    if destination_name in occupied_names:
+                        ambiguous_fallback_symlink_destinations.discard(destination_name)
+                    else:
+                        ambiguous_fallback_symlink_destinations.add(destination_name)
+            occupied_names.add(destination_name)
+        initial_destination_name = cls._resolve_archive_path_through_symlinks(
+            initial_name,
+            symlink_targets,
+            member_visit_budget,
+        )
+        if initial_destination_name is None:
+            return None
+        if observed_link.islnk() and initial_destination_name != initial_name:
+            member_visit_budget[0] = -2
+            return None
+        active_names = {initial_destination_name}
         effective_content = initial_content
+
+        def traverses_ambiguous_fallback_symlink(member_name: str) -> bool:
+            for ambiguous_destination in ambiguous_fallback_symlink_destinations:
+                if cls._symlink_path_traverses_name(
+                    member_name,
+                    ambiguous_destination,
+                    symlink_targets,
+                    member_visit_budget,
+                ):
+                    return True
+                if member_visit_budget[0] < 0:
+                    return False
+            return False
+
         for archive_member in archive_members:
             if archive_member.offset <= initial_content.offset:
                 continue
             member_name = cls._normalize_safe_archive_member_name(archive_member.name)
             if member_name is None:
                 continue
+            destination_name = cls._resolve_archive_path_through_symlinks(
+                member_name,
+                symlink_targets,
+                member_visit_budget,
+                follow_final_symlink=False,
+            )
+            if destination_name is None:
+                return None
             if cls._tar_member_materializes_file_content(archive_member):
-                occupied_names.add(member_name)
+                occupied_names.add(destination_name)
                 resolves_to_inode = cls._path_resolves_to_hardlink_inode(
                     member_name,
                     active_names,
@@ -1210,6 +1386,11 @@ class NemoScanner(BaseScanner):
                 if member_visit_budget[0] < 0:
                     return None
                 if resolves_to_inode:
+                    if traverses_ambiguous_fallback_symlink(member_name):
+                        member_visit_budget[0] = -2
+                        return None
+                    if member_visit_budget[0] < 0:
+                        return None
                     effective_content = archive_member
                 continue
 
@@ -1223,46 +1404,49 @@ class NemoScanner(BaseScanner):
                 if member_visit_budget[0] < 0:
                     return None
                 hardlink_target_name = cls._resolve_archive_link_member_name(archive_member)
-                if member_name in occupied_names:
+                if destination_name in occupied_names:
                     destination_on_observed_path = cls._tar_member_identity(archive_member) == cls._tar_member_identity(
                         observed_link
                     ) or (
                         observed_link.issym()
                         and cls._symlink_path_traverses_name(
                             observed_name,
-                            member_name,
+                            destination_name,
                             symlink_targets,
                             member_visit_budget,
                         )
                     )
                     if member_visit_budget[0] < 0:
                         return None
-                    if destination_reaches_inode or destination_on_observed_path:
-                        fallback_member = cls._resolve_hardlink_fallback_member(
-                            archive_member,
-                            members_by_normalized_name,
-                            member_visit_budget,
+                    fallback_member = cls._resolve_hardlink_fallback_member(
+                        archive_member,
+                        members_by_normalized_name,
+                        member_visit_budget,
+                    )
+                    if fallback_member is None:
+                        return None
+                    if fallback_member.issym():
+                        active_names.discard(destination_name)
+                        symlink_targets.pop(destination_name, None)
+                        symlink_target_name = cls._resolve_symlink_at_destination(
+                            fallback_member,
+                            destination_name,
                         )
-                        if fallback_member is None:
+                        if symlink_target_name is None:
                             return None
+                        symlink_targets[destination_name] = symlink_target_name
+                        ambiguous_fallback_symlink_destinations.discard(destination_name)
+                        continue
+                    if destination_reaches_inode or destination_on_observed_path:
                         if cls._tar_member_materializes_file_content(fallback_member):
                             effective_content = fallback_member
                             if destination_on_observed_path and not destination_reaches_inode:
-                                symlink_targets.pop(member_name, None)
-                                active_names.add(member_name)
-                        elif fallback_member.issym():
-                            active_names.discard(member_name)
-                            symlink_targets.pop(member_name, None)
-                            symlink_target_name = cls._resolve_symlink_at_destination(
-                                fallback_member,
-                                member_name,
-                            )
-                            if symlink_target_name is not None:
-                                symlink_targets[member_name] = symlink_target_name
+                                symlink_targets.pop(destination_name, None)
+                                active_names.add(destination_name)
                         else:
                             return None
                     continue
-                occupied_names.add(member_name)
+                occupied_names.add(destination_name)
                 if hardlink_target_name is not None:
                     target_reaches_inode = cls._path_resolves_to_hardlink_inode(
                         hardlink_target_name,
@@ -1273,14 +1457,38 @@ class NemoScanner(BaseScanner):
                     if member_visit_budget[0] < 0:
                         return None
                     if target_reaches_inode:
-                        active_names.add(member_name)
+                        if traverses_ambiguous_fallback_symlink(hardlink_target_name):
+                            member_visit_budget[0] = -2
+                            return None
+                        if member_visit_budget[0] < 0:
+                            return None
+                        active_names.add(destination_name)
+                    else:
+                        fallback_member = cls._resolve_hardlink_fallback_member(
+                            archive_member,
+                            members_by_normalized_name,
+                            member_visit_budget,
+                        )
+                        if fallback_member is not None and fallback_member.issym():
+                            symlink_target_name = cls._resolve_symlink_at_destination(
+                                fallback_member,
+                                destination_name,
+                            )
+                            if symlink_target_name is None:
+                                return None
+                            symlink_targets[destination_name] = symlink_target_name
+                            ambiguous_fallback_symlink_destinations.add(destination_name)
             elif archive_member.issym():
-                active_names.discard(member_name)
-                symlink_targets.pop(member_name, None)
-                occupied_names.add(member_name)
-                symlink_target_name = cls._resolve_archive_link_member_name(archive_member)
+                active_names.discard(destination_name)
+                symlink_targets.pop(destination_name, None)
+                occupied_names.add(destination_name)
+                symlink_target_name = cls._resolve_symlink_at_destination(
+                    archive_member,
+                    destination_name,
+                )
                 if symlink_target_name is not None:
-                    symlink_targets[member_name] = symlink_target_name
+                    symlink_targets[destination_name] = symlink_target_name
+                    ambiguous_fallback_symlink_destinations.discard(destination_name)
 
         observed_reaches_inode = cls._path_resolves_to_hardlink_inode(
             observed_name,
@@ -1292,28 +1500,52 @@ class NemoScanner(BaseScanner):
             return None
         return effective_content if observed_reaches_inode else None
 
-    @staticmethod
+    @classmethod
     def _symlink_path_traverses_name(
+        cls,
         start_name: str,
         candidate_name: str,
         symlink_targets: dict[str, str],
         member_visit_budget: list[int],
     ) -> bool:
         """Return whether a symlink path currently traverses a candidate name."""
+        normalized_candidate = cls._normalize_safe_archive_member_name(candidate_name)
+        current_name = cls._normalize_safe_archive_member_name(start_name)
+        if normalized_candidate is None or current_name is None:
+            return False
         seen: set[str] = set()
-        current_name = start_name
         while current_name not in seen:
-            if member_visit_budget[0] <= 0:
-                member_visit_budget[0] = -1
-                return False
-            member_visit_budget[0] -= 1
-            if current_name == candidate_name:
+            if current_name == normalized_candidate:
                 return True
             seen.add(current_name)
-            target_name = symlink_targets.get(current_name)
-            if target_name is None:
+            if not symlink_targets:
                 return False
-            current_name = target_name
+            components = current_name.split("/")
+            if not cls._consume_archive_prefix_probe_budget(
+                components,
+                len(components),
+                member_visit_budget,
+            ):
+                return False
+            for length in range(len(components), 0, -1):
+                prefix = "/".join(components[:length])
+                target_name = symlink_targets.get(prefix)
+                if target_name is None:
+                    continue
+                if prefix == normalized_candidate:
+                    return True
+                suffix = "/".join(components[length:])
+                redirected_name = target_name if not suffix else posixpath.join(target_name, suffix)
+                if posixpath.normpath(redirected_name) == ".":
+                    current_name = "."
+                    break
+                normalized_redirected = cls._normalize_safe_archive_member_name(redirected_name)
+                if normalized_redirected is None:
+                    return False
+                current_name = normalized_redirected
+                break
+            else:
+                return False
         return False
 
     @classmethod
@@ -1350,52 +1582,39 @@ class NemoScanner(BaseScanner):
         if is_absolute_archive_path(linkname):
             return None
         candidate = posixpath.join(posixpath.dirname(destination_name), linkname)
+        if posixpath.normpath(candidate) == ".":
+            return "."
         return cls._normalize_safe_archive_member_name(candidate)
 
-    @staticmethod
+    @classmethod
     def _path_resolves_to_hardlink_inode(
+        cls,
         member_name: str,
         active_names: set[str],
         symlink_targets: dict[str, str],
         member_visit_budget: list[int],
     ) -> bool:
         """Return whether opening a safe path reaches the tracked hardlink inode."""
-        seen: set[str] = set()
-        current_name = member_name
-        while current_name not in seen:
-            if member_visit_budget[0] <= 0:
-                member_visit_budget[0] = -1
-                return False
-            member_visit_budget[0] -= 1
-            if current_name in active_names:
-                return True
-            seen.add(current_name)
-            target_name = symlink_targets.get(current_name)
-            if target_name is None:
-                return False
-            current_name = target_name
-        return False
+        terminal_name = cls._resolve_archive_path_through_symlinks(
+            member_name,
+            symlink_targets,
+            member_visit_budget,
+        )
+        return terminal_name is not None and terminal_name in active_names
 
-    @staticmethod
+    @classmethod
     def _resolve_symlink_terminal_name(
+        cls,
         member_name: str,
         symlink_targets: dict[str, str],
         member_visit_budget: list[int],
     ) -> str | None:
         """Resolve a safe extracted symlink chain to its terminal pathname."""
-        seen: set[str] = set()
-        current_name = member_name
-        while current_name not in seen:
-            if member_visit_budget[0] <= 0:
-                member_visit_budget[0] = -1
-                return None
-            member_visit_budget[0] -= 1
-            seen.add(current_name)
-            target_name = symlink_targets.get(current_name)
-            if target_name is None:
-                return current_name
-            current_name = target_name
-        return None
+        return cls._resolve_archive_path_through_symlinks(
+            member_name,
+            symlink_targets,
+            member_visit_budget,
+        )
 
     @classmethod
     def _effective_archive_link_target_member(
