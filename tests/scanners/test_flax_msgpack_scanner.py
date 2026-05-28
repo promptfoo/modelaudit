@@ -442,6 +442,7 @@ def test_flax_msgpack_deep_nesting_is_inconclusive(tmp_path: Path) -> None:
     assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.RECURSION_LIMIT_INCONCLUSIVE_REASON]
     depth_checks = [check for check in result.checks if check.name == "Recursion Depth Check"]
     assert depth_checks
+    assert all("Maximum recursion depth exceeded" in check.message for check in depth_checks)
     assert all(check.severity == IssueSeverity.INFO for check in depth_checks)
     assert all(check.rule_code == "S902" for check in depth_checks)
     assert all(check.details["analysis_incomplete"] is True for check in depth_checks)
@@ -491,6 +492,49 @@ def test_flax_msgpack_pattern_within_recursion_limit_remains_security_finding(tm
         cache_enabled=False,
     )
     assert determine_exit_code(aggregate) == 1
+
+
+def test_flax_msgpack_visible_finding_with_deep_sibling_remains_security_finding(tmp_path: Path) -> None:
+    """Observed malicious content must win over incomplete sibling coverage."""
+    path = tmp_path / "visible_and_deep.msgpack"
+    create_msgpack_file(
+        path,
+        {
+            "params": {
+                "payload": 'os.system("id")',
+                "opaque": {"level": {"level": "benign"}},
+            }
+        },
+    )
+
+    result = FlaxMsgpackScanner(config={"max_recursion_depth": 2}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.RECURSION_LIMIT_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(issue.severity == IssueSeverity.CRITICAL and "os\\.system" in issue.message for issue in result.issues)
+    assert any("Maximum recursion depth exceeded" in check.message for check in result.checks)
+
+    reset_cache_manager()
+    try:
+        aggregates = [
+            scan_model_directory_or_file(
+                str(path),
+                max_recursion_depth=2,
+                cache_enabled=True,
+                cache_dir=str(tmp_path / "mixed-outcome-cache"),
+                min_cache_file_size=0,
+            )
+            for _ in range(2)
+        ]
+        for aggregate in aggregates:
+            metadata = aggregate.file_metadata[str(path)]
+            assert FlaxMsgpackScanner.RECURSION_LIMIT_INCONCLUSIVE_REASON in metadata["scan_outcome_reasons"]
+            assert any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+            assert determine_exit_code(aggregate) == 1
+        assert get_cache_manager(str(tmp_path / "mixed-outcome-cache"), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_flax_msgpack_non_standard_structure(tmp_path):
