@@ -390,6 +390,10 @@ def test_scan_zip_flags_concatenated_getattr_name_dangerous_python_member(tmp_pa
         "import os\nlocals()['os'].system('echo hidden')\n",
         "import os\nvars()['os'].system('echo hidden')\n",
         "import os\nnamespace = globals()\nnamespace['runner'] = os.system\nnamespace['runner']('echo hidden')\n",
+        "import os\nglobals().setdefault('runner', os.system)\nrunner('echo hidden')\n",
+        "import os\nnamespace = globals()\nnamespace.setdefault('runner', os.system)\nrunner('echo hidden')\n",
+        "import os\nglobals().__setitem__('runner', os.system)\nrunner('echo hidden')\n",
+        "import os\nnamespace = globals()\nnamespace.__setitem__('runner', os.system)\nrunner('echo hidden')\n",
         "import os\nnamespace = locals()\nnamespace['runner'] = os.system\nnamespace['runner']('echo hidden')\n",
         "import os\nnamespace = vars()\nnamespace['runner'] = os.system\nnamespace['runner']('echo hidden')\n",
         "import os\nclass Install:\n    globals()['runner'] = os.system\nrunner('echo hidden')\n",
@@ -421,6 +425,14 @@ def test_scan_zip_flags_concatenated_getattr_name_dangerous_python_member(tmp_pa
         "import os\nlookup = os.__dict__.pop\nlookup('_missing_runner_', os.__dict__)['sys' + 'tem']('echo hidden')\n",
         "import os\ndict.pop(os.__dict__, '_missing_runner_', os.__dict__)['sys' + 'tem']('echo hidden')\n",
         "import os\ndict.setdefault(os.__dict__, '_missing_runner_', os.system)('echo hidden')\n",
+        "import os\nglobals()['runner'] = os.system\npopped = globals().pop('runner')\npopped('echo hidden')\n",
+        "import os\nglobals()['runner'] = os.system\nglobals().pop('runner')('echo hidden')\n",
+        "import os\nos.__dict__['runner'] = os.system\nos.runner('echo hidden')\n",
+        "import os\nos.__dict__['runner'] = os.system\npopped = os.__dict__.pop('runner')\npopped('echo hidden')\n",
+        "import os\nnamespace = os.__dict__\nnamespace.__setitem__('runner', os.system)\nos.runner('echo hidden')\n",
+        "import os\n[runner := os.system for _ in (1,)]\nrunner('echo hidden')\n",
+        "import os\n{runner := os.system for _ in (1,)}\nrunner('echo hidden')\n",
+        "import os\nany(runner := os.system for _ in (1,))\nrunner('echo hidden')\n",
         "import os\nrunner = os.system\nos.__dict__['system'] = print\nrunner('echo hidden')\n",
         "import os\nos.system = getattr\nos.system(os, 'popen')('echo hidden')\n",
     ],
@@ -492,6 +504,12 @@ def test_scan_zip_reports_rebound_namespace_callable_target(tmp_path: Path) -> N
             "import os\nclass Safe:\n    system = print\ndef run():\n"
             "    globals()['os'] = Safe\n    os.system('safe')\nrun()\n"
         ),
+        "import os\nos.__dict__['_safe'] = print\nos.__dict__.get('_safe', os.system)('safe')\n",
+        "import os\nos.__dict__['_safe'] = print\nos.__dict__.pop('_safe', os.system)('safe')\n",
+        "import os\nos.__dict__['_safe'] = print\nos.__dict__.setdefault('_safe', os.system)('safe')\n",
+        "import os\nrunner = print\nglobals().setdefault('runner', os.system)\nrunner('safe')\n",
+        "import os\nglobals()['runner'] = os.system\nglobals().pop('runner')\nrunner('safe')\n",
+        "import os\nos.__dict__['runner'] = os.system\nos.__dict__.pop('runner')\nos.runner('safe')\n",
         ("import os\nrunner = os.system\nif True:\n    globals()['runner'] = print\nglobals()['runner']('safe')\n"),
     ],
 )
@@ -584,7 +602,6 @@ def test_scan_zip_ignores_shadowed_implicit_builtins_mapping(tmp_path: Path) -> 
         "lookup = vars().get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n",
         "dict.__getitem__(locals(), '__builtins__')['ev' + 'al']('1 + 1')\n",
         "if enabled:\n    locals()['__builtins__']['ev' + 'al']('1 + 1')\n",
-        "[locals()['__builtins__']['ev' + 'al']('1 + 1') for _ in (1,)]\n",
         (
             "namespace = locals()\ndef run():\n    __builtins__ = {'eval': print}\n"
             "    namespace['__builtins__']['ev' + 'al']('1 + 1')\nrun()\n"
@@ -689,9 +706,13 @@ def test_scan_zip_ignores_shadowed_globals_builtins_mapping(tmp_path: Path, sour
             "    vars()['__builtins__'].eval('safe')\nrun()\n"
         ),
         "[locals()['__builtins__']['eval']('safe') for __builtins__ in ({'eval': print},)]\n",
+        "[locals()['__builtins__']['eval']('safe') for _ in (1,)]\n",
         "{locals()['__builtins__']['eval']('safe') for __builtins__ in ({'eval': print},)}\n",
+        "{locals()['__builtins__']['eval']('safe') for _ in (1,)}\n",
         "{1: locals()['__builtins__']['eval']('safe') for __builtins__ in ({'eval': print},)}\n",
+        "{1: locals()['__builtins__']['eval']('safe') for _ in (1,)}\n",
         "(locals()['__builtins__']['eval']('safe') for __builtins__ in ({'eval': print},))\n",
+        "(locals()['__builtins__']['eval']('safe') for _ in (1,))\n",
     ],
 )
 def test_scan_zip_ignores_non_module_local_mappings(tmp_path: Path, source: str) -> None:

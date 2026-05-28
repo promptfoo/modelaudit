@@ -297,6 +297,15 @@ class TestTarScanner:
                 b"import os\nnamespace = globals()\nnamespace['runner'] = os.system\n"
                 b"namespace['runner']('echo hidden')\n"
             ),
+            b"import os\nglobals().setdefault('runner', os.system)\nrunner('echo hidden')\n",
+            b"import os\nglobals().__setitem__('runner', os.system)\nrunner('echo hidden')\n",
+            b"import os\nglobals()['runner'] = os.system\npopped = globals().pop('runner')\npopped('echo hidden')\n",
+            b"import os\nos.__dict__['runner'] = os.system\nos.runner('echo hidden')\n",
+            (
+                b"import os\nos.__dict__['runner'] = os.system\n"
+                b"popped = os.__dict__.pop('runner')\npopped('echo hidden')\n"
+            ),
+            b"import os\n[runner := os.system for _ in (1,)]\nrunner('echo hidden')\n",
             b"import os\nclass Install:\n    globals()['runner'] = os.system\nrunner('echo hidden')\n",
             b"import os\ndef run():\n    globals()['runner'] = os.system\n    runner('echo hidden')\nrun()\n",
             (
@@ -381,6 +390,33 @@ class TestTarScanner:
         payload = (
             b"import os\nrunner = os.system\nif True:\n    globals()['runner'] = print\nglobals()['runner']('safe')\n"
         )
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            b"import os\nos.__dict__['_safe'] = print\nos.__dict__.get('_safe', os.system)('safe')\n",
+            b"import os\nos.__dict__['_safe'] = print\nos.__dict__.pop('_safe', os.system)('safe')\n",
+            b"import os\nos.__dict__['_safe'] = print\nos.__dict__.setdefault('_safe', os.system)('safe')\n",
+            b"import os\nrunner = print\nglobals().setdefault('runner', os.system)\nrunner('safe')\n",
+            b"import os\nglobals()['runner'] = os.system\nglobals().pop('runner')\nrunner('safe')\n",
+            b"import os\nos.__dict__['runner'] = os.system\nos.__dict__.pop('runner')\nos.runner('safe')\n",
+            b"[locals()['__builtins__']['eval']('safe') for _ in (1,)]\n",
+        ],
+    )
+    def test_scan_tar_ignores_benign_namespace_defaults_and_comprehension_locals(
+        self, tmp_path: Path, payload: bytes
+    ) -> None:
+        """Definite safe namespace values and nested comprehension locals should stay clean."""
+        archive_path = tmp_path / "model_bundle.tar"
 
         with tarfile.open(archive_path, "w") as archive:
             info = tarfile.TarInfo("handler.py")
