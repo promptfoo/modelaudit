@@ -239,6 +239,17 @@ class TestNetworkCommDetector:
         assert revision in url_finding["url"]
         assert url_finding["url"].endswith(f"/{revision}/model.safetensors")
 
+    def test_public_revision_names_are_preserved(self) -> None:
+        """Public model branch and tag names should remain useful for audit follow-up."""
+        detector = NetworkCommDetector()
+        revision = "ReleaseCandidate2025-05-abcdef"
+        data = f"https://huggingface.co/org/repo/resolve/{revision}/model.safetensors".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://huggingface.co/org/repo/resolve/{revision}/model.safetensors"
+
     def test_public_model_repository_ids_are_preserved(self) -> None:
         """Known public model hosts should keep repo IDs for audit follow-up."""
         detector = NetworkCommDetector()
@@ -261,6 +272,17 @@ class TestNetworkCommDetector:
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
 
         assert url_finding["url"] == f"https://huggingface.co/{route}/meta-llama/{repo_id}/resolve/main/data.json"
+
+    def test_public_github_repository_names_are_preserved(self) -> None:
+        """Public source repository identities should remain visible while refs can still be redacted."""
+        detector = NetworkCommDetector()
+        repo_id = "MyModel-2025-LongName-abcdef"
+        url = f"https://raw.githubusercontent.com/org/{repo_id}/main/model.py"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == url
 
     def test_non_public_hex_path_capability_tokens_are_redacted(self) -> None:
         """Opaque lowercase hex download IDs should be redacted outside public model revisions."""
@@ -557,6 +579,19 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == "https://example.com/path/<redacted>/model.bin"
         assert path_token not in json.dumps([network_finding, url_finding], sort_keys=True)
+
+    def test_cc_pattern_snippets_redact_partial_url_path_tokens(self) -> None:
+        """C&C snippets should expand to the URL start before redacting path tokens."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+        data = f"https://example.com/download/{path_token}/malware.bin".encode()
+
+        findings = detector.scan(data, "hook.py")
+        cc_finding = next(finding for finding in findings if finding["type"] == "cc_pattern")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>/malware.bin"
+        assert path_token not in json.dumps([cc_finding, url_finding], sort_keys=True)
 
     def test_network_functions_not_flagged_in_documentation_metadata_context(self) -> None:
         """Documentation prose should not report raw network library/function token mentions."""

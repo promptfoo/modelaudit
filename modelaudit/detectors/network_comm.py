@@ -64,10 +64,12 @@ _KNOWN_ARTIFACT_FILENAME_EXTENSIONS = frozenset(
     }
 )
 _TRAILING_PATH_DELIMITERS = ".,;:)]}'\""
+_URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>"
 _MIN_CAPABILITY_TOKEN_ENTROPY = 3.5
 _PUBLIC_MODEL_REPOSITORY_HOSTS = frozenset({"huggingface.co", "hf.co"})
 _PUBLIC_MODEL_REPOSITORY_MARKERS = frozenset({"blob", "resolve", "tree"})
 _PUBLIC_MODEL_REPOSITORY_PREFIXES = frozenset({"datasets", "spaces"})
+_PUBLIC_SOURCE_REPOSITORY_HOSTS = frozenset({"github.com", "www.github.com", "raw.githubusercontent.com"})
 _PATH_STYLE_CLOUD_HOSTS = frozenset({"s3.amazonaws.com", "storage.googleapis.com", "storage.cloud.google.com"})
 _S3_REGIONAL_HOST_PATTERN = re.compile(r"^s3[.-][a-z0-9-]+\.amazonaws\.com$")
 _AZURE_STORAGE_HOST_SUFFIXES = (".blob.core.windows.net", ".dfs.core.windows.net")
@@ -139,13 +141,20 @@ def _is_public_model_repository_segment(hostname: str, segments: list[str], inde
     return index in repository_indexes
 
 
-def _is_public_model_revision_hash_segment(hostname: str, segments: list[str], index: int) -> bool:
+def _is_public_model_revision_segment(hostname: str, segments: list[str], index: int) -> bool:
     if hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS or index == 0:
         return False
-    token_candidate, _trailing_delimiters = _split_trailing_path_delimiters(segments[index])
-    if not _HEX_PATH_TOKEN_PATTERN.fullmatch(unquote(token_candidate)):
-        return False
     return segments[index - 1].lower() in _PUBLIC_MODEL_REPOSITORY_MARKERS
+
+
+def _is_public_source_repository_segment(hostname: str, segments: list[str], index: int) -> bool:
+    if hostname not in _PUBLIC_SOURCE_REPOSITORY_HOSTS or index not in {1, 2}:
+        return False
+    if len(segments) <= 3:
+        return False
+    if hostname == "raw.githubusercontent.com":
+        return True
+    return any(segment.lower() in {"blob", "raw", "tree"} for segment in segments[3:])
 
 
 def _is_path_style_cloud_bucket_segment(scheme: str, hostname: str, index: int) -> bool:
@@ -208,7 +217,9 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
         )
         if _is_public_model_repository_segment(hostname, segments, index):
             continue
-        if _is_public_model_revision_hash_segment(hostname, segments, index):
+        if _is_public_model_revision_segment(hostname, segments, index):
+            continue
+        if _is_public_source_repository_segment(hostname, segments, index):
             continue
         if _is_path_style_cloud_bucket_segment(scheme, hostname, index):
             continue
@@ -263,6 +274,23 @@ def _redact_url_for_finding(url: str) -> str:
 
 def _redact_urls_in_text(text: str) -> str:
     return _URL_IN_TEXT_PATTERN.sub(lambda match: _redact_url_for_finding(match.group()), text)
+
+
+def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *, before: int, after: int) -> str:
+    start = max(0, match_start - before)
+    end = min(len(data), match_end + after)
+
+    url_start = match_start
+    while url_start > 0 and data[url_start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
+        url_start -= 1
+    if b"://" in data[url_start:match_start]:
+        start = min(start, url_start)
+        url_end = match_end
+        while url_end < len(data) and data[url_end] not in _URL_TEXT_BOUNDARY_BYTES:
+            url_end += 1
+        end = max(end, url_end)
+
+    return _redact_urls_in_text(data[start:end].decode("utf-8", errors="ignore"))
 
 
 _DOC_CONTEXT_EXTENSIONS: tuple[str, ...] = (
@@ -1086,9 +1114,7 @@ class NetworkCommDetector:
                     continue
 
                 # Try to get some context around the function call
-                start = max(0, idx - 50)
-                end = min(len(data), idx + 100)
-                snippet = _redact_urls_in_text(data[start:end].decode("utf-8", errors="ignore"))
+                snippet = _redacted_snippet_for_match(data, idx, idx + len(func), before=50, after=100)
 
                 confidence = 0.6
                 severity = "HIGH"
@@ -1119,10 +1145,7 @@ class NetworkCommDetector:
             if idx < 0:
                 continue
 
-            # Get context
-            start = max(0, idx - 30)
-            end = min(len(data), idx + len(pattern) + 30)
-            snippet = _redact_urls_in_text(data[start:end].decode("utf-8", errors="ignore"))
+            snippet = _redacted_snippet_for_match(data, idx, idx + len(pattern), before=30, after=30)
 
             confidence = 0.8
             severity = "CRITICAL"
