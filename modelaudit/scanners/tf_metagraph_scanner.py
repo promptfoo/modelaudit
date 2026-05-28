@@ -135,7 +135,7 @@ def _collect_structure(metagraph: Any) -> _MetaGraphStructure:
     function_node_count = sum(len(function.node_def) for function in metagraph.graph_def.library.function)
     collection_count = len(metagraph.collection_def)
 
-    if not has_graph:
+    if not has_graph and collection_count == 0:
         return _MetaGraphStructure(
             valid=False,
             reason="missing_graph_def",
@@ -542,7 +542,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                         )
 
                     if any(hint in key_lower for hint in _COLLECTION_EXEC_HINTS):
-                        decoded = value[:_MAX_ATTR_VALUE_BYTES].decode("utf-8", errors="ignore")
+                        decoded = value[:_MAX_COLLECTION_VALUE_BYTES].decode("utf-8", errors="ignore")
                         if _COMMAND_RE.search(decoded) and _NETWORK_RE.search(decoded):
                             result.add_check(
                                 name="MetaGraph Collection Executable Pattern",

@@ -126,19 +126,38 @@ def _write_oversized_header_safetensors(path: Path, header_len: int) -> None:
         handle.write(b"\x00\x00\x00\x00")
 
 
-def test_oversized_header_triggers_limit_check(tmp_path: Path) -> None:
+def test_oversized_header_returns_operational_exit2(tmp_path: Path) -> None:
+    file_path = tmp_path / "oversized_header.safetensors"
+    max_header_bytes = 1 * 1024 * 1024
+    _write_oversized_header_safetensors(file_path, header_len=max_header_bytes + 1)
+
+    result = scan_model_directory_or_file(str(file_path), max_safetensors_header_bytes=max_header_bytes)
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    limit_check = next(check for check in result.checks if check.name == "Header Size Limit")
+    assert limit_check.severity == IssueSeverity.INFO
+
+
+def test_oversized_header_triggers_limit_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     file_path = tmp_path / "oversized_header.safetensors"
     max_header_bytes = 1 * 1024 * 1024
     _write_oversized_header_safetensors(file_path, header_len=max_header_bytes + 1)
 
     scanner = SafeTensorsScanner({"max_safetensors_header_bytes": max_header_bytes})
+    monkeypatch.setattr(
+        scanner,
+        "calculate_file_hashes",
+        lambda _path: pytest.fail("oversized SafeTensors headers must be rejected before hashing"),
+    )
     result = scanner.scan(str(file_path))
 
     header_limit_check = next((check for check in result.checks if check.name == "Header Size Limit"), None)
     assert header_limit_check is not None
     assert header_limit_check.status.value == "failed"
+    assert all(check.name != "File Integrity Hash" for check in result.checks)
     assert "exceeds maximum allowed size" in header_limit_check.message
-    assert result.success is True
+    assert result.success is False
     assert result.metadata["analysis_incomplete"] is True
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "safetensors_header_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
@@ -166,7 +185,7 @@ def test_oversized_header_skips_metadata_content_analysis(tmp_path: Path, monkey
     assert header_limit_check.status.value == "failed"
     assert result.metadata["analysis_incomplete"] is True
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert result.success is True
+    assert result.success is False
 
 
 def test_oversized_header_does_not_read_beyond_configured_limit(

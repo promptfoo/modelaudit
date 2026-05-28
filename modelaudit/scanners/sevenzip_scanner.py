@@ -277,12 +277,14 @@ class SevenZipScanner(BaseScanner):
                     "py7zr library not installed. "
                     "Install with 'pip install py7zr' or 'pip install modelaudit[sevenzip]'"
                 ),
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={
                     "error_type": "missing_dependency",
                     "required_package": "py7zr",
                     "install_command": "pip install py7zr",
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "sevenzip_analysis_incomplete",
                 },
             )
             mark_archive_scan_incomplete(result, "sevenzip_analysis_incomplete")
@@ -530,9 +532,13 @@ class SevenZipScanner(BaseScanner):
                     f"Nested member probe limit ({self.max_extensionless_probes}) "
                     f"reached; remaining unsupported members were not inspected"
                 ),
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=archive_path,
-                details={"limit": self.max_extensionless_probes},
+                details={
+                    "limit": self.max_extensionless_probes,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "sevenzip_analysis_incomplete",
+                },
             )
 
         probe_candidates.sort(key=lambda item: (-item[0], item[1]))
@@ -565,9 +571,13 @@ class SevenZipScanner(BaseScanner):
                     name=f"Nested 7z Probe: {file_name}",
                     passed=False,
                     message=f"Failed to inspect nested archive candidate {file_name}: {e}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=f"{archive_path}:{file_name}",
-                    details={"error": str(e)},
+                    details={
+                        "error": str(e),
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "sevenzip_analysis_incomplete",
+                    },
                 )
 
         return nested_archives, nested_probe_formats, probes_complete
@@ -993,6 +1003,8 @@ class SevenZipScanner(BaseScanner):
             else:
                 nested_config = dict(self.config)
                 nested_config["_archive_depth"] = depth + 1
+                # Extracted members are deleted below, so their temporary paths cannot be reused as cache keys.
+                nested_config["cache_enabled"] = False
                 file_result = self._scan_nested_archive_entry(scan_path, nested_config)
 
             self._rewrite_nested_result_context(file_result, scan_path, archive_path, original_name)
