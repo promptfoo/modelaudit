@@ -680,6 +680,32 @@ def test_keras_h5_scanner_flags_weights_only_external_link_without_keras_metadat
     ]
 
 
+def test_keras_h5_scanner_flags_keras3_weights_external_link_without_legacy_attrs(tmp_path: Path) -> None:
+    """Keras 3 .weights.h5 files use layers/*/vars rather than legacy attrs."""
+    external_source = tmp_path / "external_source.h5"
+    with h5py.File(external_source, "w") as f:
+        f.create_dataset("payload", data=[1.0])
+
+    weights_path = tmp_path / "model.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        vars_group = f.create_group("layers").create_group("dense").create_group("vars")
+        vars_group["0"] = h5py.ExternalLink(external_source.name, "/payload")
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["parse_status"] == "unknown"
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/layers/dense/vars/0",
+            "filename": "external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
 def test_keras_h5_scanner_malicious_model(tmp_path):
     """Test scanning a malicious Keras H5 model."""
     model_path = create_mock_h5_file(tmp_path, malicious=True)

@@ -4,6 +4,7 @@ import json
 import os
 import re
 from contextlib import suppress
+from pathlib import Path
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import (
@@ -175,7 +176,7 @@ class KerasH5Scanner(BaseScanner):
                 if (
                     "model_config" in f.attrs
                     or "keras_version" in result.metadata
-                    or self._has_weights_like_hdf5_layout(f)
+                    or self._has_weights_like_hdf5_layout(f, path)
                 ):
                     self._check_hdf5_external_references(f, result, path)
 
@@ -342,12 +343,27 @@ class KerasH5Scanner(BaseScanner):
             return self._JSON_ATTRIBUTE_PARSE_FAILED
 
     @classmethod
-    def _has_weights_like_hdf5_layout(cls, h5_file: Any) -> bool:
+    def _has_weights_like_hdf5_layout(cls, h5_file: Any, path: str) -> bool:
         """Return True for HDF5 layouts that resemble Keras weights-only files."""
         if any(str(key).lower() in cls._KERAS_WEIGHT_ROOT_GROUPS for key in h5_file):
             return True
 
-        return any(str(key).lower() in cls._KERAS_WEIGHT_ROOT_ATTRS for key in h5_file.attrs)
+        if any(str(key).lower() in cls._KERAS_WEIGHT_ROOT_ATTRS for key in h5_file.attrs):
+            return True
+
+        return Path(path).name.lower().endswith(".weights.h5") and cls._has_keras3_weights_layout(h5_file)
+
+    @staticmethod
+    def _has_keras3_weights_layout(h5_file: Any) -> bool:
+        """Detect Keras 3 H5IOStore weights-only layouts without generic HDF5 overreach."""
+        if "vars" in h5_file:
+            return True
+
+        layers = h5_file.get("layers")
+        if not isinstance(layers, h5py.Group):
+            return False
+
+        return any(isinstance(layer, h5py.Group) and "vars" in layer for layer in layers.values())
 
     def _check_hdf5_external_references(self, h5_file: Any, result: ScanResult, source_path: str) -> None:
         """Detect HDF5 external links/storage before any Keras-specific parsing short-circuits."""
