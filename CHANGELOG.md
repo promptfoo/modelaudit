@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- route protocol-0 JAX checkpoint pickles through pickle opcode security checks
 - route renamed structured JAX/Orbax JSON checkpoints, conservatively report observable bounded-prefix threats, and fail closed for oversized identified metadata
 - classify Flax MessagePack recursion-limit analysis gaps as inconclusive coverage
 - classify incomplete JAX/Orbax metadata, pickle, and NumPy analysis as inconclusive coverage

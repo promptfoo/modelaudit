@@ -314,6 +314,46 @@ def test_malicious_pickle_global_opcode_is_detected(tmp_path: Path) -> None:
     )
 
 
+def test_protocol_zero_jax_checkpoint_pickle_global_opcode_is_detected(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "malicious_protocol0_state.checkpoint"
+    pickle_path.write_bytes(pickle.dumps({"framework": "jax", "payload": _MaliciousJaxState()}, protocol=0))
+
+    assert JaxCheckpointScanner.can_handle(str(pickle_path))
+
+    result = JaxCheckpointScanner().scan(str(pickle_path))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] in {"os.system", "posix.system", "nt.system"}
+        for check in result.checks
+    )
+
+
+def test_benign_protocol_zero_jax_checkpoint_is_scanned_as_pickle(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "benign_protocol0_state.checkpoint"
+    pickle_path.write_bytes(pickle.dumps({"framework": "jax", "params": {"dense": [1, 2, 3]}}, protocol=0))
+
+    assert JaxCheckpointScanner.can_handle(str(pickle_path))
+
+    result = JaxCheckpointScanner().scan(str(pickle_path))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Pickle Opcode Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_stack_global_opcode_is_detected_after_interleaved_unhandled_stack_push(tmp_path: Path) -> None:
     pickle_path = tmp_path / "interleaved_empty_list_stack_global_state.pickle"
     payload = (

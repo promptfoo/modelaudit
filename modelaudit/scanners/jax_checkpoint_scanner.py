@@ -226,6 +226,7 @@ class JaxCheckpointScanner(BaseScanner):
     _JSON_PREFIX_PATTERN_READ_FAILED_REASON: ClassVar[str] = "jax_json_checkpoint_prefix_pattern_read_failed"
     _METADATA_TRAVERSAL_LIMIT_REASON: ClassVar[str] = "jax_metadata_traversal_depth_limit"
     _PICKLE_SCAN_LIMIT_REASON: ClassVar[str] = "jax_pickle_scan_limit_exceeded"
+    _LEGACY_PICKLE_INITIAL_OPCODES: ClassVar[bytes] = b"(cdgINRSUV"
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         """Initialize JAX checkpoint scanning limits and regex detectors."""
@@ -742,6 +743,18 @@ class JaxCheckpointScanner(BaseScanner):
         return any(list(path_obj.glob(pattern)) for pattern in jax_patterns)
 
     @classmethod
+    def _legacy_pickle_header_has_jax_indicator(cls, path: str, header: bytes) -> bool:
+        if header[:1] not in cls._LEGACY_PICKLE_INITIAL_OPCODES:
+            return False
+
+        with suppress(Exception):
+            with open(path, "rb") as source:
+                data = source.read(max(8192, len(header)))
+            return cls._contains_jax_indicator(data.decode("utf-8", errors="ignore"))
+
+        return False
+
+    @classmethod
     def _is_likely_jax_file(cls, path: str) -> bool:
         """Determine if a file is likely a JAX checkpoint."""
         try:
@@ -751,7 +764,7 @@ class JaxCheckpointScanner(BaseScanner):
                 # pickles are textual and can begin directly with a string
                 # opcode such as `Vjax`, so they do not have the binary
                 # protocol marker.
-                if header.startswith(b"\x80") or header[:1] in b"(cdgINRSUV":
+                if header.startswith(b"\x80") or header[:1] in cls._LEGACY_PICKLE_INITIAL_OPCODES:
                     with suppress(Exception):
                         data = header + f.read(max(0, 8192 - len(header)))
                         data_str = data.decode("utf-8", errors="ignore").lower()
@@ -950,7 +963,7 @@ class JaxCheckpointScanner(BaseScanner):
                 header = f.read(1024)
 
             # Check file format
-            if header.startswith(b"\x80"):  # Pickle format
+            if header.startswith(b"\x80") or self._legacy_pickle_header_has_jax_indicator(path, header):
                 self._scan_pickle_checkpoint(path, result)
             elif header.startswith(b"\x93NUMPY"):  # NumPy format
                 self._scan_numpy_checkpoint(path, result)
