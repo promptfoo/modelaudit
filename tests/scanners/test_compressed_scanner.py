@@ -1,6 +1,7 @@
 import bz2
 import gzip
 import io
+import json
 import lzma
 import pickle
 import tarfile
@@ -313,6 +314,40 @@ def test_compressed_scanner_surfaces_high_risk_python_payload(tmp_path: Path) ->
     assert determine_exit_code(aggregate) == 1
 
 
+def test_compressed_scanner_header_routed_python_payload_preserves_security_name(tmp_path: Path) -> None:
+    path = tmp_path / "evil.py"
+    path.write_bytes(gzip.compress(b'import os\nos.system("echo hidden")\n'))
+
+    result = CompressedScanner().scan(str(path))
+
+    python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+    assert any(check.rule_code == "S101" for check in python_checks)
+    assert any(check.location == f"{path} -> evil.py.inner" for check in python_checks)
+
+
+def test_compressed_scanner_nested_python_payload_preserves_security_name(tmp_path: Path) -> None:
+    path = tmp_path / "evil.py.gz.gz"
+    path.write_bytes(gzip.compress(gzip.compress(b'import os\nos.system("echo hidden")\n')))
+
+    result = CompressedScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+    assert any(check.rule_code == "S101" for check in python_checks)
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_compressed_scanner_python_named_executable_bytes_still_report_executable(tmp_path: Path) -> None:
+    path = tmp_path / "native.py.gz"
+    path.write_bytes(gzip.compress(b"\x7fELF" + b"\x00" * 48))
+
+    result = CompressedScanner().scan(str(path))
+
+    executable_checks = [check for check in result.checks if check.name == "Executable Archive Member Detection"]
+    assert executable_checks
+    assert executable_checks[0].location == f"{path} -> native.py"
+
+
 def test_compressed_scanner_surfaces_content_disguised_executable_payload(tmp_path: Path) -> None:
     path = tmp_path / "payload.dat.gz"
     path.write_bytes(gzip.compress(b"\x7fELF" + b"\x00" * 48))
@@ -321,9 +356,23 @@ def test_compressed_scanner_surfaces_content_disguised_executable_payload(tmp_pa
     aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
 
     executable_checks = [check for check in result.checks if check.name == "Executable Archive Member Detection"]
-    assert executable_checks
+    assert len(executable_checks) == 1
     assert executable_checks[0].location == f"{path} -> payload.dat"
     assert determine_exit_code(aggregate) == 1
+
+
+def test_compressed_scanner_benign_llamafile_uses_owned_executable_analysis(tmp_path: Path) -> None:
+    path = tmp_path / "safe.llamafile.gz"
+    payload = b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime\n--threads 4\n"
+    path.write_bytes(gzip.compress(payload))
+
+    result = CompressedScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    routing_checks = [check for check in result.checks if check.name == "Compressed Wrapper Inner Scanner Routing"]
+    assert routing_checks[0].details["inner_scanner"] == "llamafile"
+    assert not any(check.name == "Executable Archive Member Detection" for check in result.checks)
+    assert determine_exit_code(aggregate) == 0
 
 
 @pytest.mark.parametrize(
@@ -857,12 +906,22 @@ def test_compressed_scanner_complete_wrapper_caches_without_ephemeral_inner_entr
             min_cache_file_size=0,
         )
         second_stats = get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()
+        cache_files = [
+            cache_file
+            for cache_file in (tmp_path / "cache").rglob("*.json")
+            if cache_file.name != "cache_metadata.json"
+        ]
+        cached_names = {
+            json.loads(cache_file.read_text(encoding="utf-8"))["file_info"]["original_name"]
+            for cache_file in cache_files
+        }
 
         assert first.success is True
         assert second.success is True
-        assert first_stats["total_entries"] <= 2
+        assert first_stats["total_entries"] == 2
         assert second_stats["total_entries"] == first_stats["total_entries"]
         assert second_stats["cache_hits"] > first_stats["cache_hits"]
+        assert cached_names == {path.name}
     finally:
         reset_cache_manager()
 
@@ -1014,6 +1073,19 @@ def test_compressed_scanner_analyzes_split_python_as_one_payload(tmp_path: Path)
     python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
     assert any(check.rule_code == "S101" for check in python_checks)
     assert "scan_outcome" not in result.metadata
+
+
+def test_compressed_scanner_scans_later_python_member_when_aggregate_cannot_parse(tmp_path: Path) -> None:
+    path = tmp_path / "members.py.gz"
+    path.write_bytes(gzip.compress(b"def incomplete(\n") + gzip.compress(b'import os\nos.system("echo hidden")\n'))
+
+    result = CompressedScanner().scan(str(path))
+
+    python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+    assert any(
+        check.rule_code == "S101" and check.location == f"{path} -> members.py#member-2" for check in python_checks
+    )
+    assert result.metadata["scan_outcome_reasons"] == ["compressed_python_payload_analysis_incomplete"]
 
 
 def test_read_lz4_chunk_stream_splits_members_across_chunk_boundary() -> None:

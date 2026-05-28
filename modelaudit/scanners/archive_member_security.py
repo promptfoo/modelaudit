@@ -681,20 +681,34 @@ def scan_archive_member_for_known_risks(
     result: ScanResult,
     max_python_analysis_bytes: int,
     python_analysis_incomplete_reason: str,
+    analyze_python_source: bool = True,
+    analyze_executable_content: bool = True,
 ) -> None:
     """Inspect generic archive members that nested dispatch would otherwise ignore.
 
     ``archive_kind`` is a short label (``"ZIP"`` / ``"TAR"`` / ``"NeMo"``) used only for the
-    human-readable message text. The dispatcher (1) routes Python-looking
-    members through bounded AST analysis, (2) flags native/script executable-
-    suffix members, and (3) leaves everything else to the caller's normal
-    nested routing.
+    human-readable message text. The dispatcher (1) flags native/script
+    executable members, (2) routes Python-looking members through bounded AST
+    analysis when requested, and (3) leaves everything else to the caller's
+    normal nested routing.
     """
     normalized_name = member_name.replace("\\", "/").lstrip("/")
     normalized_lower = normalized_name.lower()
     location = f"{archive_path}:{member_name}"
 
-    if is_python_archive_member_name(normalized_lower):
+    if is_executable_archive_member_name(normalized_lower) or (
+        analyze_executable_content and tmp_path is not None and is_executable_archive_member_content(tmp_path)
+    ):
+        result.add_check(
+            name=_EXECUTABLE_MEMBER_CHECK_NAME,
+            passed=False,
+            message=f"Executable file found in {archive_kind} archive: {member_name}",
+            severity=IssueSeverity.WARNING,
+            location=location,
+            details={"entry": member_name},
+        )
+
+    if analyze_python_source and is_python_archive_member_name(normalized_lower):
         if total_size > max_python_analysis_bytes:
             mark_archive_scan_incomplete(result, python_analysis_incomplete_reason)
             result.add_check(
@@ -764,15 +778,3 @@ def scan_archive_member_for_known_risks(
                 rule_code=rule_code,
             )
         return
-
-    if is_executable_archive_member_name(normalized_lower) or (
-        tmp_path is not None and is_executable_archive_member_content(tmp_path)
-    ):
-        result.add_check(
-            name=_EXECUTABLE_MEMBER_CHECK_NAME,
-            passed=False,
-            message=f"Executable file found in {archive_kind} archive: {member_name}",
-            severity=IssueSeverity.WARNING,
-            location=location,
-            details={"entry": member_name},
-        )
