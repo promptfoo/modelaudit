@@ -13,7 +13,9 @@ from modelaudit.rules import Severity
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.gguf_scanner import (
     GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON,
+    GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON,
     GGUF_PARSE_INCONCLUSIVE_REASON,
+    GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON,
     GgufScanner,
 )
 from tests.helpers import create_mock_gguf
@@ -134,6 +136,34 @@ def _write_gguf_string_metadata_entries(
             f.write(encoded_value)
 
 
+def _write_gguf_raw_metadata_entries(
+    path: Path,
+    entries: list[tuple[str, int, bytes]],
+    *,
+    n_tensors: int = 0,
+) -> None:
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", n_tensors))
+        f.write(struct.pack("<Q", len(entries)))
+        for key, value_type, value_bytes in entries:
+            encoded_key = key.encode("utf-8")
+            f.write(struct.pack("<Q", len(encoded_key)))
+            f.write(encoded_key)
+            f.write(struct.pack("<I", value_type))
+            f.write(value_bytes)
+
+
+def _encode_gguf_string(value: str) -> bytes:
+    encoded = value.encode("utf-8")
+    return struct.pack("<Q", len(encoded)) + encoded
+
+
+def _encode_gguf_array(subtype: int, values: bytes, count: int) -> bytes:
+    return struct.pack("<IQ", subtype, count) + values
+
+
 def _single_file_metadata(aggregate: Any) -> Any:
     return next(iter(aggregate.file_metadata.values()))
 
@@ -147,10 +177,15 @@ def _assert_inconclusive_exit2(aggregate: Any, reason: str) -> None:
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
 
 
+def _assert_no_warning_or_critical_issues(result: Any) -> None:
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
 def _assert_uncached_rerun_preserves_inconclusive_exit2(
     path: Path,
     cache_dir: Path,
     reason: str,
+    **scan_kwargs: Any,
 ) -> None:
     reset_cache_manager()
     try:
@@ -159,12 +194,14 @@ def _assert_uncached_rerun_preserves_inconclusive_exit2(
             cache_enabled=True,
             cache_dir=str(cache_dir),
             min_cache_file_size=0,
+            **scan_kwargs,
         )
         second = scan_model_directory_or_file(
             str(path),
             cache_enabled=True,
             cache_dir=str(cache_dir),
             min_cache_file_size=0,
+            **scan_kwargs,
         )
 
         _assert_inconclusive_exit2(first, reason)
@@ -378,6 +415,40 @@ def test_gguf_scanner_duplicate_benign_chat_template_ignores_s902_severity_overr
     _assert_inconclusive_exit2(aggregate, GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON)
 
 
+def test_gguf_scanner_duplicate_and_key_limit_ignore_s902_severity_override(tmp_path: Path) -> None:
+    path = tmp_path / "benign-duplicate-template-key-limit-severity-override.gguf"
+    _write_gguf_string_metadata_entries(
+        path,
+        [
+            ("tokenizer.chat_template", "{{ message['content'] }}"),
+            ("tokenizer.chat_template", "{{ message['role'] }}"),
+        ],
+        declared_count=3,
+    )
+
+    set_config(ModelAuditConfig(severity={"S902": Severity.CRITICAL}))
+    try:
+        direct = GgufScanner(config={"gguf_max_metadata_keys": 2}).scan(str(path))
+        aggregate = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=False,
+            gguf_max_metadata_keys=2,
+        )
+    finally:
+        reset_config()
+
+    checks_by_name = {check.name: check for check in direct.checks}
+    assert checks_by_name["GGUF Duplicate Metadata Keys"].rule_code is None
+    assert checks_by_name["GGUF Duplicate Metadata Keys"].severity == IssueSeverity.INFO
+    assert checks_by_name["GGUF Metadata Resource Limits"].rule_code is None
+    assert checks_by_name["GGUF Metadata Resource Limits"].severity == IssueSeverity.INFO
+    _assert_no_warning_or_critical_issues(direct)
+    assert GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    _assert_inconclusive_exit2(aggregate, GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON)
+    assert GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON in _single_file_metadata(aggregate)["scan_outcome_reasons"]
+
+
 def test_gguf_scanner_scans_malicious_template_before_truncated_metadata(tmp_path: Path) -> None:
     path = tmp_path / "trailing-truncated-template.gguf"
     _write_gguf_string_metadata_entries(
@@ -418,6 +489,306 @@ def test_gguf_scanner_reports_duplicate_key_before_truncated_duplicate_value(tmp
     assert GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
     assert any(check.name == "GGUF Duplicate Metadata Keys" for check in direct.checks)
     _assert_inconclusive_exit2(aggregate, GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON)
+
+
+def test_gguf_metadata_array_item_limit_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "bounded-array.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [("test.array", 9, _encode_gguf_array(0, b"\x01\x02", 2))],
+    )
+
+    direct = GgufScanner(config={"gguf_max_metadata_array_items": 1}).scan(str(path))
+    aggregate = scan_model_directory_or_file(
+        str(path),
+        cache_enabled=False,
+        gguf_max_metadata_array_items=1,
+    )
+
+    assert direct.success is False
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in direct.issues)
+    assert any(
+        check.name == "GGUF Metadata Resource Limits"
+        and check.details["max_metadata_array_items"] == 1
+        and check.details["scan_outcome_reason"] == GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON
+        for check in direct.checks
+    )
+    _assert_inconclusive_exit2(aggregate, GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON)
+    _assert_uncached_rerun_preserves_inconclusive_exit2(
+        path,
+        tmp_path / "array-cache",
+        GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON,
+        gguf_max_metadata_array_items=1,
+    )
+
+
+def test_gguf_metadata_byte_limit_is_inconclusive(tmp_path: Path) -> None:
+    path = tmp_path / "bounded-metadata-bytes.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [("test.string", 8, _encode_gguf_string("benign value"))],
+    )
+
+    direct = GgufScanner(config={"gguf_max_metadata_bytes": 8}).scan(str(path))
+    aggregate = scan_model_directory_or_file(
+        str(path),
+        cache_enabled=False,
+        gguf_max_metadata_bytes=8,
+    )
+
+    assert direct.success is False
+    assert any(
+        check.name == "GGUF Metadata Resource Limits" and check.details["max_metadata_bytes"] == 8
+        for check in direct.checks
+    )
+    _assert_inconclusive_exit2(aggregate, GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON)
+
+
+def test_gguf_metadata_limit_ignores_s902_severity_override(tmp_path: Path) -> None:
+    path = tmp_path / "bounded-array-severity-override.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [("test.array", 9, _encode_gguf_array(0, b"\x01\x02", 2))],
+    )
+
+    set_config(ModelAuditConfig(severity={"S902": Severity.CRITICAL}))
+    try:
+        direct = GgufScanner(config={"gguf_max_metadata_array_items": 1}).scan(str(path))
+        aggregate = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=False,
+            gguf_max_metadata_array_items=1,
+        )
+    finally:
+        reset_config()
+
+    limit_checks = [check for check in direct.checks if check.name == "GGUF Metadata Resource Limits"]
+    assert len(limit_checks) == 1
+    assert limit_checks[0].severity == IssueSeverity.INFO
+    assert limit_checks[0].rule_code is None
+    _assert_no_warning_or_critical_issues(direct)
+    _assert_inconclusive_exit2(aggregate, GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON)
+
+
+def test_gguf_extract_metadata_reports_bounded_partial_results(tmp_path: Path) -> None:
+    path = tmp_path / "bounded-extracted-metadata.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [
+            ("general.architecture", 8, _encode_gguf_string("llama")),
+            ("test.array", 9, _encode_gguf_array(0, b"\x01\x02", 2)),
+        ],
+    )
+
+    metadata = GgufScanner(config={"gguf_max_metadata_array_items": 1}).extract_metadata(str(path))
+
+    assert metadata["architecture"] == "llama"
+    assert metadata["metadata_count"] == 2
+    assert "exceeds per-array limit 1" in metadata["error_reading_metadata"]
+
+
+def test_gguf_total_metadata_array_item_limit_is_inconclusive(tmp_path: Path) -> None:
+    path = tmp_path / "bounded-total-array-items.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [
+            ("test.first", 9, _encode_gguf_array(0, b"\x01", 1)),
+            ("test.second", 9, _encode_gguf_array(0, b"\x02", 1)),
+        ],
+    )
+
+    direct = GgufScanner(config={"gguf_max_total_metadata_array_items": 1}).scan(str(path))
+
+    assert direct.success is False
+    assert any(
+        check.name == "GGUF Metadata Resource Limits" and check.details["max_total_metadata_array_items"] == 1
+        for check in direct.checks
+    )
+    assert GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+
+
+def test_gguf_scanner_keeps_malicious_template_found_before_array_limit(tmp_path: Path) -> None:
+    path = tmp_path / "template-before-array-limit.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [
+            ("tokenizer.chat_template", 8, _encode_gguf_string("{{ ''.__class__.__mro__[1].__subclasses__() }}")),
+            ("test.array", 9, _encode_gguf_array(0, b"\x01\x02", 2)),
+        ],
+    )
+
+    direct = GgufScanner(config={"gguf_max_metadata_array_items": 1}).scan(str(path))
+    aggregate = scan_model_directory_or_file(
+        str(path),
+        cache_enabled=False,
+        gguf_max_metadata_array_items=1,
+    )
+
+    assert GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in direct.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_gguf_scanner_keeps_malicious_template_found_before_key_count_limit(tmp_path: Path) -> None:
+    path = tmp_path / "template-before-key-count-limit.gguf"
+    _write_gguf_string_metadata_entries(
+        path,
+        [("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}")],
+        declared_count=2,
+    )
+
+    direct = GgufScanner(config={"gguf_max_metadata_keys": 1}).scan(str(path))
+    aggregate = scan_model_directory_or_file(
+        str(path),
+        cache_enabled=False,
+        gguf_max_metadata_keys=1,
+    )
+
+    assert GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in direct.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_gguf_nested_metadata_array_depth_limit_is_inconclusive(tmp_path: Path) -> None:
+    path = tmp_path / "deep-array.gguf"
+    leaf = _encode_gguf_array(0, b"\x01", 1)
+    nested = _encode_gguf_array(9, _encode_gguf_array(9, leaf, 1), 1)
+    _write_gguf_raw_metadata_entries(path, [("test.array", 9, nested)])
+
+    direct = GgufScanner(config={"gguf_max_metadata_array_depth": 2}).scan(str(path))
+    aggregate = scan_model_directory_or_file(
+        str(path),
+        cache_enabled=False,
+        gguf_max_metadata_array_depth=2,
+    )
+
+    assert direct.success is False
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in direct.issues)
+    _assert_inconclusive_exit2(aggregate, GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON)
+
+
+def test_gguf_tensor_information_byte_limit_is_inconclusive(tmp_path: Path) -> None:
+    path = tmp_path / "bounded-tensor-info.gguf"
+    _write_gguf_with_tensor_type(path, tensor_type=0)
+
+    direct = GgufScanner(config={"gguf_max_tensor_info_bytes": 4}).scan(str(path))
+    aggregate = scan_model_directory_or_file(
+        str(path),
+        cache_enabled=False,
+        gguf_max_tensor_info_bytes=4,
+    )
+
+    assert direct.success is False
+    assert any(
+        check.name == "GGUF Tensor Resource Limits" and check.details["max_tensor_info_bytes"] == 4
+        for check in direct.checks
+    )
+    _assert_inconclusive_exit2(aggregate, GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON)
+
+
+def test_gguf_default_tensor_count_limit_blocks_compact_resource_exhaustion(tmp_path: Path) -> None:
+    path = tmp_path / "too-many-compact-tensors.gguf"
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", GgufScanner.DEFAULT_MAX_TENSORS + 1))
+        f.write(struct.pack("<Q", 0))
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert direct.success is False
+    assert "tensors" not in direct.metadata
+    assert any(
+        check.name == "GGUF Tensor Resource Limits"
+        and check.details["declared_tensors"] == GgufScanner.DEFAULT_MAX_TENSORS + 1
+        for check in direct.checks
+    )
+    _assert_inconclusive_exit2(aggregate, GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON)
+
+
+def test_gguf_tensor_metadata_summary_is_capped_without_skipping_validation(tmp_path: Path) -> None:
+    path = tmp_path / "capped-tensor-summary.gguf"
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", 3))
+        f.write(struct.pack("<Q", 0))
+
+        for index in range(3):
+            name = f"tensor{index}".encode()
+            f.write(struct.pack("<Q", len(name)))
+            f.write(name)
+            f.write(struct.pack("<I", 1))
+            f.write(struct.pack("<Q", 8))
+            f.write(struct.pack("<I", 0))
+            f.write(struct.pack("<Q", index * 32))
+
+        pad_to_tensor_data = (32 - (f.tell() % 32)) % 32
+        if pad_to_tensor_data:
+            f.write(b"\0" * pad_to_tensor_data)
+        f.write(b"\0" * 96)
+
+    result = GgufScanner(config={"gguf_max_reported_tensors": 1}).scan(str(path))
+
+    assert result.success
+    assert result.metadata["tensors"] == [{"name": "tensor0", "type": 0, "dims": [8]}]
+    assert result.metadata["tensor_count_reported"] == 1
+    assert result.metadata["tensor_metadata_truncated"] is True
+    assert result.metadata["max_reported_tensors"] == 1
+    assert not any("size mismatch" in issue.message.lower() for issue in result.issues)
+
+
+def test_gguf_streaming_tensor_parse_preserves_excessive_dimension_finding(tmp_path: Path) -> None:
+    path = tmp_path / "excessive-dimensions-missing-data.gguf"
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", 1))
+        f.write(struct.pack("<Q", 0))
+        name = b"huge_rank"
+        f.write(struct.pack("<Q", len(name)))
+        f.write(name)
+        f.write(struct.pack("<I", 1001))
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert any(
+        check.name == "Tensor Dimension Validation" and check.severity == IssueSeverity.CRITICAL
+        for check in direct.checks
+    )
+    assert any(check.name == "Tensor Data Section Bounds" for check in direct.checks)
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_gguf_tensor_limit_ignores_s902_severity_override(tmp_path: Path) -> None:
+    path = tmp_path / "bounded-tensor-info-severity-override.gguf"
+    _write_gguf_with_tensor_type(path, tensor_type=0)
+
+    set_config(ModelAuditConfig(severity={"S902": Severity.CRITICAL}))
+    try:
+        direct = GgufScanner(config={"gguf_max_tensor_info_bytes": 4}).scan(str(path))
+        aggregate = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=False,
+            gguf_max_tensor_info_bytes=4,
+        )
+    finally:
+        reset_config()
+
+    limit_checks = [check for check in direct.checks if check.name == "GGUF Tensor Resource Limits"]
+    assert len(limit_checks) == 1
+    assert limit_checks[0].severity == IssueSeverity.INFO
+    assert limit_checks[0].rule_code is None
+    _assert_no_warning_or_critical_issues(direct)
+    _assert_inconclusive_exit2(aggregate, GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON)
 
 
 def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -> None:
@@ -531,9 +902,11 @@ def test_gguf_scanner_large_kv_count(tmp_path: Path) -> None:
     result = GgufScanner().scan(str(path))
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert any(i.severity == IssueSeverity.INFO for i in result.issues)
-    # Should detect parsing error due to impossibly large KV count
-    assert "parse error" in str(result.issues[0].message).lower() or "invalid" in str(result.issues[0].message).lower()
+    assert GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "GGUF Metadata Resource Limits" and check.details["declared_metadata_keys"] == 2**31
+        for check in result.checks
+    )
 
 
 def test_gguf_scanner_large_tensor_count(tmp_path: Path) -> None:
@@ -548,7 +921,11 @@ def test_gguf_scanner_large_tensor_count(tmp_path: Path) -> None:
     result = GgufScanner().scan(str(path))
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert any(i.severity == IssueSeverity.INFO for i in result.issues)
+    assert GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "GGUF Tensor Resource Limits" and check.details["declared_tensors"] == 2**31
+        for check in result.checks
+    )
 
 
 def test_gguf_scanner_truncated_file(tmp_path: Path) -> None:
