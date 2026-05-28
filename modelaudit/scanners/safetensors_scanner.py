@@ -10,7 +10,8 @@ from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from ..core_results import mark_operational_scan_error
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 # Map SafeTensors dtypes to byte sizes for integrity checking
 _DTYPE_SIZES = {
@@ -34,6 +35,7 @@ MAX_HEADER_BYTES = 16 * 1024 * 1024
 SAFETENSORS_HEADER_INCONCLUSIVE_REASON = "safetensors_header_validation_failed"
 SAFETENSORS_STRUCTURE_INCONCLUSIVE_REASON = "safetensors_structure_validation_failed"
 SAFETENSORS_HEADER_LIMIT_INCONCLUSIVE_REASON = "safetensors_header_size_limit_exceeded"
+SAFETENSORS_READ_INCONCLUSIVE_REASON = "safetensors_read_failed"
 
 
 class SafeTensorsScanner(BaseScanner):
@@ -56,6 +58,30 @@ class SafeTensorsScanner(BaseScanner):
             result.metadata["scan_outcome_reasons"] = reasons
         if reason not in reasons:
             reasons.append(reason)
+
+    @staticmethod
+    def _is_unreadable_path_result(result: ScanResult) -> bool:
+        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    @classmethod
+    def _finish_read_failure(cls, result: ScanResult, path: str, error: OSError) -> ScanResult:
+        cls._mark_inconclusive(result, SAFETENSORS_READ_INCONCLUSIVE_REASON)
+        mark_operational_scan_error(result, SAFETENSORS_READ_INCONCLUSIVE_REASON)
+        result.add_check(
+            name="SafeTensors File Read",
+            passed=False,
+            message=f"Unable to read SafeTensors file: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": SAFETENSORS_READ_INCONCLUSIVE_REASON,
+            },
+        )
+        result.finish(success=False)
+        return result
 
     @staticmethod
     def _is_valid_shape(shape: Any) -> bool:
@@ -85,6 +111,12 @@ class SafeTensorsScanner(BaseScanner):
         """Scan a SafeTensors file."""
         path_check_result = self._check_path(path)
         if path_check_result:
+            if self._is_unreadable_path_result(path_check_result):
+                return self._finish_read_failure(
+                    self._create_result(),
+                    path,
+                    PermissionError(f"Path is not readable: {path}"),
+                )
             return path_check_result
 
         size_check = self._check_size_limit(path)
@@ -491,6 +523,8 @@ class SafeTensorsScanner(BaseScanner):
                 # Bytes scanned = file size
                 result.bytes_scanned = file_size
 
+        except OSError as e:
+            return self._finish_read_failure(result, path, e)
         except Exception as e:
             result.add_check(
                 name="SafeTensors File Scan",

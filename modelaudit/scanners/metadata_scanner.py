@@ -5,7 +5,9 @@ from pathlib import Path
 from typing import ClassVar
 from urllib.parse import unquote, urlparse, urlunparse
 
-from .base import BaseScanner, Issue, IssueSeverity, ScanResult
+from ..core_results import mark_operational_scan_error
+from ..scanner_results import mark_inconclusive_scan_result, scan_result_has_inconclusive_outcome
+from .base import BaseScanner, CheckStatus, Issue, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +23,8 @@ SUSPICIOUS_URL_DOMAINS = (
     "ngrok.io",
     "localtunnel.me",
 )
+_METADATA_READ_FAILED_REASON = "metadata_read_failed"
+_METADATA_TIMEOUT_REASON = "scan_timeout"
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -79,6 +83,14 @@ class MetadataScanner(BaseScanner):
         """Scan metadata file for security issues."""
         path_check_result = self._check_path(path)
         if path_check_result:
+            if any(
+                check.name == "Path Readable" and check.status == CheckStatus.FAILED
+                for check in path_check_result.checks
+            ):
+                result = self._create_result()
+                self._mark_metadata_read_failure(result, path, PermissionError(f"Path is not readable: {path}"))
+                result.finish(success=False)
+                return result
             return path_check_result
 
         size_check = self._check_size_limit(path)
@@ -100,13 +112,19 @@ class MetadataScanner(BaseScanner):
             self._check_timeout()
 
         except TimeoutError as e:
+            mark_inconclusive_scan_result(result, _METADATA_TIMEOUT_REASON)
+            mark_operational_scan_error(result, _METADATA_TIMEOUT_REASON)
             result.add_check(
                 name="Metadata Scan Timeout",
                 passed=False,
                 message=f"Scan timed out: {e!s}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"timeout_seconds": self.timeout},
+                details={
+                    "timeout_seconds": self.timeout,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": _METADATA_TIMEOUT_REASON,
+                },
                 why="Metadata scanning exceeded the configured timeout before all checks completed",
             )
         except Exception as e:
@@ -122,7 +140,7 @@ class MetadataScanner(BaseScanner):
             )
 
         result.bytes_scanned = file_size if p.exists() else 0
-        result.finish(success=True)
+        result.finish(success=not scan_result_has_inconclusive_outcome(result))
         return result
 
     def _add_issue_check(self, result: ScanResult, issue: Issue) -> None:
@@ -154,6 +172,8 @@ class MetadataScanner(BaseScanner):
 
         except TimeoutError:
             raise
+        except (OSError, UnicodeError) as e:
+            self._mark_metadata_read_failure(result, file_path, e)
         except Exception as e:
             self._add_issue_check(
                 result,
@@ -166,6 +186,25 @@ class MetadataScanner(BaseScanner):
                     type="file_error",
                 ),
             )
+
+    @staticmethod
+    def _mark_metadata_read_failure(result: ScanResult, file_path: str, error: OSError | UnicodeError) -> None:
+        """Record unavailable document coverage without fabricating a security finding."""
+        mark_inconclusive_scan_result(result, _METADATA_READ_FAILED_REASON)
+        mark_operational_scan_error(result, _METADATA_READ_FAILED_REASON)
+        result.add_check(
+            name="Metadata File Read",
+            passed=False,
+            message=f"Unable to load metadata document for analysis: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=file_path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": _METADATA_READ_FAILED_REASON,
+            },
+        )
 
     def _check_suspicious_urls_in_text(self, content: str, file_path: str, result: ScanResult) -> None:
         """Check for suspicious URLs in text content."""

@@ -6,10 +6,13 @@ from typing import Any
 
 import pytest
 
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
 from modelaudit.scanners import manifest_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.manifest_scanner import _PARSE_FAILED, ManifestScanner, _is_trusted_url_domain
+from modelaudit.utils.helpers import cache_decorator
 
 
 def _https_url(host: str, path: str = "/model.bin") -> str:
@@ -94,6 +97,232 @@ def test_manifest_scanner_clears_manifest_text_after_scan(tmp_path: Path) -> Non
 
     assert result.scanner is scanner
     assert scanner._manifest_text_cache == {}
+
+
+def test_manifest_blacklist_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert"}), encoding="utf-8")
+
+    def raise_os_error(_self: ManifestScanner, _path: str) -> str:
+        raise OSError("simulated manifest read failure")
+
+    monkeypatch.setattr(ManifestScanner, "_read_manifest_text", raise_os_error)
+
+    direct = ManifestScanner(config={"blacklist_patterns": ["blocked"]}).scan(str(test_file))
+    aggregate = scan_model_directory_or_file(
+        str(test_file),
+        blacklist_patterns=["blocked"],
+        cache_scan_results=False,
+    )
+
+    assert direct.success is False
+    assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert SCAN_OUTCOME_MESSAGE_METADATA_KEY in direct.metadata
+    assert "manifest_blacklist_read_failed" in direct.metadata.get("scan_outcome_reasons", [])
+    assert direct.metadata.get("operational_error") is True
+    assert direct.metadata.get("operational_error_reason") == "manifest_blacklist_read_failed"
+    assert any(
+        check.name == "Blacklist Pattern Check"
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("scan_outcome_reason") == "manifest_blacklist_read_failed"
+        and check.rule_code is None
+        for check in direct.checks
+    )
+    assert all(check.rule_code != "S1001" for check in direct.checks)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+    assert aggregate.file_metadata[str(test_file)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_manifest_blacklist_invalid_utf8_is_operational_not_security_finding(tmp_path: Path) -> None:
+    test_file = tmp_path / "config.json"
+    test_file.write_bytes(b'{"model_type": "bert", "label": "\xff"}')
+    cache_dir = tmp_path / "cache"
+
+    direct = ManifestScanner(config={"blacklist_patterns": ["blocked"]}).scan(str(test_file))
+    reset_cache_manager()
+    try:
+        aggregates = [
+            scan_model_directory_or_file(
+                str(test_file),
+                blacklist_patterns=["blocked"],
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            for _ in range(2)
+        ]
+
+        assert direct.success is False
+        assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert direct.metadata.get("operational_error_reason") == "manifest_blacklist_read_failed"
+        assert any(
+            check.name == "Blacklist Pattern Check"
+            and check.details.get("exception_type") == "UnicodeDecodeError"
+            and check.severity == IssueSeverity.INFO
+            and check.rule_code is None
+            for check in direct.checks
+        )
+        assert all(check.rule_code not in {"S902", "S1001"} for check in direct.checks)
+        for aggregate in aggregates:
+            assert not any(
+                issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues
+            )
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_manifest_unreadable_path_preflight_is_operational_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert"}), encoding="utf-8")
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
+
+    direct = ManifestScanner().scan(str(test_file))
+    aggregate = scan_model_directory_or_file(str(test_file), cache_enabled=False)
+
+    assert direct.success is False
+    assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata.get("operational_error_reason") == "manifest_read_failed"
+    assert aggregate.file_metadata[str(test_file)].get("operational_error_reason") == "manifest_read_failed"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_manifest_zip_probe_failure_preserves_owner_for_parser_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert"}), encoding="utf-8")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    def raise_os_error(_self: ManifestScanner, _path: str) -> str:
+        raise OSError("simulated manifest parser read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+    monkeypatch.setattr(ManifestScanner, "_read_manifest_text", raise_os_error)
+
+    aggregate = scan_model_directory_or_file(str(test_file), cache_enabled=False)
+
+    assert "manifest" in aggregate.scanner_names
+    assert aggregate.file_metadata[str(test_file)].get("operational_error_reason") == "manifest_read_failed"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_manifest_blacklist_read_failure_bypasses_stale_clean_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert", "padding": "x" * 11_000}), encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        with monkeypatch.context() as warm_cache:
+            warm_cache.setattr(
+                cache_decorator,
+                "should_bypass_cache_for_read_failure_aware_file",
+                lambda _path: False,
+            )
+            warm_result = scan_file(
+                str(test_file),
+                config={
+                    "blacklist_patterns": ["blocked"],
+                    "cache_enabled": True,
+                    "cache_dir": str(cache_dir),
+                    "min_cache_file_size": 0,
+                },
+            )
+
+        assert warm_result.success is True
+        cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        assert cached_entries > 0
+
+        def raise_os_error(_self: ManifestScanner, _path: str) -> str:
+            raise OSError("simulated manifest read failure after cache warm")
+
+        monkeypatch.setattr(ManifestScanner, "_read_manifest_text", raise_os_error)
+
+        aggregate = scan_model_directory_or_file(
+            str(test_file),
+            blacklist_patterns=["blocked"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        assert determine_exit_code(aggregate) == 2
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+        assert aggregate.file_metadata[str(test_file)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert (
+            aggregate.file_metadata[str(test_file)].get("operational_error_reason") == "manifest_blacklist_read_failed"
+        )
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
+    finally:
+        reset_cache_manager()
+
+
+def test_manifest_parser_read_failure_bypasses_stale_clean_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert", "padding": "x" * 11_000}), encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        with monkeypatch.context() as warm_cache:
+            warm_cache.setattr(
+                cache_decorator,
+                "should_bypass_cache_for_read_failure_aware_file",
+                lambda _path: False,
+            )
+            warm_result = scan_file(
+                str(test_file),
+                config={
+                    "cache_enabled": True,
+                    "cache_dir": str(cache_dir),
+                    "min_cache_file_size": 0,
+                },
+            )
+
+        assert warm_result.success is True
+        cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        assert cached_entries > 0
+
+        def raise_os_error(_self: ManifestScanner, _path: str) -> str:
+            raise OSError("simulated manifest parser read failure after cache warm")
+
+        monkeypatch.setattr(ManifestScanner, "_read_manifest_text", raise_os_error)
+
+        aggregate = scan_model_directory_or_file(
+            str(test_file),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        assert determine_exit_code(aggregate) == 2
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+        assert aggregate.file_metadata[str(test_file)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert aggregate.file_metadata[str(test_file)].get("operational_error_reason") == "manifest_read_failed"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
+    finally:
+        reset_cache_manager()
 
 
 def test_manifest_scanner_case_insensitive_blacklist(tmp_path):
@@ -213,8 +442,8 @@ def test_manifest_scanner_license_extraction(tmp_path):
     assert result.metadata["license"] == "apache-2.0"
 
 
-def test_parse_file_logs_warning(caplog, capsys):
-    """Ensure parsing errors log warnings without stdout output."""
+def test_parse_file_read_failure_logs_warning(caplog, capsys):
+    """Ensure read failures log warnings without stdout output."""
     scanner = ManifestScanner()
 
     with caplog.at_level(logging.WARNING, logger="modelaudit.scanners"):
@@ -222,9 +451,15 @@ def test_parse_file_logs_warning(caplog, capsys):
         content = scanner._parse_file("nonexistent.json", ".json", result)
 
     assert content is _PARSE_FAILED
-    assert any("Error parsing file nonexistent.json" in record.getMessage() for record in caplog.records)
+    assert any("Error reading file nonexistent.json" in record.getMessage() for record in caplog.records)
     assert capsys.readouterr().out == ""
-    assert any(issue.severity == IssueSeverity.DEBUG for issue in result.issues)
+    assert all(issue.severity == IssueSeverity.INFO for issue in result.issues)
+    assert any(
+        check.name == "Manifest File Read"
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("scan_outcome_reason") == "manifest_read_failed"
+        for check in result.checks
+    )
 
 
 def test_manifest_scanner_yaml_not_handled(tmp_path):
