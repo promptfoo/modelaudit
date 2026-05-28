@@ -32,6 +32,9 @@ _READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS = frozenset(
         ".pdiparams",
         ".pdmodel",
         ".plan",
+        ".rda",
+        ".rdata",
+        ".rds",
         ".safetensors",
         ".trt",
     }
@@ -71,6 +74,26 @@ def should_bypass_cache_for_safetensors_header_limit(file_path: str, config: dic
     except (ImportError, TypeError, ValueError):
         return False
     return should_defer_safetensors_header_limit_hash(file_path, max_header_bytes)
+
+
+def _known_uncacheable_scan_result(result: Any) -> bool:
+    """Return True for ScanResult objects policy will reject without serialization."""
+    try:
+        from ...scanner_results import INCONCLUSIVE_SCAN_OUTCOME, ScanResult, normalize_unclassified_scan_failure
+    except Exception:
+        return False
+
+    if not isinstance(result, ScanResult):
+        return False
+
+    normalize_unclassified_scan_failure(result)
+    metadata = result.metadata
+    return (
+        result.success is False
+        or bool(metadata.get("operational_error"))
+        or bool(metadata.get("analysis_incomplete"))
+        or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    )
 
 
 def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "cache_dir") -> Callable[[F], F]:
@@ -151,9 +174,11 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                 cache_manager = get_cache_manager(cache_config.cache_dir, enabled=True)
                 version_context = cache_config.get_version_context()
 
-                def cached_func_wrapper(fpath: str) -> dict:
+                def cached_func_wrapper(fpath: str) -> Any:
                     """Wrapper function for cache manager"""
                     result = func(*args, **kwargs)
+                    if _known_uncacheable_scan_result(result):
+                        return result
 
                     # Convert result to dictionary format for caching
                     if hasattr(result, "to_dict"):
@@ -187,6 +212,11 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     logger.debug(f"Cache miss for {os.path.basename(file_path)}, performing scan")
                     scan_start = time.perf_counter()
                     result_dict = cached_func_wrapper(file_path)
+                    if not isinstance(result_dict, dict):
+                        logger.debug(
+                            f"Skipping cache store for known uncacheable result from {os.path.basename(file_path)}"
+                        )
+                        return result_dict
                     if should_cache_scan_result(result_dict):
                         scan_duration_ms = int((time.perf_counter() - scan_start) * 1000)
                         cache_manager.store_result(

@@ -1697,7 +1697,13 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     format_probe_error: OSError | None = None
     try:
-        header_format = detect_file_format(path)
+        if os.path.isfile(path) and not os.access(path, os.R_OK):
+            format_probe_error = PermissionError(f"Path is not readable: {path}")
+    except OSError as e:
+        format_probe_error = e
+
+    try:
+        header_format = "unknown" if format_probe_error is not None else detect_file_format(path)
     except OSError as e:
         # Dedicated scanners can produce a format-specific inconclusive result
         # once extension routing selects their ownership.

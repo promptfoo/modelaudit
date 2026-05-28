@@ -265,6 +265,28 @@ def test_cached_scan_normalizes_and_skips_persisting_bare_unsuccessful_scan_resu
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
 
+def test_cached_scan_does_not_serialize_known_uncacheable_scan_result(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+
+    class UnserializableFailedResult(ScanResult):
+        def to_dict(self) -> dict[str, Any]:
+            raise AssertionError("known uncacheable results should not be serialized")
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        result = UnserializableFailedResult(scanner_name="pickle")
+        result.finish(success=False)
+        return result
+
+    result = scan(str(file_path), config)
+
+    assert isinstance(result, ScanResult)
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
 def test_cached_scan_skips_persisting_scan_timed_out_messages(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
