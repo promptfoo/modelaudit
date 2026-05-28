@@ -7,7 +7,9 @@ from typing import Any
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.rules import Severity
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.gguf_scanner import (
     GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON,
@@ -348,6 +350,32 @@ def test_gguf_scanner_duplicate_benign_chat_template_is_inconclusive_without_fin
         tmp_path / "duplicate-template-cache",
         GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON,
     )
+
+
+def test_gguf_scanner_duplicate_benign_chat_template_ignores_s902_severity_override(tmp_path: Path) -> None:
+    path = tmp_path / "benign-duplicate-template-severity-override.gguf"
+    _write_gguf_string_metadata_entries(
+        path,
+        [
+            ("tokenizer.chat_template", "{{ message['content'] }}"),
+            ("tokenizer.chat_template", "{{ message['role'] }}"),
+        ],
+    )
+
+    set_config(ModelAuditConfig(severity={"S902": Severity.CRITICAL}))
+    try:
+        direct = GgufScanner().scan(str(path))
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+    finally:
+        reset_config()
+
+    duplicate_checks = [check for check in direct.checks if check.name == "GGUF Duplicate Metadata Keys"]
+    assert len(duplicate_checks) == 1
+    assert duplicate_checks[0].severity == IssueSeverity.INFO
+    assert duplicate_checks[0].rule_code is None
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in direct.issues)
+    assert all(issue.rule_code != "S902" for issue in direct.issues)
+    _assert_inconclusive_exit2(aggregate, GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON)
 
 
 def test_gguf_scanner_scans_malicious_template_before_truncated_metadata(tmp_path: Path) -> None:
