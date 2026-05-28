@@ -131,6 +131,18 @@ class TestNetworkCommDetector:
         assert url_finding["url"] == "https://example.com/path/<redacted>,"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
 
+    def test_quoted_path_delimiters_do_not_prevent_token_redaction(self) -> None:
+        """Single-quoted source strings should not keep path tokens raw."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+        data = f"url='https://example.com/path/{path_token}'".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/path/<redacted>'"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
     def test_base64_path_capability_tokens_are_redacted(self) -> None:
         """Base64/base64url path tokens may contain encoded separators or padding."""
         detector = NetworkCommDetector()
@@ -141,6 +153,17 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == "https://example.com/download/<redacted>"
         assert encoded_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_long_base64_path_capability_tokens_use_entropy_not_unique_ratio(self) -> None:
+        """Long signed-CDN style path tokens should still be redacted."""
+        detector = NetworkCommDetector()
+        path_token = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_=" * 3
+
+        findings = detector.scan(f"https://example.com/download/{path_token}".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
 
     def test_public_revision_hash_paths_are_preserved(self) -> None:
         """Public model revision hashes should remain useful for audit follow-up."""

@@ -5,7 +5,9 @@ that could be used for data exfiltration or command & control operations.
 """
 
 import ipaddress
+import math
 import re
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import suppress
 from typing import Any, ClassVar
@@ -29,12 +31,19 @@ _PATH_TOKEN_CHARACTER_CLASS_PATTERNS = (
     re.compile(r"[._~+/=-]"),
 )
 _ARTIFACT_FILENAME_PATTERN = re.compile(r"(?i)^.+\.[a-z0-9]{1,10}$")
-_TRAILING_PATH_DELIMITERS = ".,;:)]}"
+_TRAILING_PATH_DELIMITERS = ".,;:)]}'\""
+_MIN_CAPABILITY_TOKEN_ENTROPY = 3.5
 
 
 def _split_trailing_path_delimiters(segment: str) -> tuple[str, str]:
     stripped = segment.rstrip(_TRAILING_PATH_DELIMITERS)
     return stripped, segment[len(stripped) :]
+
+
+def _shannon_entropy_per_char(value: str) -> float:
+    counts = Counter(value)
+    length = len(value)
+    return -sum((count / length) * math.log2(count / length) for count in counts.values())
 
 
 def _looks_like_capability_path_token(segment: str) -> bool:
@@ -51,8 +60,7 @@ def _looks_like_capability_path_token(segment: str) -> bool:
         return False
 
     character_classes = sum(bool(pattern.search(decoded)) for pattern in _PATH_TOKEN_CHARACTER_CLASS_PATTERNS)
-    unique_ratio = len(set(decoded)) / len(decoded)
-    return character_classes >= 3 and unique_ratio >= 0.45
+    return character_classes >= 3 and _shannon_entropy_per_char(decoded) >= _MIN_CAPABILITY_TOKEN_ENTROPY
 
 
 def _redact_url_path_tokens(hostname: str, path: str) -> str:
