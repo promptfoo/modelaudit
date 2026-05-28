@@ -17,6 +17,8 @@ from contextvars import copy_context
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from ..helpers.cache_decorator import should_bypass_cache_for_safetensors_header_limit
+
 if TYPE_CHECKING:
     from ...scanner_results import ScanResult
 
@@ -730,6 +732,10 @@ def scan_advanced_large_file(
     config = getattr(scanner, "config", {})
     cache_enabled = config.get("cache_enabled", True)
     cache_dir = config.get("cache_dir")
+
+    if should_bypass_cache_for_safetensors_header_limit(file_path, config):
+        logger.debug(f"Bypassing advanced-file cache for bounded SafeTensors header failure: {file_path}")
+        return scanner.scan(file_path)  # type: ignore[no-any-return]
 
     # If caching is disabled, proceed with direct scan
     if not cache_enabled:
