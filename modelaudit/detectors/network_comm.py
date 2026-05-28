@@ -24,6 +24,7 @@ _SENSITIVE_PATH_TOKEN_PATTERN = re.compile(
     r"xox[baprs]-[0-9A-Za-z-]{20,}"
     r")$"
 )
+_HEX_PATH_TOKEN_PATTERN = re.compile(r"(?i)^[a-f0-9]{32,}$")
 _PATH_TOKEN_CHARACTER_CLASS_PATTERNS = (
     re.compile(r"[a-z]"),
     re.compile(r"[A-Z]"),
@@ -62,6 +63,10 @@ _TRAILING_PATH_DELIMITERS = ".,;:)]}'\""
 _MIN_CAPABILITY_TOKEN_ENTROPY = 3.5
 _PUBLIC_MODEL_REPOSITORY_HOSTS = frozenset({"huggingface.co", "hf.co"})
 _PUBLIC_MODEL_REPOSITORY_MARKERS = frozenset({"blob", "resolve", "tree"})
+_PUBLIC_MODEL_REPOSITORY_PREFIXES = frozenset({"datasets", "spaces"})
+_PATH_STYLE_CLOUD_HOSTS = frozenset({"s3.amazonaws.com", "storage.googleapis.com", "storage.cloud.google.com"})
+_S3_REGIONAL_HOST_PATTERN = re.compile(r"^s3[.-][a-z0-9-]+\.amazonaws\.com$")
+_AZURE_STORAGE_HOST_SUFFIXES = (".blob.core.windows.net", ".dfs.core.windows.net")
 
 
 def _split_trailing_path_delimiters(segment: str) -> tuple[str, str]:
@@ -107,6 +112,8 @@ def _looks_like_capability_path_token(segment: str) -> bool:
         return False
     if len(decoded) < 20:
         return False
+    if _HEX_PATH_TOKEN_PATTERN.fullmatch(decoded):
+        return _shannon_entropy_per_char(decoded) >= _MIN_CAPABILITY_TOKEN_ENTROPY
     if not re.fullmatch(r"[A-Za-z0-9._~+/=\-]+", decoded):
         return False
 
@@ -115,10 +122,34 @@ def _looks_like_capability_path_token(segment: str) -> bool:
 
 
 def _is_public_model_repository_segment(hostname: str, segments: list[str], index: int) -> bool:
-    if hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS or index not in {1, 2}:
+    if hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS:
+        return False
+    if not any(segment.lower() in _PUBLIC_MODEL_REPOSITORY_MARKERS for segment in segments[index + 1 :]):
         return False
 
-    return any(segment.lower() in _PUBLIC_MODEL_REPOSITORY_MARKERS for segment in segments[index + 1 :])
+    repository_indexes = {1, 2}
+    if len(segments) > 1 and segments[1].lower() in _PUBLIC_MODEL_REPOSITORY_PREFIXES:
+        repository_indexes.add(3)
+    return index in repository_indexes
+
+
+def _is_public_model_revision_hash_segment(hostname: str, segments: list[str], index: int) -> bool:
+    if hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS or index == 0:
+        return False
+    token_candidate, _trailing_delimiters = _split_trailing_path_delimiters(segments[index])
+    if not _HEX_PATH_TOKEN_PATTERN.fullmatch(unquote(token_candidate)):
+        return False
+    return segments[index - 1].lower() in _PUBLIC_MODEL_REPOSITORY_MARKERS
+
+
+def _is_path_style_cloud_bucket_segment(hostname: str, index: int) -> bool:
+    if index != 1:
+        return False
+    return (
+        hostname in _PATH_STYLE_CLOUD_HOSTS
+        or _S3_REGIONAL_HOST_PATTERN.fullmatch(hostname) is not None
+        or hostname.endswith(_AZURE_STORAGE_HOST_SUFFIXES)
+    )
 
 
 def _redact_path_parameter_tokens(segment: str) -> str | None:
@@ -159,6 +190,10 @@ def _redact_url_path_tokens(hostname: str, path: str) -> str:
             hostname == "hooks.slack.com" and len(segments) > 2 and segments[1].lower() == "services" and index > 1
         )
         if _is_public_model_repository_segment(hostname, segments, index):
+            continue
+        if _is_public_model_revision_hash_segment(hostname, segments, index):
+            continue
+        if _is_path_style_cloud_bucket_segment(hostname, index):
             continue
 
         parameter_redaction = _redact_path_parameter_tokens(segment)

@@ -250,6 +250,48 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == f"https://huggingface.co/meta-llama/{repo_id}/resolve/main/model.safetensors"
 
+    @pytest.mark.parametrize("route", ["datasets", "spaces"])
+    def test_huggingface_prefixed_repository_ids_are_preserved(self, route: str) -> None:
+        """Prefixed Hugging Face repository routes should keep public repo IDs."""
+        detector = NetworkCommDetector()
+        repo_id = "Llama-3.1-70B-Instruct"
+        data = f"https://huggingface.co/{route}/meta-llama/{repo_id}/resolve/main/data.json".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://huggingface.co/{route}/meta-llama/{repo_id}/resolve/main/data.json"
+
+    def test_non_public_hex_path_capability_tokens_are_redacted(self) -> None:
+        """Opaque lowercase hex download IDs should be redacted outside public model revisions."""
+        detector = NetworkCommDetector()
+        path_token = "0123456789abcdef0123456789abcdef"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://storage.googleapis.com/model-bucket-1234567890abcdef/weights.bin",
+            "https://account.blob.core.windows.net/model-container-1234567890abcdef/weights.bin",
+        ],
+    )
+    def test_path_style_cloud_bucket_names_are_preserved(self, url: str) -> None:
+        """Path-style cloud bucket/container names should remain actionable."""
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        url_findings = [finding for finding in findings if finding["type"] in {"url_detected", "cloud_storage_url"}]
+
+        assert url_findings
+        serialized = json.dumps(url_findings, sort_keys=True)
+        assert url in serialized
+        assert "<redacted>" not in serialized
+
     def test_long_artifact_filenames_are_preserved(self) -> None:
         """Ordinary model artifact filenames should not be treated as capability tokens."""
         detector = NetworkCommDetector()
