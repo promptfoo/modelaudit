@@ -26,7 +26,7 @@ from modelaudit.scanners.archive_dispatch import (
 )
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
-from modelaudit.scanners.zip_scanner import ZipScanner
+from modelaudit.scanners.zip_scanner import KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, ZipScanner
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import ONNX_ROUTING_INCONCLUSIVE_FORMAT
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
@@ -2346,6 +2346,22 @@ def test_zip_scanner_marks_configured_skipped_archive_entries_incomplete(tmp_pat
     assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
 
 
+def test_zip_scanner_preserves_executable_name_finding_for_skipped_archive_entry(tmp_path: Path) -> None:
+    archive_path = tmp_path / "skipped-executable.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("bin/run.sh", "#!/bin/sh\necho hidden\n")
+
+    result = ZipScanner({"skip_archive_entries": ["bin/run.sh"], "cache_enabled": False}).scan(str(archive_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Executable Archive Member Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "bin/run.sh"
+        for check in result.checks
+    )
+
+
 def test_zip_scanner_checks_compression_ratio_before_skipping_archive_entry(tmp_path: Path) -> None:
     archive_path = tmp_path / "skipped-bomb.zip"
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -2373,6 +2389,87 @@ def test_zip_scanner_validates_traversal_before_skipping_archive_entry(tmp_path:
         check.name == "Path Traversal Protection"
         and check.status == CheckStatus.FAILED
         and check.details["entry"] == "../metadata.json"
+        for check in result.checks
+    )
+
+
+def test_zip_scanner_validates_readable_symlink_target_before_regular_skip(tmp_path: Path) -> None:
+    archive_path = tmp_path / "skipped-symlink.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        info = zipfile.ZipInfo("weights_link")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(info, "../outside.bin")
+
+    result = ZipScanner({"skip_archive_entries": ["weights_link"], "cache_enabled": False}).scan(str(archive_path))
+
+    assert any(
+        check.name == "Symlink Safety Validation"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "weights_link"
+        for check in result.checks
+    )
+
+
+def test_zip_scanner_does_not_reopen_known_unreadable_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "unreadable-symlink.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        info = zipfile.ZipInfo("weights_link")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(info, "safe-target.bin")
+
+    with zipfile.ZipFile(archive_path) as archive:
+        unreadable_offset = archive.getinfo("weights_link").header_offset
+
+    def fail_read(_archive: zipfile.ZipFile, _info: zipfile.ZipInfo) -> str:
+        raise AssertionError("known unreadable symlink target should not be reopened")
+
+    monkeypatch.setattr(ZipScanner, "_read_symlink_target", fail_read)
+
+    result = ZipScanner(
+        {
+            KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY: [unreadable_offset],
+            "cache_enabled": False,
+        }
+    ).scan(str(archive_path))
+
+    assert result.success is False
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert not any(check.name == "Symlink Safety Validation" for check in result.checks)
+    assert any(
+        check.name == "ZIP Member Analysis Coverage"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "weights_link"
+        for check in result.checks
+    )
+
+
+def test_zip_scanner_validates_traversal_before_known_unreadable_symlink_skip(tmp_path: Path) -> None:
+    archive_path = tmp_path / "unreadable-traversal-symlink.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        info = zipfile.ZipInfo("../weights_link")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(info, "safe-target.bin")
+
+    with zipfile.ZipFile(archive_path) as archive:
+        unreadable_offset = archive.getinfo("../weights_link").header_offset
+
+    result = ZipScanner(
+        {
+            KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY: [unreadable_offset],
+            "cache_enabled": False,
+        }
+    ).scan(str(archive_path))
+
+    assert any(
+        check.name == "Path Traversal Protection"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "../weights_link"
         for check in result.checks
     )
 

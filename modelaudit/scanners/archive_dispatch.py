@@ -77,6 +77,7 @@ _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _ONNX_ROUTING_INCOMPLETE_REASON = "onnx_routing_incomplete"
 _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_incomplete"
 SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY = "_skip_composed_archive_member_scan"
+KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY = "_known_unreadable_archive_entry_offsets"
 
 
 def _select_nested_scanner_id(path: str, header_format_override: str | None = None) -> str | None:
@@ -304,11 +305,19 @@ def merge_executable_zip_container_findings(
 
     subtype_config = dict(config or {})
     subtype_config[SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY] = True
+    zip_config = dict(config or {})
+    known_unreadable_offsets: set[int] = set()
     for subtype_id in subtype_ids:
         if scanner_selection.allows(subtype_id):
             subtype_scanner = _registry.load_scanner_by_id(subtype_id)
             if subtype_scanner:
-                result.merge(subtype_scanner(config=subtype_config).scan(path))
+                subtype_result = subtype_scanner(config=subtype_config).scan(path)
+                raw_offsets = subtype_result.metadata.pop(KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, ())
+                if isinstance(raw_offsets, (list, tuple, set, frozenset)):
+                    known_unreadable_offsets.update(
+                        offset for offset in raw_offsets if isinstance(offset, int) and not isinstance(offset, bool)
+                    )
+                _merge_composed_scan_result(result, subtype_result)
         else:
             add_scanner_selection_skip_check(
                 result,
@@ -319,7 +328,9 @@ def merge_executable_zip_container_findings(
             )
 
     if scanner_selection.allows("zip"):
-        result.merge(ZipScanner(config=config).scan_archive_members(path))
+        if known_unreadable_offsets:
+            zip_config[KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY] = sorted(known_unreadable_offsets)
+        _merge_composed_scan_result(result, ZipScanner(config=zip_config).scan_archive_members(path))
     else:
         add_scanner_selection_skip_check(
             result,
