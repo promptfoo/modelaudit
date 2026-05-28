@@ -1177,6 +1177,49 @@ def test_pytorch_zip_scans_os_process_launch_source_conservatively(tmp_path: Pat
     )
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"def payload():\n    return subprocess.check_call(['id'])\n",
+        b"from subprocess import getstatusoutput as launch\ndef payload():\n    return launch('id')\n",
+        b"def payload():\n    subprocess.run = len\n    return subprocess.run([])\n",
+        b"async def payload():\n    return await asyncio.create_subprocess_shell('id')\n",
+        b"async def payload():\n    return await asyncio.subprocess.create_subprocess_exec('id')\n",
+        b"from asyncio import create_subprocess_exec as launch\nasync def payload():\n    return await launch('id')\n",
+        (
+            b"async def payload():\n    asyncio.create_subprocess_shell = len\n"
+            b"    return asyncio.create_subprocess_shell([])\n"
+        ),
+        (
+            b"async def payload(data):\n    asyncio.create_subprocess_exec = pickle.loads\n"
+            b"    return asyncio.create_subprocess_exec(data)\n"
+        ),
+        (
+            b"async def payload(make_launch):\n    asyncio.create_subprocess_shell = make_launch()\n"
+            b"    return asyncio.create_subprocess_shell('id')\n"
+        ),
+    ],
+)
+def test_pytorch_zip_scans_subprocess_launch_source_conservatively(tmp_path: Path, payload: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    jit_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(
+        check.location == f"{zip_path}:archive/data/payload.bin" and "Subprocess execution detected" in check.message
+        for check in jit_failures
+    )
+
+
 def test_pytorch_zip_ignores_non_source_eval_text_in_archive_data(tmp_path: Path) -> None:
     """Plain payload text containing a dangerous substring must not become a JIT false positive."""
     zip_path = tmp_path / "model.pt"

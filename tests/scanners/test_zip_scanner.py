@@ -196,6 +196,48 @@ def test_scan_zip_retains_os_process_launch_findings_through_alias_or_mutation(t
     assert python_checks[0].rule_code == "S101"
 
 
+@pytest.mark.parametrize(
+    ("source", "dangerous_name"),
+    [
+        (
+            "import asyncio\nasyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
+            "asyncio.create_subprocess_exec",
+        ),
+        (
+            "from asyncio import create_subprocess_shell as run\nrun('id')\n",
+            "asyncio.create_subprocess_shell",
+        ),
+        (
+            "import asyncio.subprocess\nasyncio.subprocess.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
+            "asyncio.subprocess.create_subprocess_exec",
+        ),
+        (
+            "import asyncio\nasyncio.create_subprocess_shell = len\nasyncio.create_subprocess_shell([])\n",
+            "asyncio.create_subprocess_shell",
+        ),
+        (
+            "import asyncio\nasyncio.create_subprocess_shell = make_launch()\nasyncio.create_subprocess_shell('id')\n",
+            "asyncio.create_subprocess_shell",
+        ),
+    ],
+)
+def test_scan_zip_flags_asyncio_process_launch_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S103"
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
 def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:

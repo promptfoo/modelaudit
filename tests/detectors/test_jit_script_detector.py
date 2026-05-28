@@ -279,6 +279,51 @@ class TestJITScriptDetector:
 
         assert findings == []
 
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"def payload():\n    return subprocess.check_call(['id'])\n",
+            b"from subprocess import getoutput as launch\ndef payload():\n    return launch('id')\n",
+            b"def payload():\n    subprocess.run = len\n    return subprocess.run([])\n",
+            b"async def payload():\n    return await asyncio.create_subprocess_shell('id')\n",
+            b"async def payload():\n    return await asyncio.subprocess.create_subprocess_exec('id')\n",
+            (
+                b"from asyncio import create_subprocess_exec as launch\n"
+                b"async def payload():\n    return await launch('id')\n"
+            ),
+            (
+                b"async def payload():\n    asyncio.create_subprocess_shell = len\n"
+                b"    return asyncio.create_subprocess_shell([])\n"
+            ),
+            (
+                b"async def payload(data):\n    asyncio.create_subprocess_exec = pickle.loads\n"
+                b"    return asyncio.create_subprocess_exec(data)\n"
+            ),
+        ],
+    )
+    def test_scan_model_detects_subprocess_launch_source_conservatively(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"def payload():\n    return \"subprocess.check_call(['id'])\"\n",
+            b"def payload():\n    return \"asyncio.create_subprocess_shell('id')\"\n",
+        ],
+    )
+    def test_scan_model_ignores_string_literal_subprocess_launch(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
     def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""
         detector_normal = JITScriptDetector({"strict_mode": False})

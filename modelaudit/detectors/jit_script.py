@@ -138,6 +138,7 @@ def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
 
 
 # Patterns that indicate code execution attempts
+_SUBPROCESS_CODE_EXECUTION_DESCRIPTION = "Subprocess execution detected"
 _OS_CODE_EXECUTION_DESCRIPTION = "OS command execution detected"
 CODE_EXECUTION_PATTERNS = [
     # Direct execution patterns
@@ -146,7 +147,11 @@ CODE_EXECUTION_PATTERNS = [
     (rb"compile\s*\(", "compile() call detected"),
     (rb"__import__\s*\(", "__import__() call detected"),
     # Subprocess patterns
-    (rb"subprocess\.(call|run|Popen|check_output)", "Subprocess execution detected"),
+    (
+        rb"(?:subprocess\.(?:call|run|Popen|check_call|check_output|getoutput|getstatusoutput)"
+        rb"|asyncio\.(?:subprocess\.)?create_subprocess_(?:exec|shell))",
+        _SUBPROCESS_CODE_EXECUTION_DESCRIPTION,
+    ),
     (rb"os\.(system|popen|exec\w*|spawn\w*|posix_spawnp?|startfile)", _OS_CODE_EXECUTION_DESCRIPTION),
     # Network patterns
     (rb"socket\.(socket|create_connection)", "Socket creation detected"),
@@ -597,6 +602,12 @@ class JITScriptDetector:
         # Check for common code execution patterns in binary
         for pattern, description in CODE_EXECUTION_PATTERNS:
             pattern_match = re.search(pattern, bounded) is not None
+            if description == _SUBPROCESS_CODE_EXECUTION_DESCRIPTION and bounded_high_risk_calls is not None:
+                resolved_subprocess_call = any(code == "S103" for _, code in bounded_high_risk_calls)
+                rebound_to_high_risk_call = pattern_match and bool(bounded_high_risk_calls)
+                if not resolved_subprocess_call and not rebound_to_high_risk_call:
+                    continue
+                pattern_match = True
             if description == _OS_CODE_EXECUTION_DESCRIPTION and bounded_high_risk_calls is not None:
                 resolved_os_process_call = any(code == "S101" for _, code in bounded_high_risk_calls)
                 rebound_to_high_risk_call = pattern_match and bool(bounded_high_risk_calls)

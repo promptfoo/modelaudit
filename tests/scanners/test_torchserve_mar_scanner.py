@@ -278,6 +278,51 @@ def test_scan_detects_os_process_launch_handler_execution_primitive(
     assert dangerous_name in handler_failures[0].message
 
 
+@pytest.mark.parametrize(
+    ("handler_source", "dangerous_name"),
+    [
+        (
+            b"import asyncio\nasync def handle(data, context):\n"
+            b"    return await asyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
+            "asyncio.create_subprocess_exec",
+        ),
+        (
+            b"from asyncio import create_subprocess_shell as run\nasync def handle(data, context):\n"
+            b"    return await run('id')\n",
+            "asyncio.create_subprocess_shell",
+        ),
+        (
+            b"import asyncio.subprocess\nasync def handle(data, context):\n"
+            b"    return await asyncio.subprocess.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
+            "asyncio.subprocess.create_subprocess_exec",
+        ),
+        (
+            b"import asyncio\nasync def handle(data, context):\n"
+            b"    asyncio.create_subprocess_shell = len\n"
+            b"    return asyncio.create_subprocess_shell([])\n",
+            "asyncio.create_subprocess_shell",
+        ),
+    ],
+)
+def test_scan_detects_asyncio_process_launch_handler_execution_primitive(
+    tmp_path: Path, handler_source: bytes, dangerous_name: str
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="asyncio_process_launch_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert dangerous_name in handler_failures[0].message
+
+
 def test_scan_detects_dunder_call_getattr_wrapped_handler_execution_primitive(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(

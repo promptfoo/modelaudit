@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - detect dangerous Python calls retrieved through module namespace dictionaries in ZIP and TAR members
 - detect embedded Python `os.exec*`, `os.spawn*`, `os.posix_spawn*`, and `os.startfile` process-launch calls in archives and JIT-scanned content
+- detect embedded Python `asyncio.create_subprocess_*` calls and resolved JIT `subprocess` launch aliases
 - route renamed structured JAX/Orbax JSON checkpoints and fail closed for oversized identified metadata
 - route renamed structurally valid Flax/JAX MessagePack checkpoints through bounded, fail-closed security analysis
 - avoid emitting sensitive scanner finding or loader error payloads in logs
