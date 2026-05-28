@@ -100,6 +100,55 @@ def create_python_onnx_model(tmp_path: Path) -> Path:
     return path
 
 
+def create_onnx_model_with_nested_external_initializer(
+    tmp_path: Path,
+    *,
+    external_path: str,
+    missing_external: bool = False,
+) -> Path:
+    tensor = helper.make_tensor("nested_W", TensorProto.FLOAT, [1], vals=[1.0])
+    tensor.data_location = onnx.TensorProto.EXTERNAL
+    entry = StringStringEntryProto()
+    entry.key = "location"
+    entry.value = external_path
+    tensor.external_data.append(entry)
+
+    then_branch = helper.make_graph(
+        [helper.make_node("Identity", ["nested_W"], ["Z"])],
+        "then_branch",
+        [],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+        initializer=[tensor],
+    )
+    else_tensor = helper.make_tensor("else_W", TensorProto.FLOAT, [1], vals=[0.0])
+    else_branch = helper.make_graph(
+        [helper.make_node("Identity", ["else_W"], ["Z"])],
+        "else_branch",
+        [],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+        initializer=[else_tensor],
+    )
+    condition = helper.make_tensor("cond", TensorProto.BOOL, [], vals=[True])
+    graph = helper.make_graph(
+        [helper.make_node("If", ["cond"], ["Y"], then_branch=then_branch, else_branch=else_branch)],
+        "graph",
+        [],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+        initializer=[condition],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / "nested_external.onnx"
+    onnx.save(model, str(path))
+
+    if not missing_external:
+        external_file = tmp_path / external_path
+        external_file.parent.mkdir(parents=True, exist_ok=True)
+        external_file.write_bytes(struct.pack("f", 1.0))
+
+    return path
+
+
 def _failed_custom_domain_checks(result: Any) -> list[Any]:
     return [c for c in result.checks if c.name == "Custom Operator Domain Check" and c.status == CheckStatus.FAILED]
 
@@ -1010,6 +1059,58 @@ class TestCVE202427318NestedPathTraversal:
         assert len(cve_checks) > 0
         assert cve_checks[0].details["cwe"] == "CWE-22"
         assert cve_checks[0].details["cvss"] == 7.5
+
+    def test_nested_graph_initializer_traversal_detected(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model_with_nested_external_initializer(
+            tmp_path,
+            external_path="weights/../../../tmp/exfil",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is False
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2024-27318"]
+        assert len(cve_checks) > 0
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["tensor"] == "nested_W"
+
+    def test_nested_graph_initializer_in_dir_dotdot_not_flagged(self, tmp_path: Path) -> None:
+        (tmp_path / "nested_weights.bin").write_bytes(struct.pack("f", 1.0))
+        model_path = create_onnx_model_with_nested_external_initializer(
+            tmp_path,
+            external_path="weights/../nested_weights.bin",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        traversal_checks = [
+            c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
+        ]
+        assert traversal_checks == []
+        size_checks = [
+            c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.PASSED
+        ]
+        assert len(size_checks) > 0
+        assert size_checks[0].details["tensor"] == "nested_W"
+
+    def test_nested_graph_initializer_missing_external_data_reported(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model_with_nested_external_initializer(
+            tmp_path,
+            external_path="missing_nested_weights.bin",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        missing_checks = [
+            c for c in result.checks if c.name == "External Data Reference Check" and c.status == CheckStatus.FAILED
+        ]
+        assert len(missing_checks) == 1
+        assert missing_checks[0].severity == IssueSeverity.WARNING
+        assert missing_checks[0].details["sample_tensors"] == ["nested_W"]
 
     def test_windows_absolute_path_is_flagged_on_posix_hosts(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(
