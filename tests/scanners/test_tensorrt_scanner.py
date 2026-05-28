@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.tensorrt_scanner import TensorRTScanner
 from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
 
@@ -98,7 +98,11 @@ def test_tensorrt_unavailable_read_is_inconclusive_not_security_finding(
     aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
 
     read_checks = [check for check in direct.checks if check.name == "TensorRT Engine Read"]
+    assert direct.success is False
+    assert aggregate.success is False
     assert len(read_checks) == 1
+    assert read_checks[0].status == CheckStatus.FAILED
+    assert "Error reading TensorRT engine" in read_checks[0].message
     assert read_checks[0].severity == IssueSeverity.INFO
     assert read_checks[0].details["analysis_incomplete"] is True
     assert read_checks[0].details["scan_outcome_reason"] == "tensorrt_read_failed"
@@ -108,6 +112,10 @@ def test_tensorrt_unavailable_read_is_inconclusive_not_security_finding(
     metadata = aggregate.file_metadata[str(path)]
     assert "tensorrt_read_failed" in metadata["scan_outcome_reasons"]
     assert metadata["operational_error_reason"] == "tensorrt_read_failed"
+    assert any(
+        check.name == "TensorRT Engine Read" and "Error reading TensorRT engine" in check.message
+        for check in aggregate.checks
+    )
     assert not [
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]

