@@ -12,6 +12,7 @@ from modelaudit_picklescan import Finding, PickleReport, ScanError, ScanOptions,
 
 from modelaudit.config.explanations import get_import_explanation
 
+from ..scanner_results import mark_inconclusive_scan_result
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
 from .rule_mapper import get_generic_rule_code, get_import_rule_code, get_pickle_opcode_rule_code
 
@@ -301,6 +302,12 @@ def pickle_report_to_scan_result(
                 ),
             )
 
+    operational_errors = [error for error in report.errors if error.category != "parse_error"]
+    if operational_errors:
+        result.metadata["operational_error"] = True
+        result.metadata["operational_error_reason"] = operational_errors[0].category
+        mark_inconclusive_scan_result(result, operational_errors[0].category)
+
     for error in report.errors:
         is_parse_error = error.category == "parse_error"
         result.add_check(
@@ -313,7 +320,7 @@ def pickle_report_to_scan_result(
                 "pickle_source": report.source,
                 "category": error.category,
                 "exception_type": error.exception_type,
-                "analysis_incomplete": is_parse_error,
+                "analysis_incomplete": True,
                 **(
                     {
                         "file_type": "pickle",
@@ -325,13 +332,8 @@ def pickle_report_to_scan_result(
                 ),
                 **error.to_dict()["details"],
             },
-            rule_code="S901" if is_parse_error else None,
+            rule_code="S901" if is_parse_error else "S902",
         )
-
-    operational_errors = [error for error in report.errors if error.category != "parse_error"]
-    if operational_errors:
-        result.metadata["operational_error"] = True
-        result.metadata["operational_error_reason"] = operational_errors[0].category
 
     if not result.checks:
         result.add_check(
@@ -354,9 +356,7 @@ def pickle_report_to_scan_result(
 def _issue_severity_for_error(error: ScanError) -> IssueSeverity:
     if error.category == "parse_error":
         return IssueSeverity.WARNING
-    if error.category == "empty_input":
-        return IssueSeverity.INFO
-    return IssueSeverity.CRITICAL
+    return IssueSeverity.INFO
 
 
 def apply_pickle_member_context(result: ScanResult, *, archive_path: str, member_name: str) -> None:

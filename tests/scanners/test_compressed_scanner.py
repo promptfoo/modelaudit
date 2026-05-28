@@ -139,6 +139,20 @@ def test_compressed_scanner_can_handle_header_routed_misnamed_wrapper(tmp_path: 
     assert CompressedScanner.can_handle(str(near_match_path)) is False
 
 
+def test_registry_routes_misnamed_compressed_malicious_payload_and_rejects_near_match(tmp_path: Path) -> None:
+    payload_path = tmp_path / "payload.jpg"
+    payload_path.write_bytes(gzip.compress(pickle.dumps({"payload": _MaliciousPayload()})))
+    near_match_path = tmp_path / "near-match.jpg"
+    near_match_path.write_bytes(b"\x1f\x00not-a-gzip-stream")
+
+    scanner = get_scanner_for_file(str(payload_path))
+
+    assert scanner is not None
+    assert scanner.name == "compressed"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in scanner.scan(str(payload_path)).issues)
+    assert get_scanner_for_file(str(near_match_path)) is None
+
+
 def test_compressed_scanner_can_handle_rejects_invalid_zlib_header_near_match(tmp_path: Path) -> None:
     zlib_path = tmp_path / "payload.bin.zlib"
     zlib_path.write_bytes(b"\x78\x00" + b"not-a-valid-zlib-stream")
@@ -853,6 +867,39 @@ def test_compressed_scanner_complete_wrapper_caches_without_ephemeral_inner_entr
         reset_cache_manager()
 
 
+def test_compressed_scanner_depth_limit_preserves_exit1_and_is_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "depth_limited_payload.pkl.gz"
+    path.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]})))
+
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+            compressed_max_depth=0,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+            compressed_max_depth=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert aggregate.success is True
+            assert determine_exit_code(aggregate) == 1
+            assert metadata["scan_outcome"] == "inconclusive"
+            assert metadata["scan_outcome_reasons"] == ["compressed_depth_limit_exceeded"]
+            assert any("nesting depth (0) exceeded" in issue.message.lower() for issue in aggregate.issues)
+        assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def test_compressed_scanner_decompression_limit_preserves_exit1_and_is_not_cached(tmp_path: Path) -> None:
     path = tmp_path / "size_limited_payload.pkl.gz"
     path.write_bytes(gzip.compress(b"A" * 4096))
@@ -1106,3 +1153,41 @@ def test_compressed_scanner_missing_lz4_dependency_path(tmp_path: Path, monkeypa
     assert dependency_checks[0].details["scan_outcome_reason"] == "compressed_optional_dependency_unavailable"
     assert result.metadata["scan_outcome_reasons"] == ["compressed_optional_dependency_unavailable"]
     assert result.success is False
+
+
+def test_compressed_scanner_missing_lz4_is_exit2_and_not_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lz4_path = tmp_path / "payload.bin.lz4"
+    lz4_path.write_bytes(b"\x04\x22\x4d\x18" + b"\x00" * 16)
+
+    def _raise_missing_dependency() -> object:
+        raise _MissingOptionalDependencyError("Optional dependency 'lz4' is not installed")
+
+    monkeypatch.setattr(CompressedScanner, "_get_lz4_frame_module", staticmethod(_raise_missing_dependency))
+
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(lz4_path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(lz4_path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(lz4_path)]
+            assert aggregate.success is False
+            assert determine_exit_code(aggregate) == 2
+            assert metadata["scan_outcome"] == "inconclusive"
+            assert metadata["scan_outcome_reasons"] == ["compressed_optional_dependency_unavailable"]
+            assert any("optional dependency" in issue.message.lower() for issue in aggregate.issues)
+        assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
