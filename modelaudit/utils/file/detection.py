@@ -2465,6 +2465,11 @@ def is_jax_json_checkpoint_file(path: str | Path) -> bool:
     return _probe_jax_json_checkpoint_file(Path(path)) is not False
 
 
+def is_confirmed_jax_json_checkpoint_file(path: str | Path) -> bool:
+    """Return True only when bounded parsing positively identifies JAX JSON."""
+    return _probe_jax_json_checkpoint_file(Path(path)) is True
+
+
 def _probe_content_routed_jax_json_checkpoint(file_path: Path) -> bool | None:
     """Return the bounded JAX JSON probe state for content-routable suffixes."""
     ext = file_path.suffix.lower()

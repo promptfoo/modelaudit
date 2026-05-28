@@ -2683,6 +2683,32 @@ def test_scan_file_composes_jax_analysis_for_xgboost_shaped_json(tmp_path: Path)
     )
 
 
+@pytest.mark.parametrize("foreign_owner", ["mxnet", "xgboost"])
+def test_scan_file_large_foreign_json_does_not_compose_ambiguous_jax_analysis(
+    tmp_path: Path,
+    foreign_owner: str,
+) -> None:
+    model_path = tmp_path / f"large-{foreign_owner}.json"
+    payload: dict[str, Any]
+    if foreign_owner == "mxnet":
+        payload = {
+            "nodes": [{"op": "null", "name": "data"}],
+            "arg_nodes": [0],
+            "heads": [[0, 0, 0]],
+        }
+    else:
+        payload = {"version": [1, 7, 4], "learner": {"gradient_booster": {}}}
+    payload["padding"] = "x" * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16)
+    model_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == foreign_owner
+    assert result.success is True
+    assert "jax_json_checkpoint_analysis_size_limit" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "JSON Checkpoint Analysis Limit" for check in result.checks)
+
+
 @pytest.mark.parametrize("suffix", [".ckpt", ".pickle"])
 def test_scan_file_routes_jax_json_on_pickle_owned_suffixes_through_json_analysis(tmp_path: Path, suffix: str) -> None:
     model_path = tmp_path / f"state{suffix}"

@@ -17,6 +17,7 @@ from modelaudit.utils.file.detection import (
     detect_mxnet_symbol_content_route,
     has_mxnet_symbol_graph_structure,
     inspect_mxnet_symbol_root_keys,
+    is_confirmed_jax_json_checkpoint_file,
 )
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
@@ -391,7 +392,7 @@ class MXNetScanner(BaseScanner):
         from .manifest_scanner import ManifestScanner
 
         scanner_selection = policy_from_config(self.config)
-        if JaxCheckpointScanner.can_handle(path):
+        if is_confirmed_jax_json_checkpoint_file(path):
             if scanner_selection.allows("jax_checkpoint"):
                 self._merge_filename_owned_result(result, JaxCheckpointScanner(config=self.config).scan(path))
             elif scanner_selection.active:
