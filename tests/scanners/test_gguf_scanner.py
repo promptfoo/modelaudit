@@ -7,9 +7,15 @@ from typing import Any
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.rules import Severity
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.gguf_scanner import GgufScanner
+from modelaudit.scanners.gguf_scanner import (
+    GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON,
+    GGUF_PARSE_INCONCLUSIVE_REASON,
+    GgufScanner,
+)
 from tests.helpers import create_mock_gguf
 
 
@@ -105,6 +111,27 @@ def _write_gguf_with_tensor_type(path: Path, tensor_type: int) -> None:
         if pad_to_tensor_data:
             f.write(b"\0" * pad_to_tensor_data)
         f.write(b"\0" * 32)
+
+
+def _write_gguf_string_metadata_entries(
+    path: Path,
+    entries: list[tuple[str, str]],
+    *,
+    declared_count: int | None = None,
+) -> None:
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", 0))
+        f.write(struct.pack("<Q", declared_count if declared_count is not None else len(entries)))
+        for key, value in entries:
+            encoded_key = key.encode("utf-8")
+            encoded_value = value.encode("utf-8")
+            f.write(struct.pack("<Q", len(encoded_key)))
+            f.write(encoded_key)
+            f.write(struct.pack("<I", 8))
+            f.write(struct.pack("<Q", len(encoded_value)))
+            f.write(encoded_value)
 
 
 def _single_file_metadata(aggregate: Any) -> Any:
@@ -278,6 +305,121 @@ def test_gguf_scanner_keeps_benign_macro_chat_templates_clean(tmp_path: Path) ->
     )
 
 
+def test_gguf_scanner_detects_malicious_chat_template_hidden_by_duplicate_key(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-template.gguf"
+    _write_gguf_string_metadata_entries(
+        path,
+        [
+            ("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}"),
+            ("tokenizer.chat_template", "{{ message['content'] }}"),
+        ],
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert any(check.name == "GGUF Duplicate Metadata Keys" for check in direct.checks)
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in direct.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_gguf_scanner_duplicate_benign_chat_template_is_inconclusive_without_finding(tmp_path: Path) -> None:
+    path = tmp_path / "benign-duplicate-template.gguf"
+    _write_gguf_string_metadata_entries(
+        path,
+        [
+            ("tokenizer.chat_template", "{{ message['content'] }}"),
+            ("tokenizer.chat_template", "{{ message['role'] }}"),
+        ],
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in direct.issues)
+    _assert_inconclusive_exit2(aggregate, GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON)
+    _assert_uncached_rerun_preserves_inconclusive_exit2(
+        path,
+        tmp_path / "duplicate-template-cache",
+        GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON,
+    )
+
+
+def test_gguf_scanner_duplicate_benign_chat_template_ignores_s902_severity_override(tmp_path: Path) -> None:
+    path = tmp_path / "benign-duplicate-template-severity-override.gguf"
+    _write_gguf_string_metadata_entries(
+        path,
+        [
+            ("tokenizer.chat_template", "{{ message['content'] }}"),
+            ("tokenizer.chat_template", "{{ message['role'] }}"),
+        ],
+    )
+
+    set_config(ModelAuditConfig(severity={"S902": Severity.CRITICAL}))
+    try:
+        direct = GgufScanner().scan(str(path))
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+    finally:
+        reset_config()
+
+    duplicate_checks = [check for check in direct.checks if check.name == "GGUF Duplicate Metadata Keys"]
+    assert len(duplicate_checks) == 1
+    assert duplicate_checks[0].severity == IssueSeverity.INFO
+    assert duplicate_checks[0].rule_code is None
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in direct.issues)
+    assert all(issue.rule_code != "S902" for issue in direct.issues)
+    _assert_inconclusive_exit2(aggregate, GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON)
+
+
+def test_gguf_scanner_scans_malicious_template_before_truncated_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "trailing-truncated-template.gguf"
+    _write_gguf_string_metadata_entries(
+        path,
+        [("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}")],
+        declared_count=2,
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert GGUF_PARSE_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in direct.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_gguf_scanner_reports_duplicate_key_before_truncated_duplicate_value(tmp_path: Path) -> None:
+    path = tmp_path / "truncated-duplicate-template.gguf"
+    key = "tokenizer.chat_template"
+    _write_gguf_string_metadata_entries(
+        path,
+        [(key, "{{ message['content'] }}")],
+        declared_count=2,
+    )
+    with path.open("ab") as f:
+        encoded_key = key.encode("utf-8")
+        f.write(struct.pack("<Q", len(encoded_key)))
+        f.write(encoded_key)
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert GGUF_PARSE_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert any(check.name == "GGUF Duplicate Metadata Keys" for check in direct.checks)
+    _assert_inconclusive_exit2(aggregate, GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON)
+
+
 def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -> None:
     path = create_mock_gguf(
         tmp_path / "large-template.gguf",
@@ -298,6 +440,27 @@ def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -
     )
     assert not any(check.name == "Jinja2 SSTI Analysis" for check in direct.checks)
     _assert_inconclusive_exit2(aggregate, "jinja2_template_size_limit_exceeded")
+
+
+def test_gguf_scanner_preserves_duplicate_reason_with_oversized_chat_template(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-large-template.gguf"
+    _write_gguf_string_metadata_entries(
+        path,
+        [
+            ("tokenizer.chat_template", "{{ content }}" * 10000),
+            ("tokenizer.chat_template", "{{ message['content'] }}"),
+        ],
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    reasons = direct.metadata["scan_outcome_reasons"]
+    assert GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON in reasons
+    assert "jinja2_template_size_limit_exceeded" in reasons
+    assert any(check.name == "Template Size Limit" and check.status == CheckStatus.FAILED for check in direct.checks)
+    _assert_inconclusive_exit2(aggregate, GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON)
+    assert "jinja2_template_size_limit_exceeded" in _single_file_metadata(aggregate)["scan_outcome_reasons"]
 
 
 def test_gguf_oversized_chat_template_uncached_rerun_preserves_exit2(tmp_path: Path) -> None:
@@ -418,7 +581,7 @@ def test_gguf_truncated_metadata_returns_exit2(tmp_path: Path) -> None:
     assert direct.success is False
     assert direct.has_errors is False
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "gguf_parse_incomplete" in direct.metadata["scan_outcome_reasons"]
+    assert GGUF_PARSE_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
     assert aggregate.success is False
     assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert determine_exit_code(aggregate) == 2
@@ -438,7 +601,7 @@ def test_gguf_truncated_metadata_uncached_rerun_preserves_exit2(
     _assert_uncached_rerun_preserves_inconclusive_exit2(
         path,
         tmp_path / "cache",
-        "gguf_parse_incomplete",
+        GGUF_PARSE_INCONCLUSIVE_REASON,
     )
 
 
