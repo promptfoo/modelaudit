@@ -3455,7 +3455,7 @@ def test_scan_file_inconclusive_mxnet_route_composes_jax_analysis(
     assert core_module.determine_exit_code(aggregate) == 2
 
 
-def test_scan_file_inconclusive_mxnet_route_composes_suffix_owned_jax_payload_without_root_marker(
+def test_scan_file_inconclusive_mxnet_route_composes_escaped_suffix_owned_jax_payload_without_root_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3467,9 +3467,9 @@ def test_scan_file_inconclusive_mxnet_route_composes_suffix_owned_jax_payload_wi
                 "nodes": [{"attrs": "x" * 129, "op": "Custom", "name": "load"}],
                 "arg_nodes": [0],
                 "heads": [[0, 0, 0]],
-                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+                "payload": "jax.experimental.io_callback",
             }
-        ),
+        ).replace("jax.experimental.io_callback", r"j\u0061x.experimental.io_callback"),
         encoding="utf-8",
     )
 
@@ -3480,6 +3480,31 @@ def test_scan_file_inconclusive_mxnet_route_composes_suffix_owned_jax_payload_wi
     assert any(
         check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
     )
+
+
+def test_scan_file_inconclusive_mxnet_route_does_not_compose_ambiguous_large_foreign_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    model_path = tmp_path / "ambiguous-large-foreign.jpg"
+    model_path.write_text(
+        json.dumps(
+            {
+                "nodes": [{"attrs": "x" * 129, "op": "Custom", "name": "load"}],
+                "arg_nodes": [0],
+                "heads": [[0, 0, 0]],
+                "padding": "x" * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome_reasons"] == ["mxnet_symbol_routing_incomplete"]
+    assert not any(check.name == "JSON Checkpoint Analysis Limit" for check in result.checks)
 
 
 def test_scan_file_inconclusive_mxnet_route_preserves_jax_incomplete_reason(

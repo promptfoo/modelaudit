@@ -23,6 +23,7 @@ from ..scanner_selection import (
 )
 from ..utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
@@ -473,7 +474,7 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
                 context="inconclusive MXNet params byte analysis",
             )
 
-    if JaxCheckpointScanner.can_handle(path):
+    if os.path.getsize(path) <= JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
         if scanner_selection.allows("jax_checkpoint"):
             merge_owner_result(JaxCheckpointScanner(config=config).scan(path))
         elif scanner_selection.active:
