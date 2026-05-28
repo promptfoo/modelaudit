@@ -250,6 +250,18 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == f"https://huggingface.co/org/repo/resolve/{revision}/model.safetensors"
 
+    def test_known_credentials_in_public_revision_position_are_redacted(self) -> None:
+        """Known secret formats should not be preserved as public model revision names."""
+        detector = NetworkCommDetector()
+        revision = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        data = f"https://huggingface.co/org/repo/resolve/{revision}/model.safetensors".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://huggingface.co/org/repo/resolve/<redacted>/model.safetensors"
+        assert revision not in json.dumps(url_finding, sort_keys=True)
+
     def test_public_model_repository_ids_are_preserved(self) -> None:
         """Known public model hosts should keep repo IDs for audit follow-up."""
         detector = NetworkCommDetector()
@@ -260,6 +272,17 @@ class TestNetworkCommDetector:
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
 
         assert url_finding["url"] == f"https://huggingface.co/meta-llama/{repo_id}/resolve/main/model.safetensors"
+
+    def test_huggingface_api_repository_ids_are_preserved(self) -> None:
+        """Hugging Face API paths should keep public repo IDs for audit follow-up."""
+        detector = NetworkCommDetector()
+        repo_id = "Llama-3.1-70B-Instruct"
+        data = f"https://huggingface.co/api/models/meta-llama/{repo_id}".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://huggingface.co/api/models/meta-llama/{repo_id}"
 
     @pytest.mark.parametrize("route", ["datasets", "spaces"])
     def test_huggingface_prefixed_repository_ids_are_preserved(self, route: str) -> None:
@@ -304,6 +327,17 @@ class TestNetworkCommDetector:
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
 
         assert url_finding["url"] == "https://example.com/download/<redacted>/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_high_entropy_artifact_filename_stems_are_redacted(self) -> None:
+        """Opaque bearer tokens carried as known artifact filenames should not bypass redaction."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}.bin".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>.bin"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
 
     @pytest.mark.parametrize(

@@ -67,6 +67,7 @@ _TRAILING_PATH_DELIMITERS = ".,;:)]}'\""
 _URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>"
 _MIN_CAPABILITY_TOKEN_ENTROPY = 3.5
 _PUBLIC_MODEL_REPOSITORY_HOSTS = frozenset({"huggingface.co", "hf.co"})
+_PUBLIC_MODEL_API_REPOSITORY_TYPES = frozenset({"datasets", "models", "spaces"})
 _PUBLIC_MODEL_REPOSITORY_MARKERS = frozenset({"blob", "resolve", "tree"})
 _PUBLIC_MODEL_REPOSITORY_PREFIXES = frozenset({"datasets", "spaces"})
 _PUBLIC_SOURCE_REPOSITORY_HOSTS = frozenset({"github.com", "www.github.com", "raw.githubusercontent.com"})
@@ -88,6 +89,14 @@ def _shannon_entropy_per_char(value: str) -> float:
     return -sum((count / length) * math.log2(count / length) for count in counts.values())
 
 
+def _looks_like_high_entropy_filename_stem(stem: str) -> bool:
+    if len(stem) < 20 or not re.fullmatch(r"[A-Za-z0-9]+", stem):
+        return False
+
+    character_classes = sum(bool(pattern.search(stem)) for pattern in _PATH_TOKEN_CHARACTER_CLASS_PATTERNS[:3])
+    return character_classes >= 2 and _shannon_entropy_per_char(stem) >= _MIN_CAPABILITY_TOKEN_ENTROPY
+
+
 def _redact_known_token_filename(segment: str) -> str | None:
     token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
     decoded = unquote(token_candidate)
@@ -95,7 +104,10 @@ def _redact_known_token_filename(segment: str) -> str | None:
         return None
 
     stem, separator, suffix = decoded.rpartition(".")
-    if separator and _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(stem):
+    if separator and (
+        _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(stem)
+        or (suffix.lower() in _KNOWN_ARTIFACT_FILENAME_EXTENSIONS and _looks_like_high_entropy_filename_stem(stem))
+    ):
         return f"{_REDACTED_PATH_TOKEN}.{suffix}{trailing_delimiters}"
     return None
 
@@ -139,6 +151,14 @@ def _is_public_model_repository_segment(hostname: str, segments: list[str], inde
     if len(segments) > 1 and segments[1].lower() in _PUBLIC_MODEL_REPOSITORY_PREFIXES:
         repository_indexes.add(3)
     return index in repository_indexes
+
+
+def _is_public_model_api_repository_segment(hostname: str, segments: list[str], index: int) -> bool:
+    if hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS or len(segments) < 4:
+        return False
+    if segments[1].lower() != "api" or segments[2].lower() not in _PUBLIC_MODEL_API_REPOSITORY_TYPES:
+        return False
+    return index in {3, 4}
 
 
 def _is_public_model_revision_segment(hostname: str, segments: list[str], index: int) -> bool:
@@ -215,7 +235,18 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
         is_slack_webhook_secret = (
             hostname == "hooks.slack.com" and len(segments) > 2 and segments[1].lower() == "services" and index > 1
         )
+        filename_redaction = _redact_known_token_filename(segment)
+        if filename_redaction is not None:
+            segments[index] = filename_redaction
+            continue
+        if _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(unquote(_split_trailing_path_delimiters(segment)[0])):
+            _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+            segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+            continue
+
         if _is_public_model_repository_segment(hostname, segments, index):
+            continue
+        if _is_public_model_api_repository_segment(hostname, segments, index):
             continue
         if _is_public_model_revision_segment(hostname, segments, index):
             continue
@@ -229,10 +260,6 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
         parameter_redaction = _redact_path_parameter_tokens(segment)
         if parameter_redaction is not None:
             segments[index] = parameter_redaction
-            continue
-        filename_redaction = _redact_known_token_filename(segment)
-        if filename_redaction is not None:
-            segments[index] = filename_redaction
             continue
         if is_slack_webhook_secret or _looks_like_capability_path_token(segment):
             _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
