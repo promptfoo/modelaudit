@@ -230,9 +230,6 @@ def _allowed_shard_paths_from_config(config: dict[str, Any]) -> list[str] | None
 
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
     """Select a scanner by trusted file structure, not just suffix."""
-    if header_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
-        return "protobuf_model_candidate"
-
     if header_format == "zip":
         if is_torchserve_mar_archive(path):
             return "torchserve_mar"
@@ -300,8 +297,6 @@ def _merge_pytorch_binary_supplemental_analysis(
 
 def _is_direct_header_route(scanner_id: str, header_format: str) -> bool:
     """Return whether the detected header directly maps to this scanner."""
-    if header_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
-        return scanner_id == "protobuf_model_candidate"
     return header_format != "unknown" and HEADER_FORMAT_TO_SCANNER_ID.get(header_format) == scanner_id
 
 

@@ -89,9 +89,6 @@ def _select_nested_scanner_id(path: str, header_format_override: str | None = No
     header_format = header_format_override or detect_file_format(path)
     ext = os.path.splitext(path)[1].lower()
 
-    if header_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
-        return "protobuf_model_candidate"
-
     if header_format == "zip":
         if is_torchserve_mar_archive(path):
             return "torchserve_mar"
@@ -123,8 +120,6 @@ def _select_nested_scanner_id(path: str, header_format_override: str | None = No
 
 def _is_direct_header_route(scanner_id: str, header_format: str) -> bool:
     """Return whether the detected header directly maps to this scanner."""
-    if header_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
-        return scanner_id == "protobuf_model_candidate"
     return header_format != "unknown" and _HEADER_FORMAT_TO_SCANNER_ID.get(header_format) == scanner_id
 
 
@@ -706,11 +701,7 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         result.finish(success=not result.has_errors)
         return result
 
-    header_format_override = (
-        trusted_content_format
-        if trusted_content_format in {"mxnet", "xgboost", PROTOBUF_MODEL_CANDIDATE_FORMAT}
-        else None
-    )
+    header_format_override = trusted_content_format if trusted_content_format in {"mxnet", "xgboost"} else None
     scanner_id = _select_nested_scanner_id(path, header_format_override)
     pytorch_binary_supplemental_scanner_id = (
         detect_pytorch_binary_supplemental_format(path)

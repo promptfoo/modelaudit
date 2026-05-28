@@ -728,7 +728,7 @@ def test_budget_exhausted_protobuf_probe_does_not_steal_coreml_extension_route(t
     model_path = tmp_path / "ambiguous.mlmodel"
     model_path.write_bytes(b"\x42\x00" * 4097)
 
-    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
     assert detect_file_format(str(model_path)) == "coreml"
     assert validate_file_type(str(model_path)) is True
 

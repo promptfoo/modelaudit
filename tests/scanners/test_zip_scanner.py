@@ -3364,6 +3364,30 @@ class TestZipScanner:
         )
         assert any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
 
+    def test_nested_declared_onnx_candidate_keeps_extension_owner_when_dependency_missing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A declared nested .onnx keeps normal ONNX ownership even with ambiguous magic."""
+        pytest.importorskip("onnx")
+        archive_path = tmp_path / "outer.zip"
+        onnx_path = create_mock_onnx(tmp_path / "model.onnx")
+        prefix_mock_onnx_with_unknown_group(onnx_path)
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.onnx", onnx_path.read_bytes())
+
+        monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            entry["path"] == f"{archive_path}:model.onnx" and entry["type"] == "onnx"
+            for entry in result.metadata["contents"]
+        )
+        assert any(check.name == "ONNX Library Check" for check in result.checks)
+        assert not any(check.name == "ONNX Candidate Analysis" for check in result.checks)
+
     def test_nested_member_does_not_route_prefixed_generic_protobuf_as_onnx(self, tmp_path: Path) -> None:
         """An unknown protobuf prefix alone must not promote a nested member."""
         archive_path = tmp_path / "outer.zip"

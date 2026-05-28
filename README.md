@@ -100,7 +100,7 @@ ModelAudit includes 45 registered scanners covering model, archive, and configur
 Plus scanners for ZIP, TAR, 7-Zip, OCI layers, Jinja2 templates, JSON/YAML metadata, manifests, model cards, text files, and RAR recognition. RAR archives are reported as unsupported/fail-closed instead of being skipped.
 
 Structurally valid TensorFlow SavedModel and MetaGraph protobufs are also recognized when renamed to non-model suffixes.
-CoreML content routing preserves bounded ambiguous candidates for static custom-code and metadata analysis.
+CoreML models can also be recognized when renamed, with incomplete coverage reported explicitly.
 SafeTensors files with oversized but plausible framing are retained for bounded, inconclusive analysis under
 otherwise unclaimed suffixes such as `.jpg`.
 Structurally plausible Flax/JAX MessagePack checkpoints are also recognized when renamed to non-model suffixes;

@@ -10,7 +10,7 @@ import pickle
 import struct
 import sys
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -5188,6 +5188,45 @@ def test_scan_file_detects_malicious_renamed_tf_metagraph_by_content(tmp_path: P
         and issue.details.get("op_type") == "PyFunc"
         for issue in result.issues
     )
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload_factory", "expected_scanner", "expected_message"),
+    [
+        (
+            "saved.json",
+            _build_malicious_tf_savedmodel,
+            "tf_savedmodel",
+            "PyFunc operation detected",
+        ),
+        (
+            "metagraph.json",
+            _build_malicious_tf_metagraph,
+            "tf_metagraph",
+            "Dangerous TensorFlow operation: PyFunc",
+        ),
+    ],
+)
+def test_scan_file_detects_malicious_tensorflow_protobuf_renamed_json(
+    tmp_path: Path,
+    filename: str,
+    payload_factory: Callable[[], bytes],
+    expected_scanner: str,
+    expected_message: str,
+) -> None:
+    disguised_tensorflow = tmp_path / filename
+    disguised_tensorflow.write_bytes(payload_factory())
+
+    result = scan_file(str(disguised_tensorflow), config={"cache_scan_results": False})
+
+    assert result.scanner_name == expected_scanner
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and expected_message in issue.message for issue in result.issues
+    )
+
+    aggregate = scan_model_directory_or_file(str(disguised_tensorflow), cache_scan_results=False)
+    assert core_module.determine_exit_code(aggregate) == 1
 
 
 def test_scan_file_detects_malicious_renamed_tf_function_metagraph_by_content(tmp_path: Path) -> None:

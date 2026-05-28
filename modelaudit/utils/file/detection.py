@@ -910,9 +910,6 @@ PROTO0_1_MAX_PROBE_BYTES: int = 64 * 1024
 # budget aligned with the byte budget so trivial padding cannot hide a later
 # dangerous opcode inside the sampled prefix.
 PROTO0_1_MAX_PROBE_OPCODES: int = PROTO0_1_MAX_PROBE_BYTES
-# Fully inspect short scalar-only text near-matches before candidate routing.
-# Longer files remain unresolved so a late model payload cannot be hidden.
-PROTO0_1_MAX_TRIVIAL_TEXT_VALIDATION_BYTES: int = 1024 * 1024
 PROTO0_1_START_BYTES: bytes = b"()]}cilp0FGIJKLMNSTUVX"
 PROTO0_1_IGNORABLE_TRAILING_BYTES: bytes = b" \t\r\n\x00"
 PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES: tuple[str, ...] = (
@@ -1255,49 +1252,6 @@ def _looks_like_onnx_model_file(path: Path, size: int) -> bool | None:
         return False
 
 
-def _looks_like_onnx_model_candidate_file(path: Path, size: int) -> bool:
-    """Return True only when bounded routing establishes ONNX structure."""
-    return _looks_like_onnx_model_file(path, size) is True
-
-
-def _is_complete_trivial_proto0_or_1_text_stream(path: Path, size: int) -> bool:
-    """Return True for fully inspected scalar-only protocol-text near-matches."""
-    if size <= 0 or size > PROTO0_1_MAX_TRIVIAL_TEXT_VALIDATION_BYTES:
-        return False
-    try:
-        sample = path.read_bytes()
-        sample.decode("utf-8")
-    except (OSError, UnicodeDecodeError):
-        return False
-    if len(sample) < 2 or sample[0] not in PROTO0_1_START_BYTES:
-        return False
-
-    opcode_count = 0
-    try:
-        for opcode, _arg, _pos in pickletools.genops(sample):
-            opcode_count += 1
-            if opcode.name == "STOP" or opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
-                return False
-    except ValueError as exc:
-        if not str(exc).startswith("pickle exhausted before seeing STOP"):
-            return False
-    except Exception:
-        return False
-    return opcode_count >= 2
-
-
-def _is_complete_plain_text_stream(path: Path, size: int) -> bool:
-    """Return True for fully inspected plain text that should not become a protobuf candidate."""
-    if size <= 0 or size > PROTO0_1_MAX_TRIVIAL_TEXT_VALIDATION_BYTES:
-        return False
-    try:
-        sample = path.read_bytes()
-        sample.decode("utf-8")
-    except (OSError, UnicodeDecodeError):
-        return False
-    return all(byte in {9, 10, 13} or 32 <= byte < 127 for byte in sample)
-
-
 def _looks_like_proto_message_prefix(data: bytes) -> bool:
     """Return whether bytes begin with a non-empty protobuf message field."""
     if not data:
@@ -1307,15 +1261,6 @@ def _looks_like_proto_message_prefix(data: bytes) -> bool:
         return False
     tag, _value_offset = tag_result
     return tag >> 3 > 0 and tag & 0x07 in _COREML_PROTO_PREFIX_WIRE_TYPES
-
-
-def _has_budget_exhausted_protobuf_model_candidate(path: Path, size: int) -> bool:
-    """Return True when a bounded probe leaves a protobuf model candidate."""
-    if _is_complete_trivial_proto0_or_1_text_stream(path, size) or _is_complete_plain_text_stream(path, size):
-        return False
-    if _looks_like_onnx_model_file(path, size) is None:
-        return True
-    return _looks_like_coreml_model_file(path, size) is None
 
 
 def _looks_like_coreml_description_proto_prefix(data: bytes, *, sample_is_prefix: bool = False) -> bool | None:
@@ -1405,7 +1350,7 @@ def _looks_like_coreml_model_proto_prefix(data: bytes, *, sample_is_prefix: bool
         if (field_number == 2 or field_number in _COREML_MODEL_TYPE_FIELDS) and wire_type != 2:
             return False
 
-        if field_number == 1 and wire_type == 0:
+        if field_number == 1:
             value_result = _read_proto_varint(data, value_offset)
             if value_result is None:
                 return None if sample_is_prefix else False
@@ -1420,7 +1365,6 @@ def _looks_like_coreml_model_proto_prefix(data: bytes, *, sample_is_prefix: bool
                 if field_number == 2:
                     return None if sample_is_prefix and has_specification_version else False
                 if field_number in _COREML_MODEL_TYPE_FIELDS and length > 0:
-                    has_model_type = True
                     return True if has_specification_version and has_description else None
                 return None if sample_is_prefix else False
             if field_number == 2:
@@ -2606,8 +2550,6 @@ def _detect_renamed_tensorflow_protobuf(
 ) -> str:
     """Recognize renamed MetaGraph/SavedModel protobufs after bounded field discovery."""
     suffix = file_path.suffix.lower()
-    if suffix == ".json":
-        return "unknown"
     if _is_complete_bounded_printable_text(file_path, file_size):
         return "unknown"
     route = _classify_bounded_tensorflow_protobuf(file_path, file_size)
@@ -3415,6 +3357,9 @@ def detect_format_from_magic_bytes(
 
     if renamed_tensorflow_format == "inconclusive":
         return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+
+    if file_path is not None and file_path.suffix.lower() == ".mlmodel" and coreml_route_status is None:
+        return "coreml"
 
     if (
         coreml_route_status is None
