@@ -348,22 +348,91 @@ class KerasH5Scanner(BaseScanner):
         if any(str(key).lower() in cls._KERAS_WEIGHT_ROOT_GROUPS for key in h5_file):
             return True
 
-        if any(str(key).lower() in cls._KERAS_WEIGHT_ROOT_ATTRS for key in h5_file.attrs):
+        if cls._has_legacy_weights_layout(h5_file):
             return True
 
         return Path(path).name.lower().endswith(".weights.h5") and cls._has_keras3_weights_layout(h5_file)
 
-    @staticmethod
-    def _has_keras3_weights_layout(h5_file: Any) -> bool:
+    @classmethod
+    def _has_legacy_weights_layout(cls, h5_file: Any) -> bool:
+        layer_names = cls._decode_hdf5_names(h5_file.attrs.get("layer_names"))
+        if not layer_names:
+            return False
+
+        for layer_name in layer_names:
+            link = h5_file.get(layer_name, getlink=True)
+            if isinstance(link, h5py.ExternalLink):
+                return True
+            if not isinstance(link, h5py.HardLink):
+                continue
+
+            layer = h5_file.get(layer_name, getlink=False)
+            if isinstance(layer, h5py.Group) and "weight_names" in layer.attrs:
+                return True
+
+        return False
+
+    @classmethod
+    def _has_keras3_weights_layout(cls, h5_file: Any) -> bool:
         """Detect Keras 3 H5IOStore weights-only layouts without generic HDF5 overreach."""
-        if "vars" in h5_file:
+        if cls._has_group_or_external_link(h5_file, "vars"):
             return True
 
-        layers = h5_file.get("layers")
+        layers_link = h5_file.get("layers", getlink=True)
+        if isinstance(layers_link, h5py.ExternalLink):
+            return True
+        if not isinstance(layers_link, h5py.HardLink):
+            return False
+
+        layers = h5_file.get("layers", getlink=False)
         if not isinstance(layers, h5py.Group):
             return False
 
-        return any(isinstance(layer, h5py.Group) and "vars" in layer for layer in layers.values())
+        for layer_name in layers:
+            layer_link = layers.get(layer_name, getlink=True)
+            if isinstance(layer_link, h5py.ExternalLink):
+                return True
+            if not isinstance(layer_link, h5py.HardLink):
+                continue
+
+            layer = layers.get(layer_name, getlink=False)
+            if isinstance(layer, h5py.Group) and cls._has_group_or_external_link(layer, "vars"):
+                return True
+
+        return False
+
+    @staticmethod
+    def _has_group_or_external_link(group: Any, name: str) -> bool:
+        link = group.get(name, getlink=True)
+        if isinstance(link, h5py.ExternalLink):
+            return True
+        if not isinstance(link, h5py.HardLink):
+            return False
+        return isinstance(group.get(name, getlink=False), h5py.Group)
+
+    @staticmethod
+    def _decode_hdf5_names(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, bytes):
+            return [value.decode("utf-8", errors="ignore")]
+        if isinstance(value, str):
+            return [value]
+
+        try:
+            items = list(value)
+        except TypeError:
+            items = [value]
+
+        names = []
+        for item in items:
+            if isinstance(item, bytes):
+                names.append(item.decode("utf-8", errors="ignore"))
+            elif isinstance(item, str):
+                names.append(item)
+        return [name for name in names if name]
 
     def _check_hdf5_external_references(self, h5_file: Any, result: ScanResult, source_path: str) -> None:
         """Detect HDF5 external links/storage before any Keras-specific parsing short-circuits."""

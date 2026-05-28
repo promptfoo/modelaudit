@@ -651,6 +651,21 @@ def test_keras_h5_scanner_skips_generic_root_weight_like_groups(tmp_path: Path) 
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
+def test_keras_h5_scanner_skips_generic_layer_names_attr_without_weight_groups(tmp_path: Path) -> None:
+    """Generic HDF5 metadata named layer_names is not enough for Keras attribution."""
+    generic_path = tmp_path / "generic_layer_names.h5"
+    with h5py.File(generic_path, "w") as f:
+        f.attrs["layer_names"] = [b"experiment"]
+        f.create_group("experiment")
+        f["linked"] = h5py.ExternalLink("external_source.h5", "/payload")
+
+    result = KerasH5Scanner().scan(str(generic_path))
+
+    assert result.success is True
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
 def test_keras_h5_scanner_flags_weights_only_external_link_without_keras_metadata(tmp_path: Path) -> None:
     """Weights-only HDF5 files can still be Keras load inputs and must not skip external references."""
     external_source = tmp_path / "external_source.h5"
@@ -701,6 +716,27 @@ def test_keras_h5_scanner_flags_keras3_weights_external_link_without_legacy_attr
             "kind": "ExternalLink",
             "hdf5_path": "/layers/dense/vars/0",
             "filename": "external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
+def test_keras_h5_scanner_flags_keras3_weights_external_link_without_resolving_it(tmp_path: Path) -> None:
+    """Keras 3 layout probing should not follow attacker-controlled external links."""
+    weights_path = tmp_path / "model.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        layers = f.create_group("layers")
+        layers["dense"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/layers/dense",
+            "filename": "missing_external_source.h5",
             "path": "/payload",
         },
     ]
