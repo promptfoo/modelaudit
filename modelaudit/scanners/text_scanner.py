@@ -5,7 +5,7 @@ from typing import Any, ClassVar
 
 from modelaudit.core_results import mark_operational_scan_error
 from modelaudit.scanner_results import mark_inconclusive_scan_result
-from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
+from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 
 class TextScanner(BaseScanner):
@@ -50,10 +50,40 @@ class TextScanner(BaseScanner):
         """Return file size for bounded text classification."""
         return os.path.getsize(path)
 
+    @staticmethod
+    def _is_unreadable_path_result(result: ScanResult) -> bool:
+        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    @staticmethod
+    def _finish_metadata_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
+        mark_inconclusive_scan_result(result, "text_metadata_read_failed")
+        mark_operational_scan_error(result, "text_metadata_read_failed")
+        result.add_check(
+            name="Text File Metadata Read",
+            passed=False,
+            message=f"Unable to inspect text file metadata: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "text_metadata_read_failed",
+            },
+        )
+        result.finish(success=False)
+        return result
+
     def scan(self, path: str) -> ScanResult:
         """Scan a text file for security issues."""
         result = self._create_scan_result_after_preflight(path, check_size_limit=False)
         if not result.success:
+            if self._is_unreadable_path_result(result):
+                return self._finish_metadata_read_failure(
+                    self._create_result(),
+                    path,
+                    PermissionError(f"Path is not readable: {path}"),
+                )
             return result
 
         try:
@@ -145,22 +175,7 @@ class TextScanner(BaseScanner):
             result.finish(success=True)
 
         except OSError as e:
-            mark_inconclusive_scan_result(result, "text_metadata_read_failed")
-            mark_operational_scan_error(result, "text_metadata_read_failed")
-            result.add_check(
-                name="Text File Metadata Read",
-                passed=False,
-                message=f"Unable to inspect text file metadata: {e!s}",
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={
-                    "exception": str(e),
-                    "exception_type": type(e).__name__,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": "text_metadata_read_failed",
-                },
-            )
-            result.finish(success=False)
+            self._finish_metadata_read_failure(result, path, e)
         except Exception as e:
             result.add_check(
                 name="Text File Scan",

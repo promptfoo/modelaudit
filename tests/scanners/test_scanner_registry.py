@@ -879,6 +879,8 @@ def test_get_scanner_for_path_routes_generic_pkl_zip_without_pytorch_markers_to_
         ("unreadable.pdmodel", "paddle"),
         ("unreadable.bin", "pytorch_binary"),
         ("unreadable.pb", "tf_savedmodel"),
+        ("config.json", "manifest"),
+        ("vocab.txt", "text"),
     ],
 )
 def test_get_scanner_for_path_preserves_read_failure_aware_owner_after_failed_zip_probe(

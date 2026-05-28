@@ -13,7 +13,7 @@ from modelaudit.core_results import mark_operational_scan_error, scan_result_has
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
 try:
     _tomllib: ModuleType | None = importlib.import_module("tomllib")
@@ -606,6 +606,12 @@ class ManifestScanner(BaseScanner):
         # Check if path is valid
         path_check_result = self._check_path(path)
         if path_check_result:
+            if self._is_unreadable_path_result(path_check_result):
+                return self._finish_read_failure(
+                    self._create_result(),
+                    path,
+                    PermissionError(f"Path is not readable: {path}"),
+                )
             return path_check_result
 
         size_check = self._check_size_limit(path)
@@ -758,6 +764,56 @@ class ManifestScanner(BaseScanner):
 
         result.finish(success=True)
 
+    @staticmethod
+    def _is_unreadable_path_result(result: ScanResult) -> bool:
+        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    @staticmethod
+    def _record_read_failure(
+        result: ScanResult,
+        path: str,
+        error: OSError | UnicodeError,
+        *,
+        reason: str,
+        check_name: str,
+        message: str,
+    ) -> None:
+        mark_inconclusive_scan_result(result, reason)
+        mark_operational_scan_error(result, reason)
+        result.add_check(
+            name=check_name,
+            passed=False,
+            message=f"{message}: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+        )
+
+    @classmethod
+    def _finish_read_failure(
+        cls,
+        result: ScanResult,
+        path: str,
+        error: OSError | UnicodeError,
+        *,
+        reason: str = "manifest_read_failed",
+    ) -> ScanResult:
+        cls._record_read_failure(
+            result,
+            path,
+            error,
+            reason=reason,
+            check_name="Manifest File Read",
+            message="Unable to read manifest file",
+        )
+        result.finish(success=False)
+        return result
+
     def _check_file_for_blacklist(self, path: str, result: ScanResult) -> None:
         """Check the entire file content for blacklisted terms"""
         if not self.blacklist_patterns:
@@ -798,20 +854,13 @@ class ManifestScanner(BaseScanner):
         except TimeoutError:
             raise
         except (OSError, UnicodeError) as e:
-            self._mark_inconclusive_scan_result(result, "manifest_blacklist_read_failed")
-            mark_operational_scan_error(result, "manifest_blacklist_read_failed")
-            result.add_check(
-                name="Blacklist Pattern Check",
-                passed=False,
-                message=f"Unable to load manifest text for configured policy analysis: {e!s}",
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={
-                    "exception": str(e),
-                    "exception_type": type(e).__name__,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": "manifest_blacklist_read_failed",
-                },
+            self._record_read_failure(
+                result,
+                path,
+                e,
+                reason="manifest_blacklist_read_failed",
+                check_name="Blacklist Pattern Check",
+                message="Unable to load manifest text for configured policy analysis",
             )
         except Exception as e:
             result.add_check(
@@ -871,6 +920,17 @@ class ManifestScanner(BaseScanner):
 
         except TimeoutError:
             raise
+        except (OSError, UnicodeError) as e:
+            logger.warning(f"Error reading file {path}: {e!s}")
+            if result is not None:
+                self._record_read_failure(
+                    result,
+                    path,
+                    e,
+                    reason="manifest_read_failed",
+                    check_name="Manifest File Read",
+                    message="Unable to read manifest file for structured analysis",
+                )
         except Exception as e:
             logger.warning(f"Error parsing file {path}: {e!s}")
             if result is not None:
