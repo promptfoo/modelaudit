@@ -188,6 +188,16 @@ def test_compound_tar_wrappers_route_to_tar_scanner(
     assert scanner.name == "tar"
 
 
+def test_truncated_compound_tar_wrapper_routes_to_compressed_scanner(tmp_path: Path) -> None:
+    archive_path = tmp_path / "truncated.tar.gz"
+    archive_path.write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00")
+
+    scanner = get_scanner_for_file(str(archive_path))
+
+    assert scanner is not None
+    assert scanner.name == "compressed"
+
+
 @pytest.mark.parametrize(
     ("filename", "mode"),
     [
@@ -379,6 +389,7 @@ def test_compressed_scanner_benign_llamafile_uses_owned_executable_analysis(tmp_
     ("filename", "payload"),
     [
         ("safe.py.gz", b"import math\nanswer = math.sqrt(4)\n"),
+        ("safe_shebang.py.gz", b"#!/usr/bin/env python3\nprint('ok')\n"),
         ("safe.dat.gz", b"weights: [1, 2, 3]\n"),
     ],
 )

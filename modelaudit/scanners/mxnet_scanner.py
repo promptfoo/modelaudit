@@ -15,6 +15,7 @@ from modelaudit.utils.file.detection import (
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     detect_mxnet_symbol_content_route,
+    has_jax_json_checkpoint_structure,
     has_mxnet_symbol_graph_structure,
     inspect_mxnet_symbol_root_keys,
 )
@@ -314,7 +315,7 @@ class MXNetScanner(BaseScanner):
         self._scan_operator_names_for_cve_2022_24294(path, payload, result)
         self._scan_graph_metadata_payloads(path, payload, result)
         self._scan_xgboost_overlap(path, payload, result)
-        self._scan_filename_owned_json_overlap(path, result)
+        self._scan_filename_owned_json_overlap(path, result, payload)
         return True
 
     def _record_symbol_root_key_ambiguity(
@@ -384,12 +385,29 @@ class MXNetScanner(BaseScanner):
         for reason in existing_reasons:
             self._mark_inconclusive_scan_result(result, reason)
 
-    def _scan_filename_owned_json_overlap(self, path: str, result: ScanResult) -> None:
-        """Preserve filename-owned JSON checks for symbol-shaped content."""
+    def _scan_filename_owned_json_overlap(
+        self,
+        path: str,
+        result: ScanResult,
+        parsed_payload: object | None = None,
+    ) -> None:
+        """Preserve additional JSON analyses for symbol-shaped content."""
+        from .jax_checkpoint_scanner import JaxCheckpointScanner
         from .jinja2_template_scanner import Jinja2TemplateScanner
         from .manifest_scanner import ManifestScanner
 
         scanner_selection = policy_from_config(self.config)
+        if parsed_payload is not None and has_jax_json_checkpoint_structure(parsed_payload):
+            if scanner_selection.allows("jax_checkpoint"):
+                self._merge_filename_owned_result(result, JaxCheckpointScanner(config=self.config).scan(path))
+            elif scanner_selection.active:
+                add_scanner_selection_skip_check(
+                    result,
+                    path,
+                    "jax_checkpoint",
+                    scanner_selection,
+                    context="overlapping JAX JSON analysis",
+                )
         manifest_covered_templates = False
         if ManifestScanner.can_handle(path):
             if scanner_selection.allows("manifest"):

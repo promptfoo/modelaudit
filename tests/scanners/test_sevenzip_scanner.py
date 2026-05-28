@@ -12,6 +12,7 @@ Tests the 7-Zip archive scanning functionality including:
 import io
 import os
 import pickle
+import struct
 import tarfile
 import tempfile
 import zipfile
@@ -22,14 +23,56 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.sevenzip_scanner import HAS_PY7ZR, SevenZipScanner, _RecursiveScanBudget
+from modelaudit.scanners.sevenzip_scanner import (
+    HAS_PY7ZR,
+    SevenZipScanner,
+    _NestedMemberProbeResult,
+    _RecursiveScanBudget,
+)
 from modelaudit.scanners.xgboost_scanner import XGBoostScanner
 
 # Skip all tests if py7zr is not available for asset generation
 pytest_plugins: list[str] = []
+
+
+def _assert_inconclusive_aggregate_not_cached(
+    path: Path,
+    expected_reason: str,
+    cache_dir: Path,
+    **scan_kwargs: Any,
+) -> None:
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert expected_reason in metadata["scan_outcome_reasons"]
+            assert not [
+                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def _mock_scan_result(
@@ -187,18 +230,19 @@ class TestSevenZipScanner:
         assert len(result.issues) == 1
 
         issue = result.issues[0]
-        # Missing optional dependency is a WARNING, not CRITICAL
-        assert issue.severity == IssueSeverity.WARNING
+        assert issue.severity == IssueSeverity.INFO
         assert "py7zr library not installed" in issue.message
         assert "pip install py7zr" in issue.message
-        assert result.has_warnings is True
+        assert issue.details["analysis_incomplete"] is True
+        assert issue.details["scan_outcome_reason"] == "sevenzip_analysis_incomplete"
+        assert result.has_warnings is False
         assert result.has_errors is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert result.metadata["analysis_incomplete"] is True
         assert "sevenzip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
 
     @patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", False)
-    def test_scan_mocked_unavailable(self, scanner, temp_7z_file):
+    def test_scan_mocked_unavailable(self, scanner: SevenZipScanner, temp_7z_file: str, tmp_path: Path) -> None:
         """Test scan behavior when py7zr is mocked as unavailable"""
         result = scanner.scan(temp_7z_file)
 
@@ -206,14 +250,22 @@ class TestSevenZipScanner:
         assert len(result.issues) == 1
 
         issue = result.issues[0]
-        # Missing optional dependency is a WARNING, not CRITICAL
-        assert issue.severity == IssueSeverity.WARNING
+        assert issue.severity == IssueSeverity.INFO
         assert "py7zr library not installed" in issue.message
-        assert result.has_warnings is True
+        assert issue.details["analysis_incomplete"] is True
+        assert issue.details["scan_outcome_reason"] == "sevenzip_analysis_incomplete"
+        assert result.has_warnings is False
         assert result.has_errors is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert result.metadata["analysis_incomplete"] is True
         assert "sevenzip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+
+        Path(temp_7z_file).write_bytes(SevenZipScanner._SEVENZIP_MAGIC + b"\0" * 26)
+        _assert_inconclusive_aggregate_not_cached(
+            Path(temp_7z_file),
+            "sevenzip_analysis_incomplete",
+            tmp_path / "missing-dependency-cache",
+        )
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_can_handle_valid_7z_magic_bytes(self, temp_7z_file):
@@ -1283,6 +1335,7 @@ class TestSevenZipScannerConfiguration:
             assert mock_scan_file.call_args.args[1] == {
                 **scanner.config,
                 "_archive_depth": 1,
+                "cache_enabled": False,
             }
 
     def test_large_extracted_file_handling(self, scanner: SevenZipScanner, temp_7z_file: str) -> None:
@@ -1437,7 +1490,7 @@ class TestSevenZipScannerHardening:
             patch.object(
                 scanner,
                 "_probe_extensionless_members",
-                return_value=dict.fromkeys(extensionless_members[:3], False),
+                return_value={name: _NestedMemberProbeResult(None) for name in extensionless_members[:3]},
             ) as mock_probe,
             patch("os.path.getsize", return_value=32),
         ):
@@ -1454,6 +1507,149 @@ class TestSevenZipScannerHardening:
             limit_checks = [c for c in result.checks if "Probe Limit" in c.name]
             assert len(limit_checks) == 1
             assert limit_checks[0].status == CheckStatus.FAILED
+            assert limit_checks[0].severity == IssueSeverity.INFO
+            assert "remaining unsupported members were not inspected" in limit_checks[0].message
+            assert limit_checks[0].details["analysis_incomplete"] is True
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_extensionless_probe_limit_benign_archive_exits_inconclusive(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A bounded probe window is incomplete coverage, not a security finding."""
+        import py7zr  # type: ignore[import-untyped]
+
+        archive_path = tmp_path / "benign_probe_limit.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.writestr(b"ordinary notes", "first_payload")
+            archive.writestr(b"more ordinary notes", "second_payload")
+
+        config = {"max_7z_extensionless_probes": 1}
+        result = SevenZipScanner(config=config).scan(str(archive_path))
+        _assert_inconclusive_aggregate_not_cached(
+            archive_path,
+            "sevenzip_analysis_incomplete",
+            tmp_path / "benign-probe-limit-cache",
+            max_7z_extensionless_probes=1,
+        )
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "sevenzip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any("remaining unsupported members were not inspected" in check.message for check in result.checks)
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_extensionless_probe_limit_hidden_payload_exits_inconclusive(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An uninspected payload after the probe cap must not produce a clean or invented finding."""
+        import py7zr  # type: ignore[import-untyped]
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                return (os.system, ("echo hidden_after_probe_cap",))
+
+        archive_path = tmp_path / "hidden_probe_limit.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.writestr(b"ordinary notes", "first_payload")
+            archive.writestr(pickle.dumps(DangerousPayload(), protocol=0), "second_payload")
+
+        config = {"max_7z_extensionless_probes": 1}
+        result = SevenZipScanner(config=config).scan(str(archive_path))
+        _assert_inconclusive_aggregate_not_cached(
+            archive_path,
+            "sevenzip_analysis_incomplete",
+            tmp_path / "hidden-probe-limit-cache",
+            max_7z_extensionless_probes=1,
+        )
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["scannable_files"] == 0
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_extensionless_probe_limit_preserves_observed_security_finding(self, tmp_path: Path) -> None:
+        """An inspected malicious member must stay a security finding despite later incomplete coverage."""
+        import py7zr  # type: ignore[import-untyped]
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                return (os.system, ("echo detected_before_probe_cap",))
+
+        archive_path = tmp_path / "observed_probe_limit.7z"
+        payload_path = tmp_path / "observed_payload"
+        payload_path.write_bytes(pickle.dumps(DangerousPayload(), protocol=0))
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, "first_payload")
+            archive.writestr(b"ordinary notes", "second_payload")
+
+        reset_cache_manager()
+        try:
+            aggregates = [
+                scan_model_directory_or_file(
+                    str(archive_path),
+                    max_7z_extensionless_probes=1,
+                    cache_enabled=True,
+                    cache_dir=str(tmp_path / "observed-probe-limit-cache"),
+                    min_cache_file_size=0,
+                )
+                for _ in range(2)
+            ]
+            for aggregate in aggregates:
+                metadata = aggregate.file_metadata[str(archive_path)]
+                assert "sevenzip_analysis_incomplete" in metadata["scan_outcome_reasons"]
+                assert any(
+                    issue.severity == IssueSeverity.CRITICAL
+                    and issue.location
+                    and f"{archive_path}:first_payload" in issue.location
+                    and "system" in str(issue.message).lower()
+                    for issue in aggregate.issues
+                )
+                assert determine_exit_code(aggregate) == 1
+            assert (
+                get_cache_manager(str(tmp_path / "observed-probe-limit-cache"), enabled=True).get_stats()[
+                    "total_entries"
+                ]
+                == 0
+            )
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_extensionless_probe_read_failure_is_inconclusive_and_not_cached(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        import py7zr  # type: ignore[import-untyped]
+
+        archive_path = tmp_path / "unreadable_probe.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.writestr(b"ordinary notes", "payload")
+
+        with (
+            patch.object(SevenZipScanner, "_probe_extensionless_members", side_effect=OSError("batch read failed")),
+            patch.object(SevenZipScanner, "_member_probe_result", side_effect=OSError("member read failed")),
+        ):
+            result = SevenZipScanner().scan(str(archive_path))
+
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert "sevenzip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+            failure_check = next(check for check in result.checks if check.name.startswith("Nested 7z Probe:"))
+            assert failure_check.severity == IssueSeverity.INFO
+            assert "Failed to inspect nested archive candidate" in failure_check.message
+            assert failure_check.details["analysis_incomplete"] is True
+            assert failure_check.details["scan_outcome_reason"] == "sevenzip_analysis_incomplete"
+
+            _assert_inconclusive_aggregate_not_cached(
+                archive_path,
+                "sevenzip_analysis_incomplete",
+                tmp_path / "probe-read-failure-cache",
+            )
 
     def test_disguised_nested_zip_member_is_routed_for_scan(
         self,
@@ -1467,7 +1663,11 @@ class TestSevenZipScannerHardening:
         with (
             patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
             patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
-            patch.object(scanner, "_probe_extensionless_members", return_value={"payload.jpg": "zip"}) as mock_probe,
+            patch.object(
+                scanner,
+                "_probe_extensionless_members",
+                return_value={"payload.jpg": _NestedMemberProbeResult("zip")},
+            ) as mock_probe,
             patch.object(scanner, "_extract_and_scan_files", return_value=True) as mock_extract,
             patch("os.path.getsize", return_value=32),
         ):
@@ -1521,7 +1721,11 @@ class TestSevenZipScannerHardening:
         with (
             patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
             patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
-            patch.object(scanner, "_probe_extensionless_members", return_value={"payload.jpg": "zip"}),
+            patch.object(
+                scanner,
+                "_probe_extensionless_members",
+                return_value={"payload.jpg": _NestedMemberProbeResult("zip")},
+            ),
             patch("os.path.getsize", return_value=32),
         ):
             mock_archive = MagicMock()
@@ -1559,8 +1763,8 @@ class TestSevenZipScannerHardening:
         fake_archive = FakeArchive()
 
         assert scanner._probe_extensionless_members(fake_archive, ["payload_a.jpg", "payload_b.jpg"]) == {
-            "payload_a.jpg": "zip",
-            "payload_b.jpg": "zip",
+            "payload_a.jpg": _NestedMemberProbeResult("zip"),
+            "payload_b.jpg": _NestedMemberProbeResult("zip"),
         }
         assert fake_archive.targets == [["payload_a.jpg"], ["payload_b.jpg"]]
         assert fake_archive.reset_count == 2
@@ -1608,6 +1812,34 @@ class TestSevenZipScannerHardening:
 
         result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
 
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.location
+            and f"{archive_path}:models/model.jpg" in issue.location
+            and "System call in JSON" in str(issue.message)
+            for issue in result.issues
+        )
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_probe_limit_preserves_disguised_xgboost_security_finding(self, tmp_path: Path) -> None:
+        pytest.importorskip("ubjson", reason="ubjson not installed")
+        import py7zr  # type: ignore[import-untyped]
+
+        payload_path = tmp_path / "model_payload"
+        payload_path.write_bytes(_xgboost_ubjson_probe(malicious=True))
+        archive_path = tmp_path / "capped_disguised_xgboost.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, "models/model.jpg")
+            archive.writestr(b"ordinary notes", "models/filler.jpg")
+
+        result = scan_model_directory_or_file(
+            str(archive_path),
+            max_7z_extensionless_probes=1,
+            cache_enabled=False,
+        )
+
+        metadata = result.file_metadata[str(archive_path)]
+        assert "sevenzip_analysis_incomplete" in metadata["scan_outcome_reasons"]
         assert determine_exit_code(result) == 1
         assert any(
             issue.location
@@ -1682,6 +1914,239 @@ class TestSevenZipScannerHardening:
         assert result.metadata["scannable_files"] == 0
         assert not result.issues
 
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_high_risk_python_member_is_scanned_through_shared_archive_security(self, tmp_path: Path) -> None:
+        """Python source members must not bypass the AST archive-member detector."""
+        import py7zr  # type: ignore[import-untyped]
+
+        archive_path = tmp_path / "python_sidecar.7z"
+        source_path = tmp_path / "setup.py"
+        source_path.write_bytes(b"import os\nos.system('echo hidden')\n")
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(source_path, "assets/setup.py")
+
+        result = SevenZipScanner().scan(str(archive_path))
+        security_checks = [
+            check
+            for check in result.checks
+            if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+        ]
+
+        assert len(security_checks) == 1
+        assert "high-risk calls: os.system" in security_checks[0].message
+        assert security_checks[0].rule_code == "S101"
+        aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+        assert determine_exit_code(aggregate) == 1
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_python_named_pickle_still_reaches_nested_pickle_scanning(self, tmp_path: Path) -> None:
+        """A pickle disguised as Python source must not stop at AST inspection."""
+        import py7zr  # type: ignore[import-untyped]
+
+        class MaliciousClass:
+            def __reduce__(self) -> tuple[Any, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo disguised_python_pickle",))
+
+        payload_path = tmp_path / "payload.pkl"
+        archive_path = tmp_path / "python_named_pickle.7z"
+        self._write_pickle(payload_path, MaliciousClass())
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, "assets/payload.py")
+
+        result = SevenZipScanner().scan(str(archive_path))
+
+        assert any(
+            issue.location
+            and f"{archive_path}:assets/payload.py" in issue.location
+            and "system" in issue.message.lower()
+            for issue in result.issues
+        )
+        aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+        assert determine_exit_code(aggregate) == 1
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_benign_python_named_pickle_does_not_mark_python_analysis_incomplete(self, tmp_path: Path) -> None:
+        """A nested pickle owned by content routing must not be parsed as Python source."""
+        import py7zr  # type: ignore[import-untyped]
+
+        payload_path = tmp_path / "payload.pkl"
+        archive_path = tmp_path / "benign_python_named_pickle.7z"
+        self._write_pickle(payload_path, {"safe": True})
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, "assets/payload.py")
+
+        result = SevenZipScanner().scan(str(archive_path))
+
+        assert result.success is True
+        assert result.metadata.get("analysis_incomplete") is not True
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+        aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+        assert determine_exit_code(aggregate) == 0
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_benign_python_and_ordinary_members_stay_clean(self, tmp_path: Path) -> None:
+        """Scanning generic member types must not turn inert sidecars into findings."""
+        import py7zr  # type: ignore[import-untyped]
+
+        archive_path = tmp_path / "benign_sidecars.7z"
+        source_path = tmp_path / "setup.py"
+        notes_path = tmp_path / "readme.dat"
+        source_path.write_bytes(b"def transform(value):\n    return value\n")
+        notes_path.write_bytes(b"ordinary model notes")
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(source_path, "assets/setup.py")
+            archive.write(notes_path, "assets/readme.dat")
+
+        result = SevenZipScanner().scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_unparseable_python_member_marks_scan_inconclusive(self, tmp_path: Path) -> None:
+        """Unparseable Python source must fail closed instead of silently clearing coverage."""
+        import py7zr  # type: ignore[import-untyped]
+
+        archive_path = tmp_path / "unparseable_python.7z"
+        source_path = tmp_path / "broken.py"
+        source_path.write_bytes(b"def broken(:\n")
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(source_path, "assets/broken.py")
+
+        result = SevenZipScanner().scan(str(archive_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "sevenzip_python_member_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        parse_checks = [
+            check
+            for check in result.checks
+            if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+        ]
+        assert len(parse_checks) == 1
+        assert parse_checks[0].severity == IssueSeverity.INFO
+        aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+        assert determine_exit_code(aggregate) == 2
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_disguised_executable_members_are_detected_by_content(self, tmp_path: Path) -> None:
+        """Executable bytes must not disappear behind inert member suffixes."""
+        import py7zr  # type: ignore[import-untyped]
+
+        distant_pe_header = bytearray(b"\x00" * 2052)
+        distant_pe_header[:2] = b"MZ"
+        distant_pe_header[0x3C:0x40] = (2048).to_bytes(4, "little")
+        distant_pe_header[2048:2052] = b"PE\x00\x00"
+        archive_path = tmp_path / "executable_sidecars.7z"
+        elf_path = tmp_path / "payload.dat"
+        pe_path = tmp_path / "loader.txt"
+        supported_path = tmp_path / "declared.pkl"
+        python_named_path = tmp_path / "payload.py"
+        elf_path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+        pe_path.write_bytes(bytes(distant_pe_header))
+        supported_path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+        python_named_path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(elf_path, "assets/payload.dat")
+            archive.write(pe_path, "assets/loader.txt")
+            archive.write(supported_path, "assets/declared.pkl")
+            archive.write(python_named_path, "assets/payload.py")
+
+        result = SevenZipScanner().scan(str(archive_path))
+        security_messages = {
+            check.message
+            for check in result.checks
+            if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+        }
+
+        assert "Executable file found in 7z archive: assets/payload.dat" in security_messages
+        assert "Executable file found in 7z archive: assets/loader.txt" in security_messages
+        assert "Executable file found in 7z archive: assets/declared.pkl" in security_messages
+        assert "Executable file found in 7z archive: assets/payload.py" in security_messages
+        aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+        assert determine_exit_code(aggregate) == 1
+
+    def test_probed_executable_finding_survives_nested_extraction_size_limit(self, tmp_path: Path) -> None:
+        """A positive content probe must be reported before nested extraction is rejected."""
+        scanner = SevenZipScanner(config={"max_7z_extract_size": 8})
+        archive_path = tmp_path / "mock_oversized_executable.7z"
+        archive_path.write_bytes(scanner._SEVENZIP_MAGIC + b"\0" * 26)
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(
+                scanner,
+                "_probe_extensionless_members",
+                return_value={"payload.py": _NestedMemberProbeResult(None, executable_content=True)},
+            ),
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["payload.py"]
+            mock_archive.getinfo.return_value = MagicMock(is_directory=False, uncompressed=32)
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(str(archive_path))
+
+        assert any(
+            check.name == "Executable Archive Member Detection"
+            and check.message == "Executable file found in 7z archive: payload.py"
+            for check in result.checks
+        )
+        assert any(check.name == "Extracted File Size" for check in result.checks)
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_benign_llamafile_member_is_scanned_without_generic_executable_warning(self, tmp_path: Path) -> None:
+        """An explicit Llamafile member is a model artifact, not an executable sidecar."""
+        import py7zr  # type: ignore[import-untyped]
+
+        archive_path = tmp_path / "llamafile_model.7z"
+        source_path = tmp_path / "safe.llamafile"
+        source_path.write_bytes(
+            b"\x7fELF\x02\x01\x01\x00"
+            + (b"\x00" * 56)
+            + b"llamafile runtime\n--threads 4\n--ctx-size 2048"
+            + (b"\x00" * 256)
+            + (b"\x00" * 8192)
+            + b"GGUF"
+            + struct.pack("<IQQ", 3, 0, 0)
+        )
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(source_path, "models/safe.llamafile")
+
+        result = SevenZipScanner().scan(str(archive_path))
+
+        assert not any(check.name == "Executable Archive Member Detection" for check in result.checks)
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_unconfirmed_pe_pointer_marks_disguised_member_probe_inconclusive(self, tmp_path: Path) -> None:
+        """An MZ near-match beyond the PE budget must not become a confirmed finding."""
+        import py7zr  # type: ignore[import-untyped]
+
+        payload = bytearray(64)
+        payload[:2] = b"MZ"
+        payload[0x3C:0x40] = ((1024 * 1024) + 1).to_bytes(4, "little")
+        archive_path = tmp_path / "ambiguous_pe_sidecar.7z"
+        payload_path = tmp_path / "loader.dat"
+        payload_path.write_bytes(payload)
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, "assets/loader.dat")
+
+        result = SevenZipScanner().scan(str(archive_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "sevenzip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Executable 7z Probe: assets/loader.dat" and check.details["analysis_incomplete"] is True
+            for check in result.checks
+        )
+        assert not any(check.name == "Executable Archive Member Detection" for check in result.checks)
+
     # -- cumulative entry count -----------------------------------------------
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
@@ -1746,9 +2211,117 @@ class TestSevenZipScannerHardening:
         assert not result.success
         assert cumulative_checks[0].severity == IssueSeverity.CRITICAL
         assert cumulative_checks[0].details["limit"] == limit
-        assert mock_scan_file.call_count == 1
-        scanned_file = Path(mock_scan_file.call_args.args[0])
-        assert scanned_file.name == "inner_a.pkl"
+        mock_scan_file.assert_not_called()
+
+    def test_known_cumulative_extraction_size_limit_preflights_before_extraction(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
+        scanner.max_total_extract_size = 100
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_scan_extracted_file") as mock_scan_extracted_file,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["a.pkl", "b.pkl"]
+            mock_archive.getinfo.side_effect = lambda _name: MagicMock(uncompressed=60, is_directory=False)
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+        cumulative_checks = [c for c in result.checks if c.name == "Cumulative Extraction Size"]
+        assert result.success is False
+        assert len(cumulative_checks) == 1
+        assert cumulative_checks[0].severity == IssueSeverity.CRITICAL
+        assert cumulative_checks[0].details["cumulative_bytes"] == 120
+        mock_archive.extract.assert_not_called()
+        mock_scan_extracted_file.assert_not_called()
+
+    def test_unknown_cumulative_extraction_size_limit_uses_budgeted_factory(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
+        scanner.max_total_extract_size = 100
+        extract_kwargs: dict[str, Any] = {}
+
+        def fake_extract(*_args: Any, **kwargs: Any) -> None:
+            extract_kwargs.update(kwargs)
+            factory = kwargs["factory"]
+            for target in kwargs["targets"]:
+                writer = factory.create(target)
+                writer.write(b"x" * 60)
+                writer.close()
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_scan_extracted_file") as mock_scan_extracted_file,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["a.pkl", "b.pkl"]
+            mock_archive.getinfo.side_effect = lambda _name: MagicMock(uncompressed=None, is_directory=False)
+            mock_archive.extract.side_effect = fake_extract
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+        cumulative_checks = [c for c in result.checks if c.name == "Cumulative Extraction Size"]
+        assert result.success is False
+        assert len(cumulative_checks) == 1
+        assert cumulative_checks[0].severity == IssueSeverity.CRITICAL
+        assert cumulative_checks[0].details["cumulative_bytes"] == 120
+        assert "factory" in extract_kwargs
+        assert "path" not in extract_kwargs
+        mock_scan_extracted_file.assert_not_called()
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_real_many_small_members_abort_before_extraction_budget_is_exceeded(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "many_small.7z"
+        members: list[tuple[Path, str]] = []
+        for index in range(4):
+            member_path = tmp_path / f"member_{index}.pkl"
+            self._write_pickle(member_path, {"payload": "x" * 64, "index": index})
+            members.append((member_path, f"member_{index}.pkl"))
+        self._write_7z_archive(archive_path, members)
+        limit = sum(path.stat().st_size for path, _name in members) - 1
+        scanner = SevenZipScanner(config={"max_7z_total_extract_size": limit})
+
+        with patch("modelaudit.core.scan_file", return_value=_mock_scan_result()) as mock_scan_file:
+            result = scanner.scan(str(archive_path))
+
+        cumulative_checks = [c for c in result.checks if c.name == "Cumulative Extraction Size"]
+        assert result.success is False
+        assert len(cumulative_checks) == 1
+        assert cumulative_checks[0].details["limit"] == limit
+        mock_scan_file.assert_not_called()
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_real_archive_under_cumulative_extraction_budget_scans_members(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "under_budget.7z"
+        members: list[tuple[Path, str]] = []
+        for index in range(2):
+            member_path = tmp_path / f"safe_{index}.pkl"
+            self._write_pickle(member_path, {"payload": "safe", "index": index})
+            members.append((member_path, f"safe_{index}.pkl"))
+        self._write_7z_archive(archive_path, members)
+        limit = sum(path.stat().st_size for path, _name in members)
+        scanner = SevenZipScanner(config={"max_7z_total_extract_size": limit})
+
+        with patch("modelaudit.core.scan_file", return_value=_mock_scan_result()) as mock_scan_file:
+            result = scanner.scan(str(archive_path))
+
+        cumulative_checks = [c for c in result.checks if c.name == "Cumulative Extraction Size"]
+        assert result.success is True
+        assert cumulative_checks == []
+        assert mock_scan_file.call_count == 2
 
     # -- depth bomb finish() --------------------------------------------------
 

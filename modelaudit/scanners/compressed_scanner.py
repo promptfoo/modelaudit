@@ -111,6 +111,7 @@ class CompressedScanner(BaseScanner):
     _OPTIONAL_DEPENDENCY_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_optional_dependency_unavailable"
     _STREAM_DECODE_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_stream_decode_failed"
     _PYTHON_PAYLOAD_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_python_payload_analysis_incomplete"
+    _EXECUTABLE_PAYLOAD_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_executable_payload_analysis_incomplete"
     _LOGICAL_WRAPPER_NAME_CONFIG: ClassVar[str] = "_compressed_logical_wrapper_name"
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -746,6 +747,7 @@ class CompressedScanner(BaseScanner):
             result=result,
             max_python_analysis_bytes=self.MAX_PYTHON_PAYLOAD_ANALYSIS_BYTES,
             python_analysis_incomplete_reason=self._PYTHON_PAYLOAD_INCONCLUSIVE_REASON,
+            executable_analysis_incomplete_reason=self._EXECUTABLE_PAYLOAD_INCONCLUSIVE_REASON,
             analyze_executable_content=not inner_owns_executable_content,
         )
         self._set_compressed_provenance(
@@ -778,6 +780,7 @@ class CompressedScanner(BaseScanner):
                 result=result,
                 max_python_analysis_bytes=self.MAX_PYTHON_PAYLOAD_ANALYSIS_BYTES,
                 python_analysis_incomplete_reason=self._PYTHON_PAYLOAD_INCONCLUSIVE_REASON,
+                executable_analysis_incomplete_reason=self._EXECUTABLE_PAYLOAD_INCONCLUSIVE_REASON,
                 analyze_python_source=aggregate_python_incomplete,
             )
             self._set_compressed_provenance(

@@ -7,7 +7,9 @@ from typing import Any
 
 import pytest
 
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 from modelaudit.utils.file.detection import (
     JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
@@ -29,6 +31,42 @@ def _proto4_short_unicode(value: str) -> bytes:
 def _proto4_binunicode(value: str) -> bytes:
     encoded = value.encode("utf-8")
     return b"X" + len(encoded).to_bytes(4, "little") + encoded
+
+
+def _assert_file_inconclusive_not_cached(
+    path: Path,
+    expected_reason: str,
+    cache_dir: Path,
+    **scan_kwargs: Any,
+) -> None:
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert expected_reason in metadata["scan_outcome_reasons"]
+            assert not [
+                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_orbax_metadata_regex_patterns_are_detected(tmp_path: Path) -> None:
@@ -273,6 +311,314 @@ def test_malicious_pickle_global_opcode_is_detected(tmp_path: Path) -> None:
         and check.severity == IssueSeverity.CRITICAL
         and check.details["global"] in {"os.system", "posix.system", "nt.system"}
         for check in failed_checks
+    )
+
+
+def test_protocol_zero_jax_checkpoint_pickle_global_opcode_is_detected(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "malicious_protocol0_state.checkpoint"
+    pickle_path.write_bytes(pickle.dumps({"framework": "jax", "payload": _MaliciousJaxState()}, protocol=0))
+
+    assert JaxCheckpointScanner.can_handle(str(pickle_path))
+
+    result = JaxCheckpointScanner().scan(str(pickle_path))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] in {"os.system", "posix.system", "nt.system"}
+        for check in result.checks
+    )
+
+
+def test_orbax_protocol_zero_checkpoint_without_jax_marker_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_protocol0"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
+def test_orbax_protocol_one_checkpoint_without_jax_marker_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_protocol1"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(pickle.dumps({"payload": _MaliciousJaxState()}, protocol=1))
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] in {"os.system", "posix.system", "nt.system"}
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "configuration for jax checkpoint in a plain text sidecar",
+        "JAX checkpoint metadata in a plain text sidecar",
+    ],
+)
+def test_jax_text_checkpoint_with_legacy_opcode_prefix_does_not_scan_as_pickle(tmp_path: Path, text: str) -> None:
+    checkpoint_path = tmp_path / "plain_text.checkpoint"
+    checkpoint_path.write_text(text, encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success
+    assert not any(check.name == "Pickle Checkpoint Scan" for check in result.checks)
+    assert "jax_pickle_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_orbax_text_checkpoint_sidecar_with_global_shape_does_not_scan_as_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_plain_text"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "metadata.json").write_text("{}", encoding="utf-8")
+    (checkpoint_dir / "checkpoint").write_text("configuration\nmetadata\n", encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(check.name == "Pickle Checkpoint Scan" for check in result.checks)
+    assert "jax_pickle_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_empty_orbax_checkpoint_file_does_not_scan_as_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "empty_orbax"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "checkpoint").write_bytes(b"")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(check.name == "Pickle Checkpoint Scan" for check in result.checks)
+    assert "jax_pickle_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_orbax_protocol_zero_persid_checkpoint_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_persid"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(b"Popaque_id\ncposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
+def test_orbax_protocol_zero_long_unicode_prefix_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_long_unicode"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(
+        b"V" + (b"A" * (JaxCheckpointScanner._LEGACY_PICKLE_PREFIX_PROBE_BYTES + 1)) + b"\n"
+        b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n."
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
+def test_eof_truncated_orbax_legacy_pickle_is_scanned_inconclusive(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_eof_truncated"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(b"cposix\nsystem\n")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+    assert "jax_pickle_scan_failed" in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_orbax_binbytes_prefix_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_binbytes"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(b"B\x03\x00\x00\x00abccposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
+def test_orbax_frame_prefix_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_frame"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    frame_payload = b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n."
+    checkpoint_file.write_bytes(b"\x95" + len(frame_payload).to_bytes(8, "little") + frame_payload)
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
+def test_orbax_truncated_binstring_prefix_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_long_binstring"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    binary_string = b"A" * (JaxCheckpointScanner._LEGACY_PICKLE_PREFIX_PROBE_BYTES + 1)
+    checkpoint_file.write_bytes(
+        b"T" + len(binary_string).to_bytes(4, "little") + binary_string + b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n."
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
+def test_orbax_truncated_numeric_prefix_is_scanned_inconclusive(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_long_numeric"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(
+        b"I" + (b"9" * (JaxCheckpointScanner._LEGACY_PICKLE_PREFIX_PROBE_BYTES + 1)) + b"\n"
+        b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n."
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert "jax_pickle_scan_failed" in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_benign_protocol_zero_jax_checkpoint_is_scanned_as_pickle(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "benign_protocol0_state.checkpoint"
+    pickle_path.write_bytes(pickle.dumps({"framework": "jax", "params": {"dense": [1, 2, 3]}}, protocol=0))
+
+    assert JaxCheckpointScanner.can_handle(str(pickle_path))
+
+    result = JaxCheckpointScanner().scan(str(pickle_path))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Pickle Opcode Security Check" and check.status == CheckStatus.FAILED for check in result.checks
     )
 
 
@@ -575,6 +921,7 @@ def test_truncated_large_pickle_prefix_keeps_dangerous_global_without_scan_error
         + b"\x93"
         + b"0"
         + _proto4_binunicode("a" * 4096)
+        + b"."
     )
     pickle_path.write_bytes(payload)
 
@@ -583,11 +930,13 @@ def test_truncated_large_pickle_prefix_keeps_dangerous_global_without_scan_error
 
     result = scanner.scan(str(pickle_path))
 
-    assert result.success
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_pickle_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
     assert any(
         check.name == "Pickle Checkpoint Prefix Scan Limit"
         and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.WARNING
+        and check.severity == IssueSeverity.INFO
         for check in result.checks
     )
     assert any(
@@ -598,10 +947,19 @@ def test_truncated_large_pickle_prefix_keeps_dangerous_global_without_scan_error
     )
     assert all(check.name != "Pickle Checkpoint Scan" for check in result.checks)
 
+    aggregate = scan_model_directory_or_file(
+        str(pickle_path),
+        cache_scan_results=False,
+        jax_pickle_max_scan_bytes=1024,
+    )
+    assert determine_exit_code(aggregate) == 1
+    assert aggregate.file_metadata[str(pickle_path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_pickle_scan_limit_exceeded" in aggregate.file_metadata[str(pickle_path)]["scan_outcome_reasons"]
+
 
 def test_truncated_benign_large_pickle_prefix_does_not_emit_scan_error(tmp_path: Path) -> None:
     pickle_path = tmp_path / "truncated_benign_prefix.pickle"
-    payload = b"\x80\x04" + _proto4_short_unicode("jax") + b"0" + _proto4_binunicode("safe" * 1024)
+    payload = b"\x80\x04" + _proto4_short_unicode("jax") + b"0" + _proto4_binunicode("safe" * 1024) + b"."
     pickle_path.write_bytes(payload)
 
     scanner = JaxCheckpointScanner(config={"jax_pickle_max_scan_bytes": 1024})
@@ -609,10 +967,57 @@ def test_truncated_benign_large_pickle_prefix_does_not_emit_scan_error(tmp_path:
 
     result = scanner.scan(str(pickle_path))
 
-    assert result.success
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_pickle_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
     assert all(check.name != "Pickle Checkpoint Scan" for check in result.checks)
+    assert any(
+        check.name == "Pickle Checkpoint Prefix Scan Limit"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
     assert all(
         check.name != "Pickle Opcode Security Check" or check.status != CheckStatus.FAILED for check in result.checks
+    )
+    _assert_file_inconclusive_not_cached(
+        pickle_path,
+        "jax_pickle_scan_limit_exceeded",
+        tmp_path / "pickle-prefix-cache",
+        jax_pickle_max_scan_bytes=1024,
+    )
+
+
+def test_late_dangerous_pickle_opcode_beyond_prefix_is_inconclusive(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "late_dangerous_prefix.pickle"
+    payload = (
+        b"\x80\x04"
+        + _proto4_short_unicode("jax")
+        + b"0"
+        + _proto4_binunicode("safe" * 1024)
+        + b"0"
+        + _proto4_short_unicode("os")
+        + _proto4_short_unicode("system")
+        + b"\x93."
+    )
+    pickle_path.write_bytes(payload)
+
+    scanner = JaxCheckpointScanner(config={"jax_pickle_max_scan_bytes": 1024})
+    assert scanner.can_handle(str(pickle_path))
+
+    result = scanner.scan(str(pickle_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_pickle_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Pickle Checkpoint Prefix Scan Limit"
+        and "inspected for opcode patterns" in check.message
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Pickle Opcode Security Check" and check.status == CheckStatus.FAILED for check in result.checks
     )
 
 
@@ -708,6 +1113,299 @@ def test_oversized_renamed_jax_json_checkpoint_fails_closed_without_routing_ajax
         and check.status == CheckStatus.FAILED
         and check.message == "JSON checkpoint analysis incomplete because the file exceeds the bounded parsing limit"
         and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+    _assert_file_inconclusive_not_cached(
+        checkpoint_path,
+        "jax_json_checkpoint_analysis_size_limit",
+        tmp_path / "json-size-cache",
+    )
+
+
+def test_oversized_jax_json_checkpoint_reports_visible_bounded_pattern_before_failing_closed(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "malicious-large.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["context"] == "json_checkpoint_bounded_prefix.payload"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Documentation mentions jax.experimental.host_callback.call as unsupported.",
+        {"detail": "Documentation mentions jax.experimental.host_callback.call as unsupported."},
+        ["Documentation mentions jax.experimental.host_callback.call as unsupported."],
+    ],
+)
+def test_oversized_jax_json_checkpoint_does_not_promote_documentation_pattern_to_critical(
+    tmp_path: Path,
+    description: object,
+) -> None:
+    checkpoint_path = tmp_path / "documentation-large.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "description": description,
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert all(check.name != "JSON Pattern Security Check" for check in result.checks)
+
+
+def test_oversized_jax_json_checkpoint_reports_visible_nested_payload_pattern(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "nested-malicious-large.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "runtime": {"payload": "jax.experimental.host_callback.call(os.system, 'id')"},
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["context"] == "json_checkpoint_bounded_prefix.runtime.payload"
+        for check in result.checks
+    )
+
+
+def test_oversized_jax_json_checkpoint_reports_visible_payload_after_depth_capped_value(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "depth-capped-prefix-large.checkpoint"
+    deep_value: object = "benign"
+    for _ in range(JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH + 1):
+        deep_value = [deep_value]
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "deep": deep_value,
+                "payload": "jax.experimental.io_callback",
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["context"] == "json_checkpoint_bounded_prefix.payload"
+        for check in result.checks
+    )
+    assert any(check.name == "JSON Metadata Traversal Depth Limit" for check in result.checks)
+
+
+def test_oversized_jax_json_checkpoint_reports_visible_payload_after_json_parser_recursion_limit(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "recursive-prefix-large.checkpoint"
+    depth = 2048
+    checkpoint_path.write_text(
+        '{"framework":"jax","deep":'
+        + ("[" * depth)
+        + "0"
+        + ("]" * depth)
+        + ',"payload":"jax.experimental.io_callback","padding":"'
+        + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16))
+        + '"}',
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["context"] == "json_checkpoint_bounded_prefix.payload"
+        for check in result.checks
+    )
+    assert all(check.name != "Checkpoint File Scan" for check in result.checks)
+
+
+def test_oversized_jax_json_checkpoint_reports_pattern_in_truncated_visible_string_value(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "long-payload-malicious.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "payload": "jax.experimental.io_callback" + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["pattern"] == r"jax\.experimental\.io_callback"
+        and check.details["context"] == "json_checkpoint_bounded_prefix.payload"
+        for check in result.checks
+    )
+
+
+def test_oversized_jax_json_checkpoint_decodes_pattern_in_truncated_string_value(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "escaped-long-payload-malicious.checkpoint"
+    checkpoint_path.write_text(
+        '{"framework":"jax","payload":"jax\\u002eexperimental\\u002eio_callback'
+        + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16))
+        + '"}',
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["pattern"] == r"jax\.experimental\.io_callback"
+        and check.details["context"] == "json_checkpoint_bounded_prefix.payload"
+        for check in result.checks
+    )
+
+
+def test_oversized_jax_json_checkpoint_decodes_truncated_documentation_before_suppression(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "escaped-long-documentation.checkpoint"
+    checkpoint_path.write_text(
+        '{"framework":"jax","description":"caf\\u00e9 Documentation mentions '
+        "jax.experimental.io_callback as unsupported. "
+        + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16))
+        + '"}',
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert all(check.name != "JSON Pattern Security Check" for check in result.checks)
+
+
+def test_oversized_jax_json_checkpoint_does_not_scan_trailing_second_root(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "trailing-document-large.checkpoint"
+    checkpoint_path.write_text(
+        '{"framework":"jax"}{"payload":"jax.experimental.io_callback","padding":"'
+        + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16))
+        + '"}',
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert all(check.name != "JSON Pattern Security Check" for check in result.checks)
+
+
+def test_oversized_jax_json_checkpoint_scans_visible_first_root_before_trailing_bytes(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "visible-malicious-root-with-trailing-bytes.checkpoint"
+    checkpoint_path.write_text(
+        '{"framework":"jax","payload":"jax.experimental.io_callback"}'
+        + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["context"] == "json_checkpoint_bounded_prefix.payload"
+        for check in result.checks
+    )
+
+
+def test_oversized_jax_json_checkpoint_uses_final_duplicate_value_when_root_is_visible(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "visible-root-duplicate-value.checkpoint"
+    checkpoint_path.write_text(
+        '{"framework":"jax","payload":"jax.experimental.io_callback","payload":"benign"}'
+        + (" " * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert all(check.name != "JSON Pattern Security Check" for check in result.checks)
+
+
+def test_oversized_jax_json_checkpoint_reports_visible_duplicate_value_when_root_is_truncated(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "truncated-root-duplicate-value.checkpoint"
+    checkpoint_path.write_text(
+        '{"framework":"jax","payload":"jax.experimental.io_callback","padding":"'
+        + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16))
+        + '","payload":"benign"}',
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["context"] == "json_checkpoint_bounded_prefix.payload"
+        for check in result.checks
+    )
+
+
+def test_oversized_jax_json_array_reports_visible_nested_pattern(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "array-malicious.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps(
+            [
+                "jax.experimental.host_callback.call(os.system, 'id')",
+                "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["context"] == "json_checkpoint_bounded_prefix[0]"
         for check in result.checks
     )
 
@@ -976,11 +1674,13 @@ def test_deep_orbax_metadata_reports_depth_limit_without_silent_truncation(tmp_p
 
     result = JaxCheckpointScanner().scan(str(checkpoint_dir))
 
-    assert result.success
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_metadata_traversal_depth_limit" in result.metadata["scan_outcome_reasons"]
     assert any(
         check.name == "Orbax Metadata Traversal Depth Limit"
         and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.WARNING
+        and check.severity == IssueSeverity.INFO
         and check.details["traversal_depth_cap_reached"] is True
         and check.details["max_metadata_traversal_depth"] == JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH
         and check.details["context"].startswith("orbax_metadata.payload")
@@ -989,7 +1689,7 @@ def test_deep_orbax_metadata_reports_depth_limit_without_silent_truncation(tmp_p
 
 
 def test_deep_json_checkpoint_reports_depth_limit_without_silent_truncation(tmp_path: Path) -> None:
-    checkpoint_path = tmp_path / "deep_model.checkpoint"
+    checkpoint_path = tmp_path / "deep_model.jpg"
     nested_metadata: object = "jax.experimental.host_callback.call(os.system, 'id')"
     for _ in range(2 * JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH):
         nested_metadata = {"nested": nested_metadata}
@@ -1002,13 +1702,296 @@ def test_deep_json_checkpoint_reports_depth_limit_without_silent_truncation(tmp_
 
     result = JaxCheckpointScanner().scan(str(checkpoint_path))
 
-    assert result.success
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_metadata_traversal_depth_limit" in result.metadata["scan_outcome_reasons"]
     assert any(
         check.name == "JSON Metadata Traversal Depth Limit"
         and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.WARNING
+        and check.severity == IssueSeverity.INFO
         and check.details["traversal_depth_cap_reached"] is True
         and check.details["max_metadata_traversal_depth"] == JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH
         and check.details["context"].startswith("json_checkpoint.payload")
         for check in result.checks
     )
+
+    _assert_file_inconclusive_not_cached(
+        checkpoint_path,
+        "jax_metadata_traversal_depth_limit",
+        tmp_path / "json-depth-cache",
+    )
+
+
+def test_malformed_jax_json_checkpoint_is_inconclusive(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "malformed.checkpoint"
+    checkpoint_path.write_text('{"framework": "jax", "payload": ', encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "JSON Checkpoint Validation"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+
+    _assert_file_inconclusive_not_cached(
+        checkpoint_path,
+        "jax_json_parse_failed",
+        tmp_path / "json-parse-cache",
+    )
+
+
+def test_checkpoint_file_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_path = tmp_path / "read-failure.checkpoint"
+    checkpoint_path.write_text(json.dumps({"framework": "jax", "type": "checkpoint"}), encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path))
+
+    def fail_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("simulated JAX file read failure")
+
+    def always_handles(_cls: type[JaxCheckpointScanner], _path: str) -> bool:
+        return True
+
+    monkeypatch.setattr(JaxCheckpointScanner, "can_handle", classmethod(always_handles))
+    monkeypatch.setattr("modelaudit.scanners.jax_checkpoint_scanner.open", fail_open, raising=False)
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_checkpoint_file_scan_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Checkpoint File Scan"
+        and check.severity == IssueSeverity.INFO
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+    _assert_file_inconclusive_not_cached(
+        checkpoint_path,
+        "jax_checkpoint_file_scan_failed",
+        tmp_path / "file-read-cache",
+    )
+
+
+def test_json_loader_failure_is_inconclusive_and_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_path = tmp_path / "json-loader-failure.checkpoint"
+    checkpoint_path.write_text(json.dumps({"framework": "jax", "type": "checkpoint"}), encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path))
+
+    def fail_json_load(_stream: Any) -> Any:
+        raise OSError("simulated JSON load failure")
+
+    monkeypatch.setattr("modelaudit.scanners.jax_checkpoint_scanner.json.load", fail_json_load)
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_json_scan_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "JSON Checkpoint Scan"
+        and check.severity == IssueSeverity.INFO
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+    _assert_file_inconclusive_not_cached(
+        checkpoint_path,
+        "jax_json_scan_failed",
+        tmp_path / "json-load-cache",
+    )
+
+
+def test_unexpected_checkpoint_dispatch_failure_is_inconclusive_and_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_path = tmp_path / "unexpected-failure.checkpoint"
+    checkpoint_path.write_text(json.dumps({"framework": "jax", "type": "checkpoint"}), encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path))
+
+    def fail_dispatch(_self: JaxCheckpointScanner, _path: str, _result: Any) -> None:
+        raise RuntimeError("simulated JAX dispatcher failure")
+
+    monkeypatch.setattr(JaxCheckpointScanner, "_scan_checkpoint_file", fail_dispatch)
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_checkpoint_scan_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "JAX Checkpoint Scan"
+        and check.severity == IssueSeverity.INFO
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+    _assert_file_inconclusive_not_cached(
+        checkpoint_path,
+        "jax_checkpoint_scan_failed",
+        tmp_path / "dispatcher-cache",
+    )
+
+
+def test_pickle_opcode_parse_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pickle_path = tmp_path / "jax_parse_failure.pickle"
+    pickle_path.write_bytes(b"\x80\x04" + _proto4_short_unicode("jax") + b".")
+
+    assert JaxCheckpointScanner.can_handle(str(pickle_path))
+
+    def fail_genops(_data: bytes) -> Any:
+        raise ValueError("simulated pickle parse failure")
+
+    monkeypatch.setattr("modelaudit.scanners.jax_checkpoint_scanner.pickletools.genops", fail_genops)
+
+    result = JaxCheckpointScanner().scan(str(pickle_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_pickle_scan_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Pickle Checkpoint Scan"
+        and check.severity == IssueSeverity.INFO
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+
+
+def test_object_numpy_file_is_inconclusive(tmp_path: Path) -> None:
+    np = pytest.importorskip("numpy")
+    checkpoint_path = tmp_path / "jax_object.ckpt"
+    with checkpoint_path.open("wb") as checkpoint_file:
+        np.save(checkpoint_file, np.array([{"payload": "unsafe"}], dtype=object), allow_pickle=True)
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_numpy_load_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "NumPy Checkpoint Load"
+        and check.severity == IssueSeverity.INFO
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+
+
+def test_numpy_dependency_unavailable_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    np = pytest.importorskip("numpy")
+    checkpoint_path = tmp_path / "jax_numeric.ckpt"
+    with checkpoint_path.open("wb") as checkpoint_file:
+        np.save(checkpoint_file, np.array([1.0, 2.0, 3.0]))
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path))
+    monkeypatch.setattr("modelaudit.scanners.jax_checkpoint_scanner.HAS_NUMPY", False)
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_numpy_analysis_unavailable" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "NumPy Library Check"
+        and check.severity == IssueSeverity.INFO
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+
+
+def test_malformed_orbax_metadata_is_inconclusive(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "malformed_orbax"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "metadata.json").write_text('{"type": "orbax_checkpoint"', encoding="utf-8")
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_orbax_metadata_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Orbax Metadata JSON Validation"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+
+
+def test_orbax_metadata_read_failure_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir = tmp_path / "unreadable_orbax"
+    _write_orbax_metadata(checkpoint_dir, {"type": "orbax_checkpoint"})
+
+    def fail_json_load(_stream: Any) -> Any:
+        raise OSError("simulated Orbax metadata read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.jax_checkpoint_scanner.json.load", fail_json_load)
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_orbax_metadata_read_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Orbax Metadata Read Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.INFO
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+
+
+def test_orbax_object_numpy_checkpoint_is_inconclusive(tmp_path: Path) -> None:
+    np = pytest.importorskip("numpy")
+    checkpoint_dir = tmp_path / "orbax_object_numpy"
+    _write_orbax_metadata(checkpoint_dir, {"type": "orbax_checkpoint"})
+    with (checkpoint_dir / "checkpoint_0").open("wb") as checkpoint_file:
+        np.save(checkpoint_file, np.array([{"payload": "unsafe"}], dtype=object), allow_pickle=True)
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_numpy_load_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "NumPy Checkpoint Load"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+
+
+def test_orbax_numeric_numpy_checkpoint_remains_clean(tmp_path: Path) -> None:
+    np = pytest.importorskip("numpy")
+    checkpoint_dir = tmp_path / "orbax_numeric_numpy"
+    _write_orbax_metadata(checkpoint_dir, {"type": "orbax_checkpoint"})
+    with (checkpoint_dir / "checkpoint_0").open("wb") as checkpoint_file:
+        np.save(checkpoint_file, np.array([1.0, 2.0, 3.0]))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != "inconclusive"
