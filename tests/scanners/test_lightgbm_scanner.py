@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.lightgbm_scanner import LightGBMScanner
@@ -40,6 +41,33 @@ def _build_lightgbm_text(extra_lines: list[str] | None = None) -> str:
 
 def _check_by_name(result: ScanResult, name: str) -> list[Check]:
     return [check for check in result.checks if check.name == name]
+
+
+def _scan_without_cache(path: Path) -> ModelAuditResultModel:
+    return scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+
+def _assert_lightgbm_read_failure(
+    direct: ScanResult,
+    aggregate: ModelAuditResultModel,
+    path: Path,
+) -> None:
+    read_checks = _check_by_name(direct, "LightGBM File Read")
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "lightgbm_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "lightgbm_read_failed" in direct.metadata["scan_outcome_reasons"]
+    assert direct.metadata["operational_error"] is True
+    assert direct.metadata["operational_error_reason"] == "lightgbm_read_failed"
+
+    metadata = aggregate.file_metadata[str(path)]
+    assert "lightgbm_read_failed" in metadata["scan_outcome_reasons"]
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_can_handle_lightgbm_text_model(tmp_path: Path) -> None:
@@ -183,23 +211,9 @@ def test_lightgbm_read_failure_is_inconclusive_not_security_finding(
     monkeypatch.setattr("modelaudit.scanners.lightgbm_scanner.open", raise_os_error, raising=False)
 
     direct = LightGBMScanner().scan(str(path))
-    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+    aggregate = _scan_without_cache(path)
 
-    read_checks = _check_by_name(direct, "LightGBM File Read")
-    assert len(read_checks) == 1
-    assert read_checks[0].severity == IssueSeverity.INFO
-    assert read_checks[0].details["analysis_incomplete"] is True
-    assert read_checks[0].details["scan_outcome_reason"] == "lightgbm_read_failed"
-    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "lightgbm_read_failed" in direct.metadata["scan_outcome_reasons"]
-    assert direct.metadata["operational_error"] is True
-    assert direct.metadata["operational_error_reason"] == "lightgbm_read_failed"
-    metadata = aggregate.file_metadata[str(path)]
-    assert "lightgbm_read_failed" in metadata["scan_outcome_reasons"]
-    assert not [
-        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-    ]
-    assert determine_exit_code(aggregate) == 2
+    _assert_lightgbm_read_failure(direct, aggregate, path)
 
 
 def test_lightgbm_unreadable_path_preflight_is_inconclusive_not_security_finding(
@@ -222,20 +236,9 @@ def test_lightgbm_unreadable_path_preflight_is_inconclusive_not_security_finding
     monkeypatch.setattr("modelaudit.scanners.lightgbm_scanner.open", raise_os_error, raising=False)
 
     direct = LightGBMScanner().scan(str(path))
-    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+    aggregate = _scan_without_cache(path)
 
-    read_checks = _check_by_name(direct, "LightGBM File Read")
-    assert len(read_checks) == 1
-    assert read_checks[0].severity == IssueSeverity.INFO
-    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "lightgbm_read_failed" in direct.metadata["scan_outcome_reasons"]
-    metadata = aggregate.file_metadata[str(path)]
-    assert "lightgbm_read_failed" in metadata["scan_outcome_reasons"]
-    assert metadata["operational_error"] is True
-    assert not [
-        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-    ]
-    assert determine_exit_code(aggregate) == 2
+    _assert_lightgbm_read_failure(direct, aggregate, path)
 
 
 def test_lightgbm_read_failure_takes_operational_precedence_over_security_finding(
