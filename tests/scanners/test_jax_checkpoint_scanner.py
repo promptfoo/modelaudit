@@ -360,6 +360,64 @@ def test_orbax_protocol_zero_checkpoint_without_jax_marker_scans_pickle(tmp_path
     )
 
 
+def test_orbax_protocol_one_checkpoint_without_jax_marker_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_protocol1"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(pickle.dumps({"payload": _MaliciousJaxState()}, protocol=1))
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] in {"os.system", "posix.system", "nt.system"}
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "configuration for jax checkpoint in a plain text sidecar",
+        "JAX checkpoint metadata in a plain text sidecar",
+    ],
+)
+def test_jax_text_checkpoint_with_legacy_opcode_prefix_does_not_scan_as_pickle(tmp_path: Path, text: str) -> None:
+    checkpoint_path = tmp_path / "plain_text.checkpoint"
+    checkpoint_path.write_text(text, encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success
+    assert not any(check.name == "Pickle Checkpoint Scan" for check in result.checks)
+    assert "jax_pickle_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_empty_orbax_checkpoint_file_does_not_scan_as_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "empty_orbax"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "checkpoint").write_bytes(b"")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(check.name == "Pickle Checkpoint Scan" for check in result.checks)
+    assert "jax_pickle_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
+
+
 def test_benign_protocol_zero_jax_checkpoint_is_scanned_as_pickle(tmp_path: Path) -> None:
     pickle_path = tmp_path / "benign_protocol0_state.checkpoint"
     pickle_path.write_bytes(pickle.dumps({"framework": "jax", "params": {"dense": [1, 2, 3]}}, protocol=0))

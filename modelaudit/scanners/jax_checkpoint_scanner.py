@@ -226,7 +226,8 @@ class JaxCheckpointScanner(BaseScanner):
     _JSON_PREFIX_PATTERN_READ_FAILED_REASON: ClassVar[str] = "jax_json_checkpoint_prefix_pattern_read_failed"
     _METADATA_TRAVERSAL_LIMIT_REASON: ClassVar[str] = "jax_metadata_traversal_depth_limit"
     _PICKLE_SCAN_LIMIT_REASON: ClassVar[str] = "jax_pickle_scan_limit_exceeded"
-    _LEGACY_PICKLE_INITIAL_OPCODES: ClassVar[bytes] = b"(cdgINRSUV"
+    _LEGACY_PICKLE_INITIAL_OPCODES: ClassVar[bytes] = b"()cFGIJKLMNSTUVX]}"
+    _LEGACY_PICKLE_PREFIX_PROBE_BYTES: ClassVar[int] = 8192
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         """Initialize JAX checkpoint scanning limits and regex detectors."""
@@ -743,8 +744,42 @@ class JaxCheckpointScanner(BaseScanner):
         return any(list(path_obj.glob(pattern)) for pattern in jax_patterns)
 
     @classmethod
+    def _header_starts_with_legacy_pickle_opcode(cls, header: bytes) -> bool:
+        return bool(header) and header[:1] in cls._LEGACY_PICKLE_INITIAL_OPCODES
+
+    @staticmethod
+    def _is_truncated_pickle_parse_error(error: ValueError) -> bool:
+        message = str(error)
+        return (
+            "pickle exhausted before seeing STOP" in message
+            or "not enough data" in message
+            or ("expected " in message and " bytes " in message and "remain" in message)
+        )
+
+    def _has_structural_legacy_pickle_prefix(self, path: str, header: bytes) -> bool:
+        if not self._header_starts_with_legacy_pickle_opcode(header):
+            return False
+
+        read_limit = max(len(header), min(self.max_pickle_scan_bytes, self._LEGACY_PICKLE_PREFIX_PROBE_BYTES))
+        with suppress(Exception):
+            file_size = os.path.getsize(path)
+            with open(path, "rb") as source:
+                data = source.read(read_limit)
+
+            parsed_opcode = False
+            try:
+                for opcode, _, _ in pickletools.genops(data):
+                    parsed_opcode = True
+                    if opcode.name == "STOP":
+                        return True
+            except ValueError as e:
+                return file_size > len(data) and parsed_opcode and self._is_truncated_pickle_parse_error(e)
+
+        return False
+
+    @classmethod
     def _legacy_pickle_header_has_jax_indicator(cls, path: str, header: bytes) -> bool:
-        if header[:1] not in cls._LEGACY_PICKLE_INITIAL_OPCODES:
+        if not cls._header_starts_with_legacy_pickle_opcode(header):
             return False
 
         with suppress(Exception):
@@ -764,7 +799,7 @@ class JaxCheckpointScanner(BaseScanner):
                 # pickles are textual and can begin directly with a string
                 # opcode such as `Vjax`, so they do not have the binary
                 # protocol marker.
-                if header.startswith(b"\x80") or header[:1] in cls._LEGACY_PICKLE_INITIAL_OPCODES:
+                if header.startswith(b"\x80") or cls._header_starts_with_legacy_pickle_opcode(header):
                     with suppress(Exception):
                         data = header + f.read(max(0, 8192 - len(header)))
                         data_str = data.decode("utf-8", errors="ignore").lower()
@@ -973,11 +1008,11 @@ class JaxCheckpointScanner(BaseScanner):
                 header = f.read(1024)
 
             # Check file format
-            legacy_pickle_header = header[:1] in self._LEGACY_PICKLE_INITIAL_OPCODES
+            legacy_pickle_header = self._has_structural_legacy_pickle_prefix(path, header)
             if (
                 header.startswith(b"\x80")
                 or (legacy_pickle_header and treat_legacy_pickle_header_as_checkpoint)
-                or self._legacy_pickle_header_has_jax_indicator(path, header)
+                or (legacy_pickle_header and self._legacy_pickle_header_has_jax_indicator(path, header))
             ):
                 self._scan_pickle_checkpoint(path, result)
             elif header.startswith(b"\x93NUMPY"):  # NumPy format
