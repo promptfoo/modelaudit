@@ -18,6 +18,7 @@ from ..scanner_results import (
 from ..scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
     add_scanner_selection_skip_check,
+    allows_protobuf_model_candidate_analysis,
     make_scanner_selection_skip_result,
     policy_from_config,
 )
@@ -29,6 +30,7 @@ from ..utils.file.detection import (
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
     ONNX_ROUTING_INCONCLUSIVE_FORMAT,
+    PROTOBUF_MODEL_CANDIDATE_FORMAT,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
@@ -45,6 +47,7 @@ from ..utils.file.detection import (
     is_skops_archive,
     is_torchserve_mar_archive,
 )
+from .base import FORMAT_VALIDATION_CONFIG_KEY
 from .mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
 from .xgboost_scanner import (
     XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY,
@@ -72,6 +75,7 @@ _COMPRESSED_HEADER_FORMATS: frozenset[str] = frozenset(
 _R_SERIALIZED_EXTENSIONS: frozenset[str] = frozenset({".rds", ".rda", ".rdata"})
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
+_PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _ONNX_ROUTING_INCOMPLETE_REASON = "onnx_routing_incomplete"
@@ -221,6 +225,26 @@ def _make_incomplete_xml_model_result(path: str) -> ScanResult:
     )
     mark_inconclusive_scan_result(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
     mark_operational_scan_error(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_protobuf_model_result(path: str) -> ScanResult:
+    """Fail closed when a nested protobuf candidate cannot receive analysis."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="Protobuf Model Routing",
+        passed=False,
+        message=(
+            "Protobuf model routing was inconclusive because tentative protobuf "
+            "analysis was unavailable for a bounded-probe candidate"
+        ),
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": PROTOBUF_MODEL_CANDIDATE_FORMAT, "path": path},
+    )
+    mark_inconclusive_scan_result(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
+    mark_operational_scan_error(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -469,9 +493,9 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
 
     def merge_owner_result(owner_result: ScanResult) -> None:
         existing_reasons = list(result.metadata.get("scan_outcome_reasons", []))
+        owner_reasons = list(owner_result.metadata.get("scan_outcome_reasons", []))
         result.merge(owner_result)
-        for reason in existing_reasons:
-            mark_inconclusive_scan_result(result, reason)
+        result.metadata["scan_outcome_reasons"] = list(dict.fromkeys([*owner_reasons, *existing_reasons]))
 
     if os.path.splitext(path)[1].lower() == ".params":
         if scanner_selection.allows("mxnet"):
@@ -583,6 +607,7 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
 
     scanner_selection = policy_from_config(config)
     scanner_class = None
+    routed_content_format = detect_file_format(path)
     trusted_content_format = detect_file_format_from_magic(path)
     skipped_overlap_scanner_id: str | None = None
     if (
@@ -697,7 +722,10 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         )
         if trusted_flax_overlap_scanner_id is not None:
             scanner_id = trusted_flax_overlap_scanner_id
-    if scanner_id and scanner_selection.allows(scanner_id):
+    if scanner_id and (
+        scanner_selection.allows(scanner_id)
+        or (scanner_id == "protobuf_model_candidate" and allows_protobuf_model_candidate_analysis(scanner_selection))
+    ):
         scanner_class = _registry.load_scanner_by_id(scanner_id)
         if (
             scanner_class
@@ -740,6 +768,10 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
 
         if trusted_content_format == XML_MODEL_INCONCLUSIVE_FORMAT:
             return _make_incomplete_xml_model_result(path)
+        if routed_content_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
+            return _make_incomplete_protobuf_model_result(path)
+        if trusted_content_format == PROTOBUF_MODEL_CANDIDATE_FORMAT and routed_content_format != "unknown":
+            return _make_unavailable_recognized_format_result(path, routed_content_format, scanner_id)
         if trusted_content_format != "unknown":
             return _make_unavailable_recognized_format_result(path, trusted_content_format, scanner_id)
 
@@ -747,7 +779,15 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         result.finish(success=True)
         return result
 
-    scanner = scanner_class(config=config)
+    scanner_config = dict(config or {})
+    if routed_content_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
+        existing_format_validation = scanner_config.get(FORMAT_VALIDATION_CONFIG_KEY)
+        format_validation = dict(existing_format_validation) if isinstance(existing_format_validation, dict) else {}
+        format_validation["header_format"] = PROTOBUF_MODEL_CANDIDATE_FORMAT
+        format_validation["routed_format"] = PROTOBUF_MODEL_CANDIDATE_FORMAT
+        scanner_config[FORMAT_VALIDATION_CONFIG_KEY] = format_validation
+
+    scanner = scanner_class(config=scanner_config)
     result = scanner.scan_with_cache(path)
     if result.scanner_name == "flax_msgpack":
         merge_flax_msgpack_overlap_findings(

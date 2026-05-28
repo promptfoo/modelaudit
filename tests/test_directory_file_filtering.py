@@ -25,7 +25,6 @@ from modelaudit.utils.file.detection import (
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
-    ONNX_ROUTING_INCONCLUSIVE_FORMAT,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
 )
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
@@ -574,7 +573,7 @@ class TestDirectoryFileFiltering:
     def test_prefixed_disguised_malicious_onnx_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         pytest.importorskip("onnx")
         disguised_payload = create_mock_onnx(tmp_path / "payload.jpg", op_type="PythonOp")
-        prefix_mock_onnx_with_unknown_field(disguised_payload, value_size=(1024 * 1024) + 32)
+        prefix_mock_onnx_with_unknown_field(disguised_payload, value_size=0, count=4097, field_number=8)
 
         results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
 
@@ -583,7 +582,7 @@ class TestDirectoryFileFiltering:
         assert determine_exit_code(results) == 1
         assert any(issue.details.get("op_type") == "PythonOp" for issue in results.issues)
 
-    def test_group_budget_prefixed_malicious_onnx_with_skipped_extension_fails_closed(self, tmp_path: Path) -> None:
+    def test_group_budget_prefixed_malicious_onnx_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         pytest.importorskip("onnx")
         disguised_payload = create_mock_onnx(tmp_path / "group-payload.jpg", op_type="PythonOp")
         prefix_mock_onnx_with_unknown_group(disguised_payload)
@@ -591,9 +590,9 @@ class TestDirectoryFileFiltering:
         results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
 
         assert results["files_scanned"] == 1
-        assert determine_exit_code(results) == 2
-        assert any(issue.details.get("format") == ONNX_ROUTING_INCONCLUSIVE_FORMAT for issue in results.issues)
-        assert not any(issue.details.get("op_type") == "PythonOp" for issue in results.issues)
+        assert "onnx" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.details.get("op_type") == "PythonOp" for issue in results.issues)
 
     def test_disguised_cntk_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         disguised_payload = tmp_path / "cntk.jpg"

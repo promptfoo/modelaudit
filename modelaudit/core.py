@@ -32,6 +32,7 @@ from modelaudit.scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
     ScannerSelectionPolicy,
     add_scanner_selection_skip_check,
+    allows_protobuf_model_candidate_analysis,
     make_scanner_selection_skip_result,
     normalize_scanner_selection_config,
     policy_from_config,
@@ -62,6 +63,7 @@ from modelaudit.utils.file.detection import (
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
     ONNX_ROUTING_INCONCLUSIVE_FORMAT,
+    PROTOBUF_MODEL_CANDIDATE_FORMAT,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
@@ -142,6 +144,7 @@ _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
 _XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
+_PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON = "xgboost_ubjson_routing_incomplete"
@@ -387,6 +390,26 @@ def _make_incomplete_xml_model_result(path: str) -> ScanResult:
     return result
 
 
+def _make_incomplete_protobuf_model_result(path: str) -> ScanResult:
+    """Fail closed when a protobuf candidate cannot receive tentative analysis."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="Protobuf Model Routing",
+        passed=False,
+        message=(
+            "Protobuf model routing was inconclusive because tentative protobuf "
+            "analysis was unavailable for a bounded-probe candidate"
+        ),
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": PROTOBUF_MODEL_CANDIDATE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
 def _make_incomplete_llamafile_routing_result(path: str, config: dict[str, Any]) -> ScanResult:
     """Fail closed when an executable Llamafile marker probe cannot complete."""
     result = ScanResult(scanner_name="unknown")
@@ -407,7 +430,6 @@ def _make_incomplete_llamafile_routing_result(path: str, config: dict[str, Any])
         config,
         context="inconclusive executable ZIP polyglot",
     )
-
     result.finish(success=False)
     return result
 
@@ -452,9 +474,9 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
 
     def merge_owner_result(owner_result: ScanResult) -> None:
         existing_reasons = list(result.metadata.get("scan_outcome_reasons", []))
+        owner_reasons = list(owner_result.metadata.get("scan_outcome_reasons", []))
         result.merge(owner_result)
-        for reason in existing_reasons:
-            _mark_inconclusive_scan_outcome(result, reason)
+        result.metadata["scan_outcome_reasons"] = list(dict.fromkeys([*owner_reasons, *existing_reasons]))
 
     if Path(path).suffix.lower() == ".params":
         if scanner_selection.allows("mxnet"):
@@ -1821,7 +1843,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         )
         if trusted_flax_overlap_scanner_id is not None:
             scanner_id = trusted_flax_overlap_scanner_id
-    if scanner_id and scanner_selection.allows(scanner_id):
+    if scanner_id and (
+        scanner_selection.allows(scanner_id)
+        or (scanner_id == "protobuf_model_candidate" and allows_protobuf_model_candidate_analysis(scanner_selection))
+    ):
         preferred_scanner = _registry.load_scanner_by_id(scanner_id)
     elif scanner_id:
         skipped_preferred_scanner_id = scanner_id
@@ -1836,6 +1861,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     config[FORMAT_VALIDATION_CONFIG_KEY] = {
         "path": os.path.abspath(path),
         "header_format": magic_format,
+        "routed_format": header_format,
         "extension_format": ext_format,
         "file_type_valid": file_type_valid,
     }
@@ -1972,6 +1998,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
             if magic_format == XML_MODEL_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_xml_model_result(path)
+            elif header_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
+                sr = _make_incomplete_protobuf_model_result(path)
+            elif magic_format == PROTOBUF_MODEL_CANDIDATE_FORMAT and header_format != "unknown":
+                sr = _make_unavailable_recognized_format_result(path, header_format, scanner_id)
             elif magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_llamafile_routing_result(path, config)
             elif magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:

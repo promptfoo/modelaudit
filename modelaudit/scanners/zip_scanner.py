@@ -33,6 +33,7 @@ CRITICAL_SYSTEM_PATHS = [
     "C:\\Windows",
 ]
 ARCHIVE_MEMBER_COPY_CHUNK_BYTES = 64 * 1024
+ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY = "_zip_security_only_member_entries"
 
 
 class ZipScanner(BaseScanner):
@@ -66,6 +67,14 @@ class ZipScanner(BaseScanner):
         self.known_unreadable_archive_entry_offsets = self._normalize_archive_entry_offsets(
             self.config.get(KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, ())
         )
+        raw_security_only_entries = self.config.get(ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY, ())
+        if isinstance(raw_security_only_entries, str):
+            raw_security_only_entries = (raw_security_only_entries,)
+        if not isinstance(raw_security_only_entries, (list, tuple, set, frozenset)):
+            raw_security_only_entries = ()
+        self.security_only_member_entries = {
+            self._normalize_skip_entry_name(entry) for entry in raw_security_only_entries if isinstance(entry, str)
+        }
 
     def _get_zip_depth(self) -> int:
         """Return the current nested ZIP depth from config."""
@@ -143,6 +152,9 @@ class ZipScanner(BaseScanner):
 
     def _should_skip_archive_entry(self, name: str) -> bool:
         return self._normalize_skip_entry_name(name) in self.skip_archive_entries
+
+    def _is_security_only_member_entry(self, name: str) -> bool:
+        return self._normalize_skip_entry_name(name) in self.security_only_member_entries
 
     def _is_known_unreadable_archive_entry(self, info: zipfile.ZipInfo) -> bool:
         return info.header_offset in self.known_unreadable_archive_entry_offsets
@@ -600,6 +612,9 @@ class ZipScanner(BaseScanner):
                     )
                     continue
 
+                if self._is_security_only_member_entry(name):
+                    continue
+
                 # Extract and scan the file
                 tmp_path: str | None = None
                 try:
@@ -657,6 +672,7 @@ class ZipScanner(BaseScanner):
 
                         nested_config = dict(self.config)
                         nested_config.pop("skip_archive_entries", None)
+                        nested_config.pop(ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY, None)
                         nested_config.pop(KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, None)
                         # Extracted members are deleted below and cannot provide
                         # stable cache keys for a subsequent scan.
