@@ -462,9 +462,6 @@ _NAMESPACE_LOOKUP_METHODS_WITH_DEFAULTS = frozenset({"get", "pop", "setdefault"}
 _NAMESPACE_LOOKUP_DESCRIPTORS = frozenset(
     f"{prefix}.{method}" for prefix in ("dict", "builtins.dict") for method in _NAMESPACE_LOOKUP_METHODS
 )
-_NAMESPACE_LOOKUP_DESCRIPTORS_WITH_DEFAULTS = frozenset(
-    f"{prefix}.{method}" for prefix in ("dict", "builtins.dict") for method in _NAMESPACE_LOOKUP_METHODS_WITH_DEFAULTS
-)
 
 
 def _resolve_module_namespace_key_names(
