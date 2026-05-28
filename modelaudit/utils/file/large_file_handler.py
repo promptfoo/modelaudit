@@ -12,6 +12,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..helpers.cache_decorator import should_bypass_cache_for_safetensors_header_limit
+
 # Lazy import to avoid circular dependency
 if TYPE_CHECKING:
     from ...scanner_results import ScanResult
@@ -239,6 +241,10 @@ def scan_large_file(
     config = getattr(scanner, "config", {})
     cache_enabled = config.get("cache_enabled", True)
     cache_dir = config.get("cache_dir")
+
+    if should_bypass_cache_for_safetensors_header_limit(file_path, config):
+        logger.debug(f"Bypassing large-file cache for bounded SafeTensors header failure: {file_path}")
+        return scanner.scan(file_path)  # type: ignore[no-any-return]
 
     # If caching is disabled, proceed with direct scan
     if not cache_enabled:

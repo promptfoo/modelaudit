@@ -418,7 +418,7 @@ class OnnxScanner(BaseScanner):
 
         has_graph = model.HasField("graph")
         if model.ir_version <= 0 or not has_graph:
-            if self._is_tentative_protobuf_route():
+            if self._is_tentative_protobuf_route() and not has_graph:
                 result.scanner_name = "unknown"
                 result.metadata["tentative_protobuf_candidate_rejected"] = True
                 result.finish(success=True)

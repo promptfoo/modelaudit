@@ -165,6 +165,21 @@ def test_onnx_scanner_tentative_protobuf_parse_failure_is_inconclusive(tmp_path:
     assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
 
 
+def test_onnx_scanner_tentative_invalid_version_still_detects_python_operator(tmp_path: Path) -> None:
+    model_path = create_python_onnx_model(tmp_path)
+    model = onnx.load(str(model_path))
+    model.ir_version = 0
+    onnx.save(model, str(model_path))
+    scanner = OnnxScanner({FORMAT_VALIDATION_CONFIG_KEY: {"routed_format": PROTOBUF_MODEL_CANDIDATE_FORMAT}})
+
+    result = scanner.scan(str(model_path))
+
+    assert result.scanner_name == "onnx"
+    assert result.success is False
+    assert ONNX_STRUCTURE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+
+
 def test_onnx_scanner_reuses_raw_bytes_for_model_parse(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

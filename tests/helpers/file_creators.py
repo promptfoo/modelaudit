@@ -281,6 +281,34 @@ def prefix_mock_onnx_with_unknown_group(
     return path
 
 
+def prefix_mock_onnx_with_branching_unknown_groups(
+    path: Path,
+    *,
+    field_number: int = 100,
+    depth: int = 2,
+    branch_count: int = 3,
+    leaf_field_count: int = 60,
+) -> Path:
+    """Prefix ONNX with one group whose nested branches collectively exceed a probe budget."""
+    if field_number <= 0:
+        raise ValueError("field_number must be positive")
+    if depth < 0 or branch_count <= 0 or leaf_field_count <= 0:
+        raise ValueError("branching group dimensions must be positive")
+
+    start_group = _encode_protobuf_varint((field_number << 3) | 3)
+    end_group = _encode_protobuf_varint((field_number << 3) | 4)
+    nested_field = _encode_protobuf_varint((1 << 3) | 0) + b"\x01"
+
+    def build_group_body(remaining_depth: int) -> bytes:
+        if remaining_depth == 0:
+            return nested_field * leaf_field_count
+        child = start_group + build_group_body(remaining_depth - 1) + end_group
+        return child * branch_count
+
+    path.write_bytes(start_group + build_group_body(depth) + end_group + path.read_bytes())
+    return path
+
+
 def create_mock_mxnet_symbol(path: Path, *, custom_library: str | None = None) -> Path:
     """Create a minimal MXNet symbol graph, optionally with a custom library reference."""
     nodes: list[dict[str, Any]] = [{"op": "null", "name": "data", "inputs": []}]

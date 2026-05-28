@@ -68,11 +68,11 @@ class ProtobufModelCandidateScanner(BaseScanner):
                 continue
             last_rejection = result
 
+        if incomplete_result is not None:
+            return incomplete_result
         fallback_result = self._scan_filename_owned_fallback(path, scanner_selection)
         if fallback_result is not None:
             return fallback_result
-        if incomplete_result is not None:
-            return incomplete_result
         if last_rejection is None:  # pragma: no cover - routing filters unusable selections
             result = self._create_result()
             result.scanner_name = "unknown"

