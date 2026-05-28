@@ -724,6 +724,68 @@ def test_get_scanner_for_path_does_not_route_cntk_or_lightgbm_near_matches(tmp_p
     assert ScannerRegistry().get_scanner_for_path(str(lightgbm_near_match)) is None
 
 
+@pytest.mark.parametrize(
+    ("filename", "scanner_name"),
+    [
+        ("unreadable.mlmodel", "coreml"),
+        ("unreadable.safetensors", "safetensors"),
+        ("unreadable.engine", "tensorrt"),
+    ],
+)
+def test_get_scanner_for_path_routes_owned_binary_model_after_zip_probe_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    scanner_name: str,
+) -> None:
+    unreadable_model = tmp_path / filename
+    unreadable_model.write_bytes(b"simulated unavailable model bytes")
+
+    def raise_read_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_read_error)
+    monkeypatch.setattr(
+        "modelaudit.scanners.coreml_scanner.CoreMLScanner.can_handle",
+        classmethod(lambda _cls, _path: True),
+    )
+
+    _assert_scanner_for_path(unreadable_model, scanner_name)
+
+
+def test_get_scanner_for_path_routes_owned_metagraph_after_zip_probe_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable_meta = tmp_path / "unreadable.meta"
+    unreadable_meta.write_bytes(b"simulated metagraph bytes")
+
+    def raise_read_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_read_error)
+    monkeypatch.setattr(
+        "modelaudit.scanners.tf_metagraph_scanner.TensorFlowMetaGraphScanner.can_handle",
+        classmethod(lambda _cls, _path: True),
+    )
+
+    _assert_scanner_for_path(unreadable_meta, "tf_metagraph")
+
+
+def test_get_scanner_for_path_does_not_route_pickle_after_zip_probe_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable_pickle = _write_safe_pickle(tmp_path / "unreadable.pkl")
+
+    def raise_read_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_read_error)
+
+    assert ScannerRegistry().get_scanner_for_path(str(unreadable_pickle)) is None
+
+
 def test_get_scanner_for_path_routes_misnamed_malicious_llamafile(tmp_path: Path) -> None:
     llamafile_path = tmp_path / "payload.jpg"
     llamafile_path.write_bytes(
@@ -810,34 +872,84 @@ def test_get_scanner_for_path_routes_generic_pkl_zip_without_pytorch_markers_to_
     _assert_scanner_for_path(model_path, "zip")
 
 
-def test_get_scanner_for_path_preserves_metadata_owner_after_failed_zip_probe(
+@pytest.mark.parametrize(
+    ("filename", "scanner_name"),
+    [
+        ("README", "metadata"),
+        ("README.md", "metadata"),
+        ("model_card", "metadata"),
+        ("unreadable.npy", "numpy"),
+        ("unreadable.pdmodel", "paddle"),
+        ("unreadable.bin", "pytorch_binary"),
+        ("unreadable.pb", "tf_savedmodel"),
+        ("config.json", "manifest"),
+        ("vocab.txt", "text"),
+    ],
+)
+def test_get_scanner_for_path_preserves_read_failure_aware_owner_after_failed_zip_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    scanner_name: str,
 ) -> None:
-    readme_path = tmp_path / "README.md"
-    readme_path.write_text("# Metadata whose later read becomes unavailable\n", encoding="utf-8")
+    path = tmp_path / filename
+    path.write_bytes(b"owned unreadable model payload")
 
     def raise_zip_error(_path: str) -> bool:
         raise OSError("simulated ZIP probe read failure")
 
     monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+    monkeypatch.setattr("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True)
 
-    scanner_class = ScannerRegistry().get_scanner_for_path(str(readme_path))
+    scanner_class = ScannerRegistry().get_scanner_for_path(str(path))
 
     assert scanner_class is not None
-    assert scanner_class.name == "metadata"
+    assert scanner_class.name == scanner_name
 
 
-def test_get_scanner_for_path_does_not_claim_non_metadata_text_after_failed_zip_probe(
+def test_get_scanner_for_path_preserves_npz_zip_owner_after_failed_zip_probe_read_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    text_path = tmp_path / "vocab.txt"
-    text_path.write_text("token\n", encoding="utf-8")
+    path = _write_zip_archive(tmp_path / "unreadable.npz", {"weights.npy": b"safe array payload"})
+
+    def raise_zip_error(*_args: object, **_kwargs: object) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+    monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", raise_zip_error)
+
+    scanner_class = ScannerRegistry().get_scanner_for_path(str(path))
+
+    assert scanner_class is not None
+    assert scanner_class.name == "zip"
+
+
+def test_get_scanner_for_path_does_not_claim_pickle_after_failed_zip_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.pkl"
+    path.write_bytes(b"unreadable generic pickle candidate")
 
     def raise_zip_error(_path: str) -> bool:
         raise OSError("simulated ZIP probe read failure")
 
     monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
 
-    assert ScannerRegistry().get_scanner_for_path(str(text_path)) is None
+    assert ScannerRegistry().get_scanner_for_path(str(path)) is None
+
+
+def test_get_scanner_for_path_does_not_claim_generic_text_after_failed_zip_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "notes.txt"
+    path.write_text("ordinary notes\n", encoding="utf-8")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+
+    assert ScannerRegistry().get_scanner_for_path(str(path)) is None

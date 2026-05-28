@@ -13,7 +13,24 @@ from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanRes
 
 logger = logging.getLogger(__name__)
 
-_READ_FAILURE_AWARE_EXTENSION_SCANNERS = frozenset({"metadata"})
+_READ_FAILURE_AWARE_EXTENSION_SCANNERS = frozenset(
+    {
+        "cntk",
+        "coreml",
+        "lightgbm",
+        "manifest",
+        "metadata",
+        "numpy",
+        "paddle",
+        "pytorch_binary",
+        "safetensors",
+        "tensorrt",
+        "text",
+        "tf_metagraph",
+        "tf_savedmodel",
+        "zip",
+    }
+)
 
 
 def _check_numpy_compatibility() -> tuple[bool, str]:
@@ -261,8 +278,8 @@ class ScannerRegistry:
         try:
             is_zip_file = os.path.isfile(path) and zipfile.is_zipfile(path)
         except OSError:
-            # Only scanners with explicit unreadable-input outcomes can safely
-            # retain extension ownership after a failed container probe.
+            # Continue only into scanners that explicitly translate unreadable
+            # owned inputs into an operationally incomplete outcome.
             zip_probe_failed = True
 
         for candidate_extension in candidate_extensions:
@@ -296,7 +313,20 @@ class ScannerRegistry:
                                 return torch7_class
                     return scanner_class
 
+        # Filename-owned scanners still need to retain ownership when a failed
+        # ZIP probe prevents later content-routing fallback.
         if zip_probe_failed:
+            for scanner_id, scanner_info in sorted_scanners:
+                if scanner_selection is not None and not scanner_selection.allows(scanner_id):
+                    continue
+                if scanner_id not in _READ_FAILURE_AWARE_EXTENSION_SCANNERS:
+                    continue
+                if not self._is_content_routed_filename(filename, scanner_info):
+                    continue
+
+                scanner_class = self._load_scanner(scanner_id)
+                if scanner_class and scanner_class.can_handle(path):
+                    return scanner_class
             return None
 
         # Some ZIP-backed artifacts intentionally use pickle/checkpoint suffixes.

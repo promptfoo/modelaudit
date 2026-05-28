@@ -8,11 +8,12 @@ from urllib.parse import ParseResult
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners import metadata_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.metadata_scanner import MetadataScanner
+from modelaudit.utils.helpers import cache_decorator
 
 
 class TestMetadataScanner:
@@ -162,6 +163,59 @@ class TestMetadataScanner:
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in direct.issues)
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
         assert determine_exit_code(aggregate) == 2
+
+    def test_metadata_read_failure_bypasses_stale_clean_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        metadata_path = tmp_path / "model-index.yml"
+        metadata_path.write_text("model-index:\n- name: clean-model\n" + "x" * 11_000, encoding="utf-8")
+        cache_dir = tmp_path / "cache"
+
+        reset_cache_manager()
+        try:
+            with monkeypatch.context() as warm_cache:
+                warm_cache.setattr(
+                    cache_decorator,
+                    "should_bypass_cache_for_read_failure_aware_file",
+                    lambda _path: False,
+                )
+                warm_result = scan_file(
+                    str(metadata_path),
+                    config={
+                        "cache_enabled": True,
+                        "cache_dir": str(cache_dir),
+                        "min_cache_file_size": 0,
+                    },
+                )
+
+            assert warm_result.success is True
+            cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+            assert cached_entries > 0
+
+            def fail_read(*_args: object, **_kwargs: object) -> object:
+                raise OSError("simulated metadata read failure after cache warm")
+
+            monkeypatch.setattr(metadata_scanner, "open", fail_read, raising=False)
+
+            aggregate = scan_model_directory_or_file(
+                str(metadata_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert aggregate.success is False
+            assert aggregate.file_metadata[str(metadata_path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert aggregate.file_metadata[str(metadata_path)]["operational_error_reason"] == "metadata_read_failed"
+            assert not any(
+                issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues
+            )
+            assert determine_exit_code(aggregate) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
+        finally:
+            reset_cache_manager()
 
     def test_scan_suspicious_urls_in_readme(self) -> None:
         """Test detection of suspicious URLs in README."""
