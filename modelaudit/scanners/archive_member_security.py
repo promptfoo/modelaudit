@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+import shlex
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -40,6 +41,8 @@ _MACHO_FAT_MAGICS = {
 }
 _VERSIONED_SHARED_OBJECT_SUFFIX_RE = re.compile(r"\.so(?:\.[0-9]+)+$")
 _PYTHON_ARCHIVE_MEMBER_SUFFIXES = (".py", ".pyw")
+_PYTHON_SHEBANG_COMMAND_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?w?|pypy(?:\d+(?:\.\d+)*)?)$")
+_ENV_SHEBANG_OPTIONS_WITH_ARGUMENT = frozenset({"-u", "--unset", "-C", "--chdir"})
 _HIGH_RISK_PYTHON_CALLS = {
     "__import__",
     "builtins.__import__",
@@ -226,6 +229,46 @@ def probe_executable_archive_member_content(path: str) -> ExecutableArchiveMembe
 def is_executable_archive_member_content(path: str) -> bool:
     """Return True when a member begins with a confirmed executable signature."""
     return probe_executable_archive_member_content(path) == "detected"
+
+
+def _shebang_command_name(source_bytes: bytes) -> str | None:
+    if not source_bytes.startswith(b"#!"):
+        return None
+    first_line = source_bytes.splitlines()[0][2:].decode("utf-8", errors="ignore").strip()
+    if not first_line:
+        return None
+    try:
+        parts = shlex.split(first_line)
+    except ValueError:
+        parts = first_line.split()
+    if not parts:
+        return None
+
+    command = parts[0].rsplit("/", 1)[-1].lower()
+    if command != "env":
+        return command
+
+    index = 1
+    while index < len(parts):
+        token = parts[index]
+        if token in _ENV_SHEBANG_OPTIONS_WITH_ARGUMENT:
+            index += 2
+            continue
+        if token == "--" or token.startswith("--unset=") or token.startswith("--chdir="):
+            index += 1
+            continue
+        if token.startswith("-") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            index += 1
+            continue
+        return token.rsplit("/", 1)[-1].lower()
+    return None
+
+
+def _python_member_has_non_python_shebang(source_bytes: bytes) -> bool:
+    if not source_bytes.startswith(b"#!"):
+        return False
+    command = _shebang_command_name(source_bytes)
+    return command is None or _PYTHON_SHEBANG_COMMAND_RE.fullmatch(command) is None
 
 
 def executable_archive_member_content_rule_code(path: str) -> str | None:
@@ -1707,7 +1750,16 @@ def scan_archive_member_for_known_risks(
 
         try:
             with open(tmp_path, "rb") as member_file:
-                calls = high_risk_python_calls_in_source(member_file.read())
+                source_bytes = member_file.read()
+            if analyze_executable_content and _python_member_has_non_python_shebang(source_bytes):
+                _add_executable_archive_member_check(
+                    archive_kind=archive_kind,
+                    archive_path=archive_path,
+                    member_name=member_name,
+                    result=result,
+                )
+                return
+            calls = high_risk_python_calls_in_source(source_bytes)
         except PythonArchiveMemberParseError as exc:
             if analyze_executable_content:
                 executable_probe_outcome = probe_executable_archive_member_content(tmp_path)

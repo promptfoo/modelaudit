@@ -358,6 +358,19 @@ def test_compressed_scanner_python_named_executable_bytes_still_report_executabl
     assert executable_checks[0].location == f"{path} -> native.py"
 
 
+def test_compressed_scanner_python_named_non_python_shebang_reports_executable(tmp_path: Path) -> None:
+    path = tmp_path / "script.py.gz"
+    path.write_bytes(gzip.compress(b"#!/bin/sh\nrm -rf /tmp/pwned\n"))
+
+    result = CompressedScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    executable_checks = [check for check in result.checks if check.name == "Executable Archive Member Detection"]
+    assert executable_checks
+    assert executable_checks[0].location == f"{path} -> script.py"
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_compressed_scanner_surfaces_content_disguised_executable_payload(tmp_path: Path) -> None:
     path = tmp_path / "payload.dat.gz"
     path.write_bytes(gzip.compress(b"\x7fELF" + b"\x00" * 48))
