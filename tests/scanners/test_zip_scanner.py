@@ -26,6 +26,7 @@ from modelaudit.scanners.archive_dispatch import (
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.zip_scanner import ZipScanner
 from modelaudit.utils.file import detection as file_detection
+from modelaudit.utils.file.detection import ONNX_ROUTING_INCONCLUSIVE_FORMAT
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers import (
     create_mock_mxnet_symbol,
@@ -2912,8 +2913,8 @@ class TestZipScanner:
         )
         assert any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
 
-    def test_nested_member_routes_group_budget_prefixed_misnamed_onnx(self, tmp_path: Path) -> None:
-        """A bounded legal group prefix must not hide malicious nested ONNX."""
+    def test_nested_member_fails_closed_for_group_budget_prefixed_misnamed_onnx(self, tmp_path: Path) -> None:
+        """A nested ONNX candidate hidden beyond the group budget must be inconclusive."""
         pytest.importorskip("onnx")
         archive_path = tmp_path / "outer.zip"
         onnx_path = create_mock_onnx(tmp_path / "model.onnx", op_type="PythonOp")
@@ -2924,10 +2925,11 @@ class TestZipScanner:
         result = self.scanner.scan(str(archive_path))
 
         assert any(
-            entry["path"] == f"{archive_path}:model.jpg" and entry["type"] == "onnx"
+            entry["path"] == f"{archive_path}:model.jpg" and entry["type"] == "unknown"
             for entry in result.metadata["contents"]
         )
-        assert any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+        assert any(issue.details.get("format") == ONNX_ROUTING_INCONCLUSIVE_FORMAT for issue in result.issues)
+        assert not any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
 
     def test_nested_member_does_not_route_prefixed_generic_protobuf_as_onnx(self, tmp_path: Path) -> None:
         """An unknown protobuf prefix alone must not promote a nested member."""

