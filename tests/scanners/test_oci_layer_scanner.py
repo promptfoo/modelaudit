@@ -12,8 +12,10 @@ import pytest
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanner_results import mark_inconclusive_scan_result
+from modelaudit.scanners import flax_msgpack_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.scanners.oci_layer_scanner import OciLayerScanner
+from modelaudit.utils.file.detection import FLAX_MSGPACK_STRUCTURE_READ_BYTES
 
 
 def _assert_inconclusive_aggregate_not_cached(
@@ -50,6 +52,16 @@ def _assert_inconclusive_aggregate_not_cached(
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+def _write_delayed_flax_cntk_overlap(path: Path) -> None:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    structure = b" CompositeFunction primitive_functions "
+    delayed_flax_root = flax_msgpack_scanner.msgpack.packb(
+        {"params": {"w": [1, 2, 3]}, "__reduce__": "attacker_callable"},
+        use_bin_type=True,
+    )
+    path.write_bytes(prefix + structure + (b"\xc0" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1)) + delayed_flax_root)
 
 
 class TestOciLayerScanner:
@@ -241,6 +253,48 @@ class TestOciLayerScanner:
         assert "oci_layer_missing" in result.metadata["scan_outcome_reasons"]
         assert "nested_scan_incomplete" in result.metadata["scan_outcome_reasons"]
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    def test_scan_manifest_preserves_composed_nested_incomplete_reasons_without_caching(self, tmp_path: Path) -> None:
+        """OCI gaps and nested overlap-analysis gaps must survive together."""
+        if not flax_msgpack_scanner.HAS_MSGPACK:
+            pytest.skip("msgpack unavailable")
+
+        member_path = tmp_path / "delayed-flax-cntk.jpg"
+        _write_delayed_flax_cntk_overlap(member_path)
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(member_path, arcname="delayed-flax-cntk.jpg")
+
+        manifest_path = tmp_path / "stacked-incomplete.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["missing.tar.gz", "layer.tar.gz"]}))
+        cache_dir = tmp_path / "stacked-cache"
+
+        reset_cache_manager()
+        try:
+            first = scan_model_directory_or_file(
+                str(manifest_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            second = scan_model_directory_or_file(
+                str(manifest_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            for aggregate in (first, second):
+                metadata = aggregate.file_metadata[str(manifest_path)]
+                assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+                assert "oci_layer_missing" in metadata["scan_outcome_reasons"]
+                assert "flax_msgpack_routing_incomplete" in metadata["scan_outcome_reasons"]
+                assert metadata["file_size"] == manifest_path.stat().st_size
+                assert aggregate.assets[0].size == manifest_path.stat().st_size
+                assert determine_exit_code(aggregate) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     def test_scan_manifest_with_multiple_layers(self, tmp_path):
         """Test scanning manifest with multiple layers."""

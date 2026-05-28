@@ -51,11 +51,28 @@ class OciLayerScanner(BaseScanner):
     _MEMBER_HEADER_PROBE_BYTES: ClassVar[int] = 64
     _DEFAULT_MAX_LAYER_FILE_SIZE: ClassVar[int] = 10 * 1024 * 1024 * 1024
     _REMOTE_LAYER_REF_SCHEMES: ClassVar[frozenset[str]] = frozenset({"http", "https", "s3", "gs", "oci"})
+    _PARENT_IDENTITY_METADATA_KEYS: ClassVar[frozenset[str]] = frozenset({"file_size", "file_hashes"})
 
     @staticmethod
     def _mark_incomplete_coverage(result: ScanResult, reason: str) -> None:
         """Record OCI content that could not be inspected without reporting a security finding."""
         mark_inconclusive_scan_result(result, reason)
+
+    @classmethod
+    def _merge_nested_result(cls, result: ScanResult, nested_result: ScanResult) -> None:
+        """Merge embedded analysis without replacing manifest identity or incomplete coverage."""
+        parent_identity = {
+            key: result.metadata[key] for key in cls._PARENT_IDENTITY_METADATA_KEYS if key in result.metadata
+        }
+        existing_reasons = list(result.metadata.get("scan_outcome_reasons", []))
+        result.merge(nested_result)
+        for key in cls._PARENT_IDENTITY_METADATA_KEYS:
+            if key in parent_identity:
+                result.metadata[key] = parent_identity[key]
+            else:
+                result.metadata.pop(key, None)
+        for reason in existing_reasons:
+            cls._mark_incomplete_coverage(result, reason)
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -436,6 +453,8 @@ class OciLayerScanner(BaseScanner):
                             from .. import core
 
                             nested_config = dict(self.config)
+                            # Extracted members are deleted below, so their temporary paths are not reusable cache keys.
+                            nested_config["cache_enabled"] = False
                             try:
                                 _oci_depth = int(nested_config.get("_archive_depth", 0))
                             except (TypeError, ValueError):
@@ -472,11 +491,7 @@ class OciLayerScanner(BaseScanner):
                                 if issue.details is None:
                                     issue.details = {}
                                 issue.details["layer"] = layer_ref
-                            existing_reasons = list(result.metadata.get("scan_outcome_reasons", []))
-                            result.merge(file_result)
-                            # A nested incomplete scan must not erase incomplete OCI-layer coverage.
-                            for reason in existing_reasons:
-                                self._mark_incomplete_coverage(result, reason)
+                            self._merge_nested_result(result, file_result)
                             if not file_result.success or file_result.has_errors:
                                 scan_complete = False
                         finally:
