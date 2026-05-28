@@ -162,6 +162,7 @@ def test_download_from_cloud(mock_fs: MagicMock, tmp_path: Path) -> None:
 
     fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
 
     mock_fs.side_effect = [fs_meta, fs]
 
@@ -179,6 +180,32 @@ def test_download_from_cloud(mock_fs: MagicMock, tmp_path: Path) -> None:
     assert result.name == "model.pt"
 
     # Note: fsspec filesystems don't need explicit cleanup according to implementation
+
+
+@patch("fsspec.filesystem")
+def test_download_from_cloud_reuses_cache_with_matching_etag(mock_fs: MagicMock, tmp_path: Path) -> None:
+    url = "s3://bucket/model.pt"
+
+    first_meta = make_fs_mock()
+    first_meta.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+
+    downloader = make_fs_mock()
+    downloader.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+    downloader.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+
+    second_meta = make_fs_mock()
+    second_meta.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+
+    mock_fs.side_effect = [first_meta, downloader, second_meta]
+
+    first = download_from_cloud(url, cache_dir=tmp_path, show_progress=False)
+    second = download_from_cloud(url, cache_dir=tmp_path, show_progress=False)
+
+    assert isinstance(first, Path)
+    assert second == first
+    assert first.read_bytes() == b"data"
+    downloader.get.assert_called_once()
+    assert mock_fs.call_count == 3
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
