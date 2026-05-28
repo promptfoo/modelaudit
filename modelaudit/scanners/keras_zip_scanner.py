@@ -42,6 +42,7 @@ from .keras_utils import (
     find_case_insensitive_substrings,
     is_known_safe_keras_layer_class,
 )
+from .zip_scanner import ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY
 
 # CVE-2025-1550: Keras safe_mode bypass via arbitrary module references in config.json
 # Allowlist of top-level module names that are safe in Keras model configs.
@@ -333,7 +334,7 @@ class KerasZipScanner(BaseScanner):
         return _KERAS_CONFIG_MAX_BYTES
 
     def _get_recursive_archive_scan_config(self, *, skip_weights_entry: bool = False) -> dict[str, Any]:
-        """Return a ZIP scanner config with an explicit bounded per-member extraction limit."""
+        """Return bounded ZIP-recursion config for entries not owned by this scanner."""
         recursive_config = dict(self.config)
         member_size_limits = [self.max_embedded_weights_bytes]
         for config_key in ("max_file_size", "max_entry_size"):
@@ -350,17 +351,28 @@ class KerasZipScanner(BaseScanner):
             recursive_config["max_file_size"] = recursive_member_size_limit
         else:
             recursive_config.pop("max_file_size", None)
+        skip_entries = recursive_config.get("skip_archive_entries", ())
+        if isinstance(skip_entries, str):
+            skip_entry_values: list[str] = [skip_entries]
+        elif isinstance(skip_entries, (list, tuple, set, frozenset)):
+            skip_entry_values = [entry for entry in skip_entries if isinstance(entry, str)]
+        else:
+            skip_entry_values = []
+        raw_security_only_entries = recursive_config.get(ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY, ())
+        if isinstance(raw_security_only_entries, str):
+            security_only_entries: list[str] = [raw_security_only_entries]
+        elif isinstance(raw_security_only_entries, (list, tuple, set, frozenset)):
+            security_only_entries = [entry for entry in raw_security_only_entries if isinstance(entry, str)]
+        else:
+            security_only_entries = []
+        owned_entries = [_KERAS_CONFIG_ENTRY]
         if skip_weights_entry:
-            skip_entries = recursive_config.get("skip_archive_entries", ())
-            if isinstance(skip_entries, str):
-                skip_entry_values: list[str] = [skip_entries]
-            elif isinstance(skip_entries, (list, tuple, set, frozenset)):
-                skip_entry_values = [entry for entry in skip_entries if isinstance(entry, str)]
-            else:
-                skip_entry_values = []
-            if _KERAS_WEIGHTS_ENTRY not in skip_entry_values:
-                skip_entry_values.append(_KERAS_WEIGHTS_ENTRY)
-            recursive_config["skip_archive_entries"] = skip_entry_values
+            owned_entries.append(_KERAS_WEIGHTS_ENTRY)
+        for owned_entry in owned_entries:
+            if owned_entry not in security_only_entries:
+                security_only_entries.append(owned_entry)
+        recursive_config["skip_archive_entries"] = skip_entry_values
+        recursive_config[ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY] = security_only_entries
         return recursive_config
 
     def _merge_recursive_archive_scan(self, path: str, result: ScanResult) -> None:

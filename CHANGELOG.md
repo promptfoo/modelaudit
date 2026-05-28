@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
+- route renamed and unknown-field-prefixed CoreML models, including valid unknown groups, reordered fields, and bounded routing candidates, through custom-code and metadata analysis
+- avoid inconclusive protobuf-candidate noise for fully inspected scalar-only text and Keras-owned JSON members while preserving binary-tailed candidates for analysis
+- preserve archive member incomplete-outcome reasons when nested tentative analysis also fails closed
+- route renamed TensorFlow SavedModel and MetaGraph protobufs through unsafe-operation analysis
+- route renamed ONNX protobuf models with prefixed unknown fields through content analysis and fail closed on unresolved or incomplete structure
+- preserve ambiguous budget-exhausted protobuf candidates for tentative analysis without misclassifying non-ONNX payloads
 - classify unavailable ZIP traversal, member, manifest-less TorchServe handler, and Keras artifact scan coverage as inconclusive while preserving archive-depth security findings
 - classify unavailable TAR traversal and member scan coverage as inconclusive while preserving depth-limit security findings
 - classify unavailable Skops member and schema coverage as inconclusive rather than security findings

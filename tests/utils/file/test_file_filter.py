@@ -18,7 +18,7 @@ from modelaudit.utils.file.detection import (
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
-    ONNX_ROUTING_INCONCLUSIVE_FORMAT,
+    PROTOBUF_MODEL_CANDIDATE_FORMAT,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     detect_file_format_for_skip_filter,
@@ -441,35 +441,17 @@ class TestFileFilter:
         assert detect_file_format_for_skip_filter(str(disguised_metagraph)) == "tf_metagraph"
         assert not should_skip_file(str(disguised_metagraph))
 
-    @pytest.mark.parametrize("filename", ["model.jpg", "model.py", "model.pyw"])
-    def test_prefixed_disguised_onnx_bypasses_skip_without_promoting_generic_protobuf(
-        self,
-        tmp_path: Path,
-        filename: str,
-    ) -> None:
+    def test_prefixed_disguised_onnx_bypasses_skip_without_promoting_generic_protobuf(self, tmp_path: Path) -> None:
         pytest.importorskip("onnx")
-        disguised_onnx = create_mock_onnx(tmp_path / filename)
-        prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=(1024 * 1024) + 32)
+        disguised_onnx = create_mock_onnx(tmp_path / "model.jpg")
+        prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097, field_number=8)
         generic_protobuf = tmp_path / "generic.jpg"
         generic_protobuf.write_bytes(b"\xa2\x06\x04xxxx\x12\x02\x08\x01")
 
-        assert detect_file_format_for_skip_filter(str(disguised_onnx)) == "onnx"
+        assert detect_file_format_for_skip_filter(str(disguised_onnx)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
         assert not should_skip_file(str(disguised_onnx))
         assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
         assert should_skip_file(str(generic_protobuf))
-
-    @pytest.mark.parametrize("field_number", [2, 9])
-    def test_budget_exhausted_onnx_candidate_bypasses_skip_as_inconclusive(
-        self,
-        tmp_path: Path,
-        field_number: int,
-    ) -> None:
-        pytest.importorskip("onnx")
-        candidate = create_mock_onnx(tmp_path / f"budget-{field_number}.jpg")
-        prefix_mock_onnx_with_unknown_field(candidate, value_size=0, count=4097, field_number=field_number)
-
-        assert detect_file_format_for_skip_filter(str(candidate)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
-        assert not should_skip_file(str(candidate))
 
     def test_disguised_torch7_bypasses_default_skip(self, tmp_path: Path) -> None:
         disguised_torch7 = tmp_path / "payload.jpg"

@@ -34,7 +34,6 @@ from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Che
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 from modelaudit.scanners.zip_scanner import KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, ZipScanner
 from modelaudit.utils.file import detection as file_detection
-from modelaudit.utils.file.detection import ONNX_ROUTING_INCONCLUSIVE_FORMAT
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers import (
     create_mock_mxnet_symbol,
@@ -833,8 +832,9 @@ def test_scan_zip_python_member_emits_separate_check_per_rule_code(tmp_path: Pat
     assert python_checks[1].details["reason"] == "high-risk calls: subprocess.run"
 
 
-def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path) -> None:
-    """Generic ZIP Python scanning must honor the same config knob the MAR path reads."""
+def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Generic ZIP Python analysis stays focused on Python-source coverage."""
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
     archive_path = tmp_path / "source_bundle.zip"
     # ~60 KB payload; a 1 KB configured cap must cause the scanner to mark this
     # member analysis incomplete instead of silently reading the whole thing.
@@ -854,7 +854,9 @@ def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path) ->
     assert details["analysis_incomplete"] is True
     assert details["max_scan_bytes"] == 1024
     assert details["file_size"] >= 60_000
-    assert "zip_python_member_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    reasons = result.metadata["scan_outcome_reasons"]
+    assert "zip_python_member_analysis_incomplete" in reasons
+    assert "onnx_tentative_candidate_analysis_unavailable" not in reasons
 
 
 def test_scan_zip_python_member_honors_pep263_encoding_declaration(tmp_path: Path) -> None:
@@ -1323,7 +1325,6 @@ def test_scan_nested_file_partial_malformed_renamed_mxnet_xgboost_overlap_fails_
         '"arg_nodes":[0],"heads":' + suffix,
         encoding="utf-8",
     )
-
     result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
 
     assert result.scanner_name == "unknown"
@@ -3249,6 +3250,39 @@ class TestZipScanner:
         assert "size floor" in compression_checks[0].message
         assert compression_checks[0].details["min_uncompressed_size"] == 1024 * 1024
 
+    def test_configured_skip_entry_is_incomplete_and_not_recursively_scanned(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "owned-entry.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("metadata.json", b'{"owned": true}')
+            archive.writestr("payload.bin", b"payload")
+
+        nested_scan_paths: list[str] = []
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_scan_paths.append(path)
+            result = ScanResult(scanner_name="test")
+            result.finish(success=True)
+            return result
+
+        scanner = ZipScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                "skip_archive_entries": ["metadata.json"],
+            }
+        )
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "ZIP Member Analysis Coverage"
+            and check.status == CheckStatus.FAILED
+            and check.details["entry"] == "metadata.json"
+            for check in result.checks
+        )
+        assert not any(path.endswith("_metadata.json") for path in nested_scan_paths)
+        assert any(path.endswith("_payload.bin") for path in nested_scan_paths)
+
     def test_zip_bomb_detection_skips_only_suspicious_entry(self, tmp_path: Path) -> None:
         """Suspicious entries should be skipped while safe entries still route to nested scanning."""
         archive_path = tmp_path / "mixed.zip"
@@ -3313,8 +3347,8 @@ class TestZipScanner:
         )
         assert any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
 
-    def test_nested_member_fails_closed_for_group_budget_prefixed_misnamed_onnx(self, tmp_path: Path) -> None:
-        """A nested ONNX candidate hidden beyond the group budget must be inconclusive."""
+    def test_nested_member_routes_group_budget_prefixed_misnamed_onnx(self, tmp_path: Path) -> None:
+        """A bounded legal group prefix must not hide malicious nested ONNX."""
         pytest.importorskip("onnx")
         archive_path = tmp_path / "outer.zip"
         onnx_path = create_mock_onnx(tmp_path / "model.onnx", op_type="PythonOp")
@@ -3325,11 +3359,34 @@ class TestZipScanner:
         result = self.scanner.scan(str(archive_path))
 
         assert any(
-            entry["path"] == f"{archive_path}:model.jpg" and entry["type"] == "unknown"
+            entry["path"] == f"{archive_path}:model.jpg" and entry["type"] == "onnx"
             for entry in result.metadata["contents"]
         )
-        assert any(issue.details.get("format") == ONNX_ROUTING_INCONCLUSIVE_FORMAT for issue in result.issues)
-        assert not any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+        assert any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+
+    def test_nested_declared_onnx_candidate_keeps_extension_owner_when_dependency_missing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A declared nested .onnx keeps normal ONNX ownership even with ambiguous magic."""
+        pytest.importorskip("onnx")
+        archive_path = tmp_path / "outer.zip"
+        onnx_path = create_mock_onnx(tmp_path / "model.onnx")
+        prefix_mock_onnx_with_unknown_group(onnx_path)
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.onnx", onnx_path.read_bytes())
+
+        monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            entry["path"] == f"{archive_path}:model.onnx" and entry["type"] == "onnx"
+            for entry in result.metadata["contents"]
+        )
+        assert any(check.name == "ONNX Library Check" for check in result.checks)
+        assert not any(check.name == "ONNX Candidate Analysis" for check in result.checks)
 
     def test_nested_member_does_not_route_prefixed_generic_protobuf_as_onnx(self, tmp_path: Path) -> None:
         """An unknown protobuf prefix alone must not promote a nested member."""

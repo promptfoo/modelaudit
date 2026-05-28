@@ -24,8 +24,8 @@ from modelaudit.utils.file.detection import (
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
-    ONNX_ROUTING_INCONCLUSIVE_FORMAT,
     PROTO0_1_MAX_PROBE_BYTES,
+    PROTOBUF_MODEL_CANDIDATE_FORMAT,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
@@ -39,13 +39,14 @@ from modelaudit.utils.file.detection import (
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers import (
+    create_mock_coreml,
     create_mock_mxnet_symbol,
     create_mock_onnx,
     prefix_mock_onnx_with_branching_unknown_groups,
     prefix_mock_onnx_with_unknown_field,
     prefix_mock_onnx_with_unknown_group,
 )
-from tests.helpers.file_creators import create_v7_tar_archive
+from tests.helpers.file_creators import _coreml_field_bytes, _coreml_field_varint, create_v7_tar_archive
 
 
 def _ubjson_key(key: bytes) -> bytes:
@@ -543,6 +544,129 @@ def test_detect_file_format_coreml_validation_passthrough(tmp_path: Path) -> Non
     assert validate_file_type(str(model_path)) is True
 
 
+def test_detect_file_format_routes_renamed_coreml_structure_and_rejects_near_match(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(tmp_path / "model.jpg")
+    prefixed_model_path = create_mock_coreml(tmp_path / "prefixed-model.jpg")
+    group_prefixed_model_path = create_mock_coreml(tmp_path / "group-prefixed-model.jpg")
+    near_match = tmp_path / "near-match.jpg"
+    group_near_match = tmp_path / "group-near-match.jpg"
+    unknown_field_prefix = b"\x9a\x06\x03pad"
+    unknown_group_prefix = b"\x9b\x06\x08\x01\x9c\x06"
+    prefixed_model_path.write_bytes(unknown_field_prefix + prefixed_model_path.read_bytes())
+    group_prefixed_model_path.write_bytes(unknown_group_prefix + group_prefixed_model_path.read_bytes())
+    near_match.write_bytes(unknown_field_prefix + b"\x08\x08\x12\x03\xa2\x06\x00")
+    group_near_match.write_bytes(unknown_group_prefix + b"\x08\x08\x12\x03\xa2\x06\x00")
+
+    for recognized_path in (model_path, prefixed_model_path, group_prefixed_model_path):
+        assert detect_file_format(str(recognized_path)) == "coreml"
+        assert detect_file_format_from_magic(str(recognized_path)) == "coreml"
+        assert detect_file_format_for_skip_filter(str(recognized_path)) == "coreml"
+
+    for rejected_path in (near_match, group_near_match):
+        assert detect_file_format(str(rejected_path)) == "unknown"
+        assert detect_file_format_from_magic(str(rejected_path)) == "unknown"
+        assert detect_file_format_for_skip_filter(str(rejected_path)) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        b"\x08\x08" + (b"\x9a\x06\x00" * 4097),
+        b"\x08\x08" + b"\x9b\x06" + (b"\x08\x01" * 4097) + b"\x9c\x06",
+    ],
+    ids=["top-level-field-budget", "unknown-group-budget"],
+)
+def test_detect_file_format_retains_budget_exhausted_renamed_coreml_candidate(tmp_path: Path, prefix: bytes) -> None:
+    model_path = create_mock_coreml(tmp_path / "model.jpg")
+    model_path.write_bytes(prefix + model_path.read_bytes())
+
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
+def test_detect_file_format_routes_renamed_coreml_with_reordered_fields(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(tmp_path / "reordered.jpg", model_type_first=True)
+
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+
+
+def test_detect_file_format_routes_renamed_coreml_with_large_model_payload(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(tmp_path / "large-model.jpg", model_type_padding=(1024 * 1024) + 1)
+
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+
+
+def test_detect_file_format_routes_renamed_coreml_after_long_varint_prefix(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(tmp_path / "long-varint-prefix.jpg")
+    long_unknown_key = _encode_proto_varint((1 << 35) << 3 | 2)
+    model_path.write_bytes(long_unknown_key + b"\x00" + model_path.read_bytes())
+
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+
+
+def test_detect_file_format_routes_renamed_coreml_serialized_model(tmp_path: Path) -> None:
+    description = _coreml_field_bytes(100, _coreml_field_bytes(1, b"Mock CoreML model"))
+    serialized_model = (
+        _coreml_field_varint(1, 8)
+        + _coreml_field_bytes(2, description)
+        + _coreml_field_bytes(3000, _coreml_field_bytes(1, b"payload"))
+    )
+    model_path = tmp_path / "serialized-model.jpg"
+    model_path.write_bytes(serialized_model)
+
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+
+
+def test_detect_file_format_rejects_empty_renamed_coreml_model_payload(tmp_path: Path) -> None:
+    description = _coreml_field_bytes(100, _coreml_field_bytes(1, b"Mock CoreML model"))
+    near_match = _coreml_field_varint(1, 8) + _coreml_field_bytes(2, description) + _coreml_field_bytes(500, b"")
+    model_path = tmp_path / "empty-model-type.jpg"
+    model_path.write_bytes(near_match)
+
+    assert detect_file_format(str(model_path)) == "unknown"
+    assert detect_file_format_from_magic(str(model_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "unknown"
+
+
+def test_detect_file_format_retains_oversized_coreml_description_candidate(tmp_path: Path) -> None:
+    model_path = tmp_path / "large-description.jpg"
+    model_path.write_bytes(
+        _coreml_field_varint(1, 8)
+        + _encode_proto_varint((2 << 3) | 2)
+        + _encode_proto_varint((1024 * 1024) + 1)
+        + (b"a" * ((1024 * 1024) + 1))
+        + _coreml_field_bytes(500, _coreml_field_bytes(1, b"layer"))
+    )
+
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
+def test_detect_file_format_retains_oversized_unknown_coreml_prefix_candidate(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(tmp_path / "large-unknown-prefix.jpg")
+    model_path.write_bytes(
+        _coreml_field_varint(1, 8)
+        + _encode_proto_varint((123 << 3) | 2)
+        + _encode_proto_varint((1024 * 1024) + 1)
+        + (b"x" * ((1024 * 1024) + 1))
+        + model_path.read_bytes()
+    )
+
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
 def test_detect_file_format_onnx_pb_content_hint_preempts_protobuf_extension(tmp_path: Path) -> None:
     """ONNX protobuf payloads renamed to .pb should route to ONNX, not TensorFlow protobuf."""
     pytest.importorskip("onnx")
@@ -566,19 +690,47 @@ def test_detect_file_format_routes_prefixed_renamed_onnx_by_bounded_structure(tm
     assert detect_file_format_for_skip_filter(str(model_path)) == "onnx"
 
 
-@pytest.mark.parametrize("field_number", [2, 9, 63])
-def test_detect_file_format_reports_inconclusive_budget_exhausted_prefixed_renamed_onnx(
+@pytest.mark.parametrize("prefix_field_number", [8, 9, 63])
+def test_detect_file_format_marks_budget_exhausted_prefixed_renamed_onnx_as_candidate(
     tmp_path: Path,
-    field_number: int,
+    prefix_field_number: int,
 ) -> None:
-    """Legal known or unknown padding must fail closed when routing exhausts its budget."""
+    """A long valid prefix must survive filtering without a premature format guess."""
     pytest.importorskip("onnx")
-    model_path = create_mock_onnx(tmp_path / f"many-prefixes-{field_number}.jpg")
-    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=field_number)
+    model_path = create_mock_onnx(tmp_path / f"many-prefixes-{prefix_field_number}.jpg")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=prefix_field_number)
 
-    assert detect_file_format(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_from_magic(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_for_skip_filter(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
+def test_validate_file_type_accepts_budget_exhausted_onnx_candidate_with_onnx_suffix(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "many-prefixes.onnx")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=8)
+
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format(str(model_path)) == "onnx"
+    assert validate_file_type(str(model_path)) is True
+
+
+def test_budget_exhausted_onnx_candidate_with_protobuf_suffix_still_routes_to_analysis(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "many-prefixes.pb")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=8)
+
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
+def test_budget_exhausted_protobuf_probe_does_not_steal_coreml_extension_route(tmp_path: Path) -> None:
+    model_path = tmp_path / "ambiguous.mlmodel"
+    model_path.write_bytes(b"\x42\x00" * 4097)
+
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert validate_file_type(str(model_path)) is True
 
 
 def test_detect_budget_exhausted_onnx_flax_overlap_keeps_existing_flax_owner(tmp_path: Path) -> None:
@@ -603,7 +755,7 @@ def test_detect_file_format_routes_group_prefixed_renamed_onnx_by_bounded_struct
     assert detect_file_format_for_skip_filter(str(model_path)) == "onnx"
 
 
-def test_detect_file_format_reports_inconclusive_budget_exhausted_group_prefixed_renamed_onnx(
+def test_detect_file_format_retains_budget_exhausted_group_prefixed_renamed_onnx_candidate(
     tmp_path: Path,
 ) -> None:
     """A bounded group walk must fail closed rather than skip renamed ONNX."""
@@ -611,20 +763,20 @@ def test_detect_file_format_reports_inconclusive_budget_exhausted_group_prefixed
     model_path = create_mock_onnx(tmp_path / "group-budget-model.jpg")
     prefix_mock_onnx_with_unknown_group(model_path)
 
-    assert detect_file_format(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_from_magic(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_for_skip_filter(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
 
 
-def test_detect_file_format_reports_inconclusive_branching_group_budget_exhaustion(tmp_path: Path) -> None:
+def test_detect_file_format_retains_branching_group_budget_candidate(tmp_path: Path) -> None:
     """Nested legal groups share one bounded routing budget across branches."""
     pytest.importorskip("onnx")
     model_path = create_mock_onnx(tmp_path / "branching-groups.jpg")
     prefix_mock_onnx_with_branching_unknown_groups(model_path)
 
-    assert detect_file_format(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_from_magic(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
-    assert detect_file_format_for_skip_filter(str(model_path)) == ONNX_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
 
 
 def test_detect_file_format_rejects_unknown_prefixed_generic_protobuf(tmp_path: Path) -> None:
@@ -641,6 +793,16 @@ def test_detect_file_format_rejects_group_prefixed_generic_protobuf(tmp_path: Pa
     """Skipping an unknown group still requires ONNX graph structure afterward."""
     generic_path = tmp_path / "group-metadata.jpg"
     generic_path.write_bytes(b"\xa3\x06\x08\x01\xa4\x06\x12\x02\x08\x01")
+
+    assert detect_file_format(str(generic_path)) == "unknown"
+    assert detect_file_format_from_magic(str(generic_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(generic_path)) == "unknown"
+
+
+def test_detect_file_format_rejects_invalid_known_protobuf_field_near_match(tmp_path: Path) -> None:
+    """Wrong wire types for known model fields must not become bounded candidates."""
+    generic_path = tmp_path / "invalid-known-field.jpg"
+    generic_path.write_bytes(b"\x10\x00" * 4097)
 
     assert detect_file_format(str(generic_path)) == "unknown"
     assert detect_file_format_from_magic(str(generic_path)) == "unknown"
@@ -2092,12 +2254,23 @@ def test_detect_file_format_probe_boundary_prefixed_proto0_pickle(tmp_path: Path
 
 
 def test_detect_file_format_trivial_probe_boundary_prefix_not_pickle(tmp_path: Path) -> None:
-    """Large no-STOP scalar opcode prefixes should not be treated as pickle by themselves."""
+    """Fully inspected scalar-only text should not become a protobuf candidate."""
     payload = tmp_path / "probe-boundary-trivial-prefix-notes.txt"
     payload.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1))
 
-    assert detect_file_format(str(payload)) != "pickle"
-    assert detect_file_format_from_magic(str(payload)) != "pickle"
+    assert detect_file_format(str(payload)) == "unknown"
+    assert detect_file_format_from_magic(str(payload)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(payload)) == "unknown"
+
+
+def test_detect_file_format_trivial_text_with_binary_tail_remains_candidate(tmp_path: Path) -> None:
+    """A binary tail after scalar text padding must remain fail-closed."""
+    payload = tmp_path / "probe-boundary-trivial-prefix-with-tail.txt"
+    payload.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1) + (b"\x42\x00" * 4097))
+
+    assert detect_file_format(str(payload)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(payload)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(payload)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
 
 
 def test_detect_file_format_exact_probe_boundary_prefix_without_stop_not_pickle(tmp_path: Path) -> None:
