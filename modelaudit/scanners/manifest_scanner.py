@@ -756,6 +756,10 @@ class ManifestScanner(BaseScanner):
 
     def _finish_manifest_result(self, result: ScanResult) -> None:
         """Fail closed for inconclusive manifests unless real security findings were recovered."""
+        if scan_result_has_operational_error(result):
+            result.finish(success=False)
+            return
+
         if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME and not _scan_result_has_security_findings(
             result
         ):
