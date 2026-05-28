@@ -371,6 +371,25 @@ def test_compressed_scanner_python_named_non_python_shebang_reports_executable(t
     assert determine_exit_code(aggregate) == 1
 
 
+def test_compressed_scanner_oversized_python_named_shebang_still_reports_executable(tmp_path: Path) -> None:
+    path = tmp_path / "script.py.gz"
+    payload = b"#!/bin/sh\n" + (b"# filler\n" * ((CompressedScanner.MAX_PYTHON_PAYLOAD_ANALYSIS_BYTES // 9) + 1))
+    path.write_bytes(gzip.compress(payload))
+
+    result = CompressedScanner(config={"compressed_max_decompression_ratio": 10000.0}).scan(str(path))
+    aggregate = scan_model_directory_or_file(
+        str(path),
+        cache_enabled=False,
+        compressed_max_decompression_ratio=10000.0,
+    )
+
+    assert result.metadata["scan_outcome_reasons"] == ["compressed_python_payload_analysis_incomplete"]
+    executable_checks = [check for check in result.checks if check.name == "Executable Archive Member Detection"]
+    assert executable_checks
+    assert executable_checks[0].location == f"{path} -> script.py"
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_compressed_scanner_surfaces_content_disguised_executable_payload(tmp_path: Path) -> None:
     path = tmp_path / "payload.dat.gz"
     path.write_bytes(gzip.compress(b"\x7fELF" + b"\x00" * 48))
@@ -403,6 +422,8 @@ def test_compressed_scanner_benign_llamafile_uses_owned_executable_analysis(tmp_
     [
         ("safe.py.gz", b"import math\nanswer = math.sqrt(4)\n"),
         ("safe_shebang.py.gz", b"#!/usr/bin/env python3\nprint('ok')\n"),
+        ("safe_env_split.py.gz", b"#!/usr/bin/env -S 'python3 -I'\nprint('ok')\n"),
+        ("safe_env_split_long.py.gz", b"#!/usr/bin/env --split-string='python3 -I'\nprint('ok')\n"),
         ("safe.dat.gz", b"weights: [1, 2, 3]\n"),
     ],
 )

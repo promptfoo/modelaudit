@@ -62,6 +62,17 @@ _HIGH_RISK_PYTHON_CALLS = {
     "subprocess.run",
 }
 
+
+def _split_env_shebang_command(value: str) -> str | None:
+    try:
+        split_parts = shlex.split(value)
+    except ValueError:
+        split_parts = value.split()
+    if not split_parts:
+        return None
+    return split_parts[0].rsplit("/", 1)[-1].lower()
+
+
 # Map each high-risk call name to the rule code that best describes its risk
 # category. SARIF consumers, dashboards, and per-rule severity overrides rely
 # on accurate codes, so `os.system` must not be reported under `S104`
@@ -251,6 +262,14 @@ def _shebang_command_name(source_bytes: bytes) -> str | None:
     index = 1
     while index < len(parts):
         token = parts[index]
+        if token in {"-S", "--split-string"}:
+            if index + 1 >= len(parts):
+                return None
+            return _split_env_shebang_command(parts[index + 1])
+        if token.startswith("--split-string="):
+            return _split_env_shebang_command(token.split("=", 1)[1])
+        if token.startswith("-S") and token != "-S":
+            return _split_env_shebang_command(token[2:])
         if token in _ENV_SHEBANG_OPTIONS_WITH_ARGUMENT:
             index += 2
             continue
@@ -269,6 +288,28 @@ def _python_member_has_non_python_shebang(source_bytes: bytes) -> bool:
         return False
     command = _shebang_command_name(source_bytes)
     return command is None or _PYTHON_SHEBANG_COMMAND_RE.fullmatch(command) is None
+
+
+def _probe_python_archive_member_executable_content(path: str) -> ExecutableArchiveMemberProbeOutcome:
+    try:
+        with open(path, "rb") as member_file:
+            prefix_cache = member_file.read(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES)
+            if prefix_cache.startswith(b"#!"):
+                return "detected" if _python_member_has_non_python_shebang(prefix_cache) else "absent"
+
+            def read_prefix(limit: int) -> bytes:
+                nonlocal prefix_cache
+                if limit <= len(prefix_cache) or not prefix_cache.startswith(b"MZ"):
+                    return prefix_cache[:limit]
+                member_file.seek(0)
+                expanded_prefix = member_file.read(limit)
+                if len(expanded_prefix) > len(prefix_cache):
+                    prefix_cache = expanded_prefix
+                return prefix_cache[:limit]
+
+            return probe_executable_archive_member_signature(read_prefix)
+    except OSError:
+        return "absent"
 
 
 def executable_archive_member_content_rule_code(path: str) -> str | None:
@@ -1734,6 +1775,23 @@ def scan_archive_member_for_known_risks(
                     "analysis_incomplete": True,
                 },
             )
+            if analyze_executable_content and tmp_path is not None:
+                executable_probe_outcome = _probe_python_archive_member_executable_content(tmp_path)
+                if executable_probe_outcome == "detected":
+                    _add_executable_archive_member_check(
+                        archive_kind=archive_kind,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        result=result,
+                    )
+                elif executable_probe_outcome == "incomplete":
+                    _add_incomplete_executable_archive_member_check(
+                        archive_kind=archive_kind,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        result=result,
+                        incomplete_reason=executable_analysis_incomplete_reason,
+                    )
             return
 
         if tmp_path is None:
@@ -1762,7 +1820,7 @@ def scan_archive_member_for_known_risks(
             calls = high_risk_python_calls_in_source(source_bytes)
         except PythonArchiveMemberParseError as exc:
             if analyze_executable_content:
-                executable_probe_outcome = probe_executable_archive_member_content(tmp_path)
+                executable_probe_outcome = _probe_python_archive_member_executable_content(tmp_path)
                 if executable_probe_outcome == "detected":
                     _add_executable_archive_member_check(
                         archive_kind=archive_kind,

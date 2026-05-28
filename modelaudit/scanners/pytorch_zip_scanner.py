@@ -53,6 +53,14 @@ _PORTABLE_EXECUTABLE_MAX_PROBE_BYTES = (1024 * 1024) + 4
 _TORCHSCRIPT_FORBIDDEN_SOURCE_PATTERN = re.compile(
     r"(?im)(?:^\s*(?:import|from)\s+|\b(?:__import__|eval|exec|compile|open)\s*\(|\b(?:os|subprocess|socket|requests)\s*\.)"
 )
+
+
+@dataclass(frozen=True)
+class _PickleGlobalRef:
+    module: str
+    name: str
+
+
 _TORCHSCRIPT_FORBIDDEN_AST_NAMES: frozenset[str] = frozenset(
     {
         "__builtins__",
@@ -1547,7 +1555,12 @@ class PyTorchZipScanner(BaseScanner):
                 return None
             if pid[0] != "storage":
                 return None
-            if not any(isinstance(value, str) and value.endswith("Storage") for value in pid):
+            storage_type = pid[1]
+            if not (
+                isinstance(storage_type, _PickleGlobalRef)
+                and storage_type.module == "torch"
+                and storage_type.name.endswith("Storage")
+            ):
                 return None
             storage_key = cls._coerce_pickle_string_arg(pid[2])
             if (
@@ -1580,14 +1593,14 @@ class PyTorchZipScanner(BaseScanner):
                     stack.append(None)
                     continue
                 parts = global_name.split()
-                stack.append(".".join(parts) if len(parts) == 2 else global_name)
+                stack.append(_PickleGlobalRef(parts[0], parts[1]) if len(parts) == 2 else None)
             elif opcode_name == "STACK_GLOBAL":
                 if len(stack) < 2:
                     stack.clear()
                     continue
                 name = cls._coerce_pickle_string_arg(stack.pop())
                 module = cls._coerce_pickle_string_arg(stack.pop())
-                stack.append(f"{module}.{name}" if module is not None and name is not None else None)
+                stack.append(_PickleGlobalRef(module, name) if module is not None and name is not None else None)
             elif opcode_name == "EMPTY_TUPLE":
                 stack.append(())
             elif opcode_name == "TUPLE":
