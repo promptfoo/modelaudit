@@ -2869,6 +2869,15 @@ def detect_flax_msgpack_overlap_routes(path: str) -> tuple[str, ...]:
     return tuple(routes)
 
 
+def _resolve_inconclusive_flax_foreign_overlap(file_path: Path) -> str | None:
+    """Prefer a proven foreign owner when renamed Flax routing is only ambiguous."""
+    if file_path.suffix.lower() in _FLAX_MSGPACK_NATIVE_SUFFIXES:
+        return None
+    if _probe_flax_msgpack_checkpoint_file(file_path) is not None:
+        return None
+    return next(iter(detect_flax_msgpack_overlap_routes(str(file_path))), None)
+
+
 def detect_format_from_magic_bytes(
     magic4: MagicBytes,
     magic8: MagicBytes,
@@ -2968,6 +2977,9 @@ def detect_format_from_magic_bytes(
             return renamed_tensorflow_format
 
     if file_path is not None and _could_be_content_routed_flax_msgpack(file_path):
+        foreign_overlap_format = _resolve_inconclusive_flax_foreign_overlap(file_path)
+        if foreign_overlap_format is not None:
+            return foreign_overlap_format
         if renamed_tensorflow_format == "inconclusive":
             return _resolve_inconclusive_tensorflow_flax_overlap(file_path, file_size)
         return "flax_msgpack"
@@ -3414,6 +3426,9 @@ def detect_file_format(path: str) -> str:
         return "jax_checkpoint"
 
     if ext in _FLAX_MSGPACK_SCANNER_SUFFIXES or _could_be_content_routed_flax_msgpack(file_path):
+        foreign_overlap_format = _resolve_inconclusive_flax_foreign_overlap(file_path)
+        if foreign_overlap_format is not None:
+            return foreign_overlap_format
         if renamed_tensorflow_format == "inconclusive":
             return _resolve_inconclusive_tensorflow_flax_overlap(file_path, size)
         return "flax_msgpack"

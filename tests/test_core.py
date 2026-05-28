@@ -280,6 +280,16 @@ def _write_malicious_cntk(path: Path, include_structure: bool = True) -> None:
     path.write_bytes(prefix + structure + payload)
 
 
+def _write_delayed_flax_cntk_overlap(path: Path) -> None:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    structure = b" CompositeFunction primitive_functions "
+    delayed_flax_root = flax_msgpack_scanner.msgpack.packb(
+        {"params": {"w": [1, 2, 3]}, "__reduce__": "attacker_callable"},
+        use_bin_type=True,
+    )
+    path.write_bytes(prefix + structure + (b"\xc0" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1)) + delayed_flax_root)
+
+
 def _write_malicious_lightgbm(path: Path, valid: bool = True) -> None:
     body = "tree=0\nversion=v4\nnum_class=1\n"
     if valid:
@@ -1099,6 +1109,65 @@ def test_scan_file_preserves_foreign_findings_in_flax_content_overlap(tmp_path: 
     assert result.scanner_name == "flax_msgpack"
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert result.bytes_scanned == payload.stat().st_size
+
+
+def test_scan_file_prefers_strict_cntk_owner_over_inconclusive_flax_probe(tmp_path: Path) -> None:
+    payload = tmp_path / "bounded-cntk.jpg"
+    _write_malicious_cntk(payload)
+    payload.write_bytes(payload.read_bytes() + (b" safe " * (2 * FLAX_MSGPACK_STRUCTURE_READ_BYTES)))
+
+    assert file_detection.detect_file_format(str(payload)) == "cntk"
+    assert file_detection.detect_file_format_from_magic(str(payload)) == "cntk"
+    assert file_detection.detect_file_format_for_skip_filter(str(payload)) == "cntk"
+
+    result = scan_file(str(payload), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "cntk"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "cntk_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_file_preserves_inconclusive_flax_outcome_under_strict_cntk_owner(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    payload = tmp_path / "delayed-flax-cntk.jpg"
+    _write_delayed_flax_cntk_overlap(payload)
+
+    assert payload.stat().st_size < 10 * 1024 * 1024
+    assert file_detection.detect_file_format(str(payload)) == "cntk"
+    assert file_detection.detect_file_format_from_magic(str(payload)) == "cntk"
+
+    result = scan_file(str(payload), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(payload), cache_scan_results=False)
+
+    assert result.scanner_name == "cntk"
+    assert result.success is False
+    assert "cntk_bounded_read_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_preserves_inconclusive_flax_outcome_for_nested_strict_cntk_owner(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    nested_payload = tmp_path / "delayed-flax-cntk.jpg"
+    _write_delayed_flax_cntk_overlap(nested_payload)
+    archive = tmp_path / "delayed-flax-cntk.zip"
+    _create_misnamed_zip(archive, {"delayed-flax-cntk.jpg": nested_payload.read_bytes()})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+    assert result.scanner_name == "zip"
+    assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert core_module.determine_exit_code(aggregate) == 2
 
 
 def test_scan_file_fails_closed_when_flax_overlap_scanner_is_unavailable(
