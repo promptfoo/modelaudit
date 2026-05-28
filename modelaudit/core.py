@@ -1830,8 +1830,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     try:
         file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
     except OSError as e:
-        # Do not turn an unreadable model into a spoofing finding before its
-        # scanner gets a chance to emit its precise read-failure outcome.
+        # A failed content read is not evidence of spoofing. Let an owning
+        # scanner produce a precise read-failure outcome when one exists.
         file_type_valid = True
         if format_probe_error is None:
             format_probe_error = e
