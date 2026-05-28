@@ -65,6 +65,8 @@ _KNOWN_ARTIFACT_FILENAME_EXTENSIONS = frozenset(
 )
 _TRAILING_PATH_DELIMITERS = ".,;:)]}'\""
 _URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>`"
+_PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"]")
+_MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
 _MIN_CAPABILITY_TOKEN_ENTROPY = 3.5
 _MIN_URLSAFE_FILENAME_STEM_ENTROPY = 4.0
 _PUBLIC_MODEL_REPOSITORY_HOSTS = frozenset({"huggingface.co", "hf.co"})
@@ -82,6 +84,13 @@ _AZURE_CONTAINER_NAME_PATTERN = re.compile(r"^(?:\$root|[a-z0-9](?:[a-z0-9-]{1,6
 def _split_trailing_path_delimiters(segment: str) -> tuple[str, str]:
     stripped = segment.rstrip(_TRAILING_PATH_DELIMITERS)
     return stripped, segment[len(stripped) :]
+
+
+def _split_path_token_boundary(decoded: str) -> tuple[str, str] | None:
+    match = _PATH_TOKEN_BOUNDARY_PATTERN.search(decoded)
+    if match is None or match.start() == 0:
+        return None
+    return decoded[: match.start()], decoded[match.start() :]
 
 
 def _shannon_entropy_per_char(value: str) -> float:
@@ -131,6 +140,10 @@ def _looks_like_capability_path_token(segment: str) -> bool:
         return any(_looks_like_capability_path_token(part) for part in decoded.split("/") if part)
     if ":" in decoded:
         return any(_looks_like_capability_path_token(part) for part in decoded.split(":") if part)
+    boundary_parts = _split_path_token_boundary(decoded)
+    if boundary_parts is not None:
+        prefix, _suffix = boundary_parts
+        return _looks_like_capability_path_token(prefix)
     if _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded):
         return True
     if _redact_known_token_filename(segment) is not None:
@@ -193,6 +206,19 @@ def _redact_colon_delimited_path_tokens(segment: str) -> str | None:
     if not changed:
         return None
     return f"{':'.join(parts)}{trailing_delimiters}"
+
+
+def _redact_boundary_delimited_path_tokens(segment: str) -> str | None:
+    token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+    decoded = unquote(token_candidate)
+    boundary_parts = _split_path_token_boundary(decoded)
+    if boundary_parts is None:
+        return None
+
+    prefix, suffix = boundary_parts
+    if not _looks_like_capability_path_token(prefix):
+        return None
+    return f"{_REDACTED_PATH_TOKEN}{suffix}{trailing_delimiters}"
 
 
 def _is_public_model_repository_segment(hostname: str, segments: list[str], index: int) -> bool:
@@ -275,10 +301,11 @@ def _is_azure_authority_container(container: str) -> bool:
 
 def _redact_path_parameter_tokens(segment: str) -> str | None:
     token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
-    if ";" not in token_candidate:
+    decoded = unquote(token_candidate)
+    if _MATRIX_PARAMETER_SEPARATOR_PATTERN.search(decoded) is None:
         return None
 
-    parts = token_candidate.split(";")
+    parts = _MATRIX_PARAMETER_SEPARATOR_PATTERN.split(decoded)
     changed = False
     if parts[0] and _looks_like_capability_path_token(parts[0]):
         parts[0] = _REDACTED_PATH_TOKEN
@@ -293,9 +320,13 @@ def _redact_path_parameter_tokens(segment: str) -> str | None:
                 changed = True
             continue
         key, value = part.split("=", 1)
-        if _looks_like_capability_path_token(value):
-            parts[index] = f"{key}={_REDACTED_PATH_TOKEN}"
+        if _looks_like_capability_path_token(key):
+            key = _REDACTED_PATH_TOKEN
             changed = True
+        if _looks_like_capability_path_token(value):
+            value = _REDACTED_PATH_TOKEN
+            changed = True
+        parts[index] = f"{key}={value}"
 
     if changed:
         return f"{';'.join(parts)}{trailing_delimiters}"
@@ -318,10 +349,6 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
             _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
             segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
             continue
-        parameter_redaction = _redact_path_parameter_tokens(segment)
-        if parameter_redaction is not None:
-            segments[index] = parameter_redaction
-            continue
         encoded_separator_redaction = _redact_encoded_path_separator_tokens(segment)
         if encoded_separator_redaction is not None:
             segments[index] = encoded_separator_redaction
@@ -329,6 +356,14 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
         colon_redaction = _redact_colon_delimited_path_tokens(segment)
         if colon_redaction is not None:
             segments[index] = colon_redaction
+            continue
+        boundary_redaction = _redact_boundary_delimited_path_tokens(segment)
+        if boundary_redaction is not None:
+            segments[index] = boundary_redaction
+            continue
+        parameter_redaction = _redact_path_parameter_tokens(segment)
+        if parameter_redaction is not None:
+            segments[index] = parameter_redaction
             continue
 
         if _is_public_model_repository_segment(hostname, segments, index):

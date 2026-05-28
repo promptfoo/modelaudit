@@ -213,6 +213,34 @@ class TestNetworkCommDetector:
         assert url_finding["url"] == "https://example.com/download;token=<redacted>/model.bin"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
 
+    def test_encoded_path_parameter_tokens_are_redacted(self) -> None:
+        """Encoded matrix delimiters should still expose path parameter tokens."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/download%3Btoken={path_token}/model.bin".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download;token=<redacted>/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_path_parameter_key_tokens_are_redacted(self) -> None:
+        """Matrix parameter names can carry capability tokens too."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/download;{path_token}=1/model.bin".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download;<redacted>=1/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
     def test_path_segment_tokens_before_matrix_parameters_are_redacted(self) -> None:
         """A token segment followed by benign matrix params should still be redacted."""
         detector = NetworkCommDetector()
@@ -225,6 +253,20 @@ class TestNetworkCommDetector:
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
 
         assert url_finding["url"] == "https://example.com/path/<redacted>;v=1/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_ampersand_delimited_path_tokens_are_redacted(self) -> None:
+        """HTML-escaped path suffixes should not hide capability token prefixes."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/path/{path_token}&amp;download=1".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/path/<redacted>&amp;download=1"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
 
     def test_public_revision_hash_paths_are_preserved(self) -> None:
@@ -754,6 +796,19 @@ class TestNetworkCommDetector:
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
 
         assert url_finding["url"].endswith(f"/{long_prefix}/<redacted>/model.bin")
+        assert path_token not in json.dumps([network_finding, url_finding], sort_keys=True)
+
+    def test_single_quoted_call_tail_does_not_prevent_path_token_redaction(self) -> None:
+        """Call syntax after a URL should not stay attached to the secret token."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+        data = f"requests.get('https://example.com/path/{path_token}',verify=True)".encode()
+
+        findings = detector.scan(data, "hook.py")
+        network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/path/<redacted>',verify=True)"
         assert path_token not in json.dumps([network_finding, url_finding], sort_keys=True)
 
     def test_cc_pattern_snippets_redact_partial_url_path_tokens(self) -> None:
