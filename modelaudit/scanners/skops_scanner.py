@@ -15,7 +15,10 @@ from typing import Any, ClassVar
 
 from ..utils.file.detection import is_skops_archive, read_magic_bytes
 from ._archive_outcomes import mark_archive_scan_incomplete
-from .archive_dispatch import SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY
+from .archive_dispatch import (
+    KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY,
+    SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY,
+)
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 
@@ -29,6 +32,7 @@ class SkopsScanner(BaseScanner):
     _OVERSIZED_ENTRY_METADATA_KEY: ClassVar[str] = "oversized_zip_entries"
     _UNREADABLE_ENTRY_REASON: ClassVar[str] = "skops_zip_entry_read_failed"
     _UNREADABLE_ENTRY_METADATA_KEY: ClassVar[str] = "unreadable_zip_entries"
+    _UNREADABLE_ENTRY_OFFSETS_METADATA_KEY: ClassVar[str] = KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY
     _NOT_ZIP_REASON: ClassVar[str] = "skops_not_zip_archive"
     _BAD_ZIP_REASON: ClassVar[str] = "skops_bad_zip_file"
     _SCAN_FAILURE_REASON: ClassVar[str] = "skops_scan_failed"
@@ -95,6 +99,13 @@ class SkopsScanner(BaseScanner):
         file_info: zipfile.ZipInfo,
         exc: Exception,
     ) -> None:
+        unreadable_offsets = result.metadata.setdefault(self._UNREADABLE_ENTRY_OFFSETS_METADATA_KEY, [])
+        if not isinstance(unreadable_offsets, list):
+            unreadable_offsets = []
+            result.metadata[self._UNREADABLE_ENTRY_OFFSETS_METADATA_KEY] = unreadable_offsets
+        if file_info.header_offset not in unreadable_offsets:
+            unreadable_offsets.append(file_info.header_offset)
+
         unreadable_entries = result.metadata.setdefault(self._UNREADABLE_ENTRY_METADATA_KEY, [])
         if not isinstance(unreadable_entries, list):
             unreadable_entries = []
@@ -138,7 +149,7 @@ class SkopsScanner(BaseScanner):
             with zip_file.open(file_info, "r") as entry:
                 content = entry.read(self.max_zip_entry_read_size + 1)
         except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
-            if result is not None and zip_path is not None and not self._is_nested_array_payload(file_info.filename):
+            if result is not None and zip_path is not None:
                 self._record_unreadable_zip_entry(result, zip_path, file_info, exc)
             return None
 
@@ -468,25 +479,18 @@ class SkopsScanner(BaseScanner):
         if self.config.get(SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY):
             return
 
-        from .zip_scanner import KNOWN_UNREADABLE_ARCHIVE_ENTRIES_CONFIG_KEY, ZipScanner
+        from .zip_scanner import ZipScanner
 
+        unreadable_offsets = result.metadata.pop(self._UNREADABLE_ENTRY_OFFSETS_METADATA_KEY, ())
         nested_config = dict(self.config)
-        unreadable_entries = result.metadata.get(self._UNREADABLE_ENTRY_METADATA_KEY, ())
-        known_unreadable_entries = (
-            {entry for entry in unreadable_entries if isinstance(entry, str)}
-            if isinstance(unreadable_entries, list)
+        known_unreadable_offsets = (
+            {offset for offset in unreadable_offsets if isinstance(offset, int) and not isinstance(offset, bool)}
+            if isinstance(unreadable_offsets, list)
             else set()
         )
 
-        if known_unreadable_entries:
-            skipped_entries = set(known_unreadable_entries)
-            configured_entries = nested_config.get("skip_archive_entries", ())
-            if isinstance(configured_entries, str):
-                skipped_entries.add(configured_entries)
-            elif isinstance(configured_entries, (list, tuple, set, frozenset)):
-                skipped_entries.update(entry for entry in configured_entries if isinstance(entry, str))
-            nested_config["skip_archive_entries"] = sorted(skipped_entries)
-            nested_config[KNOWN_UNREADABLE_ARCHIVE_ENTRIES_CONFIG_KEY] = sorted(known_unreadable_entries)
+        if known_unreadable_offsets:
+            nested_config[KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY] = sorted(known_unreadable_offsets)
 
         existing_reasons = result.metadata.get("scan_outcome_reasons")
         preserved_reasons = (

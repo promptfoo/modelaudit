@@ -26,7 +26,7 @@ from modelaudit.scanners.archive_dispatch import (
 )
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
-from modelaudit.scanners.zip_scanner import KNOWN_UNREADABLE_ARCHIVE_ENTRIES_CONFIG_KEY, ZipScanner
+from modelaudit.scanners.zip_scanner import KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, ZipScanner
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import ONNX_ROUTING_INCONCLUSIVE_FORMAT
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
@@ -2422,6 +2422,9 @@ def test_zip_scanner_does_not_reopen_known_unreadable_symlink(
         info.external_attr = (stat.S_IFLNK | 0o777) << 16
         archive.writestr(info, "safe-target.bin")
 
+    with zipfile.ZipFile(archive_path) as archive:
+        unreadable_offset = archive.getinfo("weights_link").header_offset
+
     def fail_read(_archive: zipfile.ZipFile, _info: zipfile.ZipInfo) -> str:
         raise AssertionError("known unreadable symlink target should not be reopened")
 
@@ -2429,8 +2432,7 @@ def test_zip_scanner_does_not_reopen_known_unreadable_symlink(
 
     result = ZipScanner(
         {
-            "skip_archive_entries": ["weights_link"],
-            KNOWN_UNREADABLE_ARCHIVE_ENTRIES_CONFIG_KEY: ["weights_link"],
+            KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY: [unreadable_offset],
             "cache_enabled": False,
         }
     ).scan(str(archive_path))
@@ -2454,10 +2456,12 @@ def test_zip_scanner_validates_traversal_before_known_unreadable_symlink_skip(tm
         info.external_attr = (stat.S_IFLNK | 0o777) << 16
         archive.writestr(info, "safe-target.bin")
 
+    with zipfile.ZipFile(archive_path) as archive:
+        unreadable_offset = archive.getinfo("../weights_link").header_offset
+
     result = ZipScanner(
         {
-            "skip_archive_entries": ["../weights_link"],
-            KNOWN_UNREADABLE_ARCHIVE_ENTRIES_CONFIG_KEY: ["../weights_link"],
+            KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY: [unreadable_offset],
             "cache_enabled": False,
         }
     ).scan(str(archive_path))

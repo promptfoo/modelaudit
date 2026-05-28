@@ -617,6 +617,41 @@ class TestSkopsScannerEdgeCases:
         oversized_checks = [c for c in result.checks if c.name == "Skops Oversized ZIP Entry"]
         assert len(oversized_checks) == 0
 
+    def test_unreadable_numpy_payload_marks_skops_incomplete(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unreadable numeric payload has no nested coverage and must fail closed."""
+        skops_file = tmp_path / "unreadable_array.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("step/0/content/0.npy", _make_numeric_npy())
+
+        original_open = zipfile.ZipFile.open
+
+        def open_with_failure(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            if isinstance(name, zipfile.ZipInfo) and name.filename == "step/0/content/0.npy":
+                raise zipfile.BadZipFile("CRC mismatch")
+            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+
+        result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
+
+        metadata = result.file_metadata[str(skops_file)]
+        _assert_inconclusive_reason(metadata, "skops_zip_entry_read_failed")
+        assert "_known_unreadable_archive_entry_offsets" not in metadata
+        assert not any("Error scanning ZIP entry step/0/content/0.npy" in issue.message for issue in result.issues)
+        assert determine_exit_code(result) == 2
+
     def test_detected_cve_before_oversized_entry_preserves_security_exit_code(self, tmp_path: Path) -> None:
         """Observed CVE payloads remain findings even when later coverage is bounded."""
         skops_file = tmp_path / "detected_before_oversized_entry.skops"
@@ -777,6 +812,46 @@ class TestSkopsScannerEdgeCases:
         )
         assert determine_exit_code(result) == 1
 
+    def test_unreadable_member_alias_does_not_suppress_readable_pickle_finding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unreadable alias must not suppress scanning a distinct readable pickle member."""
+        skops_file = tmp_path / "unreadable_alias_payload.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("./payload.pkl", b"unreadable alias")
+            zf.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+        original_open = zipfile.ZipFile.open
+
+        def open_with_failure(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            if isinstance(name, zipfile.ZipInfo) and name.filename == "./payload.pkl":
+                raise zipfile.BadZipFile("CRC mismatch")
+            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+
+        result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
+
+        metadata = result.file_metadata[str(skops_file)]
+        _assert_inconclusive_reason(metadata, "skops_zip_entry_read_failed")
+        assert "_known_unreadable_archive_entry_offsets" not in metadata
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
+
     def test_unreadable_symlink_member_remains_inconclusive(
         self,
         tmp_path: Path,
@@ -814,6 +889,53 @@ class TestSkopsScannerEdgeCases:
         _assert_inconclusive_reason(metadata, "skops_zip_entry_read_failed")
         assert not any("Unable to read symlink target" in issue.message for issue in result.issues)
         assert determine_exit_code(result) == 2
+
+    def test_unreadable_symlink_alias_does_not_suppress_readable_escape_finding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unreadable symlink alias must not suppress a separate escaping symlink."""
+        skops_file = tmp_path / "unreadable_symlink_alias.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            unreadable_info = zipfile.ZipInfo("./weights_link")
+            unreadable_info.create_system = 3
+            unreadable_info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            zf.writestr(unreadable_info, "safe-target.bin")
+            readable_info = zipfile.ZipInfo("weights_link")
+            readable_info.create_system = 3
+            readable_info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            zf.writestr(readable_info, "../outside.bin")
+
+        original_open = zipfile.ZipFile.open
+
+        def open_with_failure(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            if isinstance(name, zipfile.ZipInfo) and name.filename == "./weights_link":
+                raise zipfile.BadZipFile("CRC mismatch")
+            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+
+        result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
+
+        metadata = result.file_metadata[str(skops_file)]
+        _assert_inconclusive_reason(metadata, "skops_zip_entry_read_failed")
+        assert "_known_unreadable_archive_entry_offsets" not in metadata
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("entry") == "weights_link"
+            and "resolves outside extraction directory" in issue.message
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
 
     def test_oversized_entry_core_exits_two_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
         """Aggregate scans should preserve fail-closed exit and avoid reusing incomplete outer results."""

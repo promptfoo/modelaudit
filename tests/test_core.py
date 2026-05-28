@@ -1924,6 +1924,53 @@ def test_scan_file_preserves_skops_cve_findings_in_llamafile_polyglot(tmp_path: 
     )
 
 
+def test_scan_file_keeps_unreadable_skops_member_inconclusive_in_llamafile_polyglot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polyglot = tmp_path / "skops-unreadable.jpg"
+    _create_misnamed_zip(
+        polyglot,
+        {
+            "schema.json": json.dumps(
+                {
+                    "__class__": "Pipeline",
+                    "__module__": "sklearn.pipeline",
+                    "__loader__": "ObjectNode",
+                    "_skops_version": "0.12.0",
+                    "content": {},
+                }
+            ).encode("utf-8"),
+            "README.md": b"ordinary documentation",
+        },
+    )
+    _prepend_stub(polyglot, b"\x7fELF" + b"\x00" * 60 + b"llamafile runtime\n")
+
+    original_open = zipfile.ZipFile.open
+
+    def open_with_failure(
+        archive: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        mode: str = "r",
+        pwd: bytes | None = None,
+        *,
+        force_zip64: bool = False,
+    ) -> Any:
+        if isinstance(name, zipfile.ZipInfo) and name.filename == "README.md":
+            raise zipfile.BadZipFile("CRC mismatch")
+        return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+
+    result = scan_model_directory_or_file(str(polyglot), cache_enabled=False)
+
+    metadata = result.file_metadata[str(polyglot)]
+    assert "skops_zip_entry_read_failed" in metadata["scan_outcome_reasons"]
+    assert "_known_unreadable_archive_entry_offsets" not in metadata
+    assert not any("Error scanning ZIP entry README.md" in issue.message for issue in result.issues)
+    assert core_module.determine_exit_code(result) == 2
+
+
 def test_scan_file_preserves_skops_cve_findings_in_out_of_window_executable_zip(tmp_path: Path) -> None:
     polyglot = tmp_path / "skops-late-marker.jpg"
     _create_misnamed_zip(polyglot, {"schema.json": _build_malicious_skops_schema()})
