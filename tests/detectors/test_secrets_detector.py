@@ -263,6 +263,18 @@ class TestSecretsDetector:
         serialized = json.dumps(findings, sort_keys=True)
         assert raw_secret not in serialized
 
+    def test_context_redaction_does_not_change_uuid_false_positive_filtering(self) -> None:
+        """Redaction markers should not introduce secret hints into detector scoring."""
+        detector = SecretsDetector()
+        raw_key = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ12"
+        benign_uuid = "550e8400-e29b-41d4-a716-446655440000"
+
+        findings = detector.scan_dict({raw_key: {"id": benign_uuid}})
+
+        assert not any(finding["secret_type"] == "UUID (potential secret)" for finding in findings)
+        serialized = json.dumps(findings, sort_keys=True)
+        assert raw_key not in serialized
+
 
 class TestPickleScannerWithSecrets:
     """Test the PickleScanner with embedded secrets detection."""
