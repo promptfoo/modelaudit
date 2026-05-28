@@ -203,6 +203,7 @@ _KERAS_CONFIG_PREFIX_HINT_RE = re.compile(
 )
 _NEMO_CONFIG_ENTRIES = frozenset({"model_config.yaml", "model_config.yml"})
 _NEMO_ROUTE_MAX_ENTRIES = 10_000
+_NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS = 100_000
 _PYTORCH_ZIP_METADATA_MAX_BYTES = 64
 _SKOPS_SCHEMA_ENTRIES = frozenset({"schema", "schema.json"})
 _SKOPS_SCHEMA_MAX_BYTES = 4 * 1024 * 1024
@@ -2100,9 +2101,162 @@ def _resolve_safe_tar_link_target_name(member: tarfile.TarInfo) -> str | None:
     if PurePosixPath(link_name).is_absolute() or re.match(r"^[A-Za-z]:/", link_name):
         return None
 
-    member_dir = posixpath.dirname(member.name.replace("\\", "/"))
-    target_name = posixpath.normpath(posixpath.join(member_dir, link_name))
+    if member.islnk():
+        target_name = link_name
+    else:
+        member_dir = posixpath.dirname(member.name.replace("\\", "/"))
+        target_name = posixpath.join(member_dir, link_name)
+    if posixpath.normpath(target_name) == ".":
+        return "."
     return _normalize_safe_tar_member_name(target_name)
+
+
+def _resolve_safe_tar_symlink_target_at_destination(member: tarfile.TarInfo, destination_name: str) -> str | None:
+    """Resolve a symlink target relative to its extracted destination."""
+    link_name = member.linkname.replace("\\", "/")
+    if PurePosixPath(link_name).is_absolute() or re.match(r"^[A-Za-z]:/", link_name):
+        return None
+    target_name = posixpath.join(posixpath.dirname(destination_name), link_name)
+    if posixpath.normpath(target_name) == ".":
+        return "."
+    return _normalize_safe_tar_member_name(target_name)
+
+
+class _NemoRouteResolutionLimitExceeded(Exception):
+    """Raised when bounded NeMo TAR link routing cannot safely continue."""
+
+
+def _consume_nemo_route_link_visit(member_visit_budget: list[int]) -> None:
+    if member_visit_budget[0] <= 0:
+        raise _NemoRouteResolutionLimitExceeded
+    member_visit_budget[0] -= 1
+
+
+def _consume_nemo_route_prefix_probe_budget(
+    components: list[str],
+    maximum_length: int,
+    member_visit_budget: list[int],
+) -> None:
+    """Bound total prefix-string work before resolving symlink components."""
+    prefix_length = 0
+    probe_cost = 0
+    for index, component in enumerate(components[:maximum_length]):
+        prefix_length += len(component) + (1 if index else 0)
+        probe_cost += prefix_length
+        if probe_cost > member_visit_budget[0]:
+            raise _NemoRouteResolutionLimitExceeded
+    member_visit_budget[0] -= probe_cost
+
+
+def _resolve_safe_tar_path_through_symlinks(
+    member_name: str,
+    symlink_targets: dict[str, str],
+    member_visit_budget: list[int],
+    *,
+    follow_final_symlink: bool = True,
+) -> str | None:
+    """Resolve a safe extraction destination through symlinks already created."""
+    current_name = _normalize_safe_tar_member_name(member_name)
+    if current_name is None:
+        return None
+    seen: set[str] = set()
+    while current_name not in seen:
+        seen.add(current_name)
+        if not symlink_targets:
+            return current_name
+        components = current_name.split("/")
+        maximum_length = len(components) if follow_final_symlink else len(components) - 1
+        _consume_nemo_route_prefix_probe_budget(
+            components,
+            maximum_length,
+            member_visit_budget,
+        )
+        for length in range(maximum_length, 0, -1):
+            prefix = "/".join(components[:length])
+            target_name = symlink_targets.get(prefix)
+            if target_name is None:
+                continue
+            suffix = "/".join(components[length:])
+            redirected_name = target_name if not suffix else posixpath.join(target_name, suffix)
+            if posixpath.normpath(redirected_name) == ".":
+                current_name = "."
+            else:
+                current_name = _normalize_safe_tar_member_name(redirected_name)
+                if current_name is None:
+                    return None
+            break
+        else:
+            return current_name
+    return None
+
+
+def _tar_member_materializes_file_content(member: tarfile.TarInfo) -> bool:
+    """Mirror tarfile members extracted through makefile or makeunknown."""
+    return not (
+        member.isdir() or member.isfifo() or member.ischr() or member.isblk() or member.islnk() or member.issym()
+    )
+
+
+def _tar_links_resolve_to_regular_member(
+    root_links: list[tarfile.TarInfo],
+    members_by_normalized_name: dict[str, list[tarfile.TarInfo]],
+    member_visit_budget: list[int],
+) -> bool:
+    """Return whether a TAR link chain can materialize a regular config member."""
+    pending = list(root_links)
+    seen: set[tuple[str, int]] = set()
+    while pending:
+        member = pending.pop()
+        identity = (member.name, member.offset)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if _tar_member_materializes_file_content(member):
+            return True
+        if not (member.issym() or member.islnk()):
+            continue
+        _consume_nemo_route_link_visit(member_visit_budget)
+        target_member = _effective_safe_tar_link_target_member(member, members_by_normalized_name)
+        if target_member is not None:
+            pending.append(target_member)
+    return False
+
+
+def _effective_safe_tar_link_target_member(
+    member: tarfile.TarInfo,
+    members_by_normalized_name: dict[str, list[tarfile.TarInfo]],
+) -> tarfile.TarInfo | None:
+    """Return the single target entry TAR extraction would use for a link."""
+    target_name = _resolve_safe_tar_link_target_name(member)
+    if target_name is None:
+        return None
+    target_members = members_by_normalized_name.get(target_name, [])
+    if member.islnk():
+        target_members = [target_member for target_member in target_members if target_member.offset < member.offset]
+    return target_members[-1] if target_members else None
+
+
+def _resolve_tar_hardlink_fallback_member(
+    hardlink: tarfile.TarInfo,
+    members_by_normalized_name: dict[str, list[tarfile.TarInfo]],
+    member_visit_budget: list[int],
+) -> tarfile.TarInfo | None:
+    """Resolve the member tarfile extracts after a colliding hardlink."""
+    pending = hardlink
+    seen: set[tuple[str, int]] = set()
+    while pending.islnk():
+        _consume_nemo_route_link_visit(member_visit_budget)
+        identity = (pending.name, pending.offset)
+        if identity in seen:
+            return None
+        seen.add(identity)
+        target_member = _effective_safe_tar_link_target_member(pending, members_by_normalized_name)
+        if target_member is None:
+            return None
+        if _tar_member_materializes_file_content(target_member) or target_member.issym():
+            return target_member
+        pending = target_member
+    return None
 
 
 def _detect_tar_route(path: str) -> str | None:
@@ -2115,31 +2269,138 @@ def _detect_tar_route(path: str) -> str | None:
         with tarfile.open(file_path, "r:*") as archive:
             if file_path.suffix.lower() == ".nemo":
                 return "tar"
-            regular_member_names: set[str] = set()
-            linked_root_config_targets: set[str] = set()
+            members_by_normalized_name: dict[str, list[tarfile.TarInfo]] = {}
+            root_config_links: list[tarfile.TarInfo] = []
+            symlink_targets: dict[str, str] = {}
+            occupied_names: set[str] = set()
+            link_resolution_budget = [_NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS]
             for entry_count, member in enumerate(archive, start=1):
                 if entry_count > _NEMO_ROUTE_MAX_ENTRIES:
+                    if _tar_links_resolve_to_regular_member(
+                        root_config_links,
+                        members_by_normalized_name,
+                        link_resolution_budget,
+                    ):
+                        return "nemo"
                     return NEMO_ROUTING_INCONCLUSIVE_FORMAT
                 normalized_member_name = _normalize_safe_tar_member_name(member.name)
-                if member.isfile():
+                if normalized_member_name is not None:
+                    members_by_normalized_name.setdefault(normalized_member_name, []).append(member)
+                if _tar_member_materializes_file_content(member):
+                    resolved_destination = _resolve_safe_tar_path_through_symlinks(
+                        member.name,
+                        symlink_targets,
+                        link_resolution_budget,
+                    )
+                    if resolved_destination is not None and _is_nemo_root_config_member(resolved_destination):
+                        return "nemo"
+                    physical_destination = _resolve_safe_tar_path_through_symlinks(
+                        member.name,
+                        symlink_targets,
+                        link_resolution_budget,
+                        follow_final_symlink=False,
+                    )
+                    if physical_destination is not None:
+                        occupied_names.add(physical_destination)
+                elif member.issym():
+                    destination_name = _resolve_safe_tar_path_through_symlinks(
+                        member.name,
+                        symlink_targets,
+                        link_resolution_budget,
+                        follow_final_symlink=False,
+                    )
+                    if destination_name is None:
+                        continue
+                    target_name = _resolve_safe_tar_symlink_target_at_destination(member, destination_name)
+                    if target_name is None:
+                        continue
+                    if _is_nemo_root_config_member(destination_name):
+                        return "nemo"
+                    occupied_names.add(destination_name)
+                    symlink_targets[destination_name] = target_name
+                elif member.islnk():
+                    destination_name = _resolve_safe_tar_path_through_symlinks(
+                        member.name,
+                        symlink_targets,
+                        link_resolution_budget,
+                        follow_final_symlink=False,
+                    )
+                    target_name = _resolve_safe_tar_link_target_name(member)
+                    if (
+                        destination_name is not None
+                        and _is_nemo_root_config_member(destination_name)
+                        and target_name is not None
+                    ):
+                        return "nemo"
+                    if destination_name is None or target_name is None:
+                        continue
+                    if destination_name in occupied_names:
+                        fallback_member = _resolve_tar_hardlink_fallback_member(
+                            member,
+                            members_by_normalized_name,
+                            link_resolution_budget,
+                        )
+                        if fallback_member is None:
+                            continue
+                        if fallback_member.issym():
+                            symlink_targets.pop(destination_name, None)
+                            fallback_target = _resolve_safe_tar_symlink_target_at_destination(
+                                fallback_member,
+                                destination_name,
+                            )
+                            if fallback_target is not None:
+                                symlink_targets[destination_name] = fallback_target
+                            continue
+                        resolved_write = _resolve_safe_tar_path_through_symlinks(
+                            destination_name,
+                            symlink_targets,
+                            link_resolution_budget,
+                        )
+                        if resolved_write is not None and _is_nemo_root_config_member(resolved_write):
+                            return "nemo"
+                        continue
+                    occupied_names.add(destination_name)
+                    fallback_member = _resolve_tar_hardlink_fallback_member(
+                        member,
+                        members_by_normalized_name,
+                        link_resolution_budget,
+                    )
+                    redirected_target = _resolve_safe_tar_path_through_symlinks(
+                        target_name,
+                        symlink_targets,
+                        link_resolution_budget,
+                    )
+                    if (
+                        fallback_member is not None
+                        and fallback_member.issym()
+                        and redirected_target is not None
+                        and redirected_target not in occupied_names
+                    ):
+                        fallback_target = _resolve_safe_tar_symlink_target_at_destination(
+                            fallback_member,
+                            destination_name,
+                        )
+                        if fallback_target is not None:
+                            symlink_targets[destination_name] = fallback_target
                     if _is_nemo_root_config_member(member.name):
-                        return "nemo"
-                    if normalized_member_name in linked_root_config_targets:
-                        return "nemo"
-                    if normalized_member_name is not None:
-                        regular_member_names.add(normalized_member_name)
-                    continue
-                if not (member.issym() or member.islnk()) or not _is_nemo_root_config_member(member.name):
-                    continue
-                target_name = _resolve_safe_tar_link_target_name(member)
-                if target_name in regular_member_names:
-                    return "nemo"
-                if member.issym() and target_name is not None:
-                    linked_root_config_targets.add(target_name)
+                        root_config_links.append(member)
+    except _NemoRouteResolutionLimitExceeded:
+        return NEMO_ROUTING_INCONCLUSIVE_FORMAT
     except (EOFError, OSError, tarfile.TarError):
         return None
 
-    return "tar"
+    try:
+        return (
+            "nemo"
+            if _tar_links_resolve_to_regular_member(
+                root_config_links,
+                members_by_normalized_name,
+                link_resolution_budget,
+            )
+            else "tar"
+        )
+    except _NemoRouteResolutionLimitExceeded:
+        return NEMO_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def is_nemo_archive(path: str) -> bool:

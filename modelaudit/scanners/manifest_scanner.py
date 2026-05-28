@@ -756,6 +756,10 @@ class ManifestScanner(BaseScanner):
 
     def _finish_manifest_result(self, result: ScanResult) -> None:
         """Fail closed for inconclusive manifests unless real security findings were recovered."""
+        if scan_result_has_operational_error(result):
+            result.finish(success=False)
+            return
+
         if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME and not _scan_result_has_security_findings(
             result
         ):
@@ -1153,6 +1157,15 @@ class ManifestScanner(BaseScanner):
 
         except TimeoutError:
             raise
+        except (OSError, UnicodeError) as e:
+            self._record_read_failure(
+                result,
+                path,
+                e,
+                reason="manifest_cloud_storage_read_failed",
+                check_name="Cloud Storage URL Detection",
+                message="Unable to load manifest text for cloud storage URL analysis",
+            )
         except Exception as e:
             logger.debug(f"Error checking cloud storage URLs in {path}: {e}")
 

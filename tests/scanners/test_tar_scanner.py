@@ -265,6 +265,186 @@ class TestTarScanner:
         assert python_checks[0].rule_code == "S101"
         assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
+    def test_scan_tar_flags_namespace_mapping_dangerous_python_member(self, tmp_path: Path) -> None:
+        """Module namespace dictionary lookup must not hide a risky call."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"import subprocess as sp\nvars(sp)['r' + 'un'](['echo', 'hidden'], check=False)\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].severity == IssueSeverity.WARNING
+        assert python_checks[0].rule_code == "S103"
+        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            b"import os\nglobals()['os'].system('echo hidden')\n",
+            b"import os\ngetattr(object, '__getattribute__')(os, 'sys' + 'tem')('echo hidden')\n",
+            (
+                b"import os\nnamespace = os.__dict__\nnamespace['runner'] = os.system\n"
+                b"namespace['runner']('echo hidden')\n"
+            ),
+            (
+                b"import os\nnamespace = globals()\nnamespace['runner'] = os.system\n"
+                b"namespace['runner']('echo hidden')\n"
+            ),
+            b"import os\nglobals().setdefault('runner', os.system)\nrunner('echo hidden')\n",
+            b"import os\nglobals().__setitem__('runner', os.system)\nrunner('echo hidden')\n",
+            b"import os\nglobals()['runner'] = os.system\npopped = globals().pop('runner')\npopped('echo hidden')\n",
+            b"import os\nos.__dict__['runner'] = os.system\nos.runner('echo hidden')\n",
+            (
+                b"import os\nos.__dict__['runner'] = os.system\n"
+                b"popped = os.__dict__.pop('runner')\npopped('echo hidden')\n"
+            ),
+            b"import os\n[runner := os.system for _ in (1,)]\nrunner('echo hidden')\n",
+            b"import os\nclass Install:\n    globals()['runner'] = os.system\nrunner('echo hidden')\n",
+            b"import os\ndef run():\n    globals()['runner'] = os.system\n    runner('echo hidden')\nrun()\n",
+            (
+                b"import os\nrunner = os.system\nif bool():\n    globals()['runner'] = print\n"
+                b"globals()['runner']('echo hidden')\n"
+            ),
+        ],
+    )
+    def test_scan_tar_flags_static_namespace_indirection_dangerous_python_member(
+        self, tmp_path: Path, payload: bytes
+    ) -> None:
+        """Static namespace indirection should retain high-risk callable identity."""
+        archive_path = tmp_path / "model_bundle.tar"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].rule_code == "S101"
+        assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+
+    def test_scan_tar_ignores_safe_namespace_slot_rebinding(self, tmp_path: Path) -> None:
+        """A safe final callable bound through a module dictionary should remain clean."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = (
+            b"import os\nnamespace = os.__dict__\nnamespace['runner'] = os.system\n"
+            b"namespace['runner'] = print\nnamespace['runner']('safe')\n"
+        )
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+
+    def test_scan_tar_ignores_overwritten_module_namespace_import(self, tmp_path: Path) -> None:
+        """A known module mapping overwrite should not retain a stale dangerous import."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = (
+            b"import os\nclass Safe:\n    system = print\nnamespace = globals()\n"
+            b"namespace['os'] = Safe\nnamespace['os'].system('safe')\n"
+        )
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+
+    def test_scan_tar_ignores_class_body_module_namespace_overwrite(self, tmp_path: Path) -> None:
+        """A class-body globals write is an executed module namespace overwrite."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = (
+            b"import os\nclass Safe:\n    system = print\nclass Replace:\n"
+            b"    globals()['os'] = Safe\nos.system('safe')\n"
+        )
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+
+    def test_scan_tar_ignores_definite_safe_module_namespace_overwrite(self, tmp_path: Path) -> None:
+        """A definitely executed safe mapping overwrite should suppress a stale alias."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = (
+            b"import os\nrunner = os.system\nif True:\n    globals()['runner'] = print\nglobals()['runner']('safe')\n"
+        )
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            b"import os\nos.__dict__['_safe'] = print\nos.__dict__.get('_safe', os.system)('safe')\n",
+            b"import os\nos.__dict__['_safe'] = print\nos.__dict__.pop('_safe', os.system)('safe')\n",
+            b"import os\nos.__dict__['_safe'] = print\nos.__dict__.setdefault('_safe', os.system)('safe')\n",
+            b"import os\nrunner = print\nglobals().setdefault('runner', os.system)\nrunner('safe')\n",
+            b"import os\nglobals()['runner'] = os.system\nglobals().pop('runner')\nrunner('safe')\n",
+            b"import os\nos.__dict__['runner'] = os.system\nos.__dict__.pop('runner')\nos.runner('safe')\n",
+            b"[locals()['__builtins__']['eval']('safe') for _ in (1,)]\n",
+        ],
+    )
+    def test_scan_tar_ignores_benign_namespace_defaults_and_comprehension_locals(
+        self, tmp_path: Path, payload: bytes
+    ) -> None:
+        """Definite safe namespace values and nested comprehension locals should stay clean."""
+        archive_path = tmp_path / "model_bundle.tar"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+
+    def test_scan_tar_flags_implicit_builtins_mapping_dangerous_python_member(self, tmp_path: Path) -> None:
+        """Implicit builtins mapping lookup must not hide a risky call."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"__builtins__['ev' + 'al']('1 + 1')\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].rule_code == "S104"
+        assert python_checks[0].details["reason"] == "high-risk calls: builtins.eval"
+
     def test_scan_tar_flags_rebound_dangerous_python_member(self, tmp_path: Path) -> None:
         """Callable rebindings should not bypass generic TAR Python member scanning."""
         archive_path = tmp_path / "model_bundle.tar"

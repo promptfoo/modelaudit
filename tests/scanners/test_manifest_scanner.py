@@ -325,6 +325,153 @@ def test_manifest_parser_read_failure_bypasses_stale_clean_cache(
         reset_cache_manager()
 
 
+def test_manifest_cloud_storage_read_failure_is_inconclusive_after_parse_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_file = tmp_path / "config.json"
+    test_file.write_text(
+        json.dumps({"model_type": "bert", "weights": "https://bucket.s3.amazonaws.com/malware/model.bin"}),
+        encoding="utf-8",
+    )
+    original_read = ManifestScanner._read_manifest_text
+    read_counts: dict[int, int] = {}
+
+    def fail_cloud_url_read_once(self: ManifestScanner, path: str) -> str:
+        scanner_id = id(self)
+        read_counts[scanner_id] = read_counts.get(scanner_id, 0) + 1
+        if read_counts[scanner_id] == 1:
+            raise OSError("simulated cloud storage URL read failure")
+        return original_read(self, path)
+
+    monkeypatch.setattr(ManifestScanner, "_read_manifest_text", fail_cloud_url_read_once)
+
+    result = ManifestScanner().scan(str(test_file))
+    aggregate = scan_model_directory_or_file(str(test_file), cache_enabled=False)
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "manifest_cloud_storage_read_failed"
+    assert any(
+        check.name == "Cloud Storage URL Detection"
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("scan_outcome_reason") == "manifest_cloud_storage_read_failed"
+        for check in result.checks
+    )
+    assert (
+        aggregate.file_metadata[str(test_file)].get("operational_error_reason") == "manifest_cloud_storage_read_failed"
+    )
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_manifest_cloud_storage_read_failure_remains_unsuccessful_with_recovered_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_file = tmp_path / "config.json"
+    test_file.write_text(
+        json.dumps(
+            {
+                "model_type": "bert",
+                "weights": "https://bucket.s3.amazonaws.com/releases/model.bin",
+                "checksum": "0" * 40,
+            }
+        ),
+        encoding="utf-8",
+    )
+    original_read = ManifestScanner._read_manifest_text
+    read_counts: dict[int, int] = {}
+
+    def fail_cloud_url_read_once(self: ManifestScanner, path: str) -> str:
+        scanner_id = id(self)
+        read_counts[scanner_id] = read_counts.get(scanner_id, 0) + 1
+        if read_counts[scanner_id] == 1:
+            raise OSError("simulated cloud storage URL read failure")
+        return original_read(self, path)
+
+    monkeypatch.setattr(ManifestScanner, "_read_manifest_text", fail_cloud_url_read_once)
+
+    result = ManifestScanner().scan(str(test_file))
+    aggregate = scan_model_directory_or_file(str(test_file), cache_enabled=False)
+
+    assert result.success is False
+    assert result.metadata.get("operational_error_reason") == "manifest_cloud_storage_read_failed"
+    assert any(
+        check.name == "Weak Hash Detection" and check.severity == IssueSeverity.WARNING for check in result.checks
+    )
+    assert any(issue.severity == IssueSeverity.WARNING for issue in aggregate.issues)
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_manifest_cloud_storage_read_failure_bypasses_stale_clean_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_file = tmp_path / "config.json"
+    test_file.write_text(
+        json.dumps(
+            {
+                "model_type": "bert",
+                "weights": "https://bucket.s3.amazonaws.com/releases/model.bin",
+                "padding": "x" * 11_000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        with monkeypatch.context() as warm_cache:
+            warm_cache.setattr(
+                cache_decorator,
+                "should_bypass_cache_for_read_failure_aware_file",
+                lambda _path: False,
+            )
+            warm_result = scan_file(
+                str(test_file),
+                config={
+                    "cache_enabled": True,
+                    "cache_dir": str(cache_dir),
+                    "min_cache_file_size": 0,
+                },
+            )
+
+        assert warm_result.success is True
+        cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        assert cached_entries > 0
+
+        original_read = ManifestScanner._read_manifest_text
+        read_counts: dict[int, int] = {}
+
+        def fail_cloud_url_read_once(self: ManifestScanner, path: str) -> str:
+            scanner_id = id(self)
+            read_counts[scanner_id] = read_counts.get(scanner_id, 0) + 1
+            if read_counts[scanner_id] == 1:
+                raise OSError("simulated cloud storage URL read failure after cache warm")
+            return original_read(self, path)
+
+        monkeypatch.setattr(ManifestScanner, "_read_manifest_text", fail_cloud_url_read_once)
+
+        aggregate = scan_model_directory_or_file(
+            str(test_file),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        assert determine_exit_code(aggregate) == 2
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+        assert aggregate.file_metadata[str(test_file)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert (
+            aggregate.file_metadata[str(test_file)].get("operational_error_reason")
+            == "manifest_cloud_storage_read_failed"
+        )
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
+    finally:
+        reset_cache_manager()
+
+
 def test_manifest_scanner_case_insensitive_blacklist(tmp_path):
     """Test that blacklist matching is case-insensitive."""
     test_file = tmp_path / "inference_config.json"

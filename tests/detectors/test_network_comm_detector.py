@@ -1,11 +1,13 @@
 """Tests for network communication detection."""
 
+import json
 import os
 from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
 
+from modelaudit.detectors import network_comm
 from modelaudit.detectors.network_comm import NetworkCommDetector, detect_network_communication
 
 
@@ -88,6 +90,633 @@ class TestNetworkCommDetector:
         assert "SECRET_CREDENTIAL" not in serialized
         assert "SECRET_SIGNATURE" not in serialized
         assert cloud_finding["provider"] == "s3"
+
+    def test_slack_webhook_path_tokens_are_redacted(self) -> None:
+        """Slack webhook capability tokens should not survive URL findings."""
+        detector = NetworkCommDetector()
+        webhook_token = "SECRETWEBHOOKTOKEN123456"
+        data = f"https://hooks.slack.com/services/T00000000/B00000000/{webhook_token}".encode()
+
+        findings = detector.scan(data, "model.pkl")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://hooks.slack.com/services/<redacted>/<redacted>/<redacted>"
+        assert webhook_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_cloud_storage_path_capability_tokens_are_redacted(self) -> None:
+        """Signed object URLs can carry capability tokens in path segments."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+        data = (
+            f"https://storage.googleapis.com/model-bucket/{path_token}/weights.bin?X-Goog-Signature=QUERYSECRET"
+        ).encode()
+
+        findings = detector.scan(data, "model.bin")
+        url_findings = [finding for finding in findings if finding["type"] in {"url_detected", "cloud_storage_url"}]
+
+        assert url_findings
+        serialized = json.dumps(url_findings, sort_keys=True)
+        assert path_token not in serialized
+        assert "QUERYSECRET" not in serialized
+        assert "storage.googleapis.com/model-bucket/<redacted>/weights.bin" in serialized
+
+    def test_trailing_path_delimiters_do_not_prevent_token_redaction(self) -> None:
+        """Punctuation included by URL matching should not keep path tokens raw."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+        data = f"https://example.com/path/{path_token},".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/path/<redacted>,"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_quoted_path_delimiters_do_not_prevent_token_redaction(self) -> None:
+        """Single-quoted source strings should not keep path tokens raw."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+        data = f"url='https://example.com/path/{path_token}'".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/path/<redacted>'"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_base64_path_capability_tokens_are_redacted(self) -> None:
+        """Base64/base64url path tokens may contain encoded separators or padding."""
+        detector = NetworkCommDetector()
+        encoded_token = "AbCdEfGhIjKlMnOpQrStUvWxYz1234567890%2B%2F%3D"
+
+        findings = detector.scan(f"https://example.com/download/{encoded_token}".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>"
+        assert encoded_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_base64url_path_capability_tokens_with_hyphen_are_redacted(self) -> None:
+        """Base64url path tokens can contain hyphens as data."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz123456-_"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_long_base64_path_capability_tokens_use_entropy_not_unique_ratio(self) -> None:
+        """Long signed-CDN style path tokens should still be redacted."""
+        detector = NetworkCommDetector()
+        path_token = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_=" * 3
+
+        findings = detector.scan(f"https://example.com/download/{path_token}".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_known_path_tokens_with_filename_suffix_are_redacted(self) -> None:
+        """Known token formats must win over filename preservation."""
+        detector = NetworkCommDetector()
+        github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        segment = f"{github_token}.json"
+
+        findings = detector.scan(f"https://example.com/path/{segment}".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/path/<redacted>.json"
+        assert github_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_dotted_opaque_path_capability_tokens_are_redacted(self) -> None:
+        """Unknown dotted opaque tokens should not hide behind broad filename parsing."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWx.Yz1234567890abcdefGhij.Klmn"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_path_parameter_tokens_are_redacted(self) -> None:
+        """Matrix-style path parameters can carry capability tokens."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/download;token={path_token}/model.bin".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download;token=<redacted>/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_encoded_path_parameter_tokens_are_redacted(self) -> None:
+        """Encoded matrix delimiters should still expose path parameter tokens."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/download%3Btoken={path_token}/model.bin".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download;token=<redacted>/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_path_parameter_key_tokens_are_redacted(self) -> None:
+        """Matrix parameter names can carry capability tokens too."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/download;{path_token}=1/model.bin".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download;<redacted>=1/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_path_segment_tokens_before_matrix_parameters_are_redacted(self) -> None:
+        """A token segment followed by benign matrix params should still be redacted."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/path/{path_token};v=1/model.bin".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/path/<redacted>;v=1/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    @pytest.mark.parametrize("separator", ["&", "&amp;"])
+    def test_ampersand_delimited_path_tokens_are_redacted(self, separator: str) -> None:
+        """Ampersand-style path suffixes should not hide capability token prefixes."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/path/{path_token}{separator}download=1".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://example.com/path/<redacted>{separator}download=1"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    @pytest.mark.parametrize("separator", ["&", "&amp;"])
+    def test_ampersand_suffix_path_tokens_are_redacted(self, separator: str) -> None:
+        """Ampersand-delimited suffix tokens should not survive after benign prefixes."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/path/download=1{separator}{path_token}/model.bin".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://example.com/path/download=1{separator}<redacted>/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    @pytest.mark.parametrize("separator", ["&", "&amp;"])
+    def test_ampersand_key_value_suffix_path_tokens_are_redacted(self, separator: str) -> None:
+        """Ampersand-delimited key/value suffix tokens should be redacted too."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/path/download=1{separator}token={path_token}/model.bin".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://example.com/path/download=1{separator}token=<redacted>/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    @pytest.mark.parametrize(
+        ("encoded_suffix", "expected_suffix"),
+        [("%3Fdownload=1", "?download=1"), ("%20download", " download")],
+    )
+    def test_encoded_delimited_path_tokens_are_redacted(self, encoded_suffix: str, expected_suffix: str) -> None:
+        """Encoded URL delimiters should not hide capability token prefixes."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/path/{path_token}{encoded_suffix}".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://example.com/path/<redacted>{expected_suffix}"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_public_revision_hash_paths_are_preserved(self) -> None:
+        """Public model revision hashes should remain useful for audit follow-up."""
+        detector = NetworkCommDetector()
+        revision = "0123456789abcdef0123456789abcdef01234567"
+        data = f"https://huggingface.co/org/repo/resolve/{revision}/model.safetensors".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert revision in url_finding["url"]
+        assert url_finding["url"].endswith(f"/{revision}/model.safetensors")
+
+    def test_public_revision_names_are_preserved(self) -> None:
+        """Public model branch and tag names should remain useful for audit follow-up."""
+        detector = NetworkCommDetector()
+        revision = "ReleaseCandidate2025-05-abcdef"
+        data = f"https://huggingface.co/org/repo/resolve/{revision}/model.safetensors".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://huggingface.co/org/repo/resolve/{revision}/model.safetensors"
+
+    def test_known_credentials_in_public_revision_position_are_redacted(self) -> None:
+        """Known secret formats should not be preserved as public model revision names."""
+        detector = NetworkCommDetector()
+        revision = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        data = f"https://huggingface.co/org/repo/resolve/{revision}/model.safetensors".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://huggingface.co/org/repo/resolve/<redacted>/model.safetensors"
+        assert revision not in json.dumps(url_finding, sort_keys=True)
+
+    def test_public_model_repository_ids_are_preserved(self) -> None:
+        """Known public model hosts should keep repo IDs for audit follow-up."""
+        detector = NetworkCommDetector()
+        repo_id = "Llama-3.1-70B-Instruct"
+        data = f"https://huggingface.co/meta-llama/{repo_id}/resolve/main/model.safetensors".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://huggingface.co/meta-llama/{repo_id}/resolve/main/model.safetensors"
+
+    def test_huggingface_repository_home_ids_are_preserved(self) -> None:
+        """Public Hugging Face repository home URLs should keep exact repo identity."""
+        detector = NetworkCommDetector()
+        repo_id = "Llama-3.1-70B-Instruct"
+        data = f"https://huggingface.co/meta-llama/{repo_id}".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://huggingface.co/meta-llama/{repo_id}"
+
+    def test_single_segment_huggingface_model_ids_are_preserved(self) -> None:
+        """Single-component public Hugging Face model URLs should stay useful."""
+        detector = NetworkCommDetector()
+        repo_id = "Llama-3.1-70B-Instruct"
+        data = f"https://huggingface.co/{repo_id}".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://huggingface.co/{repo_id}"
+
+    def test_huggingface_api_repository_ids_are_preserved(self) -> None:
+        """Hugging Face API paths should keep public repo IDs for audit follow-up."""
+        detector = NetworkCommDetector()
+        repo_id = "Llama-3.1-70B-Instruct"
+        data = f"https://huggingface.co/api/models/meta-llama/{repo_id}".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://huggingface.co/api/models/meta-llama/{repo_id}"
+
+    @pytest.mark.parametrize("route", ["datasets", "spaces"])
+    def test_huggingface_prefixed_repository_ids_are_preserved(self, route: str) -> None:
+        """Prefixed Hugging Face repository routes should keep public repo IDs."""
+        detector = NetworkCommDetector()
+        repo_id = "Llama-3.1-70B-Instruct"
+        data = f"https://huggingface.co/{route}/meta-llama/{repo_id}/resolve/main/data.json".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://huggingface.co/{route}/meta-llama/{repo_id}/resolve/main/data.json"
+
+    def test_public_github_repository_names_are_preserved(self) -> None:
+        """Public source repository identities should remain visible while refs can still be redacted."""
+        detector = NetworkCommDetector()
+        repo_id = "MyModel-2025-LongName-abcdef"
+        url = f"https://raw.githubusercontent.com/org/{repo_id}/main/model.py"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == url
+
+    def test_public_github_ref_names_are_preserved(self) -> None:
+        """Public GitHub source refs should remain visible for audit follow-up."""
+        detector = NetworkCommDetector()
+        ref = "ReleaseCandidate2025-05-abcdef"
+        url = f"https://raw.githubusercontent.com/org/repo/{ref}/model.py"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == url
+
+    def test_public_github_release_repository_names_are_preserved(self) -> None:
+        """Public GitHub release repository identities should remain visible for audit follow-up."""
+        detector = NetworkCommDetector()
+        repo_id = "MyModel-2025-LongName-abcdef"
+        url = f"https://github.com/org/{repo_id}/releases/download/v1/model.bin"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == url
+
+    def test_non_public_hex_path_capability_tokens_are_redacted(self) -> None:
+        """Opaque lowercase hex download IDs should be redacted outside public model revisions."""
+        detector = NetworkCommDetector()
+        path_token = "0123456789abcdef0123456789abcdef"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_two_class_high_entropy_path_tokens_are_redacted(self) -> None:
+        """Base32/base36-style bearer tokens may only use lowercase letters and digits."""
+        detector = NetworkCommDetector()
+        path_token = "0123456789abcdefghjkmnpqrstvwxyz"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}/model.bin".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_dotted_path_tokens_do_not_leak_as_domain_findings(self) -> None:
+        """Domain-like path tokens should not leak through the later domain detector."""
+        detector = NetworkCommDetector()
+        path_token = "0123456789abcdefghjkmnpqrstvwxyz.com"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}/model.bin".encode(), "metadata.txt")
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert "https://example.com/download/<redacted>/model.bin" in serialized
+        assert path_token not in serialized
+
+    def test_backtick_wrapped_dotted_path_tokens_do_not_leak_as_domain_findings(self) -> None:
+        """Markdown code delimiters should not hide the URL around a dotted path token."""
+        detector = NetworkCommDetector()
+        path_token = "0123456789abcdefghjkmnpqrstvwxyz.com"
+
+        findings = detector.scan(f"`https://example.com/download/{path_token}/model.bin`".encode(), "metadata.txt")
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert "https://example.com/download/<redacted>/model.bin" in serialized
+        assert path_token not in serialized
+
+    def test_parenthesized_dotted_path_tokens_do_not_leak_as_domain_findings(self) -> None:
+        """Parenthesized call URLs should still suppress redacted path-token domain hits."""
+        detector = NetworkCommDetector()
+        path_token = "0123456789abcdefghjkmnpqrstvwxyz.com"
+
+        findings = detector.scan(
+            f"requests.get(https://example.com/download/{path_token}/model.bin)".encode(), "metadata.txt"
+        )
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert "https://example.com/download/<redacted>/model.bin" in serialized
+        assert path_token not in serialized
+
+    def test_markdown_link_dotted_path_tokens_do_not_leak_as_domain_findings(self) -> None:
+        """Markdown-link parentheses should bound URL domain suppression."""
+        detector = NetworkCommDetector()
+        path_token = "0123456789abcdefghjkmnpqrstvwxyz.com"
+
+        findings = detector.scan(
+            f"[model](https://example.com/download/{path_token}/model.bin)".encode(), "metadata.txt"
+        )
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert "https://example.com/download/<redacted>/model.bin" in serialized
+        assert path_token not in serialized
+
+    def test_domain_suppression_url_lookup_is_bounded(self) -> None:
+        """Domain suppression should not scan unbounded whitespace-free buffers."""
+        path_token = "0123456789abcdefghjkmnpqrstvwxyz.com"
+        data = (
+            b"https://example.com/"
+            + b"a" * (network_comm._MAX_URL_TEXT_LOOKUP_BYTES + 1)
+            + f"/{path_token}/model.bin".encode()
+        )
+
+        assert network_comm._url_text_containing_offset(data, data.index(path_token.encode())) is None
+
+    def test_encoded_path_separator_tokens_are_redacted(self) -> None:
+        """Encoded separators should not make a token and following artifact look benign."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}%2Fweights.bin".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>%2Fweights.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    @pytest.mark.parametrize("separator", [":", "%3A"])
+    def test_colon_delimited_path_tokens_are_redacted(self, separator: str) -> None:
+        """Colon-delimited keyed capabilities should have the token component removed."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(
+            f"https://example.com/download/token{separator}{path_token}/model.bin".encode(),
+            "metadata.txt",
+        )
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/token:<redacted>/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_high_entropy_artifact_filename_stems_are_redacted(self) -> None:
+        """Opaque bearer tokens carried as known artifact filenames should not bypass redaction."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}.bin".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_urlsafe_artifact_filename_stems_are_redacted(self) -> None:
+        """URL-safe base64 token stems may include hyphen and underscore before artifact suffixes."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz123456-_"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}.bin".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_lowercase_urlsafe_artifact_filename_stems_are_redacted(self) -> None:
+        """Lowercase URL-safe token stems with separators should still be entropy-checked."""
+        detector = NetworkCommDetector()
+        path_token = "abcdefghjkmnpqrstvwxyz0123456789-_"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}.bin".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://storage.googleapis.com/model-bucket-1234567890abcdef/weights.bin",
+            "https://account.blob.core.windows.net/model-container-1234567890abcdef/weights.bin",
+        ],
+    )
+    def test_path_style_cloud_bucket_names_are_preserved(self, url: str) -> None:
+        """Path-style cloud bucket/container names should remain actionable."""
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        url_findings = [finding for finding in findings if finding["type"] in {"url_detected", "cloud_storage_url"}]
+
+        assert url_findings
+        serialized = json.dumps(url_findings, sort_keys=True)
+        assert url in serialized
+        assert "<redacted>" not in serialized
+
+    def test_path_style_cloud_bucket_parameters_are_redacted(self) -> None:
+        """Bucket identity should stay visible while bucket path-parameter tokens are redacted."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+        url = f"https://storage.googleapis.com/model-bucket;token={path_token}/weights.bin"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        url_findings = [finding for finding in findings if finding["type"] in {"url_detected", "cloud_storage_url"}]
+
+        assert url_findings
+        serialized = json.dumps(url_findings, sort_keys=True)
+        assert "model-bucket;token=<redacted>" in serialized
+        assert path_token not in serialized
+
+    @pytest.mark.parametrize(
+        ("url", "expected_url"),
+        [
+            (
+                "wasbs://container@account.blob.core.windows.net/AbCdEfGhIjKlMnOpQrStUvWxYz012345/weights.bin",
+                "wasbs://container@account.blob.core.windows.net/<redacted>/weights.bin",
+            ),
+            (
+                "abfss://container@account.dfs.core.windows.net/AbCdEfGhIjKlMnOpQrStUvWxYz012345/weights.bin",
+                "abfss://container@account.dfs.core.windows.net/<redacted>/weights.bin",
+            ),
+        ],
+    )
+    def test_wasb_and_abfs_object_path_tokens_are_redacted(self, url: str, expected_url: str) -> None:
+        """WASB/ABFS containers live in the authority, so the first path segment is still object data."""
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        cloud_finding = next(finding for finding in findings if finding["type"] == "cloud_storage_url")
+
+        assert cloud_finding["url"] == expected_url
+        assert "AbCdEfGhIjKlMnOpQrStUvWxYz012345" not in json.dumps(cloud_finding, sort_keys=True)
+
+    def test_encoded_wasb_userinfo_credentials_are_stripped(self) -> None:
+        """Encoded credential userinfo must not be mistaken for an Azure container name."""
+        detector = NetworkCommDetector()
+        url = "wasbs://user%3ASECRET@account.blob.core.windows.net/model.bin"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        cloud_finding = next(finding for finding in findings if finding["type"] == "cloud_storage_url")
+
+        assert cloud_finding["url"] == "wasbs://account.blob.core.windows.net/model.bin"
+        assert "user%3ASECRET" not in json.dumps(cloud_finding, sort_keys=True)
+
+    def test_gcs_api_bucket_names_are_preserved(self) -> None:
+        """GCS JSON/download API bucket segments live after /b/ rather than at path index 1."""
+        detector = NetworkCommDetector()
+        url = "https://storage.googleapis.com/download/storage/v1/b/model-bucket-1234567890abcdef/o/weights.bin"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        url_findings = [finding for finding in findings if finding["type"] in {"url_detected", "cloud_storage_url"}]
+
+        assert url_findings
+        serialized = json.dumps(url_findings, sort_keys=True)
+        assert "model-bucket-1234567890abcdef" in serialized
+        assert "<redacted>" not in serialized
+
+    def test_gcs_object_key_tokens_after_b_directory_are_redacted(self) -> None:
+        """Only GCS API /b/{bucket}/ routes should preserve the segment after b."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+        url = f"https://storage.googleapis.com/model-bucket/b/{path_token}/weights.bin"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        cloud_finding = next(finding for finding in findings if finding["type"] == "cloud_storage_url")
+
+        assert cloud_finding["url"] == "https://storage.googleapis.com/model-bucket/b/<redacted>/weights.bin"
+        assert path_token not in json.dumps(cloud_finding, sort_keys=True)
+
+    def test_long_artifact_filenames_are_preserved(self) -> None:
+        """Ordinary model artifact filenames should not be treated as capability tokens."""
+        detector = NetworkCommDetector()
+        filename = "pytorch_model-00001-of-00002.bin"
+        data = f"https://huggingface.co/org/repo/resolve/main/{filename}".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert filename in url_finding["url"]
+
+    def test_safetensors_artifact_filenames_are_preserved(self) -> None:
+        """SafeTensors shard names should stay visible for audit and SBOM follow-up."""
+        detector = NetworkCommDetector()
+        filename = "pytorch_model-00001-of-00002.safetensors"
+        data = f"https://huggingface.co/org/repo/resolve/main/{filename}".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://huggingface.co/org/repo/resolve/main/{filename}"
+
+    def test_github_path_tokens_are_redacted(self) -> None:
+        """Known token formats embedded in URL paths should be removed."""
+        detector = NetworkCommDetector()
+        github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        data = f"https://raw.githubusercontent.com/org/repo/{github_token}/model.py".encode()
+
+        findings = detector.scan(data, "model.pkl")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://raw.githubusercontent.com/org/repo/<redacted>/model.py"
+        assert github_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_benign_short_url_paths_are_preserved(self) -> None:
+        """Ordinary URL paths should remain readable after redaction."""
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(b"https://example.com/models/v1/model.bin", "model.pkl")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/models/v1/model.bin"
 
     def test_detect_ipv4_addresses(self) -> None:
         """Test detection of IPv4 addresses."""
@@ -239,6 +868,83 @@ class TestNetworkCommDetector:
         assert "socket.connect" in funcs
         assert "requests.post" in funcs
         assert "urlopen" in funcs
+
+    def test_network_function_snippets_redact_url_path_tokens(self) -> None:
+        """URL-bearing snippets should not leak capability tokens after URL findings are redacted."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+        data = f'requests.get("https://example.com/path/{path_token}/model.bin")'.encode()
+
+        findings = detector.scan(data, "hook.py")
+        network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/path/<redacted>/model.bin"
+        assert path_token not in json.dumps([network_finding, url_finding], sort_keys=True)
+
+    def test_network_function_snippets_expand_forward_urls_before_redaction(self) -> None:
+        """Long URL tails after the function token should be included before URL redaction."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+        long_prefix = "a" * 90
+        data = f'requests.get("https://example.com/{long_prefix}/{path_token}/model.bin")'.encode()
+
+        findings = detector.scan(data, "hook.py")
+        network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"].endswith(f"/{long_prefix}/<redacted>/model.bin")
+        assert path_token not in json.dumps([network_finding, url_finding], sort_keys=True)
+
+    def test_network_function_snippet_expansion_is_bounded_without_nearby_url_scheme(self) -> None:
+        """Incidental matches in long binary blobs should not expand snippets across megabytes."""
+        detector = NetworkCommDetector()
+        data = b"https://example.com/" + (b"a" * 6000) + b"requests.get("
+
+        findings = detector.scan(data, "hook.py")
+        network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+        snippet = network_finding["snippet"]
+
+        assert len(snippet) <= 200
+        assert "https://example.com" not in snippet
+
+    def test_single_quoted_call_tail_does_not_prevent_path_token_redaction(self) -> None:
+        """Call syntax after a URL should not stay attached to the secret token."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+        data = f"requests.get('https://example.com/path/{path_token}',verify=True)".encode()
+
+        findings = detector.scan(data, "hook.py")
+        network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/path/<redacted>',verify=True)"
+        assert path_token not in json.dumps([network_finding, url_finding], sort_keys=True)
+
+    def test_cc_pattern_snippets_redact_partial_url_path_tokens(self) -> None:
+        """C&C snippets should expand to the URL start before redacting path tokens."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+        data = f"https://example.com/download/{path_token}/malware.bin".encode()
+
+        findings = detector.scan(data, "hook.py")
+        cc_finding = next(finding for finding in findings if finding["type"] == "cc_pattern")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>/malware.bin"
+        assert path_token not in json.dumps([cc_finding, url_finding], sort_keys=True)
+
+    def test_cc_pattern_snippet_url_expansion_is_bounded(self) -> None:
+        """Long whitespace-free binary regions should not force unbounded URL scans."""
+        detector = NetworkCommDetector()
+        long_prefix = "a" * 6000
+        data = f"https://example.com/{long_prefix}/malware.bin".encode()
+
+        findings = detector.scan(data, "hook.py")
+        cc_finding = next(finding for finding in findings if finding["type"] == "cc_pattern")
+
+        assert cc_finding["pattern"] == "malware"
+        assert len(cc_finding["snippet"]) < 200
 
     def test_network_functions_not_flagged_in_documentation_metadata_context(self) -> None:
         """Documentation prose should not report raw network library/function token mentions."""
