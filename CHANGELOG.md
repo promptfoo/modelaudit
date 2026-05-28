@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - route protocol-0 JAX checkpoint pickles through pickle opcode security checks
+- preflight and stream-enforce cumulative SevenZip extraction budgets before writing oversized archives
+- mark oversized structured JSON/YAML Jinja template fields as incomplete coverage instead of clean
+- redact capability tokens embedded in network URL path segments
+- redact secret-shaped dictionary keys from embedded-secret detector finding contexts
+- redact compound credential names and malformed userinfo URLs in scanner evidence
+- restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- inspect every parsed GGUF chat template when duplicate or trailing malformed metadata could otherwise hide SSTI payloads
+- redact secret-shaped dictionary keys from embedded-secret detector finding contexts
+- redact compound credential names and malformed userinfo URLs in scanner evidence
+- restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- redact compound credential names and malformed userinfo URLs in scanner evidence
+- restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
+- treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
+- detect external references in weights-only Keras HDF5 layouts without Keras metadata
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - classify unavailable metadata document reads and timed-out metadata scans as operationally incomplete rather than security findings
 - route renamed structured JAX/Orbax JSON checkpoints, conservatively report observable bounded-prefix threats, and fail closed for oversized identified metadata
@@ -32,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - classify unavailable manifest and ML text reads as inconclusive rather than security findings, including routing, preflight, and stale cache transitions
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
+- skip non-numeric weight metadata and report incomplete weight-distribution analysis accurately
 - report incomplete R serialized coverage without treating extraction ceilings alone as suspicious payloads, and preserve detection across printable-chunk boundaries
 - classify unavailable Paddle, NumPy, PyTorch binary, and SavedModel reads as inconclusive rather than security findings
 - classify unavailable CoreML, SafeTensors, and TensorRT reads as inconclusive rather than security findings
