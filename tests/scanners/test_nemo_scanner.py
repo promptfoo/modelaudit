@@ -1478,9 +1478,17 @@ class TestCVE202523304HydraTarget:
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
         assert cve_checks[0].details["cve_id"] == "CVE-2025-23304"
 
-    def test_explicit_safe_torch_utils_data_target_remains_safe(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "torch.utils.data.DataLoader",
+            "torch.utils.data.dataloader.DataLoader",
+            "torch.utils.data.sampler.RandomSampler",
+        ],
+    )
+    def test_explicit_safe_torch_utils_data_target_remains_safe(self, tmp_path: Path, target: str) -> None:
         """Legitimate torch.utils data helpers stay clean without trusting all torch.utils targets."""
-        config = {"loader": {"_target_": "torch.utils.data.DataLoader", "batch_size": 4}}
+        config = {"loader": {"_target_": target, "batch_size": 4}}
         path = _create_nemo_file(tmp_path, config)
 
         result = NemoScanner().scan(str(path))
@@ -1488,13 +1496,12 @@ class TestCVE202523304HydraTarget:
         assert not [
             check
             for check in result.checks
-            if check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.details.get("target") == "torch.utils.data.DataLoader"
+            if check.name == "CVE-2025-23304: Dangerous Hydra _target_" and check.details.get("target") == target
         ]
         assert any(
             check.name == "Hydra _target_ Safety Check"
             and check.status == CheckStatus.PASSED
-            and check.details.get("target") == "torch.utils.data.DataLoader"
+            and check.details.get("target") == target
             for check in result.checks
         )
 

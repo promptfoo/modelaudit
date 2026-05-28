@@ -72,6 +72,14 @@ _SAFE_TARGETS = {
     "torch.utils.data.TensorDataset",
     "torch.utils.data.WeightedRandomSampler",
     "torch.utils.data.distributed.DistributedSampler",
+    "torch.utils.data.dataloader.DataLoader",
+    "torch.utils.data.dataset.ConcatDataset",
+    "torch.utils.data.dataset.Subset",
+    "torch.utils.data.dataset.TensorDataset",
+    "torch.utils.data.sampler.BatchSampler",
+    "torch.utils.data.sampler.RandomSampler",
+    "torch.utils.data.sampler.SequentialSampler",
+    "torch.utils.data.sampler.WeightedRandomSampler",
 }
 
 # Dangerous _target_ values that indicate exploitation
