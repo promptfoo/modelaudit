@@ -38,7 +38,6 @@ from ..utils.file.detection import (
     detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
     has_inconclusive_renamed_flax_msgpack_routing,
-    is_confirmed_jax_json_checkpoint_file,
     is_executorch_archive,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
@@ -474,7 +473,7 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
                 context="inconclusive MXNet params byte analysis",
             )
 
-    if is_confirmed_jax_json_checkpoint_file(path):
+    if JaxCheckpointScanner.can_handle(path):
         if scanner_selection.allows("jax_checkpoint"):
             merge_owner_result(JaxCheckpointScanner(config=config).scan(path))
         elif scanner_selection.active:

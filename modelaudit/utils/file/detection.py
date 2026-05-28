@@ -2417,7 +2417,7 @@ def _could_start_json_object(prefix: bytes) -> bool:
     return normalized_prefix.startswith(b"{")
 
 
-def _has_jax_json_checkpoint_structure(payload: object) -> bool:
+def has_jax_json_checkpoint_structure(payload: object) -> bool:
     """Return whether parsed metadata explicitly identifies a JAX-family checkpoint."""
     if not isinstance(payload, dict):
         return False
@@ -2457,17 +2457,12 @@ def _probe_jax_json_checkpoint_file(file_path: Path) -> bool | None:
         if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
             return None
         return False
-    return _has_jax_json_checkpoint_structure(payload)
+    return has_jax_json_checkpoint_structure(payload)
 
 
 def is_jax_json_checkpoint_file(path: str | Path) -> bool:
     """Preserve confirmed and bounded-inconclusive JAX JSON candidates for scanning."""
     return _probe_jax_json_checkpoint_file(Path(path)) is not False
-
-
-def is_confirmed_jax_json_checkpoint_file(path: str | Path) -> bool:
-    """Return True only when bounded parsing positively identifies JAX JSON."""
-    return _probe_jax_json_checkpoint_file(Path(path)) is True
 
 
 def _probe_content_routed_jax_json_checkpoint(file_path: Path) -> bool | None:

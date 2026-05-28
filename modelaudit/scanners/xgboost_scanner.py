@@ -30,7 +30,7 @@ import tempfile
 from typing import Any, ClassVar, cast
 
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
-from ..utils.file.detection import is_confirmed_jax_json_checkpoint_file
+from ..utils.file.detection import has_jax_json_checkpoint_structure
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
@@ -658,7 +658,7 @@ class XGBoostScanner(BaseScanner):
             )
 
             self.scan_parsed_json_security(path, model_data, result)
-            self._scan_filename_owned_json_overlap(path, result)
+            self._scan_filename_owned_json_overlap(path, result, model_data)
             self._record_duplicate_mxnet_root_keys(duplicate_mxnet_root_keys, result, path)
             self._record_mxnet_symbol_overlap(
                 model_data,
@@ -728,14 +728,19 @@ class XGBoostScanner(BaseScanner):
         for reason in existing_reasons:
             self._mark_inconclusive_scan_result(result, reason)
 
-    def _scan_filename_owned_json_overlap(self, path: str, result: ScanResult) -> None:
+    def _scan_filename_owned_json_overlap(
+        self,
+        path: str,
+        result: ScanResult,
+        parsed_payload: object | None = None,
+    ) -> None:
         """Preserve additional JSON analyses for XGBoost-shaped content."""
         from .jax_checkpoint_scanner import JaxCheckpointScanner
         from .jinja2_template_scanner import Jinja2TemplateScanner
         from .manifest_scanner import ManifestScanner
 
         scanner_selection = policy_from_config(self.config)
-        if is_confirmed_jax_json_checkpoint_file(path):
+        if parsed_payload is not None and has_jax_json_checkpoint_structure(parsed_payload):
             if scanner_selection.allows("jax_checkpoint"):
                 self._merge_filename_owned_result(result, JaxCheckpointScanner(config=self.config).scan(path))
             elif scanner_selection.active:

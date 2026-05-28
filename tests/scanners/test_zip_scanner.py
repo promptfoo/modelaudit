@@ -1983,6 +1983,33 @@ def test_scan_nested_file_inconclusive_mxnet_route_composes_jax_analysis(
     )
 
 
+def test_scan_nested_file_inconclusive_mxnet_route_composes_suffix_owned_jax_payload_without_root_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "ambiguous-jax.checkpoint"
+    extracted_member.write_text(
+        json.dumps(
+            {
+                "nodes": [{"attrs": "x" * 129, "op": "Custom", "name": "load"}],
+                "arg_nodes": [0],
+                "heads": [[0, 0, 0]],
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_scan_nested_file_inconclusive_mxnet_route_preserves_jax_incomplete_reason(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
