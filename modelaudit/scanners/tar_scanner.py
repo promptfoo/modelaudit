@@ -463,6 +463,7 @@ class TarScanner(BaseScanner):
             passed=False,
             message=f"Error scanning tar file: {exc!s}",
             severity=IssueSeverity.INFO,
+            rule_code="S902",
             location=path,
             details={
                 "exception": str(exc),
@@ -617,6 +618,9 @@ class TarScanner(BaseScanner):
                         if is_tar_extension and tarfile.is_tarfile(tmp_path):
                             nested_config = dict(self.config)
                             nested_config.pop(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY, None)
+                            # Extracted members are deleted below, so temporary paths
+                            # cannot serve as reusable cache keys.
+                            nested_config["cache_enabled"] = False
                             nested_config["_archive_depth"] = depth + 1
                             nested_result = self._scan_nested_archive_entry(tmp_path, nested_config)
                             if member_scan_incomplete(nested_result):
@@ -643,6 +647,9 @@ class TarScanner(BaseScanner):
                             else:
                                 nested_config = dict(self.config)
                                 nested_config.pop(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY, None)
+                                # Extracted members are deleted below, so temporary paths
+                                # cannot serve as reusable cache keys.
+                                nested_config["cache_enabled"] = False
                                 nested_config["_archive_depth"] = depth + 1
                                 file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
                                 self._rewrite_nested_result_context(file_result, tmp_path, path, name)
@@ -667,6 +674,7 @@ class TarScanner(BaseScanner):
                         passed=False,
                         message=f"Unable to fully inspect TAR entry {name}: {exc!s}",
                         severity=IssueSeverity.INFO,
+                        rule_code="S902",
                         location=f"{path}:{name}",
                         details={
                             "entry": name,
@@ -684,6 +692,7 @@ class TarScanner(BaseScanner):
                         passed=False,
                         message=f"Error scanning TAR entry {name}: {exc!s}",
                         severity=IssueSeverity.INFO,
+                        rule_code="S902",
                         location=f"{path}:{name}",
                         details={
                             "entry": name,

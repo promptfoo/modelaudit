@@ -9,6 +9,8 @@ import pytest
 
 from modelaudit import core
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.config import ModelAuditConfig, reset_config, set_config
+from modelaudit.rules import Severity
 from modelaudit.scanners import tar_scanner as tar_scanner_module
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
@@ -57,7 +59,9 @@ def _assert_inconclusive_aggregate_not_reused(
             assert bool(security_findings) is expected_security_findings
             assert core.determine_exit_code(aggregate) == expected_exit_code
 
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["cache_hits"] == 0
+        stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+        assert stats["cache_hits"] == 0
+        assert stats["total_entries"] == 0
     finally:
         reset_cache_manager()
 
@@ -921,6 +925,69 @@ class TestTarScanner:
             tmp_path / "oversized-benign-cache",
             max_entry_size=64,
         )
+
+    def test_oversized_entry_name_cannot_inherit_symlink_severity_override(self, tmp_path: Path) -> None:
+        """Attacker-controlled entry names must not recast incomplete coverage as symlink findings."""
+        archive_path = tmp_path / "oversized_named_symlink.tar"
+        payload = b"ordinary metadata " * 10
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("symlink.txt")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        reset_config()
+        set_config(ModelAuditConfig(severity={"S406": Severity.CRITICAL}))
+        try:
+            direct = TarScanner(config={"max_entry_size": 64}).scan(str(archive_path))
+            entry_checks = [check for check in direct.checks if check.name == "TAR Entry Scan"]
+            assert len(entry_checks) == 1
+            assert entry_checks[0].rule_code == "S902"
+            assert entry_checks[0].severity == IssueSeverity.INFO
+
+            aggregate = core.scan_model_directory_or_file(
+                str(archive_path),
+                cache_enabled=False,
+                max_entry_size=64,
+            )
+            assert core.determine_exit_code(aggregate) == 2
+        finally:
+            reset_config()
+
+    def test_incomplete_tar_does_not_cache_temporary_nested_members(self, tmp_path: Path) -> None:
+        """A later coverage gap must not leave earlier extracted child scans cached."""
+        archive_path = tmp_path / "mixed_nested_cache.tar"
+        malicious_payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
+
+        with tarfile.open(archive_path, "w") as archive:
+            nested = tarfile.TarInfo("payload.pkl")
+            nested.size = len(malicious_payload)
+            archive.addfile(nested, tarfile.io.BytesIO(malicious_payload))  # type: ignore[attr-defined]
+
+            oversized = b"A" * 128
+            info = tarfile.TarInfo("large.bin")
+            info.size = len(oversized)
+            archive.addfile(info, tarfile.io.BytesIO(oversized))  # type: ignore[attr-defined]
+
+        cache_dir = tmp_path / "nested-member-cache"
+        reset_cache_manager()
+        try:
+            for _ in range(2):
+                aggregate = core.scan_model_directory_or_file(
+                    str(archive_path),
+                    cache_enabled=True,
+                    cache_dir=str(cache_dir),
+                    min_cache_file_size=0,
+                    max_entry_size=64,
+                )
+                metadata = aggregate.file_metadata[str(archive_path)]
+                assert "tar_entry_extraction_incomplete" in metadata["scan_outcome_reasons"]
+                assert core.determine_exit_code(aggregate) == 1
+                assert any(issue.location == f"{archive_path}:payload.pkl" for issue in aggregate.issues)
+
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     def test_oversized_hidden_payload_returns_inconclusive_without_detected_finding(self, tmp_path: Path) -> None:
         """A payload hidden above the extraction bound must not be reported as observed."""
