@@ -48,6 +48,8 @@ Renamed RKNN and standalone ExecuTorch routing does not override `.pb` or `.meta
 ## Notes
 
 - Scanner selection is extension- and content-aware; overlapping extensions may be dispatched to different scanners based on file content.
+- TensorFlow SavedModel/MetaGraph content routing recognizes renamed protobufs only after strict structural validation; oversized plausible candidates are retained for fail-closed bounded analysis.
+- SafeTensors content routing validates normal-size headers and retains oversized plausible framing for inconclusive bounded analysis under otherwise unclaimed suffixes.
 - Runtime scanner selection is available with `modelaudit scan --scanners ...` and `--exclude-scanner ...`; use `modelaudit scan --list-scanners` to discover scanner IDs.
 - Compressed wrappers enforce limits via `compressed_max_decompressed_bytes`, `compressed_max_decompression_ratio`, and `compressed_max_depth`.
 - GGUF/GGML header signatures route renamed artifacts through the same static validation as declared extensions.
