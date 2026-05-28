@@ -226,7 +226,8 @@ class JaxCheckpointScanner(BaseScanner):
     _JSON_PREFIX_PATTERN_READ_FAILED_REASON: ClassVar[str] = "jax_json_checkpoint_prefix_pattern_read_failed"
     _METADATA_TRAVERSAL_LIMIT_REASON: ClassVar[str] = "jax_metadata_traversal_depth_limit"
     _PICKLE_SCAN_LIMIT_REASON: ClassVar[str] = "jax_pickle_scan_limit_exceeded"
-    _LEGACY_PICKLE_INITIAL_OPCODES: ClassVar[bytes] = b"()cFGIJKLMNSTUVX]}"
+    _LEGACY_PICKLE_INITIAL_OPCODES: ClassVar[bytes] = b"()cFGIJKLMNPSTUVX]}"
+    _LEGACY_PICKLE_LINE_ARGUMENT_OPCODES: ClassVar[bytes] = b"PSV"
     _LEGACY_PICKLE_PREFIX_PROBE_BYTES: ClassVar[int] = 8192
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
@@ -753,6 +754,7 @@ class JaxCheckpointScanner(BaseScanner):
         return (
             "pickle exhausted before seeing STOP" in message
             or "not enough data" in message
+            or "no newline found" in message
             or ("expected " in message and " bytes " in message and "remain" in message)
         )
 
@@ -766,14 +768,78 @@ class JaxCheckpointScanner(BaseScanner):
             with open(path, "rb") as source:
                 data = source.read(read_limit)
 
+            marker = object()
+            stack: list[object] = []
+            memo_indices: set[int] = set()
+            next_memo_index = 0
             parsed_opcode = False
+
+            def _memo_index(value: Any) -> int | None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+
+            def _apply_probe_stack_effect(opcode_info: Any) -> bool:
+                if opcode_info.name == "MARK":
+                    stack.append(marker)
+                    return True
+
+                stack_before = list(getattr(opcode_info, "stack_before", ()))
+                stack_after = list(getattr(opcode_info, "stack_after", ()))
+
+                if pickletools.markobject in stack_before:
+                    preserved_items_before_mark = stack_before.index(pickletools.markobject)
+                    if marker not in stack:
+                        return False
+                    marker_index = len(stack) - 1 - stack[::-1].index(marker)
+                    if marker_index < preserved_items_before_mark:
+                        return False
+                    del stack[marker_index:]
+                    if len(stack_after) > preserved_items_before_mark:
+                        stack.extend(object() for _ in range(len(stack_after) - preserved_items_before_mark))
+                    elif len(stack_after) < preserved_items_before_mark:
+                        remove_count = preserved_items_before_mark - len(stack_after)
+                        if len(stack) < remove_count:
+                            return False
+                        del stack[-remove_count:]
+                    return True
+
+                if len(stack) < len(stack_before):
+                    return False
+                if stack_before:
+                    del stack[-len(stack_before) :]
+                stack.extend(object() for _ in stack_after)
+                return True
+
             try:
-                for opcode, _, _ in pickletools.genops(data):
+                for opcode, arg, _pos in pickletools.genops(data):
                     parsed_opcode = True
+                    if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
+                        if not stack:
+                            return False
+                        memo_index = _memo_index(arg)
+                        if memo_index is not None:
+                            memo_indices.add(memo_index)
+                            next_memo_index = max(next_memo_index, memo_index + 1)
+                    elif opcode.name == "MEMOIZE":
+                        if not stack:
+                            return False
+                        memo_indices.add(next_memo_index)
+                        next_memo_index += 1
+                    elif opcode.name in {"BINGET", "LONG_BINGET", "GET"}:
+                        memo_index = _memo_index(arg)
+                        if memo_index is None or memo_index not in memo_indices:
+                            return False
+                    if not _apply_probe_stack_effect(opcode):
+                        return False
                     if opcode.name == "STOP":
                         return True
             except ValueError as e:
-                return file_size > len(data) and parsed_opcode and self._is_truncated_pickle_parse_error(e)
+                if "pickle exhausted before seeing STOP" in str(e):
+                    return parsed_opcode
+                if file_size > len(data) and self._is_truncated_pickle_parse_error(e):
+                    return parsed_opcode or header[:1] in self._LEGACY_PICKLE_LINE_ARGUMENT_OPCODES
 
         return False
 
