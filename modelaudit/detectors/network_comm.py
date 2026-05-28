@@ -64,8 +64,9 @@ _KNOWN_ARTIFACT_FILENAME_EXTENSIONS = frozenset(
     }
 )
 _TRAILING_PATH_DELIMITERS = ".,;:)]}'\""
-_URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>"
+_URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>`"
 _MIN_CAPABILITY_TOKEN_ENTROPY = 3.5
+_MIN_URLSAFE_FILENAME_STEM_ENTROPY = 4.0
 _PUBLIC_MODEL_REPOSITORY_HOSTS = frozenset({"huggingface.co", "hf.co"})
 _PUBLIC_MODEL_API_REPOSITORY_TYPES = frozenset({"datasets", "models", "spaces"})
 _PUBLIC_MODEL_REPOSITORY_MARKERS = frozenset({"blob", "resolve", "tree"})
@@ -95,7 +96,7 @@ def _looks_like_high_entropy_filename_stem(stem: str) -> bool:
 
     character_classes = sum(bool(pattern.search(stem)) for pattern in _PATH_TOKEN_CHARACTER_CLASS_PATTERNS[:3])
     if re.search(r"[-_]", stem) and not re.search(r"[A-Z]", stem):
-        return False
+        return character_classes >= 2 and _shannon_entropy_per_char(stem) >= _MIN_URLSAFE_FILENAME_STEM_ENTROPY
 
     return character_classes >= 2 and _shannon_entropy_per_char(stem) >= _MIN_CAPABILITY_TOKEN_ENTROPY
 
@@ -126,6 +127,8 @@ def _looks_like_known_artifact_filename(decoded: str) -> bool:
 def _looks_like_capability_path_token(segment: str) -> bool:
     token_candidate, _trailing_delimiters = _split_trailing_path_delimiters(segment)
     decoded = unquote(token_candidate)
+    if "/" in decoded:
+        return any(_looks_like_capability_path_token(part) for part in decoded.split("/") if part)
     if _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded):
         return True
     if _redact_known_token_filename(segment) is not None:
@@ -142,6 +145,26 @@ def _looks_like_capability_path_token(segment: str) -> bool:
 
     character_classes = sum(bool(pattern.search(decoded)) for pattern in _PATH_TOKEN_CHARACTER_CLASS_PATTERNS)
     return character_classes >= 2 and _shannon_entropy_per_char(decoded) >= _MIN_CAPABILITY_TOKEN_ENTROPY
+
+
+def _redact_encoded_path_separator_tokens(segment: str) -> str | None:
+    token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+    decoded = unquote(token_candidate)
+    if "/" not in decoded:
+        return None
+
+    parts = decoded.split("/")
+    changed = False
+    for index, part in enumerate(parts):
+        if part and _looks_like_capability_path_token(part):
+            parts[index] = _REDACTED_PATH_TOKEN
+            changed = True
+
+    if not changed:
+        return None
+    if any(part and part != _REDACTED_PATH_TOKEN and not _looks_like_known_artifact_filename(part) for part in parts):
+        return f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+    return f"{'%2F'.join(parts)}{trailing_delimiters}"
 
 
 def _is_public_model_repository_segment(hostname: str, segments: list[str], index: int) -> bool:
@@ -256,6 +279,10 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
         parameter_redaction = _redact_path_parameter_tokens(segment)
         if parameter_redaction is not None:
             segments[index] = parameter_redaction
+            continue
+        encoded_separator_redaction = _redact_encoded_path_separator_tokens(segment)
+        if encoded_separator_redaction is not None:
+            segments[index] = encoded_separator_redaction
             continue
 
         if _is_public_model_repository_segment(hostname, segments, index):

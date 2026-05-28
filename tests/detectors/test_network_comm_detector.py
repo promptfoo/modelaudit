@@ -362,6 +362,28 @@ class TestNetworkCommDetector:
         assert "https://example.com/download/<redacted>/model.bin" in serialized
         assert path_token not in serialized
 
+    def test_backtick_wrapped_dotted_path_tokens_do_not_leak_as_domain_findings(self) -> None:
+        """Markdown code delimiters should not hide the URL around a dotted path token."""
+        detector = NetworkCommDetector()
+        path_token = "0123456789abcdefghjkmnpqrstvwxyz.com"
+
+        findings = detector.scan(f"`https://example.com/download/{path_token}/model.bin`".encode(), "metadata.txt")
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert "https://example.com/download/<redacted>/model.bin" in serialized
+        assert path_token not in serialized
+
+    def test_encoded_path_separator_tokens_are_redacted(self) -> None:
+        """Encoded separators should not make a token and following artifact look benign."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}%2Fweights.bin".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>%2Fweights.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
     def test_high_entropy_artifact_filename_stems_are_redacted(self) -> None:
         """Opaque bearer tokens carried as known artifact filenames should not bypass redaction."""
         detector = NetworkCommDetector()
@@ -377,6 +399,17 @@ class TestNetworkCommDetector:
         """URL-safe base64 token stems may include hyphen and underscore before artifact suffixes."""
         detector = NetworkCommDetector()
         path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz123456-_"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}.bin".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_lowercase_urlsafe_artifact_filename_stems_are_redacted(self) -> None:
+        """Lowercase URL-safe token stems with separators should still be entropy-checked."""
+        detector = NetworkCommDetector()
+        path_token = "abcdefghjkmnpqrstvwxyz0123456789-_"
 
         findings = detector.scan(f"https://example.com/download/{path_token}.bin".encode(), "metadata.txt")
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
