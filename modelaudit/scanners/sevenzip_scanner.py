@@ -904,7 +904,6 @@ class SevenZipScanner(BaseScanner):
         projected_cumulative_bytes = budget.cumulative_extract_bytes + known_extract_bytes
         if known_extract_bytes > 0 and projected_cumulative_bytes > self.max_total_extract_size:
             budget.abort_due_to_limit()
-            scan_complete = False
             self._add_cumulative_extraction_size_check(
                 result,
                 archive_path,
