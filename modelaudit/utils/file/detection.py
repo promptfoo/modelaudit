@@ -5,7 +5,7 @@ import re
 import struct
 import tarfile
 import zipfile
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Literal
 
@@ -234,6 +234,9 @@ _FLAX_MSGPACK_STATE_WRAPPER_KEY = "state"
 _FLAX_MSGPACK_SCANNER_SUFFIXES = frozenset({".msgpack", ".flax", ".orbax", ".jax"})
 _FLAX_MSGPACK_OVERLAP_SUFFIXES = frozenset({".ckpt", ".checkpoint", ".orbax-checkpoint"})
 _FLAX_MSGPACK_CONTENT_ROUTE_EXCLUDED_SUFFIXES = frozenset({".py", ".pyw"})
+_FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES = frozenset(
+    {".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml"}
+)
 _FLAX_MSGPACK_DECLARED_SUFFIXES = frozenset(get_registered_scanner_extensions())
 _FLAX_MSGPACK_NATIVE_SUFFIXES = _FLAX_MSGPACK_SCANNER_SUFFIXES
 _FLAX_MSGPACK_PROBE_MAX_NODES = 4096
@@ -945,6 +948,37 @@ PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
         "SHORT_BINUNICODE",
     },
 )
+_BINARY_PICKLE_SECURITY_OPCODES: frozenset[str] = frozenset(
+    {
+        "BINPERSID",
+        "BUILD",
+        "EXT1",
+        "EXT2",
+        "EXT4",
+        "GLOBAL",
+        "INST",
+        "NEWOBJ",
+        "NEWOBJ_EX",
+        "OBJ",
+        "PERSID",
+        "REDUCE",
+        "STACK_GLOBAL",
+    }
+)
+_BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES: frozenset[str] = frozenset(
+    {
+        "BINPERSID",
+        "EXT1",
+        "EXT2",
+        "EXT4",
+        "GLOBAL",
+        "INST",
+        "OBJ",
+        "PERSID",
+        "REDUCE",
+        "STACK_GLOBAL",
+    }
+)
 
 
 def _read_proto_length_delimited_bounds_stream(
@@ -1511,6 +1545,33 @@ def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool = Fa
     # Regression hardening: a single leading "#" token should not suppress
     # protocol 0/1 detection for otherwise valid pickle streams.
     return sample.startswith(b"#") and _matches_proto_stream(sample[1:])
+
+
+def _has_bounded_binary_pickle_security_signal(sample: bytes) -> bool:
+    """Return whether a pickle-shaped binary prefix contains a security signal."""
+    if not _looks_like_binary_pickle_protocol(sample[:4]):
+        return False
+    protocol_opcode_count = 0
+    has_security_opcode = False
+    has_pre_stop_security_opcode = False
+    try:
+        for opcode, _arg, position in pickletools.genops(sample):
+            if opcode.name == "PROTO":
+                protocol_opcode_count += 1
+            if opcode.name in _BINARY_PICKLE_SECURITY_OPCODES:
+                has_security_opcode = True
+            if opcode.name in _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES:
+                has_pre_stop_security_opcode = True
+            if opcode.name == "STOP":
+                stop_position = 0 if position is None else position
+                try:
+                    pickletools.dis(sample[: stop_position + 1], out=StringIO())
+                except Exception:
+                    return has_pre_stop_security_opcode
+                return protocol_opcode_count > 1 or has_security_opcode
+    except Exception:
+        return has_pre_stop_security_opcode
+    return has_pre_stop_security_opcode
 
 
 def _read_pickle_probe_sample(path: Path, size: int, header16: bytes) -> bytes:
@@ -3184,7 +3245,7 @@ def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
         json_document_probe = _probe_complete_structured_json_document(file_path, size)
         if json_document_probe is True:
             return False
-        if json_document_probe is None:
+        if json_document_probe is None and ext not in _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES:
             return True
         if _is_complete_bounded_printable_text(file_path, size):
             return False
@@ -3194,14 +3255,21 @@ def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
         )
         if xgboost_route is not None:
             return False
-    return (
+    content_routable = (
         ext in _FLAX_MSGPACK_SCANNER_SUFFIXES
         or ext in _FLAX_MSGPACK_OVERLAP_SUFFIXES
         or ext not in _FLAX_MSGPACK_DECLARED_SUFFIXES
-    ) and is_flax_msgpack_checkpoint_file(file_path)
+        or ext in _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES
+    )
+    if not content_routable:
+        return False
+    probe_state = _probe_flax_msgpack_checkpoint_file(file_path)
+    # An oversized document-suffix scalar stream is indistinguishable from a
+    # delayed Flax root within the bounded probe, so preserve it fail closed.
+    return probe_state is not False
 
 
-def detect_flax_msgpack_overlap_routes(path: str) -> tuple[str, ...]:
+def detect_flax_msgpack_overlap_routes(path: str, *, include_unvalidated_pickle: bool = False) -> tuple[str, ...]:
     """Return trusted foreign content routes that also occur in a Flax candidate."""
     file_path = Path(path)
     try:
@@ -3215,6 +3283,16 @@ def detect_flax_msgpack_overlap_routes(path: str) -> tuple[str, ...]:
         path, min(size, max(_TORCH7_SIGNATURE_READ_BYTES, _CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
     )
     routes: list[str] = []
+    pickle_probe_sample = _read_pickle_probe_sample(file_path, size, prefix[:16])
+    if (
+        (include_unvalidated_pickle and _looks_like_binary_pickle_protocol(prefix[:4]))
+        or _has_bounded_binary_pickle_security_signal(pickle_probe_sample)
+        or _looks_like_proto0_or_1_pickle(
+            pickle_probe_sample,
+            sample_is_prefix=size > len(pickle_probe_sample),
+        )
+    ):
+        routes.append("pickle")
     if _allows_renamed_binary_content_route(file_path) and prefix[:4] == b"RKNN":
         routes.append("rknn")
     if _is_torch7_signature(prefix[:_TORCH7_SIGNATURE_READ_BYTES]):
@@ -3302,17 +3380,19 @@ def detect_format_from_magic_bytes(
             if onnx_route_status is True:
                 return "onnx"
 
-    if _looks_like_binary_pickle_protocol(magic4):
-        return "pickle"
     if _is_safetensors_routing_candidate(file_path, magic8, file_size):
         return "safetensors"
+    if _looks_like_binary_pickle_protocol(magic4) and (
+        file_path is None or not _could_be_content_routed_flax_msgpack(file_path)
+    ):
+        return "pickle"
 
     if file_path is not None:
         pickle_probe_sample = _read_pickle_probe_sample(file_path, file_size, magic16)
         if _looks_like_proto0_or_1_pickle(
             pickle_probe_sample,
             sample_is_prefix=file_size > len(pickle_probe_sample),
-        ):
+        ) and not _could_be_content_routed_flax_msgpack(file_path):
             return "pickle"
 
     if file_path is not None and _is_confirmed_content_routed_jax_json_checkpoint(file_path):
@@ -3339,7 +3419,7 @@ def detect_format_from_magic_bytes(
         if renamed_tensorflow_format not in {"unknown", "inconclusive"}:
             return renamed_tensorflow_format
 
-    if file_path is not None and _could_be_content_routed_flax_msgpack(file_path):
+    if file_path is not None and not _could_be_xml_prefix(magic16) and _could_be_content_routed_flax_msgpack(file_path):
         foreign_overlap_format = _resolve_inconclusive_flax_foreign_overlap(file_path)
         if foreign_overlap_format is not None:
             return foreign_overlap_format
@@ -3490,6 +3570,8 @@ def detect_file_format_from_magic(path: str) -> str:
                 )
                 if xml_format != "unknown":
                     return xml_format
+            if _could_be_content_routed_flax_msgpack(file_path):
+                return "flax_msgpack"
 
             renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
             if renamed_tensorflow_format != "unknown":
@@ -3663,6 +3745,8 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             )
             if xml_format != "unknown":
                 return xml_format
+        if _could_be_content_routed_flax_msgpack(file_path):
+            return "flax_msgpack"
 
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
     if renamed_tensorflow_format != "unknown":
@@ -3784,13 +3868,17 @@ def detect_file_format(path: str) -> str:
     if onnx_route_status is True:
         return "onnx"
 
-    if _looks_like_binary_pickle_protocol(magic4):
+    if (
+        _looks_like_binary_pickle_protocol(magic4)
+        and not _could_be_content_routed_flax_msgpack(file_path)
+        and not _is_safetensors_routing_candidate(file_path, magic8, size)
+    ):
         return "pickle"
     pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
     if _looks_like_proto0_or_1_pickle(
         pickle_probe_sample,
         sample_is_prefix=size > len(pickle_probe_sample),
-    ):
+    ) and not _could_be_content_routed_flax_msgpack(file_path):
         return "pickle"
     if _could_be_xml_prefix(header):
         xml_prefix = read_magic_bytes(path, _XML_MODEL_SIGNATURE_READ_BYTES)
@@ -3821,6 +3909,8 @@ def detect_file_format(path: str) -> str:
         return renamed_tensorflow_format
 
     if _is_safetensors_routing_candidate(file_path, magic8, size):
+        if renamed_tensorflow_format == "inconclusive":
+            return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
         return "safetensors"
 
     if _is_confirmed_content_routed_jax_json_checkpoint(file_path):
