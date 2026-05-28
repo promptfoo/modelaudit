@@ -270,6 +270,16 @@ def _write_tensorflow_overlap_safetensors_candidate(path: Path, header_prefix: b
     path.write_bytes(struct.pack("<Q", header_len) + header + b"\x00")
 
 
+def _write_minimal_safetensors(path: Path) -> None:
+    header = {"weights": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + b"\x00\x00\x00\x00")
+
+
+def _write_safe_tensorrt(path: Path) -> None:
+    path.write_bytes(b"TensorRT safe engine metadata")
+
+
 def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
     """Write a ZIP archive at an intentionally misleading file path."""
     with zipfile.ZipFile(path, "w") as archive:
@@ -6412,6 +6422,164 @@ def test_directory_scan_bypasses_stale_cache_when_owner_read_fails_with_access(
         metadata = result.file_metadata[str(cached_clean)]
         assert metadata["operational_error_reason"] == "lightgbm_read_failed"
         assert "lightgbm_read_failed" in metadata["scan_outcome_reasons"]
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert core_module.determine_exit_code(result) == 2
+    finally:
+        reset_cache_manager()
+
+
+@pytest.mark.parametrize(
+    ("filename", "writer", "reason", "check_name", "message_fragment"),
+    [
+        ("cached.mlmodel", create_mock_coreml, "coreml_read_failed", "CoreML File Read", "Failed to read CoreML file"),
+        (
+            "cached.safetensors",
+            _write_minimal_safetensors,
+            "safetensors_read_failed",
+            "SafeTensors File Read",
+            "Unable to read SafeTensors file",
+        ),
+        (
+            "cached.engine",
+            _write_safe_tensorrt,
+            "tensorrt_read_failed",
+            "TensorRT Engine Read",
+            "Error reading TensorRT engine",
+        ),
+    ],
+)
+def test_single_file_scan_bypasses_stale_cache_when_binary_owner_read_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    writer: Callable[[Path], object],
+    reason: str,
+    check_name: str,
+    message_fragment: str,
+) -> None:
+    model_path = tmp_path / filename
+    writer(model_path)
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        first = core_module.scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert core_module.determine_exit_code(first) == 0
+        assert first.success is True
+        cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        assert cached_entries > 0
+
+        real_open = open
+
+        def fail_cached_binary_read(
+            candidate: str | bytes | os.PathLike[str],
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            if str(candidate) == str(model_path):
+                raise OSError(f"simulated transient {reason} read")
+            return real_open(candidate, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fail_cached_binary_read)
+
+        second = core_module.scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        metadata = second.file_metadata[str(model_path)]
+        assert second.success is False
+        assert metadata["operational_error_reason"] == reason
+        assert reason in metadata["scan_outcome_reasons"]
+        assert any(check.name == check_name and message_fragment in check.message for check in second.checks)
+        assert core_module.determine_exit_code(second) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
+    finally:
+        reset_cache_manager()
+
+
+@pytest.mark.parametrize(
+    ("filename", "writer", "reason", "check_name", "message_fragment"),
+    [
+        ("cached.mlmodel", create_mock_coreml, "coreml_read_failed", "CoreML File Read", "Failed to read CoreML file"),
+        (
+            "cached.safetensors",
+            _write_minimal_safetensors,
+            "safetensors_read_failed",
+            "SafeTensors File Read",
+            "Unable to read SafeTensors file",
+        ),
+        (
+            "cached.engine",
+            _write_safe_tensorrt,
+            "tensorrt_read_failed",
+            "TensorRT Engine Read",
+            "Error reading TensorRT engine",
+        ),
+    ],
+)
+def test_directory_scan_bypasses_stale_cache_when_binary_owner_read_fails_with_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    writer: Callable[[Path], object],
+    reason: str,
+    check_name: str,
+    message_fragment: str,
+) -> None:
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    cached_clean = model_dir / filename
+    writer(cached_clean)
+    malicious = model_dir / "malicious.pkl"
+    malicious.write_bytes(_build_malicious_pickle())
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        warm = core_module.scan_model_directory_or_file(
+            str(cached_clean),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert core_module.determine_exit_code(warm) == 0
+        assert warm.success is True
+        cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        assert cached_entries > 0
+
+        real_open = open
+
+        def fail_cached_binary_read(
+            candidate: str | bytes | os.PathLike[str],
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            if str(candidate) == str(cached_clean):
+                raise OSError(f"simulated transient {reason} read")
+            return real_open(candidate, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fail_cached_binary_read)
+
+        result = core_module.scan_model_directory_or_file(
+            str(model_dir),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        metadata = result.file_metadata[str(cached_clean)]
+        assert result.success is False
+        assert metadata["operational_error_reason"] == reason
+        assert reason in metadata["scan_outcome_reasons"]
+        assert any(check.name == check_name and message_fragment in check.message for check in result.checks)
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         assert core_module.determine_exit_code(result) == 2
     finally:

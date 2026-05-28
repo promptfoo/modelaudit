@@ -13,7 +13,9 @@ from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanRes
 
 logger = logging.getLogger(__name__)
 
-_READ_FAILURE_AWARE_EXTENSION_SCANNERS = frozenset({"cntk", "lightgbm", "tf_metagraph"})
+_READ_FAILURE_AWARE_EXTENSION_SCANNERS = frozenset(
+    {"cntk", "coreml", "lightgbm", "safetensors", "tensorrt", "tf_metagraph"}
+)
 
 
 def _check_numpy_compatibility() -> tuple[bool, str]:

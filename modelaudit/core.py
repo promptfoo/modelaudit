@@ -1827,13 +1827,15 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             sr.bytes_scanned = file_size
         return sr
 
-    try:
-        file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
-    except OSError as e:
+    if format_probe_error is not None:
         # A failed content read is not evidence of spoofing. Let an owning
         # scanner produce a precise read-failure outcome when one exists.
         file_type_valid = True
-        if format_probe_error is None:
+    else:
+        try:
+            file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
+        except OSError as e:
+            file_type_valid = True
             format_probe_error = e
     discrepancy_msg = None
 
