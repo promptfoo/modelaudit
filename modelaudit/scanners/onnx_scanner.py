@@ -157,6 +157,7 @@ def _iter_model_initializer_graphs(model: Any) -> Any:
     """Yield every ONNX graph that can carry tensor initializers."""
     yield from _iter_graph_and_subgraphs(model.graph)
     for function in getattr(model, "functions", []):
+        yield from _iter_graph_and_subgraphs(function)
         for attribute in getattr(function, "attribute_proto", []):
             for subgraph in _iter_attribute_graphs(attribute):
                 yield from _iter_graph_and_subgraphs(subgraph)
