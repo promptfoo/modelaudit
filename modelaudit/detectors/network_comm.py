@@ -14,6 +14,10 @@ from typing import Any, ClassVar
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 _REDACTED_PATH_TOKEN = "<redacted>"
+_URL_IN_TEXT_PATTERN = re.compile(
+    r"(?:https?|ftp|ftps|ssh|telnet|ws|wss|s3|gs|az|wasbs?|abfss?)://[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+",
+    re.IGNORECASE,
+)
 _SENSITIVE_PATH_TOKEN_PATTERN = re.compile(
     r"(?i)^(?:"
     r"AKIA[0-9A-Z]{16}|"
@@ -31,7 +35,7 @@ _PATH_TOKEN_CHARACTER_CLASS_PATTERNS = (
     re.compile(r"\d"),
     re.compile(r"[._~+/=\-]"),
 )
-_ARTIFACT_FILENAME_PATTERN = re.compile(r"(?i)^.+\.[a-z0-9]{1,10}$")
+_ARTIFACT_FILENAME_PATTERN = re.compile(r"(?i)^.+\.[a-z0-9]{1,20}$")
 _KNOWN_ARTIFACT_FILENAME_EXTENSIONS = frozenset(
     {
         "bin",
@@ -67,6 +71,7 @@ _PUBLIC_MODEL_REPOSITORY_PREFIXES = frozenset({"datasets", "spaces"})
 _PATH_STYLE_CLOUD_HOSTS = frozenset({"s3.amazonaws.com", "storage.googleapis.com", "storage.cloud.google.com"})
 _S3_REGIONAL_HOST_PATTERN = re.compile(r"^s3[.-][a-z0-9-]+\.amazonaws\.com$")
 _AZURE_STORAGE_HOST_SUFFIXES = (".blob.core.windows.net", ".dfs.core.windows.net")
+_AZURE_AUTHORITY_CONTAINER_SCHEMES = frozenset({"wasb", "wasbs", "abfs", "abfss"})
 
 
 def _split_trailing_path_delimiters(segment: str) -> tuple[str, str]:
@@ -142,14 +147,12 @@ def _is_public_model_revision_hash_segment(hostname: str, segments: list[str], i
     return segments[index - 1].lower() in _PUBLIC_MODEL_REPOSITORY_MARKERS
 
 
-def _is_path_style_cloud_bucket_segment(hostname: str, index: int) -> bool:
+def _is_path_style_cloud_bucket_segment(scheme: str, hostname: str, index: int) -> bool:
     if index != 1:
         return False
-    return (
-        hostname in _PATH_STYLE_CLOUD_HOSTS
-        or _S3_REGIONAL_HOST_PATTERN.fullmatch(hostname) is not None
-        or hostname.endswith(_AZURE_STORAGE_HOST_SUFFIXES)
-    )
+    if hostname in _PATH_STYLE_CLOUD_HOSTS or _S3_REGIONAL_HOST_PATTERN.fullmatch(hostname) is not None:
+        return True
+    return scheme in {"http", "https"} and hostname.endswith(_AZURE_STORAGE_HOST_SUFFIXES)
 
 
 def _redact_path_parameter_tokens(segment: str) -> str | None:
@@ -181,7 +184,7 @@ def _redact_path_parameter_tokens(segment: str) -> str | None:
     return None
 
 
-def _redact_url_path_tokens(hostname: str, path: str) -> str:
+def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
     segments = path.split("/")
     for index, segment in enumerate(segments):
         if not segment:
@@ -193,7 +196,7 @@ def _redact_url_path_tokens(hostname: str, path: str) -> str:
             continue
         if _is_public_model_revision_hash_segment(hostname, segments, index):
             continue
-        if _is_path_style_cloud_bucket_segment(hostname, index):
+        if _is_path_style_cloud_bucket_segment(scheme, hostname, index):
             continue
 
         parameter_redaction = _redact_path_parameter_tokens(segment)
@@ -230,9 +233,20 @@ def _redact_url_for_finding(url: str) -> str:
     except ValueError:
         port = None
 
-    netloc = f"{hostname}:{port}" if port is not None else hostname
-    safe_path = _redact_url_path_tokens(hostname.lower(), parsed.path)
+    netloc_host = f"{hostname}:{port}" if port is not None else hostname
+    netloc = netloc_host
+    scheme = parsed.scheme.lower()
+    if scheme in _AZURE_AUTHORITY_CONTAINER_SCHEMES and "@" in parsed.netloc:
+        container, _separator, _host = parsed.netloc.rpartition("@")
+        if container and ":" not in container:
+            netloc = f"{container}@{netloc_host}"
+
+    safe_path = _redact_url_path_tokens(scheme, hostname.lower(), parsed.path)
     return urlunsplit((parsed.scheme, netloc, safe_path, "", ""))
+
+
+def _redact_urls_in_text(text: str) -> str:
+    return _URL_IN_TEXT_PATTERN.sub(lambda match: _redact_url_for_finding(match.group()), text)
 
 
 _DOC_CONTEXT_EXTENSIONS: tuple[str, ...] = (
@@ -1058,7 +1072,7 @@ class NetworkCommDetector:
                 # Try to get some context around the function call
                 start = max(0, idx - 50)
                 end = min(len(data), idx + 100)
-                snippet = data[start:end].decode("utf-8", errors="ignore")
+                snippet = _redact_urls_in_text(data[start:end].decode("utf-8", errors="ignore"))
 
                 confidence = 0.6
                 severity = "HIGH"
@@ -1092,7 +1106,7 @@ class NetworkCommDetector:
             # Get context
             start = max(0, idx - 30)
             end = min(len(data), idx + len(pattern) + 30)
-            snippet = data[start:end].decode("utf-8", errors="ignore")
+            snippet = _redact_urls_in_text(data[start:end].decode("utf-8", errors="ignore"))
 
             confidence = 0.8
             severity = "CRITICAL"
@@ -1199,7 +1213,7 @@ class NetworkCommDetector:
                     printable_ratio = sum(c.isprintable() for c in context_str) / len(context_str)
 
                     if printable_ratio > 0.7:  # High ratio of printable characters
-                        matched_text = match.group().decode("utf-8", errors="ignore")
+                        matched_text = _redact_urls_in_text(match.group().decode("utf-8", errors="ignore"))
                         self.findings.append(
                             {
                                 "type": "explicit_network_pattern",

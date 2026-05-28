@@ -292,6 +292,29 @@ class TestNetworkCommDetector:
         assert url in serialized
         assert "<redacted>" not in serialized
 
+    @pytest.mark.parametrize(
+        ("url", "expected_url"),
+        [
+            (
+                "wasbs://container@account.blob.core.windows.net/AbCdEfGhIjKlMnOpQrStUvWxYz012345/weights.bin",
+                "wasbs://container@account.blob.core.windows.net/<redacted>/weights.bin",
+            ),
+            (
+                "abfss://container@account.dfs.core.windows.net/AbCdEfGhIjKlMnOpQrStUvWxYz012345/weights.bin",
+                "abfss://container@account.dfs.core.windows.net/<redacted>/weights.bin",
+            ),
+        ],
+    )
+    def test_wasb_and_abfs_object_path_tokens_are_redacted(self, url: str, expected_url: str) -> None:
+        """WASB/ABFS containers live in the authority, so the first path segment is still object data."""
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        cloud_finding = next(finding for finding in findings if finding["type"] == "cloud_storage_url")
+
+        assert cloud_finding["url"] == expected_url
+        assert "AbCdEfGhIjKlMnOpQrStUvWxYz012345" not in json.dumps(cloud_finding, sort_keys=True)
+
     def test_long_artifact_filenames_are_preserved(self) -> None:
         """Ordinary model artifact filenames should not be treated as capability tokens."""
         detector = NetworkCommDetector()
@@ -302,6 +325,17 @@ class TestNetworkCommDetector:
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
 
         assert filename in url_finding["url"]
+
+    def test_safetensors_artifact_filenames_are_preserved(self) -> None:
+        """SafeTensors shard names should stay visible for audit and SBOM follow-up."""
+        detector = NetworkCommDetector()
+        filename = "pytorch_model-00001-of-00002.safetensors"
+        data = f"https://huggingface.co/org/repo/resolve/main/{filename}".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://huggingface.co/org/repo/resolve/main/{filename}"
 
     def test_github_path_tokens_are_redacted(self) -> None:
         """Known token formats embedded in URL paths should be removed."""
@@ -474,6 +508,19 @@ class TestNetworkCommDetector:
         assert "socket.connect" in funcs
         assert "requests.post" in funcs
         assert "urlopen" in funcs
+
+    def test_network_function_snippets_redact_url_path_tokens(self) -> None:
+        """URL-bearing snippets should not leak capability tokens after URL findings are redacted."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+        data = f'requests.get("https://example.com/path/{path_token}/model.bin")'.encode()
+
+        findings = detector.scan(data, "hook.py")
+        network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/path/<redacted>/model.bin"
+        assert path_token not in json.dumps([network_finding, url_finding], sort_keys=True)
 
     def test_network_functions_not_flagged_in_documentation_metadata_context(self) -> None:
         """Documentation prose should not report raw network library/function token mentions."""
