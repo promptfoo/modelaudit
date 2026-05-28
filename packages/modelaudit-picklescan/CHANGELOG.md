@@ -51,6 +51,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- fail closed when encoded nested-pickle probe candidates exhaust the analysis cap
 - prevent call-graph alias cycles from hanging scans
 - detect nested brace-format lookups that reach tracked `defaultdict` factories
 - avoid `str.format` false positives when a `ChainMap` shadows a `defaultdict`
