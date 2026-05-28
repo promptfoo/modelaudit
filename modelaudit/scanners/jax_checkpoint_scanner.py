@@ -226,6 +226,10 @@ class JaxCheckpointScanner(BaseScanner):
     _JSON_PREFIX_PATTERN_READ_FAILED_REASON: ClassVar[str] = "jax_json_checkpoint_prefix_pattern_read_failed"
     _METADATA_TRAVERSAL_LIMIT_REASON: ClassVar[str] = "jax_metadata_traversal_depth_limit"
     _PICKLE_SCAN_LIMIT_REASON: ClassVar[str] = "jax_pickle_scan_limit_exceeded"
+    _LEGACY_PICKLE_INITIAL_OPCODES: ClassVar[bytes] = (
+        b"()BCcFGIJKLMNPSTUVX]}\x82\x83\x84\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x95\x96\x97"
+    )
+    _LEGACY_PICKLE_PREFIX_PROBE_BYTES: ClassVar[int] = 8192
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         """Initialize JAX checkpoint scanning limits and regex detectors."""
@@ -742,6 +746,129 @@ class JaxCheckpointScanner(BaseScanner):
         return any(list(path_obj.glob(pattern)) for pattern in jax_patterns)
 
     @classmethod
+    def _header_starts_with_legacy_pickle_opcode(cls, header: bytes) -> bool:
+        return bool(header) and header[:1] in cls._LEGACY_PICKLE_INITIAL_OPCODES
+
+    @staticmethod
+    def _is_truncated_pickle_parse_error(error: ValueError) -> bool:
+        message = str(error)
+        return (
+            "pickle exhausted before seeing STOP" in message
+            or "not enough data" in message
+            or "no newline found" in message
+            or ("expected " in message and " bytes " in message and "remain" in message)
+        )
+
+    def _has_structural_legacy_pickle_prefix(self, path: str, header: bytes) -> bool:
+        if not self._header_starts_with_legacy_pickle_opcode(header):
+            return False
+
+        read_limit = max(len(header), min(self.max_pickle_scan_bytes, self._LEGACY_PICKLE_PREFIX_PROBE_BYTES))
+        with suppress(Exception):
+            file_size = os.path.getsize(path)
+            with open(path, "rb") as source:
+                data = source.read(read_limit)
+
+            marker = object()
+            stack: list[object] = []
+            memo_indices: set[int] = set()
+            next_memo_index = 0
+            parsed_opcode = False
+            parsed_opcode_count = 0
+            saw_dangerous_global = False
+
+            def _memo_index(value: Any) -> int | None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+
+            def _apply_probe_stack_effect(opcode_info: Any) -> bool:
+                if opcode_info.name == "MARK":
+                    stack.append(marker)
+                    return True
+
+                stack_before = list(getattr(opcode_info, "stack_before", ()))
+                stack_after = list(getattr(opcode_info, "stack_after", ()))
+
+                if pickletools.markobject in stack_before:
+                    preserved_items_before_mark = stack_before.index(pickletools.markobject)
+                    if marker not in stack:
+                        return False
+                    marker_index = len(stack) - 1 - stack[::-1].index(marker)
+                    if marker_index < preserved_items_before_mark:
+                        return False
+                    del stack[marker_index:]
+                    if len(stack_after) > preserved_items_before_mark:
+                        stack.extend(object() for _ in range(len(stack_after) - preserved_items_before_mark))
+                    elif len(stack_after) < preserved_items_before_mark:
+                        remove_count = preserved_items_before_mark - len(stack_after)
+                        if len(stack) < remove_count:
+                            return False
+                        del stack[-remove_count:]
+                    return True
+
+                if len(stack) < len(stack_before):
+                    return False
+                if stack_before:
+                    del stack[-len(stack_before) :]
+                stack.extend(object() for _ in stack_after)
+                return True
+
+            try:
+                for opcode, arg, _pos in pickletools.genops(data):
+                    parsed_opcode = True
+                    parsed_opcode_count += 1
+                    if opcode.name == "GLOBAL" and isinstance(arg, str):
+                        parsed_global = self._parse_pickle_global_reference(arg)
+                        if parsed_global is not None:
+                            module_name, global_name = parsed_global
+                            saw_dangerous_global = saw_dangerous_global or self._is_dangerous_pickle_global(
+                                module_name, global_name
+                            )
+                    if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
+                        if not stack:
+                            return False
+                        memo_index = _memo_index(arg)
+                        if memo_index is not None:
+                            memo_indices.add(memo_index)
+                            next_memo_index = max(next_memo_index, memo_index + 1)
+                    elif opcode.name == "MEMOIZE":
+                        if not stack:
+                            return False
+                        memo_indices.add(next_memo_index)
+                        next_memo_index += 1
+                    elif opcode.name in {"BINGET", "LONG_BINGET", "GET"}:
+                        memo_index = _memo_index(arg)
+                        if memo_index is None or memo_index not in memo_indices:
+                            return False
+                    if not _apply_probe_stack_effect(opcode):
+                        return False
+                    if opcode.name == "STOP":
+                        return True
+            except ValueError as e:
+                if "pickle exhausted before seeing STOP" in str(e):
+                    if parsed_opcode_count == 1 and not saw_dangerous_global:
+                        return False
+                    return parsed_opcode
+                if file_size > len(data) and self._is_truncated_pickle_parse_error(e):
+                    return parsed_opcode or self._header_starts_with_legacy_pickle_opcode(header)
+
+        return False
+
+    @classmethod
+    def _legacy_pickle_header_has_jax_indicator(cls, path: str, header: bytes) -> bool:
+        if not cls._header_starts_with_legacy_pickle_opcode(header):
+            return False
+
+        with suppress(Exception):
+            with open(path, "rb") as source:
+                data = source.read(max(8192, len(header)))
+            return cls._contains_jax_indicator(data.decode("utf-8", errors="ignore"))
+
+        return False
+
+    @classmethod
     def _is_likely_jax_file(cls, path: str) -> bool:
         """Determine if a file is likely a JAX checkpoint."""
         try:
@@ -751,7 +878,7 @@ class JaxCheckpointScanner(BaseScanner):
                 # pickles are textual and can begin directly with a string
                 # opcode such as `Vjax`, so they do not have the binary
                 # protocol marker.
-                if header.startswith(b"\x80") or header[:1] in b"(cdgINRSUV":
+                if header.startswith(b"\x80") or cls._header_starts_with_legacy_pickle_opcode(header):
                     with suppress(Exception):
                         data = header + f.read(max(0, 8192 - len(header)))
                         data_str = data.decode("utf-8", errors="ignore").lower()
@@ -873,7 +1000,11 @@ class JaxCheckpointScanner(BaseScanner):
         checkpoint_files = list(path_obj.glob("checkpoint*"))
         for checkpoint_file in checkpoint_files:
             if checkpoint_file.is_file():
-                self._scan_checkpoint_file(str(checkpoint_file), result)
+                self._scan_checkpoint_file(
+                    str(checkpoint_file),
+                    result,
+                    treat_legacy_pickle_header_as_checkpoint=True,
+                )
 
     def _analyze_orbax_metadata(self, metadata: dict[str, Any], path: str, result: ScanResult) -> None:
         """Analyze Orbax metadata for security issues."""
@@ -930,7 +1061,13 @@ class JaxCheckpointScanner(BaseScanner):
                 }
             )
 
-    def _scan_checkpoint_file(self, path: str, result: ScanResult) -> None:
+    def _scan_checkpoint_file(
+        self,
+        path: str,
+        result: ScanResult,
+        *,
+        treat_legacy_pickle_header_as_checkpoint: bool = False,
+    ) -> None:
         """Scan individual checkpoint file."""
         try:
             file_size = os.path.getsize(path)
@@ -950,7 +1087,12 @@ class JaxCheckpointScanner(BaseScanner):
                 header = f.read(1024)
 
             # Check file format
-            if header.startswith(b"\x80"):  # Pickle format
+            legacy_pickle_header = self._has_structural_legacy_pickle_prefix(path, header)
+            if (
+                header.startswith(b"\x80")
+                or (legacy_pickle_header and treat_legacy_pickle_header_as_checkpoint)
+                or (legacy_pickle_header and self._legacy_pickle_header_has_jax_indicator(path, header))
+            ):
                 self._scan_pickle_checkpoint(path, result)
             elif header.startswith(b"\x93NUMPY"):  # NumPy format
                 self._scan_numpy_checkpoint(path, result)

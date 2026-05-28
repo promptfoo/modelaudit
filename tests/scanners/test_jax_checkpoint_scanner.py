@@ -314,6 +314,314 @@ def test_malicious_pickle_global_opcode_is_detected(tmp_path: Path) -> None:
     )
 
 
+def test_protocol_zero_jax_checkpoint_pickle_global_opcode_is_detected(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "malicious_protocol0_state.checkpoint"
+    pickle_path.write_bytes(pickle.dumps({"framework": "jax", "payload": _MaliciousJaxState()}, protocol=0))
+
+    assert JaxCheckpointScanner.can_handle(str(pickle_path))
+
+    result = JaxCheckpointScanner().scan(str(pickle_path))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] in {"os.system", "posix.system", "nt.system"}
+        for check in result.checks
+    )
+
+
+def test_orbax_protocol_zero_checkpoint_without_jax_marker_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_protocol0"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
+def test_orbax_protocol_one_checkpoint_without_jax_marker_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_protocol1"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(pickle.dumps({"payload": _MaliciousJaxState()}, protocol=1))
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] in {"os.system", "posix.system", "nt.system"}
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "configuration for jax checkpoint in a plain text sidecar",
+        "JAX checkpoint metadata in a plain text sidecar",
+    ],
+)
+def test_jax_text_checkpoint_with_legacy_opcode_prefix_does_not_scan_as_pickle(tmp_path: Path, text: str) -> None:
+    checkpoint_path = tmp_path / "plain_text.checkpoint"
+    checkpoint_path.write_text(text, encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success
+    assert not any(check.name == "Pickle Checkpoint Scan" for check in result.checks)
+    assert "jax_pickle_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_orbax_text_checkpoint_sidecar_with_global_shape_does_not_scan_as_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_plain_text"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "metadata.json").write_text("{}", encoding="utf-8")
+    (checkpoint_dir / "checkpoint").write_text("configuration\nmetadata\n", encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(check.name == "Pickle Checkpoint Scan" for check in result.checks)
+    assert "jax_pickle_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_empty_orbax_checkpoint_file_does_not_scan_as_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "empty_orbax"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "checkpoint").write_bytes(b"")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(check.name == "Pickle Checkpoint Scan" for check in result.checks)
+    assert "jax_pickle_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_orbax_protocol_zero_persid_checkpoint_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_persid"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(b"Popaque_id\ncposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
+def test_orbax_protocol_zero_long_unicode_prefix_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_long_unicode"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(
+        b"V" + (b"A" * (JaxCheckpointScanner._LEGACY_PICKLE_PREFIX_PROBE_BYTES + 1)) + b"\n"
+        b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n."
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
+def test_eof_truncated_orbax_legacy_pickle_is_scanned_inconclusive(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_eof_truncated"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(b"cposix\nsystem\n")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+    assert "jax_pickle_scan_failed" in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_orbax_binbytes_prefix_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_binbytes"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(b"B\x03\x00\x00\x00abccposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
+def test_orbax_frame_prefix_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_frame"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    frame_payload = b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n."
+    checkpoint_file.write_bytes(b"\x95" + len(frame_payload).to_bytes(8, "little") + frame_payload)
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
+def test_orbax_truncated_binstring_prefix_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_long_binstring"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    binary_string = b"A" * (JaxCheckpointScanner._LEGACY_PICKLE_PREFIX_PROBE_BYTES + 1)
+    checkpoint_file.write_bytes(
+        b"T" + len(binary_string).to_bytes(4, "little") + binary_string + b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n."
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
+def test_orbax_truncated_numeric_prefix_is_scanned_inconclusive(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_long_numeric"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(
+        b"I" + (b"9" * (JaxCheckpointScanner._LEGACY_PICKLE_PREFIX_PROBE_BYTES + 1)) + b"\n"
+        b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n."
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert "jax_pickle_scan_failed" in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_benign_protocol_zero_jax_checkpoint_is_scanned_as_pickle(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "benign_protocol0_state.checkpoint"
+    pickle_path.write_bytes(pickle.dumps({"framework": "jax", "params": {"dense": [1, 2, 3]}}, protocol=0))
+
+    assert JaxCheckpointScanner.can_handle(str(pickle_path))
+
+    result = JaxCheckpointScanner().scan(str(pickle_path))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Pickle Opcode Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_stack_global_opcode_is_detected_after_interleaved_unhandled_stack_push(tmp_path: Path) -> None:
     pickle_path = tmp_path / "interleaved_empty_list_stack_global_state.pickle"
     payload = (
