@@ -170,6 +170,7 @@ BINARY_FALSE_POSITIVE_TYPES = frozenset(
     }
 )
 FLOAT_LIKE_PATTERN = re.compile(r"[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?")
+REDACTED_CONTEXT_SECRET = "<redacted-secret>"
 
 
 class SecretsDetector:
@@ -336,6 +337,13 @@ class SecretsDetector:
 
         return max(0.0, min(1.0, confidence))  # Clamp to [0, 1]
 
+    def _redact_context(self, context: str) -> str:
+        """Redact secret-shaped material before storing context strings."""
+        redacted = context
+        for pattern, _description in self._compiled_patterns:
+            redacted = pattern.sub(REDACTED_CONTEXT_SECRET, redacted)
+        return redacted
+
     def scan_bytes(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
         """Scan binary data for embedded secrets.
 
@@ -347,6 +355,7 @@ class SecretsDetector:
             List of detected secrets with details
         """
         findings = []
+        safe_context = self._redact_context(context)
 
         # First, try to detect secrets in decoded text
         try:
@@ -393,7 +402,7 @@ class SecretsDetector:
                                     "confidence": 0.4,  # Low confidence for entropy-only detection
                                     "message": f"High entropy region detected (entropy: {entropy:.2f}) - "
                                     "possible encoded secret",
-                                    "context": f"{context} offset:{i}" if context else f"offset:{i}",
+                                    "context": f"{safe_context} offset:{i}" if safe_context else f"offset:{i}",
                                     "recommendation": "Review this region for base64/hex encoded secrets",
                                 }
                             )
@@ -476,6 +485,7 @@ class SecretsDetector:
             List of detected secrets with details
         """
         findings = []
+        safe_context = self._redact_context(context)
 
         # Limit text size to prevent DoS
         max_text_size = 100 * 1024 * 1024  # 100MB text analysis limit
@@ -540,7 +550,7 @@ class SecretsDetector:
                         "pattern": pattern.pattern[:50] + "..." if len(pattern.pattern) > 50 else pattern.pattern,
                         "redacted_value": redacted,
                         "message": f"{description} detected (confidence: {confidence:.0%})",
-                        "context": f"{context} pos:{position}" if context else f"pos:{position}",
+                        "context": f"{safe_context} pos:{position}" if safe_context else f"pos:{position}",
                         "recommendation": f"Remove {description} from model data immediately"
                         if confidence >= 0.8
                         else f"Review and remove {description} if not intentional",
@@ -562,7 +572,8 @@ class SecretsDetector:
         findings = []
 
         for key, value in data.items():
-            key_context = f"{context}/{key}" if context else key
+            safe_key = self._redact_context(str(key))
+            key_context = f"{context}/{safe_key}" if context else safe_key
 
             # Check the key itself for secrets
             key_findings = self.scan_text(str(key), f"{key_context}[key]")
