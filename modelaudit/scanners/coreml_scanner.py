@@ -11,8 +11,10 @@ from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import ClassVar, NamedTuple
 
+from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from .base import BaseScanner, IssueSeverity, ScanResult
+from ..utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
+from .base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 _MAX_VARINT_BYTES = 10
 
@@ -63,6 +65,95 @@ def _read_varint(data: bytes, offset: int) -> tuple[int, int] | None:
     return None
 
 
+def _skip_group(
+    data: bytes,
+    offset: int,
+    start_field_number: int,
+    *,
+    max_fields: int,
+    fields_seen: int,
+    allow_truncated: bool,
+) -> tuple[int, int, str | None]:
+    """Skip an unknown protobuf group while preserving parser bounds."""
+    group_stack = [start_field_number]
+
+    while group_stack:
+        if offset >= len(data):
+            if allow_truncated:
+                return len(data), fields_seen, None
+            return offset, fields_seen, f"truncated group field {start_field_number}"
+
+        if fields_seen >= max_fields:
+            return offset, fields_seen, f"field count exceeded limit ({max_fields})"
+
+        key_info = _read_varint(data, offset)
+        if key_info is None:
+            return offset, fields_seen, f"truncated or invalid field key in group field {start_field_number}"
+        key, offset = key_info
+        fields_seen += 1
+
+        field_number = key >> 3
+        wire_type = key & 0x07
+        if field_number <= 0:
+            return offset, fields_seen, "invalid field number 0"
+
+        if wire_type == 0:
+            value_info = _read_varint(data, offset)
+            if value_info is None:
+                if allow_truncated:
+                    return len(data), fields_seen, None
+                return offset, fields_seen, f"invalid varint value for field {field_number}"
+            _value, offset = value_info
+            continue
+
+        if wire_type == 1:
+            end = offset + 8
+            if end > len(data):
+                if allow_truncated:
+                    return len(data), fields_seen, None
+                return offset, fields_seen, f"truncated fixed64 field {field_number}"
+            offset = end
+            continue
+
+        if wire_type == 2:
+            length_info = _read_varint(data, offset)
+            if length_info is None:
+                if allow_truncated:
+                    return len(data), fields_seen, None
+                return offset, fields_seen, f"invalid length varint for field {field_number}"
+            declared_length, offset = length_info
+            end = offset + declared_length
+            if end > len(data):
+                if allow_truncated:
+                    return len(data), fields_seen, None
+                return offset, fields_seen, f"truncated length-delimited field {field_number}"
+            offset = end
+            continue
+
+        if wire_type == 3:
+            group_stack.append(field_number)
+            continue
+
+        if wire_type == 4:
+            if field_number != group_stack[-1]:
+                return offset, fields_seen, f"mismatched end group field {field_number}"
+            group_stack.pop()
+            continue
+
+        if wire_type == 5:
+            end = offset + 4
+            if end > len(data):
+                if allow_truncated:
+                    return len(data), fields_seen, None
+                return offset, fields_seen, f"truncated fixed32 field {field_number}"
+            offset = end
+            continue
+
+        return offset, fields_seen, f"unsupported wire type {wire_type} for field {field_number}"
+
+    return offset, fields_seen, None
+
+
 def _parse_message(
     data: bytes,
     *,
@@ -78,15 +169,17 @@ def _parse_message(
     """
     fields: list[_ProtoField] = []
     offset = 0
+    fields_seen = 0
 
     while offset < len(data):
-        if len(fields) >= max_fields:
+        if fields_seen >= max_fields:
             return fields, f"field count exceeded limit ({max_fields})"
 
         key_info = _read_varint(data, offset)
         if key_info is None:
             return fields, "truncated or invalid field key"
         key, offset = key_info
+        fields_seen += 1
 
         field_number = key >> 3
         wire_type = key & 0x07
@@ -143,6 +236,22 @@ def _parse_message(
             )
             offset = end
             continue
+
+        if wire_type == 3:  # start group (deprecated but valid protobuf encoding)
+            offset, fields_seen, group_error = _skip_group(
+                data,
+                offset,
+                field_number,
+                max_fields=max_fields,
+                fields_seen=fields_seen,
+                allow_truncated=allow_truncated,
+            )
+            if group_error:
+                return fields, group_error
+            continue
+
+        if wire_type == 4:
+            return fields, f"unexpected end group field {field_number}"
 
         if wire_type == 5:  # fixed32
             end = offset + 4
@@ -240,6 +349,7 @@ class CoreMLScanner(BaseScanner):
             2004,
             2005,
             2006,
+            3000,
         }
     )
     NEURAL_NETWORK_FIELDS: ClassVar[frozenset[int]] = frozenset({303, 403, 500})
@@ -276,6 +386,37 @@ class CoreMLScanner(BaseScanner):
 
     SAFE_LINKED_PATH_PREFIXES: ClassVar[tuple[str, ...]] = ("$BUNDLE_MAIN", "$BUNDLE_IDENTIFIER(")
 
+    def _is_tentative_protobuf_route(self) -> bool:
+        format_validation = self.config.get(FORMAT_VALIDATION_CONFIG_KEY)
+        return isinstance(format_validation, dict) and (
+            format_validation.get("routed_format") == PROTOBUF_MODEL_CANDIDATE_FORMAT
+        )
+
+    @staticmethod
+    def _is_inconclusive_result(result: ScanResult) -> bool:
+        return result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+
+    @staticmethod
+    def _preserve_tentative_inconclusive(result: ScanResult) -> None:
+        result.scanner_name = "unknown"
+        result.metadata["tentative_protobuf_candidate_unresolved"] = "coreml_analysis_incomplete"
+
+    @staticmethod
+    def _reject_tentative_candidate(result: ScanResult) -> ScanResult:
+        result.scanner_name = "unknown"
+        result.metadata["tentative_protobuf_candidate_rejected"] = True
+        for key in (
+            "analysis_incomplete",
+            "coreml_bounded_read_truncated",
+            "scan_outcome",
+            "scan_outcome_message",
+            "scan_outcome_reasons",
+        ):
+            result.metadata.pop(key, None)
+        result.checks = [check for check in result.checks if check.name != "CoreML Bounded Parse Window"]
+        result.finish(success=True)
+        return result
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         if not os.path.isfile(path):
@@ -283,11 +424,11 @@ class CoreMLScanner(BaseScanner):
         if os.path.splitext(path)[1].lower() not in cls.supported_extensions:
             return False
 
-        file_size = os.path.getsize(path)
-        if file_size < 8:
-            return False
-
         try:
+            file_size = os.path.getsize(path)
+            if file_size < 8:
+                return False
+
             read_size = min(file_size, cls.CAN_HANDLE_READ_BYTES)
             with open(path, "rb") as handle:
                 prefix = handle.read(read_size)
@@ -301,8 +442,34 @@ class CoreMLScanner(BaseScanner):
                 return False
 
             return cls._has_coreml_structure(top_fields)
+        except OSError:
+            return True
         except Exception:
             return False
+
+    @staticmethod
+    def _is_unreadable_path_result(result: ScanResult) -> bool:
+        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    @staticmethod
+    def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
+        mark_inconclusive_scan_result(result, "coreml_read_failed")
+        mark_operational_scan_error(result, "coreml_read_failed")
+        result.add_check(
+            name="CoreML File Read",
+            passed=False,
+            message=f"Failed to read CoreML file: {error}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "coreml_read_failed",
+            },
+        )
+        result.finish(success=False)
+        return result
 
     @classmethod
     def _has_coreml_structure(cls, fields: list[_ProtoField]) -> bool:
@@ -314,7 +481,13 @@ class CoreMLScanner(BaseScanner):
         if not description_fields:
             return False
 
-        has_model_type = any(field.field_number in cls.MODEL_TYPE_FIELDS and field.wire_type == 2 for field in fields)
+        has_model_type = any(
+            field.field_number in cls.MODEL_TYPE_FIELDS
+            and field.wire_type == 2
+            and isinstance(field.value, bytes)
+            and len(field.value) > 0
+            for field in fields
+        )
         if not has_model_type:
             return False
 
@@ -332,6 +505,12 @@ class CoreMLScanner(BaseScanner):
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
+            if self._is_unreadable_path_result(path_check_result):
+                return self._finish_read_failure(
+                    self._create_result(),
+                    path,
+                    PermissionError(f"Path is not readable: {path}"),
+                )
             return path_check_result
 
         size_check = self._check_size_limit(path)
@@ -352,6 +531,8 @@ class CoreMLScanner(BaseScanner):
             with open(path, "rb") as handle:
                 data = handle.read(read_limit)
             result.bytes_scanned = len(data)
+        except OSError as exc:
+            return self._finish_read_failure(result, path, exc)
         except Exception as exc:
             result.add_check(
                 name="CoreML File Read",
@@ -388,6 +569,10 @@ class CoreMLScanner(BaseScanner):
             allow_truncated=file_size > self.MAX_PARSE_BYTES,
         )
         if parse_error:
+            if parse_error.startswith("field count exceeded limit"):
+                mark_inconclusive_scan_result(result, "coreml_top_level_field_limit")
+            elif self._is_tentative_protobuf_route() and not self._is_inconclusive_result(result):
+                return self._reject_tentative_candidate(result)
             result.add_check(
                 name="CoreML Protobuf Parse",
                 passed=False,
@@ -396,10 +581,14 @@ class CoreMLScanner(BaseScanner):
                 location=path,
                 details={"parse_error": parse_error},
             )
+            if self._is_tentative_protobuf_route() and self._is_inconclusive_result(result):
+                self._preserve_tentative_inconclusive(result)
             result.finish(success=False)
             return result
 
         if not self._has_coreml_structure(top_fields):
+            if self._is_tentative_protobuf_route() and not self._is_inconclusive_result(result):
+                return self._reject_tentative_candidate(result)
             result.add_check(
                 name="CoreML Structural Validation",
                 passed=False,
@@ -407,6 +596,8 @@ class CoreMLScanner(BaseScanner):
                 severity=IssueSeverity.INFO,
                 location=path,
             )
+            if self._is_tentative_protobuf_route() and self._is_inconclusive_result(result):
+                self._preserve_tentative_inconclusive(result)
             result.finish(success=False)
             return result
 
