@@ -314,6 +314,7 @@ class ZipScanner(BaseScanner):
                     passed=False,
                     message=f"Skipped ZIP symlink target validation for known unreadable member: {name}",
                     severity=IssueSeverity.INFO,
+                    rule_code="S902",
                     location=f"{archive_path}:{name}",
                     details={"entry": name, "reason": "known_unreadable_archive_member_skip"},
                 )
@@ -322,17 +323,20 @@ class ZipScanner(BaseScanner):
             try:
                 target = self._read_symlink_target(archive, info)
             except Exception as exc:
+                mark_archive_scan_incomplete(result, "zip_symlink_target_read_incomplete")
                 result.add_check(
                     name="Symlink Safety Validation",
                     passed=False,
                     message=f"Unable to read symlink target for {name}: {exc!s}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     rule_code="S902",
                     location=f"{archive_path}:{name}",
                     details={
                         "entry": name,
                         "exception": str(exc),
                         "exception_type": type(exc).__name__,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "zip_symlink_target_read_incomplete",
                     },
                 )
                 return False, False
@@ -392,6 +396,7 @@ class ZipScanner(BaseScanner):
 
         # Check depth to prevent zip bomb attacks
         if depth >= self.max_depth:
+            mark_archive_scan_incomplete(result, "zip_depth_limit")
             result.add_check(
                 name="ZIP Depth Bomb Protection",
                 passed=False,
@@ -399,9 +404,13 @@ class ZipScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 rule_code="S410",  # Archive bomb
                 location=path,
-                details={"depth": depth, "max_depth": self.max_depth},
+                details={
+                    "depth": depth,
+                    "max_depth": self.max_depth,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "zip_depth_limit",
+                },
             )
-            mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
             result.finish(success=False)
             return result
         else:
@@ -585,6 +594,7 @@ class ZipScanner(BaseScanner):
                         passed=False,
                         message=skip_message,
                         severity=IssueSeverity.INFO,
+                        rule_code="S902",
                         location=f"{path}:{name}",
                         details={"entry": name, "reason": skip_reason},
                     )
@@ -648,6 +658,9 @@ class ZipScanner(BaseScanner):
                         nested_config = dict(self.config)
                         nested_config.pop("skip_archive_entries", None)
                         nested_config.pop(KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, None)
+                        # Extracted members are deleted below and cannot provide
+                        # stable cache keys for a subsequent scan.
+                        nested_config["cache_enabled"] = False
                         nested_config["_archive_depth"] = depth + 1
                         if zipfile.is_zipfile(tmp_path):
                             nested_config["_zip_depth"] = depth + 1
@@ -680,14 +693,21 @@ class ZipScanner(BaseScanner):
 
                 except Exception as e:
                     scan_complete = False
+                    mark_archive_scan_incomplete(result, "zip_entry_scan_incomplete")
                     result.add_check(
                         name="ZIP Entry Scan",
                         passed=False,
                         message=f"Error scanning ZIP entry {name}: {e!s}",
-                        severity=IssueSeverity.WARNING,
-                        rule_code="S902",  # Scan error
+                        severity=IssueSeverity.INFO,
+                        rule_code="S902",
                         location=f"{path}:{name}",
-                        details={"entry": name, "exception": str(e), "exception_type": type(e).__name__},
+                        details={
+                            "entry": name,
+                            "exception": str(e),
+                            "exception_type": type(e).__name__,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "zip_entry_scan_incomplete",
+                        },
                     )
 
         result.metadata["contents"] = contents
@@ -716,6 +736,7 @@ class ZipScanner(BaseScanner):
 
         if entry_size > max_analysis_bytes:
             result = ScanResult(scanner_name=self.name)
+            mark_archive_scan_incomplete(result, "torchserve_handler_size_limit")
             result.add_check(
                 name="TorchServe Handler Static Analysis",
                 passed=False,
@@ -723,9 +744,15 @@ class ZipScanner(BaseScanner):
                     f"Skipped Python handler static analysis for oversized entry ({entry_size} bytes); "
                     f"limit is {max_analysis_bytes} bytes"
                 ),
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=f"{archive_path}:{entry_name}",
-                details={"entry": entry_name, "entry_size": entry_size, "size_limit": max_analysis_bytes},
+                details={
+                    "entry": entry_name,
+                    "entry_size": entry_size,
+                    "size_limit": max_analysis_bytes,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torchserve_handler_size_limit",
+                },
             )
             result.finish(success=False)
             return result
@@ -735,13 +762,19 @@ class ZipScanner(BaseScanner):
                 source_bytes = source_file.read()
         except OSError as exc:
             result = ScanResult(scanner_name=self.name)
+            mark_archive_scan_incomplete(result, "torchserve_handler_read_failed")
             result.add_check(
                 name="TorchServe Handler Static Analysis",
                 passed=False,
                 message=f"Unable to read Python entry for static analysis: {exc}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=f"{archive_path}:{entry_name}",
-                details={"entry": entry_name, "exception_type": type(exc).__name__},
+                details={
+                    "entry": entry_name,
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torchserve_handler_read_failed",
+                },
             )
             result.finish(success=False)
             return result
@@ -755,13 +788,20 @@ class ZipScanner(BaseScanner):
 
         result = ScanResult(scanner_name=self.name)
         if parse_error is not None:
+            mark_archive_scan_incomplete(result, "torchserve_handler_parse_failed")
             result.add_check(
                 name="TorchServe Handler Static Analysis",
                 passed=False,
                 message=f"Unable to parse Python entry for static analysis: {parse_error}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=f"{archive_path}:{entry_name}",
-                details={"entry": entry_name, "analysis_kind": "syntax", "parse_error": parse_error},
+                details={
+                    "entry": entry_name,
+                    "analysis_kind": "syntax",
+                    "parse_error": parse_error,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torchserve_handler_parse_failed",
+                },
             )
         else:
             result.add_check(

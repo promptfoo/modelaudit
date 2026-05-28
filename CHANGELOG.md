@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
+- classify unavailable ZIP traversal, member, manifest-less TorchServe handler, and Keras artifact scan coverage as inconclusive while preserving archive-depth security findings
 - classify unavailable TAR traversal and member scan coverage as inconclusive while preserving depth-limit security findings
 - classify unavailable Skops member and schema coverage as inconclusive rather than security findings
 - classify bounded, unreadable, or unparseable TorchServe MAR analysis gaps as inconclusive rather than security findings
