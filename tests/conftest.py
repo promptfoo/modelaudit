@@ -7,6 +7,7 @@ import shutil
 import sys
 import tempfile
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, Mock, patch
@@ -225,6 +226,16 @@ def pytest_runtest_setup(item):
         marker = item.get_closest_marker(marker_name)
         if marker is not None and not _check_framework(module_name):
             pytest.skip(f"{marker_name} is not installed")
+
+
+@pytest.fixture(autouse=True)
+def reset_rule_config_between_tests() -> Iterator[None]:
+    """Keep CLI rule suppressions from leaking between tests."""
+    from modelaudit.config import reset_config
+
+    reset_config()
+    yield
+    reset_config()
 
 
 @pytest.fixture(autouse=True)
