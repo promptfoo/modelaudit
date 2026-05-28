@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -19,6 +19,15 @@ _PORTABLE_EXECUTABLE_POINTER_OFFSET = 0x3C
 _PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET = 0x40
 _PORTABLE_EXECUTABLE_MAX_HEADER_OFFSET = 1024 * 1024
 _PORTABLE_EXECUTABLE_SIGNATURE = b"PE\x00\x00"
+ExecutableArchiveMemberProbeOutcome = Literal["detected", "absent", "incomplete"]
+_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_PREFIXES = (
+    b"\x7fELF",
+    b"\xfe\xed\xfa\xce",
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+    b"\xce\xfa\xed\xfe",
+    b"#!",
+)
 _MACHO_FAT_MAGIC_32_BE = b"\xca\xfe\xba\xbe"
 _MACHO_FAT_MAGIC_32_LE = b"\xbe\xba\xfe\xca"
 _MACHO_FAT_MAGIC_64_BE = b"\xca\xfe\xba\xbf"
@@ -127,34 +136,44 @@ def executable_archive_member_name_rule_code(member_name: str) -> str | None:
     return None
 
 
-def _looks_like_portable_executable(prefix: bytes, *, path: str | None = None) -> bool:
+def _looks_like_portable_executable(
+    prefix: bytes,
+    *,
+    read_prefix: Callable[[int], bytes] | None = None,
+) -> ExecutableArchiveMemberProbeOutcome:
     if not prefix.startswith(b"MZ"):
-        return False
+        return "absent"
     if b"This program cannot be run in DOS mode" in prefix[:512]:
-        return True
+        return "detected"
     if len(prefix) < _PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET:
-        return False
+        return "absent"
 
     pe_offset = int.from_bytes(
         prefix[_PORTABLE_EXECUTABLE_POINTER_OFFSET : _PORTABLE_EXECUTABLE_POINTER_OFFSET + 4],
         "little",
         signed=False,
     )
-    if not _PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET <= pe_offset <= _PORTABLE_EXECUTABLE_MAX_HEADER_OFFSET:
-        return False
+    if pe_offset < _PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET:
+        return "absent"
+    if pe_offset > _PORTABLE_EXECUTABLE_MAX_HEADER_OFFSET:
+        return "incomplete"
 
     if pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE) <= len(prefix):
-        return prefix[pe_offset : pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE)] == _PORTABLE_EXECUTABLE_SIGNATURE
+        if prefix[pe_offset : pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE)] == _PORTABLE_EXECUTABLE_SIGNATURE:
+            return "detected"
+        return "absent"
 
-    if path is None:
-        return False
+    if read_prefix is None:
+        return "absent"
 
-    try:
-        with open(path, "rb") as member_file:
-            member_file.seek(pe_offset)
-            return member_file.read(len(_PORTABLE_EXECUTABLE_SIGNATURE)) == _PORTABLE_EXECUTABLE_SIGNATURE
-    except OSError:
-        return False
+    expanded_prefix = read_prefix(pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE))
+    if (
+        len(expanded_prefix) >= pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE)
+        and expanded_prefix[pe_offset : pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE)]
+        == _PORTABLE_EXECUTABLE_SIGNATURE
+    ):
+        return "detected"
+    return "absent"
 
 
 def _looks_like_macho_fat_binary(prefix: bytes) -> bool:
@@ -173,20 +192,61 @@ def _looks_like_macho_fat_binary(prefix: bytes) -> bool:
     return len(prefix) >= 8 + (arch_count * arch_entry_size)
 
 
+def probe_executable_archive_member_signature(
+    read_prefix: Callable[[int], bytes],
+) -> ExecutableArchiveMemberProbeOutcome:
+    """Classify strong executable signatures without reading beyond the bounded PE budget."""
+    prefix = read_prefix(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES)
+    if prefix.startswith(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_PREFIXES):
+        return "detected"
+    if _looks_like_macho_fat_binary(prefix):
+        return "detected"
+    return _looks_like_portable_executable(prefix, read_prefix=read_prefix)
+
+
+def has_executable_archive_member_signature(read_prefix: Callable[[int], bytes]) -> bool:
+    """Return True when a bounded prefix reader exposes a confirmed executable signature."""
+    return probe_executable_archive_member_signature(read_prefix) == "detected"
+
+
+def probe_executable_archive_member_content(path: str) -> ExecutableArchiveMemberProbeOutcome:
+    """Classify executable bytes in an extracted archive member."""
+    try:
+        with open(path, "rb") as member_file:
+
+            def read_prefix(limit: int) -> bytes:
+                member_file.seek(0)
+                return member_file.read(limit)
+
+            return probe_executable_archive_member_signature(read_prefix)
+    except OSError:
+        return "absent"
+
+
 def is_executable_archive_member_content(path: str) -> bool:
-    """Return True when a member begins with a strong executable signature."""
-    return executable_archive_member_content_rule_code(path) is not None
+    """Return True when a member begins with a confirmed executable signature."""
+    return probe_executable_archive_member_content(path) == "detected"
 
 
 def executable_archive_member_content_rule_code(path: str) -> str | None:
     """Return the executable rule code implied by an archive member's content."""
     try:
         with open(path, "rb") as member_file:
-            prefix = member_file.read(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES)
+            prefix_cache = member_file.read(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES)
+
+            def read_prefix(limit: int) -> bytes:
+                nonlocal prefix_cache
+                if limit <= len(prefix_cache) or not prefix_cache.startswith(b"MZ"):
+                    return prefix_cache[:limit]
+                member_file.seek(0)
+                expanded_prefix = member_file.read(limit)
+                if len(expanded_prefix) > len(prefix_cache):
+                    prefix_cache = expanded_prefix
+                return prefix_cache[:limit]
+
+            return _executable_archive_member_content_rule_code(prefix_cache, read_prefix=read_prefix)
     except OSError:
         return None
-
-    return _executable_archive_member_content_rule_code(prefix, path=path)
 
 
 def executable_archive_member_content_rule_code_from_bytes(content: bytes) -> str | None:
@@ -194,8 +254,12 @@ def executable_archive_member_content_rule_code_from_bytes(content: bytes) -> st
     return _executable_archive_member_content_rule_code(content)
 
 
-def _executable_archive_member_content_rule_code(prefix: bytes, *, path: str | None = None) -> str | None:
-    if _looks_like_portable_executable(prefix, path=path):
+def _executable_archive_member_content_rule_code(
+    prefix: bytes,
+    *,
+    read_prefix: Callable[[int], bytes] | None = None,
+) -> str | None:
+    if _looks_like_portable_executable(prefix, read_prefix=read_prefix) == "detected":
         return "S501"
     if prefix.startswith(b"\x7fELF"):
         return "S502"
@@ -1549,6 +1613,42 @@ _PYTHON_MEMBER_CHECK_NAME = "Python Archive Member Security"
 _EXECUTABLE_MEMBER_CHECK_NAME = "Executable Archive Member Detection"
 
 
+def _add_executable_archive_member_check(
+    *,
+    archive_kind: str,
+    archive_path: str,
+    member_name: str,
+    result: ScanResult,
+) -> None:
+    result.add_check(
+        name=_EXECUTABLE_MEMBER_CHECK_NAME,
+        passed=False,
+        message=f"Executable file found in {archive_kind} archive: {member_name}",
+        severity=IssueSeverity.WARNING,
+        location=f"{archive_path}:{member_name}",
+        details={"entry": member_name},
+    )
+
+
+def _add_incomplete_executable_archive_member_check(
+    *,
+    archive_kind: str,
+    archive_path: str,
+    member_name: str,
+    result: ScanResult,
+    incomplete_reason: str,
+) -> None:
+    mark_archive_scan_incomplete(result, incomplete_reason)
+    result.add_check(
+        name=_EXECUTABLE_MEMBER_CHECK_NAME,
+        passed=False,
+        message=f"Executable content probe was inconclusive for {archive_kind} archive member: {member_name}",
+        severity=IssueSeverity.INFO,
+        location=f"{archive_path}:{member_name}",
+        details={"entry": member_name, "analysis_incomplete": True},
+    )
+
+
 def scan_archive_member_for_known_risks(
     *,
     archive_kind: str,
@@ -1559,20 +1659,22 @@ def scan_archive_member_for_known_risks(
     result: ScanResult,
     max_python_analysis_bytes: int,
     python_analysis_incomplete_reason: str,
+    executable_analysis_incomplete_reason: str,
+    analyze_python_source: bool = True,
 ) -> None:
     """Inspect generic archive members that nested dispatch would otherwise ignore.
 
     ``archive_kind`` is a short label (``"ZIP"`` / ``"TAR"`` / ``"NeMo"``) used only for the
     human-readable message text. The dispatcher (1) routes Python-looking
-    members through bounded AST analysis, (2) flags native/script executable-
-    suffix members, and (3) leaves everything else to the caller's normal
-    nested routing.
+    members through bounded AST analysis unless content routing already owns
+    the member, (2) flags native/script executable-suffix members, and (3)
+    leaves everything else to the caller's normal nested routing.
     """
     normalized_name = member_name.replace("\\", "/").lstrip("/")
     normalized_lower = normalized_name.lower()
     location = f"{archive_path}:{member_name}"
 
-    if is_python_archive_member_name(normalized_lower):
+    if is_python_archive_member_name(normalized_lower) and analyze_python_source:
         if total_size > max_python_analysis_bytes:
             mark_archive_scan_incomplete(result, python_analysis_incomplete_reason)
             result.add_check(
@@ -1606,6 +1708,25 @@ def scan_archive_member_for_known_risks(
             with open(tmp_path, "rb") as member_file:
                 calls = high_risk_python_calls_in_source(member_file.read())
         except PythonArchiveMemberParseError as exc:
+            executable_probe_outcome = probe_executable_archive_member_content(tmp_path)
+            if executable_probe_outcome == "detected":
+                _add_executable_archive_member_check(
+                    archive_kind=archive_kind,
+                    archive_path=archive_path,
+                    member_name=member_name,
+                    result=result,
+                )
+                return
+            if executable_probe_outcome == "incomplete":
+                _add_incomplete_executable_archive_member_check(
+                    archive_kind=archive_kind,
+                    archive_path=archive_path,
+                    member_name=member_name,
+                    result=result,
+                    incomplete_reason=executable_analysis_incomplete_reason,
+                )
+                return
+
             mark_archive_scan_incomplete(result, python_analysis_incomplete_reason)
             result.add_check(
                 name=_PYTHON_MEMBER_CHECK_NAME,
@@ -1643,14 +1764,31 @@ def scan_archive_member_for_known_risks(
             )
         return
 
-    if is_executable_archive_member_name(normalized_lower) or (
-        tmp_path is not None and is_executable_archive_member_content(tmp_path)
-    ):
-        result.add_check(
-            name=_EXECUTABLE_MEMBER_CHECK_NAME,
-            passed=False,
-            message=f"Executable file found in {archive_kind} archive: {member_name}",
-            severity=IssueSeverity.WARNING,
-            location=location,
-            details={"entry": member_name},
+    if is_executable_archive_member_name(normalized_lower):
+        _add_executable_archive_member_check(
+            archive_kind=archive_kind,
+            archive_path=archive_path,
+            member_name=member_name,
+            result=result,
+        )
+        return
+
+    if tmp_path is None:
+        return
+
+    executable_probe_outcome = probe_executable_archive_member_content(tmp_path)
+    if executable_probe_outcome == "detected":
+        _add_executable_archive_member_check(
+            archive_kind=archive_kind,
+            archive_path=archive_path,
+            member_name=member_name,
+            result=result,
+        )
+    elif executable_probe_outcome == "incomplete":
+        _add_incomplete_executable_archive_member_check(
+            archive_kind=archive_kind,
+            archive_path=archive_path,
+            member_name=member_name,
+            result=result,
+            incomplete_reason=executable_analysis_incomplete_reason,
         )
