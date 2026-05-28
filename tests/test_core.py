@@ -149,7 +149,7 @@ def test_multi_file_directory_scan_refreshes_changed_pickle_source_snapshot(
     assert any(issue.rule_code == "DANGEROUS_CALL_GRAPH" for issue in result.issues)
 
 
-def _build_malicious_pickle() -> bytes:
+def _build_malicious_pickle(*, protocol: int | None = None) -> bytes:
     """Build a tiny pickle payload that exercises nested dangerous-opcode scanning."""
     import os as os_module
 
@@ -160,7 +160,7 @@ def _build_malicious_pickle() -> bytes:
             """Return a dangerous reducer target for scanner regression coverage."""
             return (os_module.system, ("echo core-dispatch-test",))
 
-    return pickle.dumps(DangerousPayload())
+    return pickle.dumps(DangerousPayload(), protocol=protocol)
 
 
 def _require_tf_protos() -> None:
@@ -1411,8 +1411,48 @@ def test_scan_file_routes_renamed_flax_stream_with_leading_scalar_object(
     assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
 
 
-@pytest.mark.parametrize("leading_scalar", [123, 91], ids=["json-object-byte", "json-array-byte"])
-def test_scan_file_routes_nested_renamed_flax_stream_with_json_delimiter_scalar(
+@pytest.mark.parametrize("prefix", [b"I1\n.", b"cbuiltins\nstr\n.", b"\x80\x04."])
+def test_scan_file_routes_renamed_flax_stream_after_pickle_shaped_prefix(tmp_path: Path, prefix: bytes) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "stream-pickle-prefix.jpg"
+    checkpoint.write_bytes(
+        prefix
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+def test_scan_file_preserves_pickle_findings_in_protocol0_flax_overlap(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "stream-malicious-protocol0-prefix.jpg"
+    checkpoint.write_bytes(
+        _build_malicious_pickle(protocol=0)
+        + flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize("leading_scalar", [123, 91, 60], ids=["json-object-byte", "json-array-byte", "xml-angle-byte"])
+def test_scan_file_routes_nested_renamed_flax_stream_with_delimiter_like_scalar(
     tmp_path: Path,
     leading_scalar: int,
 ) -> None:
@@ -1434,6 +1474,311 @@ def test_scan_file_routes_nested_renamed_flax_stream_with_json_delimiter_scalar(
     assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
 
 
+def test_scan_file_routes_nested_renamed_flax_stream_after_protocol0_pickle_prefix(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    nested_payload = b"cbuiltins\nstr\n." + flax_msgpack_scanner.msgpack.packb(
+        {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+        use_bin_type=True,
+    )
+    archive = tmp_path / "nested-protocol0-prefix.zip"
+    _create_misnamed_zip(archive, {"payload.jpg": nested_payload})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        b"\x80\x04",
+        b"\x80\x04(2.",
+        b"\x80\x04NNa.",
+        b"\x80\x04\x95" + struct.pack("<Q", 1_000_000) + b"N.",
+        b"\x80\x04}(Nu.",
+        b"\x80\x04(Nd.",
+    ],
+    ids=["binary-header", "mark-dup", "invalid-append", "overlong-frame", "odd-setitems", "odd-dict"],
+)
+def test_scan_file_does_not_merge_pickle_failure_for_binary_header_like_flax_stream(
+    tmp_path: Path,
+    prefix: bytes,
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "binary-header-like-flax.jpg"
+    checkpoint.write_bytes(
+        prefix
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is True
+    assert all("pickle" not in (check.name + check.message).lower() for check in result.checks)
+
+
+def test_scan_file_selected_pickle_does_not_claim_binary_header_like_flax_stream(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "selected-binary-header-like-flax.jpg"
+    checkpoint.write_bytes(
+        b"\x80\x04"
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"scanners": ["pickle"], "cache_scan_results": False})
+
+    assert result.scanner_name != "pickle"
+    assert all("pickle parsing failed" not in check.message.lower() for check in result.checks)
+
+
+def test_scan_file_selected_pickle_does_not_claim_nested_binary_header_like_flax_stream(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    payload = b"\x80\x04" + flax_msgpack_scanner.msgpack.packb(
+        {"params": {"w": [1, 2, 3]}},
+        use_bin_type=True,
+    )
+    archive = tmp_path / "selected-binary-header-like-flax.zip"
+    _create_misnamed_zip(archive, {"payload.jpg": payload})
+
+    result = scan_file(str(archive), config={"scanners": ["zip", "pickle"], "cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert all("pickle parsing failed" not in check.message.lower() for check in result.checks)
+
+
+def test_scan_file_preserves_binary_pickle_findings_when_stop_follows_probe_window(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "delayed-binary-pickle-stop.jpg"
+    pickle_stream = (
+        b"\x80\x04cos\nsystem\n(S'echo pwned'\ntR" + (b"N0" * (file_detection.PROTO0_1_MAX_PROBE_BYTES // 2 + 1)) + b"."
+    )
+    checkpoint.write_bytes(
+        pickle_stream
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
+def test_scan_file_preserves_binary_pickle_findings_when_dangerous_opcode_follows_probe_window(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "late-binary-pickle-dangerous-global.jpg"
+    pickle_stream = (
+        b"\x80\x04" + (b"N0" * (file_detection.PROTO0_1_MAX_PROBE_BYTES // 2 + 1)) + b"cos\nsystem\n(S'echo pwned'\ntR."
+    )
+    checkpoint.write_bytes(
+        pickle_stream
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("opcode", "operand"),
+    [(b"q", b"\x00"), (b"r", b"\x00\x00\x00\x00"), (b"p", b"0\n")],
+    ids=["binput", "long-binput", "put"],
+)
+def test_scan_file_preserves_binary_pickle_findings_when_operand_crosses_probe_boundary(
+    tmp_path: Path,
+    opcode: bytes,
+    operand: bytes,
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / f"binary-pickle-{opcode.hex()}-boundary.jpg"
+    malicious_prefix = b"\x80\x04cos\nsystem\n(S'echo pwned'\ntR"
+    padding_size = file_detection.PROTO0_1_MAX_PROBE_BYTES - len(malicious_prefix) - 1
+    neutral_padding = (b"N0" * (padding_size // 2)) + (b"N" if padding_size % 2 else b"")
+    pickle_stream = malicious_prefix + neutral_padding + opcode + operand + b"."
+    checkpoint.write_bytes(
+        pickle_stream
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert (
+        pickle_stream[file_detection.PROTO0_1_MAX_PROBE_BYTES - 1 : file_detection.PROTO0_1_MAX_PROBE_BYTES] == opcode
+    )
+    assert result.scanner_name == "flax_msgpack"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    "pickle_stream",
+    [
+        b"\x80\x04Ncos\nsystem\n(S'echo pwned'\ntR.",
+        b"\x80\x04}q\x00Nq\x00cos\nsystem\n(S'echo pwned'\ntR.",
+    ],
+    ids=["extra-return-stack-item", "memo-overwrite"],
+)
+def test_scan_file_preserves_unpickler_permitted_binary_pickle_findings(
+    tmp_path: Path,
+    pickle_stream: bytes,
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "unpickler-permitted-overlap.jpg"
+    checkpoint.write_bytes(
+        pickle_stream
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
+def test_scan_file_preserves_dangerous_list_setitem_binary_pickle_findings(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "list-setitem-overlap.jpg"
+    pickle_stream = b"\x80\x04]NaK\x00cos\nsystem\n(S'id'\ntRs."
+    checkpoint.write_bytes(
+        pickle_stream
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
+def test_scan_file_preserves_binary_pickle_structural_tamper_in_flax_overlap(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "structural-tamper-overlap.jpg"
+    checkpoint.write_bytes(
+        b"\x80\x04\x80\x04K\x01."
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(check.name == "Pickle Structural Tamper Check" for check in result.checks)
+
+
+def test_scan_file_preserves_nested_binary_pickle_structural_tamper_in_flax_overlap(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    payload = b"\x80\x04\x80\x04K\x01." + flax_msgpack_scanner.msgpack.packb(
+        {"params": {"w": [1, 2, 3]}},
+        use_bin_type=True,
+    )
+    archive = tmp_path / "structural-tamper-overlap.zip"
+    _create_misnamed_zip(archive, {"payload.jpg": payload})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert any(check.name == "Pickle Structural Tamper Check" for check in result.checks)
+
+
+@pytest.mark.parametrize(
+    "scanner_config",
+    [{"exclude_scanners": ["flax_msgpack"]}, {"scanners": ["pickle"]}],
+    ids=["excluded-flax", "exact-pickle"],
+)
+def test_scan_file_preserves_selected_pickle_findings_in_flax_content_overlap(
+    tmp_path: Path,
+    scanner_config: dict[str, list[str]],
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "selected-list-setitem-overlap.jpg"
+    pickle_stream = b"\x80\x04]NaK\x00cos\nsystem\n(S'id'\ntRs."
+    checkpoint.write_bytes(
+        pickle_stream
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={**scanner_config, "cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("kind") == "preferred"
+        and check.details.get("skipped_scanner_id") == "flax_msgpack"
+        for check in result.checks
+    )
+
+
 def test_scan_file_does_not_raise_for_deep_json_array_near_match(tmp_path: Path) -> None:
     payload = tmp_path / "deep-json-array.jpg"
     payload.write_bytes((b"[" * 2000) + b"0" + (b"]" * 2000))
@@ -1453,11 +1798,36 @@ def test_scan_file_does_not_raise_for_deep_json_array_near_match(tmp_path: Path)
     assert nested_result.success is True
 
 
-def test_scan_file_fails_closed_for_renamed_flax_stream_with_scalar_padding_past_analysis_limit(tmp_path: Path) -> None:
+def test_scan_file_fails_closed_for_ambiguous_json_looking_stream_before_later_flax_root(tmp_path: Path) -> None:
     if not flax_msgpack_scanner.HAS_MSGPACK:
         pytest.skip("msgpack unavailable")
 
-    checkpoint = tmp_path / "stream-scalar-padding.jpg"
+    checkpoint = tmp_path / "json-looking-padding.jpg"
+    checkpoint.write_bytes(
+        b"["
+        + b" " * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(checkpoint), cache_scan_results=False)
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize("suffix", [".jpg", ".txt"])
+def test_scan_file_fails_closed_for_renamed_flax_stream_with_scalar_padding_past_analysis_limit(
+    tmp_path: Path, suffix: str
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / f"stream-scalar-padding{suffix}"
     checkpoint.write_bytes(
         flax_msgpack_scanner.msgpack.packb(None, use_bin_type=True) * 4097
         + flax_msgpack_scanner.msgpack.packb(
@@ -1556,6 +1926,26 @@ def test_scan_file_routes_msgpack_checkpoint_overlap_suffixes_to_flax_scanner(tm
     checkpoint = tmp_path / f"malicious{suffix}"
     checkpoint.write_bytes(
         flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"])
+def test_scan_file_routes_malicious_flax_checkpoint_under_skipped_suffix(tmp_path: Path, suffix: str) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / f"malicious{suffix}"
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
     )
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
