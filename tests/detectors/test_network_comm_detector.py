@@ -340,6 +340,28 @@ class TestNetworkCommDetector:
         assert url_finding["url"] == "https://example.com/download/<redacted>.bin"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
 
+    def test_url_safe_artifact_filename_token_stems_are_redacted(self) -> None:
+        """URL-safe bearer token stems should not bypass redaction when they carry artifact suffixes."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz123456-_"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}.bin".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_urlsafe_artifact_filename_stems_are_redacted(self) -> None:
+        """URL-safe base64 token stems may include hyphen and underscore before artifact suffixes."""
+        detector = NetworkCommDetector()
+        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz123456-_"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}.bin".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
     @pytest.mark.parametrize(
         "url",
         [

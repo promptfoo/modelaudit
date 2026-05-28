@@ -90,10 +90,13 @@ def _shannon_entropy_per_char(value: str) -> float:
 
 
 def _looks_like_high_entropy_filename_stem(stem: str) -> bool:
-    if len(stem) < 20 or not re.fullmatch(r"[A-Za-z0-9]+", stem):
+    if len(stem) < 20 or not re.fullmatch(r"[A-Za-z0-9_-]+", stem):
         return False
 
     character_classes = sum(bool(pattern.search(stem)) for pattern in _PATH_TOKEN_CHARACTER_CLASS_PATTERNS[:3])
+    if re.search(r"[-_]", stem) and not re.search(r"[A-Z]", stem):
+        return False
+
     return character_classes >= 2 and _shannon_entropy_per_char(stem) >= _MIN_CAPABILITY_TOKEN_ENTROPY
 
 
