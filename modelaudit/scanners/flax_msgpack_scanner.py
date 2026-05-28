@@ -7,7 +7,7 @@ import re
 from contextlib import suppress
 from typing import Any, ClassVar
 
-from ..scanner_results import mark_inconclusive_scan_result
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import has_inconclusive_renamed_flax_msgpack_routing, is_flax_msgpack_checkpoint_file
 
 try:
@@ -43,6 +43,7 @@ class FlaxMsgpackScanner(BaseScanner):
 
     name = "flax_msgpack"
     description = "Scans Flax/JAX msgpack checkpoints for security threats and integrity issues"
+    RECURSION_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "flax_msgpack_recursion_limit_exceeded"
     # Enhanced file extension support for JAX/Flax ecosystem
     supported_extensions: ClassVar[list[str]] = [
         ".msgpack",
@@ -506,13 +507,19 @@ class FlaxMsgpackScanner(BaseScanner):
     ) -> None:
         """Recursively analyze msgpack content for security threats and anomalies."""
         if depth > self.max_recursion_depth:
+            mark_inconclusive_scan_result(result, self.RECURSION_LIMIT_INCONCLUSIVE_REASON)
             result.add_check(
                 name="Recursion Depth Check",
                 passed=False,
                 message=f"Maximum recursion depth exceeded: {depth}",
                 severity=IssueSeverity.INFO,
                 location=location,
-                details={"depth": depth, "max_allowed": self.max_recursion_depth},
+                details={
+                    "depth": depth,
+                    "max_allowed": self.max_recursion_depth,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self.RECURSION_LIMIT_INCONCLUSIVE_REASON,
+                },
                 rule_code="S902",
             )
             return
@@ -1151,5 +1158,7 @@ class FlaxMsgpackScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=not result.has_errors and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        )
         return result
