@@ -227,7 +227,7 @@ class JaxCheckpointScanner(BaseScanner):
     _METADATA_TRAVERSAL_LIMIT_REASON: ClassVar[str] = "jax_metadata_traversal_depth_limit"
     _PICKLE_SCAN_LIMIT_REASON: ClassVar[str] = "jax_pickle_scan_limit_exceeded"
     _LEGACY_PICKLE_INITIAL_OPCODES: ClassVar[bytes] = (
-        b"()BCcFGIJKLMNPSTUVX]}\x82\x83\x84\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x96\x97"
+        b"()BCcFGIJKLMNPSTUVX]}\x82\x83\x84\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x95\x96\x97"
     )
     _LEGACY_PICKLE_PREFIX_PROBE_BYTES: ClassVar[int] = 8192
 

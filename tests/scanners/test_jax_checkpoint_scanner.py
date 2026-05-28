@@ -517,6 +517,31 @@ def test_orbax_binbytes_prefix_scans_pickle(tmp_path: Path) -> None:
     )
 
 
+def test_orbax_frame_prefix_scans_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_frame"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    frame_payload = b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n."
+    checkpoint_file.write_bytes(b"\x95" + len(frame_payload).to_bytes(8, "little") + frame_payload)
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
 def test_orbax_truncated_binstring_prefix_scans_pickle(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "orbax_long_binstring"
     checkpoint_dir.mkdir()
