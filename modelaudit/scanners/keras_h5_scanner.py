@@ -85,6 +85,17 @@ class KerasH5Scanner(BaseScanner):
             "system",
         }
     )
+    _WEIGHTS_LIKE_ROOT_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "layer_names",
+            "layers",
+            "model_weights",
+            "optimizer_weights",
+            "vars",
+            "weights",
+            "weight_names",
+        }
+    )
     _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
     _WRAPPED_LAYER_SCAN_MODEL: ClassVar[dict[str, Any]] = {"class_name": "Sequential", "config": {"layers": []}}
 
@@ -167,9 +178,14 @@ class KerasH5Scanner(BaseScanner):
                 if isinstance(keras_version_attr, str) and keras_version_attr.strip():
                     result.metadata["keras_version"] = keras_version_attr.strip()
 
-                # CVE-2026-1669 only applies to Keras weight loading. Skip generic HDF5
-                # files to avoid warning on benign non-Keras artifacts.
-                if "model_config" in f.attrs or "keras_version" in result.metadata:
+                # CVE-2026-1669 applies to weight loading too. Inspect full
+                # Keras files and weights-like HDF5 layouts while leaving
+                # unrelated generic HDF5 artifacts quiet.
+                if (
+                    "model_config" in f.attrs
+                    or "keras_version" in result.metadata
+                    or self._has_weights_like_hdf5_layout(f)
+                ):
                     self._check_hdf5_external_references(f, result, path)
 
                 # Check if this is a Keras model file
@@ -333,6 +349,29 @@ class KerasH5Scanner(BaseScanner):
                 rule_code="S902",
             )
             return self._JSON_ATTRIBUTE_PARSE_FAILED
+
+    @classmethod
+    def _has_weights_like_hdf5_layout(cls, h5_file: Any) -> bool:
+        """Return True for HDF5 layouts that resemble Keras weights-only files."""
+        if any(str(key).lower() in cls._WEIGHTS_LIKE_ROOT_KEYS for key in h5_file):
+            return True
+
+        if any(str(key).lower() in cls._WEIGHTS_LIKE_ROOT_KEYS for key in h5_file.attrs):
+            return True
+
+        found_weight_metadata = False
+
+        def visit(name: str, _obj: Any) -> None:
+            nonlocal found_weight_metadata
+            if found_weight_metadata:
+                return
+            normalized_parts = {part.lower() for part in name.replace("\\", "/").split("/") if part}
+            if normalized_parts & cls._WEIGHTS_LIKE_ROOT_KEYS:
+                found_weight_metadata = True
+
+        with suppress(Exception):
+            h5_file.visititems(visit)
+        return found_weight_metadata
 
     def _check_hdf5_external_references(self, h5_file: Any, result: ScanResult, source_path: str) -> None:
         """Detect HDF5 external links/storage before any Keras-specific parsing short-circuits."""

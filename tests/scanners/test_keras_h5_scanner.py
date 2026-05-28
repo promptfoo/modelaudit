@@ -624,6 +624,32 @@ def test_keras_h5_scanner_skips_generic_hdf5_external_links_without_keras_metada
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
+def test_keras_h5_scanner_flags_weights_only_external_link_without_keras_metadata(tmp_path: Path) -> None:
+    """Weights-only HDF5 files can still be Keras load inputs and must not skip external references."""
+    external_source = tmp_path / "external_source.h5"
+    with h5py.File(external_source, "w") as f:
+        f.create_dataset("payload", data=[1.0])
+
+    weights_path = tmp_path / "weights_only.h5"
+    with h5py.File(weights_path, "w") as f:
+        f["weights"] = h5py.ExternalLink(external_source.name, "/payload")
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].severity == IssueSeverity.WARNING
+    assert cve_issues[0].details["parse_status"] == "unknown"
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/weights",
+            "filename": "external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
 def test_keras_h5_scanner_malicious_model(tmp_path):
     """Test scanning a malicious Keras H5 model."""
     model_path = create_mock_h5_file(tmp_path, malicious=True)
