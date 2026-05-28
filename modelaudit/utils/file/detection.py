@@ -1730,7 +1730,7 @@ def _detect_tar_route(path: str) -> str | None:
                     return "nemo"
                 if member.issym() and target_name is not None:
                     linked_root_config_targets.add(target_name)
-    except (OSError, tarfile.TarError):
+    except (EOFError, OSError, tarfile.TarError):
         return None
 
     return "tar"
