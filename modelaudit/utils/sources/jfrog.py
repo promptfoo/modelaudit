@@ -217,12 +217,12 @@ def _build_jfrog_auth_headers(
     if api_token:
         return {"X-JFrog-Art-Api": api_token}
 
+    if access_token:
+        return {"Authorization": f"Bearer {access_token}"}
+
     env_api_token = os.getenv("JFROG_API_TOKEN")
     if env_api_token:
         return {"X-JFrog-Art-Api": env_api_token}
-
-    if access_token:
-        return {"Authorization": f"Bearer {access_token}"}
 
     env_access_token = os.getenv("JFROG_ACCESS_TOKEN")
     if env_access_token:
