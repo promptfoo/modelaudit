@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.paddle_scanner import PaddleScanner
 from modelaudit.utils.file.detection import validate_file_type
 
@@ -130,10 +130,14 @@ def test_paddle_read_failure_is_inconclusive_not_security_finding(
 
     with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
         direct = PaddleScanner().scan(str(path))
-        aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
 
     read_checks = [check for check in direct.checks if check.name == "Paddle File Read"]
+    assert direct.success is False
+    assert aggregate.success is False
     assert len(read_checks) == 1
+    assert read_checks[0].status == CheckStatus.FAILED
+    assert "Error reading file" in read_checks[0].message
     assert read_checks[0].severity == IssueSeverity.INFO
     assert read_checks[0].details["analysis_incomplete"] is True
     assert read_checks[0].details["scan_outcome_reason"] == "paddle_read_failed"
@@ -143,6 +147,7 @@ def test_paddle_read_failure_is_inconclusive_not_security_finding(
     metadata = aggregate.file_metadata[str(path)]
     assert "paddle_read_failed" in metadata["scan_outcome_reasons"]
     assert metadata["operational_error_reason"] == "paddle_read_failed"
+    assert any(check.name == "Paddle File Read" and "Error reading file" in check.message for check in aggregate.checks)
     assert not [
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]

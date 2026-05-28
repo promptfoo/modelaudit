@@ -7,7 +7,7 @@ import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors.suspicious_symbols import BINARY_CODE_PATTERNS
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
 from tests.helpers import create_mock_onnx
 
@@ -80,7 +80,11 @@ def test_pytorch_binary_read_failure_is_inconclusive_not_security_finding(
     aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
 
     read_checks = [check for check in direct.checks if check.name == "Binary File Read"]
+    assert direct.success is False
+    assert aggregate.success is False
     assert len(read_checks) == 1
+    assert read_checks[0].status == CheckStatus.FAILED
+    assert "Unable to read binary file" in read_checks[0].message
     assert read_checks[0].severity == IssueSeverity.INFO
     assert read_checks[0].details["analysis_incomplete"] is True
     assert read_checks[0].details["scan_outcome_reason"] == "pytorch_binary_read_failed"
@@ -90,6 +94,9 @@ def test_pytorch_binary_read_failure_is_inconclusive_not_security_finding(
     metadata = aggregate.file_metadata[str(path)]
     assert "pytorch_binary_read_failed" in metadata["scan_outcome_reasons"]
     assert metadata["operational_error_reason"] == "pytorch_binary_read_failed"
+    assert any(
+        check.name == "Binary File Read" and "Unable to read binary file" in check.message for check in aggregate.checks
+    )
     assert not [
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]
@@ -136,9 +143,12 @@ def test_pytorch_binary_validation_read_failure_is_operational(
     result = PyTorchBinaryScanner().scan(str(path))
 
     assert scanner_open_count == 2
+    assert result.success is False
     assert result.metadata["scan_outcome_reasons"] == ["pytorch_binary_read_failed"]
     assert result.metadata["operational_error_reason"] == "pytorch_binary_read_failed"
-    assert any(check.name == "Binary File Read" for check in result.checks)
+    assert any(
+        check.name == "Binary File Read" and "Unable to read binary file" in check.message for check in result.checks
+    )
 
 
 def test_pytorch_binary_unreadable_path_preflight_is_operational(

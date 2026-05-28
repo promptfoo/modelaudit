@@ -343,6 +343,66 @@ def test_pytorch_zip_scanner_native_library_near_match_extension_stays_clean(tmp
     )
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected_rule_code"),
+    [
+        (b"\x7fELF" + b"\x00" * 64, "S502"),
+        (b"MZ" + b"\x00" * 58 + (1536).to_bytes(4, "little") + b"\x00" * (1536 - 64) + b"PE\x00\x00", "S501"),
+    ],
+)
+def test_pytorch_zip_scanner_detects_executable_content_with_benign_name(
+    tmp_path: Path,
+    payload: bytes,
+    expected_rule_code: str,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "content_hidden_executable.pt")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data/payload.dat", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    executable_issues = [
+        issue for issue in result.issues if issue.message and "Executable file found in PyTorch model" in issue.message
+    ]
+    assert any(
+        issue.details.get("file") == "archive/data/payload.dat" and issue.rule_code == expected_rule_code
+        for issue in executable_issues
+    )
+    assert all(issue.severity == IssueSeverity.CRITICAL for issue in executable_issues)
+
+
+def test_pytorch_zip_scanner_detects_executable_magic_in_unreferenced_numeric_member(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "unreferenced_numeric_member.pt")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data/0", b"\x7fELF" + b"\x00" * 64)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.details.get("file") == "archive/data/0"
+        and issue.message
+        and "Executable file found in PyTorch model" in issue.message
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_scanner_ignores_executable_magic_in_referenced_tensor_storage(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "referenced_tensor_bytes.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", b"\x7fELF" + b"\x00" * 64)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
+    assert not any(
+        issue.details.get("file") == "archive/data/0"
+        and issue.message
+        and "Executable file found in PyTorch model" in issue.message
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_scanner_relaxes_crc_for_pickle_scan(tmp_path: Path) -> None:
     """CRC-mismatched pickle entries should still be scanned with an explicit warning."""
     model_path = create_mock_pytorch_zip(tmp_path / "crc_mismatch.pt", malicious=True)

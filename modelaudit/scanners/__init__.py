@@ -13,7 +13,21 @@ from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanRes
 
 logger = logging.getLogger(__name__)
 
-_READ_FAILURE_AWARE_EXTENSION_SCANNERS = frozenset({"numpy", "paddle", "pytorch_binary", "tf_savedmodel"})
+_READ_FAILURE_AWARE_EXTENSION_SCANNERS = frozenset(
+    {
+        "cntk",
+        "coreml",
+        "lightgbm",
+        "numpy",
+        "paddle",
+        "pytorch_binary",
+        "safetensors",
+        "tensorrt",
+        "tf_metagraph",
+        "tf_savedmodel",
+        "zip",
+    }
+)
 
 
 def _check_numpy_compatibility() -> tuple[bool, str]:
@@ -261,8 +275,8 @@ class ScannerRegistry:
         try:
             is_zip_file = os.path.isfile(path) and zipfile.is_zipfile(path)
         except OSError:
-            # Only scanners with explicit unreadable-input outcomes can safely
-            # retain extension ownership after a failed container probe.
+            # Continue only into scanners that explicitly translate unreadable
+            # owned inputs into an operationally incomplete outcome.
             zip_probe_failed = True
 
         for candidate_extension in candidate_extensions:

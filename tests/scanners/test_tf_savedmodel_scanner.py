@@ -8,7 +8,7 @@ from typing import Any, Protocol, TypedDict
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import _ASSET_PROBE_BYTES, TensorFlowSavedModelScanner
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as has_tf_protos
@@ -84,7 +84,11 @@ def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
     aggregate = scan_model_directory_or_file(path, cache_scan_results=False)
 
     read_checks = [check for check in direct.checks if check.name == "SavedModel File Read"]
+    assert direct.success is False
+    assert aggregate.success is False
     assert len(read_checks) == 1
+    assert read_checks[0].status == CheckStatus.FAILED
+    assert "Unable to read TF SavedModel file" in read_checks[0].message
     assert read_checks[0].severity == IssueSeverity.INFO
     assert read_checks[0].details["analysis_incomplete"] is True
     assert read_checks[0].details["scan_outcome_reason"] == "savedmodel_read_failed"
@@ -94,6 +98,10 @@ def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
     metadata = aggregate.file_metadata[str(Path(path) / "saved_model.pb")].model_dump()
     assert "savedmodel_read_failed" in metadata["scan_outcome_reasons"]
     assert metadata["operational_error_reason"] == "savedmodel_read_failed"
+    assert any(
+        check.name == "SavedModel File Read" and "Unable to read TF SavedModel file" in check.message
+        for check in aggregate.checks
+    )
     assert not [
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]
@@ -1127,8 +1135,12 @@ def test_scan_savedmodel_directory_detects_probe_boundary_padded_pickle_asset(tm
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
-def test_scan_savedmodel_directory_trivial_probe_boundary_padding_stays_clean(tmp_path: Path) -> None:
+def test_scan_savedmodel_directory_trivial_probe_boundary_padding_stays_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Large trivial opcode prefixes without STOP should not be routed as pickle payloads."""
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
     model_dir = Path(create_tf_savedmodel(tmp_path))
     asset_path = model_dir / "assets" / "probe-boundary-notes.txt"
     asset_path.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1))

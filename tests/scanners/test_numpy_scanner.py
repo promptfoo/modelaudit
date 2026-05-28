@@ -9,7 +9,7 @@ import pytest
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.rules import Severity
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.numpy_scanner import NumPyScanner
 
 
@@ -83,7 +83,11 @@ def test_numpy_read_failure_is_operational_not_security_finding(
     aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
 
     read_checks = [check for check in direct.checks if check.name == "NumPy File Read"]
+    assert direct.success is False
+    assert aggregate.success is False
     assert len(read_checks) == 1
+    assert read_checks[0].status == CheckStatus.FAILED
+    assert "Unable to read NumPy file" in read_checks[0].message
     assert read_checks[0].severity == IssueSeverity.INFO
     assert read_checks[0].details["analysis_incomplete"] is True
     assert read_checks[0].details["operational_error"] is True
@@ -93,6 +97,9 @@ def test_numpy_read_failure_is_operational_not_security_finding(
     assert direct.metadata["operational_error_reason"] == "numpy_read_failed"
     assert "numpy_read_failed" in direct.metadata["scan_outcome_reasons"]
     assert aggregate.file_metadata[str(path)]["operational_error_reason"] == "numpy_read_failed"
+    assert any(
+        check.name == "NumPy File Read" and "Unable to read NumPy file" in check.message for check in aggregate.checks
+    )
     assert not [
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]
