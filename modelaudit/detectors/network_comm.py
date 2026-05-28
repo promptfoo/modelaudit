@@ -177,7 +177,7 @@ def _is_public_source_repository_segment(hostname: str, segments: list[str], ind
         return False
     if hostname == "raw.githubusercontent.com":
         return True
-    return any(segment.lower() in {"blob", "raw", "tree"} for segment in segments[3:])
+    return any(segment.lower() in {"blob", "raw", "releases", "tree"} for segment in segments[3:])
 
 
 def _is_path_style_cloud_bucket_segment(scheme: str, hostname: str, index: int) -> bool:
@@ -246,6 +246,10 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
             _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
             segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
             continue
+        parameter_redaction = _redact_path_parameter_tokens(segment)
+        if parameter_redaction is not None:
+            segments[index] = parameter_redaction
+            continue
 
         if _is_public_model_repository_segment(hostname, segments, index):
             continue
@@ -258,11 +262,6 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
         if _is_path_style_cloud_bucket_segment(scheme, hostname, index):
             continue
         if _is_gcs_api_bucket_segment(hostname, segments, index):
-            continue
-
-        parameter_redaction = _redact_path_parameter_tokens(segment)
-        if parameter_redaction is not None:
-            segments[index] = parameter_redaction
             continue
         if is_slack_webhook_secret or _looks_like_capability_path_token(segment):
             _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
@@ -321,6 +320,38 @@ def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *
         end = max(end, url_end)
 
     return _redact_urls_in_text(data[start:end].decode("utf-8", errors="ignore"))
+
+
+def _url_text_containing_offset(data: bytes, offset: int) -> str | None:
+    start = offset
+    while start > 0 and data[start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
+        start -= 1
+    end = offset
+    while end < len(data) and data[end] not in _URL_TEXT_BOUNDARY_BYTES:
+        end += 1
+
+    candidate = data[start:end]
+    if b"://" not in candidate:
+        return None
+    return candidate.decode("utf-8", errors="ignore")
+
+
+def _is_domain_match_redacted_from_url_path(data: bytes, match_start: int, domain: str) -> bool:
+    url = _url_text_containing_offset(data, match_start)
+    if url is None:
+        return False
+
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+
+    hostname = parsed.hostname
+    if not hostname or domain == hostname.lower():
+        return False
+    if domain not in parsed.path.lower():
+        return False
+    return domain not in _redact_url_for_finding(url).lower()
 
 
 _DOC_CONTEXT_EXTENSIONS: tuple[str, ...] = (
@@ -988,6 +1019,8 @@ class NetworkCommDetector:
 
             # Skip common false positives
             if domain in seen_domains:
+                continue
+            if _is_domain_match_redacted_from_url_path(data, match.start(), domain):
                 continue
             if domain.endswith((".pkl", ".pt", ".h5", ".pb", ".onnx", ".json")):
                 continue  # File extensions

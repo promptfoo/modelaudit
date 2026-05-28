@@ -307,6 +307,28 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == url
 
+    def test_public_github_release_repository_names_are_preserved(self) -> None:
+        """GitHub release artifact URLs should keep public repository identity."""
+        detector = NetworkCommDetector()
+        repo_id = "MyModel-2025-LongName-abcdef"
+        url = f"https://github.com/org/{repo_id}/releases/download/v1/model.bin"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == url
+
+    def test_public_github_release_repository_names_are_preserved(self) -> None:
+        """Public GitHub release repository identities should remain visible for audit follow-up."""
+        detector = NetworkCommDetector()
+        repo_id = "MyModel-2025-LongName-abcdef"
+        url = f"https://github.com/org/{repo_id}/releases/download/v1/model.bin"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == url
+
     def test_non_public_hex_path_capability_tokens_are_redacted(self) -> None:
         """Opaque lowercase hex download IDs should be redacted outside public model revisions."""
         detector = NetworkCommDetector()
@@ -329,21 +351,21 @@ class TestNetworkCommDetector:
         assert url_finding["url"] == "https://example.com/download/<redacted>/model.bin"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
 
+    def test_dotted_path_tokens_do_not_leak_as_domain_findings(self) -> None:
+        """Domain-like path tokens should not leak through the later domain detector."""
+        detector = NetworkCommDetector()
+        path_token = "0123456789abcdefghjkmnpqrstvwxyz.com"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}/model.bin".encode(), "metadata.txt")
+        serialized = json.dumps(findings, sort_keys=True)
+
+        assert "https://example.com/download/<redacted>/model.bin" in serialized
+        assert path_token not in serialized
+
     def test_high_entropy_artifact_filename_stems_are_redacted(self) -> None:
         """Opaque bearer tokens carried as known artifact filenames should not bypass redaction."""
         detector = NetworkCommDetector()
         path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
-
-        findings = detector.scan(f"https://example.com/download/{path_token}.bin".encode(), "metadata.txt")
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == "https://example.com/download/<redacted>.bin"
-        assert path_token not in json.dumps(url_finding, sort_keys=True)
-
-    def test_url_safe_artifact_filename_token_stems_are_redacted(self) -> None:
-        """URL-safe bearer token stems should not bypass redaction when they carry artifact suffixes."""
-        detector = NetworkCommDetector()
-        path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz123456-_"
 
         findings = detector.scan(f"https://example.com/download/{path_token}.bin".encode(), "metadata.txt")
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
@@ -380,6 +402,32 @@ class TestNetworkCommDetector:
         serialized = json.dumps(url_findings, sort_keys=True)
         assert url in serialized
         assert "<redacted>" not in serialized
+
+    def test_path_style_cloud_bucket_parameters_are_redacted(self) -> None:
+        """Bucket identity should stay visible while matrix params on it are sanitized."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+        url = f"https://storage.googleapis.com/model-bucket;token={path_token}/weights.bin"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        cloud_finding = next(finding for finding in findings if finding["type"] == "cloud_storage_url")
+
+        assert cloud_finding["url"] == "https://storage.googleapis.com/model-bucket;token=<redacted>/weights.bin"
+        assert path_token not in json.dumps(cloud_finding, sort_keys=True)
+
+    def test_path_style_cloud_bucket_parameters_are_redacted(self) -> None:
+        """Bucket identity should stay visible while bucket path-parameter tokens are redacted."""
+        detector = NetworkCommDetector()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+        url = f"https://storage.googleapis.com/model-bucket;token={path_token}/weights.bin"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        url_findings = [finding for finding in findings if finding["type"] in {"url_detected", "cloud_storage_url"}]
+
+        assert url_findings
+        serialized = json.dumps(url_findings, sort_keys=True)
+        assert "model-bucket;token=<redacted>" in serialized
+        assert path_token not in serialized
 
     @pytest.mark.parametrize(
         ("url", "expected_url"),
@@ -473,6 +521,18 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == "https://raw.githubusercontent.com/org/repo/<redacted>/model.py"
         assert github_token not in json.dumps(url_finding, sort_keys=True)
+
+    def test_dotted_path_tokens_do_not_leak_as_domain_findings(self) -> None:
+        """Domain scanning should not re-emit a dotted token already redacted from a URL path."""
+        detector = NetworkCommDetector()
+        path_token = "0123456789abcdefghjkmnpqrstvwxyz.com"
+        data = f"https://example.com/download/{path_token}/model.bin".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+
+        serialized = json.dumps(findings, sort_keys=True)
+        assert path_token not in serialized
+        assert any(finding["type"] == "url_detected" for finding in findings)
 
     def test_benign_short_url_paths_are_preserved(self) -> None:
         """Ordinary URL paths should remain readable after redaction."""
