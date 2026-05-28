@@ -543,6 +543,112 @@ class TestWeightDistributionScanner:
         assert "Blocked torch.load" in scanner.extraction_unsafe_reason
         assert load_called is False
 
+    def test_blocks_torch_load_for_vulnerable_pytorch_prereleases(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Prerelease PyTorch versions must fail closed before torch.load."""
+        for torch_version in ["2.6.0rc1", "2.6.0a0", "2.6.0.dev20250101", "2.10.0a0"]:
+            load_called = False
+
+            fake_torch: Any = types.ModuleType("torch")
+            fake_torch.__version__ = torch_version
+
+            class FakeTensor:  # pragma: no cover - simple test double
+                pass
+
+            fake_torch.Tensor = FakeTensor
+            fake_torch.device = lambda value: value
+
+            def fake_load(_path: str, *, map_location: object, weights_only: bool) -> dict[str, object]:
+                nonlocal load_called
+                load_called = True
+                return {}
+
+            fake_torch.load = fake_load
+            monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+            model_path = tmp_path / f"blocked-{torch_version}.pt"
+            model_path.write_bytes(b"not-a-valid-pytorch-model")
+
+            scanner = WeightDistributionScanner()
+            weights = scanner._extract_pytorch_weights(str(model_path))
+
+            assert weights == {}
+            assert scanner.extraction_unsafe
+            assert scanner.extraction_unsafe_reason is not None
+            assert "stable PyTorch 2.6.0 or newer" in scanner.extraction_unsafe_reason
+            assert load_called is False
+
+    def test_allows_torch_load_for_stable_patched_pytorch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        load_call: dict[str, object] = {}
+
+        fake_torch: Any = types.ModuleType("torch")
+        fake_torch.__version__ = "2.6.0+cpu"
+
+        class FakeTensor:  # pragma: no cover - simple test double
+            pass
+
+        fake_torch.Tensor = FakeTensor
+        fake_torch.device = lambda value: value
+
+        def fake_load(_path: str, *, map_location: object, weights_only: bool) -> dict[str, object]:
+            load_call["map_location"] = map_location
+            load_call["weights_only"] = weights_only
+            return {}
+
+        fake_torch.load = fake_load
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+        model_path = tmp_path / "stable.pt"
+        model_path.write_bytes(b"not-a-valid-pytorch-model")
+
+        scanner = WeightDistributionScanner()
+        weights = scanner._extract_pytorch_weights(str(model_path))
+
+        assert weights == {}
+        assert scanner.extraction_unsafe is False
+        assert load_call == {"map_location": "cpu", "weights_only": True}
+
+    def test_blocks_torch_load_for_unknown_pytorch_version(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        load_called = False
+
+        fake_torch: Any = types.ModuleType("torch")
+        fake_torch.__version__ = "unknown"
+
+        class FakeTensor:  # pragma: no cover - simple test double
+            pass
+
+        fake_torch.Tensor = FakeTensor
+        fake_torch.device = lambda value: value
+
+        def fake_load(_path: str, *, map_location: object, weights_only: bool) -> dict[str, object]:
+            nonlocal load_called
+            load_called = True
+            return {}
+
+        fake_torch.load = fake_load
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+        model_path = tmp_path / "unknown.pt"
+        model_path.write_bytes(b"not-a-valid-pytorch-model")
+
+        scanner = WeightDistributionScanner()
+        weights = scanner._extract_pytorch_weights(str(model_path))
+
+        assert weights == {}
+        assert scanner.extraction_unsafe
+        assert load_called is False
+
     def test_multiple_anomalies(self):
         """Test detection of multiple types of anomalies in one layer"""
         import numpy as np

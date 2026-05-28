@@ -146,6 +146,7 @@ def pytest_runtest_setup(item):
             "test_cntk_scanner.py",  # CNTK .dnn/.cmf scanner tests
             "test_rknn_scanner.py",  # RKNN scanner tests
             "test_torch7_scanner.py",  # Torch7 scanner tests
+            "test_weight_distribution_scanner.py",  # PyTorch weight extraction safety regressions
             "test_lightgbm_scanner.py",  # LightGBM native scanner tests
             "test_llamafile_scanner.py",  # Llamafile executable scanner tests
             "test_coreml_scanner.py",  # CoreML scanner tests
