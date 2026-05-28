@@ -338,9 +338,11 @@ def test_protocol_zero_jax_checkpoint_pickle_global_opcode_is_detected(tmp_path:
 
 def test_orbax_protocol_zero_checkpoint_without_jax_marker_scans_pickle(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "orbax_protocol0"
-    _write_orbax_metadata(checkpoint_dir, {"type": "orbax_checkpoint"})
+    checkpoint_dir.mkdir()
     checkpoint_file = checkpoint_dir / "checkpoint"
     checkpoint_file.write_bytes(b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
 
     result = JaxCheckpointScanner().scan(str(checkpoint_dir))
 
