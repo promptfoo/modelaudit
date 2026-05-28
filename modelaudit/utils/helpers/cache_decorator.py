@@ -38,9 +38,22 @@ _READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS = frozenset(
 )
 
 
+def _is_read_failure_aware_scanner_path(file_path: str) -> bool:
+    try:
+        from ...scanners.manifest_scanner import ManifestScanner
+        from ...scanners.text_scanner import TextScanner
+    except Exception:
+        return False
+
+    return ManifestScanner.can_handle(file_path) or TextScanner.can_handle(file_path)
+
+
 def should_bypass_cache_for_read_failure_aware_file(file_path: str) -> bool:
     """Bypass stale clean cache entries for formats with explicit read-failure outcomes."""
-    return os.path.splitext(file_path)[1].lower() in _READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS
+    extension_is_read_failure_aware = (
+        os.path.splitext(file_path)[1].lower() in _READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS
+    )
+    return extension_is_read_failure_aware or _is_read_failure_aware_scanner_path(file_path)
 
 
 def should_bypass_cache_for_safetensors_header_limit(file_path: str, config: dict[str, Any]) -> bool:
