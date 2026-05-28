@@ -22,7 +22,10 @@ from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTE
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
-from .archive_member_security import is_executable_archive_member_name
+from .archive_member_security import (
+    executable_archive_member_content_rule_code_from_bytes,
+    executable_archive_member_name_rule_code,
+)
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 from .picklescan_adapter import apply_pickle_member_context
@@ -44,6 +47,8 @@ _TORCHSCRIPT_DEBUG_PREFIX_BYTES = 256
 _TORCHSCRIPT_SOURCE_MAX_BYTES = 1024 * 1024
 _TORCHSCRIPT_GENERATED_CLASS_PATTERN = re.compile(r"(?m)^class\s+[A-Za-z_][A-Za-z0-9_]*\(Module\):\s*$")
 _TORCHSCRIPT_GENERATED_METHOD_PATTERN = re.compile(r"(?m)^\s+def\s+\w+\(self:\s+__torch__\.")
+_EXECUTABLE_MEMBER_PROBE_BYTES = 1024
+_PORTABLE_EXECUTABLE_MAX_PROBE_BYTES = (1024 * 1024) + 4
 _TORCHSCRIPT_FORBIDDEN_SOURCE_PATTERN = re.compile(
     r"(?im)(?:^\s*(?:import|from)\s+|\b(?:__import__|eval|exec|compile|open)\s*\(|\b(?:os|subprocess|socket|requests)\s*\.)"
 )
@@ -1629,6 +1634,7 @@ class PyTorchZipScanner(BaseScanner):
         """Detect suspicious non-pickle files in the archive"""
         python_files_found = False
         executable_files_found = False
+        trusted_storage_members = self._trusted_referenced_storage_blob_members(result)
         member_names = {self._get_zip_member_name(entry).replace("\\", "/").lstrip("/") for entry in safe_entries}
         entries_by_normalized_name = {
             self._get_zip_member_name(entry).replace("\\", "/").lstrip("/"): entry for entry in safe_entries
@@ -1658,13 +1664,36 @@ class PyTorchZipScanner(BaseScanner):
                     details={"file": name},
                 )
                 python_files_found = True
-            # Check for shell scripts or other executable files
-            elif is_executable_archive_member_name(normalized_name_lower):
+            # Check for shell scripts or other executable files, including payloads with benign names.
+            else:
+                executable_rule_code = executable_archive_member_name_rule_code(normalized_name_lower)
+                if executable_rule_code is None and normalized_name not in trusted_storage_members:
+                    prefix = self._read_member_prefix(
+                        zip_file,
+                        entry,
+                        _EXECUTABLE_MEMBER_PROBE_BYTES,
+                        phase="executable_member_probe",
+                        result=result,
+                    )
+                    executable_rule_code = executable_archive_member_content_rule_code_from_bytes(prefix)
+                    if executable_rule_code is None and prefix.startswith(b"MZ"):
+                        prefix = self._read_member_prefix(
+                            zip_file,
+                            entry,
+                            _PORTABLE_EXECUTABLE_MAX_PROBE_BYTES,
+                            phase="executable_member_probe",
+                            result=result,
+                        )
+                        executable_rule_code = executable_archive_member_content_rule_code_from_bytes(prefix)
+
+                if executable_rule_code is None:
+                    continue
                 result.add_check(
                     name="Executable File Detection",
                     passed=False,
                     message=f"Executable file found in PyTorch model: {name}",
                     severity=IssueSeverity.CRITICAL,
+                    rule_code=executable_rule_code,
                     location=f"{path}:{name}",
                     details={"file": name},
                 )
@@ -1686,6 +1715,28 @@ class PyTorchZipScanner(BaseScanner):
                 message="No executable files found in model",
                 location=path,
             )
+
+    @classmethod
+    def _trusted_referenced_storage_blob_members(cls, result: ScanResult) -> set[str]:
+        """Return tensor storage members proven by trusted persistent-ID findings."""
+        trusted_members: set[str] = set()
+        for check in result.checks:
+            details = check.details
+            if details.get("trusted_pytorch_archive_context") is not True:
+                continue
+            pickle_filename = details.get("pickle_filename")
+            storage_key = details.get("pytorch_storage_key")
+            if (
+                not isinstance(pickle_filename, str)
+                or not pickle_filename.endswith("data.pkl")
+                or not isinstance(storage_key, str)
+                or not cls._is_ascii_decimal_digits(storage_key)
+            ):
+                continue
+            normalized_pickle = pickle_filename.replace("\\", "/").lstrip("/")
+            prefix = normalized_pickle[: -len("data.pkl")]
+            trusted_members.add(f"{prefix}data/{storage_key}")
+        return trusted_members
 
     def _validate_pytorch_structure(self, pickle_files: list[zipfile.ZipInfo], result: ScanResult) -> None:
         """Validate that the PyTorch model has expected structure"""

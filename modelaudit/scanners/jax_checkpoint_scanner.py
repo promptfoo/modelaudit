@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from ..core_results import mark_operational_scan_error
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
+from ..utils.file.detection import JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES, is_jax_json_checkpoint_file
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 try:
@@ -34,6 +37,17 @@ class _PatternFindingBudget:
     max_findings: int
     recorded_findings: int = 0
     limit_reported: bool = False
+
+
+@dataclass
+class _BoundedJsonPrefixFrame:
+    """Track visible JSON container position while a bounded prefix is walked."""
+
+    kind: str
+    context: str
+    state: str
+    pending_key: str | None = None
+    next_index: int = 0
 
 
 class JaxCheckpointScanner(BaseScanner):
@@ -208,6 +222,10 @@ class JaxCheckpointScanner(BaseScanner):
         re.IGNORECASE,
     )
     DEFAULT_MAX_PICKLE_SCAN_BYTES: ClassVar[int] = 16 * 1024 * 1024
+    _JSON_ANALYSIS_SIZE_LIMIT_REASON: ClassVar[str] = "jax_json_checkpoint_analysis_size_limit"
+    _JSON_PREFIX_PATTERN_READ_FAILED_REASON: ClassVar[str] = "jax_json_checkpoint_prefix_pattern_read_failed"
+    _METADATA_TRAVERSAL_LIMIT_REASON: ClassVar[str] = "jax_metadata_traversal_depth_limit"
+    _PICKLE_SCAN_LIMIT_REASON: ClassVar[str] = "jax_pickle_scan_limit_exceeded"
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         """Initialize JAX checkpoint scanning limits and regex detectors."""
@@ -343,6 +361,10 @@ class JaxCheckpointScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         """Surface metadata traversal truncation so deeply nested payloads do not fail open."""
+        if not contexts:
+            return
+
+        mark_inconclusive_scan_result(result, self._METADATA_TRAVERSAL_LIMIT_REASON)
         for context in sorted(contexts):
             result.add_check(
                 name=check_name,
@@ -351,12 +373,14 @@ class JaxCheckpointScanner(BaseScanner):
                     f"Reached the maximum JAX metadata traversal depth at {context}; "
                     "nested metadata below this path was not scanned"
                 ),
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=location,
                 details={
                     "context": context,
                     "max_metadata_traversal_depth": self._MAX_METADATA_TRAVERSAL_DEPTH,
                     "traversal_depth_cap_reached": True,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self._METADATA_TRAVERSAL_LIMIT_REASON,
                 },
                 rule_code="S902",
             )
@@ -428,6 +452,237 @@ class JaxCheckpointScanner(BaseScanner):
         return result
 
     @staticmethod
+    def _decode_truncated_json_string_fragment(fragment: str) -> str | None:
+        """Decode visible string content cut off by the bounded prefix read."""
+        candidate = fragment
+        try:
+            decoded = json.loads(f'"{candidate}"')
+        except json.JSONDecodeError:
+            escape_start = candidate.rfind("\\")
+            if escape_start < 0:
+                return None
+
+            preceding_backslashes = 0
+            for character in reversed(candidate[:escape_start]):
+                if character != "\\":
+                    break
+                preceding_backslashes += 1
+            if preceding_backslashes % 2 != 0:
+                return None
+
+            incomplete_escape = candidate[escape_start:]
+            if incomplete_escape != "\\" and re.fullmatch(r"\\u[0-9a-fA-F]{0,3}", incomplete_escape) is None:
+                return None
+
+            try:
+                decoded = json.loads(f'"{candidate[:escape_start]}"')
+            except json.JSONDecodeError:
+                return None
+
+        return decoded if isinstance(decoded, str) else None
+
+    @classmethod
+    def _skip_bounded_json_prefix_container(cls, prefix_text: str, offset: int) -> int | None:
+        """Return the end of a balanced nested container without visiting its values."""
+        opening = prefix_text[offset]
+        if opening not in "{[":
+            return None
+
+        closing_for = {"{": "}", "[": "]"}
+        nested_containers = [opening]
+        decoder = json.JSONDecoder()
+        offset += 1
+        while offset < len(prefix_text):
+            marker = prefix_text[offset]
+            if marker == '"':
+                try:
+                    _, offset = decoder.raw_decode(prefix_text, offset)
+                except json.JSONDecodeError:
+                    return None
+                continue
+            if marker in "{[":
+                nested_containers.append(marker)
+            elif marker in "}]":
+                if marker != closing_for[nested_containers[-1]]:
+                    return None
+                nested_containers.pop()
+                if not nested_containers:
+                    return offset + 1
+            offset += 1
+        return None
+
+    @classmethod
+    def _iter_bounded_json_prefix_strings(
+        cls,
+        prefix_text: str,
+        *,
+        depth_cap_contexts: set[str] | None = None,
+    ) -> Iterator[tuple[str, str]]:
+        """Yield decoded visible JSON strings with bounded ancestor context."""
+        decoder = json.JSONDecoder()
+        frames: list[_BoundedJsonPrefixFrame] = []
+        offset = 0
+        root_complete = False
+
+        def finish_value() -> None:
+            if not frames:
+                return
+            parent = frames[-1]
+            parent.state = "separator"
+            parent.pending_key = None
+            if parent.kind == "array":
+                parent.next_index += 1
+
+        def value_context(frame: _BoundedJsonPrefixFrame) -> str | None:
+            if frame.kind == "object":
+                return f"{frame.context}.{frame.pending_key}" if frame.pending_key is not None else None
+            return f"{frame.context}[{frame.next_index}]"
+
+        while offset < len(prefix_text):
+            if prefix_text[offset].isspace():
+                offset += 1
+                continue
+
+            if not frames:
+                if root_complete:
+                    return
+                if prefix_text[offset] not in "{[":
+                    return
+                kind = "object" if prefix_text[offset] == "{" else "array"
+                state = "key" if kind == "object" else "value"
+                frames.append(_BoundedJsonPrefixFrame(kind, "json_checkpoint_bounded_prefix", state))
+                offset += 1
+                continue
+
+            frame = frames[-1]
+            marker = prefix_text[offset]
+            if frame.kind == "object" and frame.state == "key":
+                if marker == "}":
+                    frames.pop()
+                    offset += 1
+                    root_complete = not frames
+                    finish_value()
+                    continue
+                if marker != '"':
+                    return
+                try:
+                    key, offset = decoder.raw_decode(prefix_text, offset)
+                except json.JSONDecodeError:
+                    return
+                if not isinstance(key, str):
+                    return
+                frame.pending_key = key
+                frame.state = "colon"
+                continue
+
+            if frame.kind == "object" and frame.state == "colon":
+                if marker != ":":
+                    return
+                frame.state = "value"
+                offset += 1
+                continue
+
+            if frame.state == "value":
+                if frame.kind == "array" and marker == "]":
+                    frames.pop()
+                    offset += 1
+                    root_complete = not frames
+                    finish_value()
+                    continue
+                context = value_context(frame)
+                if context is None:
+                    return
+                if marker == '"':
+                    try:
+                        text_value, offset = decoder.raw_decode(prefix_text, offset)
+                    except json.JSONDecodeError:
+                        text_value = cls._decode_truncated_json_string_fragment(prefix_text[offset + 1 :])
+                        if text_value:
+                            yield context, text_value
+                        return
+                    if not isinstance(text_value, str):
+                        return
+                    yield context, text_value
+                    finish_value()
+                    continue
+                if marker in "{[":
+                    if len(frames) >= cls._MAX_METADATA_TRAVERSAL_DEPTH:
+                        if depth_cap_contexts is not None:
+                            depth_cap_contexts.add(context)
+                        skipped_offset = cls._skip_bounded_json_prefix_container(prefix_text, offset)
+                        if skipped_offset is None:
+                            return
+                        offset = skipped_offset
+                        finish_value()
+                        continue
+                    kind = "object" if marker == "{" else "array"
+                    state = "key" if kind == "object" else "value"
+                    frames.append(_BoundedJsonPrefixFrame(kind, context, state))
+                    offset += 1
+                    continue
+                scalar_end = offset
+                while scalar_end < len(prefix_text) and prefix_text[scalar_end] not in ",}]":
+                    scalar_end += 1
+                if scalar_end == len(prefix_text):
+                    return
+                offset = scalar_end
+                finish_value()
+                continue
+
+            if frame.state != "separator":
+                return
+            closing_marker = "}" if frame.kind == "object" else "]"
+            if marker == closing_marker:
+                frames.pop()
+                offset += 1
+                root_complete = not frames
+                finish_value()
+                continue
+            if marker != ",":
+                return
+            frame.state = "key" if frame.kind == "object" else "value"
+            offset += 1
+
+    def _scan_bounded_json_prefix_patterns(self, path: str, result: ScanResult) -> None:
+        """Scan decoded JSON string content visible inside the bounded prefix."""
+        with open(path, "rb") as source:
+            prefix_text = source.read(JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES).decode("utf-8-sig", errors="ignore")
+
+        depth_cap_contexts: set[str] = set()
+        first_token_offset = len(prefix_text) - len(prefix_text.lstrip())
+        try:
+            parsed_root, _ = json.JSONDecoder().raw_decode(prefix_text, first_token_offset)
+        except (json.JSONDecodeError, RecursionError):
+            string_values = self._iter_bounded_json_prefix_strings(
+                prefix_text,
+                depth_cap_contexts=depth_cap_contexts,
+            )
+        else:
+            string_values = self._iter_string_metadata(
+                parsed_root,
+                "json_checkpoint_bounded_prefix",
+                depth_cap_contexts=depth_cap_contexts,
+            )
+
+        finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
+        for context, text_value in string_values:
+            self._add_suspicious_pattern_checks(
+                text_value,
+                context=context,
+                check_name="JSON Pattern Security Check",
+                message_prefix="Suspicious pattern in bounded JSON checkpoint prefix",
+                location=path,
+                result=result,
+                finding_budget=finding_budget,
+            )
+        self._add_metadata_traversal_depth_limit_checks(
+            contexts=depth_cap_contexts,
+            check_name="JSON Metadata Traversal Depth Limit",
+            location=path,
+            result=result,
+        )
+
+    @staticmethod
     def _parse_pickle_global_reference(arg: str) -> tuple[str, str] | None:
         """Parse pickle GLOBAL/INST opcode args into ``(module, name)``."""
         normalized = arg.replace("\n", " ").strip()
@@ -464,7 +719,8 @@ class JaxCheckpointScanner(BaseScanner):
         if os.path.isfile(path):
             ext = os.path.splitext(path)[1].lower()
             if ext in cls.supported_extensions:
-                return cls._is_likely_jax_file(path)
+                return cls._is_likely_jax_file(path) or is_jax_json_checkpoint_file(path)
+            return is_jax_json_checkpoint_file(path)
 
         return False
 
@@ -549,6 +805,21 @@ class JaxCheckpointScanner(BaseScanner):
                 start = index + 1
         return False
 
+    @classmethod
+    def should_analyze_inconclusive_json_overlap(cls, path: str) -> bool:
+        """Return whether bounded JAX analysis should supplement ambiguous JSON routing."""
+        if Path(path).suffix.lower() in cls.supported_extensions:
+            return True
+        try:
+            with open(path, "rb") as source:
+                prefix_text = source.read(JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES).decode("utf-8-sig", errors="ignore")
+        except OSError:
+            return False
+        return any(
+            cls._contains_jax_indicator(text_value)
+            for _, text_value in cls._iter_bounded_json_prefix_strings(prefix_text)
+        )
+
     def _scan_orbax_checkpoint(self, path: str, result: ScanResult) -> None:
         """Scan Orbax checkpoint directory."""
         path_obj = Path(path)
@@ -567,23 +838,35 @@ class JaxCheckpointScanner(BaseScanner):
                     self._analyze_orbax_metadata(metadata, str(metadata_path), result)
 
                 except json.JSONDecodeError as e:
+                    mark_inconclusive_scan_result(result, "jax_orbax_metadata_parse_failed")
                     result.add_check(
                         name="Orbax Metadata JSON Validation",
                         passed=False,
                         message=f"Invalid JSON in Orbax metadata: {e}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=str(metadata_path),
                         rule_code="S902",
-                        details={"error": str(e), "file": metadata_file},
+                        details={
+                            "error": str(e),
+                            "file": metadata_file,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "jax_orbax_metadata_parse_failed",
+                        },
                     )
                 except Exception as e:
+                    mark_inconclusive_scan_result(result, "jax_orbax_metadata_read_failed")
                     result.add_check(
                         name="Orbax Metadata Read Check",
                         passed=False,
                         message=f"Error reading Orbax metadata: {e}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=str(metadata_path),
                         rule_code="S902",
+                        details={
+                            "error": str(e),
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "jax_orbax_metadata_read_failed",
+                        },
                     )
 
         # Scan checkpoint files
@@ -671,7 +954,7 @@ class JaxCheckpointScanner(BaseScanner):
                 self._scan_pickle_checkpoint(path, result)
             elif header.startswith(b"\x93NUMPY"):  # NumPy format
                 self._scan_numpy_checkpoint(path, result)
-            elif self._header_looks_like_json(header):  # JSON format
+            elif self._header_looks_like_json(header) or is_jax_json_checkpoint_file(path):  # JSON format
                 self._scan_json_checkpoint(path, result)
             else:
                 result.add_check(
@@ -684,13 +967,19 @@ class JaxCheckpointScanner(BaseScanner):
                 )
 
         except Exception as e:
+            mark_inconclusive_scan_result(result, "jax_checkpoint_file_scan_failed")
             result.add_check(
                 name="Checkpoint File Scan",
                 passed=False,
                 message=f"Error scanning checkpoint file: {e}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"error": str(e), "error_type": type(e).__name__},
+                details={
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "jax_checkpoint_file_scan_failed",
+                },
                 rule_code="S902",
             )
 
@@ -704,6 +993,7 @@ class JaxCheckpointScanner(BaseScanner):
             if len(data) > self.max_pickle_scan_bytes:
                 data = data[: self.max_pickle_scan_bytes]
                 pickle_prefix_truncated = True
+                mark_inconclusive_scan_result(result, self._PICKLE_SCAN_LIMIT_REASON)
                 result.add_check(
                     name="Pickle Checkpoint Prefix Scan Limit",
                     passed=False,
@@ -711,9 +1001,13 @@ class JaxCheckpointScanner(BaseScanner):
                         f"Only the first {self.max_pickle_scan_bytes} bytes of the pickle checkpoint were "
                         "inspected for opcode patterns"
                     ),
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=path,
-                    details={"max_pickle_scan_bytes": self.max_pickle_scan_bytes},
+                    details={
+                        "max_pickle_scan_bytes": self.max_pickle_scan_bytes,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": self._PICKLE_SCAN_LIMIT_REASON,
+                    },
                     rule_code="S902",
                 )
 
@@ -939,26 +1233,37 @@ class JaxCheckpointScanner(BaseScanner):
             result.merge(self.scan_pickle_pattern_text(path, data.decode("utf-8", errors="ignore")))
 
         except Exception as e:
+            mark_inconclusive_scan_result(result, "jax_pickle_scan_failed")
             result.add_check(
                 name="Pickle Checkpoint Scan",
                 passed=False,
                 message=f"Error scanning pickle checkpoint: {e}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"error": str(e), "error_type": type(e).__name__},
+                details={
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "jax_pickle_scan_failed",
+                },
                 rule_code="S902",
             )
 
     def _scan_numpy_checkpoint(self, path: str, result: ScanResult) -> None:
         """Scan NumPy-based JAX checkpoint."""
         if not HAS_NUMPY:
+            mark_inconclusive_scan_result(result, "jax_numpy_analysis_unavailable")
             result.add_check(
                 name="NumPy Library Check",
                 passed=False,
                 message="NumPy not available for checkpoint analysis",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"required_library": "numpy"},
+                details={
+                    "required_library": "numpy",
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "jax_numpy_analysis_unavailable",
+                },
                 rule_code="S902",
             )
             return
@@ -992,18 +1297,60 @@ class JaxCheckpointScanner(BaseScanner):
                 )
 
         except Exception as e:
+            mark_inconclusive_scan_result(result, "jax_numpy_load_failed")
             result.add_check(
                 name="NumPy Checkpoint Load",
                 passed=False,
                 message=f"Error loading NumPy checkpoint: {e}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"error": str(e), "error_type": type(e).__name__},
+                details={
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "jax_numpy_load_failed",
+                },
                 rule_code="S902",
             )
 
     def _scan_json_checkpoint(self, path: str, result: ScanResult) -> None:
         """Scan JSON-based checkpoint metadata."""
+        file_size = os.path.getsize(path)
+        if file_size > JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+            mark_inconclusive_scan_result(result, self._JSON_ANALYSIS_SIZE_LIMIT_REASON)
+            result.add_check(
+                name="JSON Checkpoint Analysis Limit",
+                passed=False,
+                message="JSON checkpoint analysis incomplete because the file exceeds the bounded parsing limit",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "file_size": file_size,
+                    "max_json_analysis_bytes": JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self._JSON_ANALYSIS_SIZE_LIMIT_REASON,
+                },
+                rule_code="S902",
+            )
+            try:
+                self._scan_bounded_json_prefix_patterns(path, result)
+            except OSError as e:
+                mark_operational_scan_error(result, self._JSON_PREFIX_PATTERN_READ_FAILED_REASON)
+                result.add_check(
+                    name="JSON Bounded Prefix Pattern Scan",
+                    passed=False,
+                    message=f"Unable to inspect bounded JSON checkpoint prefix: {e}",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "error_type": type(e).__name__,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": self._JSON_PREFIX_PATTERN_READ_FAILED_REASON,
+                    },
+                    rule_code="S902",
+                )
+            return
+
         try:
             with open(path, encoding="utf-8-sig") as f:
                 data = json.load(f)
@@ -1033,23 +1380,34 @@ class JaxCheckpointScanner(BaseScanner):
             )
 
         except json.JSONDecodeError as e:
+            mark_inconclusive_scan_result(result, "jax_json_parse_failed")
             result.add_check(
                 name="JSON Checkpoint Validation",
                 passed=False,
                 message=f"Invalid JSON in checkpoint: {e}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"error": str(e)},
+                details={
+                    "error": str(e),
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "jax_json_parse_failed",
+                },
                 rule_code="S902",
             )
         except Exception as e:
+            mark_inconclusive_scan_result(result, "jax_json_scan_failed")
             result.add_check(
                 name="JSON Checkpoint Scan",
                 passed=False,
                 message=f"Error scanning JSON checkpoint: {e}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"error": str(e), "error_type": type(e).__name__},
+                details={
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "jax_json_scan_failed",
+                },
                 rule_code="S902",
             )
 
@@ -1091,17 +1449,23 @@ class JaxCheckpointScanner(BaseScanner):
                 self._scan_checkpoint_file(path, result)
 
         except Exception as e:
+            mark_inconclusive_scan_result(result, "jax_checkpoint_scan_failed")
             result.add_check(
                 name="JAX Checkpoint Scan",
                 passed=False,
                 message=f"Unexpected error scanning JAX checkpoint: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"error": str(e), "error_type": type(e).__name__},
+                details={
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "jax_checkpoint_scan_failed",
+                },
                 rule_code="S902",
             )
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        result.finish(success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME)
         return result

@@ -30,7 +30,9 @@ from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_ini
 from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
 from modelaudit.scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
+    ScannerSelectionPolicy,
     add_scanner_selection_skip_check,
+    allows_protobuf_model_candidate_analysis,
     make_scanner_selection_skip_result,
     normalize_scanner_selection_config,
     policy_from_config,
@@ -40,26 +42,44 @@ from modelaudit.scanners import _registry
 from modelaudit.scanners.archive_dispatch import (
     NESTED_SCAN_CALLBACK_CONFIG_KEY,
     merge_executable_zip_container_findings,
+    merge_flax_msgpack_overlap_findings,
+    merge_inconclusive_flax_msgpack_outcome,
 )
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
-from modelaudit.scanners.xgboost_scanner import XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY
+from modelaudit.scanners.mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
+from modelaudit.scanners.safetensors_scanner import MAX_HEADER_BYTES as SAFETENSORS_MAX_HEADER_BYTES
+from modelaudit.scanners.xgboost_scanner import (
+    XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY,
+    XGBoostScanner,
+    configure_content_routed_json_scan,
+)
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
+    MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
+    MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
+    ONNX_ROUTING_INCONCLUSIVE_FORMAT,
+    PROTOBUF_MODEL_CANDIDATE_FORMAT,
+    TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_from_magic,
+    detect_flax_msgpack_overlap_routes,
     detect_format_from_extension,
+    detect_mxnet_symbol_content_route,
+    detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
     is_executorch_archive,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
     is_skops_archive,
     is_torchserve_mar_archive,
+    should_defer_safetensors_header_limit_hash,
     validate_file_type_with_formats,
 )
 from modelaudit.utils.file.handlers import (
@@ -123,9 +143,14 @@ _R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
 _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
 _XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
+_FORMAT_DETECTION_READ_FAILED_REASON = "format_detection_read_failed"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
+_PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
+_MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON = "xgboost_ubjson_routing_incomplete"
+_ONNX_ROUTING_INCOMPLETE_REASON = "onnx_routing_incomplete"
+_TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_incomplete"
 _ShardFamilyKey = tuple[str, str, int | None]
 _ScanEntry = tuple[str, list[str], _ShardFamilyKey | None]
 _SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY = "shard_family_cache_fingerprint"
@@ -235,6 +260,42 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
     return _registry.get_scanner_id_for_header_format(header_format)
 
 
+def _merge_pytorch_binary_supplemental_analysis(
+    path: str,
+    result: ScanResult,
+    config: dict[str, Any],
+    scanner_selection: ScannerSelectionPolicy,
+    supplemental_scanner_id: str | None,
+) -> None:
+    """Merge strict format-specific findings without dropping raw `.bin` checks."""
+    if supplemental_scanner_id is None:
+        return
+    if not scanner_selection.allows(supplemental_scanner_id):
+        add_scanner_selection_skip_check(
+            result,
+            path,
+            supplemental_scanner_id,
+            scanner_selection,
+            context="supplemental .bin content analysis",
+        )
+        return
+
+    scanner_class = _registry.load_scanner_by_id(supplemental_scanner_id)
+    if scanner_class is None:
+        supplemental_result = _make_unavailable_recognized_format_result(
+            path,
+            supplemental_scanner_id,
+            supplemental_scanner_id,
+        )
+    else:
+        supplemental_result = scanner_class(config=config).scan(path)
+
+    primary_bytes_scanned = result.bytes_scanned
+    result.merge(supplemental_result)
+    result.bytes_scanned = max(primary_bytes_scanned, supplemental_result.bytes_scanned)
+    result.metadata.setdefault("supplemental_scanners", []).append(supplemental_scanner_id)
+
+
 def _is_direct_header_route(scanner_id: str, header_format: str) -> bool:
     """Return whether the detected header directly maps to this scanner."""
     return header_format != "unknown" and HEADER_FORMAT_TO_SCANNER_ID.get(header_format) == scanner_id
@@ -310,6 +371,23 @@ def _make_unavailable_recognized_format_result(path: str, format_: str, scanner_
     return result
 
 
+def _make_incomplete_format_detection_read_result(path: str, error: OSError) -> ScanResult:
+    """Fail closed when no owning scanner can classify a file after a read failure."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="Format Detection",
+        passed=False,
+        message=f"File format could not be determined because the file could not be read: {error}",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"path": path, "error": str(error), "analysis_incomplete": True},
+    )
+    _mark_inconclusive_scan_outcome(result, _FORMAT_DETECTION_READ_FAILED_REASON)
+    _mark_operational_scan_error(result, _FORMAT_DETECTION_READ_FAILED_REASON)
+    result.finish(success=False)
+    return result
+
+
 def _make_incomplete_xml_model_result(path: str) -> ScanResult:
     """Fail closed when bounded XML routing cannot reach the structural root."""
     result = ScanResult(scanner_name="unknown")
@@ -326,6 +404,26 @@ def _make_incomplete_xml_model_result(path: str) -> ScanResult:
     )
     _mark_inconclusive_scan_outcome(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
     _mark_operational_scan_error(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_protobuf_model_result(path: str) -> ScanResult:
+    """Fail closed when a protobuf candidate cannot receive tentative analysis."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="Protobuf Model Routing",
+        passed=False,
+        message=(
+            "Protobuf model routing was inconclusive because tentative protobuf "
+            "analysis was unavailable for a bounded-probe candidate"
+        ),
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": PROTOBUF_MODEL_CANDIDATE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -350,7 +448,6 @@ def _make_incomplete_llamafile_routing_result(path: str, config: dict[str, Any])
         config,
         context="inconclusive executable ZIP polyglot",
     )
-
     result.finish(success=False)
     return result
 
@@ -372,6 +469,90 @@ def _make_incomplete_nemo_routing_result(path: str) -> ScanResult:
     return result
 
 
+def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+    """Fail closed when bounded MXNet symbol routing cannot decide."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="MXNet Symbol Routing",
+        passed=False,
+        message="MXNet symbol routing was inconclusive because the bounded JSON probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)
+
+    from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
+    from modelaudit.scanners.jinja2_template_scanner import Jinja2TemplateScanner
+    from modelaudit.scanners.manifest_scanner import ManifestScanner
+    from modelaudit.scanners.mxnet_scanner import MXNetScanner
+
+    scanner_selection = policy_from_config(config)
+
+    def merge_owner_result(owner_result: ScanResult) -> None:
+        existing_reasons = list(result.metadata.get("scan_outcome_reasons", []))
+        owner_reasons = list(owner_result.metadata.get("scan_outcome_reasons", []))
+        result.merge(owner_result)
+        result.metadata["scan_outcome_reasons"] = list(dict.fromkeys([*owner_reasons, *existing_reasons]))
+
+    if Path(path).suffix.lower() == ".params":
+        if scanner_selection.allows("mxnet"):
+            MXNetScanner(config=config).scan_params_file_security(path, result)
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "mxnet",
+                scanner_selection,
+                context="inconclusive MXNet params byte analysis",
+            )
+
+    if os.path.getsize(
+        path
+    ) <= JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES or JaxCheckpointScanner.should_analyze_inconclusive_json_overlap(
+        path
+    ):
+        if scanner_selection.allows("jax_checkpoint"):
+            merge_owner_result(JaxCheckpointScanner(config=config).scan(path))
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "jax_checkpoint",
+                scanner_selection,
+                context="overlapping JAX JSON analysis",
+            )
+
+    manifest_covered_templates = False
+    if ManifestScanner.can_handle(path):
+        if scanner_selection.allows("manifest"):
+            manifest_result = ManifestScanner(config=config).scan(path)
+            merge_owner_result(manifest_result)
+            manifest_covered_templates = manifest_result.metadata.get("analysis_incomplete") is not True
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "manifest",
+                scanner_selection,
+                context="overlapping manifest JSON analysis",
+            )
+    if not manifest_covered_templates and Jinja2TemplateScanner.can_handle(path):
+        if scanner_selection.allows("jinja2_template"):
+            merge_owner_result(Jinja2TemplateScanner(config=config).scan(path))
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "jinja2_template",
+                scanner_selection,
+                context="overlapping Jinja JSON analysis",
+            )
+    result.finish(success=False)
+    return result
+
+
 def _make_incomplete_xgboost_ubjson_routing_result(path: str) -> ScanResult:
     """Fail closed when bounded extensionless UBJSON routing cannot confirm XGBoost."""
     result = ScanResult(scanner_name="unknown")
@@ -385,6 +566,40 @@ def _make_incomplete_xgboost_ubjson_routing_result(path: str) -> ScanResult:
     )
     _mark_inconclusive_scan_outcome(result, _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON)
     _mark_operational_scan_error(result, _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_tensorflow_protobuf_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded TensorFlow protobuf routing cannot decide."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="TensorFlow Protobuf Routing",
+        passed=False,
+        message="TensorFlow protobuf routing was inconclusive because the bounded structural probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_onnx_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded ONNX protobuf routing cannot decide."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="ONNX Routing",
+        passed=False,
+        message="ONNX routing was inconclusive because the bounded structural probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": ONNX_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _ONNX_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _ONNX_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -416,11 +631,21 @@ def _calculate_file_hash(file_path: str) -> str:
     return hash_sha256.hexdigest()
 
 
-def _hash_files_by_path(file_paths: list[str]) -> dict[str, str]:
+def _should_defer_hash_for_safetensors_header_limit(file_path: str, config: dict[str, Any]) -> bool:
+    """Avoid full-file hashing for terminal bounded outcomes from oversized SafeTensors framing."""
+    try:
+        max_header_bytes = int(config.get("max_safetensors_header_bytes", SAFETENSORS_MAX_HEADER_BYTES))
+    except (TypeError, ValueError):
+        return False
+    return should_defer_safetensors_header_limit_hash(file_path, max_header_bytes)
+
+
+def _hash_files_by_path(file_paths: list[str], *, config: dict[str, Any] | None = None) -> dict[str, str]:
     """Hash files individually so scan results stay path-specific.
 
     Args:
         file_paths: List of file paths to group
+        config: Scan settings used for bounded format-specific hashing decisions.
 
     Returns:
         Dictionary mapping each file path to its content hash. Files that fail to
@@ -430,6 +655,9 @@ def _hash_files_by_path(file_paths: list[str]) -> dict[str, str]:
     hashes_by_inode: dict[tuple[int, int, int, int], str] = {}
 
     for file_path in file_paths:
+        if _should_defer_hash_for_safetensors_header_limit(file_path, config or {}):
+            content_hashes[file_path] = f"unhashable_bounded_safetensors_{id(file_path)}"
+            continue
         try:
             inode_key: tuple[int, int, int, int] | None = None
             try:
@@ -647,12 +875,14 @@ def scan_model_directory_or_file(
         if not os.path.exists(path):
             raise FileNotFoundError(f"Path does not exist: {path}")
 
-        # Check if path is readable
-        if not os.access(path, os.R_OK):
-            raise PermissionError(f"Path is not readable: {path}")
-
         # Check if path is a directory
         if os.path.isdir(path):
+            # Directory scans require root traversal before scanner dispatch.
+            # Single files must reach their owning scanner so unreadable model
+            # inputs can produce a format-specific operational outcome.
+            if not os.access(path, os.R_OK):
+                raise PermissionError(f"Path is not readable: {path}")
+
             if progress_callback:
                 progress_callback(f"Scanning directory: {path}", 0.0)
 
@@ -863,7 +1093,7 @@ def scan_model_directory_or_file(
                             seen_hash_paths.add(scanned_file_path)
 
                 top_level_hashing_started_at = _start_phase_timing(phase_timings)
-                content_hashes = _hash_files_by_path(hash_paths)
+                content_hashes = _hash_files_by_path(hash_paths, config=config)
                 _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
                 duplicate_paths_by_hash: dict[str, list[str]] = {}
                 for file_path, content_hash in content_hashes.items():
@@ -1101,14 +1331,15 @@ def scan_model_directory_or_file(
                 # Hash the top-level target before scanning. Archive scanners merge
                 # nested member results into their metadata, so scanner-emitted
                 # hashes are not always the bytes of this target.
-                try:
-                    top_level_hashing_started_at = _start_phase_timing(phase_timings)
-                    file_hash = _calculate_file_hash(target)
-                    file_hashes.append(file_hash)
-                except Exception as e:
-                    logger.debug(f"Failed to hash file {target}: {e}")
-                finally:
-                    _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
+                if not _should_defer_hash_for_safetensors_header_limit(target, config):
+                    try:
+                        top_level_hashing_started_at = _start_phase_timing(phase_timings)
+                        file_hash = _calculate_file_hash(target)
+                        file_hashes.append(file_hash)
+                    except Exception as e:
+                        logger.debug(f"Failed to hash file {target}: {e}")
+                    finally:
+                        _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
 
                 file_scan_started_at = _start_phase_timing(phase_timings)
                 try:
@@ -1464,10 +1695,71 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     logger.debug(f"Processing: {path}")
 
-    header_format = detect_file_format(path)
+    format_probe_error: OSError | None = None
+    try:
+        header_format = detect_file_format(path)
+    except OSError as e:
+        # Dedicated scanners can produce a format-specific inconclusive result
+        # once extension routing selects their ownership.
+        header_format = "unknown"
+        format_probe_error = e
     ext_format = detect_format_from_extension(path)
     ext = os.path.splitext(path)[1].lower()
-    magic_format = detect_file_format_from_magic(path)
+    magic_format = (
+        header_format
+        if header_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}
+        else detect_file_format_from_magic(path)
+    )
+    skipped_overlap_scanner_id: str | None = None
+    if (
+        header_format == "xgboost"
+        and scanner_selection.active
+        and scanner_selection.allows("mxnet")
+        and not scanner_selection.allows("xgboost")
+    ):
+        selected_mxnet_route = detect_mxnet_symbol_content_route(path)
+        if selected_mxnet_route == "mxnet":
+            header_format = magic_format = "mxnet"
+            config[MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY] = str(Path(path).resolve())
+            skipped_overlap_scanner_id = "xgboost"
+        elif selected_mxnet_route == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
+            header_format = magic_format = MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+            skipped_overlap_scanner_id = "xgboost"
+    if (
+        header_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}
+        and ext != ".json"
+        and scanner_selection.active
+        and scanner_selection.allows("xgboost")
+        and not scanner_selection.allows("mxnet")
+        and (
+            XGBoostScanner._is_xgboost_json(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
+            or XGBoostScanner._is_probable_mxnet_overlap_candidate(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
+        )
+    ):
+        # Keep default bounded ownership with MXNet, but honor explicit
+        # XGBoost-only coverage when its structure is already observable.
+        header_format = magic_format = "xgboost"
+    if (
+        header_format == "xgboost"
+        and ext != ".json"
+        and (
+            XGBoostScanner._is_xgboost_json(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
+            or XGBoostScanner._is_probable_mxnet_overlap_candidate(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
+        )
+    ):
+        configure_content_routed_json_scan(config, max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES)
     if int(config.get("_archive_depth", 0)) > 0 and magic_format == "unknown":
         nested_xgboost_route = detect_xgboost_ubjson_content_route(path)
         if nested_xgboost_route is not None:
@@ -1492,10 +1784,40 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             sr.bytes_scanned = file_size
         return sr
     if (
+        header_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+        or magic_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    ):
+        sr = _make_incomplete_mxnet_symbol_routing_result(path, config)
+        if skipped_overlap_scanner_id:
+            add_scanner_selection_skip_check(
+                sr,
+                path,
+                skipped_overlap_scanner_id,
+                scanner_selection,
+                context="overlapping JSON analysis",
+                kind=SCANNER_SELECTION_PREFERRED_KIND,
+            )
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
+    if (
         header_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
         or magic_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
     ):
         sr = _make_incomplete_xgboost_ubjson_routing_result(path)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
+    if header_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT or magic_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
+        sr = _make_incomplete_onnx_routing_result(path)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
+    if (
+        header_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+        or magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    ):
+        sr = _make_incomplete_tensorflow_protobuf_routing_result(path)
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
@@ -1505,7 +1827,14 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             sr.bytes_scanned = file_size
         return sr
 
-    file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
+    try:
+        file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
+    except OSError as e:
+        # A failed content read is not evidence of spoofing. Let an owning
+        # scanner produce a precise read-failure outcome when one exists.
+        file_type_valid = True
+        if format_probe_error is None:
+            format_probe_error = e
     discrepancy_msg = None
 
     if not file_type_valid:
@@ -1520,6 +1849,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         if not (
             (ext_format == "pytorch_binary" and header_format in ["zip", "pickle"] and ext == ".bin")
             or (ext_format == "pytorch_binary" and header_format == "pickle" and ext in [".pt", ".pth"])
+            or (ext_format == "pickle" and header_format == "jax_checkpoint" and ext in [".ckpt", ".pickle"])
             or (ext_format == "keras" and header_format in ["zip", "hdf5"])
             or (ext_format == "protobuf" and header_format == "onnx" and ext == ".pb")
             or (ext_format == "skops" and header_format == "zip" and ext == ".skops")
@@ -1530,8 +1860,27 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     # Prefer scanners based on trusted structure rather than the filename alone.
     preferred_scanner: type[BaseScanner] | None = None
     scanner_id = _select_preferred_scanner_id(path, header_format, ext)
+    pytorch_binary_supplemental_scanner_id = (
+        detect_pytorch_binary_supplemental_format(path) if ext == ".bin" and header_format == "pytorch_binary" else None
+    )
     skipped_preferred_scanner_id: str | None = None
-    if scanner_id and scanner_selection.allows(scanner_id):
+    trusted_flax_overlap_scanner_id: str | None = None
+    if scanner_id == "flax_msgpack" and not scanner_selection.allows(scanner_id):
+        skipped_preferred_scanner_id = scanner_id
+        trusted_flax_overlap_scanner_id = next(
+            (
+                overlap_scanner_id
+                for overlap_scanner_id in detect_flax_msgpack_overlap_routes(path)
+                if scanner_selection.allows(overlap_scanner_id)
+            ),
+            None,
+        )
+        if trusted_flax_overlap_scanner_id is not None:
+            scanner_id = trusted_flax_overlap_scanner_id
+    if scanner_id and (
+        scanner_selection.allows(scanner_id)
+        or (scanner_id == "protobuf_model_candidate" and allows_protobuf_model_candidate_analysis(scanner_selection))
+    ):
         preferred_scanner = _registry.load_scanner_by_id(scanner_id)
     elif scanner_id:
         skipped_preferred_scanner_id = scanner_id
@@ -1546,6 +1895,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     config[FORMAT_VALIDATION_CONFIG_KEY] = {
         "path": os.path.abspath(path),
         "header_format": magic_format,
+        "routed_format": header_format,
         "extension_format": ext_format,
         "file_type_valid": file_type_valid,
     }
@@ -1553,7 +1903,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     if (
         preferred_scanner
         and scanner_id
-        and _preferred_scanner_can_handle(preferred_scanner, scanner_id, header_format, path)
+        and (
+            scanner_id == trusted_flax_overlap_scanner_id
+            or _preferred_scanner_can_handle(preferred_scanner, scanner_id, header_format, path)
+        )
     ):
         logger.debug(
             f"Using {preferred_scanner.name} scanner for {path} based on header",
@@ -1599,10 +1952,18 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             result.finish(success=False)
     else:
         # Use registry's lazy loading method to avoid loading all scanners
-        scanner_class = _registry.get_scanner_for_path(
-            path,
-            scanner_selection=scanner_selection if scanner_selection.active else None,
-        )
+        scanner_class = None
+        if (
+            skipped_preferred_scanner_id == "pytorch_binary"
+            and pytorch_binary_supplemental_scanner_id is not None
+            and scanner_selection.allows(pytorch_binary_supplemental_scanner_id)
+        ):
+            scanner_class = _registry.load_scanner_by_id(pytorch_binary_supplemental_scanner_id)
+        if scanner_class is None:
+            scanner_class = _registry.get_scanner_for_path(
+                path,
+                scanner_selection=scanner_selection if scanner_selection.active else None,
+            )
         if scanner_class:
             logger.debug(f"Using {scanner_class.name} scanner for {path}")
             scanner = scanner_class(config=config)
@@ -1669,14 +2030,26 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                         result.bytes_scanned = file_size
                     return result
 
-            if magic_format == XML_MODEL_INCONCLUSIVE_FORMAT:
+            if format_probe_error is not None and magic_format == "unknown":
+                sr = _make_incomplete_format_detection_read_result(path, format_probe_error)
+            elif magic_format == XML_MODEL_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_xml_model_result(path)
+            elif header_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
+                sr = _make_incomplete_protobuf_model_result(path)
+            elif magic_format == PROTOBUF_MODEL_CANDIDATE_FORMAT and header_format != "unknown":
+                sr = _make_unavailable_recognized_format_result(path, header_format, scanner_id)
             elif magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_llamafile_routing_result(path, config)
             elif magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_nemo_routing_result(path)
+            elif magic_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_mxnet_symbol_routing_result(path, config)
             elif magic_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_xgboost_ubjson_routing_result(path)
+            elif magic_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_onnx_routing_result(path)
+            elif magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_tensorflow_protobuf_routing_result(path)
             elif magic_format == "unknown":
                 # Not a recognized model format — skip silently
                 sr = ScanResult(scanner_name="unknown")
@@ -1685,8 +2058,64 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 sr = _make_unavailable_recognized_format_result(path, magic_format, scanner_id)
             result = sr
 
+    if skipped_overlap_scanner_id:
+        add_scanner_selection_skip_check(
+            result,
+            path,
+            skipped_overlap_scanner_id,
+            scanner_selection,
+            context="overlapping JSON analysis",
+            kind=SCANNER_SELECTION_PREFERRED_KIND,
+        )
+
     if is_xgboost_pickle_spoof:
         _mark_xgboost_pickle_extension_spoof(result, path, ext)
+
+    if (
+        skipped_preferred_scanner_id == "flax_msgpack"
+        and trusted_flax_overlap_scanner_id is not None
+        and result.scanner_name == trusted_flax_overlap_scanner_id
+    ):
+        add_scanner_selection_skip_check(
+            result,
+            path,
+            skipped_preferred_scanner_id,
+            scanner_selection,
+            context="preferred scanner",
+            kind=SCANNER_SELECTION_PREFERRED_KIND,
+        )
+
+    if result.scanner_name == "flax_msgpack":
+        merge_flax_msgpack_overlap_findings(
+            path,
+            result,
+            config,
+            context="Flax MessagePack overlapping content analysis",
+        )
+    elif skipped_preferred_scanner_id == "flax_msgpack":
+        merge_flax_msgpack_overlap_findings(
+            path,
+            result,
+            config,
+            context="Flax MessagePack overlapping content analysis",
+            scanned_scanner_ids=frozenset({result.scanner_name}),
+        )
+    elif result.scanner_name != "flax_msgpack":
+        merge_inconclusive_flax_msgpack_outcome(
+            path,
+            result,
+            config,
+            context="strict content owner overlapping ambiguous Flax analysis",
+        )
+
+    if ext == ".bin" and header_format == "pytorch_binary" and result.scanner_name == "pytorch_binary":
+        _merge_pytorch_binary_supplemental_analysis(
+            path,
+            result,
+            config,
+            scanner_selection,
+            pytorch_binary_supplemental_scanner_id,
+        )
 
     if discrepancy_msg:
         # Determine severity based on whether it's a validation failure or just a discrepancy
@@ -1820,22 +2249,25 @@ def scan_model_streaming(
                         logger.debug(f"Skipping non-model file: {source_path}")
                     continue
 
-                # Compute file hash
-                if progress_callback:
-                    progress_callback(f"Hashing {source_path.name}", (files_processed / (files_processed + 1)) * 100)
-
-                file_hash = compute_sha256_hash(scan_path)
-                file_hashes.append(file_hash)
-
-                # Scan the file
-                if progress_callback:
-                    progress_callback(f"Scanning {source_path.name}", (files_processed / (files_processed + 1)) * 100)
-
                 # Build config dict for scan_file
                 scan_config = {
                     "timeout": timeout - int(time.time() - start_time),
                     **scan_kwargs,
                 }
+
+                file_hash: str | None = None
+                if not _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config):
+                    if progress_callback:
+                        progress_callback(
+                            f"Hashing {source_path.name}",
+                            (files_processed / (files_processed + 1)) * 100,
+                        )
+                    file_hash = compute_sha256_hash(scan_path)
+                    file_hashes.append(file_hash)
+
+                # Scan the file
+                if progress_callback:
+                    progress_callback(f"Scanning {source_path.name}", (files_processed / (files_processed + 1)) * 100)
 
                 scan_result = scan_file(
                     str(scan_path),
@@ -1853,11 +2285,12 @@ def scan_model_streaming(
                         metadata_dict.setdefault("resolved_path", resolved_report_path)
                     operational_scan_failure = _scan_result_has_operational_error(scan_result)
 
-                    existing_hashes = metadata_dict.get("file_hashes")
-                    if isinstance(existing_hashes, dict):
-                        existing_hashes.setdefault("sha256", file_hash)
-                    else:
-                        metadata_dict["file_hashes"] = {"sha256": file_hash}
+                    if file_hash is not None:
+                        existing_hashes = metadata_dict.get("file_hashes")
+                        if isinstance(existing_hashes, dict):
+                            existing_hashes.setdefault("sha256", file_hash)
+                        else:
+                            metadata_dict["file_hashes"] = {"sha256": file_hash}
 
                     # Use dict-based aggregation to avoid import issues
                     scan_result_dict = {
