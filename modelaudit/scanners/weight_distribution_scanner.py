@@ -11,6 +11,10 @@ from ..scanner_results import mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 _ANALYSIS_INCONCLUSIVE_REASON = "weight_distribution_analysis_incomplete"
+_PATCHED_TORCH_WEIGHTS_ONLY_VERSION = (2, 6, 0)
+_TORCH_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?")
+_TORCH_PRERELEASE_MARKER_PATTERN = re.compile(r"(?i)^(?:a|b|c|rc|alpha|beta|pre|preview|dev)")
+_TORCH_STABLE_SUFFIX_PATTERN = re.compile(r"(?i)^post\d*(?:\+.*)?$")
 
 
 class WeightDistributionScanner(BaseScanner):
@@ -229,6 +233,22 @@ class WeightDistributionScanner(BaseScanner):
         result.finish(success=True)
         return result
 
+    @staticmethod
+    def _torch_weights_only_is_patched_version(version: object) -> bool:
+        version_text = str(version).strip()
+        match = _TORCH_RELEASE_VERSION_PATTERN.match(version_text)
+        if not match:
+            return False
+
+        release = tuple(int(part or 0) for part in match.groups())
+        suffix = version_text[match.end() :].strip()
+        normalized_suffix = suffix.lstrip("._-")
+        if _TORCH_PRERELEASE_MARKER_PATTERN.match(normalized_suffix):
+            return False
+        if suffix and not suffix.startswith("+") and _TORCH_STABLE_SUFFIX_PATTERN.fullmatch(normalized_suffix) is None:
+            return False
+        return release >= _PATCHED_TORCH_WEIGHTS_ONLY_VERSION
+
     def _record_extraction_incomplete(self, reason: str, **details: Any) -> None:
         """Record incomplete tensor extraction while preserving already-read tensors."""
         self.extraction_incomplete = True
@@ -303,18 +323,14 @@ class WeightDistributionScanner(BaseScanner):
 
             if supports_weights_only:
                 load_kwargs["weights_only"] = True
-                version_match = re.match(r"^(\d+)\.(\d+)", str(torch_version))
-                is_patched_version = False
-                if version_match:
-                    major = int(version_match.group(1))
-                    minor = int(version_match.group(2))
-                    is_patched_version = (major, minor) >= (2, 6)
+                is_patched_version = self._torch_weights_only_is_patched_version(torch_version)
 
                 if not is_patched_version and not self.enable_unsafe_torch_load:
                     self.extraction_unsafe = True
                     self.extraction_unsafe_reason = (
-                        "Blocked torch.load: weights_only=True on PyTorch versions below 2.6 "
-                        "is vulnerable to RCE. Set enable_unsafe_torch_load=true to override."
+                        "Blocked torch.load: weights_only=True is only treated as safe on stable "
+                        "PyTorch 2.6.0 or newer. Prerelease, dev, and unknown versions may still "
+                        "be vulnerable to RCE. Set enable_unsafe_torch_load=true to override."
                     )
                     raise RuntimeError(self.extraction_unsafe_reason)
             elif not self.enable_unsafe_torch_load:

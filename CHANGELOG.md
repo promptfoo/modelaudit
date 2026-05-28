@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
 - detect external references in weights-only Keras HDF5 layouts without Keras metadata
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
