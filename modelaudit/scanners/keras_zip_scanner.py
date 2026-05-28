@@ -116,6 +116,8 @@ def _has_get_file_reference(values: list[str]) -> bool:
 _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
+_KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+_-]*)\s*$")
+_KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(r"(?i)^(?:a|alpha|b|beta|c|rc|pre|preview|dev)")
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -2012,20 +2014,20 @@ class KerasZipScanner(BaseScanner):
     @staticmethod
     def _is_vulnerable_to_cve_2026_1669(version: str) -> bool:
         """Return True for Keras versions in the known CVE-2026-1669 affected ranges."""
-        parts = version.split(".", 2)
-        if len(parts) < 2:
+        version_match = _KERAS_RELEASE_VERSION_PATTERN.match(version)
+        if not version_match:
             return False
 
         try:
-            major = int(parts[0])
-            minor = int(parts[1])
-            patch = 0
-            if len(parts) == 3:
-                patch_digits = "".join(ch for ch in parts[2] if ch.isdigit())
-                if patch_digits:
-                    patch = int(patch_digits)
+            major = int(version_match.group(1))
+            minor = int(version_match.group(2))
+            patch = int(version_match.group(3) or 0)
         except ValueError:
             return False
 
+        suffix = (version_match.group(4) or "").lstrip("._-")
+        is_prerelease = bool(_KERAS_PRERELEASE_SUFFIX_PATTERN.match(suffix))
         parsed = (major, minor, patch)
-        return (3, 0, 0) <= parsed < (3, 12, 1) or (3, 13, 0) <= parsed < (3, 13, 2)
+        if (3, 0, 0) <= parsed < (3, 12, 1) or (3, 13, 0) <= parsed < (3, 13, 2):
+            return True
+        return parsed in {(3, 12, 1), (3, 13, 2)} and is_prerelease
