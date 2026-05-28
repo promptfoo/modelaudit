@@ -55,7 +55,7 @@ from .telemetry import (
     record_scan_failed,
     record_scan_started,
 )
-from .utils import resolve_dvc_file
+from .utils import resolve_dvc_file, should_skip_file
 from .utils.helpers.auto_defaults import (
     apply_auto_overrides,
     detect_ci_environment,
@@ -877,7 +877,7 @@ def _should_skip_non_model_file(scan_path: str, runtime: _ScanRuntimeConfig, *, 
 
     _, ext = os.path.splitext(scan_path)
     ext = ext.lower()
-    if ext in (".py", ".js", ".html", ".css"):
+    if ext in (".py", ".js", ".html", ".css") and should_skip_file(scan_path):
         if verbose:
             logger.debug(f"Skipped: {scan_path} (non-model file)")
         if runtime.show_styled_output:

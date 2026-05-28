@@ -18,7 +18,6 @@ from modelaudit.scanners.pickle_scanner import (
     ALWAYS_DANGEROUS_FUNCTIONS,
     ALWAYS_DANGEROUS_MODULES,
     PickleScanner,
-    _contains_any_jax_indicator,
     _hex_token_has_execution_seed,
     _is_dangerous_module,
     _is_legitimate_serialization_file,
@@ -1729,20 +1728,6 @@ def test_pickle_scanner_delegates_jax_specific_patterns_for_jax_pickles(tmp_path
     )
 
 
-def test_contains_any_jax_indicator_reuses_lowered_text() -> None:
-    class TrackingStr(str):
-        lower_calls = 0
-
-        def lower(self) -> str:
-            self.lower_calls += 1
-            return super().lower()
-
-    text = TrackingStr("jax")
-
-    assert _contains_any_jax_indicator(text, ("jax", "flax", "haiku")) is True
-    assert text.lower_calls == 1
-
-
 def test_pickle_scanner_delegates_jax_patterns_for_pkl_suffixes(tmp_path: Path) -> None:
     path = tmp_path / "jax_state.pkl"
     path.write_bytes(pickle.dumps({"payload": "jax.experimental.io_callback"}))
@@ -1812,7 +1797,7 @@ def test_pickle_scanner_delegates_late_jax_patterns_for_ckpt_suffixes(tmp_path: 
     )
 
 
-def test_pickle_scanner_reports_info_only_jax_truncation_without_jax_context(tmp_path: Path) -> None:
+def test_pickle_scanner_reports_jax_truncation_as_inconclusive_info(tmp_path: Path) -> None:
     path = tmp_path / "large-benign.pkl"
     path.write_bytes(pickle.dumps({"padding": "a" * 4096}))
 
@@ -1824,6 +1809,8 @@ def test_pickle_scanner_reports_info_only_jax_truncation_without_jax_context(tmp
     assert result.metadata["scan_outcome_reasons"] == ["jax_pickle_scan_limit_exceeded"]
     assert len(prefix_limit_checks) == 1
     assert prefix_limit_checks[0].severity == IssueSeverity.INFO
+    assert prefix_limit_checks[0].details["analysis_incomplete"] is True
+    assert prefix_limit_checks[0].details["scan_outcome_reason"] == "jax_pickle_scan_limit_exceeded"
 
 
 def test_pickle_scanner_fails_closed_when_jax_payload_is_after_delegated_scan_window(tmp_path: Path) -> None:
@@ -1835,7 +1822,9 @@ def test_pickle_scanner_fails_closed_when_jax_payload_is_after_delegated_scan_wi
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata["scan_outcome_reasons"] == ["jax_pickle_scan_limit_exceeded"]
-    assert any(check.name == "Pickle Checkpoint Prefix Scan Limit" for check in result.checks)
+    prefix_limit_check = next(check for check in result.checks if check.name == "Pickle Checkpoint Prefix Scan Limit")
+    assert prefix_limit_check.severity == IssueSeverity.INFO
+    assert prefix_limit_check.details["analysis_incomplete"] is True
     assert not any(
         check.name == "JAX Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
     )
