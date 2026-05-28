@@ -16,7 +16,7 @@ from ...cache.optimized_config import get_config_extractor
 logger = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
 
-_READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS = frozenset({".cmf", ".dnn", ".lgb", ".lightgbm"})
+_READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS = frozenset({".cmf", ".dnn", ".lgb", ".lightgbm", ".meta"})
 
 
 def should_bypass_cache_for_read_failure_aware_file(file_path: str) -> bool:

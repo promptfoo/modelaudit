@@ -724,6 +724,25 @@ def test_get_scanner_for_path_does_not_route_cntk_or_lightgbm_near_matches(tmp_p
     assert ScannerRegistry().get_scanner_for_path(str(lightgbm_near_match)) is None
 
 
+def test_get_scanner_for_path_routes_owned_metagraph_after_zip_probe_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable_meta = tmp_path / "unreadable.meta"
+    unreadable_meta.write_bytes(b"simulated metagraph bytes")
+
+    def raise_read_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_read_error)
+    monkeypatch.setattr(
+        "modelaudit.scanners.tf_metagraph_scanner.TensorFlowMetaGraphScanner.can_handle",
+        classmethod(lambda _cls, _path: True),
+    )
+
+    _assert_scanner_for_path(unreadable_meta, "tf_metagraph")
+
+
 def test_get_scanner_for_path_does_not_route_pickle_after_zip_probe_read_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
