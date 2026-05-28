@@ -1153,6 +1153,15 @@ class ManifestScanner(BaseScanner):
 
         except TimeoutError:
             raise
+        except (OSError, UnicodeError) as e:
+            self._record_read_failure(
+                result,
+                path,
+                e,
+                reason="manifest_cloud_storage_read_failed",
+                check_name="Cloud Storage URL Detection",
+                message="Unable to load manifest text for cloud storage URL analysis",
+            )
         except Exception as e:
             logger.debug(f"Error checking cloud storage URLs in {path}: {e}")
 

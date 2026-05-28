@@ -325,6 +325,41 @@ def test_manifest_parser_read_failure_bypasses_stale_clean_cache(
         reset_cache_manager()
 
 
+def test_manifest_cloud_storage_read_failure_is_inconclusive_after_parse_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_file = tmp_path / "config.json"
+    test_file.write_text(
+        json.dumps({"model_type": "bert", "weights": "https://bucket.s3.amazonaws.com/malware/model.bin"}),
+        encoding="utf-8",
+    )
+    scanner = ManifestScanner()
+    original_read = scanner._read_manifest_text
+    read_count = 0
+
+    def fail_cloud_url_read_once(path: str) -> str:
+        nonlocal read_count
+        read_count += 1
+        if read_count == 1:
+            raise OSError("simulated cloud storage URL read failure")
+        return original_read(path)
+
+    monkeypatch.setattr(scanner, "_read_manifest_text", fail_cloud_url_read_once)
+
+    result = scanner.scan(str(test_file))
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "manifest_cloud_storage_read_failed"
+    assert any(
+        check.name == "Cloud Storage URL Detection"
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("scan_outcome_reason") == "manifest_cloud_storage_read_failed"
+        for check in result.checks
+    )
+
+
 def test_manifest_scanner_case_insensitive_blacklist(tmp_path):
     """Test that blacklist matching is case-insensitive."""
     test_file = tmp_path / "inference_config.json"
