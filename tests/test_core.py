@@ -149,7 +149,7 @@ def test_multi_file_directory_scan_refreshes_changed_pickle_source_snapshot(
     assert any(issue.rule_code == "DANGEROUS_CALL_GRAPH" for issue in result.issues)
 
 
-def _build_malicious_pickle() -> bytes:
+def _build_malicious_pickle(*, protocol: int | None = None) -> bytes:
     """Build a tiny pickle payload that exercises nested dangerous-opcode scanning."""
     import os as os_module
 
@@ -160,7 +160,7 @@ def _build_malicious_pickle() -> bytes:
             """Return a dangerous reducer target for scanner regression coverage."""
             return (os_module.system, ("echo core-dispatch-test",))
 
-    return pickle.dumps(DangerousPayload())
+    return pickle.dumps(DangerousPayload(), protocol=protocol)
 
 
 def _require_tf_protos() -> None:
@@ -268,6 +268,50 @@ def _write_tensorflow_overlap_safetensors_candidate(path: Path, header_prefix: b
     header_len = 0x212
     header = header_prefix + (b" " * (header_len - len(header_prefix)))
     path.write_bytes(struct.pack("<Q", header_len) + header + b"\x00")
+
+
+def _write_minimal_safetensors(path: Path) -> None:
+    header = {"weights": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + b"\x00\x00\x00\x00")
+
+
+def _write_safe_tensorrt(path: Path) -> None:
+    path.write_bytes(b"TensorRT safe engine metadata")
+
+
+def _write_minimal_numpy(path: Path) -> None:
+    header = "{'descr': '<f4', 'fortran_order': False, 'shape': (1,), }"
+    header_bytes = header.encode("latin1")
+    padding = b" " * ((16 - ((10 + len(header_bytes) + 1) % 16)) % 16)
+    payload = b"\x93NUMPY\x01\x00" + struct.pack("<H", len(header_bytes) + len(padding) + 1)
+    path.write_bytes(payload + header_bytes + padding + b"\n" + struct.pack("<f", 1.0))
+
+
+def _write_safe_npz(path: Path) -> None:
+    header = "{'descr': '<f4', 'fortran_order': False, 'shape': (1,), }"
+    header_bytes = header.encode("latin1")
+    padding = b" " * ((16 - ((10 + len(header_bytes) + 1) % 16)) % 16)
+    payload = b"\x93NUMPY\x01\x00" + struct.pack("<H", len(header_bytes) + len(padding) + 1)
+    array_bytes = payload + header_bytes + padding + b"\n" + struct.pack("<f", 1.0)
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("weights.npy", array_bytes)
+
+
+def _write_safe_paddle(path: Path) -> None:
+    path.write_bytes(b"safe paddle model metadata")
+
+
+def _write_safe_pytorch_binary(path: Path) -> None:
+    path.write_bytes(b"benign binary tensor weights" * 10)
+
+
+def _write_safe_savedmodel(path: Path) -> None:
+    path.write_bytes(_build_collection_only_tf_savedmodel(value=b"documentation: https://example.invalid/runtime"))
+
+
+def _write_safe_r_serialized(path: Path) -> None:
+    path.write_bytes(b"X\nsafe\nmodel\nweights")
 
 
 def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
@@ -1411,8 +1455,48 @@ def test_scan_file_routes_renamed_flax_stream_with_leading_scalar_object(
     assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
 
 
-@pytest.mark.parametrize("leading_scalar", [123, 91], ids=["json-object-byte", "json-array-byte"])
-def test_scan_file_routes_nested_renamed_flax_stream_with_json_delimiter_scalar(
+@pytest.mark.parametrize("prefix", [b"I1\n.", b"cbuiltins\nstr\n.", b"\x80\x04."])
+def test_scan_file_routes_renamed_flax_stream_after_pickle_shaped_prefix(tmp_path: Path, prefix: bytes) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "stream-pickle-prefix.jpg"
+    checkpoint.write_bytes(
+        prefix
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+def test_scan_file_preserves_pickle_findings_in_protocol0_flax_overlap(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "stream-malicious-protocol0-prefix.jpg"
+    checkpoint.write_bytes(
+        _build_malicious_pickle(protocol=0)
+        + flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize("leading_scalar", [123, 91, 60], ids=["json-object-byte", "json-array-byte", "xml-angle-byte"])
+def test_scan_file_routes_nested_renamed_flax_stream_with_delimiter_like_scalar(
     tmp_path: Path,
     leading_scalar: int,
 ) -> None:
@@ -1434,6 +1518,311 @@ def test_scan_file_routes_nested_renamed_flax_stream_with_json_delimiter_scalar(
     assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
 
 
+def test_scan_file_routes_nested_renamed_flax_stream_after_protocol0_pickle_prefix(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    nested_payload = b"cbuiltins\nstr\n." + flax_msgpack_scanner.msgpack.packb(
+        {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+        use_bin_type=True,
+    )
+    archive = tmp_path / "nested-protocol0-prefix.zip"
+    _create_misnamed_zip(archive, {"payload.jpg": nested_payload})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        b"\x80\x04",
+        b"\x80\x04(2.",
+        b"\x80\x04NNa.",
+        b"\x80\x04\x95" + struct.pack("<Q", 1_000_000) + b"N.",
+        b"\x80\x04}(Nu.",
+        b"\x80\x04(Nd.",
+    ],
+    ids=["binary-header", "mark-dup", "invalid-append", "overlong-frame", "odd-setitems", "odd-dict"],
+)
+def test_scan_file_does_not_merge_pickle_failure_for_binary_header_like_flax_stream(
+    tmp_path: Path,
+    prefix: bytes,
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "binary-header-like-flax.jpg"
+    checkpoint.write_bytes(
+        prefix
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is True
+    assert all("pickle" not in (check.name + check.message).lower() for check in result.checks)
+
+
+def test_scan_file_selected_pickle_does_not_claim_binary_header_like_flax_stream(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "selected-binary-header-like-flax.jpg"
+    checkpoint.write_bytes(
+        b"\x80\x04"
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"scanners": ["pickle"], "cache_scan_results": False})
+
+    assert result.scanner_name != "pickle"
+    assert all("pickle parsing failed" not in check.message.lower() for check in result.checks)
+
+
+def test_scan_file_selected_pickle_does_not_claim_nested_binary_header_like_flax_stream(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    payload = b"\x80\x04" + flax_msgpack_scanner.msgpack.packb(
+        {"params": {"w": [1, 2, 3]}},
+        use_bin_type=True,
+    )
+    archive = tmp_path / "selected-binary-header-like-flax.zip"
+    _create_misnamed_zip(archive, {"payload.jpg": payload})
+
+    result = scan_file(str(archive), config={"scanners": ["zip", "pickle"], "cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert all("pickle parsing failed" not in check.message.lower() for check in result.checks)
+
+
+def test_scan_file_preserves_binary_pickle_findings_when_stop_follows_probe_window(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "delayed-binary-pickle-stop.jpg"
+    pickle_stream = (
+        b"\x80\x04cos\nsystem\n(S'echo pwned'\ntR" + (b"N0" * (file_detection.PROTO0_1_MAX_PROBE_BYTES // 2 + 1)) + b"."
+    )
+    checkpoint.write_bytes(
+        pickle_stream
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
+def test_scan_file_preserves_binary_pickle_findings_when_dangerous_opcode_follows_probe_window(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "late-binary-pickle-dangerous-global.jpg"
+    pickle_stream = (
+        b"\x80\x04" + (b"N0" * (file_detection.PROTO0_1_MAX_PROBE_BYTES // 2 + 1)) + b"cos\nsystem\n(S'echo pwned'\ntR."
+    )
+    checkpoint.write_bytes(
+        pickle_stream
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("opcode", "operand"),
+    [(b"q", b"\x00"), (b"r", b"\x00\x00\x00\x00"), (b"p", b"0\n")],
+    ids=["binput", "long-binput", "put"],
+)
+def test_scan_file_preserves_binary_pickle_findings_when_operand_crosses_probe_boundary(
+    tmp_path: Path,
+    opcode: bytes,
+    operand: bytes,
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / f"binary-pickle-{opcode.hex()}-boundary.jpg"
+    malicious_prefix = b"\x80\x04cos\nsystem\n(S'echo pwned'\ntR"
+    padding_size = file_detection.PROTO0_1_MAX_PROBE_BYTES - len(malicious_prefix) - 1
+    neutral_padding = (b"N0" * (padding_size // 2)) + (b"N" if padding_size % 2 else b"")
+    pickle_stream = malicious_prefix + neutral_padding + opcode + operand + b"."
+    checkpoint.write_bytes(
+        pickle_stream
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert (
+        pickle_stream[file_detection.PROTO0_1_MAX_PROBE_BYTES - 1 : file_detection.PROTO0_1_MAX_PROBE_BYTES] == opcode
+    )
+    assert result.scanner_name == "flax_msgpack"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    "pickle_stream",
+    [
+        b"\x80\x04Ncos\nsystem\n(S'echo pwned'\ntR.",
+        b"\x80\x04}q\x00Nq\x00cos\nsystem\n(S'echo pwned'\ntR.",
+    ],
+    ids=["extra-return-stack-item", "memo-overwrite"],
+)
+def test_scan_file_preserves_unpickler_permitted_binary_pickle_findings(
+    tmp_path: Path,
+    pickle_stream: bytes,
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "unpickler-permitted-overlap.jpg"
+    checkpoint.write_bytes(
+        pickle_stream
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
+def test_scan_file_preserves_dangerous_list_setitem_binary_pickle_findings(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "list-setitem-overlap.jpg"
+    pickle_stream = b"\x80\x04]NaK\x00cos\nsystem\n(S'id'\ntRs."
+    checkpoint.write_bytes(
+        pickle_stream
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
+def test_scan_file_preserves_binary_pickle_structural_tamper_in_flax_overlap(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "structural-tamper-overlap.jpg"
+    checkpoint.write_bytes(
+        b"\x80\x04\x80\x04K\x01."
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(check.name == "Pickle Structural Tamper Check" for check in result.checks)
+
+
+def test_scan_file_preserves_nested_binary_pickle_structural_tamper_in_flax_overlap(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    payload = b"\x80\x04\x80\x04K\x01." + flax_msgpack_scanner.msgpack.packb(
+        {"params": {"w": [1, 2, 3]}},
+        use_bin_type=True,
+    )
+    archive = tmp_path / "structural-tamper-overlap.zip"
+    _create_misnamed_zip(archive, {"payload.jpg": payload})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert any(check.name == "Pickle Structural Tamper Check" for check in result.checks)
+
+
+@pytest.mark.parametrize(
+    "scanner_config",
+    [{"exclude_scanners": ["flax_msgpack"]}, {"scanners": ["pickle"]}],
+    ids=["excluded-flax", "exact-pickle"],
+)
+def test_scan_file_preserves_selected_pickle_findings_in_flax_content_overlap(
+    tmp_path: Path,
+    scanner_config: dict[str, list[str]],
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "selected-list-setitem-overlap.jpg"
+    pickle_stream = b"\x80\x04]NaK\x00cos\nsystem\n(S'id'\ntRs."
+    checkpoint.write_bytes(
+        pickle_stream
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={**scanner_config, "cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("kind") == "preferred"
+        and check.details.get("skipped_scanner_id") == "flax_msgpack"
+        for check in result.checks
+    )
+
+
 def test_scan_file_does_not_raise_for_deep_json_array_near_match(tmp_path: Path) -> None:
     payload = tmp_path / "deep-json-array.jpg"
     payload.write_bytes((b"[" * 2000) + b"0" + (b"]" * 2000))
@@ -1453,11 +1842,36 @@ def test_scan_file_does_not_raise_for_deep_json_array_near_match(tmp_path: Path)
     assert nested_result.success is True
 
 
-def test_scan_file_fails_closed_for_renamed_flax_stream_with_scalar_padding_past_analysis_limit(tmp_path: Path) -> None:
+def test_scan_file_fails_closed_for_ambiguous_json_looking_stream_before_later_flax_root(tmp_path: Path) -> None:
     if not flax_msgpack_scanner.HAS_MSGPACK:
         pytest.skip("msgpack unavailable")
 
-    checkpoint = tmp_path / "stream-scalar-padding.jpg"
+    checkpoint = tmp_path / "json-looking-padding.jpg"
+    checkpoint.write_bytes(
+        b"["
+        + b" " * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(checkpoint), cache_scan_results=False)
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize("suffix", [".jpg", ".txt"])
+def test_scan_file_fails_closed_for_renamed_flax_stream_with_scalar_padding_past_analysis_limit(
+    tmp_path: Path, suffix: str
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / f"stream-scalar-padding{suffix}"
     checkpoint.write_bytes(
         flax_msgpack_scanner.msgpack.packb(None, use_bin_type=True) * 4097
         + flax_msgpack_scanner.msgpack.packb(
@@ -1556,6 +1970,26 @@ def test_scan_file_routes_msgpack_checkpoint_overlap_suffixes_to_flax_scanner(tm
     checkpoint = tmp_path / f"malicious{suffix}"
     checkpoint.write_bytes(
         flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"])
+def test_scan_file_routes_malicious_flax_checkpoint_under_skipped_suffix(tmp_path: Path, suffix: str) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / f"malicious{suffix}"
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
     )
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
@@ -5838,6 +6272,117 @@ def test_scan_file_fails_closed_when_format_detection_read_fails_without_owner(
     assert core_module.determine_exit_code(aggregate) == 2
 
 
+def test_scan_file_unreadable_non_read_failure_aware_suffix_is_operational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable = tmp_path / "unavailable.onnx"
+    unreadable.write_bytes(b"unreadable ONNX-like payload")
+    real_access = os.access
+
+    def deny_file_access(candidate: str | bytes | os.PathLike[str], mode: int) -> bool:
+        if str(candidate) == str(unreadable):
+            return False
+        return real_access(candidate, mode)
+
+    monkeypatch.setattr(core_module.os, "access", deny_file_access)
+    monkeypatch.setattr(core_module, "detect_file_format", lambda _path: "unknown")
+    monkeypatch.setattr(core_module, "detect_file_format_from_magic", lambda _path: "unknown")
+
+    result = scan_file(str(unreadable), config={"cache_enabled": False})
+    aggregate = core_module.scan_model_directory_or_file(str(unreadable), cache_enabled=False)
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "format_detection_read_failed"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_preserves_r_serialized_outcome_after_failed_read_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    r_path = tmp_path / "unavailable.rds"
+    r_path.write_bytes(b"X\nsafe\nmodel")
+
+    def raise_route_read_error(*_args: object, **_kwargs: object) -> str:
+        raise OSError("simulated routing read failure")
+
+    def raise_r_read_error(*_args: object, **_kwargs: object) -> tuple[bytes, str, bool, int]:
+        raise PermissionError(13, "simulated R payload read failure")
+
+    monkeypatch.setattr(core_module, "detect_file_format", raise_route_read_error)
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_route_read_error)
+    monkeypatch.setattr(
+        "modelaudit.scanners.r_serialized_scanner.RSerializedScanner._read_payload_for_analysis",
+        raise_r_read_error,
+    )
+
+    result = scan_file(str(r_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "r_serialized"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["operational_error_reason"] == "r_serialized_read_failed"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_file_unreadable_suffix_only_candidate_does_not_emit_path_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "unavailable.onnx"
+    model_path.write_bytes(b"unreadable onnx candidate")
+    real_access = os.access
+
+    def unreadable_path(candidate: str, mode: int) -> bool:
+        return False if candidate == str(model_path) and mode == os.R_OK else real_access(candidate, mode)
+
+    def raise_read_error(*_args: object, **_kwargs: object) -> str:
+        raise OSError("simulated unreadable model payload")
+
+    monkeypatch.setattr(os, "access", unreadable_path)
+    monkeypatch.setattr(core_module, "detect_file_format", raise_read_error)
+
+    direct = scan_file(str(model_path), config={"cache_scan_results": False})
+    aggregate = core_module.scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert direct.scanner_name == "unknown"
+    assert direct.success is False
+    assert direct.metadata["operational_error_reason"] == "format_detection_read_failed"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in direct.issues)
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+
+
+@pytest.mark.parametrize("filename", ["README.md", "README", "model_card"])
+def test_scan_file_preserves_metadata_outcome_after_failed_read_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+) -> None:
+    readme_path = tmp_path / filename
+    readme_path.write_text("# metadata\n", encoding="utf-8")
+
+    def raise_read_error(*_args: object, **_kwargs: object) -> str:
+        raise OSError("simulated read failure")
+
+    monkeypatch.setattr(core_module, "detect_file_format", raise_read_error)
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_read_error)
+    monkeypatch.setattr("modelaudit.scanners.metadata_scanner.open", raise_read_error, raising=False)
+
+    result = scan_file(str(readme_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "metadata"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["operational_error_reason"] == "metadata_read_failed"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
 def test_scan_file_unavailable_recognized_format_result_is_not_cached(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6022,6 +6567,305 @@ def test_directory_scan_bypasses_stale_cache_when_owner_read_fails_with_access(
         metadata = result.file_metadata[str(cached_clean)]
         assert metadata["operational_error_reason"] == "lightgbm_read_failed"
         assert "lightgbm_read_failed" in metadata["scan_outcome_reasons"]
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert core_module.determine_exit_code(result) == 2
+    finally:
+        reset_cache_manager()
+
+
+@pytest.mark.parametrize(
+    ("filename", "writer", "reason", "check_name", "message_fragment"),
+    [
+        ("cached.mlmodel", create_mock_coreml, "coreml_read_failed", "CoreML File Read", "Failed to read CoreML file"),
+        (
+            "cached.safetensors",
+            _write_minimal_safetensors,
+            "safetensors_read_failed",
+            "SafeTensors File Read",
+            "Unable to read SafeTensors file",
+        ),
+        (
+            "cached.engine",
+            _write_safe_tensorrt,
+            "tensorrt_read_failed",
+            "TensorRT Engine Read",
+            "Error reading TensorRT engine",
+        ),
+        ("cached.npy", _write_minimal_numpy, "numpy_read_failed", "NumPy File Read", "Unable to read NumPy file"),
+        ("cached.npz", _write_safe_npz, "zip_analysis_incomplete", "ZIP File Scan", "Error scanning zip file"),
+        ("cached.pdmodel", _write_safe_paddle, "paddle_read_failed", "Paddle File Read", "Error reading file"),
+        (
+            "cached.bin",
+            _write_safe_pytorch_binary,
+            "pytorch_binary_read_failed",
+            "Binary File Read",
+            "Unable to read binary file",
+        ),
+        (
+            "saved_model.pb",
+            _write_safe_savedmodel,
+            "savedmodel_read_failed",
+            "SavedModel File Read",
+            "Unable to read TF SavedModel file",
+        ),
+        (
+            "cached.rds",
+            _write_safe_r_serialized,
+            "r_serialized_read_failed",
+            "R Serialized Read",
+            "Unable to read R serialized payload",
+        ),
+    ],
+)
+def test_single_file_scan_bypasses_stale_cache_when_read_failure_aware_owner_read_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    writer: Callable[[Path], object],
+    reason: str,
+    check_name: str,
+    message_fragment: str,
+) -> None:
+    model_path = tmp_path / filename
+    writer(model_path)
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        with monkeypatch.context() as cache_setup:
+            cache_setup.setattr(
+                cache_decorator,
+                "should_bypass_cache_for_read_failure_aware_file",
+                lambda _path: False,
+            )
+            first = core_module.scan_model_directory_or_file(
+                str(model_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+        assert core_module.determine_exit_code(first) == 0
+        assert first.success is True
+        cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        assert cached_entries > 0
+
+        real_open = open
+
+        def fail_cached_binary_read(
+            candidate: str | bytes | os.PathLike[str],
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            if str(candidate) == str(model_path):
+                if reason == "r_serialized_read_failed":
+                    raise PermissionError(13, f"simulated transient {reason} read")
+                raise OSError(f"simulated transient {reason} read")
+            return real_open(candidate, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fail_cached_binary_read)
+        if filename.endswith(".npz"):
+            real_zip_file = zipfile.ZipFile
+
+            def fail_cached_zip_read(
+                candidate: str | os.PathLike[str],
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                if str(candidate) == str(model_path):
+                    raise OSError(f"simulated transient {reason} read")
+                return real_zip_file(candidate, *args, **kwargs)
+
+            monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", fail_cached_zip_read)
+
+        second = core_module.scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        metadata = second.file_metadata[str(model_path)]
+        assert second.success is False
+        assert metadata["operational_error_reason"] == reason
+        assert reason in metadata["scan_outcome_reasons"]
+        assert any(check.name == check_name and message_fragment in check.message for check in second.checks)
+        assert core_module.determine_exit_code(second) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
+    finally:
+        reset_cache_manager()
+
+
+def test_single_file_scan_bypasses_stale_cache_when_numpy_header_read_fails_after_cache_warm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "cached.npy"
+    _write_minimal_numpy(model_path)
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        with monkeypatch.context() as cache_setup:
+            cache_setup.setattr(
+                cache_decorator,
+                "should_bypass_cache_for_read_failure_aware_file",
+                lambda _path: False,
+            )
+            first = core_module.scan_model_directory_or_file(
+                str(model_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+        assert core_module.determine_exit_code(first) == 0
+        cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        assert cached_entries > 0
+
+        def raise_header_oserror(*_args: object, **_kwargs: object) -> None:
+            raise OSError("simulated NumPy header read failure")
+
+        monkeypatch.setattr("modelaudit.scanners.numpy_scanner.fmt.read_array_header_1_0", raise_header_oserror)
+
+        second = core_module.scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        metadata = second.file_metadata[str(model_path)]
+        assert second.success is False
+        assert metadata["operational_error_reason"] == "numpy_read_failed"
+        assert "numpy_read_failed" in metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "NumPy File Read" and "Unable to read NumPy file" in check.message for check in second.checks
+        )
+        assert core_module.determine_exit_code(second) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
+    finally:
+        reset_cache_manager()
+
+
+@pytest.mark.parametrize(
+    ("filename", "writer", "reason", "check_name", "message_fragment"),
+    [
+        ("cached.mlmodel", create_mock_coreml, "coreml_read_failed", "CoreML File Read", "Failed to read CoreML file"),
+        (
+            "cached.safetensors",
+            _write_minimal_safetensors,
+            "safetensors_read_failed",
+            "SafeTensors File Read",
+            "Unable to read SafeTensors file",
+        ),
+        (
+            "cached.engine",
+            _write_safe_tensorrt,
+            "tensorrt_read_failed",
+            "TensorRT Engine Read",
+            "Error reading TensorRT engine",
+        ),
+        ("cached.npy", _write_minimal_numpy, "numpy_read_failed", "NumPy File Read", "Unable to read NumPy file"),
+        ("cached.npz", _write_safe_npz, "zip_analysis_incomplete", "ZIP File Scan", "Error scanning zip file"),
+        ("cached.pdmodel", _write_safe_paddle, "paddle_read_failed", "Paddle File Read", "Error reading file"),
+        (
+            "cached.bin",
+            _write_safe_pytorch_binary,
+            "pytorch_binary_read_failed",
+            "Binary File Read",
+            "Unable to read binary file",
+        ),
+        (
+            "saved_model.pb",
+            _write_safe_savedmodel,
+            "savedmodel_read_failed",
+            "SavedModel File Read",
+            "Unable to read TF SavedModel file",
+        ),
+        (
+            "cached.rds",
+            _write_safe_r_serialized,
+            "r_serialized_read_failed",
+            "R Serialized Read",
+            "Unable to read R serialized payload",
+        ),
+    ],
+)
+def test_directory_scan_bypasses_stale_cache_when_read_failure_aware_owner_read_fails_with_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    writer: Callable[[Path], object],
+    reason: str,
+    check_name: str,
+    message_fragment: str,
+) -> None:
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    cached_clean = model_dir / filename
+    writer(cached_clean)
+    malicious = model_dir / "malicious.pkl"
+    malicious.write_bytes(_build_malicious_pickle())
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        with monkeypatch.context() as cache_setup:
+            cache_setup.setattr(
+                cache_decorator,
+                "should_bypass_cache_for_read_failure_aware_file",
+                lambda _path: False,
+            )
+            warm = core_module.scan_model_directory_or_file(
+                str(cached_clean),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+        assert core_module.determine_exit_code(warm) == 0
+        assert warm.success is True
+        cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        assert cached_entries > 0
+
+        real_open = open
+
+        def fail_cached_binary_read(
+            candidate: str | bytes | os.PathLike[str],
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            if str(candidate) == str(cached_clean):
+                if reason == "r_serialized_read_failed":
+                    raise PermissionError(13, f"simulated transient {reason} read")
+                raise OSError(f"simulated transient {reason} read")
+            return real_open(candidate, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fail_cached_binary_read)
+        if filename.endswith(".npz"):
+            real_zip_file = zipfile.ZipFile
+
+            def fail_cached_zip_read(
+                candidate: str | os.PathLike[str],
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                if str(candidate) == str(cached_clean):
+                    raise OSError(f"simulated transient {reason} read")
+                return real_zip_file(candidate, *args, **kwargs)
+
+            monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", fail_cached_zip_read)
+
+        result = core_module.scan_model_directory_or_file(
+            str(model_dir),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        metadata = result.file_metadata[str(cached_clean)]
+        assert result.success is False
+        assert metadata["operational_error_reason"] == reason
+        assert reason in metadata["scan_outcome_reasons"]
+        assert any(check.name == check_name and message_fragment in check.message for check in result.checks)
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         assert core_module.determine_exit_code(result) == 2
     finally:

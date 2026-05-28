@@ -16,21 +16,52 @@ from ...cache.optimized_config import get_config_extractor
 logger = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
 
-_READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS = frozenset({".cmf", ".dnn", ".lgb", ".lightgbm"})
+_READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS = frozenset(
+    {
+        ".bin",
+        ".cmf",
+        ".dnn",
+        ".engine",
+        ".lgb",
+        ".lightgbm",
+        ".meta",
+        ".mlmodel",
+        ".npy",
+        ".npz",
+        ".pb",
+        ".pdiparams",
+        ".pdmodel",
+        ".plan",
+        ".rda",
+        ".rdata",
+        ".rds",
+        ".safetensors",
+        ".trt",
+    }
+)
+
+
+def _is_read_failure_aware_scanner_path(file_path: str) -> bool:
+    try:
+        from ...scanners.manifest_scanner import ManifestScanner
+        from ...scanners.metadata_scanner import MetadataScanner
+        from ...scanners.text_scanner import TextScanner
+    except Exception:
+        return False
+
+    return (
+        ManifestScanner.can_handle(file_path)
+        or MetadataScanner.can_handle(file_path)
+        or TextScanner.can_handle(file_path)
+    )
 
 
 def should_bypass_cache_for_read_failure_aware_file(file_path: str) -> bool:
-    """Bypass stale clean cache entries when dedicated read-failure-aware files stop reading."""
-    if os.path.splitext(file_path)[1].lower() not in _READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS:
-        return False
-
-    try:
-        with open(file_path, "rb") as handle:
-            handle.read(1)
-    except OSError:
-        return True
-
-    return False
+    """Bypass stale clean cache entries for formats with explicit read-failure outcomes."""
+    extension_is_read_failure_aware = (
+        os.path.splitext(file_path)[1].lower() in _READ_FAILURE_AWARE_CACHE_PROBE_EXTENSIONS
+    )
+    return extension_is_read_failure_aware or _is_read_failure_aware_scanner_path(file_path)
 
 
 def should_bypass_cache_for_safetensors_header_limit(file_path: str, config: dict[str, Any]) -> bool:
@@ -43,6 +74,26 @@ def should_bypass_cache_for_safetensors_header_limit(file_path: str, config: dic
     except (ImportError, TypeError, ValueError):
         return False
     return should_defer_safetensors_header_limit_hash(file_path, max_header_bytes)
+
+
+def _known_uncacheable_scan_result(result: Any) -> bool:
+    """Return True for ScanResult objects policy will reject without serialization."""
+    try:
+        from ...scanner_results import INCONCLUSIVE_SCAN_OUTCOME, ScanResult, normalize_unclassified_scan_failure
+    except Exception:
+        return False
+
+    if not isinstance(result, ScanResult):
+        return False
+
+    normalize_unclassified_scan_failure(result)
+    metadata = result.metadata
+    return (
+        result.success is False
+        or bool(metadata.get("operational_error"))
+        or bool(metadata.get("analysis_incomplete"))
+        or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    )
 
 
 def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "cache_dir") -> Callable[[F], F]:
@@ -123,9 +174,11 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                 cache_manager = get_cache_manager(cache_config.cache_dir, enabled=True)
                 version_context = cache_config.get_version_context()
 
-                def cached_func_wrapper(fpath: str) -> dict:
+                def cached_func_wrapper(fpath: str) -> Any:
                     """Wrapper function for cache manager"""
                     result = func(*args, **kwargs)
+                    if _known_uncacheable_scan_result(result):
+                        return result
 
                     # Convert result to dictionary format for caching
                     if hasattr(result, "to_dict"):
@@ -159,6 +212,11 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     logger.debug(f"Cache miss for {os.path.basename(file_path)}, performing scan")
                     scan_start = time.perf_counter()
                     result_dict = cached_func_wrapper(file_path)
+                    if not isinstance(result_dict, dict):
+                        logger.debug(
+                            f"Skipping cache store for known uncacheable result from {os.path.basename(file_path)}"
+                        )
+                        return result_dict
                     if should_cache_scan_result(result_dict):
                         scan_duration_ms = int((time.perf_counter() - scan_start) * 1000)
                         cache_manager.store_result(
