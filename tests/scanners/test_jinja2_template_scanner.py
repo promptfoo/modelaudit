@@ -655,6 +655,80 @@ class TestJinja2TemplateScannerEdgeCases:
         assert aggregate_result.success is False
         assert determine_exit_code(aggregate_result) == 2
 
+    def test_oversized_json_chat_template_fails_closed(self, tmp_path: Path) -> None:
+        default_limit = Jinja2TemplateScanner().max_template_size
+        payload = ("a" * (default_limit + 1)) + "{{ lipsum.__globals__.os.popen('id').read() }}"
+        tokenizer_file = tmp_path / "tokenizer_config.json"
+        tokenizer_file.write_text(json.dumps({"chat_template": payload}), encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"max_template_size": 64})
+        result = scanner.scan(str(tokenizer_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_template_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        size_checks = [c for c in result.checks if c.name == "Template Size Limit"]
+        assert len(size_checks) == 1
+        assert size_checks[0].status == CheckStatus.FAILED
+        assert size_checks[0].severity == IssueSeverity.INFO
+        assert size_checks[0].details["skipped_template_locations"] == ["chat_template"]
+        assert size_checks[0].details["template_size"] == len(payload)
+        assert not [c for c in result.checks if c.message == "No Jinja2 templates found in file"]
+
+        aggregate_result = scan_model_directory_or_file(
+            str(tokenizer_file),
+            config={"max_template_size": 64, "cache_scan_results": False},
+        )
+        assert aggregate_result.success is False
+        assert determine_exit_code(aggregate_result) == 2
+
+    def test_oversized_yaml_chat_template_fails_closed(self, tmp_path: Path) -> None:
+        yaml = pytest.importorskip("yaml")
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        payload = ("a" * 96) + "{{ lipsum.__globals__.os.popen('id').read() }}"
+        yaml_file = model_dir / "config.yaml"
+        yaml_file.write_text(yaml.safe_dump({"chat_template": payload}), encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"max_template_size": 64})
+        result = scanner.scan(str(yaml_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_template_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        size_checks = [c for c in result.checks if c.name == "Template Size Limit"]
+        assert len(size_checks) == 1
+        assert size_checks[0].details["format"] == "yaml"
+        assert size_checks[0].details["skipped_template_locations"] == ["chat_template"]
+        assert not [c for c in result.checks if c.message == "No Jinja2 templates found in file"]
+
+    def test_oversized_benign_json_template_is_inconclusive_without_security_finding(self, tmp_path: Path) -> None:
+        payload = "{{ message['content'] }}" + (" safe" * 32)
+        tokenizer_file = tmp_path / "tokenizer_config.json"
+        tokenizer_file.write_text(json.dumps({"chat_template": payload}), encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"max_template_size": 64})
+        result = scanner.scan(str(tokenizer_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_template_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert [c for c in result.checks if c.name == "Template Size Limit"]
+        assert not [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+
+    def test_small_json_chat_template_still_analyzed(self, tmp_path: Path) -> None:
+        payload = "{{ lipsum.__globals__.os.popen('id') }}"
+        tokenizer_file = tmp_path / "tokenizer_config.json"
+        tokenizer_file.write_text(json.dumps({"chat_template": payload}), encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"max_template_size": 128})
+        result = scanner.scan(str(tokenizer_file))
+
+        assert result.has_warnings or result.has_errors
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Size Limit"]
+        assert [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+
     def test_invalid_utf8_standalone_template_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
         """Unreadable standalone templates must not look clean."""
         template_file = tmp_path / "invalid.jinja"
