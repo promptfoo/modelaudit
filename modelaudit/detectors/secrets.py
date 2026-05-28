@@ -572,8 +572,7 @@ class SecretsDetector:
         findings = []
 
         for key, value in data.items():
-            safe_key = self._redact_context(str(key))
-            key_context = f"{context}/{safe_key}" if context else safe_key
+            key_context = f"{context}/{key}" if context else str(key)
 
             # Check the key itself for secrets
             key_findings = self.scan_text(str(key), f"{key_context}[key]")
