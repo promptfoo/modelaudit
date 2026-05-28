@@ -356,22 +356,7 @@ class KerasH5Scanner(BaseScanner):
         if any(str(key).lower() in cls._WEIGHTS_LIKE_ROOT_KEYS for key in h5_file):
             return True
 
-        if any(str(key).lower() in cls._WEIGHTS_LIKE_ROOT_KEYS for key in h5_file.attrs):
-            return True
-
-        found_weight_metadata = False
-
-        def visit(name: str, _obj: Any) -> None:
-            nonlocal found_weight_metadata
-            if found_weight_metadata:
-                return
-            normalized_parts = {part.lower() for part in name.replace("\\", "/").split("/") if part}
-            if normalized_parts & cls._WEIGHTS_LIKE_ROOT_KEYS:
-                found_weight_metadata = True
-
-        with suppress(Exception):
-            h5_file.visititems(visit)
-        return found_weight_metadata
+        return any(str(key).lower() in cls._WEIGHTS_LIKE_ROOT_KEYS for key in h5_file.attrs)
 
     def _check_hdf5_external_references(self, h5_file: Any, result: ScanResult, source_path: str) -> None:
         """Detect HDF5 external links/storage before any Keras-specific parsing short-circuits."""

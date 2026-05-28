@@ -624,6 +624,20 @@ def test_keras_h5_scanner_skips_generic_hdf5_external_links_without_keras_metada
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
+def test_keras_h5_scanner_skips_generic_nested_weight_like_groups(tmp_path: Path) -> None:
+    """Nested generic groups named vars/weights must not imply a Keras weights file."""
+    generic_path = tmp_path / "generic_nested.h5"
+    with h5py.File(generic_path, "w") as f:
+        experiment_vars = f.create_group("experiment").create_group("vars")
+        experiment_vars["linked"] = h5py.ExternalLink("external_source.h5", "/payload")
+
+    result = KerasH5Scanner().scan(str(generic_path))
+
+    assert result.success is True
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
 def test_keras_h5_scanner_flags_weights_only_external_link_without_keras_metadata(tmp_path: Path) -> None:
     """Weights-only HDF5 files can still be Keras load inputs and must not skip external references."""
     external_source = tmp_path / "external_source.h5"
