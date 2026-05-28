@@ -154,6 +154,14 @@ def _redact_encoded_path_separator_tokens(segment: str) -> str | None:
         return None
 
     parts = decoded.split("/")
+    if (
+        len(parts) > 1
+        and all(re.fullmatch(r"=*", part) for part in parts[1:])
+        and parts[0]
+        and _looks_like_capability_path_token(parts[0])
+    ):
+        return f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+
     changed = False
     for index, part in enumerate(parts):
         if part and _looks_like_capability_path_token(part):
