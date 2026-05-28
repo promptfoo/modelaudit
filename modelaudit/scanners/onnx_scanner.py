@@ -144,6 +144,28 @@ def _iter_model_graphs(model: Any) -> Any:
         yield training_info.algorithm
 
 
+def _iter_graph_and_subgraphs(graph: Any) -> Any:
+    """Yield an ONNX graph and every graph nested below node attributes."""
+    yield graph
+    for node in getattr(graph, "node", []):
+        for attribute in getattr(node, "attribute", []):
+            for subgraph in _iter_attribute_graphs(attribute):
+                yield from _iter_graph_and_subgraphs(subgraph)
+
+
+def _iter_model_initializer_graphs(model: Any) -> Any:
+    """Yield every ONNX graph that can carry tensor initializers."""
+    yield from _iter_graph_and_subgraphs(model.graph)
+    for function in getattr(model, "functions", []):
+        yield from _iter_graph_and_subgraphs(function)
+        for attribute in getattr(function, "attribute_proto", []):
+            for subgraph in _iter_attribute_graphs(attribute):
+                yield from _iter_graph_and_subgraphs(subgraph)
+    for training_info in getattr(model, "training_info", []):
+        yield from _iter_graph_and_subgraphs(training_info.initialization)
+        yield from _iter_graph_and_subgraphs(training_info.algorithm)
+
+
 def _model_declares_python_operator(model: Any) -> bool:
     """Return True when the parsed ONNX model actually declares a Python operator.
 
@@ -623,10 +645,12 @@ class OnnxScanner(BaseScanner):
         traversal_files: dict[str, list[str]] = {}  # file -> [tensor_names]
         safe_files: set[str] = set()
 
-        for tensor in model.graph.initializer:
-            self.check_interrupted()
+        for graph in _iter_model_initializer_graphs(model):
+            for tensor in getattr(graph, "initializer", []):
+                self.check_interrupted()
 
-            if tensor.data_location == onnx.TensorProto.EXTERNAL:
+                if tensor.data_location != onnx.TensorProto.EXTERNAL:
+                    continue
                 info = {entry.key: entry.value for entry in tensor.external_data}
                 location = info.get("location")
                 if not location:
