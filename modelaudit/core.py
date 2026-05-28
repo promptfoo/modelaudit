@@ -490,7 +490,11 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
                 context="inconclusive MXNet params byte analysis",
             )
 
-    if os.path.getsize(path) <= JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+    if os.path.getsize(
+        path
+    ) <= JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES or JaxCheckpointScanner.should_analyze_inconclusive_json_overlap(
+        path
+    ):
         if scanner_selection.allows("jax_checkpoint"):
             merge_owner_result(JaxCheckpointScanner(config=config).scan(path))
         elif scanner_selection.active:

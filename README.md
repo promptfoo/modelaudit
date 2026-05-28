@@ -106,7 +106,8 @@ otherwise unclaimed suffixes such as `.jpg`.
 Structurally plausible Flax/JAX MessagePack checkpoints are also recognized when renamed to non-model suffixes;
 renamed structures that cannot be fully classified are reported as incomplete coverage.
 Structured JAX/Orbax JSON checkpoint metadata is likewise recognized when renamed; oversized ambiguous
-candidates are reported as incomplete coverage.
+candidates are reported as incomplete coverage; observable security patterns in the bounded inspected prefix may
+still be reported conservatively.
 
 [View complete format documentation](https://www.promptfoo.dev/docs/model-audit/scanners/)
 

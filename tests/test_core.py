@@ -2878,6 +2878,262 @@ def test_scan_file_fails_closed_for_oversized_renamed_jax_json_and_does_not_cach
     assert core_module.determine_exit_code(aggregate) == 2
 
 
+def test_scan_file_reports_visible_jax_pattern_before_oversized_json_exit2(tmp_path: Path) -> None:
+    model_path = tmp_path / "malicious-large.checkpoint"
+    model_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert core_module.determine_exit_code(aggregate) == 1
+    assert any("Suspicious pattern in bounded JSON checkpoint prefix" in issue.message for issue in aggregate.issues)
+    assert aggregate.file_metadata[str(model_path)]["scan_outcome"] == "inconclusive"
+
+
+def test_scan_file_reports_visible_jax_pattern_after_depth_capped_prefix_value(tmp_path: Path) -> None:
+    model_path = tmp_path / "depth-capped-prefix-large.checkpoint"
+    deep_value: object = "benign"
+    for _ in range(JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH + 1):
+        deep_value = [deep_value]
+    model_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "deep": deep_value,
+                "payload": "jax.experimental.io_callback",
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert core_module.determine_exit_code(aggregate) == 2
+    assert any("Suspicious pattern in bounded JSON checkpoint prefix" in issue.message for issue in aggregate.issues)
+    assert aggregate.file_metadata[str(model_path)]["scan_outcome"] == "inconclusive"
+    assert "mxnet_symbol_routing_incomplete" in aggregate.file_metadata[str(model_path)]["scan_outcome_reasons"]
+
+
+def test_scan_file_reports_visible_renamed_jax_pattern_behind_inconclusive_mxnet_depth_route(tmp_path: Path) -> None:
+    model_path = tmp_path / "depth-capped-renamed-large.jpg"
+    deep_value: object = "benign"
+    for _ in range(JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH + 1):
+        deep_value = [deep_value]
+    model_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "deep": deep_value,
+                "payload": "jax.experimental.io_callback",
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert core_module.determine_exit_code(aggregate) == 2
+    assert any("Suspicious pattern in bounded JSON checkpoint prefix" in issue.message for issue in aggregate.issues)
+    assert aggregate.file_metadata[str(model_path)]["scan_outcome"] == "inconclusive"
+    assert "mxnet_symbol_routing_incomplete" in aggregate.file_metadata[str(model_path)]["scan_outcome_reasons"]
+
+
+def test_scan_file_reports_escaped_renamed_jax_pattern_behind_inconclusive_mxnet_depth_route(tmp_path: Path) -> None:
+    model_path = tmp_path / "escaped-depth-capped-renamed-large.jpg"
+    deep_value: object = "benign"
+    for _ in range(JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH + 1):
+        deep_value = [deep_value]
+    payload = json.dumps(
+        {
+            "framework": "jax",
+            "payload": "jax.experimental.io_callback",
+            "deep": deep_value,
+            "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+        }
+    ).replace("jax.experimental.io_callback", r"j\u0061x\u002eexperimental\u002eio_callback")
+    payload = payload.replace('"jax"', r'"j\u0061x"')
+    model_path.write_text(payload, encoding="utf-8")
+
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert b"jax" not in model_path.read_bytes()[:JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES]
+    assert core_module.determine_exit_code(aggregate) == 2
+    assert any("Suspicious pattern in bounded JSON checkpoint prefix" in issue.message for issue in aggregate.issues)
+    assert "mxnet_symbol_routing_incomplete" in aggregate.file_metadata[str(model_path)]["scan_outcome_reasons"]
+
+
+def test_scan_file_inconclusive_mxnet_depth_route_does_not_compose_visible_ajax_near_match(tmp_path: Path) -> None:
+    model_path = tmp_path / "depth-capped-renamed-ajax-large.jpg"
+    deep_value: object = "benign"
+    for _ in range(JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH + 1):
+        deep_value = [deep_value]
+    model_path.write_text(
+        json.dumps(
+            {
+                "framework": "ajax",
+                "deep": deep_value,
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome_reasons"] == ["mxnet_symbol_routing_incomplete"]
+    assert not any(check.name == "JSON Checkpoint Analysis Limit" for check in result.checks)
+
+
+def test_scan_file_reports_visible_pattern_in_truncated_oversized_json_string(tmp_path: Path) -> None:
+    model_path = tmp_path / "long-payload-malicious.checkpoint"
+    model_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "payload": "jax.experimental.io_callback" + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert core_module.determine_exit_code(aggregate) == 1
+    assert any("jax\\.experimental\\.io_callback" in issue.message for issue in aggregate.issues)
+    assert aggregate.file_metadata[str(model_path)]["scan_outcome"] == "inconclusive"
+
+
+def test_scan_file_decodes_visible_pattern_in_truncated_oversized_json_string(tmp_path: Path) -> None:
+    model_path = tmp_path / "escaped-long-payload-malicious.checkpoint"
+    model_path.write_text(
+        '{"framework":"jax","payload":"jax\\u002eexperimental\\u002eio_callback'
+        + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16))
+        + '"}',
+        encoding="utf-8",
+    )
+
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert core_module.determine_exit_code(aggregate) == 1
+    assert any("jax\\.experimental\\.io_callback" in issue.message for issue in aggregate.issues)
+    assert aggregate.file_metadata[str(model_path)]["scan_outcome"] == "inconclusive"
+
+
+def test_scan_file_does_not_report_pattern_from_oversized_trailing_json_document(tmp_path: Path) -> None:
+    model_path = tmp_path / "trailing-document-large.checkpoint"
+    model_path.write_text(
+        '{"framework":"jax"}{"payload":"jax.experimental.io_callback","padding":"'
+        + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16))
+        + '"}',
+        encoding="utf-8",
+    )
+
+    aggregate = scan_model_directory_or_file(
+        str(model_path),
+        scanners=["jax_checkpoint"],
+        cache_scan_results=False,
+    )
+
+    assert core_module.determine_exit_code(aggregate) == 2
+    assert all(
+        "Suspicious pattern in bounded JSON checkpoint prefix" not in issue.message for issue in aggregate.issues
+    )
+    assert aggregate.file_metadata[str(model_path)]["scan_outcome"] == "inconclusive"
+
+
+def test_scan_file_reports_visible_pattern_in_first_json_root_before_trailing_bytes(tmp_path: Path) -> None:
+    model_path = tmp_path / "visible-malicious-root-with-trailing-bytes.checkpoint"
+    model_path.write_text(
+        '{"framework":"jax","payload":"jax.experimental.io_callback"}'
+        + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)),
+        encoding="utf-8",
+    )
+
+    aggregate = scan_model_directory_or_file(
+        str(model_path),
+        scanners=["jax_checkpoint"],
+        cache_scan_results=False,
+    )
+
+    assert core_module.determine_exit_code(aggregate) == 1
+    assert any("Suspicious pattern in bounded JSON checkpoint prefix" in issue.message for issue in aggregate.issues)
+    assert aggregate.file_metadata[str(model_path)]["scan_outcome"] == "inconclusive"
+
+
+def test_scan_file_uses_final_duplicate_json_value_when_oversized_root_is_visible(tmp_path: Path) -> None:
+    model_path = tmp_path / "visible-root-duplicate-value.checkpoint"
+    model_path.write_text(
+        '{"framework":"jax","payload":"jax.experimental.io_callback","payload":"benign"}'
+        + (" " * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)),
+        encoding="utf-8",
+    )
+
+    aggregate = scan_model_directory_or_file(
+        str(model_path),
+        scanners=["jax_checkpoint"],
+        cache_scan_results=False,
+    )
+
+    assert core_module.determine_exit_code(aggregate) == 2
+    assert all(
+        "Suspicious pattern in bounded JSON checkpoint prefix" not in issue.message for issue in aggregate.issues
+    )
+    assert aggregate.file_metadata[str(model_path)]["scan_outcome"] == "inconclusive"
+
+
+def test_scan_file_fails_closed_and_does_not_cache_bounded_jax_prefix_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "unreadable-prefix.checkpoint"
+    model_path.write_text(
+        json.dumps({"framework": "jax", "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)}),
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "cache"
+
+    def fail_prefix_read(_scanner: JaxCheckpointScanner, _path: str, _result: ScanResult) -> None:
+        raise OSError("forced bounded prefix read failure")
+
+    monkeypatch.setattr(JaxCheckpointScanner, "_scan_bounded_json_prefix_patterns", fail_prefix_read)
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(model_path)]
+            assert aggregate.success is False
+            assert core_module.determine_exit_code(aggregate) == 2
+            assert metadata["scan_outcome"] == "inconclusive"
+            assert metadata["operational_error_reason"] == "jax_json_checkpoint_prefix_pattern_read_failed"
+            assert any(check.name == "JSON Bounded Prefix Pattern Scan" for check in aggregate.checks)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def test_scan_file_fails_closed_when_renamed_jax_json_root_is_past_routing_budget(tmp_path: Path) -> None:
     model_path = tmp_path / "late-root.jpg"
     model_path.write_text(

@@ -814,6 +814,294 @@ def test_oversized_renamed_jax_json_checkpoint_fails_closed_without_routing_ajax
     )
 
 
+def test_oversized_jax_json_checkpoint_reports_visible_bounded_pattern_before_failing_closed(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "malicious-large.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["context"] == "json_checkpoint_bounded_prefix.payload"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Documentation mentions jax.experimental.host_callback.call as unsupported.",
+        {"detail": "Documentation mentions jax.experimental.host_callback.call as unsupported."},
+        ["Documentation mentions jax.experimental.host_callback.call as unsupported."],
+    ],
+)
+def test_oversized_jax_json_checkpoint_does_not_promote_documentation_pattern_to_critical(
+    tmp_path: Path,
+    description: object,
+) -> None:
+    checkpoint_path = tmp_path / "documentation-large.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "description": description,
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert all(check.name != "JSON Pattern Security Check" for check in result.checks)
+
+
+def test_oversized_jax_json_checkpoint_reports_visible_nested_payload_pattern(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "nested-malicious-large.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "runtime": {"payload": "jax.experimental.host_callback.call(os.system, 'id')"},
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["context"] == "json_checkpoint_bounded_prefix.runtime.payload"
+        for check in result.checks
+    )
+
+
+def test_oversized_jax_json_checkpoint_reports_visible_payload_after_depth_capped_value(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "depth-capped-prefix-large.checkpoint"
+    deep_value: object = "benign"
+    for _ in range(JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH + 1):
+        deep_value = [deep_value]
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "deep": deep_value,
+                "payload": "jax.experimental.io_callback",
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["context"] == "json_checkpoint_bounded_prefix.payload"
+        for check in result.checks
+    )
+    assert any(check.name == "JSON Metadata Traversal Depth Limit" for check in result.checks)
+
+
+def test_oversized_jax_json_checkpoint_reports_visible_payload_after_json_parser_recursion_limit(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "recursive-prefix-large.checkpoint"
+    depth = 2048
+    checkpoint_path.write_text(
+        '{"framework":"jax","deep":'
+        + ("[" * depth)
+        + "0"
+        + ("]" * depth)
+        + ',"payload":"jax.experimental.io_callback","padding":"'
+        + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16))
+        + '"}',
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["context"] == "json_checkpoint_bounded_prefix.payload"
+        for check in result.checks
+    )
+    assert all(check.name != "Checkpoint File Scan" for check in result.checks)
+
+
+def test_oversized_jax_json_checkpoint_reports_pattern_in_truncated_visible_string_value(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "long-payload-malicious.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "payload": "jax.experimental.io_callback" + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["pattern"] == r"jax\.experimental\.io_callback"
+        and check.details["context"] == "json_checkpoint_bounded_prefix.payload"
+        for check in result.checks
+    )
+
+
+def test_oversized_jax_json_checkpoint_decodes_pattern_in_truncated_string_value(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "escaped-long-payload-malicious.checkpoint"
+    checkpoint_path.write_text(
+        '{"framework":"jax","payload":"jax\\u002eexperimental\\u002eio_callback'
+        + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16))
+        + '"}',
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["pattern"] == r"jax\.experimental\.io_callback"
+        and check.details["context"] == "json_checkpoint_bounded_prefix.payload"
+        for check in result.checks
+    )
+
+
+def test_oversized_jax_json_checkpoint_decodes_truncated_documentation_before_suppression(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "escaped-long-documentation.checkpoint"
+    checkpoint_path.write_text(
+        '{"framework":"jax","description":"caf\\u00e9 Documentation mentions '
+        "jax.experimental.io_callback as unsupported. "
+        + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16))
+        + '"}',
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert all(check.name != "JSON Pattern Security Check" for check in result.checks)
+
+
+def test_oversized_jax_json_checkpoint_does_not_scan_trailing_second_root(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "trailing-document-large.checkpoint"
+    checkpoint_path.write_text(
+        '{"framework":"jax"}{"payload":"jax.experimental.io_callback","padding":"'
+        + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16))
+        + '"}',
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert all(check.name != "JSON Pattern Security Check" for check in result.checks)
+
+
+def test_oversized_jax_json_checkpoint_scans_visible_first_root_before_trailing_bytes(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "visible-malicious-root-with-trailing-bytes.checkpoint"
+    checkpoint_path.write_text(
+        '{"framework":"jax","payload":"jax.experimental.io_callback"}'
+        + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["context"] == "json_checkpoint_bounded_prefix.payload"
+        for check in result.checks
+    )
+
+
+def test_oversized_jax_json_checkpoint_uses_final_duplicate_value_when_root_is_visible(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "visible-root-duplicate-value.checkpoint"
+    checkpoint_path.write_text(
+        '{"framework":"jax","payload":"jax.experimental.io_callback","payload":"benign"}'
+        + (" " * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert all(check.name != "JSON Pattern Security Check" for check in result.checks)
+
+
+def test_oversized_jax_json_checkpoint_reports_visible_duplicate_value_when_root_is_truncated(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "truncated-root-duplicate-value.checkpoint"
+    checkpoint_path.write_text(
+        '{"framework":"jax","payload":"jax.experimental.io_callback","padding":"'
+        + ("x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16))
+        + '","payload":"benign"}',
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["context"] == "json_checkpoint_bounded_prefix.payload"
+        for check in result.checks
+    )
+
+
+def test_oversized_jax_json_array_reports_visible_nested_pattern(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "array-malicious.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps(
+            [
+                "jax.experimental.host_callback.call(os.system, 'id')",
+                "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["context"] == "json_checkpoint_bounded_prefix[0]"
+        for check in result.checks
+    )
+
+
 def test_renamed_jax_json_with_root_after_routing_budget_fails_closed(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "late-root.jpg"
     checkpoint_path.write_text(

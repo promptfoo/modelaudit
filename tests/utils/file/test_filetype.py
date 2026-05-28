@@ -274,6 +274,22 @@ def test_detect_jax_json_checkpoint_with_object_after_routing_budget_fails_close
     assert detect_file_format(str(checkpoint_path)) == "jax_checkpoint"
 
 
+def test_detect_oversized_visible_ajax_prefix_stays_ambiguous_with_unseen_late_jax_identity(tmp_path: Path) -> None:
+    visible_non_jax = tmp_path / "large-ajax.jpg"
+    late_jax = tmp_path / "large-ajax-late-jax.jpg"
+    padding = "x" * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16)
+    visible_non_jax.write_text(json.dumps({"framework": "ajax", "padding": padding}), encoding="utf-8")
+    late_jax.write_text(
+        json.dumps({"framework": "ajax", "padding": padding, "backend": "jax"}),
+        encoding="utf-8",
+    )
+
+    probe_size = JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1
+    assert visible_non_jax.read_bytes()[:probe_size] == late_jax.read_bytes()[:probe_size]
+    assert detect_file_format(str(visible_non_jax)) == "jax_checkpoint"
+    assert detect_file_format(str(late_jax)) == "jax_checkpoint"
+
+
 def test_detect_oversized_jax_json_checkpoint_with_long_identity_value(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "long-identity.jpg"
     padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
