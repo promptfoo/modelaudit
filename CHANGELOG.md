@@ -11,8 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - inspect every parsed GGUF chat template when duplicate or trailing malformed metadata could otherwise hide SSTI payloads
 - bound GGUF declared metadata and tensor collections so oversized structures fail closed without exhausting scanner resources
+- redact secret-shaped dictionary keys from embedded-secret detector finding contexts
+- redact compound credential names and malformed userinfo URLs in scanner evidence
+- restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- redact compound credential names and malformed userinfo URLs in scanner evidence
+- restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
+- treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
+- detect external references in weights-only Keras HDF5 layouts without Keras metadata
+- restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- classify unavailable metadata document reads and timed-out metadata scans as operationally incomplete rather than security findings
+- route renamed structured JAX/Orbax JSON checkpoints, conservatively report observable bounded-prefix threats, and fail closed for oversized identified metadata
+- classify Flax MessagePack recursion-limit analysis gaps as inconclusive coverage
+- classify incomplete JAX/Orbax metadata, pickle, and NumPy analysis as inconclusive coverage
 - route renamed structured JAX/Orbax JSON checkpoints and fail closed for oversized identified metadata
 - route renamed structurally valid Flax/JAX MessagePack checkpoints through bounded, fail-closed security analysis
+- preserve Flax/JAX MessagePack routing under skipped text/configuration suffixes and pickle-shaped prefixes with bounded fail-closed ambiguity handling
 - avoid emitting sensitive scanner finding or loader error payloads in logs
 - fail closed when PyTorch ZIP analysis cannot complete configured blacklist inspection or a required scan phase
 - fail closed when standalone Jinja2 templates exceed the configured analysis size limit or cannot be decoded as UTF-8 text
@@ -24,9 +38,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - prevent picklescan call-graph alias cycles from hanging scans
 - preserve HuggingFace snapshot shard paths while grouping cache-backed families
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
+- classify unavailable manifest and ML text reads as inconclusive rather than security findings, including routing, preflight, and stale cache transitions
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
+- skip non-numeric weight metadata and report incomplete weight-distribution analysis accurately
+- report incomplete R serialized coverage without treating extraction ceilings alone as suspicious payloads, and preserve detection across printable-chunk boundaries
+- classify unavailable Paddle, NumPy, PyTorch binary, and SavedModel reads as inconclusive rather than security findings
+- classify unavailable CoreML, SafeTensors, and TensorRT reads as inconclusive rather than security findings
+- classify unavailable TensorFlow MetaGraph reads as operational errors rather than security findings, including stale cache transitions
+- classify unavailable CNTK and LightGBM reads as inconclusive rather than security findings
+- route renamed and unknown-field-prefixed CoreML models, including valid unknown groups, reordered fields, and bounded routing candidates, through custom-code and metadata analysis
+- avoid inconclusive protobuf-candidate noise for fully inspected scalar-only text and Keras-owned JSON members while preserving binary-tailed candidates for analysis
+- preserve archive member incomplete-outcome reasons when nested tentative analysis also fails closed
+- route renamed TensorFlow SavedModel and MetaGraph protobufs through unsafe-operation analysis
+- route renamed ONNX protobuf models with prefixed unknown fields through content analysis and fail closed on unresolved or incomplete structure
+- preserve ambiguous budget-exhausted protobuf candidates for tentative analysis without misclassifying non-ONNX payloads
+- classify unavailable ZIP traversal, member, manifest-less TorchServe handler, and Keras artifact scan coverage as inconclusive while preserving archive-depth security findings
+- classify unavailable TAR traversal and member scan coverage as inconclusive while preserving depth-limit security findings
+- classify unavailable Skops member and schema coverage as inconclusive rather than security findings
+- classify bounded, unreadable, or unparseable TorchServe MAR analysis gaps as inconclusive rather than security findings
+- detect manifest-declared TorchServe extra files and PyTorch ZIP members disguised with executable content
+- classify incomplete SevenZip coverage as inconclusive and avoid caching temporary extracted members
+- classify uninspected OCI layers and members as inconclusive analysis instead of security findings, without caching extracted temporary members
+- route renamed ONNX protobuf models with prefixed unknown fields through content analysis and fail closed on unresolved or incomplete structure
+- mark compressed-wrapper partial-analysis outcomes explicitly inconclusive
+- retain oversized renamed SafeTensors candidates for bounded fail-closed analysis
+- route renamed TensorFlow SavedModel and MetaGraph protobufs through unsafe-operation analysis
 - detect and scan signature-valid CNTK and LightGBM payloads even when renamed with misleading suffixes
+- mark CNTK read failures and string-extraction limits as inconclusive analysis while retaining strict CNTK ownership and fail-closed ambiguous Flax overlap coverage
 - detect and scan signature-valid RKNN, TFLite, and ExecuTorch payloads under non-conflicting renamed suffixes while preserving owned routes, and classify unavailable ExecuTorch reads as inconclusive
 - mark CatBoost text-fragment extraction limits and unavailable reads as inconclusive analysis
 - mark RKNN and Torch7 string-extraction limits and unavailable reads as inconclusive analysis
@@ -37,9 +76,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - route renamed structurally valid MXNet symbol graphs through existing suspicious-reference analysis
 - harden renamed MXNet symbol routing with fail-closed bounded ambiguity and XGBoost overlap handling
 - restore content routing for extensionless XGBoost UBJSON models and classify unavailable or undecodable XGBoost reads as inconclusive
+- detect NeMo Hydra targets that invoke PyTorch C++ extension loaders
 - route renamed TAR-backed NeMo archives with relative archive-root model configs through Hydra `_target_` analysis while retaining generic embedded-member checks
 - honor descriptor-owned header aliases during helper scanner selection for renamed HDF5, GGML, and compressed payloads
-- detect and scan signature-valid CNTK and LightGBM payloads even when renamed with misleading suffixes
 - detect signature-valid Torch7 payloads even when renamed with misleading suffixes
 - detect acquired executable Llamafile payloads with misleading suffixes, retain archive-polyglot coverage, and classify unavailable runtime previews as inconclusive
 

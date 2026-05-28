@@ -804,7 +804,7 @@ class GgufScanner(BaseScanner):
         result.add_check(
             name="GGUF Duplicate Metadata Keys",
             passed=False,
-            message="GGUF contains duplicate metadata keys with ambiguous consumer interpretation",
+            message="Duplicate metadata keys have ambiguous consumer interpretation",
             severity=IssueSeverity.INFO,
             location=self.current_file_path,
             details={
@@ -813,7 +813,7 @@ class GgufScanner(BaseScanner):
                 "analysis_incomplete": True,
                 "scan_outcome_reason": GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON,
             },
-            rule_code="S902",
+            rule_code=None,
         )
 
     def _report_metadata_limit(self, result: ScanResult, message: str, **details: Any) -> None:

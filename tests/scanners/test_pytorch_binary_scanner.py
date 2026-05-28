@@ -1,9 +1,13 @@
+import builtins
 import struct
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors.suspicious_symbols import BINARY_CODE_PATTERNS
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
 from tests.helpers import create_mock_onnx
 
@@ -58,6 +62,110 @@ def test_pytorch_binary_scanner_basic_scan(tmp_path):
     # Should have no file type validation warnings (.bin files with unknown headers are valid)
     validation_issues = [i for i in result.issues if "file type validation failed" in i.message.lower()]
     assert len(validation_issues) == 0
+
+
+def test_pytorch_binary_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.bin"
+    path.write_bytes(b"benign binary tensor weights" * 10)
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated PyTorch binary read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.pytorch_binary_scanner.open", raise_os_error, raising=False)
+
+    direct = PyTorchBinaryScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    read_checks = [check for check in direct.checks if check.name == "Binary File Read"]
+    assert direct.success is False
+    assert aggregate.success is False
+    assert len(read_checks) == 1
+    assert read_checks[0].status == CheckStatus.FAILED
+    assert "Unable to read binary file" in read_checks[0].message
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "pytorch_binary_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "pytorch_binary_read_failed"
+    assert "pytorch_binary_read_failed" in direct.metadata["scan_outcome_reasons"]
+    metadata = aggregate.file_metadata[str(path)]
+    assert "pytorch_binary_read_failed" in metadata["scan_outcome_reasons"]
+    assert metadata["operational_error_reason"] == "pytorch_binary_read_failed"
+    assert any(
+        check.name == "Binary File Read" and "Unable to read binary file" in check.message for check in aggregate.checks
+    )
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_pytorch_binary_can_handle_routes_detection_read_failures_without_extra_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.bin"
+    path.write_bytes(b"benign binary tensor weights" * 10)
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> str:
+        raise OSError("simulated format detection read failure")
+
+    def fail_preflight_open(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("can_handle should not preflight-open .bin files")
+
+    monkeypatch.setattr("modelaudit.utils.file.detection.detect_file_format", raise_os_error)
+    monkeypatch.setattr("modelaudit.scanners.pytorch_binary_scanner.open", fail_preflight_open, raising=False)
+
+    assert PyTorchBinaryScanner.can_handle(str(path)) is True
+
+
+def test_pytorch_binary_validation_read_failure_is_operational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "transient-read-failure.bin"
+    path.write_bytes(b"benign binary tensor weights" * 10)
+    real_open = builtins.open
+    scanner_open_count = 0
+
+    def fail_second_scanner_open(file: str, *args: Any, **kwargs: Any) -> Any:
+        nonlocal scanner_open_count
+        if file == str(path):
+            scanner_open_count += 1
+            if scanner_open_count == 2:
+                raise OSError("simulated tensor validation read failure")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("modelaudit.scanners.pytorch_binary_scanner.open", fail_second_scanner_open, raising=False)
+    result = PyTorchBinaryScanner().scan(str(path))
+
+    assert scanner_open_count == 2
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == ["pytorch_binary_read_failed"]
+    assert result.metadata["operational_error_reason"] == "pytorch_binary_read_failed"
+    assert any(
+        check.name == "Binary File Read" and "Unable to read binary file" in check.message for check in result.checks
+    )
+
+
+def test_pytorch_binary_unreadable_path_preflight_is_operational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "permission-denied.bin"
+    path.write_bytes(b"benign binary tensor weights" * 10)
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
+
+    direct = PyTorchBinaryScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert direct.metadata["operational_error_reason"] == "pytorch_binary_read_failed"
+    assert aggregate.file_metadata[str(path)]["operational_error_reason"] == "pytorch_binary_read_failed"
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_pytorch_binary_scanner_reports_tiny_top_level_bin_files(tmp_path: Path) -> None:

