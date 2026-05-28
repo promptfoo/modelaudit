@@ -295,6 +295,17 @@ class TestNetworkCommDetector:
         assert url_finding["url"] == "https://example.com/download/<redacted>"
         assert path_token not in json.dumps(url_finding, sort_keys=True)
 
+    def test_two_class_high_entropy_path_tokens_are_redacted(self) -> None:
+        """Base32/base36-style bearer tokens may only use lowercase letters and digits."""
+        detector = NetworkCommDetector()
+        path_token = "0123456789abcdefghjkmnpqrstvwxyz"
+
+        findings = detector.scan(f"https://example.com/download/{path_token}/model.bin".encode(), "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/download/<redacted>/model.bin"
+        assert path_token not in json.dumps(url_finding, sort_keys=True)
+
     @pytest.mark.parametrize(
         "url",
         [

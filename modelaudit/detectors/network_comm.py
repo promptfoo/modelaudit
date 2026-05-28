@@ -126,7 +126,7 @@ def _looks_like_capability_path_token(segment: str) -> bool:
         return False
 
     character_classes = sum(bool(pattern.search(decoded)) for pattern in _PATH_TOKEN_CHARACTER_CLASS_PATTERNS)
-    return character_classes >= 3 and _shannon_entropy_per_char(decoded) >= _MIN_CAPABILITY_TOKEN_ENTROPY
+    return character_classes >= 2 and _shannon_entropy_per_char(decoded) >= _MIN_CAPABILITY_TOKEN_ENTROPY
 
 
 def _is_public_model_repository_segment(hostname: str, segments: list[str], index: int) -> bool:
