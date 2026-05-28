@@ -10,6 +10,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - scan dangerous RKNN safe-key metadata values instead of suppressing the whole key-value string
+- detect dangerous Python calls retrieved or installed through module namespace dictionaries in ZIP and TAR members, while avoiding comprehension-local false positives
+- preflight and stream-enforce cumulative SevenZip extraction budgets before writing oversized archives
+- mark oversized structured JSON/YAML Jinja template fields as incomplete coverage instead of clean
+- redact capability tokens embedded in network URL path segments
+- redact secret-shaped dictionary keys from embedded-secret detector finding contexts
+- redact compound credential names and malformed userinfo URLs in scanner evidence
+- restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- inspect every parsed GGUF chat template when duplicate or trailing malformed metadata could otherwise hide SSTI payloads
+- bound GGUF declared metadata and tensor collections, and cap reported tensor summaries, so oversized structures fail closed without exhausting scanner resources
+- redact secret-shaped dictionary keys from embedded-secret detector finding contexts
+- redact compound credential names and malformed userinfo URLs in scanner evidence
+- restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- redact compound credential names and malformed userinfo URLs in scanner evidence
+- restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
+- treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
+- detect external references in weights-only Keras HDF5 layouts without Keras metadata
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - classify unavailable metadata document reads and timed-out metadata scans as operationally incomplete rather than security findings
 - route renamed structured JAX/Orbax JSON checkpoints, conservatively report observable bounded-prefix threats, and fail closed for oversized identified metadata
@@ -30,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve HuggingFace snapshot shard paths while grouping cache-backed families
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - classify unavailable manifest and ML text reads as inconclusive rather than security findings, including routing, preflight, and stale cache transitions
+- classify unavailable manifest cloud-reference inspection as inconclusive rather than reporting complete coverage
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
 - skip non-numeric weight metadata and report incomplete weight-distribution analysis accurately
@@ -69,6 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - restore content routing for extensionless XGBoost UBJSON models and classify unavailable or undecodable XGBoost reads as inconclusive
 - detect NeMo Hydra targets that invoke PyTorch C++ extension loaders
 - route renamed TAR-backed NeMo archives with relative archive-root model configs through Hydra `_target_` analysis while retaining generic embedded-member checks
+- avoid reporting non-extractable forward-hardlinked NeMo config or checkpoint aliases as executable findings
 - honor descriptor-owned header aliases during helper scanner selection for renamed HDF5, GGML, and compressed payloads
 - detect signature-valid Torch7 payloads even when renamed with misleading suffixes
 - detect acquired executable Llamafile payloads with misleading suffixes, retain archive-polyglot coverage, and classify unavailable runtime previews as inconclusive

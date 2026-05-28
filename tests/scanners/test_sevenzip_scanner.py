@@ -1964,9 +1964,117 @@ class TestSevenZipScannerHardening:
         assert not result.success
         assert cumulative_checks[0].severity == IssueSeverity.CRITICAL
         assert cumulative_checks[0].details["limit"] == limit
-        assert mock_scan_file.call_count == 1
-        scanned_file = Path(mock_scan_file.call_args.args[0])
-        assert scanned_file.name == "inner_a.pkl"
+        mock_scan_file.assert_not_called()
+
+    def test_known_cumulative_extraction_size_limit_preflights_before_extraction(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
+        scanner.max_total_extract_size = 100
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_scan_extracted_file") as mock_scan_extracted_file,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["a.pkl", "b.pkl"]
+            mock_archive.getinfo.side_effect = lambda _name: MagicMock(uncompressed=60, is_directory=False)
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+        cumulative_checks = [c for c in result.checks if c.name == "Cumulative Extraction Size"]
+        assert result.success is False
+        assert len(cumulative_checks) == 1
+        assert cumulative_checks[0].severity == IssueSeverity.CRITICAL
+        assert cumulative_checks[0].details["cumulative_bytes"] == 120
+        mock_archive.extract.assert_not_called()
+        mock_scan_extracted_file.assert_not_called()
+
+    def test_unknown_cumulative_extraction_size_limit_uses_budgeted_factory(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
+        scanner.max_total_extract_size = 100
+        extract_kwargs: dict[str, Any] = {}
+
+        def fake_extract(*_args: Any, **kwargs: Any) -> None:
+            extract_kwargs.update(kwargs)
+            factory = kwargs["factory"]
+            for target in kwargs["targets"]:
+                writer = factory.create(target)
+                writer.write(b"x" * 60)
+                writer.close()
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_scan_extracted_file") as mock_scan_extracted_file,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["a.pkl", "b.pkl"]
+            mock_archive.getinfo.side_effect = lambda _name: MagicMock(uncompressed=None, is_directory=False)
+            mock_archive.extract.side_effect = fake_extract
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+        cumulative_checks = [c for c in result.checks if c.name == "Cumulative Extraction Size"]
+        assert result.success is False
+        assert len(cumulative_checks) == 1
+        assert cumulative_checks[0].severity == IssueSeverity.CRITICAL
+        assert cumulative_checks[0].details["cumulative_bytes"] == 120
+        assert "factory" in extract_kwargs
+        assert "path" not in extract_kwargs
+        mock_scan_extracted_file.assert_not_called()
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_real_many_small_members_abort_before_extraction_budget_is_exceeded(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "many_small.7z"
+        members: list[tuple[Path, str]] = []
+        for index in range(4):
+            member_path = tmp_path / f"member_{index}.pkl"
+            self._write_pickle(member_path, {"payload": "x" * 64, "index": index})
+            members.append((member_path, f"member_{index}.pkl"))
+        self._write_7z_archive(archive_path, members)
+        limit = sum(path.stat().st_size for path, _name in members) - 1
+        scanner = SevenZipScanner(config={"max_7z_total_extract_size": limit})
+
+        with patch("modelaudit.core.scan_file", return_value=_mock_scan_result()) as mock_scan_file:
+            result = scanner.scan(str(archive_path))
+
+        cumulative_checks = [c for c in result.checks if c.name == "Cumulative Extraction Size"]
+        assert result.success is False
+        assert len(cumulative_checks) == 1
+        assert cumulative_checks[0].details["limit"] == limit
+        mock_scan_file.assert_not_called()
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_real_archive_under_cumulative_extraction_budget_scans_members(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "under_budget.7z"
+        members: list[tuple[Path, str]] = []
+        for index in range(2):
+            member_path = tmp_path / f"safe_{index}.pkl"
+            self._write_pickle(member_path, {"payload": "safe", "index": index})
+            members.append((member_path, f"safe_{index}.pkl"))
+        self._write_7z_archive(archive_path, members)
+        limit = sum(path.stat().st_size for path, _name in members)
+        scanner = SevenZipScanner(config={"max_7z_total_extract_size": limit})
+
+        with patch("modelaudit.core.scan_file", return_value=_mock_scan_result()) as mock_scan_file:
+            result = scanner.scan(str(archive_path))
+
+        cumulative_checks = [c for c in result.checks if c.name == "Cumulative Extraction Size"]
+        assert result.success is True
+        assert cumulative_checks == []
+        assert mock_scan_file.call_count == 2
 
     # -- depth bomb finish() --------------------------------------------------
 
