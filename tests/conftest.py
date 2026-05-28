@@ -135,6 +135,7 @@ def pytest_runtest_setup(item):
             "test_onnx_scanner.py",  # ONNX scanner CVE-2025-51480 tests
             "test_pmml_scanner.py",  # PMML suspicious-content false-positive regressions
             "test_safetensors_scanner.py",  # SafeTensors scanner dtype and metadata tests
+            "test_weight_distribution_scanner.py",  # Weight-distribution false-positive and coverage tests
             "test_rule_mapper.py",  # Rule mapper validity and network mapping tests
             "test_rule_code_registry_consistency.py",  # Scanner literal rule-code registry consistency
             "test_keras_h5_scanner.py",  # Keras H5 scanner CVE-2025-9905 tests
