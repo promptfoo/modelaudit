@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- redact secret-shaped dictionary keys from embedded-secret detector finding contexts
+- redact compound credential names and malformed userinfo URLs in scanner evidence
+- restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
