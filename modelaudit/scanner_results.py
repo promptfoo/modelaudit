@@ -323,6 +323,13 @@ class ScanResult:
         self.success = self.success and other.success
         # Merge metadata dictionaries
         for key, value in other.metadata.items():
+            if key == SCAN_OUTCOME_REASONS_METADATA_KEY and isinstance(value, list):
+                existing_reasons = self.metadata.get(key)
+                if isinstance(existing_reasons, list):
+                    for reason in value:
+                        if reason not in existing_reasons:
+                            existing_reasons.append(reason)
+                    continue
             if key in self.metadata and isinstance(self.metadata[key], dict) and isinstance(value, dict):
                 self.metadata[key].update(value)
             elif (
