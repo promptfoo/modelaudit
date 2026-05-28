@@ -362,6 +362,8 @@ def test_pytorch_zip_scanner_detects_disguised_executable_sidecar_by_content(tmp
         if check.name == "Executable File Detection" and check.status == CheckStatus.FAILED
     }
     assert {"archive/weights/payload.bin", "archive/weights/loader.dat"}.issubset(executable_checks)
+    assert executable_checks["archive/weights/payload.bin"].rule_code == "S502"
+    assert executable_checks["archive/weights/loader.dat"].rule_code == "S501"
     assert all(check.severity == IssueSeverity.CRITICAL for check in executable_checks.values())
 
     aggregate_result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
@@ -462,6 +464,30 @@ def test_pytorch_zip_scanner_does_not_treat_tensor_storage_bytes_as_executable_s
 
     result = PyTorchZipScanner().scan(str(model_path))
 
+    assert any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
+    assert not any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("file") == "archive/data/0"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_keeps_tensor_storage_trust_when_pickle_scanner_is_disabled(tmp_path: Path) -> None:
+    """Scanner-only PyTorch ZIP scans still need trusted storage IDs to avoid tensor-byte false positives."""
+    model_path = create_mock_pytorch_zip(tmp_path / "scanner_only_tensor_bytes.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner(config={"scanners": ["pytorch_zip"]}).scan(str(model_path))
+
+    assert result.success is True
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pickle"
+        for check in result.checks
+    )
+    assert any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
     assert not any(
         check.name == "Executable File Detection"
         and check.status == CheckStatus.FAILED

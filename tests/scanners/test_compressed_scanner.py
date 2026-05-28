@@ -187,6 +187,16 @@ def test_compound_tar_wrappers_route_to_tar_scanner(
     assert scanner.name == "tar"
 
 
+def test_truncated_compound_tar_wrapper_routes_to_compressed_scanner(tmp_path: Path) -> None:
+    archive_path = tmp_path / "truncated.tar.gz"
+    archive_path.write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00")
+
+    scanner = get_scanner_for_file(str(archive_path))
+
+    assert scanner is not None
+    assert scanner.name == "compressed"
+
+
 @pytest.mark.parametrize(
     ("filename", "mode"),
     [
@@ -310,6 +320,9 @@ def test_compressed_scanner_corrupt_stream_is_warning_not_critical(tmp_path: Pat
     decode_checks = [c for c in result.checks if c.name == "Compressed Wrapper Stream Decode"]
     assert decode_checks and decode_checks[0].status == CheckStatus.FAILED
     assert decode_checks[0].severity == IssueSeverity.WARNING
+    assert decode_checks[0].details["scan_outcome_reason"] == "compressed_stream_decode_failed"
+    assert result.metadata["scan_outcome_reasons"] == ["compressed_stream_decode_failed"]
+    assert result.success is False
 
 
 @pytest.mark.parametrize(
@@ -334,7 +347,12 @@ def test_compressed_scanner_enforces_decompression_size_limit(
 
     limit_checks = [c for c in result.checks if c.name == "Compressed Wrapper Decompression Limits"]
     assert limit_checks and limit_checks[0].status == CheckStatus.FAILED
+    assert "analysis incomplete" in limit_checks[0].message.lower()
     assert limit_checks[0].severity == IssueSeverity.WARNING
+    assert limit_checks[0].details["scan_outcome_reason"] == "compressed_decompression_limit_exceeded"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["scan_outcome_reasons"] == ["compressed_decompression_limit_exceeded"]
+    assert result.success is False
 
 
 def test_compressed_scanner_enforces_decompression_ratio_limit(tmp_path: Path) -> None:
@@ -347,7 +365,12 @@ def test_compressed_scanner_enforces_decompression_ratio_limit(tmp_path: Path) -
 
     ratio_checks = [c for c in result.checks if c.name == "Compressed Wrapper Decompression Limits"]
     assert ratio_checks and ratio_checks[0].status == CheckStatus.FAILED
+    assert "analysis incomplete" in ratio_checks[0].message.lower()
     assert ratio_checks[0].severity == IssueSeverity.WARNING
+    assert ratio_checks[0].details["scan_outcome_reason"] == "compressed_decompression_limit_exceeded"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["scan_outcome_reasons"] == ["compressed_decompression_limit_exceeded"]
+    assert result.success is False
 
 
 def test_compressed_scanner_false_positive_control_high_ratio_within_policy(tmp_path: Path) -> None:
@@ -369,6 +392,19 @@ def test_compressed_scanner_false_positive_control_high_ratio_within_policy(tmp_
         if c.name == "Compressed Wrapper Decompression Limits" and c.status == CheckStatus.FAILED
     ]
     assert len(ratio_failures) == 0
+
+
+def test_compressed_scanner_depth_limit_marks_analysis_incomplete(tmp_path: Path) -> None:
+    path = tmp_path / "nested_payload.pkl.gz"
+    path.write_bytes(gzip.compress(pickle.dumps({"safe": True})))
+
+    result = CompressedScanner(config={"_compressed_depth": 1, "compressed_max_depth": 1}).scan(str(path))
+
+    depth_checks = [c for c in result.checks if c.name == "Compressed Wrapper Depth Limit"]
+    assert depth_checks and depth_checks[0].status == CheckStatus.FAILED
+    assert depth_checks[0].details["scan_outcome_reason"] == "compressed_depth_limit_exceeded"
+    assert result.metadata["scan_outcome_reasons"] == ["compressed_depth_limit_exceeded"]
+    assert result.success is False
 
 
 def test_read_zlib_stream_uses_bounded_decompression(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -722,6 +758,103 @@ def test_compressed_scanner_excess_members_are_exit2_and_not_cached(tmp_path: Pa
         reset_cache_manager()
 
 
+def test_compressed_scanner_depth_limit_preserves_exit1_and_is_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "depth_limited_payload.pkl.gz"
+    path.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]})))
+
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+            compressed_max_depth=0,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+            compressed_max_depth=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert aggregate.success is True
+            assert determine_exit_code(aggregate) == 1
+            assert metadata["scan_outcome"] == "inconclusive"
+            assert metadata["scan_outcome_reasons"] == ["compressed_depth_limit_exceeded"]
+            assert any("nesting depth (0) exceeded" in issue.message.lower() for issue in aggregate.issues)
+        assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_compressed_scanner_decompression_limit_preserves_exit1_and_is_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "size_limited_payload.pkl.gz"
+    path.write_bytes(gzip.compress(b"A" * 4096))
+
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+            compressed_max_decompressed_bytes=512,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+            compressed_max_decompressed_bytes=512,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert aggregate.success is True
+            assert determine_exit_code(aggregate) == 1
+            assert metadata["scan_outcome"] == "inconclusive"
+            assert metadata["scan_outcome_reasons"] == ["compressed_decompression_limit_exceeded"]
+            assert any("decompressed size exceeded limit" in issue.message.lower() for issue in aggregate.issues)
+        assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_compressed_scanner_corrupt_stream_preserves_exit1_and_is_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "corrupt_payload.pkl.gz"
+    path.write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00")
+
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert aggregate.success is True
+            assert determine_exit_code(aggregate) == 1
+            assert metadata["scan_outcome"] == "inconclusive"
+            assert metadata["scan_outcome_reasons"] == ["compressed_stream_decode_failed"]
+            assert any("invalid gzip stream" in issue.message.lower() for issue in aggregate.issues)
+        assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def test_compressed_scanner_keeps_split_pickle_members_clean(tmp_path: Path) -> None:
     payload = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
     split_at = len(payload) // 2
@@ -885,3 +1018,44 @@ def test_compressed_scanner_missing_lz4_dependency_path(tmp_path: Path, monkeypa
     dependency_checks = [c for c in result.checks if c.name == "Compressed Wrapper Optional Dependency"]
     assert dependency_checks and dependency_checks[0].status == CheckStatus.FAILED
     assert dependency_checks[0].severity == IssueSeverity.INFO
+    assert dependency_checks[0].details["scan_outcome_reason"] == "compressed_optional_dependency_unavailable"
+    assert result.metadata["scan_outcome_reasons"] == ["compressed_optional_dependency_unavailable"]
+    assert result.success is False
+
+
+def test_compressed_scanner_missing_lz4_is_exit2_and_not_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lz4_path = tmp_path / "payload.bin.lz4"
+    lz4_path.write_bytes(b"\x04\x22\x4d\x18" + b"\x00" * 16)
+
+    def _raise_missing_dependency() -> object:
+        raise _MissingOptionalDependencyError("Optional dependency 'lz4' is not installed")
+
+    monkeypatch.setattr(CompressedScanner, "_get_lz4_frame_module", staticmethod(_raise_missing_dependency))
+
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(lz4_path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(lz4_path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(lz4_path)]
+            assert aggregate.success is False
+            assert determine_exit_code(aggregate) == 2
+            assert metadata["scan_outcome"] == "inconclusive"
+            assert metadata["scan_outcome_reasons"] == ["compressed_optional_dependency_unavailable"]
+            assert any("optional dependency" in issue.message.lower() for issue in aggregate.issues)
+        assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()

@@ -42,6 +42,26 @@ class _HeaderProbeComplete(Exception):
     """Internal signal used to stop a header probe once enough bytes are captured."""
 
 
+class _ExtractionBudgetExceeded(Exception):
+    """Internal signal used to abort extraction before a configured byte budget is exceeded."""
+
+    def __init__(
+        self,
+        file_name: str,
+        *,
+        cumulative_bytes: int,
+        total_limit: int,
+        file_bytes: int,
+        file_limit: int,
+    ) -> None:
+        super().__init__(f"Extraction budget exceeded while extracting {file_name}")
+        self.file_name = file_name
+        self.cumulative_bytes = cumulative_bytes
+        self.total_limit = total_limit
+        self.file_bytes = file_bytes
+        self.file_limit = file_limit
+
+
 class _HeaderProbeBuffer:
     def __init__(self, limit: int, *, raise_on_limit: bool = True) -> None:
         self._limit = limit
@@ -84,6 +104,92 @@ class _HeaderProbeFactory:
 
     def get(self, filename: str) -> _HeaderProbeBuffer | None:
         return self.products.get(filename)
+
+
+class _BudgetedExtractionFile:
+    def __init__(
+        self,
+        path: Path,
+        file_name: str,
+        *,
+        budget: "_RecursiveScanBudget",
+        max_file_size: int,
+        max_total_size: int,
+    ) -> None:
+        self._file = path.open("wb")
+        self._file_name = file_name
+        self._budget = budget
+        self._max_file_size = max_file_size
+        self._max_total_size = max_total_size
+        self._written = 0
+
+    def write(self, data: bytes | bytearray) -> int:
+        chunk_size = len(data)
+        projected_file_size = self._written + chunk_size
+        projected_total_size = self._budget.cumulative_extract_bytes + chunk_size
+        if projected_file_size > self._max_file_size or projected_total_size > self._max_total_size:
+            raise _ExtractionBudgetExceeded(
+                self._file_name,
+                cumulative_bytes=projected_total_size,
+                total_limit=self._max_total_size,
+                file_bytes=projected_file_size,
+                file_limit=self._max_file_size,
+            )
+
+        self._file.write(data)
+        self._written = projected_file_size
+        self._budget.record_extract_bytes(chunk_size)
+        return chunk_size
+
+    def flush(self) -> None:
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
+
+
+class _BudgetedExtractionFactory:
+    def __init__(
+        self,
+        target_dir: Path,
+        *,
+        budget: "_RecursiveScanBudget",
+        max_file_size: int,
+        max_total_size: int,
+    ) -> None:
+        self._target_dir = target_dir.resolve()
+        self._budget = budget
+        self._max_file_size = max_file_size
+        self._max_total_size = max_total_size
+        self.products: dict[str, _BudgetedExtractionFile] = {}
+        self.paths: dict[str, Path] = {}
+
+    def create(self, filename: str) -> _BudgetedExtractionFile:
+        target_path = (self._target_dir / filename).resolve()
+        try:
+            target_path.relative_to(self._target_dir)
+        except ValueError as exc:
+            raise ValueError(f"Refusing to extract 7z member outside target directory: {filename}") from exc
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = _BudgetedExtractionFile(
+            target_path,
+            filename,
+            budget=self._budget,
+            max_file_size=self._max_file_size,
+            max_total_size=self._max_total_size,
+        )
+        self.products[filename] = writer
+        self.paths[filename] = target_path
+        return writer
+
+    def get_path(self, filename: str) -> Path:
+        return self.paths.get(filename, self._target_dir / filename)
+
+    def close(self) -> None:
+        for writer in self.products.values():
+            with suppress(Exception):
+                writer.close()
 
 
 @dataclass
@@ -292,12 +398,14 @@ class SevenZipScanner(BaseScanner):
                     "py7zr library not installed. "
                     "Install with 'pip install py7zr' or 'pip install modelaudit[sevenzip]'"
                 ),
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={
                     "error_type": "missing_dependency",
                     "required_package": "py7zr",
                     "install_command": "pip install py7zr",
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "sevenzip_analysis_incomplete",
                 },
             )
             mark_archive_scan_incomplete(result, "sevenzip_analysis_incomplete")
@@ -600,7 +708,11 @@ class SevenZipScanner(BaseScanner):
                 ),
                 severity=IssueSeverity.INFO,
                 location=archive_path,
-                details={"limit": self.max_extensionless_probes},
+                details={
+                    "limit": self.max_extensionless_probes,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "sevenzip_analysis_incomplete",
+                },
             )
 
         probe_candidates.sort(key=lambda item: (-item[0], item[1]))
@@ -650,7 +762,11 @@ class SevenZipScanner(BaseScanner):
                     message=f"Failed to inspect nested archive candidate {file_name}: {e}",
                     severity=IssueSeverity.INFO,
                     location=f"{archive_path}:{file_name}",
-                    details={"error": str(e)},
+                    details={
+                        "error": str(e),
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "sevenzip_analysis_incomplete",
+                    },
                 )
 
         self._add_incomplete_executable_probe_checks(result, archive_path, incomplete_executable_members)
@@ -874,7 +990,9 @@ class SevenZipScanner(BaseScanner):
         scan_complete = not budget.should_stop()
         if nested_scan_files is None:
             nested_scan_files = frozenset(scannable_files)
-        extractable_files = []
+        extractable_files: list[str] = []
+        member_sizes: dict[str, int | None] = {}
+        known_extract_bytes = 0
         for file_name in scannable_files:
             member_info = None
             with suppress(Exception):
@@ -897,20 +1015,49 @@ class SevenZipScanner(BaseScanner):
                 continue
 
             extractable_files.append(file_name)
+            member_sizes[file_name] = member_size
+            if member_size is not None:
+                known_extract_bytes += member_size
 
         if not extractable_files or budget.should_stop():
             return scan_complete and not budget.should_stop()
 
+        projected_cumulative_bytes = budget.cumulative_extract_bytes + known_extract_bytes
+        if known_extract_bytes > 0 and projected_cumulative_bytes > self.max_total_extract_size:
+            budget.abort_due_to_limit()
+            self._add_cumulative_extraction_size_check(
+                result,
+                archive_path,
+                cumulative_bytes=projected_cumulative_bytes,
+            )
+            return False
+
+        use_budgeted_factory = any(member_sizes[file_name] is None for file_name in extractable_files)
+
         with tempfile.TemporaryDirectory(prefix="modelaudit_7z_") as tmp_dir:
+            extraction_factory: _BudgetedExtractionFactory | None = None
             try:
-                # Extract all scannable files at once to avoid py7zr state issues
-                archive.extract(path=tmp_dir, targets=extractable_files)
+                if use_budgeted_factory:
+                    extraction_factory = _BudgetedExtractionFactory(
+                        Path(tmp_dir),
+                        budget=budget,
+                        max_file_size=self.max_extract_size,
+                        max_total_size=self.max_total_extract_size,
+                    )
+                    archive.extract(targets=extractable_files, factory=extraction_factory)
+                else:
+                    # Extract all scannable files at once to avoid py7zr state issues
+                    archive.extract(path=tmp_dir, targets=extractable_files)
 
                 for file_name in extractable_files:
                     if budget.should_stop():
                         return False
                     try:
-                        extracted_path = os.path.join(tmp_dir, file_name)
+                        extracted_path = (
+                            str(extraction_factory.get_path(file_name))
+                            if extraction_factory is not None
+                            else os.path.join(tmp_dir, file_name)
+                        )
 
                         # Block symlinks — matches zip_scanner / pytorch_zip_scanner
                         if os.path.islink(extracted_path):
@@ -944,26 +1091,17 @@ class SevenZipScanner(BaseScanner):
                                 continue
 
                             # Check cumulative extraction size
-                            cumulative_extract_bytes = budget.record_extract_bytes(extracted_size)
-                            if cumulative_extract_bytes > self.max_total_extract_size:
-                                budget.abort_due_to_limit()
-                                scan_complete = False
-                                result.add_check(
-                                    name="Cumulative Extraction Size",
-                                    passed=False,
-                                    message=(
-                                        f"Cumulative extracted bytes ({cumulative_extract_bytes}) "
-                                        f"exceed limit of {self.max_total_extract_size}"
-                                    ),
-                                    severity=IssueSeverity.CRITICAL,
-                                    location=archive_path,
-                                    details={
-                                        "cumulative_bytes": cumulative_extract_bytes,
-                                        "limit": self.max_total_extract_size,
-                                        "potential_threat": "zip_bomb",
-                                    },
-                                )
-                                return False
+                            if extraction_factory is None:
+                                cumulative_extract_bytes = budget.record_extract_bytes(extracted_size)
+                                if cumulative_extract_bytes > self.max_total_extract_size:
+                                    budget.abort_due_to_limit()
+                                    scan_complete = False
+                                    self._add_cumulative_extraction_size_check(
+                                        result,
+                                        archive_path,
+                                        cumulative_bytes=cumulative_extract_bytes,
+                                    )
+                                    return False
 
                             if file_name in member_security_files and file_name not in prechecked_executable_files:
                                 scan_archive_member_for_known_risks(
@@ -1021,6 +1159,25 @@ class SevenZipScanner(BaseScanner):
                             details={"error": str(e)},
                         )
 
+            except _ExtractionBudgetExceeded as e:
+                budget.abort_due_to_limit()
+                scan_complete = False
+                if e.file_bytes > e.file_limit:
+                    result.add_check(
+                        name="Extracted File Size",
+                        passed=False,
+                        message=f"Extracted file {e.file_name} is too large ({e.file_bytes} bytes)",
+                        severity=IssueSeverity.WARNING,
+                        location=f"{archive_path}:{e.file_name}",
+                        details={"extracted_size": e.file_bytes, "size_limit": e.file_limit},
+                    )
+                else:
+                    self._add_cumulative_extraction_size_check(
+                        result,
+                        archive_path,
+                        cumulative_bytes=e.cumulative_bytes,
+                    )
+
             except Exception as e:
                 scan_complete = False
                 result.add_check(
@@ -1031,8 +1188,31 @@ class SevenZipScanner(BaseScanner):
                     location=archive_path,
                     details={"error": str(e)},
                 )
+            finally:
+                if extraction_factory is not None:
+                    extraction_factory.close()
 
         return scan_complete and not budget.should_stop()
+
+    def _add_cumulative_extraction_size_check(
+        self,
+        result: ScanResult,
+        archive_path: str,
+        *,
+        cumulative_bytes: int,
+    ) -> None:
+        result.add_check(
+            name="Cumulative Extraction Size",
+            passed=False,
+            message=(f"Cumulative extracted bytes ({cumulative_bytes}) exceed limit of {self.max_total_extract_size}"),
+            severity=IssueSeverity.CRITICAL,
+            location=archive_path,
+            details={
+                "cumulative_bytes": cumulative_bytes,
+                "limit": self.max_total_extract_size,
+                "potential_threat": "zip_bomb",
+            },
+        )
 
     @staticmethod
     def _get_archive_member_size(archive: Any, file_name: str) -> int | None:
@@ -1133,6 +1313,8 @@ class SevenZipScanner(BaseScanner):
             else:
                 nested_config = dict(self.config)
                 nested_config["_archive_depth"] = depth + 1
+                # Extracted members are deleted below, so their temporary paths cannot be reused as cache keys.
+                nested_config["cache_enabled"] = False
                 file_result = self._scan_nested_archive_entry(scan_path, nested_config)
 
             self._rewrite_nested_result_context(file_result, scan_path, archive_path, original_name)

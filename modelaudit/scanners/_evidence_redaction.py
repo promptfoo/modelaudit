@@ -19,11 +19,21 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "api_key",
         "api-key",
         "apikey",
+        "auth_token",
+        "auth-token",
+        "client_secret",
+        "client-secret",
         "credential",
         "password",
         "passwd",
+        "private_key",
+        "private-key",
+        "refresh_token",
+        "refresh-token",
         "sas",
         "secret",
+        "secret_key",
+        "secret-key",
         "sig",
         "signature",
         "token",
@@ -32,18 +42,35 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "x-amz-signature",
     }
 )
+SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
+    r"(?:[a-z0-9]+[_-])*"
+    r"(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|credential|"
+    r"password|passwd|private[_-]?key|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
+)
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?)" r"[^\s\"';&|]+"
 )
 BEARER_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)\b((?:api[_-]?key|access[_-]?token|token|password|passwd|secret|credential|signature|sig|sas)"
-    r"\s*[:=]\s*)[^\s\"';&|]+"
+    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)[^\s\"';&|]+"
 )
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)\b((?:api[_-]?key|access[_-]?token|token|password|passwd|secret|credential|signature|sig|sas)"
-    r"\s*[:=]\s*)([\"']).*?\2"
+    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)([\"']).*?\3"
 )
+
+
+def _redact_malformed_url(raw_url: str) -> str:
+    """Fail closed for URL-like strings that the parser rejects."""
+    scheme_match = re.match(r"(?i)^([a-z][a-z0-9+.-]*://)(.*)$", raw_url)
+    if scheme_match is None:
+        return REDACTED_EVIDENCE_VALUE
+
+    scheme, rest = scheme_match.groups()
+    rest = re.split(r"[?#]", rest, maxsplit=1)[0]
+    if "@" not in rest:
+        return f"{scheme}{REDACTED_EVIDENCE_VALUE}"
+
+    return f"{scheme}{REDACTED_URL_CREDENTIALS}@{rest.rsplit('@', 1)[1]}"
 
 
 def _redact_url(match: re.Match[str]) -> str:
@@ -51,7 +78,7 @@ def _redact_url(match: re.Match[str]) -> str:
     try:
         parsed = urlsplit(raw_url)
     except ValueError:
-        return raw_url
+        return _redact_malformed_url(raw_url)
 
     netloc = parsed.netloc
     if "@" in netloc:
@@ -76,7 +103,8 @@ def _redact_url(match: re.Match[str]) -> str:
 
 
 def _redact_quoted_assignment(match: re.Match[str]) -> str:
-    return f"{match.group(1)}{match.group(2)}{REDACTED_EVIDENCE_VALUE}{match.group(2)}"
+    quote = match.group(3)
+    return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
 def _truncate(text: str, max_chars: int) -> str:

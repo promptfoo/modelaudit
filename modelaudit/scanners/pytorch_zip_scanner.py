@@ -23,8 +23,8 @@ from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .archive_member_security import (
-    ExecutableArchiveMemberProbeOutcome,
-    is_executable_archive_member_name,
+    executable_archive_member_content_rule_code_from_bytes,
+    executable_archive_member_name_rule_code,
     probe_executable_archive_member_signature,
 )
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
@@ -48,6 +48,8 @@ _TORCHSCRIPT_DEBUG_PREFIX_BYTES = 256
 _TORCHSCRIPT_SOURCE_MAX_BYTES = 1024 * 1024
 _TORCHSCRIPT_GENERATED_CLASS_PATTERN = re.compile(r"(?m)^class\s+[A-Za-z_][A-Za-z0-9_]*\(Module\):\s*$")
 _TORCHSCRIPT_GENERATED_METHOD_PATTERN = re.compile(r"(?m)^\s+def\s+\w+\(self:\s+__torch__\.")
+_EXECUTABLE_MEMBER_PROBE_BYTES = 1024
+_PORTABLE_EXECUTABLE_MAX_PROBE_BYTES = (1024 * 1024) + 4
 _TORCHSCRIPT_FORBIDDEN_SOURCE_PATTERN = re.compile(
     r"(?im)(?:^\s*(?:import|from)\s+|\b(?:__import__|eval|exec|compile|open)\s*\(|\b(?:os|subprocess|socket|requests)\s*\.)"
 )
@@ -1370,6 +1372,17 @@ class PyTorchZipScanner(BaseScanner):
 
             if self.pickle_scanner is None:
                 bytes_scanned += pickle_data_size
+                normalized_name = name.replace("\\", "/").lstrip("/")
+                trusted_storage_keys = trusted_pytorch_storage_data_pkl_members.get(normalized_name)
+                if trusted_storage_keys is not None:
+                    self._record_trusted_storage_persistent_ids_without_pickle_scanner(
+                        zip_file,
+                        info,
+                        result,
+                        path,
+                        name,
+                        trusted_storage_keys,
+                    )
                 add_scanner_selection_skip_check(
                     result,
                     pickle_source,
@@ -1485,6 +1498,100 @@ class PyTorchZipScanner(BaseScanner):
             referenced_keys = referenced_keys_by_data_pkl.get(data_pkl_member, set())
             trusted_blobs.update(f"{prefix}data/{storage_key}" for storage_key in storage_keys & referenced_keys)
         return trusted_blobs
+
+    @staticmethod
+    def _coerce_pickle_string_arg(value: Any) -> str | None:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, bytes):
+            try:
+                return value.decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+        return None
+
+    @classmethod
+    def _trusted_storage_keys_from_pickle_bytes(
+        cls,
+        pickle_data: bytes,
+        trusted_storage_keys: set[str],
+    ) -> set[str]:
+        """Extract validated PyTorch storage keys without running the embedded pickle scanner."""
+        try:
+            opcodes = list(pickletools.genops(pickle_data))
+        except Exception:
+            return set()
+
+        string_op_names = {"BINSTRING", "SHORT_BINSTRING", "BINUNICODE", "SHORT_BINUNICODE", "UNICODE"}
+        referenced_keys: set[str] = set()
+        for index, (opcode, _arg, _pos) in enumerate(opcodes):
+            if opcode.name != "BINPERSID":
+                continue
+
+            window_strings: list[str] = []
+            for candidate_opcode, candidate_arg, _candidate_pos in opcodes[max(0, index - 20) : index]:
+                if candidate_opcode.name not in string_op_names:
+                    continue
+                candidate = cls._coerce_pickle_string_arg(candidate_arg)
+                if candidate is not None:
+                    window_strings.append(candidate)
+
+            if "storage" not in window_strings or not any(value.endswith("Storage") for value in window_strings):
+                continue
+
+            for value in reversed(window_strings):
+                if cls._is_ascii_decimal_digits(value) and value in trusted_storage_keys:
+                    referenced_keys.add(value)
+                    break
+        return referenced_keys
+
+    def _record_trusted_storage_persistent_ids_without_pickle_scanner(
+        self,
+        zip_file: zipfile.ZipFile,
+        info: zipfile.ZipInfo,
+        result: ScanResult,
+        path: str,
+        pickle_name: str,
+        trusted_storage_keys: set[str],
+    ) -> None:
+        max_trust_parse_bytes = 10 * 1024 * 1024
+        try:
+            if info.file_size > max_trust_parse_bytes:
+                pickle_data = self._read_member_prefix(
+                    zip_file,
+                    info,
+                    max_trust_parse_bytes,
+                    phase="pytorch_storage_trust_metadata",
+                    result=result,
+                )
+            else:
+                pickle_data = self._read_member_bytes(
+                    zip_file,
+                    info,
+                    phase="pytorch_storage_trust_metadata",
+                    result=result,
+                )
+        except Exception as exc:
+            logger.debug("Unable to inspect PyTorch storage persistent IDs for %s: %s", pickle_name, exc)
+            return
+
+        normalized_name = pickle_name.replace("\\", "/").lstrip("/")
+        for storage_key in sorted(self._trusted_storage_keys_from_pickle_bytes(pickle_data, trusted_storage_keys)):
+            result.add_check(
+                name="PyTorch Storage Persistent ID Trust",
+                passed=True,
+                message="PyTorch storage persistent ID found in validated PyTorch archive",
+                severity=IssueSeverity.INFO,
+                location=f"{path}:{pickle_name}",
+                details={
+                    "pickle_rule_code": "PERSISTENT_ID",
+                    "opcode": "BINPERSID",
+                    "pickle_filename": normalized_name,
+                    "pytorch_storage_key": storage_key,
+                    "pytorch_storage_persistent_id": True,
+                    "trusted_pytorch_archive_context": True,
+                },
+            )
 
     @staticmethod
     def _is_ascii_decimal_digits(value: str) -> bool:
@@ -1681,6 +1788,8 @@ class PyTorchZipScanner(BaseScanner):
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
             normalized_name = name.replace("\\", "/").lstrip("/")
+            if entry.is_dir() or normalized_name.endswith("/"):
+                continue
             normalized_name_lower = normalized_name.lower()
             # Check for Python code files independently of native-content detection.
             if normalized_name_lower.endswith(".py"):
@@ -1703,14 +1812,17 @@ class PyTorchZipScanner(BaseScanner):
                     )
                     python_files_found = True
 
-            executable_by_name = is_executable_archive_member_name(normalized_name_lower)
-            executable_by_content = False
+            executable_rule_code = executable_archive_member_name_rule_code(normalized_name_lower)
             # A referenced raw tensor storage member is arbitrary bytes rather
             # than a loadable sidecar, so signature bytes are not evidence of
             # an executable. Unreferenced lookalikes must still be inspected.
-            if not executable_by_name and normalized_name not in trusted_storage_blob_members:
+            if executable_rule_code is None and normalized_name not in trusted_storage_blob_members:
                 try:
-                    executable_probe_outcome = self._executable_member_probe_outcome(zip_file, entry, result)
+                    executable_rule_code, probe_failure = self._executable_member_content_rule_code(
+                        zip_file,
+                        entry,
+                        result,
+                    )
                 except Exception as exc:
                     executable_probe_failures.append(
                         {
@@ -1720,22 +1832,16 @@ class PyTorchZipScanner(BaseScanner):
                         }
                     )
                 else:
-                    executable_by_content = executable_probe_outcome == "detected"
-                    if executable_probe_outcome == "incomplete":
-                        executable_probe_failures.append(
-                            {
-                                "zip_entry": name,
-                                "exception": "PE header pointer exceeds bounded executable-content probe budget",
-                                "exception_type": "BoundedProbeIncomplete",
-                            }
-                        )
+                    if probe_failure is not None:
+                        executable_probe_failures.append(probe_failure)
 
-            if executable_by_name or executable_by_content:
+            if executable_rule_code is not None:
                 result.add_check(
                     name="Executable File Detection",
                     passed=False,
                     message=f"Executable file found in PyTorch model: {name}",
                     severity=IssueSeverity.CRITICAL,
+                    rule_code=executable_rule_code,
                     location=f"{path}:{name}",
                     details={"file": name},
                 )
@@ -1776,22 +1882,51 @@ class PyTorchZipScanner(BaseScanner):
                 location=path,
             )
 
-    def _executable_member_probe_outcome(
+    def _executable_member_content_rule_code(
         self,
         zip_file: zipfile.ZipFile,
         entry: zipfile.ZipInfo,
         result: ScanResult,
-    ) -> ExecutableArchiveMemberProbeOutcome:
-        """Classify executable bytes in a member through bounded reads."""
-        return probe_executable_archive_member_signature(
-            lambda limit: self._read_member_prefix(
+    ) -> tuple[str | None, dict[str, str] | None]:
+        """Return a content-derived executable rule code or an incomplete-probe reason."""
+        prefix_cache = b""
+
+        def read_prefix(limit: int) -> bytes:
+            nonlocal prefix_cache
+            if (
+                limit <= len(prefix_cache)
+                or len(prefix_cache) >= entry.file_size
+                or (prefix_cache and not prefix_cache.startswith(b"MZ"))
+            ):
+                return prefix_cache[:limit]
+            expanded_prefix = self._read_member_prefix(
                 zip_file,
                 entry,
                 limit,
                 phase="executable member content probe",
                 result=result,
             )
-        )
+            if len(expanded_prefix) > len(prefix_cache):
+                prefix_cache = expanded_prefix
+            return prefix_cache[:limit]
+
+        prefix = read_prefix(_EXECUTABLE_MEMBER_PROBE_BYTES)
+        rule_code = executable_archive_member_content_rule_code_from_bytes(prefix)
+        if rule_code is not None:
+            return rule_code, None
+        if not prefix.startswith(b"MZ"):
+            return None, None
+
+        probe_outcome = probe_executable_archive_member_signature(read_prefix)
+        if probe_outcome == "detected":
+            return "S501", None
+        if probe_outcome == "incomplete":
+            return None, {
+                "zip_entry": self._get_zip_member_name(entry),
+                "exception": "PE header pointer exceeds bounded executable-content probe budget",
+                "exception_type": "BoundedProbeIncomplete",
+            }
+        return None, None
 
     def _validate_pytorch_structure(self, pickle_files: list[zipfile.ZipInfo], result: ScanResult) -> None:
         """Validate that the PyTorch model has expected structure"""

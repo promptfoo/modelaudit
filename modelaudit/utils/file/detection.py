@@ -5,9 +5,9 @@ import re
 import struct
 import tarfile
 import zipfile
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO
+from typing import Any, BinaryIO, Literal
 
 from ...scanner_registry_metadata import get_extension_format_map, get_registered_scanner_extensions
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
@@ -39,22 +39,94 @@ _CNTK_V2_STRUCTURE_MARKERS = (b"CompositeFunction", b"primitive_functions", b"Pr
 _CNTK_SIGNATURE_READ_BYTES = 4096
 _TF_METAGRAPH_MIN_BYTES = 8
 _TF_METAGRAPH_MAX_VALIDATE_BYTES = 20 * 1024 * 1024
+_TF_METAGRAPH_MAX_ROUTING_PAYLOAD_BYTES = _TF_METAGRAPH_MAX_VALIDATE_BYTES
+_TF_METAGRAPH_MAX_ROUTING_FIELDS = 32768
+_TF_METAGRAPH_MAX_ROUTING_DEPTH = 64
+_CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES = 2 * 1024 * 1024
+_CONTENT_ROUTE_PRINTABLE_TEXT_BYTES = b"\t\n\r" + bytes(range(0x20, 0x7F))
+_CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES = (
+    bytes(byte for byte in range(0x20) if byte not in {0x09, 0x0A, 0x0C, 0x0D}) + b"\x7f"
+)
+_TensorFlowProtoRoute = Literal[
+    "unknown",
+    "tf_metagraph",
+    "tf_savedmodel",
+    "oversized",
+    "oversized_candidate",
+    "inconclusive",
+]
+_TensorFlowOuterHint = Literal["unknown", "tf_metagraph", "tf_savedmodel"]
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
-_ONNX_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
-_ONNX_MODEL_TOP_LEVEL_TAG_START_BYTES = frozenset(
+_ONNX_MODEL_MAX_ROUTING_FIELDS = 4096
+_ONNX_GRAPH_MAX_ROUTING_FIELDS = 4096
+_ONNX_NODE_MAX_ROUTING_FIELDS = 512
+_ONNX_MAX_ROUTING_TEXT_BYTES = 1024
+_ONNX_MODEL_FIELD_WIRE_TYPES = {
+    1: 0,
+    2: 2,
+    3: 2,
+    4: 2,
+    5: 0,
+    6: 2,
+    7: 2,
+    8: 2,
+    14: 2,
+    20: 2,
+    25: 2,
+    26: 2,
+}
+_PROTO_GROUP_MAX_ROUTING_FIELDS = 512
+_PROTO_GROUP_MAX_ROUTING_DEPTH = 8
+_COREML_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
+_COREML_PROTO_PREFIX_WIRE_TYPES = frozenset({0, 1, 2, 3, 5})
+_COREML_GROUP_BUDGET_EXHAUSTED: Literal["budget_exhausted"] = "budget_exhausted"
+_COREML_GROUP_INCOMPLETE: Literal["incomplete"] = "incomplete"
+_COREML_GROUP_MALFORMED: Literal["malformed"] = "malformed"
+_COREML_MAX_DESCRIPTION_PREFIX_FIELDS = 512
+_COREML_MAX_MODEL_PREFIX_FIELDS = 4096
+_COREML_MODEL_TYPE_FIELDS = frozenset(
     {
-        0x08,  # ir_version
-        0x12,  # producer_name
-        0x1A,  # producer_version
-        0x22,  # domain
-        0x28,  # model_version
-        0x32,  # doc_string
-        0x3A,  # graph
-        0x42,  # opset_import
-        0x72,  # metadata_props
+        200,
+        201,
+        202,
+        300,
+        301,
+        302,
+        303,
+        304,
+        400,
+        401,
+        402,
+        403,
+        404,
+        500,
+        501,
+        502,
+        555,
+        556,
+        560,
+        600,
+        601,
+        602,
+        603,
+        604,
+        606,
+        607,
+        609,
+        610,
+        900,
+        2000,
+        2001,
+        2002,
+        2003,
+        2004,
+        2005,
+        2006,
+        3000,
     }
 )
+_COREML_DESCRIPTION_FIELD_HINTS = frozenset({1, 10, 20, 21, 100})
 _LIGHTGBM_HEADER_MARKERS = (
     "version=",
     "num_class=",
@@ -131,6 +203,7 @@ _KERAS_CONFIG_PREFIX_HINT_RE = re.compile(
 )
 _NEMO_CONFIG_ENTRIES = frozenset({"model_config.yaml", "model_config.yml"})
 _NEMO_ROUTE_MAX_ENTRIES = 10_000
+_NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS = 100_000
 _PYTORCH_ZIP_METADATA_MAX_BYTES = 64
 _SKOPS_SCHEMA_ENTRIES = frozenset({"schema", "schema.json"})
 _SKOPS_SCHEMA_MAX_BYTES = 4 * 1024 * 1024
@@ -141,6 +214,7 @@ _XML_MODEL_ROOT_FORMATS = {
     "pmml": "pmml",
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
+PROTOBUF_MODEL_CANDIDATE_FORMAT = "protobuf_model_candidate"
 JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES = 1024 * 1024
 JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES = 2 * JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES
 _JAX_JSON_CHECKPOINT_IDENTITY_KEYS = frozenset(
@@ -161,6 +235,9 @@ _FLAX_MSGPACK_STATE_WRAPPER_KEY = "state"
 _FLAX_MSGPACK_SCANNER_SUFFIXES = frozenset({".msgpack", ".flax", ".orbax", ".jax"})
 _FLAX_MSGPACK_OVERLAP_SUFFIXES = frozenset({".ckpt", ".checkpoint", ".orbax-checkpoint"})
 _FLAX_MSGPACK_CONTENT_ROUTE_EXCLUDED_SUFFIXES = frozenset({".py", ".pyw"})
+_FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES = frozenset(
+    {".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml"}
+)
 _FLAX_MSGPACK_DECLARED_SUFFIXES = frozenset(get_registered_scanner_extensions())
 _FLAX_MSGPACK_NATIVE_SUFFIXES = _FLAX_MSGPACK_SCANNER_SUFFIXES
 _FLAX_MSGPACK_PROBE_MAX_NODES = 4096
@@ -208,6 +285,8 @@ _MXNET_SYMBOL_STREAM_CHUNK_BYTES = 64 * 1024
 LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
 NEMO_ROUTING_INCONCLUSIVE_FORMAT = "nemo_routing_inconclusive"
 XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT = "xgboost_ubjson_routing_inconclusive"
+ONNX_ROUTING_INCONCLUSIVE_FORMAT = "onnx_routing_inconclusive"
+TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT = "tensorflow_protobuf_routing_inconclusive"
 EXECUTABLE_ZIP_POLYGLOT_FORMAT = "executable_zip_polyglot"
 _XGBOOST_UBJSON_ROUTE_READ_BYTES = 256 * 1024
 _COMPRESSED_EXTENSION_CODECS = {
@@ -870,10 +949,56 @@ PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
         "SHORT_BINUNICODE",
     },
 )
+_BINARY_PICKLE_SECURITY_OPCODES: frozenset[str] = frozenset(
+    {
+        "BINPERSID",
+        "BUILD",
+        "EXT1",
+        "EXT2",
+        "EXT4",
+        "GLOBAL",
+        "INST",
+        "NEWOBJ",
+        "NEWOBJ_EX",
+        "OBJ",
+        "PERSID",
+        "REDUCE",
+        "STACK_GLOBAL",
+    }
+)
+_BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES: frozenset[str] = frozenset(
+    {
+        "BINPERSID",
+        "EXT1",
+        "EXT2",
+        "EXT4",
+        "GLOBAL",
+        "INST",
+        "OBJ",
+        "PERSID",
+        "REDUCE",
+        "STACK_GLOBAL",
+    }
+)
+
+
+def _read_proto_length_delimited_bounds_stream(
+    stream: BinaryIO,
+    end_offset: int,
+) -> tuple[int, int, int] | None:
+    """Return bounds for a length-delimited value without reading its payload."""
+    length = _read_proto_varint_stream(stream, end_offset)
+    if length is None:
+        return None
+    value_start = stream.tell()
+    value_end = value_start + length
+    if value_end > end_offset:
+        return None
+    return length, value_start, value_end
 
 
 def _read_proto_varint(data: bytes, offset: int, end: int | None = None) -> tuple[int, int] | None:
-    """Read a protobuf varint from bounded data."""
+    """Read a protobuf varint from bounded in-memory data."""
     limit = len(data) if end is None else min(end, len(data))
     value = 0
     shift = 0
@@ -888,17 +1013,12 @@ def _read_proto_varint(data: bytes, offset: int, end: int | None = None) -> tupl
     return None
 
 
-def _has_onnx_model_tag_start(data: bytes) -> bool:
-    """Return True when data starts with a plausible ONNX ModelProto field tag."""
-    return bool(data) and data[0] in _ONNX_MODEL_TOP_LEVEL_TAG_START_BYTES
-
-
 def _read_length_delimited_proto_value(
     data: bytes,
     offset: int,
     end: int | None = None,
 ) -> tuple[int, int, int, int] | None:
-    """Return protobuf length-delimited value bounds within the sampled prefix."""
+    """Return length-delimited value bounds within sampled CoreML bytes."""
     limit = len(data) if end is None else min(end, len(data))
     length_result = _read_proto_varint(data, offset, limit)
     if length_result is None:
@@ -931,151 +1051,429 @@ def _skip_proto_value(data: bytes, offset: int, wire_type: int, end: int | None 
     return None
 
 
-def _looks_like_onnx_node_proto_prefix(data: bytes) -> bool:
-    """Return True when a bounded prefix resembles an ONNX NodeProto."""
-    offset = 0
+def _skip_coreml_proto_group(
+    data: bytes,
+    offset: int,
+    start_field_number: int,
+    *,
+    remaining_fields: int,
+    end: int | None = None,
+) -> tuple[int, int] | Literal["budget_exhausted", "incomplete", "malformed"]:
+    """Skip a well-formed unknown CoreML protobuf group within a field budget."""
+    limit = len(data) if end is None else min(end, len(data))
+    group_stack = [start_field_number]
+    fields_seen = 0
+
+    while group_stack and offset < limit and fields_seen < remaining_fields:
+        tag_result = _read_proto_varint(data, offset, limit)
+        if tag_result is None:
+            return _COREML_GROUP_INCOMPLETE
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return _COREML_GROUP_MALFORMED
+
+        fields_seen += 1
+        if wire_type == 3:
+            group_stack.append(field_number)
+            offset = value_offset
+            continue
+        if wire_type == 4:
+            if field_number != group_stack[-1]:
+                return _COREML_GROUP_MALFORMED
+            group_stack.pop()
+            offset = value_offset
+            continue
+        if wire_type not in _COREML_PROTO_PREFIX_WIRE_TYPES:
+            return _COREML_GROUP_MALFORMED
+
+        next_offset = _skip_proto_value(data, value_offset, wire_type, limit)
+        if next_offset is None:
+            return _COREML_GROUP_INCOMPLETE
+        offset = next_offset
+
+    if group_stack:
+        if fields_seen >= remaining_fields:
+            return _COREML_GROUP_BUDGET_EXHAUSTED
+        return _COREML_GROUP_INCOMPLETE
+    return offset, fields_seen
+
+
+def _looks_like_onnx_node_proto_stream(
+    stream: BinaryIO,
+    end_offset: int,
+    routing_fields_remaining: list[int],
+) -> bool | None:
+    """Return whether a bounded message resembles an ONNX NodeProto, or is unresolved."""
     fields_seen = 0
     has_input_or_output = False
     has_op_type = False
-    while offset < len(data) and fields_seen < 128:
-        tag_result = _read_proto_varint(data, offset)
-        if tag_result is None:
-            break
-        tag, value_offset = tag_result
+    while stream.tell() < end_offset and fields_seen < _ONNX_NODE_MAX_ROUTING_FIELDS:
+        if routing_fields_remaining[0] <= 0:
+            return None
+        routing_fields_remaining[0] -= 1
+        tag = _read_proto_varint_stream(stream, end_offset)
+        if tag is None:
+            return False
         field_number = tag >> 3
         wire_type = tag & 0x07
         if field_number == 0:
             return False
 
         if wire_type == 2 and field_number in {1, 2, 4}:
-            bounds = _read_length_delimited_proto_value(data, value_offset)
+            bounds = _read_proto_length_delimited_bounds_stream(stream, end_offset)
             if bounds is None:
-                break
-            length, value_start, value_end, actual_value_end = bounds
-            if field_number in {1, 2} and 0 < length <= 1024:
+                return False
+            length, _value_start, value_end = bounds
+            if field_number in {1, 2} and 0 < length <= _ONNX_MAX_ROUTING_TEXT_BYTES:
                 has_input_or_output = True
-            elif field_number == 4 and 0 < length <= 1024:
-                op_type = data[value_start:value_end]
+            elif field_number == 4 and 0 < length <= _ONNX_MAX_ROUTING_TEXT_BYTES:
+                op_type = stream.read(length)
                 has_op_type = bool(op_type) and all(32 <= byte < 127 for byte in op_type)
-            offset = actual_value_end
+            stream.seek(value_end)
         else:
-            next_offset = _skip_proto_value(data, value_offset, wire_type)
-            if next_offset is None:
-                break
-            offset = next_offset
+            skip_status = _skip_proto_stream_value(
+                stream,
+                wire_type,
+                end_offset,
+                field_number=field_number,
+                routing_fields_remaining=routing_fields_remaining,
+            )
+            if skip_status is None:
+                return None
+            if not skip_status:
+                return False
 
         fields_seen += 1
         if has_input_or_output and has_op_type:
             return True
 
+    if stream.tell() < end_offset:
+        return None
     return False
 
 
-def _looks_like_onnx_graph_proto_prefix(data: bytes) -> bool:
-    """Return True when a bounded prefix resembles an ONNX GraphProto."""
-    offset = 0
+def _looks_like_onnx_graph_proto_stream(
+    stream: BinaryIO,
+    end_offset: int,
+    routing_fields_remaining: list[int],
+) -> bool | None:
+    """Return whether a bounded message resembles an ONNX GraphProto, or is unresolved."""
     fields_seen = 0
     has_node = False
     has_initializer = False
     value_info_fields: set[int] = set()
 
-    while offset < len(data) and fields_seen < 512:
-        tag_result = _read_proto_varint(data, offset)
-        if tag_result is None:
-            break
-        tag, value_offset = tag_result
+    while stream.tell() < end_offset and fields_seen < _ONNX_GRAPH_MAX_ROUTING_FIELDS:
+        if routing_fields_remaining[0] <= 0:
+            return None
+        routing_fields_remaining[0] -= 1
+        tag = _read_proto_varint_stream(stream, end_offset)
+        if tag is None:
+            return False
         field_number = tag >> 3
         wire_type = tag & 0x07
         if field_number == 0:
             return False
 
         if wire_type == 2:
-            bounds = _read_length_delimited_proto_value(data, value_offset)
+            bounds = _read_proto_length_delimited_bounds_stream(stream, end_offset)
             if bounds is None:
-                break
-            _length, value_start, value_end, actual_value_end = bounds
-            if field_number == 1 and _looks_like_onnx_node_proto_prefix(data[value_start:value_end]):
-                has_node = True
+                return False
+            length, _value_start, value_end = bounds
+            if field_number == 1 and length > 0:
+                node_status = _looks_like_onnx_node_proto_stream(stream, value_end, routing_fields_remaining)
+                if node_status is None:
+                    return None
+                has_node = has_node or node_status
             elif field_number == 5:
                 has_initializer = True
             elif field_number in {11, 12, 13}:
                 value_info_fields.add(field_number)
-            offset = actual_value_end
+            stream.seek(value_end)
         else:
-            next_offset = _skip_proto_value(data, value_offset, wire_type)
-            if next_offset is None:
-                break
-            offset = next_offset
+            skip_status = _skip_proto_stream_value(
+                stream,
+                wire_type,
+                end_offset,
+                field_number=field_number,
+                routing_fields_remaining=routing_fields_remaining,
+            )
+            if skip_status is None:
+                return None
+            if not skip_status:
+                return False
 
         fields_seen += 1
         if (has_node and value_info_fields) or len(value_info_fields) >= 2:
             return True
 
-    return has_initializer and bool(value_info_fields)
+    if has_initializer and value_info_fields:
+        return True
+    if stream.tell() < end_offset:
+        return None
+    return False
 
 
-def _looks_like_onnx_model_proto_prefix(data: bytes) -> bool:
-    """Return True when a bounded prefix resembles an ONNX ModelProto."""
-    if not _has_onnx_model_tag_start(data):
-        return False
-
-    offset = 0
+def _looks_like_onnx_model_proto_stream(stream: BinaryIO, end_offset: int) -> bool | None:
+    """Return whether a bounded message resembles an ONNX ModelProto, or is unresolved."""
     fields_seen = 0
     has_plausible_ir_version = False
     has_graph = False
+    routing_fields_remaining = [_ONNX_MODEL_MAX_ROUTING_FIELDS]
 
-    while offset < len(data) and fields_seen < 512:
-        tag_result = _read_proto_varint(data, offset)
-        if tag_result is None:
-            break
-        tag, value_offset = tag_result
+    while stream.tell() < end_offset and fields_seen < _ONNX_MODEL_MAX_ROUTING_FIELDS:
+        if routing_fields_remaining[0] <= 0:
+            return None
+        routing_fields_remaining[0] -= 1
+        tag = _read_proto_varint_stream(stream, end_offset)
+        if tag is None:
+            return False
         field_number = tag >> 3
         wire_type = tag & 0x07
         if field_number == 0:
             return False
 
         if field_number == 1 and wire_type == 0:
-            value_result = _read_proto_varint(data, value_offset)
-            if value_result is None:
-                break
-            ir_version, offset = value_result
+            ir_version = _read_proto_varint_stream(stream, end_offset)
+            if ir_version is None:
+                return False
             has_plausible_ir_version = 0 < ir_version <= 1000
         elif field_number == 7 and wire_type == 2:
-            bounds = _read_length_delimited_proto_value(data, value_offset)
+            bounds = _read_proto_length_delimited_bounds_stream(stream, end_offset)
             if bounds is None:
-                break
-            length, value_start, value_end, actual_value_end = bounds
-            if length > 0 and _looks_like_onnx_graph_proto_prefix(data[value_start:value_end]):
-                has_graph = True
-            offset = actual_value_end
+                return False
+            length, _value_start, value_end = bounds
+            if length > 0:
+                graph_status = _looks_like_onnx_graph_proto_stream(stream, value_end, routing_fields_remaining)
+                if graph_status is None:
+                    return None
+                has_graph = has_graph or graph_status
+            stream.seek(value_end)
         else:
-            next_offset = _skip_proto_value(data, value_offset, wire_type)
-            if next_offset is None:
-                break
-            offset = next_offset
+            expected_wire_type = _ONNX_MODEL_FIELD_WIRE_TYPES.get(field_number)
+            if expected_wire_type is not None and wire_type != expected_wire_type:
+                return False
+            skip_status = _skip_proto_stream_value(
+                stream,
+                wire_type,
+                end_offset,
+                field_number=field_number,
+                routing_fields_remaining=routing_fields_remaining,
+            )
+            if skip_status is None:
+                return None
+            if not skip_status:
+                return False
 
         fields_seen += 1
         if has_plausible_ir_version and has_graph:
             return True
 
+    if stream.tell() < end_offset:
+        return None
     return False
 
 
-def _looks_like_onnx_model_file(path: Path, size: int) -> bool:
-    """Detect real ONNX ModelProto structure with a bounded prefix read."""
+def _looks_like_onnx_model_file(path: Path, size: int) -> bool | None:
+    """Detect ONNX ModelProto structure while preserving unresolved bounded scans."""
     if size < 4:
         return False
     try:
-        with path.open("rb") as handle:
-            prefix = handle.read(min(size, _ONNX_PROTO_SIGNATURE_READ_BYTES))
+        with path.open("rb") as stream:
+            return _looks_like_onnx_model_proto_stream(stream, size)
     except OSError:
         return False
-    return _looks_like_onnx_model_proto_prefix(prefix)
 
 
-def _looks_like_onnx_model_candidate_file(path: Path, size: int, header: bytes) -> bool:
-    """Run the bounded ONNX parser only for plausible protobuf tag starts."""
-    return _has_onnx_model_tag_start(header) and _looks_like_onnx_model_file(path, size)
+def _looks_like_proto_message_prefix(data: bytes) -> bool:
+    """Return whether bytes begin with a non-empty protobuf message field."""
+    if not data:
+        return False
+    tag_result = _read_proto_varint(data, 0)
+    if tag_result is None:
+        return False
+    tag, _value_offset = tag_result
+    return tag >> 3 > 0 and tag & 0x07 in _COREML_PROTO_PREFIX_WIRE_TYPES
+
+
+def _looks_like_coreml_description_proto_prefix(data: bytes, *, sample_is_prefix: bool = False) -> bool | None:
+    """Return True when a bounded prefix resembles a CoreML ModelDescription."""
+    offset = 0
+    fields_seen = 0
+    while offset < len(data) and fields_seen < _COREML_MAX_DESCRIPTION_PREFIX_FIELDS:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            return None if sample_is_prefix else False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+
+        if wire_type == 2 and field_number in _COREML_DESCRIPTION_FIELD_HINTS:
+            return True
+
+        if wire_type == 3:
+            group_result = _skip_coreml_proto_group(
+                data,
+                value_offset,
+                field_number,
+                remaining_fields=_COREML_MAX_DESCRIPTION_PREFIX_FIELDS - fields_seen - 1,
+            )
+            if group_result == _COREML_GROUP_BUDGET_EXHAUSTED:
+                return None
+            if group_result == _COREML_GROUP_INCOMPLETE:
+                return None if sample_is_prefix else False
+            if group_result == _COREML_GROUP_MALFORMED:
+                return False
+            offset, group_fields_seen = group_result
+            fields_seen += group_fields_seen
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type)
+            if next_offset is None:
+                return None if sample_is_prefix else False
+            offset = next_offset
+        fields_seen += 1
+
+    return None if sample_is_prefix and fields_seen >= _COREML_MAX_DESCRIPTION_PREFIX_FIELDS else False
+
+
+def _could_start_coreml_model_proto(data: bytes) -> bool:
+    """Return whether a prefix starts with a skippable protobuf field."""
+    tag_result = _read_proto_varint(data, 0)
+    if tag_result is None:
+        return False
+    tag, _value_offset = tag_result
+    return tag >> 3 > 0 and tag & 0x07 in _COREML_PROTO_PREFIX_WIRE_TYPES
+
+
+def _starts_with_coreml_specification_version(data: bytes) -> bool:
+    """Return whether the bounded prefix starts with a plausible CoreML identity field."""
+    tag_result = _read_proto_varint(data, 0)
+    if tag_result is None:
+        return False
+    tag, value_offset = tag_result
+    if tag != (1 << 3):
+        return False
+    value_result = _read_proto_varint(data, value_offset)
+    return value_result is not None and 0 < value_result[0] <= 10000
+
+
+def _looks_like_coreml_model_proto_prefix(data: bytes, *, sample_is_prefix: bool = False) -> bool | None:
+    """Return whether a bounded prefix resembles, rejects, or cannot resolve CoreML Model."""
+    if not _could_start_coreml_model_proto(data):
+        return False
+
+    offset = 0
+    fields_seen = 0
+    has_specification_version = False
+    has_description = False
+    has_model_type = False
+    while offset < len(data) and fields_seen < _COREML_MAX_MODEL_PREFIX_FIELDS:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            return None if sample_is_prefix else False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+        if field_number == 1 and wire_type != 0:
+            return False
+        if (field_number == 2 or field_number in _COREML_MODEL_TYPE_FIELDS) and wire_type != 2:
+            return False
+
+        if field_number == 1:
+            value_result = _read_proto_varint(data, value_offset)
+            if value_result is None:
+                return None if sample_is_prefix else False
+            specification_version, offset = value_result
+            has_specification_version = 0 < specification_version <= 10000
+        elif wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return None if sample_is_prefix else False
+            length, value_start, value_end, actual_value_end = bounds
+            if actual_value_end > len(data):
+                if field_number == 2:
+                    return None if sample_is_prefix and has_specification_version else False
+                if field_number in _COREML_MODEL_TYPE_FIELDS and length > 0:
+                    return True if has_specification_version and has_description else None
+                return None if sample_is_prefix else False
+            if field_number == 2:
+                description_status = _looks_like_coreml_description_proto_prefix(data[value_start:value_end])
+                if description_status is True:
+                    has_description = True
+                elif description_status is None:
+                    return None
+                else:
+                    return False
+            elif (
+                field_number in _COREML_MODEL_TYPE_FIELDS
+                and length > 0
+                and _looks_like_proto_message_prefix(data[value_start:value_end])
+            ):
+                has_model_type = True
+            offset = actual_value_end
+        elif wire_type == 3:
+            group_result = _skip_coreml_proto_group(
+                data,
+                value_offset,
+                field_number,
+                remaining_fields=_COREML_MAX_MODEL_PREFIX_FIELDS - fields_seen - 1,
+            )
+            if group_result == _COREML_GROUP_BUDGET_EXHAUSTED:
+                return None
+            if group_result == _COREML_GROUP_INCOMPLETE:
+                return None if sample_is_prefix else False
+            if group_result == _COREML_GROUP_MALFORMED:
+                return False
+            offset, group_fields_seen = group_result
+            fields_seen += group_fields_seen
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type)
+            if next_offset is None:
+                return None if sample_is_prefix else False
+            offset = next_offset
+
+        fields_seen += 1
+        if has_specification_version and has_description and has_model_type:
+            return True
+
+    if has_specification_version and has_description and has_model_type:
+        return True
+    if sample_is_prefix or fields_seen >= _COREML_MAX_MODEL_PREFIX_FIELDS:
+        return None
+    return False
+
+
+def _looks_like_coreml_model_file(path: Path, size: int) -> bool | None:
+    """Detect recognizable or unresolved CoreML Model structure with a bounded prefix read."""
+    if size < 8:
+        return False
+    try:
+        with path.open("rb") as handle:
+            prefix = handle.read(min(size, _COREML_PROTO_SIGNATURE_READ_BYTES))
+    except OSError:
+        return False
+    return _looks_like_coreml_model_proto_prefix(prefix, sample_is_prefix=size > len(prefix))
+
+
+def _looks_like_coreml_model_candidate_file(path: Path, size: int, header: bytes) -> bool | None:
+    """Return a recognized, rejected, or bounded-inconclusive CoreML route."""
+    if not _could_start_coreml_model_proto(header):
+        if _read_proto_varint(header, 0) is not None or len(header) >= min(size, 10):
+            return False
+        try:
+            with path.open("rb") as handle:
+                header = handle.read(min(size, 10))
+        except OSError:
+            return False
+        if not _could_start_coreml_model_proto(header):
+            return False
+    return _looks_like_coreml_model_file(path, size)
 
 
 def _looks_like_binary_pickle_protocol(header: bytes) -> bool:
@@ -1086,7 +1484,7 @@ def _looks_like_binary_pickle_protocol(header: bytes) -> bool:
     )
 
 
-SAFETENSORS_MAX_HEADER_BYTES: int = 100 * 1024 * 1024
+SAFETENSORS_ROUTING_HEADER_PARSE_BYTES: int = 16 * 1024 * 1024
 
 
 def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool = False) -> bool:
@@ -1148,6 +1546,33 @@ def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool = Fa
     # Regression hardening: a single leading "#" token should not suppress
     # protocol 0/1 detection for otherwise valid pickle streams.
     return sample.startswith(b"#") and _matches_proto_stream(sample[1:])
+
+
+def _has_bounded_binary_pickle_security_signal(sample: bytes) -> bool:
+    """Return whether a pickle-shaped binary prefix contains a security signal."""
+    if not _looks_like_binary_pickle_protocol(sample[:4]):
+        return False
+    protocol_opcode_count = 0
+    has_security_opcode = False
+    has_pre_stop_security_opcode = False
+    try:
+        for opcode, _arg, position in pickletools.genops(sample):
+            if opcode.name == "PROTO":
+                protocol_opcode_count += 1
+            if opcode.name in _BINARY_PICKLE_SECURITY_OPCODES:
+                has_security_opcode = True
+            if opcode.name in _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES:
+                has_pre_stop_security_opcode = True
+            if opcode.name == "STOP":
+                stop_position = 0 if position is None else position
+                try:
+                    pickletools.dis(sample[: stop_position + 1], out=StringIO())
+                except Exception:
+                    return has_pre_stop_security_opcode
+                return protocol_opcode_count > 1 or has_security_opcode
+    except Exception:
+        return has_pre_stop_security_opcode
+    return has_pre_stop_security_opcode
 
 
 def _read_pickle_probe_sample(path: Path, size: int, header16: bytes) -> bytes:
@@ -1218,8 +1643,8 @@ def detect_pytorch_binary_supplemental_format(path: str) -> str | None:
     return None
 
 
-def _looks_like_safetensors_structure(path: Path | None, magic8: bytes, file_size: int) -> bool:
-    """Validate safetensors framing: <u64 header_len><JSON header><tensor data>."""
+def _is_safetensors_routing_candidate(path: Path | None, magic8: bytes, file_size: int) -> bool:
+    """Recognize SafeTensors framing or retain oversized plausible headers."""
     if file_size <= 8 or len(magic8) < 8:
         return False
 
@@ -1230,13 +1655,21 @@ def _looks_like_safetensors_structure(path: Path | None, magic8: bytes, file_siz
 
     if header_len <= 0:
         return False
-    if header_len >= SAFETENSORS_MAX_HEADER_BYTES:
-        return False
     if header_len > file_size - 8:
         return False
 
     if path is None:
         return False
+
+    # The scanner fails closed on headers above this bounded parse budget.
+    # Retain plausible object headers without parsing attacker-sized metadata.
+    if header_len > SAFETENSORS_ROUTING_HEADER_PARSE_BYTES:
+        try:
+            with path.open("rb") as handle:
+                handle.seek(8)
+                return handle.read(1) == b"{"
+        except OSError:
+            return False
 
     try:
         with path.open("rb") as handle:
@@ -1254,6 +1687,31 @@ def _looks_like_safetensors_structure(path: Path | None, magic8: bytes, file_siz
         return False
 
     return isinstance(parsed_header, dict)
+
+
+def should_defer_safetensors_header_limit_hash(path: str, max_header_bytes: int) -> bool:
+    """Return whether recognized bounded routing will fail before full-file hashing is useful."""
+    file_path = Path(path)
+    try:
+        file_size = file_path.stat().st_size
+        if file_size <= 8:
+            return False
+        with file_path.open("rb") as handle:
+            magic8 = handle.read(8)
+        if len(magic8) != 8:
+            return False
+        header_len = struct.unpack("<Q", magic8)[0]
+    except (OSError, struct.error):
+        return False
+
+    if header_len <= max_header_bytes or header_len > file_size - 8:
+        return False
+    detected_format = detect_file_format(path)
+    if detected_format == "safetensors":
+        return True
+    return detected_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT and (
+        file_path.suffix.lower() == ".safetensors" or _is_safetensors_routing_candidate(file_path, magic8, file_size)
+    )
 
 
 def _normalize_archive_member_name(member_name: str) -> str:
@@ -1643,9 +2101,162 @@ def _resolve_safe_tar_link_target_name(member: tarfile.TarInfo) -> str | None:
     if PurePosixPath(link_name).is_absolute() or re.match(r"^[A-Za-z]:/", link_name):
         return None
 
-    member_dir = posixpath.dirname(member.name.replace("\\", "/"))
-    target_name = posixpath.normpath(posixpath.join(member_dir, link_name))
+    if member.islnk():
+        target_name = link_name
+    else:
+        member_dir = posixpath.dirname(member.name.replace("\\", "/"))
+        target_name = posixpath.join(member_dir, link_name)
+    if posixpath.normpath(target_name) == ".":
+        return "."
     return _normalize_safe_tar_member_name(target_name)
+
+
+def _resolve_safe_tar_symlink_target_at_destination(member: tarfile.TarInfo, destination_name: str) -> str | None:
+    """Resolve a symlink target relative to its extracted destination."""
+    link_name = member.linkname.replace("\\", "/")
+    if PurePosixPath(link_name).is_absolute() or re.match(r"^[A-Za-z]:/", link_name):
+        return None
+    target_name = posixpath.join(posixpath.dirname(destination_name), link_name)
+    if posixpath.normpath(target_name) == ".":
+        return "."
+    return _normalize_safe_tar_member_name(target_name)
+
+
+class _NemoRouteResolutionLimitExceeded(Exception):
+    """Raised when bounded NeMo TAR link routing cannot safely continue."""
+
+
+def _consume_nemo_route_link_visit(member_visit_budget: list[int]) -> None:
+    if member_visit_budget[0] <= 0:
+        raise _NemoRouteResolutionLimitExceeded
+    member_visit_budget[0] -= 1
+
+
+def _consume_nemo_route_prefix_probe_budget(
+    components: list[str],
+    maximum_length: int,
+    member_visit_budget: list[int],
+) -> None:
+    """Bound total prefix-string work before resolving symlink components."""
+    prefix_length = 0
+    probe_cost = 0
+    for index, component in enumerate(components[:maximum_length]):
+        prefix_length += len(component) + (1 if index else 0)
+        probe_cost += prefix_length
+        if probe_cost > member_visit_budget[0]:
+            raise _NemoRouteResolutionLimitExceeded
+    member_visit_budget[0] -= probe_cost
+
+
+def _resolve_safe_tar_path_through_symlinks(
+    member_name: str,
+    symlink_targets: dict[str, str],
+    member_visit_budget: list[int],
+    *,
+    follow_final_symlink: bool = True,
+) -> str | None:
+    """Resolve a safe extraction destination through symlinks already created."""
+    current_name = _normalize_safe_tar_member_name(member_name)
+    if current_name is None:
+        return None
+    seen: set[str] = set()
+    while current_name not in seen:
+        seen.add(current_name)
+        if not symlink_targets:
+            return current_name
+        components = current_name.split("/")
+        maximum_length = len(components) if follow_final_symlink else len(components) - 1
+        _consume_nemo_route_prefix_probe_budget(
+            components,
+            maximum_length,
+            member_visit_budget,
+        )
+        for length in range(maximum_length, 0, -1):
+            prefix = "/".join(components[:length])
+            target_name = symlink_targets.get(prefix)
+            if target_name is None:
+                continue
+            suffix = "/".join(components[length:])
+            redirected_name = target_name if not suffix else posixpath.join(target_name, suffix)
+            if posixpath.normpath(redirected_name) == ".":
+                current_name = "."
+            else:
+                current_name = _normalize_safe_tar_member_name(redirected_name)
+                if current_name is None:
+                    return None
+            break
+        else:
+            return current_name
+    return None
+
+
+def _tar_member_materializes_file_content(member: tarfile.TarInfo) -> bool:
+    """Mirror tarfile members extracted through makefile or makeunknown."""
+    return not (
+        member.isdir() or member.isfifo() or member.ischr() or member.isblk() or member.islnk() or member.issym()
+    )
+
+
+def _tar_links_resolve_to_regular_member(
+    root_links: list[tarfile.TarInfo],
+    members_by_normalized_name: dict[str, list[tarfile.TarInfo]],
+    member_visit_budget: list[int],
+) -> bool:
+    """Return whether a TAR link chain can materialize a regular config member."""
+    pending = list(root_links)
+    seen: set[tuple[str, int]] = set()
+    while pending:
+        member = pending.pop()
+        identity = (member.name, member.offset)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if _tar_member_materializes_file_content(member):
+            return True
+        if not (member.issym() or member.islnk()):
+            continue
+        _consume_nemo_route_link_visit(member_visit_budget)
+        target_member = _effective_safe_tar_link_target_member(member, members_by_normalized_name)
+        if target_member is not None:
+            pending.append(target_member)
+    return False
+
+
+def _effective_safe_tar_link_target_member(
+    member: tarfile.TarInfo,
+    members_by_normalized_name: dict[str, list[tarfile.TarInfo]],
+) -> tarfile.TarInfo | None:
+    """Return the single target entry TAR extraction would use for a link."""
+    target_name = _resolve_safe_tar_link_target_name(member)
+    if target_name is None:
+        return None
+    target_members = members_by_normalized_name.get(target_name, [])
+    if member.islnk():
+        target_members = [target_member for target_member in target_members if target_member.offset < member.offset]
+    return target_members[-1] if target_members else None
+
+
+def _resolve_tar_hardlink_fallback_member(
+    hardlink: tarfile.TarInfo,
+    members_by_normalized_name: dict[str, list[tarfile.TarInfo]],
+    member_visit_budget: list[int],
+) -> tarfile.TarInfo | None:
+    """Resolve the member tarfile extracts after a colliding hardlink."""
+    pending = hardlink
+    seen: set[tuple[str, int]] = set()
+    while pending.islnk():
+        _consume_nemo_route_link_visit(member_visit_budget)
+        identity = (pending.name, pending.offset)
+        if identity in seen:
+            return None
+        seen.add(identity)
+        target_member = _effective_safe_tar_link_target_member(pending, members_by_normalized_name)
+        if target_member is None:
+            return None
+        if _tar_member_materializes_file_content(target_member) or target_member.issym():
+            return target_member
+        pending = target_member
+    return None
 
 
 def _detect_tar_route(path: str) -> str | None:
@@ -1658,31 +2269,138 @@ def _detect_tar_route(path: str) -> str | None:
         with tarfile.open(file_path, "r:*") as archive:
             if file_path.suffix.lower() == ".nemo":
                 return "tar"
-            regular_member_names: set[str] = set()
-            linked_root_config_targets: set[str] = set()
+            members_by_normalized_name: dict[str, list[tarfile.TarInfo]] = {}
+            root_config_links: list[tarfile.TarInfo] = []
+            symlink_targets: dict[str, str] = {}
+            occupied_names: set[str] = set()
+            link_resolution_budget = [_NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS]
             for entry_count, member in enumerate(archive, start=1):
                 if entry_count > _NEMO_ROUTE_MAX_ENTRIES:
+                    if _tar_links_resolve_to_regular_member(
+                        root_config_links,
+                        members_by_normalized_name,
+                        link_resolution_budget,
+                    ):
+                        return "nemo"
                     return NEMO_ROUTING_INCONCLUSIVE_FORMAT
                 normalized_member_name = _normalize_safe_tar_member_name(member.name)
-                if member.isfile():
+                if normalized_member_name is not None:
+                    members_by_normalized_name.setdefault(normalized_member_name, []).append(member)
+                if _tar_member_materializes_file_content(member):
+                    resolved_destination = _resolve_safe_tar_path_through_symlinks(
+                        member.name,
+                        symlink_targets,
+                        link_resolution_budget,
+                    )
+                    if resolved_destination is not None and _is_nemo_root_config_member(resolved_destination):
+                        return "nemo"
+                    physical_destination = _resolve_safe_tar_path_through_symlinks(
+                        member.name,
+                        symlink_targets,
+                        link_resolution_budget,
+                        follow_final_symlink=False,
+                    )
+                    if physical_destination is not None:
+                        occupied_names.add(physical_destination)
+                elif member.issym():
+                    destination_name = _resolve_safe_tar_path_through_symlinks(
+                        member.name,
+                        symlink_targets,
+                        link_resolution_budget,
+                        follow_final_symlink=False,
+                    )
+                    if destination_name is None:
+                        continue
+                    target_name = _resolve_safe_tar_symlink_target_at_destination(member, destination_name)
+                    if target_name is None:
+                        continue
+                    if _is_nemo_root_config_member(destination_name):
+                        return "nemo"
+                    occupied_names.add(destination_name)
+                    symlink_targets[destination_name] = target_name
+                elif member.islnk():
+                    destination_name = _resolve_safe_tar_path_through_symlinks(
+                        member.name,
+                        symlink_targets,
+                        link_resolution_budget,
+                        follow_final_symlink=False,
+                    )
+                    target_name = _resolve_safe_tar_link_target_name(member)
+                    if (
+                        destination_name is not None
+                        and _is_nemo_root_config_member(destination_name)
+                        and target_name is not None
+                    ):
+                        return "nemo"
+                    if destination_name is None or target_name is None:
+                        continue
+                    if destination_name in occupied_names:
+                        fallback_member = _resolve_tar_hardlink_fallback_member(
+                            member,
+                            members_by_normalized_name,
+                            link_resolution_budget,
+                        )
+                        if fallback_member is None:
+                            continue
+                        if fallback_member.issym():
+                            symlink_targets.pop(destination_name, None)
+                            fallback_target = _resolve_safe_tar_symlink_target_at_destination(
+                                fallback_member,
+                                destination_name,
+                            )
+                            if fallback_target is not None:
+                                symlink_targets[destination_name] = fallback_target
+                            continue
+                        resolved_write = _resolve_safe_tar_path_through_symlinks(
+                            destination_name,
+                            symlink_targets,
+                            link_resolution_budget,
+                        )
+                        if resolved_write is not None and _is_nemo_root_config_member(resolved_write):
+                            return "nemo"
+                        continue
+                    occupied_names.add(destination_name)
+                    fallback_member = _resolve_tar_hardlink_fallback_member(
+                        member,
+                        members_by_normalized_name,
+                        link_resolution_budget,
+                    )
+                    redirected_target = _resolve_safe_tar_path_through_symlinks(
+                        target_name,
+                        symlink_targets,
+                        link_resolution_budget,
+                    )
+                    if (
+                        fallback_member is not None
+                        and fallback_member.issym()
+                        and redirected_target is not None
+                        and redirected_target not in occupied_names
+                    ):
+                        fallback_target = _resolve_safe_tar_symlink_target_at_destination(
+                            fallback_member,
+                            destination_name,
+                        )
+                        if fallback_target is not None:
+                            symlink_targets[destination_name] = fallback_target
                     if _is_nemo_root_config_member(member.name):
-                        return "nemo"
-                    if normalized_member_name in linked_root_config_targets:
-                        return "nemo"
-                    if normalized_member_name is not None:
-                        regular_member_names.add(normalized_member_name)
-                    continue
-                if not (member.issym() or member.islnk()) or not _is_nemo_root_config_member(member.name):
-                    continue
-                target_name = _resolve_safe_tar_link_target_name(member)
-                if target_name in regular_member_names:
-                    return "nemo"
-                if member.issym() and target_name is not None:
-                    linked_root_config_targets.add(target_name)
-    except (OSError, tarfile.TarError):
+                        root_config_links.append(member)
+    except _NemoRouteResolutionLimitExceeded:
+        return NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    except (EOFError, OSError, tarfile.TarError):
         return None
 
-    return "tar"
+    try:
+        return (
+            "nemo"
+            if _tar_links_resolve_to_regular_member(
+                root_config_links,
+                members_by_normalized_name,
+                link_resolution_budget,
+            )
+            else "tar"
+        )
+    except _NemoRouteResolutionLimitExceeded:
+        return NEMO_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def is_nemo_archive(path: str) -> bool:
@@ -1801,15 +2519,394 @@ def _is_tensorflow_metagraph_file(path: str) -> bool:
         metagraph = MetaGraphDef()
         metagraph.ParseFromString(content)
 
-        if not metagraph.HasField("graph_def"):
-            return False
-
         graph_node_count = len(metagraph.graph_def.node)
         function_node_count = sum(len(function.node_def) for function in metagraph.graph_def.library.function)
         collection_count = len(metagraph.collection_def)
         return graph_node_count > 0 or function_node_count > 0 or collection_count > 0
     except Exception:
         return False
+
+
+def _is_tensorflow_saved_model_file(path: str) -> bool:
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+
+    try:
+        size = file_path.stat().st_size
+        if size < _TF_METAGRAPH_MIN_BYTES or size > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+            return False
+
+        import modelaudit.protos  # noqa: F401, I001
+
+        from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+
+        saved_model = SavedModel()
+        saved_model.ParseFromString(file_path.read_bytes())
+        return any(
+            len(metagraph.collection_def) > 0
+            or (
+                metagraph.HasField("graph_def")
+                and (
+                    len(metagraph.graph_def.node) > 0
+                    or any(function.node_def for function in metagraph.graph_def.library.function)
+                )
+            )
+            for metagraph in saved_model.meta_graphs
+        )
+    except Exception:
+        return False
+
+
+def _read_proto_varint_stream(stream: BinaryIO, end_offset: int | None = None) -> int | None:
+    value = 0
+    shift = 0
+    for _ in range(10):
+        if end_offset is not None and stream.tell() >= end_offset:
+            return None
+        raw_byte = stream.read(1)
+        if not raw_byte:
+            return None
+        byte = raw_byte[0]
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value
+        shift += 7
+    return None
+
+
+def _has_tensorflow_node_signal(node: Any) -> bool:
+    return bool(node.name or node.op or node.input or node.attr)
+
+
+def _has_tensorflow_graph_signal(graph_def: Any) -> bool:
+    return any(_has_tensorflow_node_signal(node) for node in graph_def.node) or any(
+        _has_tensorflow_node_signal(node) for function in graph_def.library.function for node in function.node_def
+    )
+
+
+def _has_tensorflow_operation_signal(graph_def: Any) -> bool:
+    return any(node.op for node in graph_def.node) or any(
+        node.op for function in graph_def.library.function for node in function.node_def
+    )
+
+
+def _classify_tensorflow_field_two_payload(
+    payload: bytes,
+    *,
+    outer_hint: _TensorFlowOuterHint,
+) -> _TensorFlowProtoRoute:
+    """Classify a bounded protobuf field 2 payload from MetaGraph/SavedModel wrappers."""
+    try:
+        import modelaudit.protos  # noqa: F401, I001
+
+        from google.protobuf.message import DecodeError
+        from tensorflow.core.framework.graph_pb2 import GraphDef
+        from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
+    except Exception:
+        return "unknown"
+
+    graph_signal = False
+    try:
+        graph_def = GraphDef()
+        graph_def.ParseFromString(payload)
+        graph_signal = _has_tensorflow_graph_signal(graph_def)
+    except (DecodeError, ValueError, TypeError, AttributeError):
+        # This field may instead hold a MetaGraphDef wrapper; inspect that next.
+        pass
+
+    saved_model_signal = False
+    try:
+        metagraph = MetaGraphDef()
+        metagraph.ParseFromString(payload)
+        saved_model_signal = len(metagraph.collection_def) > 0 or (
+            metagraph.HasField("graph_def")
+            and (
+                _has_tensorflow_operation_signal(metagraph.graph_def)
+                or (outer_hint == "tf_savedmodel" and _has_tensorflow_graph_signal(metagraph.graph_def))
+            )
+        )
+    except (DecodeError, ValueError, TypeError, AttributeError):
+        # Raw GraphDef payloads are expected here; preserve the graph signal above.
+        pass
+
+    if outer_hint == "tf_metagraph" and graph_signal:
+        return "tf_metagraph"
+    if outer_hint == "tf_savedmodel" and saved_model_signal:
+        return "tf_savedmodel"
+    if graph_signal and not saved_model_signal:
+        return "tf_metagraph"
+    if saved_model_signal and not graph_signal:
+        return "tf_savedmodel"
+    if graph_signal and saved_model_signal:
+        return "inconclusive"
+    return "unknown"
+
+
+def _is_tensorflow_collection_payload(payload: bytes) -> bool:
+    """Return whether a bounded field looks like a TensorFlow collection entry."""
+    try:
+        import modelaudit.protos  # noqa: F401, I001
+
+        from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
+    except Exception:
+        return False
+    try:
+        collection_entry = MetaGraphDef.CollectionDefEntry()
+        collection_entry.ParseFromString(payload)
+        return bool(collection_entry.key and collection_entry.value.WhichOneof("kind"))
+    except Exception:
+        return False
+
+
+def _is_tensorflow_metainfo_payload(payload: bytes) -> bool:
+    """Return whether field 1 contains recognizable MetaGraph metadata."""
+    try:
+        import modelaudit.protos  # noqa: F401, I001
+
+        from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
+    except Exception:
+        return False
+    try:
+        metainfo = MetaGraphDef.MetaInfoDef()
+        metainfo.ParseFromString(payload)
+        return bool(metainfo.meta_graph_version or metainfo.tags)
+    except Exception:
+        return False
+
+
+def _skip_proto_stream_value(
+    stream: BinaryIO,
+    wire_type: int,
+    end_offset: int,
+    *,
+    field_number: int | None = None,
+    remaining_fields: list[int] | None = None,
+    routing_fields_remaining: list[int] | None = None,
+    group_fields_remaining: list[int] | None = None,
+    group_depth: int = 0,
+) -> bool | None:
+    if wire_type == 0:
+        return _read_proto_varint_stream(stream, end_offset) is not None
+    if wire_type == 1:
+        length = 8
+    elif wire_type == 2:
+        length_result = _read_proto_varint_stream(stream, end_offset)
+        if length_result is None:
+            return False
+        length = length_result
+    elif wire_type == 5:
+        length = 4
+    elif wire_type == 3:
+        if field_number is None:
+            return False
+        max_group_depth = (
+            _TF_METAGRAPH_MAX_ROUTING_DEPTH if remaining_fields is not None else _PROTO_GROUP_MAX_ROUTING_DEPTH
+        )
+        if group_depth >= max_group_depth:
+            if remaining_fields is not None:
+                remaining_fields[0] = 0
+            return None
+
+        if remaining_fields is None and group_fields_remaining is None:
+            group_fields_remaining = [_PROTO_GROUP_MAX_ROUTING_FIELDS]
+        while stream.tell() < end_offset:
+            if group_fields_remaining is not None:
+                if group_fields_remaining[0] <= 0:
+                    return None
+                group_fields_remaining[0] -= 1
+            if routing_fields_remaining is not None:
+                if routing_fields_remaining[0] <= 0:
+                    return None
+                routing_fields_remaining[0] -= 1
+            if remaining_fields is not None:
+                if remaining_fields[0] <= 0:
+                    return None
+                remaining_fields[0] -= 1
+            nested_tag = _read_proto_varint_stream(stream, end_offset)
+            if nested_tag is None:
+                return False
+            nested_field_number = nested_tag >> 3
+            nested_wire_type = nested_tag & 0x07
+            if nested_field_number == 0:
+                return False
+            if nested_wire_type == 4:
+                return nested_field_number == field_number
+            nested_status = _skip_proto_stream_value(
+                stream,
+                nested_wire_type,
+                end_offset,
+                field_number=nested_field_number,
+                remaining_fields=remaining_fields,
+                routing_fields_remaining=routing_fields_remaining,
+                group_fields_remaining=group_fields_remaining,
+                group_depth=group_depth + 1,
+            )
+            if nested_status is not True:
+                return nested_status
+        return False
+    else:
+        return False
+
+    if stream.tell() + length > end_offset:
+        return False
+    stream.seek(length, 1)
+    return True
+
+
+def _classify_bounded_tensorflow_protobuf(path: Path, file_size: int) -> _TensorFlowProtoRoute:
+    """Seek past top-level protobuf values while looking for TensorFlow graph content."""
+    try:
+        remaining_fields = [_TF_METAGRAPH_MAX_ROUTING_FIELDS]
+        parsed_payload_bytes = 0
+        outer_hint: _TensorFlowOuterHint = "unknown"
+        saw_tensorflow_wrapper_hint = False
+        saw_tensorflow_candidate = False
+        saw_structured_unknown = False
+        with path.open("rb") as stream:
+            while remaining_fields[0] > 0:
+                remaining_fields[0] -= 1
+                if stream.tell() >= file_size:
+                    return "unknown"
+                tag = _read_proto_varint_stream(stream)
+                if tag is None:
+                    return "unknown"
+                field_number = tag >> 3
+                wire_type = tag & 0x07
+                if field_number == 0:
+                    return "unknown"
+                if wire_type in {2, 3}:
+                    saw_structured_unknown = True
+                if field_number == 1 and wire_type == 0:
+                    if _read_proto_varint_stream(stream) is None:
+                        return "unknown"
+                    # SavedModel stores its version here, but field 1 varints
+                    # are common in unrelated protobuf messages. Keep this as
+                    # an interpretation hint until a TensorFlow structure is seen.
+                    saw_tensorflow_wrapper_hint = True
+                    outer_hint = "tf_savedmodel"
+                    continue
+                if field_number == 1 and wire_type == 2:
+                    length = _read_proto_varint_stream(stream)
+                    if length is None or stream.tell() + length > file_size:
+                        return "unknown"
+                    if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+                        return "oversized" if saw_tensorflow_candidate else "inconclusive"
+                    payload = stream.read(length)
+                    if len(payload) != length:
+                        return "unknown"
+                    if _is_tensorflow_metainfo_payload(payload):
+                        saw_tensorflow_wrapper_hint = True
+                        saw_tensorflow_candidate = True
+                        outer_hint = "tf_metagraph"
+                    continue
+                if field_number == 2 and wire_type == 2:
+                    length = _read_proto_varint_stream(stream)
+                    if length is None or stream.tell() + length > file_size:
+                        return "unknown"
+                    if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+                        # Field 2 is graph_def on MetaGraphDef and meta_graphs on SavedModel.
+                        return "oversized" if saw_tensorflow_candidate else "oversized_candidate"
+                    if parsed_payload_bytes + length > _TF_METAGRAPH_MAX_ROUTING_PAYLOAD_BYTES:
+                        return "inconclusive"
+                    parsed_payload_bytes += length
+                    payload = stream.read(length)
+                    if len(payload) != length:
+                        return "unknown"
+                    payload_route = _classify_tensorflow_field_two_payload(payload, outer_hint=outer_hint)
+                    if payload_route != "unknown":
+                        return payload_route
+                    continue
+                if field_number == 4 and wire_type == 2:
+                    length = _read_proto_varint_stream(stream)
+                    if length is None or stream.tell() + length > file_size:
+                        return "unknown"
+                    if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+                        return "oversized" if saw_tensorflow_candidate else "oversized_candidate"
+                    if parsed_payload_bytes + length > _TF_METAGRAPH_MAX_ROUTING_PAYLOAD_BYTES:
+                        return "inconclusive"
+                    parsed_payload_bytes += length
+                    payload = stream.read(length)
+                    if len(payload) != length:
+                        return "unknown"
+                    if _is_tensorflow_collection_payload(payload):
+                        return "tf_metagraph"
+                    continue
+                if not _skip_proto_stream_value(
+                    stream,
+                    wire_type,
+                    file_size,
+                    field_number=field_number,
+                    remaining_fields=remaining_fields,
+                ):
+                    if remaining_fields[0] <= 0:
+                        return (
+                            "inconclusive"
+                            if saw_tensorflow_wrapper_hint or saw_tensorflow_candidate or saw_structured_unknown
+                            else "unknown"
+                        )
+                    return "unknown"
+    except OSError:
+        return "unknown"
+    return (
+        "inconclusive"
+        if saw_tensorflow_wrapper_hint or saw_tensorflow_candidate or saw_structured_unknown
+        else "unknown"
+    )
+
+
+def _has_bounded_non_source_control_signal(file_path: Path, file_size: int) -> bool:
+    """Return whether a bounded prefix contains bytes invalid in ordinary source text."""
+    try:
+        payload = read_magic_bytes(str(file_path), min(file_size, _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES))
+    except OSError:
+        return False
+    return any(byte in _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES for byte in payload)
+
+
+def _detect_renamed_tensorflow_protobuf(
+    file_path: Path,
+    file_size: int,
+    *,
+    fail_closed_on_inconclusive: bool = True,
+) -> str:
+    """Recognize renamed MetaGraph/SavedModel protobufs after bounded field discovery."""
+    suffix = file_path.suffix.lower()
+    if _is_complete_bounded_printable_text(file_path, file_size):
+        return "unknown"
+    route = _classify_bounded_tensorflow_protobuf(file_path, file_size)
+    if (
+        suffix in {".py", ".pyw"}
+        and route not in {"tf_metagraph", "tf_savedmodel"}
+        and not _has_bounded_non_source_control_signal(file_path, file_size)
+    ):
+        return "unknown"
+    if route == "unknown":
+        return "unknown"
+    if route == "oversized":
+        return "tf_metagraph" if fail_closed_on_inconclusive else route
+    if route == "oversized_candidate":
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT if fail_closed_on_inconclusive else route
+    if route == "inconclusive":
+        if _is_complete_structured_json_content_owner(file_path, file_size):
+            return "unknown"
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT if fail_closed_on_inconclusive else route
+    return route
+
+
+def _resolve_inconclusive_tensorflow_flax_overlap(file_path: Path, file_size: int) -> str:
+    """Use bounded strict parsing when an ambiguous protobuf also routes as Flax."""
+    if file_size > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    is_metagraph = _is_tensorflow_metagraph_file(str(file_path))
+    is_saved_model = _is_tensorflow_saved_model_file(str(file_path))
+    if is_metagraph and is_saved_model:
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    if is_metagraph:
+        return "tf_metagraph"
+    if is_saved_model:
+        return "tf_savedmodel"
+    return "flax_msgpack"
 
 
 def _has_torch7_ascii_object_signature(prefix: bytes) -> bool:
@@ -1999,7 +3096,7 @@ def _could_start_json_object(prefix: bytes) -> bool:
     return normalized_prefix.startswith(b"{")
 
 
-def _has_jax_json_checkpoint_structure(payload: object) -> bool:
+def has_jax_json_checkpoint_structure(payload: object) -> bool:
     """Return whether parsed metadata explicitly identifies a JAX-family checkpoint."""
     if not isinstance(payload, dict):
         return False
@@ -2035,11 +3132,13 @@ def _probe_jax_json_checkpoint_file(file_path: Path) -> bool | None:
 
     try:
         payload = json.loads(prefix.decode("utf-8-sig"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
+            # A visible non-JAX value cannot prove the unseen tail has no later
+            # JAX identity field; preserve bounded ambiguity instead of skipping.
             return None
         return False
-    return _has_jax_json_checkpoint_structure(payload)
+    return has_jax_json_checkpoint_structure(payload)
 
 
 def is_jax_json_checkpoint_file(path: str | Path) -> bool:
@@ -2339,6 +3438,61 @@ def _probe_complete_structured_json_document(file_path: Path, file_size: int) ->
     return True if read_size + trailing_read_size == file_size else None
 
 
+def _is_deep_scalar_array_json_document(payload: str) -> bool:
+    """Recognize deeply nested JSON arrays without recursive decoder traversal."""
+    stripped = payload.strip()
+    depth = 0
+    while depth < len(stripped) and stripped[depth] == "[":
+        depth += 1
+    if depth == 0 or len(stripped) < depth * 2:
+        return False
+    closing_start = len(stripped) - depth
+    if stripped[closing_start:] != "]" * depth:
+        return False
+    scalar_payload = stripped[depth:closing_start].strip()
+    if not scalar_payload:
+        return False
+    try:
+        scalar = json.loads(scalar_payload)
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        return False
+    return not isinstance(scalar, (dict, list))
+
+
+def _is_complete_structured_json_content_owner(file_path: Path, file_size: int) -> bool:
+    """Return whether bounded parsing proves that JSON, not a binary route, owns a file."""
+    json_document_probe = _probe_complete_structured_json_document(file_path, file_size)
+    if json_document_probe is True:
+        return True
+    if json_document_probe is None or file_size > MXNET_SYMBOL_SIGNATURE_READ_BYTES:
+        return False
+    try:
+        payload = read_magic_bytes(str(file_path), file_size).decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return _is_deep_scalar_array_json_document(payload)
+
+
+def _is_complete_bounded_printable_text(file_path: Path, file_size: int) -> bool:
+    """Return whether a small complete file cannot contain binary structure tags."""
+    if file_size > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES:
+        return False
+    try:
+        payload = read_magic_bytes(str(file_path), file_size)
+    except OSError:
+        return False
+    return not payload.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES)
+
+
+def _preserve_inconclusive_protobuf_model_routing(file_path: Path, file_size: int) -> bool:
+    """Keep ambiguous binary model protobufs scannable without claiming proven text."""
+    if file_path.suffix.lower() in {".py", ".pyw"} and not _has_bounded_non_source_control_signal(file_path, file_size):
+        return False
+    return not _is_complete_structured_json_content_owner(
+        file_path, file_size
+    ) and not _is_complete_bounded_printable_text(file_path, file_size)
+
+
 def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
     """Route declared Flax formats and renamed candidates without claiming overlaps."""
     ext = file_path.suffix.lower()
@@ -2352,22 +3506,31 @@ def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
         json_document_probe = _probe_complete_structured_json_document(file_path, size)
         if json_document_probe is True:
             return False
-        if json_document_probe is None:
+        if json_document_probe is None and ext not in _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES:
             return True
+        if _is_complete_bounded_printable_text(file_path, size):
+            return False
     if ext == "":
         xgboost_route = _detect_extensionless_xgboost_ubjson_route(
             read_magic_bytes(str(file_path), min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
         )
         if xgboost_route is not None:
             return False
-    return (
+    content_routable = (
         ext in _FLAX_MSGPACK_SCANNER_SUFFIXES
         or ext in _FLAX_MSGPACK_OVERLAP_SUFFIXES
         or ext not in _FLAX_MSGPACK_DECLARED_SUFFIXES
-    ) and is_flax_msgpack_checkpoint_file(file_path)
+        or ext in _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES
+    )
+    if not content_routable:
+        return False
+    probe_state = _probe_flax_msgpack_checkpoint_file(file_path)
+    # An oversized document-suffix scalar stream is indistinguishable from a
+    # delayed Flax root within the bounded probe, so preserve it fail closed.
+    return probe_state is not False
 
 
-def detect_flax_msgpack_overlap_routes(path: str) -> tuple[str, ...]:
+def detect_flax_msgpack_overlap_routes(path: str, *, include_unvalidated_pickle: bool = False) -> tuple[str, ...]:
     """Return trusted foreign content routes that also occur in a Flax candidate."""
     file_path = Path(path)
     try:
@@ -2381,6 +3544,16 @@ def detect_flax_msgpack_overlap_routes(path: str) -> tuple[str, ...]:
         path, min(size, max(_TORCH7_SIGNATURE_READ_BYTES, _CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
     )
     routes: list[str] = []
+    pickle_probe_sample = _read_pickle_probe_sample(file_path, size, prefix[:16])
+    if (
+        (include_unvalidated_pickle and _looks_like_binary_pickle_protocol(prefix[:4]))
+        or _has_bounded_binary_pickle_security_signal(pickle_probe_sample)
+        or _looks_like_proto0_or_1_pickle(
+            pickle_probe_sample,
+            sample_is_prefix=size > len(pickle_probe_sample),
+        )
+    ):
+        routes.append("pickle")
     if _allows_renamed_binary_content_route(file_path) and prefix[:4] == b"RKNN":
         routes.append("rknn")
     if _is_torch7_signature(prefix[:_TORCH7_SIGNATURE_READ_BYTES]):
@@ -2392,8 +3565,23 @@ def detect_flax_msgpack_overlap_routes(path: str) -> tuple[str, ...]:
     return tuple(routes)
 
 
+def _resolve_inconclusive_flax_foreign_overlap(file_path: Path) -> str | None:
+    """Prefer a proven foreign owner when renamed Flax routing is only ambiguous."""
+    if file_path.suffix.lower() in _FLAX_MSGPACK_NATIVE_SUFFIXES:
+        return None
+    if _probe_flax_msgpack_checkpoint_file(file_path) is not None:
+        return None
+    return next(iter(detect_flax_msgpack_overlap_routes(str(file_path))), None)
+
+
 def detect_format_from_magic_bytes(
-    magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes, file_size: int, file_path: Path | None = None
+    magic4: MagicBytes,
+    magic8: MagicBytes,
+    magic16: MagicBytes,
+    file_size: int,
+    file_path: Path | None = None,
+    *,
+    include_onnx_structure: bool = True,
 ) -> FileFormat:
     """Detect file format using Python 3.10+ pattern matching on magic bytes."""
     compression_format = _detect_compression_format(magic16)
@@ -2417,12 +3605,11 @@ def detect_format_from_magic_bytes(
         case _:
             pass
 
+    coreml_route_status: bool | None = False
     if file_path is not None:
-        mxnet_route = _detect_content_routed_mxnet_symbol(file_path, magic16)
-        if mxnet_route is not None:
-            return mxnet_route
-    if file_path is not None and _looks_like_onnx_model_candidate_file(file_path, file_size, magic4):
-        return "onnx"
+        coreml_route_status = _looks_like_coreml_model_candidate_file(file_path, file_size, magic4)
+        if coreml_route_status is True:
+            return "coreml"
 
     # Check longer magic sequences
     match magic8:
@@ -2444,30 +3631,92 @@ def detect_format_from_magic_bytes(
     if any(magic16.startswith(marker) for marker in R_SERIALIZATION_MARKERS):
         return "r_serialized"
 
-    if _looks_like_binary_pickle_protocol(magic4):
-        return "pickle"
-    if _looks_like_safetensors_structure(file_path, magic8, file_size):
-        return "safetensors"
+    onnx_route_status: bool | None = False
+    if file_path is not None:
+        mxnet_route = _detect_content_routed_mxnet_symbol(file_path, magic16)
+        if mxnet_route is not None:
+            return mxnet_route
+        if include_onnx_structure:
+            onnx_route_status = _looks_like_onnx_model_file(file_path, file_size)
+            if onnx_route_status is True:
+                return "onnx"
 
-    if b'"__metadata__"' in magic16 and _looks_like_safetensors_structure(file_path, magic8, file_size):
+    if _is_safetensors_routing_candidate(file_path, magic8, file_size):
         return "safetensors"
+    if _looks_like_binary_pickle_protocol(magic4) and (
+        file_path is None or not _could_be_content_routed_flax_msgpack(file_path)
+    ):
+        return "pickle"
 
     if file_path is not None:
         pickle_probe_sample = _read_pickle_probe_sample(file_path, file_size, magic16)
         if _looks_like_proto0_or_1_pickle(
             pickle_probe_sample,
             sample_is_prefix=file_size > len(pickle_probe_sample),
-        ):
+        ) and not _could_be_content_routed_flax_msgpack(file_path):
             return "pickle"
 
     if file_path is not None and _is_confirmed_content_routed_jax_json_checkpoint(file_path):
         return "jax_checkpoint"
 
-    if file_path is not None and _could_be_content_routed_flax_msgpack(file_path):
+    if file_path is not None and not file_path.suffix:
+        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
+            read_magic_bytes(str(file_path), min(file_size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
+        )
+        if xgboost_route is not None:
+            return xgboost_route
+
+    renamed_tensorflow_format = "unknown"
+    if file_path is not None:
+        renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(
+            file_path,
+            file_size,
+            fail_closed_on_inconclusive=False,
+        )
+        if renamed_tensorflow_format == "oversized":
+            return "tf_metagraph"
+        if renamed_tensorflow_format == "oversized_candidate":
+            return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+        if renamed_tensorflow_format not in {"unknown", "inconclusive"}:
+            return renamed_tensorflow_format
+
+    if file_path is not None and not _could_be_xml_prefix(magic16) and _could_be_content_routed_flax_msgpack(file_path):
+        foreign_overlap_format = _resolve_inconclusive_flax_foreign_overlap(file_path)
+        if foreign_overlap_format is not None:
+            return foreign_overlap_format
+        if renamed_tensorflow_format == "inconclusive":
+            return _resolve_inconclusive_tensorflow_flax_overlap(file_path, file_size)
+        if (
+            coreml_route_status is None
+            and _starts_with_coreml_specification_version(magic16)
+            and _preserve_inconclusive_protobuf_model_routing(file_path, file_size)
+            and _probe_flax_msgpack_checkpoint_file(file_path) is not True
+        ):
+            return PROTOBUF_MODEL_CANDIDATE_FORMAT
         return "flax_msgpack"
 
     if file_path is not None and _could_be_content_routed_jax_json_checkpoint(file_path):
         return "jax_checkpoint"
+
+    if renamed_tensorflow_format == "inconclusive":
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+
+    if file_path is not None and file_path.suffix.lower() == ".mlmodel" and coreml_route_status is None:
+        return "coreml"
+
+    if (
+        coreml_route_status is None
+        and file_path is not None
+        and _preserve_inconclusive_protobuf_model_routing(file_path, file_size)
+    ):
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+    if (
+        file_path is not None
+        and onnx_route_status is None
+        and _preserve_inconclusive_protobuf_model_routing(file_path, file_size)
+    ):
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
 
     return "unknown"
 
@@ -2492,7 +3741,9 @@ def detect_file_format_from_magic(path: str) -> str:
             if _is_tensorflow_metagraph_file(path):
                 return "tf_metagraph"
             mxnet_route = _detect_content_routed_mxnet_symbol(file_path, b"{")
-            return mxnet_route or "unknown"
+            if mxnet_route is not None:
+                return mxnet_route
+            return _detect_renamed_tensorflow_protobuf(file_path, size)
 
         with file_path.open("rb") as f:
             header = f.read(min(size, _TAR_BLOCK_SIZE))
@@ -2509,7 +3760,13 @@ def detect_file_format_from_magic(path: str) -> str:
                 return llamafile_format
 
             # Try the new pattern matching approach first
-            format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
+            format_result = detect_format_from_magic_bytes(
+                magic4,
+                magic8,
+                magic16,
+                size,
+                file_path,
+            )
             if format_result == "zip" and file_path.suffix.lower() == ".mar" and is_torchserve_mar_archive(path):
                 return "torchserve_mar"
             if format_result in {"gzip", "bzip2", "xz"}:
@@ -2574,6 +3831,12 @@ def detect_file_format_from_magic(path: str) -> str:
                 )
                 if xml_format != "unknown":
                     return xml_format
+            if _could_be_content_routed_flax_msgpack(file_path):
+                return "flax_msgpack"
+
+            renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
+            if renamed_tensorflow_format != "unknown":
+                return renamed_tensorflow_format
 
     except OSError:
         return "unknown"
@@ -2582,14 +3845,20 @@ def detect_file_format_from_magic(path: str) -> str:
     magic4 = header[:4]
     magic8 = header[:8]
 
-    if _looks_like_safetensors_structure(file_path, magic8, size):
+    if _is_safetensors_routing_candidate(file_path, magic8, size):
         return "safetensors"
 
-    if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
-        return "onnx"
-
+    coreml_route_status = _looks_like_coreml_model_candidate_file(file_path, size, magic4)
+    if coreml_route_status is True:
+        return "coreml"
+    if coreml_route_status is None and _preserve_inconclusive_protobuf_model_routing(file_path, size):
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
     if file_path.suffix.lower() not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(magic8):
         return "tflite"
+    if _looks_like_onnx_model_file(file_path, size) is None and _preserve_inconclusive_protobuf_model_routing(
+        file_path, size
+    ):
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
 
     return "unknown"
 
@@ -2664,7 +3933,13 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         llamafile_format = _detect_llamafile_route_format(file_path, magic4)
         if llamafile_format is not None:
             return llamafile_format
-        format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
+        format_result = detect_format_from_magic_bytes(
+            magic4,
+            magic8,
+            magic16,
+            size,
+            file_path,
+        )
         if format_result == "zip":
             return "zip"
         if format_result in {"gzip", "bzip2", "xz", "lz4", "zlib"}:
@@ -2731,7 +4006,21 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             )
             if xml_format != "unknown":
                 return xml_format
+        if _could_be_content_routed_flax_msgpack(file_path):
+            return "flax_msgpack"
 
+    renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
+    if renamed_tensorflow_format != "unknown":
+        return renamed_tensorflow_format
+    coreml_route_status = _looks_like_coreml_model_candidate_file(file_path, size, magic4)
+    if coreml_route_status is True:
+        return "coreml"
+    if coreml_route_status is None and _preserve_inconclusive_protobuf_model_routing(file_path, size):
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
+    if _looks_like_onnx_model_file(file_path, size) is None and _preserve_inconclusive_protobuf_model_routing(
+        file_path, size
+    ):
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
     return "unknown"
 
 
@@ -2772,8 +4061,9 @@ def detect_file_format(path: str) -> str:
     mxnet_route = _detect_content_routed_mxnet_symbol(file_path, header)
     if mxnet_route is not None:
         return mxnet_route
-    if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
-        return "onnx"
+    coreml_route_status = _looks_like_coreml_model_candidate_file(file_path, size, magic4)
+    if coreml_route_status is True:
+        return "coreml"
 
     # Check first 8 bytes for HDF5 magic
     hdf5_magic = b"\x89HDF\r\n\x1a\n"
@@ -2835,13 +4125,21 @@ def detect_file_format(path: str) -> str:
             return "torchserve_mar"
         return "zip"
 
-    if _looks_like_binary_pickle_protocol(magic4):
+    onnx_route_status = _looks_like_onnx_model_file(file_path, size)
+    if onnx_route_status is True:
+        return "onnx"
+
+    if (
+        _looks_like_binary_pickle_protocol(magic4)
+        and not _could_be_content_routed_flax_msgpack(file_path)
+        and not _is_safetensors_routing_candidate(file_path, magic8, size)
+    ):
         return "pickle"
     pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
     if _looks_like_proto0_or_1_pickle(
         pickle_probe_sample,
         sample_is_prefix=size > len(pickle_probe_sample),
-    ):
+    ) and not _could_be_content_routed_flax_msgpack(file_path):
         return "pickle"
     if _could_be_xml_prefix(header):
         xml_prefix = read_magic_bytes(path, _XML_MODEL_SIGNATURE_READ_BYTES)
@@ -2852,13 +4150,46 @@ def detect_file_format(path: str) -> str:
         if xml_format != "unknown":
             return xml_format
 
-    if _looks_like_safetensors_structure(file_path, magic8, size):
+    if ext == "":
+        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
+            read_magic_bytes(path, min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
+        )
+        if xgboost_route is not None:
+            return xgboost_route
+
+    renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(
+        file_path,
+        size,
+        fail_closed_on_inconclusive=False,
+    )
+    if renamed_tensorflow_format == "oversized":
+        return "tf_metagraph"
+    if renamed_tensorflow_format == "oversized_candidate":
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    if renamed_tensorflow_format not in {"unknown", "inconclusive"}:
+        return renamed_tensorflow_format
+
+    if _is_safetensors_routing_candidate(file_path, magic8, size):
+        if renamed_tensorflow_format == "inconclusive":
+            return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
         return "safetensors"
 
     if _is_confirmed_content_routed_jax_json_checkpoint(file_path):
         return "jax_checkpoint"
 
     if ext in _FLAX_MSGPACK_SCANNER_SUFFIXES or _could_be_content_routed_flax_msgpack(file_path):
+        foreign_overlap_format = _resolve_inconclusive_flax_foreign_overlap(file_path)
+        if foreign_overlap_format is not None:
+            return foreign_overlap_format
+        if renamed_tensorflow_format == "inconclusive":
+            return _resolve_inconclusive_tensorflow_flax_overlap(file_path, size)
+        if (
+            coreml_route_status is None
+            and _starts_with_coreml_specification_version(magic16)
+            and _preserve_inconclusive_protobuf_model_routing(file_path, size)
+            and _probe_flax_msgpack_checkpoint_file(file_path) is not True
+        ):
+            return PROTOBUF_MODEL_CANDIDATE_FORMAT
         return "flax_msgpack"
 
     if _could_be_content_routed_jax_json_checkpoint(file_path):
@@ -2900,12 +4231,15 @@ def detect_file_format(path: str) -> str:
         if MARKED_PROTOCOL0_GLOBAL_RE.match(magic64):
             return "pickle"
         # Check for safetensors format (<u64 header_len> + JSON header).
-        if _looks_like_safetensors_structure(file_path, magic8, size):
+        if _is_safetensors_routing_candidate(file_path, magic8, size):
             return "safetensors"
 
-        # Check for ONNX format (protobuf)
-        if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
-            return "onnx"
+        if renamed_tensorflow_format == "oversized":
+            return "tf_metagraph"
+        if renamed_tensorflow_format in {"oversized_candidate", "inconclusive"}:
+            return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+        if onnx_route_status is None and _preserve_inconclusive_protobuf_model_routing(file_path, size):
+            return PROTOBUF_MODEL_CANDIDATE_FORMAT
 
         # Otherwise, assume raw binary format (PyTorch weights)
         return "pytorch_binary"
@@ -2920,6 +4254,19 @@ def detect_file_format(path: str) -> str:
     if ext not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(magic8):
         return "tflite"
 
+    if renamed_tensorflow_format == "oversized":
+        return "tf_metagraph"
+    if renamed_tensorflow_format in {"oversized_candidate", "inconclusive"}:
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    if ext == ".mlmodel":
+        return "coreml"
+    if ext == ".onnx":
+        return "onnx"
+    if coreml_route_status is None and _preserve_inconclusive_protobuf_model_routing(file_path, size):
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
+    if onnx_route_status is None and _preserve_inconclusive_protobuf_model_routing(file_path, size):
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
+
     # Extension-based detection for non-.bin files
     # For .pt/.pth/.ckpt files, check if they're ZIP format first
     if ext in (".pt", ".pth", ".ckpt"):
@@ -2928,10 +4275,8 @@ def detect_file_format(path: str) -> str:
             return "zip"
         # If not ZIP, assume pickle format
         return "pickle"
-    if ext == ".meta":
-        if _is_tensorflow_metagraph_file(path):
-            return "tf_metagraph"
-        return "unknown"
+    if ext == ".meta" and _is_tensorflow_metagraph_file(path):
+        return "tf_metagraph"
     if ext in (".ptl", ".pte"):
         if _has_zip_magic(magic4):
             return "executorch"
@@ -2975,8 +4320,6 @@ def detect_file_format(path: str) -> str:
         return "protobuf"
     if ext == ".tflite":
         return "tflite"
-    if ext == ".mlmodel":
-        return "coreml"
     if ext in (".engine", ".plan", ".trt"):
         return "tensorrt"
     if ext == ".safetensors":
@@ -2985,8 +4328,6 @@ def detect_file_format(path: str) -> str:
         return "paddle"
     if ext == ".msgpack":
         return "flax_msgpack"
-    if ext == ".onnx":
-        return "onnx"
     if ext == ".nemo":
         return "nemo"
     ggml_exts = {".ggml", ".ggmf", ".ggjt", ".ggla", ".ggsa"}
@@ -3018,7 +4359,7 @@ def detect_file_format(path: str) -> str:
         ".txz",
     ):
         return "tar"
-    if _looks_like_safetensors_structure(file_path, magic8, size):
+    if _is_safetensors_routing_candidate(file_path, magic8, size):
         return "safetensors"
     return "unknown"
 
@@ -3093,11 +4434,20 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
             return True
 
         # TensorFlow protobuf files (.pb extension)
-        if ext_format == "protobuf" and header_format in {"protobuf", "unknown", "onnx"}:
+        if ext_format == "protobuf" and header_format in {
+            "protobuf",
+            "unknown",
+            "onnx",
+            PROTOBUF_MODEL_CANDIDATE_FORMAT,
+            "tf_metagraph",
+            "tf_savedmodel",
+        }:
             return True
 
         # TensorFlow MetaGraph files (.meta extension) require strict protobuf validation.
         if ext_format == "tf_metagraph":
+            if header_format == "tf_savedmodel":
+                return True
             return _is_tensorflow_metagraph_file(path)
 
         # PMML files are XML-based with <PMML> tag detection
@@ -3168,7 +4518,7 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
 
         # ONNX files (Protocol Buffer format - difficult to detect reliably)
         if ext_format == "onnx":
-            return header_format in {"onnx", "unknown"}
+            return header_format in {"onnx", "unknown", PROTOBUF_MODEL_CANDIDATE_FORMAT}
 
         # NumPy files (.npy should match, .npz is ZIP by design)
         if ext_format == "numpy":
@@ -3240,7 +4590,7 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
         # CoreML .mlmodel files are protobuf-encoded with no stable magic bytes.
         # Structural validation is performed by the dedicated scanner.
         if ext_format == "coreml":
-            return header_format in {"coreml", "unknown"}
+            return header_format in {"coreml", "unknown", PROTOBUF_MODEL_CANDIDATE_FORMAT}
 
         # R serialized workspace/data files may be uncompressed or wrapped;
         # extension-based intent is authoritative for static scanning.
