@@ -117,6 +117,7 @@ def pytest_runtest_setup(item):
             "test_regular_scan_hash.py",  # Regular scan mode hash generation tests
             "test_core_asset_extraction.py",  # Check consolidation and location parsing regressions
             "test_manifest_scanner.py",  # Manifest scanner tests
+            "test_text_scanner.py",  # ML-related text scanner outcome tests
             "test_metadata_scanner.py",  # Metadata scanner tests
             "test_metadata_extractor.py",  # Metadata extractor helper routing and CLI tests
             "test_weak_hash_detection.py",  # Weak hash detection tests
@@ -133,11 +134,13 @@ def pytest_runtest_setup(item):
             "test_onnx_scanner.py",  # ONNX scanner CVE-2025-51480 tests
             "test_pmml_scanner.py",  # PMML suspicious-content false-positive regressions
             "test_safetensors_scanner.py",  # SafeTensors scanner dtype and metadata tests
+            "test_weight_distribution_scanner.py",  # Weight-distribution false-positive and coverage tests
             "test_rule_mapper.py",  # Rule mapper validity and network mapping tests
             "test_rule_code_registry_consistency.py",  # Scanner literal rule-code registry consistency
             "test_keras_h5_scanner.py",  # Keras H5 scanner CVE-2025-9905 tests
             "test_cve_detection.py",  # CVE detection tests
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
+            "test_pytorch_binary_scanner.py",  # PyTorch binary scanner outcome regressions
             "test_paddle_scanner.py",  # PaddlePaddle scanner tests
             "test_cve_2025_10155_bin_pickle.py",  # CVE-2025-10155 .bin pickle detection tests
             "test_compressed_scanner.py",  # standalone compressed wrapper scanner tests

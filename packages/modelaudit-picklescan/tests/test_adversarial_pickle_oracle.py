@@ -62,6 +62,11 @@ def _binunicode(data: bytes) -> bytes:
     return b"X" + len(data).to_bytes(4, "little") + data
 
 
+def _encoded_probe_limit_decoy_literal() -> str:
+    decoys = "".join(f"gAR9Lg==-decoy-{index}|" for index in range(64))
+    return f"{decoys}Y29zCnN5c3RlbQopUi4={'A' * 65}"
+
+
 def _text_operand(value: str) -> bytes:
     data = value.encode()
     if len(data) <= 0xFF:
@@ -136,6 +141,12 @@ MEMO_READS: dict[str, MemoOpcodeBuilder] = {
     "long-binget": lambda index: b"j" + index.to_bytes(4, "little"),
     "get": lambda index: b"g" + str(index).encode("ascii") + b"\n",
 }
+
+
+def _encoded_nested_probe_limit_payload() -> bytes:
+    decoys = "".join(f"gAR9Lg==-decoy-{index}|" for index in range(64))
+    literal = f"{decoys}Y29zCnN5c3RlbQopUi4{'A' * 65}".encode()
+    return b"\x80\x04" + _binunicode(literal) + b"."
 
 
 def _stack_global_call(
@@ -419,6 +430,17 @@ def _has_critical_call_graph_limit_finding(report: PickleReport) -> bool:
         finding.severity == Severity.CRITICAL
         and finding.rule_code == "DANGEROUS_CALL_GRAPH_LIMIT"
         and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+
+
+def _has_encoded_nested_probe_limit_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.rule_code == "S601"
+        and finding.details.get("encoding") == "base64"
+        and finding.details.get("analysis_incomplete") is True
+        and finding.details.get("max_nested_payload_probes") == 64
         for finding in report.findings
     )
 
@@ -4781,6 +4803,18 @@ def test_call_graph_import_reference_limit_fails_closed() -> None:
     assert _has_critical_call_graph_limit_finding(updated)
 
 
+def test_scan_bytes_fails_closed_when_encoded_nested_probe_cap_is_exhausted() -> None:
+    report = scan_bytes(
+        _encoded_nested_probe_limit_payload(),
+        source="encoded-nested-probe-cap.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_encoded_nested_probe_limit_finding(report)
+    assert any(notice.code == "nested_probe_limit" for notice in report.notices)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
 def test_scan_bytes_blocks_call_graph_exception_poisoning_rce(tmp_path: Path) -> None:
     marker = tmp_path / "call_graph_exception_poisoning_marker"
@@ -6065,6 +6099,26 @@ def test_scan_bytes_blocks_builtins_type_setitem_assignment_rce(tmp_path: Path) 
     result = pickle.loads(payload)
     assert result is None
     assert marker.exists()
+
+
+def test_scan_bytes_encoded_nested_probe_limit_fails_closed_after_decoys() -> None:
+    literal = _encoded_probe_limit_decoy_literal()
+    payload = b"\x80\x04" + _binunicode(literal.encode()) + b"."
+
+    report = scan_bytes(
+        payload,
+        source="encoded-nested-probe-limit.pkl",
+        options=ScanOptions(max_nested_pickle_bytes=16),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    finding = next(finding for finding in report.findings if finding.rule_code == "S601")
+    assert finding.severity == Severity.CRITICAL
+    assert finding.details["encoding"] == "base64"
+    assert finding.details["max_nested_payload_probes"] == 64
+    assert finding.details["analysis_incomplete"] is True
+    assert any(notice.code == "nested_probe_limit" for notice in report.notices)
 
 
 def test_scan_bytes_blocks_builtins_staticmethod_descriptor_rce(tmp_path: Path) -> None:
