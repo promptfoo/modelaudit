@@ -21,6 +21,7 @@ from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
+from .archive_member_security import high_risk_python_calls_in_tree
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -47,25 +48,6 @@ POPULAR_ML_PACKAGE_TYPOS = {
     "trransformers": "transformers",
 }
 TRUSTED_PYPI_HOSTS = {"pypi.org", "files.pythonhosted.org", "test.pypi.org"}
-
-HIGH_RISK_CALLS = {
-    "__import__",
-    "builtins.__import__",
-    "builtins.eval",
-    "builtins.exec",
-    "eval",
-    "exec",
-    "importlib.import_module",
-    "os.popen",
-    "os.system",
-    "pickle.load",
-    "pickle.loads",
-    "subprocess.call",
-    "subprocess.check_call",
-    "subprocess.check_output",
-    "subprocess.Popen",
-    "subprocess.run",
-}
 
 SAFE_IMPORT_TIME_CALLS = {
     "logging.getLogger",
@@ -1233,42 +1215,6 @@ class TorchServeMarScanner(BaseScanner):
             return resolved_head
         return ".".join([resolved_head, *tail])
 
-    def _resolve_getattr_call_name(self, node: ast.AST, aliases: dict[str, str]) -> str | None:
-        if isinstance(node, ast.Attribute) and node.attr == "__call__":
-            return self._resolve_getattr_call_name(node.value, aliases)
-
-        if not isinstance(node, ast.Call):
-            return None
-
-        helper_name = self._resolve_call_name(node.func)
-        if helper_name is None:
-            return None
-
-        resolved_helper_name = self._apply_alias(helper_name, aliases)
-        if resolved_helper_name not in {"getattr", "builtins.getattr"}:
-            return None
-
-        target_root_node: ast.AST | None = node.args[0] if node.args else None
-        attr_name_node: ast.AST | None = node.args[1] if len(node.args) >= 2 else None
-        for keyword in node.keywords:
-            if keyword.arg == "object" and target_root_node is None:
-                target_root_node = keyword.value
-            elif keyword.arg == "name" and attr_name_node is None:
-                attr_name_node = keyword.value
-
-        if target_root_node is None or attr_name_node is None:
-            return None
-
-        target_root = self._resolve_call_name(target_root_node)
-        if target_root is None:
-            return None
-
-        if not isinstance(attr_name_node, ast.Constant) or not isinstance(attr_name_node.value, str):
-            return None
-
-        resolved_target_root = self._apply_alias(target_root, aliases)
-        return f"{resolved_target_root}.{attr_name_node.value}"
-
     def _parse_python_source(self, source_bytes: bytes) -> tuple[ast.Module | None, str | None]:
         try:
             source = source_bytes.decode("utf-8")
@@ -1283,27 +1229,7 @@ class TorchServeMarScanner(BaseScanner):
         return tree, None
 
     def _find_high_risk_calls_from_tree(self, tree: ast.AST) -> set[str]:
-        aliases = self._collect_import_aliases(tree)
-        risky_calls: set[str] = set()
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-
-            call_name = self._resolve_call_name(node.func)
-            resolved_name = (
-                self._apply_alias(call_name, aliases)
-                if call_name is not None
-                else self._resolve_getattr_call_name(node.func, aliases)
-            )
-            if resolved_name is None:
-                continue
-            if resolved_name in HIGH_RISK_CALLS:
-                risky_calls.add(resolved_name)
-                continue
-            if resolved_name.startswith("subprocess."):
-                risky_calls.add(resolved_name)
-
-        return risky_calls
+        return {call.name for call in high_risk_python_calls_in_tree(tree)}
 
     def _find_high_risk_calls(self, source_bytes: bytes) -> tuple[set[str], str | None]:
         tree, parse_error = self._parse_python_source(source_bytes)

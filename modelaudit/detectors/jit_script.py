@@ -129,7 +129,16 @@ _DANGEROUS_IMPORT_PATTERNS = {
     dangerous_import: _compile_dangerous_import_patterns(dangerous_import) for dangerous_import in DANGEROUS_IMPORTS
 }
 
+
+def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
+    """Return high-risk calls reached through shared static resolution."""
+    from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_tree
+
+    return {(call.name, call.rule_code) for call in high_risk_python_calls_in_tree(tree)}
+
+
 # Patterns that indicate code execution attempts
+_OS_CODE_EXECUTION_DESCRIPTION = "OS command execution detected"
 CODE_EXECUTION_PATTERNS = [
     # Direct execution patterns
     (rb"exec\s*\(", "exec() call detected"),
@@ -138,7 +147,7 @@ CODE_EXECUTION_PATTERNS = [
     (rb"__import__\s*\(", "__import__() call detected"),
     # Subprocess patterns
     (rb"subprocess\.(call|run|Popen|check_output)", "Subprocess execution detected"),
-    (rb"os\.(system|popen|exec\w*|spawn\w*)", "OS command execution detected"),
+    (rb"os\.(system|popen|exec\w*|spawn\w*|posix_spawnp?|startfile)", _OS_CODE_EXECUTION_DESCRIPTION),
     # Network patterns
     (rb"socket\.(socket|create_connection)", "Socket creation detected"),
     (rb"urllib\.(request|urlopen)", "URL request detected"),
@@ -193,6 +202,8 @@ class JITScriptDetector:
     @staticmethod
     def _ast_contains_dangerous_python(tree: ast.AST) -> bool:
         """Return whether parsed Python contains modeled dangerous operations."""
+        if _resolve_alias_aware_high_risk_calls(tree):
+            return True
 
         def is_dangerous_import(module_name: str) -> bool:
             return any(
@@ -237,9 +248,6 @@ class JITScriptDetector:
                     "subprocess.check_output",
                 }:
                     return True
-                if operation.startswith("os.") and re.fullmatch(r"os\.(?:system|popen|exec\w*|spawn\w*)", operation):
-                    return True
-
         return False
 
     @staticmethod
@@ -522,6 +530,12 @@ class JITScriptDetector:
         bounded = data if include_full_source else data[:1000000]
         python_code_pattern = rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+"
         matches = [bounded] if include_full_source else re.findall(python_code_pattern, bounded)
+        bounded_high_risk_calls: set[tuple[str, str]] | None = None
+        try:
+            bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
+            bounded_high_risk_calls = _resolve_alias_aware_high_risk_calls(bounded_tree)
+        except (SyntaxError, UnicodeDecodeError, ValueError):
+            pass
 
         for match in matches[:10]:  # Analyze first 10 code snippets
             try:
@@ -582,7 +596,14 @@ class JITScriptDetector:
 
         # Check for common code execution patterns in binary
         for pattern, description in CODE_EXECUTION_PATTERNS:
-            if re.search(pattern, bounded):  # Limit search size
+            pattern_match = re.search(pattern, bounded) is not None
+            if description == _OS_CODE_EXECUTION_DESCRIPTION and bounded_high_risk_calls is not None:
+                resolved_os_process_call = any(code == "S101" for _, code in bounded_high_risk_calls)
+                rebound_to_high_risk_call = pattern_match and bool(bounded_high_risk_calls)
+                if not resolved_os_process_call and not rebound_to_high_risk_call:
+                    continue
+                pattern_match = True
+            if pattern_match:  # Limit search size
                 findings.append(
                     create_jit_finding(
                         message=description,

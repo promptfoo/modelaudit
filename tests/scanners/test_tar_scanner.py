@@ -139,6 +139,33 @@ class TestTarScanner:
         assert python_checks[0].severity == IssueSeverity.WARNING
         assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
+    @pytest.mark.parametrize(
+        ("payload", "dangerous_name"),
+        [
+            (b"import os\nos.execvpe('/bin/sh', ['sh', '-c', 'id'], {})\n", "os.execvpe"),
+            (b"from os import spawnv as run\nrun(0, '/bin/sh', ['sh', '-c', 'id'])\n", "os.spawnv"),
+            (b"import os\nos.posix_spawn('/bin/sh', ['sh', '-c', 'id'], {})\n", "os.posix_spawn"),
+            (b"import os\nos.startfile('payload.exe')\n", "os.startfile"),
+            (b"import os\nos.posix_spawn = len\nos.posix_spawn([])\n", "os.posix_spawn"),
+        ],
+    )
+    def test_scan_tar_flags_os_process_launch_python_member(
+        self, tmp_path: Path, payload: bytes, dangerous_name: str
+    ) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].rule_code == "S101"
+        assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
     def test_scan_tar_flags_wildcard_import_dangerous_python_member(self, tmp_path: Path) -> None:
         """Wildcard imports should resolve known high-risk call names."""
         archive_path = tmp_path / "model_bundle.tar"

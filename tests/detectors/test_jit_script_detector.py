@@ -251,6 +251,34 @@ class TestJITScriptDetector:
 
         assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
 
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"def payload():\n    return os.posix_spawn('/bin/sh', ['sh'], {})\n",
+            b"def payload():\n    return os.posix_spawnp('sh', ['sh'], {})\n",
+            b"def payload():\n    return os.startfile('payload.exe')\n",
+            b"def payload():\n    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], {})\n",
+            b"def payload():\n    os.posix_spawn = len\n    return os.posix_spawn([])\n",
+            b"def payload(data):\n    os.posix_spawn = pickle.loads\n    return os.posix_spawn(data)\n",
+        ],
+    )
+    def test_scan_model_detects_os_process_launch_source_conservatively(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_string_literal_os_process_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = b"def payload():\n    return \"os.posix_spawn('/bin/sh', ['sh'], {})\"\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
     def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""
         detector_normal = JITScriptDetector({"strict_mode": False})

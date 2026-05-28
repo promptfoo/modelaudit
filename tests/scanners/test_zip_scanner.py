@@ -132,6 +132,70 @@ def test_scan_zip_flags_aliased_dangerous_python_member(tmp_path: Path) -> None:
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 
+@pytest.mark.parametrize(
+    "dangerous_name",
+    [
+        "os.execl",
+        "os.execle",
+        "os.execlp",
+        "os.execlpe",
+        "os.execv",
+        "os.execve",
+        "os.execvp",
+        "os.execvpe",
+        "os.posix_spawn",
+        "os.posix_spawnp",
+        "os.spawnl",
+        "os.spawnle",
+        "os.spawnlp",
+        "os.spawnlpe",
+        "os.spawnv",
+        "os.spawnve",
+        "os.spawnvp",
+        "os.spawnvpe",
+        "os.startfile",
+    ],
+)
+def test_scan_zip_flags_os_process_launch_python_member(tmp_path: Path, dangerous_name: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", f"import os\n{dangerous_name}('payload')\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S101"
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from os import spawnv as run\nrun(0, '/bin/sh', ['sh', '-c', 'id'])\n",
+        "import os\nos.posix_spawn = len\nos.posix_spawn([])\n",
+    ],
+)
+def test_scan_zip_retains_os_process_launch_findings_through_alias_or_mutation(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S101"
+
+
 def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
