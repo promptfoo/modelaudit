@@ -72,6 +72,7 @@ _PATH_STYLE_CLOUD_HOSTS = frozenset({"s3.amazonaws.com", "storage.googleapis.com
 _S3_REGIONAL_HOST_PATTERN = re.compile(r"^s3[.-][a-z0-9-]+\.amazonaws\.com$")
 _AZURE_STORAGE_HOST_SUFFIXES = (".blob.core.windows.net", ".dfs.core.windows.net")
 _AZURE_AUTHORITY_CONTAINER_SCHEMES = frozenset({"wasb", "wasbs", "abfs", "abfss"})
+_AZURE_CONTAINER_NAME_PATTERN = re.compile(r"^(?:\$root|[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?)$")
 
 
 def _split_trailing_path_delimiters(segment: str) -> tuple[str, str]:
@@ -155,6 +156,15 @@ def _is_path_style_cloud_bucket_segment(scheme: str, hostname: str, index: int) 
     return scheme in {"http", "https"} and hostname.endswith(_AZURE_STORAGE_HOST_SUFFIXES)
 
 
+def _is_gcs_api_bucket_segment(hostname: str, segments: list[str], index: int) -> bool:
+    return hostname == "storage.googleapis.com" and index > 0 and segments[index - 1].lower() == "b"
+
+
+def _is_azure_authority_container(container: str) -> bool:
+    decoded = unquote(container)
+    return decoded == container and _AZURE_CONTAINER_NAME_PATTERN.fullmatch(container) is not None
+
+
 def _redact_path_parameter_tokens(segment: str) -> str | None:
     token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
     if ";" not in token_candidate:
@@ -198,6 +208,8 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
             continue
         if _is_path_style_cloud_bucket_segment(scheme, hostname, index):
             continue
+        if _is_gcs_api_bucket_segment(hostname, segments, index):
+            continue
 
         parameter_redaction = _redact_path_parameter_tokens(segment)
         if parameter_redaction is not None:
@@ -238,7 +250,7 @@ def _redact_url_for_finding(url: str) -> str:
     scheme = parsed.scheme.lower()
     if scheme in _AZURE_AUTHORITY_CONTAINER_SCHEMES and "@" in parsed.netloc:
         container, _separator, _host = parsed.netloc.rpartition("@")
-        if container and ":" not in container:
+        if _is_azure_authority_container(container):
             netloc = f"{container}@{netloc_host}"
 
     safe_path = _redact_url_path_tokens(scheme, hostname.lower(), parsed.path)

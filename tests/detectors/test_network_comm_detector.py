@@ -315,6 +315,30 @@ class TestNetworkCommDetector:
         assert cloud_finding["url"] == expected_url
         assert "AbCdEfGhIjKlMnOpQrStUvWxYz012345" not in json.dumps(cloud_finding, sort_keys=True)
 
+    def test_encoded_wasb_userinfo_credentials_are_stripped(self) -> None:
+        """Encoded credential userinfo must not be mistaken for an Azure container name."""
+        detector = NetworkCommDetector()
+        url = "wasbs://user%3ASECRET@account.blob.core.windows.net/model.bin"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        cloud_finding = next(finding for finding in findings if finding["type"] == "cloud_storage_url")
+
+        assert cloud_finding["url"] == "wasbs://account.blob.core.windows.net/model.bin"
+        assert "user%3ASECRET" not in json.dumps(cloud_finding, sort_keys=True)
+
+    def test_gcs_api_bucket_names_are_preserved(self) -> None:
+        """GCS JSON/download API bucket segments live after /b/ rather than at path index 1."""
+        detector = NetworkCommDetector()
+        url = "https://storage.googleapis.com/download/storage/v1/b/model-bucket-1234567890abcdef/o/weights.bin"
+
+        findings = detector.scan(url.encode(), "metadata.txt")
+        url_findings = [finding for finding in findings if finding["type"] in {"url_detected", "cloud_storage_url"}]
+
+        assert url_findings
+        serialized = json.dumps(url_findings, sort_keys=True)
+        assert "model-bucket-1234567890abcdef" in serialized
+        assert "<redacted>" not in serialized
+
     def test_long_artifact_filenames_are_preserved(self) -> None:
         """Ordinary model artifact filenames should not be treated as capability tokens."""
         detector = NetworkCommDetector()
