@@ -6,6 +6,7 @@ import tempfile
 import zipfile
 from typing import Any, ClassVar
 
+from ..core_results import mark_operational_scan_error
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_config import get_archive_depth
@@ -188,6 +189,8 @@ class ZipScanner(BaseScanner):
             return True
         except zipfile.BadZipFile:
             return False
+        except OSError:
+            return os.path.splitext(path)[1].lower() in cls.supported_extensions
         except Exception:
             return False
 
@@ -207,6 +210,20 @@ class ZipScanner(BaseScanner):
             scan_result = self.scan_archive_members(path)
             result.merge(scan_result)
 
+        except OSError as e:
+            result.add_check(
+                name="ZIP File Scan",
+                passed=False,
+                message=f"Error scanning zip file: {e!s}",
+                severity=IssueSeverity.INFO,
+                rule_code="S902",  # Scan error
+                location=path,
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )
+            mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
+            mark_operational_scan_error(result, "zip_analysis_incomplete")
+            result.finish(success=False)
+            return result
         except zipfile.BadZipFile:
             result.add_check(
                 name="ZIP File Format Validation",
