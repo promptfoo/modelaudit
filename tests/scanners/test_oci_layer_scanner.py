@@ -4,12 +4,64 @@ import shutil
 import tarfile
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 
-from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanner_results import mark_inconclusive_scan_result
+from modelaudit.scanners import flax_msgpack_scanner
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.scanners.oci_layer_scanner import OciLayerScanner
+from modelaudit.utils.file.detection import FLAX_MSGPACK_STRUCTURE_READ_BYTES
+
+
+def _assert_inconclusive_aggregate_not_cached(
+    path: Path,
+    expected_reason: str,
+    cache_dir: Path,
+    **scan_kwargs: Any,
+) -> None:
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert expected_reason in metadata["scan_outcome_reasons"]
+            assert not [
+                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def _write_delayed_flax_cntk_overlap(path: Path) -> None:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    structure = b" CompositeFunction primitive_functions "
+    delayed_flax_root = flax_msgpack_scanner.msgpack.packb(
+        {"params": {"w": [1, 2, 3]}, "__reduce__": "attacker_callable"},
+        use_bin_type=True,
+    )
+    path.write_bytes(prefix + structure + (b"\xc0" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1)) + delayed_flax_root)
 
 
 class TestOciLayerScanner:
@@ -127,17 +179,24 @@ class TestOciLayerScanner:
 
         assert result.success is True
 
-    def test_scan_invalid_json_manifest(self, tmp_path):
+    def test_scan_invalid_json_manifest(self, tmp_path: Path) -> None:
         """Test scanning an invalid JSON manifest."""
         manifest_path = tmp_path / "invalid.manifest"
-        manifest_path.write_text("{ invalid json content")
+        manifest_path.write_text("{ invalid json content layer.tar.gz")
 
         scanner = OciLayerScanner()
         result = scanner.scan(str(manifest_path))
 
         assert result.success is False
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "oci_manifest_parse_failed" in result.metadata["scan_outcome_reasons"]
+        assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
         assert any("Error parsing manifest" in issue.message for issue in result.issues)
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_manifest_parse_failed",
+            tmp_path / "parse-cache",
+        )
 
     def test_scan_empty_manifest(self, tmp_path):
         """Test scanning an empty manifest."""
@@ -160,8 +219,82 @@ class TestOciLayerScanner:
         result = scanner.scan(str(manifest_path))
 
         assert result.success is False
-        assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "oci_layer_missing" in result.metadata["scan_outcome_reasons"]
+        assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
         assert any("Layer not found: nonexistent.tar.gz" in issue.message for issue in result.issues)
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_layer_missing",
+            tmp_path / "missing-cache",
+        )
+
+    def test_scan_manifest_preserves_layer_and_nested_incomplete_reasons(self, tmp_path: Path) -> None:
+        """Nested inconclusive results must not replace OCI-level coverage reasons."""
+        member_path = tmp_path / "nested.pkl"
+        member_path.write_bytes(b"safe nested member")
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(member_path, arcname="nested.pkl")
+
+        manifest_path = tmp_path / "mixed-incomplete.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["missing.tar.gz", "layer.tar.gz"]}))
+
+        nested_result = ScanResult(scanner_name="pickle")
+        mark_inconclusive_scan_result(nested_result, "nested_scan_incomplete")
+        nested_result.finish(success=False)
+
+        with patch("modelaudit.core.scan_file", return_value=nested_result) as mock_scan:
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        assert mock_scan.call_count == 1
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "oci_layer_missing" in result.metadata["scan_outcome_reasons"]
+        assert "nested_scan_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    def test_scan_manifest_preserves_composed_nested_incomplete_reasons_without_caching(self, tmp_path: Path) -> None:
+        """OCI gaps and nested overlap-analysis gaps must survive together."""
+        if not flax_msgpack_scanner.HAS_MSGPACK:
+            pytest.skip("msgpack unavailable")
+
+        member_path = tmp_path / "delayed-flax-cntk.jpg"
+        _write_delayed_flax_cntk_overlap(member_path)
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(member_path, arcname="delayed-flax-cntk.jpg")
+
+        manifest_path = tmp_path / "stacked-incomplete.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["missing.tar.gz", "layer.tar.gz"]}))
+        cache_dir = tmp_path / "stacked-cache"
+
+        reset_cache_manager()
+        try:
+            first = scan_model_directory_or_file(
+                str(manifest_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            second = scan_model_directory_or_file(
+                str(manifest_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            for aggregate in (first, second):
+                metadata = aggregate.file_metadata[str(manifest_path)]
+                assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+                assert "oci_layer_missing" in metadata["scan_outcome_reasons"]
+                assert "flax_msgpack_routing_incomplete" in metadata["scan_outcome_reasons"]
+                assert metadata["file_size"] == manifest_path.stat().st_size
+                assert aggregate.assets[0].size == manifest_path.stat().st_size
+                assert determine_exit_code(aggregate) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     def test_scan_manifest_with_multiple_layers(self, tmp_path):
         """Test scanning manifest with multiple layers."""
@@ -363,11 +496,18 @@ class TestOciLayerScanner:
         result = OciLayerScanner().scan(str(manifest_path))
 
         assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "oci_remote_layer_unavailable" in result.metadata["scan_outcome_reasons"]
         assert any(
-            issue.severity == IssueSeverity.WARNING
+            issue.severity == IssueSeverity.INFO
             and "Remote layer was not scanned" in issue.message
             and remote_layer_ref in issue.message
             for issue in result.issues
+        )
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_remote_layer_unavailable",
+            tmp_path / "remote-cache",
         )
 
     def test_scan_manifest_scans_url_like_layer_ref_when_local_path_exists(self, tmp_path: Path) -> None:
@@ -694,6 +834,35 @@ class TestOciLayerScanner:
         assert scanned_path != "models/nested.tar.gz"
         assert scanned_path.endswith(".tar.gz")
 
+    def test_scan_skipped_oversized_layer_is_inconclusive(self, tmp_path: Path) -> None:
+        """A layer outside the inspection budget must be reported as incomplete coverage."""
+        benign_member = tmp_path / "notes.txt"
+        benign_member.write_text("safe content")
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(benign_member, arcname="notes.txt")
+        assert layer_path.stat().st_size > 64
+
+        manifest_path = tmp_path / "limited-layer.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["layer.tar.gz"]}))
+
+        result = OciLayerScanner({"max_file_size": 64}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "oci_layer_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        checks = [check for check in result.checks if check.name == "Layer File Size Check"]
+        assert len(checks) == 1
+        assert checks[0].severity == IssueSeverity.INFO
+
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_layer_size_limit_exceeded",
+            tmp_path / "layer-size-cache",
+            max_file_size=64,
+        )
+
     def test_scan_layer_skips_oversized_member_before_copying(self, tmp_path: Path) -> None:
         """Oversized members should be rejected before they are copied to temp storage."""
         huge_member = tmp_path / "huge.bin"
@@ -721,13 +890,59 @@ class TestOciLayerScanner:
         assert mock_copy.call_count == 1
         size_checks = [check for check in result.checks if check.name == "Layer Member Size Check"]
         assert len(size_checks) == 1
+        assert size_checks[0].severity == IssueSeverity.INFO
         assert size_checks[0].location is not None
         assert "huge.bin" in size_checks[0].location
+        assert "oci_member_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
         assert any(
             issue.severity == IssueSeverity.CRITICAL
             and "oversized-member.manifest:mixed.tar.gz:payload.pkl" in (issue.location or "")
             for issue in result.issues
         )
+
+    def test_scan_skipped_oversized_malicious_member_is_inconclusive(self, tmp_path: Path) -> None:
+        """A malicious member outside the inspection budget must not be reported as a finding."""
+        malicious_pickle = tmp_path / "payload.pkl"
+        malicious_pickle.write_bytes(b"\x80\x04cos\nsystem\n(S'echo oci-owned'\ntR." + (b"A" * 8192))
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(malicious_pickle, arcname="payload.pkl")
+
+        manifest_path = tmp_path / "limited.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["layer.tar.gz"]}))
+
+        result = OciLayerScanner({"max_file_size": 4096}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "oci_member_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_member_size_limit_exceeded",
+            tmp_path / "member-size-cache",
+            max_file_size=4096,
+        )
+
+    def test_scan_member_at_size_limit_remains_clean(self, tmp_path: Path) -> None:
+        """Content at the configured member limit is inspected rather than failed closed."""
+        benign_member = tmp_path / "notes.bin"
+        benign_member.write_bytes(b"A" * 4096)
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(benign_member, arcname="notes.bin")
+
+        manifest_path = tmp_path / "exact-limit.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["layer.tar.gz"]}))
+
+        result = OciLayerScanner({"max_file_size": 4096}).scan(str(manifest_path))
+
+        assert result.success is True
+        assert result.metadata.get("scan_outcome") != "inconclusive"
+        assert not any(check.name == "Layer Member Size Check" for check in result.checks)
 
     def test_scan_layer_rewrites_embedded_issue_and_check_locations(self, tmp_path: Path) -> None:
         """Embedded scan results should reference the OCI member, not temp extraction paths."""
@@ -819,6 +1034,31 @@ class TestOciLayerScanner:
         assert all(not Path(path).exists() for path in created_paths)
         assert any("Error processing layer" in issue.message for issue in result.issues)
 
+    def test_scan_member_extraction_failure_is_inconclusive(self, tmp_path: Path) -> None:
+        """A member that cannot be extracted represents incomplete coverage, not malicious content."""
+        safe_file = tmp_path / "safe.txt"
+        safe_file.write_text("safe content")
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(safe_file, arcname="safe.txt")
+
+        manifest_path = tmp_path / "extraction-failure.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["layer.tar.gz"]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.tarfile.TarFile.extractfile", return_value=None):
+            result = OciLayerScanner().scan(str(manifest_path))
+
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert "oci_member_extraction_failed" in result.metadata["scan_outcome_reasons"]
+            assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+            _assert_inconclusive_aggregate_not_cached(
+                manifest_path,
+                "oci_member_extraction_failed",
+                tmp_path / "extraction-cache",
+            )
+
     def test_scan_layer_with_directory_entries(self, tmp_path):
         """Test scanning layer with directory entries (should be skipped)."""
         safe_file = tmp_path / "safe.txt"
@@ -855,8 +1095,15 @@ class TestOciLayerScanner:
         result = scanner.scan(str(manifest_path))
 
         assert result.success is False
-        assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "oci_layer_processing_failed" in result.metadata["scan_outcome_reasons"]
+        assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
         assert any("Error processing layer" in issue.message for issue in result.issues)
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_layer_processing_failed",
+            tmp_path / "processing-cache",
+        )
 
     def test_scan_nonexistent_file(self):
         """Test scanning non-existent manifest file."""

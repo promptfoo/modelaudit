@@ -42,9 +42,11 @@ from modelaudit.scanners.archive_dispatch import (
     NESTED_SCAN_CALLBACK_CONFIG_KEY,
     merge_executable_zip_container_findings,
     merge_flax_msgpack_overlap_findings,
+    merge_inconclusive_flax_msgpack_outcome,
 )
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
 from modelaudit.scanners.mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
+from modelaudit.scanners.safetensors_scanner import MAX_HEADER_BYTES as SAFETENSORS_MAX_HEADER_BYTES
 from modelaudit.scanners.xgboost_scanner import (
     XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY,
     XGBoostScanner,
@@ -54,10 +56,13 @@ from modelaudit.telemetry import record_file_type_detected, record_issue_found, 
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
+    ONNX_ROUTING_INCONCLUSIVE_FORMAT,
+    TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
@@ -72,6 +77,7 @@ from modelaudit.utils.file.detection import (
     is_pytorch_zip_archive,
     is_skops_archive,
     is_torchserve_mar_archive,
+    should_defer_safetensors_header_limit_hash,
     validate_file_type_with_formats,
 )
 from modelaudit.utils.file.handlers import (
@@ -139,6 +145,8 @@ _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON = "xgboost_ubjson_routing_incomplete"
+_ONNX_ROUTING_INCOMPLETE_REASON = "onnx_routing_incomplete"
+_TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_incomplete"
 _ShardFamilyKey = tuple[str, str, int | None]
 _ScanEntry = tuple[str, list[str], _ShardFamilyKey | None]
 _SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY = "shard_family_cache_fingerprint"
@@ -435,6 +443,7 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
     _mark_inconclusive_scan_outcome(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)
     _mark_operational_scan_error(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)
 
+    from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
     from modelaudit.scanners.jinja2_template_scanner import Jinja2TemplateScanner
     from modelaudit.scanners.manifest_scanner import ManifestScanner
     from modelaudit.scanners.mxnet_scanner import MXNetScanner
@@ -457,6 +466,18 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
                 "mxnet",
                 scanner_selection,
                 context="inconclusive MXNet params byte analysis",
+            )
+
+    if os.path.getsize(path) <= JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+        if scanner_selection.allows("jax_checkpoint"):
+            merge_owner_result(JaxCheckpointScanner(config=config).scan(path))
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "jax_checkpoint",
+                scanner_selection,
+                context="overlapping JAX JSON analysis",
             )
 
     manifest_covered_templates = False
@@ -505,6 +526,40 @@ def _make_incomplete_xgboost_ubjson_routing_result(path: str) -> ScanResult:
     return result
 
 
+def _make_incomplete_tensorflow_protobuf_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded TensorFlow protobuf routing cannot decide."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="TensorFlow Protobuf Routing",
+        passed=False,
+        message="TensorFlow protobuf routing was inconclusive because the bounded structural probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_onnx_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded ONNX protobuf routing cannot decide."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="ONNX Routing",
+        passed=False,
+        message="ONNX routing was inconclusive because the bounded structural probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": ONNX_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _ONNX_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _ONNX_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
 def _scan_executable_zip_polyglot(path: str, config: dict[str, Any]) -> ScanResult:
     """Preserve container and subtype analysis for executable-prefixed ZIPs."""
     result = ScanResult(scanner_name="zip")
@@ -532,11 +587,21 @@ def _calculate_file_hash(file_path: str) -> str:
     return hash_sha256.hexdigest()
 
 
-def _hash_files_by_path(file_paths: list[str]) -> dict[str, str]:
+def _should_defer_hash_for_safetensors_header_limit(file_path: str, config: dict[str, Any]) -> bool:
+    """Avoid full-file hashing for terminal bounded outcomes from oversized SafeTensors framing."""
+    try:
+        max_header_bytes = int(config.get("max_safetensors_header_bytes", SAFETENSORS_MAX_HEADER_BYTES))
+    except (TypeError, ValueError):
+        return False
+    return should_defer_safetensors_header_limit_hash(file_path, max_header_bytes)
+
+
+def _hash_files_by_path(file_paths: list[str], *, config: dict[str, Any] | None = None) -> dict[str, str]:
     """Hash files individually so scan results stay path-specific.
 
     Args:
         file_paths: List of file paths to group
+        config: Scan settings used for bounded format-specific hashing decisions.
 
     Returns:
         Dictionary mapping each file path to its content hash. Files that fail to
@@ -546,6 +611,9 @@ def _hash_files_by_path(file_paths: list[str]) -> dict[str, str]:
     hashes_by_inode: dict[tuple[int, int, int, int], str] = {}
 
     for file_path in file_paths:
+        if _should_defer_hash_for_safetensors_header_limit(file_path, config or {}):
+            content_hashes[file_path] = f"unhashable_bounded_safetensors_{id(file_path)}"
+            continue
         try:
             inode_key: tuple[int, int, int, int] | None = None
             try:
@@ -979,7 +1047,7 @@ def scan_model_directory_or_file(
                             seen_hash_paths.add(scanned_file_path)
 
                 top_level_hashing_started_at = _start_phase_timing(phase_timings)
-                content_hashes = _hash_files_by_path(hash_paths)
+                content_hashes = _hash_files_by_path(hash_paths, config=config)
                 _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
                 duplicate_paths_by_hash: dict[str, list[str]] = {}
                 for file_path, content_hash in content_hashes.items():
@@ -1217,14 +1285,15 @@ def scan_model_directory_or_file(
                 # Hash the top-level target before scanning. Archive scanners merge
                 # nested member results into their metadata, so scanner-emitted
                 # hashes are not always the bytes of this target.
-                try:
-                    top_level_hashing_started_at = _start_phase_timing(phase_timings)
-                    file_hash = _calculate_file_hash(target)
-                    file_hashes.append(file_hash)
-                except Exception as e:
-                    logger.debug(f"Failed to hash file {target}: {e}")
-                finally:
-                    _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
+                if not _should_defer_hash_for_safetensors_header_limit(target, config):
+                    try:
+                        top_level_hashing_started_at = _start_phase_timing(phase_timings)
+                        file_hash = _calculate_file_hash(target)
+                        file_hashes.append(file_hash)
+                    except Exception as e:
+                        logger.debug(f"Failed to hash file {target}: {e}")
+                    finally:
+                        _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
 
                 file_scan_started_at = _start_phase_timing(phase_timings)
                 try:
@@ -1686,6 +1755,19 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
+    if header_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT or magic_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
+        sr = _make_incomplete_onnx_routing_result(path)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
+    if (
+        header_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+        or magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    ):
+        sr = _make_incomplete_tensorflow_protobuf_routing_result(path)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
     if header_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT or magic_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:
         sr = _scan_executable_zip_polyglot(path, config)
         if sr.bytes_scanned == 0 and file_size > 0:
@@ -1894,6 +1976,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 sr = _make_incomplete_mxnet_symbol_routing_result(path, config)
             elif magic_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_xgboost_ubjson_routing_result(path)
+            elif magic_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_onnx_routing_result(path)
+            elif magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_tensorflow_protobuf_routing_result(path)
             elif magic_format == "unknown":
                 # Not a recognized model format — skip silently
                 sr = ScanResult(scanner_name="unknown")
@@ -1943,6 +2029,13 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             config,
             context="Flax MessagePack overlapping content analysis",
             scanned_scanner_ids=frozenset({result.scanner_name}),
+        )
+    elif result.scanner_name != "flax_msgpack":
+        merge_inconclusive_flax_msgpack_outcome(
+            path,
+            result,
+            config,
+            context="strict content owner overlapping ambiguous Flax analysis",
         )
 
     if ext == ".bin" and header_format == "pytorch_binary" and result.scanner_name == "pytorch_binary":
@@ -2086,22 +2179,25 @@ def scan_model_streaming(
                         logger.debug(f"Skipping non-model file: {source_path}")
                     continue
 
-                # Compute file hash
-                if progress_callback:
-                    progress_callback(f"Hashing {source_path.name}", (files_processed / (files_processed + 1)) * 100)
-
-                file_hash = compute_sha256_hash(scan_path)
-                file_hashes.append(file_hash)
-
-                # Scan the file
-                if progress_callback:
-                    progress_callback(f"Scanning {source_path.name}", (files_processed / (files_processed + 1)) * 100)
-
                 # Build config dict for scan_file
                 scan_config = {
                     "timeout": timeout - int(time.time() - start_time),
                     **scan_kwargs,
                 }
+
+                file_hash: str | None = None
+                if not _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config):
+                    if progress_callback:
+                        progress_callback(
+                            f"Hashing {source_path.name}",
+                            (files_processed / (files_processed + 1)) * 100,
+                        )
+                    file_hash = compute_sha256_hash(scan_path)
+                    file_hashes.append(file_hash)
+
+                # Scan the file
+                if progress_callback:
+                    progress_callback(f"Scanning {source_path.name}", (files_processed / (files_processed + 1)) * 100)
 
                 scan_result = scan_file(
                     str(scan_path),
@@ -2119,11 +2215,12 @@ def scan_model_streaming(
                         metadata_dict.setdefault("resolved_path", resolved_report_path)
                     operational_scan_failure = _scan_result_has_operational_error(scan_result)
 
-                    existing_hashes = metadata_dict.get("file_hashes")
-                    if isinstance(existing_hashes, dict):
-                        existing_hashes.setdefault("sha256", file_hash)
-                    else:
-                        metadata_dict["file_hashes"] = {"sha256": file_hash}
+                    if file_hash is not None:
+                        existing_hashes = metadata_dict.get("file_hashes")
+                        if isinstance(existing_hashes, dict):
+                            existing_hashes.setdefault("sha256", file_hash)
+                        else:
+                            metadata_dict["file_hashes"] = {"sha256": file_hash}
 
                     # Use dict-based aggregation to avoid import issues
                     scan_result_dict = {
