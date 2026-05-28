@@ -135,32 +135,44 @@ class JFrogFolderInfo(TypedDict):
 def is_jfrog_url(url: str) -> bool:
     """Check if a URL points to a JFrog Artifactory file or folder."""
     parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
+    hostname = _normalize_hostname(parsed.hostname or "")
+    if parsed.scheme != "https" and not (parsed.scheme == "http" and _is_local_jfrog_host(hostname)):
         return False
-    hostname = (parsed.hostname or "").lower()
     if "/artifactory/" not in parsed.path:
         return False
-    return _is_trusted_jfrog_host(hostname)
+    return _is_jfrog_service_host(hostname) or hostname in _get_trusted_jfrog_hosts()
+
+
+def _normalize_hostname(hostname: str) -> str:
+    return hostname.strip().lower().rstrip(".")
+
+
+def _host_from_config_value(value: str) -> str:
+    """Normalize a configured host or base URL value to a hostname."""
+    candidate = value.strip()
+    if not candidate:
+        return ""
+
+    parsed = urlparse(candidate if "://" in candidate else f"//{candidate}")
+    return _normalize_hostname(parsed.hostname or candidate.split("/", 1)[0].split(":", 1)[0])
 
 
 def _get_trusted_jfrog_hosts() -> set[str]:
     """Return explicitly allowlisted JFrog hosts.
 
-    MODELAUDIT_JFROG_ALLOWED_HOSTS accepts a comma-separated list of hostnames.
+    MODELAUDIT_JFROG_ALLOWED_HOSTS accepts a comma-separated list of hostnames
+    or JFrog base URLs.
     This keeps automatic credential forwarding opt-in for self-hosted JFrog
     instances while rejecting arbitrary lookalike URLs.
     """
     raw_hosts = os.getenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "")
-    return {host.strip().lower() for host in raw_hosts.split(",") if host.strip()}
+    return {host for host in (_host_from_config_value(value) for value in raw_hosts.split(",")) if host}
 
 
-def _is_trusted_jfrog_host(hostname: str) -> bool:
-    """Return True when a hostname is trusted for JFrog authentication."""
+def _is_local_jfrog_host(hostname: str) -> bool:
+    """Return True when a hostname is local-only development infrastructure."""
     if not hostname:
         return False
-
-    if hostname == "jfrog.io" or hostname.endswith(".jfrog.io"):
-        return True
 
     if hostname == "localhost":
         return True
@@ -170,10 +182,53 @@ def _is_trusted_jfrog_host(hostname: str) -> bool:
     except ValueError:
         parsed_ip = None
 
-    if parsed_ip is not None and parsed_ip.is_loopback:
-        return True
+    return parsed_ip is not None and parsed_ip.is_loopback
 
-    return hostname in _get_trusted_jfrog_hosts()
+
+def _is_jfrog_service_host(hostname: str) -> bool:
+    return hostname == "jfrog.io" or hostname.endswith(".jfrog.io") or _is_local_jfrog_host(hostname)
+
+
+def _is_trusted_jfrog_auth_target(url: str) -> bool:
+    """Return True when credentials may be sent to this JFrog URL."""
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        return False
+
+    hostname = _normalize_hostname(parsed.hostname or "")
+    return bool(hostname and hostname in _get_trusted_jfrog_hosts())
+
+
+def _build_jfrog_auth_headers(
+    url: str,
+    *,
+    api_token: str | None,
+    access_token: str | None,
+) -> dict[str, str]:
+    """Build JFrog auth headers only for explicitly trusted HTTPS hosts."""
+    if not _is_trusted_jfrog_auth_target(url):
+        if api_token or access_token or os.getenv("JFROG_API_TOKEN") or os.getenv("JFROG_ACCESS_TOKEN"):
+            logger.warning(
+                "Skipping JFrog credentials for untrusted or insecure URL %s",
+                redact_jfrog_url_for_display(url),
+            )
+        return {}
+
+    if api_token:
+        return {"X-JFrog-Art-Api": api_token}
+
+    if access_token:
+        return {"Authorization": f"Bearer {access_token}"}
+
+    env_api_token = os.getenv("JFROG_API_TOKEN")
+    if env_api_token:
+        return {"X-JFrog-Art-Api": env_api_token}
+
+    env_access_token = os.getenv("JFROG_ACCESS_TOKEN")
+    if env_access_token:
+        return {"Authorization": f"Bearer {env_access_token}"}
+
+    return {}
 
 
 def download_artifact(
@@ -220,25 +275,7 @@ def download_artifact(
         dest_path = cache_dir / filename
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Prepare authentication headers
-    headers = {}
-
-    # 1. Check for API token (highest precedence)
-    if api_token:
-        headers["X-JFrog-Art-Api"] = api_token
-    else:
-        env_api_token = os.getenv("JFROG_API_TOKEN")
-        if env_api_token:
-            headers["X-JFrog-Art-Api"] = env_api_token
-
-    # 2. Check for access token (only if API token not found)
-    if "X-JFrog-Art-Api" not in headers:
-        if access_token:
-            headers["Authorization"] = f"Bearer {access_token}"
-        else:
-            env_access_token = os.getenv("JFROG_ACCESS_TOKEN")
-            if env_access_token:
-                headers["Authorization"] = f"Bearer {env_access_token}"
+    headers = _build_jfrog_auth_headers(url, api_token=api_token, access_token=access_token)
 
     # If no authentication is provided, proceed without auth (for public repos)
     if not headers:
@@ -394,21 +431,7 @@ def detect_jfrog_target_type(
     storage_api_url = get_storage_api_url(url)
     display_storage_api_url = redact_jfrog_url_for_display(storage_api_url)
 
-    # Prepare authentication headers
-    headers = {}
-    if api_token:
-        headers["X-JFrog-Art-Api"] = api_token
-    elif access_token:
-        headers["Authorization"] = f"Bearer {access_token}"
-    else:
-        # Check environment variables
-        env_api_token = os.getenv("JFROG_API_TOKEN")
-        if env_api_token:
-            headers["X-JFrog-Art-Api"] = env_api_token
-        else:
-            env_access_token = os.getenv("JFROG_ACCESS_TOKEN")
-            if env_access_token:
-                headers["Authorization"] = f"Bearer {env_access_token}"
+    headers = _build_jfrog_auth_headers(storage_api_url, api_token=api_token, access_token=access_token)
 
     try:
         response = requests.get(storage_api_url, headers=headers, timeout=timeout)
