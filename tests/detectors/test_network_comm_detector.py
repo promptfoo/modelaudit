@@ -273,6 +273,17 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == f"https://huggingface.co/meta-llama/{repo_id}/resolve/main/model.safetensors"
 
+    def test_huggingface_repository_home_ids_are_preserved(self) -> None:
+        """Public Hugging Face repository home URLs should keep exact repo identity."""
+        detector = NetworkCommDetector()
+        repo_id = "Llama-3.1-70B-Instruct"
+        data = f"https://huggingface.co/meta-llama/{repo_id}".encode()
+
+        findings = detector.scan(data, "metadata.txt")
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+
+        assert url_finding["url"] == f"https://huggingface.co/meta-llama/{repo_id}"
+
     def test_huggingface_api_repository_ids_are_preserved(self) -> None:
         """Hugging Face API paths should keep public repo IDs for audit follow-up."""
         detector = NetworkCommDetector()

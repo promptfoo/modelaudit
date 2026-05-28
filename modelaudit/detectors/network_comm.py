@@ -147,12 +147,19 @@ def _looks_like_capability_path_token(segment: str) -> bool:
 def _is_public_model_repository_segment(hostname: str, segments: list[str], index: int) -> bool:
     if hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS:
         return False
-    if not any(segment.lower() in _PUBLIC_MODEL_REPOSITORY_MARKERS for segment in segments[index + 1 :]):
-        return False
 
+    non_empty_segments = [segment.lower() for segment in segments[1:] if segment]
     repository_indexes = {1, 2}
     if len(segments) > 1 and segments[1].lower() in _PUBLIC_MODEL_REPOSITORY_PREFIXES:
         repository_indexes.add(3)
+
+    if len(non_empty_segments) == len(repository_indexes) and (
+        non_empty_segments[0] in _PUBLIC_MODEL_REPOSITORY_PREFIXES
+    ) == (3 in repository_indexes):
+        return index in repository_indexes
+
+    if not any(segment.lower() in _PUBLIC_MODEL_REPOSITORY_MARKERS for segment in segments[index + 1 :]):
+        return False
     return index in repository_indexes
 
 
