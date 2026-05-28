@@ -10,7 +10,9 @@ from modelaudit.detectors.suspicious_symbols import (
     EXECUTABLE_SIGNATURES,
 )
 
-from .base import BaseScanner, IssueSeverity, ScanResult, logger
+from ..core_results import mark_operational_scan_error
+from ..scanner_results import mark_inconclusive_scan_result
+from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
 
 class PyTorchBinaryScanner(BaseScanner):
@@ -59,14 +61,46 @@ class PyTorchBinaryScanner(BaseScanner):
                 # Continue to check if it's still a valid pytorch_binary format
 
             return file_format == "pytorch_binary"
+        except OSError:
+            return True
         except Exception:
             return False
+
+    @staticmethod
+    def _is_unreadable_path_result(result: ScanResult) -> bool:
+        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    @staticmethod
+    def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
+        mark_inconclusive_scan_result(result, "pytorch_binary_read_failed")
+        mark_operational_scan_error(result, "pytorch_binary_read_failed")
+        result.add_check(
+            name="Binary File Read",
+            passed=False,
+            message=f"Unable to read binary file: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "pytorch_binary_read_failed",
+            },
+        )
+        result.finish(success=False)
+        return result
 
     def scan(self, path: str) -> ScanResult:
         """Scan a PyTorch binary file for suspicious patterns"""
         # Check if path is valid
         path_check_result = self._check_path(path)
         if path_check_result:
+            if self._is_unreadable_path_result(path_check_result):
+                return self._finish_read_failure(
+                    self._create_result(),
+                    path,
+                    PermissionError(f"Path is not readable: {path}"),
+                )
             return path_check_result
 
         size_check = self._check_size_limit(path)
@@ -154,6 +188,8 @@ class PyTorchBinaryScanner(BaseScanner):
             # Check if file appears to be a valid tensor file
             self._validate_tensor_structure(path, result)
 
+        except OSError as e:
+            return self._finish_read_failure(result, path, e)
         except Exception as e:
             result.add_check(
                 name="Binary File Scan",
@@ -505,6 +541,8 @@ class PyTorchBinaryScanner(BaseScanner):
                         rule_code="S703",
                     )
 
+        except OSError:
+            raise
         except Exception as e:
             result.add_check(
                 name="Tensor Structure Validation",

@@ -11,11 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- classify unavailable metadata document reads and timed-out metadata scans as operationally incomplete rather than security findings
 - route renamed structured JAX/Orbax JSON checkpoints, conservatively report observable bounded-prefix threats, and fail closed for oversized identified metadata
 - classify Flax MessagePack recursion-limit analysis gaps as inconclusive coverage
 - classify incomplete JAX/Orbax metadata, pickle, and NumPy analysis as inconclusive coverage
 - route renamed structured JAX/Orbax JSON checkpoints and fail closed for oversized identified metadata
 - route renamed structurally valid Flax/JAX MessagePack checkpoints through bounded, fail-closed security analysis
+- preserve Flax/JAX MessagePack routing under skipped text/configuration suffixes and pickle-shaped prefixes with bounded fail-closed ambiguity handling
 - avoid emitting sensitive scanner finding or loader error payloads in logs
 - fail closed when PyTorch ZIP analysis cannot complete configured blacklist inspection or a required scan phase
 - fail closed when standalone Jinja2 templates exceed the configured analysis size limit or cannot be decoded as UTF-8 text
@@ -27,8 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - prevent picklescan call-graph alias cycles from hanging scans
 - preserve HuggingFace snapshot shard paths while grouping cache-backed families
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
+- classify unavailable manifest and ML text reads as inconclusive rather than security findings, including routing, preflight, and stale cache transitions
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
+- report incomplete R serialized coverage without treating extraction ceilings alone as suspicious payloads, and preserve detection across printable-chunk boundaries
+- classify unavailable Paddle, NumPy, PyTorch binary, and SavedModel reads as inconclusive rather than security findings
+- classify unavailable CoreML, SafeTensors, and TensorRT reads as inconclusive rather than security findings
+- classify unavailable TensorFlow MetaGraph reads as operational errors rather than security findings, including stale cache transitions
 - classify unavailable CNTK and LightGBM reads as inconclusive rather than security findings
 - route renamed and unknown-field-prefixed CoreML models, including valid unknown groups, reordered fields, and bounded routing candidates, through custom-code and metadata analysis
 - avoid inconclusive protobuf-candidate noise for fully inspected scalar-only text and Keras-owned JSON members while preserving binary-tailed candidates for analysis
@@ -59,6 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - route renamed structurally valid MXNet symbol graphs through existing suspicious-reference analysis
 - harden renamed MXNet symbol routing with fail-closed bounded ambiguity and XGBoost overlap handling
 - restore content routing for extensionless XGBoost UBJSON models and classify unavailable or undecodable XGBoost reads as inconclusive
+- detect NeMo Hydra targets that invoke PyTorch C++ extension loaders
 - route renamed TAR-backed NeMo archives with relative archive-root model configs through Hydra `_target_` analysis while retaining generic embedded-member checks
 - honor descriptor-owned header aliases during helper scanner selection for renamed HDF5, GGML, and compressed payloads
 - detect signature-valid Torch7 payloads even when renamed with misleading suffixes
