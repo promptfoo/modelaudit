@@ -528,7 +528,7 @@ def _line_shadows_priority_alias(code_line: bytes, aliases: frozenset[bytes]) ->
     assignment_operators = rb"\+=|-=|\*=|//=|/=|%=|\*\*=|@=|&=|\|=|\^=|>>=|<<=|=(?!=)"
     return any(
         re.search(
-            rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?::[^=\n]+)?\s*(?:" + assignment_operators + rb")",
+            rb"(?:^|[;:])\s*" + re.escape(alias) + rb"\s*(?::[^=\n]+)?\s*(?:" + assignment_operators + rb")",
             code_line,
         )
         or re.search(rb"^\s*(?:async\s+)?def\s+" + re.escape(alias) + rb"\b", code_line)

@@ -803,10 +803,13 @@ def _resolve_getattr_call_names(
             resolved_names.update(getattribute_names)
         return frozenset(resolved_names) or None
 
-    if not (normalized_helper_names & {"getattr", "builtins.getattr"}):
+    has_getattr_helper = bool(normalized_helper_names & {"getattr", "builtins.getattr"})
+    has_hasattr_helper = bool(normalized_helper_names & {"hasattr", "builtins.hasattr"})
+    if not (has_getattr_helper or has_hasattr_helper):
         return None
 
-    if len(node.args) not in {2, 3} or node.keywords:
+    expected_arg_counts = {2, 3} if has_getattr_helper else {2}
+    if len(node.args) not in expected_arg_counts or node.keywords:
         return None
     target_root_node = node.args[0]
     attr_name_node = node.args[1]
@@ -2130,8 +2133,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         return aliases if isinstance(aliases, frozenset) else frozenset()
 
     @staticmethod
-    def _initializer_calls(init_method: ast.FunctionDef | ast.AsyncFunctionDef) -> Iterator[ast.Call]:
-        pending: list[ast.AST] = list(reversed(init_method.body))
+    def _initializer_node_calls(node: ast.AST) -> Iterator[ast.Call]:
+        pending = [node]
         while pending:
             node = pending.pop()
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
@@ -2139,6 +2142,197 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if isinstance(node, ast.Call):
                 yield node
             pending.extend(reversed(list(ast.iter_child_nodes(node))))
+
+    @staticmethod
+    def _argument_alias_scope(arguments: ast.arguments) -> _AliasScope:
+        argument_names = [
+            *arguments.posonlyargs,
+            *arguments.args,
+            *arguments.kwonlyargs,
+        ]
+        scope: _AliasScope = {argument.arg: None for argument in argument_names}
+        if arguments.vararg is not None:
+            scope[arguments.vararg.arg] = None
+        if arguments.kwarg is not None:
+            scope[arguments.kwarg.arg] = None
+        return scope
+
+    def _resolve_initializer_reference_names(
+        self,
+        node: ast.AST,
+        class_scope: _AliasScope,
+        initializer_scope: _AliasScope,
+    ) -> frozenset[str] | None:
+        class_local_names = self._class_local_method_aliases(node, class_scope)
+        if class_local_names:
+            return class_local_names
+        return _resolve_static_reference_names(
+            node,
+            [*self.alias_scopes, initializer_scope],
+            allow_module_locals_mapping=self._non_module_scope_depth == 0,
+            allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+        )
+
+    def _initializer_call_preserves_ctypes_loader_init(
+        self,
+        call: ast.Call,
+        class_scope: _AliasScope,
+        initializer_scope: _AliasScope,
+        first_base_loader_types: frozenset[str],
+    ) -> bool:
+        if (
+            first_base_loader_types
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "__init__"
+            and isinstance(call.func.value, ast.Call)
+            and _resolve_call_name(call.func.value.func) == "super"
+        ):
+            return True
+        return self._is_ctypes_loader_init_alias(
+            self._resolve_initializer_reference_names(call.func, class_scope, initializer_scope)
+        )
+
+    def _initializer_node_preserves_ctypes_loader_init(
+        self,
+        node: ast.AST,
+        class_scope: _AliasScope,
+        initializer_scope: _AliasScope,
+        first_base_loader_types: frozenset[str],
+    ) -> bool:
+        return any(
+            self._initializer_call_preserves_ctypes_loader_init(
+                call,
+                class_scope,
+                initializer_scope,
+                first_base_loader_types,
+            )
+            for call in self._initializer_node_calls(node)
+        )
+
+    def _merge_initializer_branch_scopes(
+        self,
+        initializer_scope: _AliasScope,
+        branch_scopes: list[_AliasScope],
+    ) -> None:
+        base_scope = dict(initializer_scope)
+        for name in {name for scope in branch_scopes for name in scope}:
+            initializer_scope[name] = self._merge_alias_values(
+                *(scope.get(name, base_scope.get(name)) for scope in branch_scopes)
+            )
+
+    def _initializer_statements_preserve_ctypes_loader_init(
+        self,
+        statements: list[ast.stmt],
+        class_scope: _AliasScope,
+        initializer_scope: _AliasScope,
+        first_base_loader_types: frozenset[str],
+    ) -> bool:
+        for statement in statements:
+            if self._initializer_statement_preserves_ctypes_loader_init(
+                statement,
+                class_scope,
+                initializer_scope,
+                first_base_loader_types,
+            ):
+                return True
+        return False
+
+    def _initializer_statement_preserves_ctypes_loader_init(
+        self,
+        statement: ast.stmt,
+        class_scope: _AliasScope,
+        initializer_scope: _AliasScope,
+        first_base_loader_types: frozenset[str],
+    ) -> bool:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return False
+        if isinstance(statement, ast.If):
+            constant_bool = self._constant_bool(statement.test)
+            if constant_bool is True:
+                return self._initializer_statements_preserve_ctypes_loader_init(
+                    statement.body,
+                    class_scope,
+                    initializer_scope,
+                    first_base_loader_types,
+                )
+            if constant_bool is False:
+                return self._initializer_statements_preserve_ctypes_loader_init(
+                    statement.orelse,
+                    class_scope,
+                    initializer_scope,
+                    first_base_loader_types,
+                )
+            branch_scopes = [dict(initializer_scope), dict(initializer_scope)]
+            if self._initializer_statements_preserve_ctypes_loader_init(
+                statement.body,
+                class_scope,
+                branch_scopes[0],
+                first_base_loader_types,
+            ):
+                return True
+            if self._initializer_statements_preserve_ctypes_loader_init(
+                statement.orelse,
+                class_scope,
+                branch_scopes[1],
+                first_base_loader_types,
+            ):
+                return True
+            self._merge_initializer_branch_scopes(initializer_scope, branch_scopes)
+            return False
+        if isinstance(statement, ast.While):
+            constant_bool = self._constant_bool(statement.test)
+            if constant_bool is False:
+                return self._initializer_statements_preserve_ctypes_loader_init(
+                    statement.orelse,
+                    class_scope,
+                    initializer_scope,
+                    first_base_loader_types,
+                )
+            branch_scope = dict(initializer_scope)
+            if self._initializer_statements_preserve_ctypes_loader_init(
+                statement.body,
+                class_scope,
+                branch_scope,
+                first_base_loader_types,
+            ):
+                return True
+            self._merge_initializer_branch_scopes(initializer_scope, [branch_scope, dict(initializer_scope)])
+            return False
+        if isinstance(statement, ast.Assign):
+            if self._initializer_node_preserves_ctypes_loader_init(
+                statement.value,
+                class_scope,
+                initializer_scope,
+                first_base_loader_types,
+            ):
+                return True
+            resolved_value = self._resolve_initializer_reference_names(statement.value, class_scope, initializer_scope)
+            for target in statement.targets:
+                for name in _binding_names(target):
+                    initializer_scope[name] = resolved_value
+            return False
+        if isinstance(statement, ast.AnnAssign):
+            if statement.value is None:
+                for name in _binding_names(statement.target):
+                    initializer_scope[name] = None
+                return False
+            if self._initializer_node_preserves_ctypes_loader_init(
+                statement.value,
+                class_scope,
+                initializer_scope,
+                first_base_loader_types,
+            ):
+                return True
+            resolved_value = self._resolve_initializer_reference_names(statement.value, class_scope, initializer_scope)
+            for name in _binding_names(statement.target):
+                initializer_scope[name] = resolved_value
+            return False
+        return self._initializer_node_preserves_ctypes_loader_init(
+            statement,
+            class_scope,
+            initializer_scope,
+            first_base_loader_types,
+        )
 
     def _class_preserves_ctypes_loader_init(self, node: ast.ClassDef, class_scope: _AliasScope) -> bool:
         init_method = next(
@@ -2150,28 +2344,21 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             None,
         )
         if init_method is None:
-            return True
+            if not node.bases:
+                return False
+            return bool(_canonical_ctypes_loader_type_aliases(self._resolve_reference_names(node.bases[0])))
         first_base_loader_types = (
             _canonical_ctypes_loader_type_aliases(self._resolve_reference_names(node.bases[0]))
             if node.bases
             else frozenset()
         )
-        for child in self._initializer_calls(init_method):
-            if (
-                first_base_loader_types
-                and isinstance(child.func, ast.Attribute)
-                and child.func.attr == "__init__"
-                and isinstance(child.func.value, ast.Call)
-                and _resolve_call_name(child.func.value.func) == "super"
-            ):
-                return True
-            resolved_names = self._resolve_reference_names(child.func)
-            class_local_names = self._class_local_method_aliases(child.func, class_scope)
-            if class_local_names:
-                resolved_names = (resolved_names or frozenset()) | class_local_names
-            if self._is_ctypes_loader_init_alias(resolved_names):
-                return True
-        return False
+        initializer_scope = self._argument_alias_scope(init_method.args)
+        return self._initializer_statements_preserve_ctypes_loader_init(
+            init_method.body,
+            class_scope,
+            initializer_scope,
+            first_base_loader_types,
+        )
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         ctypes_loader_type_aliases = (
