@@ -580,6 +580,22 @@ def _line_indent_width(line: bytes) -> int:
     return len(line) - len(line.lstrip(b" \t"))
 
 
+def _matching_compound_clause_header_start(candidate: bytes, clause_line_start: int, clause_indent: int) -> int | None:
+    search_end = clause_line_start
+    while search_end > 0:
+        previous_line_end = search_end - 1
+        previous_line_start = candidate.rfind(b"\n", 0, previous_line_end) + 1
+        previous_line = candidate[previous_line_start:search_end]
+        search_end = previous_line_start
+        if _line_indent_width(previous_line) != clause_indent:
+            continue
+        structural_line = _python_structural_line_bytes(previous_line).rstrip()
+        header_match = re.search(rb"\b(?:if|try)\b", structural_line)
+        if structural_line.endswith(b":") and header_match is not None:
+            return previous_line_start + header_match.start()
+    return None
+
+
 def _enclosing_compound_header_segments(candidate: bytes, line_start: int) -> list[tuple[int, int]]:
     line_end = candidate.find(b"\n", line_start)
     if line_end == -1:
@@ -601,7 +617,12 @@ def _enclosing_compound_header_segments(candidate: bytes, line_start: int) -> li
         previous_indent = _line_indent_width(previous_line)
         if previous_indent < current_indent and structural_line.endswith(b":"):
             header_match = re.search(rb"\b(?:if|for|while|try|with|class|def|async\s+def)\b", structural_line)
-            header_start = previous_line_start + (header_match.start() if header_match is not None else 0)
+            if header_match is None and re.match(rb"(?:elif|else|except|finally)\b", structural_line):
+                header_start = _matching_compound_clause_header_start(candidate, previous_line_start, previous_indent)
+            else:
+                header_start = previous_line_start + (header_match.start() if header_match is not None else 0)
+            if header_start is None:
+                header_start = previous_line_start
             segments.append((header_start, previous_line_start + len(previous_line)))
             current_indent = previous_indent
     return list(reversed(segments))

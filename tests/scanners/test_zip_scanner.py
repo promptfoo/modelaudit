@@ -656,6 +656,9 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "    def __init__(self, name: str) -> None:\n"
         "        super(Safe, self).__init__(name)\n"
         "ctypes.LibraryLoader(SkipSafeCDLL).superskiplib\n"
+        "class ClassBodyInitCDLL(Safe, ctypes.CDLL):\n"
+        "    __init__ = ctypes.CDLL.__init__\n"
+        "ctypes.LibraryLoader(ClassBodyInitCDLL).classbodyinitlib\n"
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
@@ -709,6 +712,7 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.LibraryLoader.localaliaslib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.starredlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.superskiplib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.classbodyinitlib" in checks_by_rule["S110"].details["reason"]
 
 
 def test_scan_zip_flags_webbrowser_controller_getattribute_launch(tmp_path: Path) -> None:
@@ -991,6 +995,26 @@ def test_scan_zip_preserves_ctypes_subclass_with_class_local_init_alias(tmp_path
     assert python_checks[0].details["reason"] == "high-risk calls: ctypes.CDLL, ctypes.LibraryLoader.payload"
 
 
+def test_scan_zip_ignores_unreachable_ctypes_cdll_subclass_initializer(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "class SafeCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        if False:\n"
+        "            super().__init__(name)\n"
+        "ctypes.LibraryLoader(SafeCDLL).payload\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_scan_zip_preserves_restored_runpy_execution_after_static_overwrite(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = (
@@ -1184,8 +1208,16 @@ def test_scan_zip_preserves_safe_runpy_overwrite_before_conditional(tmp_path: Pa
         "import builtins\nbuiltins.__getattr__('eval')('1')\n",
         "import webbrowser\nbrowser = webbrowser.get()\nother = browser\nbrowser.open = len\nother.open([])\n",
         (
+            "import webbrowser\nbrowser = webbrowser.get()\nother = browser\n"
+            "browser.open = len\nbrowser = webbrowser.get()\nother.open([])\n"
+        ),
+        (
             "import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL)\n"
             "other = loader\nloader.payload = len\nother.payload([])\n"
+        ),
+        (
+            "import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            "other = loader\nloader.payload = len\nloader = ctypes.LibraryLoader(ctypes.CDLL)\nother.payload([])\n"
         ),
         (
             "import ctypes\nclass SafeCDLL(ctypes.CDLL):\n"
@@ -1209,6 +1241,12 @@ def test_scan_zip_preserves_safe_runpy_overwrite_before_conditional(tmp_path: Pa
             "    def __init__(self, name: str) -> None:\n"
             "        super().__init__(name)\n"
             "ctypes.LibraryLoader(NoLoad).payload\nNoLoad('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass MissingNameSuperCDLL(ctypes.CDLL):\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        super().__init__()\n"
+            "ctypes.LibraryLoader(MissingNameSuperCDLL).payload\nMissingNameSuperCDLL('/missing')\n"
         ),
         (
             "import ctypes\nclass DeadDelegateCDLL(ctypes.CDLL):\n"
