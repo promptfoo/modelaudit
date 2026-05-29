@@ -259,6 +259,8 @@ def _candidate_embedded_python_snippets(
             continue
         if any(block_start == start for block_start, _block_end in block_spans) and start not in priority_starts:
             continue
+        if _is_indented_start_with_enclosing_header(bounded, start):
+            continue
         span = (start, len(bounded))
         candidates.append((bounded[start:], span, (span,)))
 
@@ -317,8 +319,9 @@ def _bounded_priority_embedded_python_candidate_at_offset(
     segment_ranges: list[tuple[int, int]] = []
 
     def add_segment(start: int, end: int) -> None:
-        if end > start:
-            segment_ranges.append((start, end))
+        segment = (start, end)
+        if end > start and segment not in segment_ranges:
+            segment_ranges.append(segment)
 
     block_header_end = candidate.find(b"\n")
     if (
@@ -327,6 +330,8 @@ def _bounded_priority_embedded_python_candidate_at_offset(
         and candidate[:block_header_end].lstrip().startswith((b"def ", b"async def ", b"class "))
     ):
         add_segment(0, block_header_end + 1)
+    for header_start, header_end in _enclosing_compound_header_segments(candidate, line_start):
+        add_segment(header_start, header_end)
     add_segment(line_start, bounded_end)
 
     aliases = _priority_import_aliases(_compact_candidate_segments(candidate, segment_ranges))
@@ -483,7 +488,11 @@ def _priority_alias_usage_lines(
             line_start = line_end
             continue
         code_line = _python_structural_line_bytes(line)
-        if _line_uses_priority_alias(code_line, aliases):
+        if _line_shadows_priority_alias(code_line, aliases):
+            usage_lines.append((line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)))
+            if len(usage_lines) >= _MAX_PRIORITY_ALIAS_USAGE_LINES:
+                return usage_lines
+        elif _line_uses_priority_alias(code_line, aliases):
             usage_lines.append((line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)))
             if _line_calls_priority_alias(code_line, aliases) or len(usage_lines) >= _MAX_PRIORITY_ALIAS_USAGE_LINES:
                 return usage_lines
@@ -514,6 +523,58 @@ def _line_calls_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> b
         )
         for alias in aliases
     )
+
+
+def _line_shadows_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
+    assignment_operators = rb"=|\+=|-=|\*=|/=|//=|%=|\*\*=|@=|&=|\|=|\^=|>>=|<<="
+    return any(
+        re.search(
+            rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?::[^=\n]+)?\s*(?:" + assignment_operators + rb")",
+            code_line,
+        )
+        or re.search(rb"^\s*(?:async\s+)?def\s+" + re.escape(alias) + rb"\b", code_line)
+        or re.search(rb"^\s*class\s+" + re.escape(alias) + rb"\b", code_line)
+        for alias in aliases
+    )
+
+
+def _line_indent_width(line: bytes) -> int:
+    return len(line) - len(line.lstrip(b" \t"))
+
+
+def _enclosing_compound_header_segments(candidate: bytes, line_start: int) -> list[tuple[int, int]]:
+    line_end = candidate.find(b"\n", line_start)
+    if line_end == -1:
+        line_end = len(candidate)
+    current_indent = _line_indent_width(candidate[line_start:line_end])
+    if current_indent == 0:
+        return []
+
+    segments: list[tuple[int, int]] = []
+    search_end = line_start
+    while current_indent > 0 and search_end > 0:
+        previous_line_end = search_end - 1
+        previous_line_start = candidate.rfind(b"\n", 0, previous_line_end) + 1
+        previous_line = candidate[previous_line_start:search_end]
+        search_end = previous_line_start
+        structural_line = _python_structural_line_bytes(previous_line).rstrip()
+        if not structural_line:
+            continue
+        previous_indent = _line_indent_width(previous_line)
+        if previous_indent < current_indent and structural_line.endswith(b":"):
+            segments.append((previous_line_start, previous_line_start + len(previous_line)))
+            current_indent = previous_indent
+    return list(reversed(segments))
+
+
+def _is_indented_start_with_enclosing_header(candidate: bytes, start: int) -> bool:
+    line_start = candidate.rfind(b"\n", 0, start) + 1
+    line_end = candidate.find(b"\n", start)
+    if line_end == -1:
+        line_end = len(candidate)
+    if _line_indent_width(candidate[line_start:line_end]) == 0:
+        return False
+    return bool(_enclosing_compound_header_segments(candidate, line_start))
 
 
 def _merge_candidate_segment_ranges(segment_ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:

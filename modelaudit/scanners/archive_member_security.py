@@ -100,11 +100,8 @@ _WEBBROWSER_LAUNCH_CALLS = frozenset(
     }
 )
 _WEBBROWSER_CONTROLLER_FACTORIES = frozenset({"webbrowser.get"})
-_WEBBROWSER_CONTROLLER_INSTANCE_ROOT = "webbrowser.get.__instance__"
-_WEBBROWSER_CONTROLLER_INSTANCE_ROOT_PREFIX = f"{_WEBBROWSER_CONTROLLER_INSTANCE_ROOT}:"
 _WEBBROWSER_CONTROLLER_LAUNCH_METHODS = frozenset({"open", "open_new", "open_new_tab"})
 _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT = "ctypes.LibraryLoader.__instance__"
-_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT_PREFIX = f"{_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT}:"
 _CTYPES_DYNAMIC_LIBRARY_NAME = "<dynamic>"
 _CTYPES_LIBRARY_LOADER_OBJECTS = frozenset(
     {
@@ -191,50 +188,44 @@ def _strip_dunder_call_suffixes(reference_name: str) -> str:
     return reference_name
 
 
-def _webbrowser_controller_instance_root(name: str) -> str:
-    return f"{_WEBBROWSER_CONTROLLER_INSTANCE_ROOT_PREFIX}{name}"
+def _localized_instance_root(root_name: str, local_name: str) -> str:
+    return f"{root_name}@{local_name}"
+
+
+def _is_localized_instance_root(root_name: str, base_root: str) -> bool:
+    return root_name.startswith(f"{base_root}@")
+
+
+def _is_ctypes_library_loader_object_root(root_name: str) -> bool:
+    return root_name in _CTYPES_LIBRARY_LOADER_OBJECTS or any(
+        _is_localized_instance_root(root_name, loader_root) for loader_root in _CTYPES_LIBRARY_LOADER_OBJECTS
+    )
 
 
 def _is_webbrowser_controller_root(root_name: str) -> bool:
-    return root_name in _WEBBROWSER_CONTROLLER_FACTORIES or root_name.startswith(
-        _WEBBROWSER_CONTROLLER_INSTANCE_ROOT_PREFIX
+    return root_name in _WEBBROWSER_CONTROLLER_FACTORIES or any(
+        _is_localized_instance_root(root_name, controller_root) for controller_root in _WEBBROWSER_CONTROLLER_FACTORIES
     )
 
 
-def _ctypes_library_loader_instance_root(name: str) -> str:
-    return f"{_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT_PREFIX}{name}"
-
-
-def _is_tracked_dynamic_instance_root(name: str) -> bool:
-    return name.startswith(_WEBBROWSER_CONTROLLER_INSTANCE_ROOT_PREFIX) or name.startswith(
-        _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT_PREFIX
-    )
+def _is_tracked_dynamic_instance_root(root_name: str) -> bool:
+    return _is_webbrowser_controller_root(root_name) or _is_ctypes_library_loader_object_root(root_name)
 
 
 def _split_ctypes_loader_reference(reference_name: str) -> tuple[str, str] | None:
     reference_name = _strip_dunder_call_suffixes(reference_name)
-    if reference_name.startswith(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT_PREFIX):
-        instance_tail = reference_name[len(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT_PREFIX) :]
-        instance_name, separator, suffix = instance_tail.partition(".")
-        if not instance_name:
-            return None
-        return f"{_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT_PREFIX}{instance_name}", suffix if separator else ""
     for candidate_root in sorted(_CTYPES_LIBRARY_LOADER_OBJECTS, key=len, reverse=True):
+        localized_prefix = f"{candidate_root}@"
+        if reference_name.startswith(localized_prefix):
+            suffix_start = reference_name.find(".", len(localized_prefix))
+            if suffix_start == -1:
+                return reference_name, ""
+            return reference_name[:suffix_start], reference_name[suffix_start + 1 :]
         if reference_name == candidate_root:
             return candidate_root, ""
         if reference_name.startswith(f"{candidate_root}."):
             return candidate_root, reference_name[len(candidate_root) + 1 :]
     return None
-
-
-def _is_ctypes_library_loader_object_root(name: str) -> bool:
-    return name in _CTYPES_LIBRARY_LOADER_OBJECTS or name.startswith(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT_PREFIX)
-
-
-def _ctypes_library_loader_display_root(loader_root: str) -> str:
-    if loader_root.startswith(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT_PREFIX):
-        return "ctypes.LibraryLoader"
-    return _CTYPES_LIBRARY_LOADER_DISPLAY_ROOTS.get(loader_root, loader_root)
 
 
 def _ctypes_loader_attribute_load_name(reference_name: str) -> str | None:
@@ -251,7 +242,7 @@ def _ctypes_loader_attribute_load_name(reference_name: str) -> str | None:
         or library_name in {"LoadLibrary", "__getitem__"}
     ):
         return None
-    display_root = _ctypes_library_loader_display_root(loader_root)
+    display_root = _CTYPES_LIBRARY_LOADER_DISPLAY_ROOTS.get(loader_root.split("@", maxsplit=1)[0], loader_root)
     return f"{display_root}.{library_name}"
 
 
@@ -1270,7 +1261,9 @@ def _resolve_ctypes_library_loader_instance_roots(
         if resolved_loader_names is None:
             return None
         subscript_loader_roots = frozenset(
-            loader_name for loader_name in resolved_loader_names if _is_ctypes_library_loader_object_root(loader_name)
+            resolved_name
+            for resolved_name in resolved_loader_names
+            if _is_ctypes_library_loader_object_root(resolved_name)
         )
         return frozenset(f"{loader_root}.{library_name}" for loader_root in subscript_loader_roots) or None
 
@@ -1348,9 +1341,9 @@ def _resolve_ctypes_library_loader_instance_roots(
             allow_local_namespace_mapping=allow_local_namespace_mapping,
         )
         self_loader_roots = frozenset(
-            loader_name
-            for loader_name in resolved_self_names or frozenset()
-            if _is_ctypes_library_loader_object_root(loader_name)
+            resolved_name
+            for resolved_name in resolved_self_names or frozenset()
+            if _is_ctypes_library_loader_object_root(resolved_name)
         )
         library_name = _resolve_static_string(unbound_library_name_node)
         loader_roots.update(
@@ -1593,7 +1586,28 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def _should_track_syntactic_static_reference(self, syntactic_name: str) -> bool:
         root_name = syntactic_name.split(".", maxsplit=1)[0]
         root_aliases, found = _lookup_bound_alias(root_name, self.alias_scopes)
-        return not found or root_aliases is not None
+        return not found or (isinstance(root_aliases, frozenset) and root_name in root_aliases)
+
+    def _localize_instance_binding_value(
+        self, local_name: str, value: ast.AST, resolved_names: _AliasValue
+    ) -> _AliasValue:
+        if not isinstance(resolved_names, frozenset):
+            return resolved_names
+        localized_names = set(resolved_names)
+        if _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT in localized_names:
+            localized_names.remove(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT)
+            localized_names.add(_localized_instance_root(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT, local_name))
+        webbrowser_controller_roots = _resolve_webbrowser_controller_factory_roots(
+            value,
+            self.alias_scopes,
+            allow_module_locals_mapping=self._non_module_scope_depth == 0,
+            allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+        )
+        for controller_root in webbrowser_controller_roots or frozenset():
+            if controller_root in localized_names:
+                localized_names.remove(controller_root)
+                localized_names.add(_localized_instance_root(controller_root, local_name))
+        return frozenset(localized_names)
 
     def _bind_module_namespace_key(self, key: str, resolved_names: _AliasValue) -> None:
         self._bind_name(f"{_MODULE_NAMESPACE_WRITE_PREFIX}{key}", resolved_names)
@@ -1609,20 +1623,6 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if value_name is not None and _is_high_risk_python_call_name(value_name):
             return frozenset({value_name})
         return self._resolve_reference_names(value)
-
-    def _resolve_binding_value_names_for_target(self, target_name: str, value: ast.AST | None) -> _AliasValue:
-        resolved_names = self._resolve_binding_value_names(value)
-        if not isinstance(value, ast.Call) or not isinstance(resolved_names, frozenset):
-            return resolved_names
-        localized_names: set[str] = set()
-        for resolved_name in resolved_names:
-            if resolved_name in _WEBBROWSER_CONTROLLER_FACTORIES:
-                localized_names.add(_webbrowser_controller_instance_root(target_name))
-            elif resolved_name == _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT:
-                localized_names.add(_ctypes_library_loader_instance_root(target_name))
-            else:
-                localized_names.add(resolved_name)
-        return frozenset(localized_names)
 
     def _restore_reassigned_instance_member_defaults(self, target_name: str, resolved_names: _AliasValue) -> None:
         if not isinstance(resolved_names, frozenset):
@@ -1654,9 +1654,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _bind_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         if isinstance(target, ast.Name):
-            resolved_names = self._resolve_binding_value_names_for_target(target.id, value)
-            self._restore_reassigned_instance_member_defaults(target.id, resolved_names)
-            self._bind_name(target.id, resolved_names)
+            resolved_names = self._resolve_binding_value_names(value)
+            localized_names = self._localize_instance_binding_value(target.id, value, resolved_names)
+            self._restore_reassigned_instance_member_defaults(target.id, localized_names)
+            self._bind_name(target.id, localized_names)
         elif isinstance(target, ast.Subscript):
             key = _resolve_static_string(target.slice)
             roots = _resolve_namespace_mapping_roots(
@@ -1858,7 +1859,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _resolve_target_bindings(self, target: ast.AST, value: ast.AST) -> _AliasScope:
         if isinstance(target, ast.Name):
-            return {target.id: self._resolve_binding_value_names_for_target(target.id, value)}
+            resolved_names = self._resolve_binding_value_names(value)
+            return {target.id: self._localize_instance_binding_value(target.id, value, resolved_names)}
         if (
             isinstance(target, (ast.Tuple, ast.List))
             and isinstance(value, (ast.Tuple, ast.List))
@@ -2068,49 +2070,38 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             for name in names
         )
 
-    def _class_static_member_aliases(self, node: ast.ClassDef) -> _AliasScope:
+    def _class_local_alias_scope(self, node: ast.ClassDef) -> _AliasScope:
         class_scope: _AliasScope = {}
         self._push_alias_scope(class_scope)
+        self._class_scope_ids.add(id(class_scope))
         try:
             for statement in node.body:
-                value_node: ast.AST | None
-                targets: list[ast.expr]
                 if isinstance(statement, ast.Assign):
-                    value_node = statement.value
-                    targets = list(statement.targets)
+                    resolved_value = self._resolve_binding_value_names(statement.value)
+                    for target in statement.targets:
+                        for name in _binding_names(target):
+                            class_scope[name] = resolved_value
                 elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
-                    value_node = statement.value
-                    targets = [statement.target]
+                    resolved_value = self._resolve_binding_value_names(statement.value)
+                    for name in _binding_names(statement.target):
+                        class_scope[name] = resolved_value
                 elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     class_scope[statement.name] = None
-                    continue
-                elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
-                    class_scope[statement.target.id] = None
-                    continue
-                else:
-                    continue
-                resolved_value = _resolve_static_reference_names(
-                    value_node,
-                    self.alias_scopes,
-                    allow_module_locals_mapping=False,
-                    allow_local_namespace_mapping=False,
-                )
-                for target in targets:
-                    if isinstance(target, ast.Name):
-                        class_scope[target.id] = resolved_value
         finally:
+            self._class_scope_ids.discard(id(class_scope))
             self._pop_alias_scope()
         return class_scope
 
     @staticmethod
-    def _resolve_self_class_member_aliases(node: ast.AST, class_aliases: _AliasScope) -> _AliasValue:
-        if isinstance(node, ast.Attribute) and node.attr == "__call__":
-            return _HighRiskPythonCallVisitor._resolve_self_class_member_aliases(node.value, class_aliases)
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in {"self", "cls"}:
-            return class_aliases.get(node.attr)
-        return None
+    def _class_local_method_aliases(func: ast.AST, class_scope: _AliasScope) -> frozenset[str]:
+        if not (
+            isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id in {"self", "cls"}
+        ):
+            return frozenset()
+        aliases = class_scope.get(func.attr)
+        return aliases if isinstance(aliases, frozenset) else frozenset()
 
-    def _class_preserves_ctypes_loader_init(self, node: ast.ClassDef) -> bool:
+    def _class_preserves_ctypes_loader_init(self, node: ast.ClassDef, class_scope: _AliasScope) -> bool:
         init_method = next(
             (
                 statement
@@ -2126,7 +2117,6 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if node.bases
             else frozenset()
         )
-        class_aliases = self._class_static_member_aliases(node)
         for child in ast.walk(init_method):
             if not isinstance(child, ast.Call):
                 continue
@@ -2138,10 +2128,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 and _resolve_call_name(child.func.value.func) == "super"
             ):
                 return True
-            class_member_aliases = self._resolve_self_class_member_aliases(child.func, class_aliases)
-            if self._is_ctypes_loader_init_alias(class_member_aliases):
-                return True
             resolved_names = self._resolve_reference_names(child.func)
+            class_local_names = self._class_local_method_aliases(child.func, class_scope)
+            if class_local_names:
+                resolved_names = (resolved_names or frozenset()) | class_local_names
             if self._is_ctypes_loader_init_alias(resolved_names):
                 return True
         return False
@@ -2153,7 +2143,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 for base in node.bases
                 for alias in _canonical_ctypes_loader_type_aliases(self._resolve_reference_names(base))
             )
-            if self._class_preserves_ctypes_loader_init(node)
+            if self._class_preserves_ctypes_loader_init(node, self._class_local_alias_scope(node))
             else frozenset()
         )
         for decorator in node.decorator_list:
