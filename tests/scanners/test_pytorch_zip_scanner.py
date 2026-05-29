@@ -1278,6 +1278,7 @@ def test_pytorch_zip_scans_unmarked_runpy_execution_in_archive_data(tmp_path: Pa
         and "Dynamic module execution detected" in check.message
     ]
     assert len(matching_failures) == 1
+    assert matching_failures[0].rule_code == "S108"
 
 
 def test_pytorch_zip_ignores_certain_replaced_runpy_execution_in_archive_data(tmp_path: Path) -> None:

@@ -476,6 +476,26 @@ class TestJITScriptDetector:
 
         assert findings == []
 
+    def test_scan_model_detects_binary_prefixed_aliased_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xff" + b"def payload():\n    from runpy import run_path as run\n    return run('payload.py')\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_binary_prefixed_replaced_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xff" + b"def payload():\n    import runpy\n    runpy.run_path = len\n    return runpy.run_path([])\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
     def test_scan_model_preserves_possible_runpy_execution_after_conditional_replacement(self) -> None:
         detector = JITScriptDetector()
         source = (

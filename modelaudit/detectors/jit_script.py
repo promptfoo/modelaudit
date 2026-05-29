@@ -584,6 +584,11 @@ class JITScriptDetector:
         bounded_subprocess_calls: set[str] | None = None
         bounded_pty_process_calls: set[str] | None = None
         bounded_runpy_execution_calls: set[str] | None = None
+        snippet_os_process_calls: set[str] = set()
+        snippet_subprocess_calls: set[str] = set()
+        snippet_pty_process_calls: set[str] = set()
+        snippet_runpy_execution_calls: set[str] = set()
+        saw_snippet_ast = False
         try:
             bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
             bounded_dangerous_builtins = _resolve_alias_aware_dangerous_builtins(bounded_tree)
@@ -649,12 +654,33 @@ class JITScriptDetector:
 
                 # Try to parse as AST for deeper analysis
                 if tree is not None:
+                    saw_snippet_ast = True
+                    (
+                        snippet_os_calls,
+                        snippet_subprocess,
+                        snippet_pty_calls,
+                        snippet_runpy_calls,
+                    ) = _resolve_alias_aware_execution_calls(tree)
+                    snippet_os_process_calls.update(snippet_os_calls)
+                    snippet_subprocess_calls.update(snippet_subprocess)
+                    snippet_pty_process_calls.update(snippet_pty_calls)
+                    snippet_runpy_execution_calls.update(snippet_runpy_calls)
                     ast_findings = self._analyze_ast(tree, framework, context)
                     findings.extend(ast_findings)
 
             except Exception:
                 # Failed to process this code snippet
                 continue
+
+        if saw_snippet_ast:
+            if bounded_os_process_calls is None:
+                bounded_os_process_calls = snippet_os_process_calls
+            if bounded_subprocess_calls is None:
+                bounded_subprocess_calls = snippet_subprocess_calls
+            if bounded_pty_process_calls is None:
+                bounded_pty_process_calls = snippet_pty_process_calls
+            if bounded_runpy_execution_calls is None:
+                bounded_runpy_execution_calls = snippet_runpy_execution_calls
 
         def add_code_execution_pattern_finding(description: str) -> None:
             findings.append(
