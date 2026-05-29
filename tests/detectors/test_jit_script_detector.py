@@ -1741,6 +1741,106 @@ class TestJITScriptDetector:
         assert "Web browser launch detected" in patterns
         assert "Native library loading detected" in patterns
 
+    def test_scan_model_keeps_webbrowser_member_overwrites_controller_local(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import webbrowser\n"
+            b"    safe_browser = webbrowser.get('safe')\n"
+            b"    safe_browser.open = len\n"
+            b"    other_browser = webbrowser.get('other')\n"
+            b"    return other_browser.open('https://example.invalid')\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_library_loader_member_overwrites_instance_local(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    safe_loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    safe_loader.payload = len\n"
+            b"    other_loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    return other_loader.payload\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_restores_dynamic_member_risk_after_delete(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    import webbrowser\n"
+            b"    browser = webbrowser.get()\n"
+            b"    browser.open = len\n"
+            b"    del browser.open\n"
+            b"    browser.open('https://example.invalid')\n"
+            b"    ctypes.cdll.payload = len\n"
+            b"    del ctypes.cdll.payload\n"
+            b"    return ctypes.cdll.payload\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        patterns = {finding.pattern for finding in findings if finding.type == "code_execution_pattern"}
+        assert "Web browser launch detected" in patterns
+        assert "Native library loading detected" in patterns
+
+    def test_scan_model_detects_ctypes_cdll_subclass_class_local_initializer_alias(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    class MyCDLL(ctypes.CDLL):\n"
+            b"        init = ctypes.CDLL.__init__\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            self.init(name)\n"
+            b"    return ctypes.LibraryLoader(MyCDLL).payload\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_unreachable_ctypes_cdll_subclass_initializer(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    class SafeCDLL(ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            if False:\n"
+            b"                super().__init__(name)\n"
+            b"    return ctypes.LibraryLoader(SafeCDLL).payload\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
     @pytest.mark.parametrize(
         ("payload", "expected_pattern"),
         [
