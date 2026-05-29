@@ -596,6 +596,13 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "loader_method = ctypes.LibraryLoader(ctypes.CDLL)\n"
         "loader_method.LoadLibrary('methodlib')\n"
         "loader_method.__getitem__('getitemlib')\n"
+        "loader_variable = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "library_name = 'variablelib'\n"
+        "loader_variable.LoadLibrary(library_name)\n"
+        "loader_variable.__getitem__(library_name)\n"
+        "class MyCDLL(ctypes.CDLL):\n"
+        "    pass\n"
+        "ctypes.LibraryLoader(MyCDLL).subclasslib\n"
         "getattr(ctypes.windll, 'user32')\n"
         "ctypes.windll.__getattr__('advapi32')\n"
         "getattr(ctypes.LibraryLoader(ctypes.CDLL), 'attrlib')\n"
@@ -622,6 +629,8 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.LibraryLoader.aliaslib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.methodlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.getitemlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.<dynamic>" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.subclasslib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.attrlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.user32" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.advapi32" in checks_by_rule["S110"].details["reason"]
@@ -767,6 +776,8 @@ def test_scan_zip_preserves_dynamic_member_risk_after_conditional_overwrite(tmp_
         "import ctypes\nload = ctypes.cdll.LoadLibrary\nname = load.__name__\n",
         "import ctypes\nname = ctypes.LibraryLoader.payload\n",
         "import ctypes\nctypes.LibraryLoader = len\nctypes.LibraryLoader(ctypes.CDLL).payload\n",
+        "import ctypes\nctypes.windll.kernel32 = len\ngetattr(ctypes.windll, 'kernel32')\n",
+        "import ctypes\nctypes.windll.kernel32 = len\nctypes.windll.__getattr__('kernel32')\n",
     ],
 )
 def test_scan_zip_ignores_benign_namespace_mapping_call(tmp_path: Path, source: str) -> None:

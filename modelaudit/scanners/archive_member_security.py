@@ -102,6 +102,7 @@ _WEBBROWSER_LAUNCH_CALLS = frozenset(
 _WEBBROWSER_CONTROLLER_FACTORIES = frozenset({"webbrowser.get"})
 _WEBBROWSER_CONTROLLER_LAUNCH_METHODS = frozenset({"open", "open_new", "open_new_tab"})
 _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT = "ctypes.LibraryLoader.__instance__"
+_CTYPES_DYNAMIC_LIBRARY_NAME = "<dynamic>"
 _CTYPES_LIBRARY_LOADER_OBJECTS = frozenset(
     {
         _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT,
@@ -127,6 +128,7 @@ _CTYPES_LIBRARY_LOADER_TYPE_ALIASES = frozenset(
     for loader_root in _CTYPES_LIBRARY_LOADER_OBJECTS
     if loader_root != _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT
 )
+_CTYPES_LIBRARY_LOADER_VALID_TYPES = _CTYPES_LIBRARY_LOADER_TYPES | _CTYPES_LIBRARY_LOADER_TYPE_ALIASES
 _CTYPES_NATIVE_LIBRARY_LOADING_CALLS = frozenset(
     {
         "ctypes.CDLL",
@@ -577,6 +579,26 @@ def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str]
     return frozenset({call_name})
 
 
+def _apply_aliases_to_names(names: frozenset[str], alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    resolved_names: set[str] = set()
+    for name in names:
+        aliases = _apply_aliases(name, alias_scopes)
+        if aliases is not None:
+            resolved_names.update(aliases)
+    return frozenset(resolved_names) or None
+
+
+def _canonical_ctypes_loader_type_aliases(names: frozenset[str] | None) -> frozenset[str]:
+    if names is None:
+        return frozenset()
+    loader_types = names & _CTYPES_LIBRARY_LOADER_TYPES
+    if loader_types:
+        return loader_types
+    if names & _CTYPES_LIBRARY_LOADER_TYPE_ALIASES:
+        return frozenset({"ctypes.CDLL"})
+    return frozenset()
+
+
 def _normalize_implicit_builtins_names(
     names: frozenset[str] | None, alias_scopes: _AliasScopes
 ) -> frozenset[str] | None:
@@ -680,7 +702,10 @@ def _resolve_getattr_call_names(
         attr_name = _resolve_static_string(node.args[1])
         if resolved_target_roots is None or attr_name is None:
             return None
-        return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
+        return _apply_aliases_to_names(
+            frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots),
+            alias_scopes,
+        )
 
     accessor_names = frozenset(
         normalized_helper_name.rsplit(".", maxsplit=1)[0]
@@ -693,7 +718,10 @@ def _resolve_getattr_call_names(
         attr_name = _resolve_static_string(node.args[0])
         if attr_name is None:
             return None
-        return frozenset(f"{target_root}.{attr_name}" for target_root in accessor_names)
+        return _apply_aliases_to_names(
+            frozenset(f"{target_root}.{attr_name}" for target_root in accessor_names),
+            alias_scopes,
+        )
 
     if not (normalized_helper_names & {"getattr", "builtins.getattr"}):
         return None
@@ -721,7 +749,10 @@ def _resolve_getattr_call_names(
     )
     if resolved_target_roots is None:
         return None
-    return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
+    return _apply_aliases_to_names(
+        frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots),
+        alias_scopes,
+    )
 
 
 def _resolve_namespace_mapping_roots(
@@ -1189,9 +1220,7 @@ def _resolve_ctypes_library_loader_instance_roots(
             allow_module_locals_mapping=allow_module_locals_mapping,
             allow_local_namespace_mapping=allow_local_namespace_mapping,
         )
-        if resolved_loader_types is None or not (
-            resolved_loader_types & (_CTYPES_LIBRARY_LOADER_TYPES | _CTYPES_LIBRARY_LOADER_TYPE_ALIASES)
-        ):
+        if not _canonical_ctypes_loader_type_aliases(resolved_loader_types):
             return None
         loader_roots.add(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT)
     if len(node.args) == 1 and not node.keywords:
@@ -1201,8 +1230,8 @@ def _resolve_ctypes_library_loader_instance_roots(
             root_name, separator, method_name = stripped_func_name.rpartition(".")
             if not separator or root_name not in _CTYPES_LIBRARY_LOADER_OBJECTS:
                 continue
-            if library_name is not None and method_name in {"__getitem__", "LoadLibrary"}:
-                loader_roots.add(f"{root_name}.{library_name}")
+            if method_name in {"__getitem__", "LoadLibrary"}:
+                loader_roots.add(f"{root_name}.{library_name or _CTYPES_DYNAMIC_LIBRARY_NAME}")
     return frozenset(loader_roots) or None
 
 
@@ -1786,6 +1815,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self._bind_name(node.name, None)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        ctypes_loader_type_aliases = frozenset(
+            alias
+            for base in node.bases
+            for alias in _canonical_ctypes_loader_type_aliases(self._resolve_reference_names(base))
+        )
         for decorator in node.decorator_list:
             self.visit(decorator)
         for base in node.bases:
@@ -1793,7 +1827,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for keyword in node.keywords:
             self.visit(keyword)
         self._visit_class_scope(node.body)
-        self._bind_name(node.name, None)
+        self._bind_name(node.name, ctypes_loader_type_aliases or None)
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         for default in [*node.args.defaults, *node.args.kw_defaults]:
