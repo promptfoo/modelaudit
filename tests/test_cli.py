@@ -1,3 +1,4 @@
+import importlib
 import json
 import os
 import re
@@ -15,6 +16,7 @@ from modelaudit.cache.trusted_config_store import TrustedConfigStore
 from modelaudit.cli import _summarize_progress_tree, cli, expand_paths, format_text_output
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.cli_output import parse_click_json_output
 
 
@@ -208,7 +210,7 @@ def test_scan_does_not_auto_load_untrusted_local_config(tmp_path: Path) -> None:
 
 
 def test_scan_json_subprocess_separates_logs_from_stdout_for_findings(tmp_path: Path) -> None:
-    """Real process execution should keep JSON stdout parseable even when findings are logged."""
+    """Real process execution keeps JSON parseable without leaking finding payloads to logs."""
     import tarfile
 
     model_file = tmp_path / "evil.tar"
@@ -228,7 +230,8 @@ def test_scan_json_subprocess_separates_logs_from_stdout_for_findings(tmp_path: 
     assert completed.stdout.lstrip().startswith("{")
     output_payload = json.loads(completed.stdout)
     assert any(issue.get("rule_code") == "S405" for issue in output_payload.get("issues", []))
-    assert "[S405]" in completed.stderr
+    assert "Security finding recorded" in completed.stderr
+    assert "../evil.txt" not in completed.stderr
 
 
 def test_scan_json_subprocess_single_skipped_file_keeps_stdout_parseable(tmp_path: Path) -> None:
@@ -250,6 +253,37 @@ def test_scan_json_subprocess_single_skipped_file_keeps_stdout_parseable(tmp_pat
     output_payload = json.loads(completed.stdout)
     assert output_payload["files_scanned"] == 0
     assert output_payload["issues"] == []
+
+
+def test_scan_json_subprocess_scans_tensorflow_metagraph_named_python(tmp_path: Path) -> None:
+    """Content-routed binary model files must bypass explicit-path Python skipping."""
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    node = metagraph.graph_def.node.add()
+    node.name = "pyfunc_node"
+    node.op = "PyFunc"
+    payload = tmp_path / "payload.py"
+    payload.write_bytes(metagraph.SerializeToString())
+
+    env = {**os.environ, "PROMPTFOO_DISABLE_TELEMETRY": "1"}
+    completed = subprocess.run(
+        [sys.executable, "-m", "modelaudit", "scan", str(payload), "--format", "json", "--no-cache"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert completed.returncode == 1
+    output_payload = json.loads(completed.stdout)
+    assert output_payload["files_scanned"] == 1
+    assert "tf_metagraph" in output_payload["scanner_names"]
+    assert any(issue["message"] == "Dangerous TensorFlow operation: PyFunc" for issue in output_payload["issues"])
 
 
 def test_scan_json_subprocess_mixed_directory_keeps_stdout_parseable(tmp_path: Path) -> None:

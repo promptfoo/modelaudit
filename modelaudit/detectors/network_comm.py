@@ -5,11 +5,420 @@ that could be used for data exfiltration or command & control operations.
 """
 
 import ipaddress
+import math
 import re
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import suppress
 from typing import Any, ClassVar
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
+
+_REDACTED_PATH_TOKEN = "<redacted>"
+_URL_IN_TEXT_PATTERN = re.compile(
+    r"(?:https?|ftp|ftps|ssh|telnet|ws|wss|s3|gs|az|wasbs?|abfss?)://[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+",
+    re.IGNORECASE,
+)
+_SENSITIVE_PATH_TOKEN_PATTERN = re.compile(
+    r"(?i)^(?:"
+    r"AKIA[0-9A-Z]{16}|"
+    r"gh[ps]_[A-Za-z0-9]{36}|"
+    r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|"
+    r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_.+/=-]*|"
+    r"sk-(?:proj-)?[A-Za-z0-9]{24,}|"
+    r"xox[baprs]-[0-9A-Za-z-]{20,}"
+    r")$"
+)
+_HEX_PATH_TOKEN_PATTERN = re.compile(r"(?i)^[a-f0-9]{32,}$")
+_PATH_TOKEN_CHARACTER_CLASS_PATTERNS = (
+    re.compile(r"[a-z]"),
+    re.compile(r"[A-Z]"),
+    re.compile(r"\d"),
+    re.compile(r"[._~+/=\-]"),
+)
+_ARTIFACT_FILENAME_PATTERN = re.compile(r"(?i)^.+\.[a-z0-9]{1,20}$")
+_KNOWN_ARTIFACT_FILENAME_EXTENSIONS = frozenset(
+    {
+        "bin",
+        "ckpt",
+        "gguf",
+        "h5",
+        "hdf5",
+        "index",
+        "json",
+        "jsonl",
+        "md",
+        "mlmodel",
+        "npy",
+        "npz",
+        "onnx",
+        "pb",
+        "pickle",
+        "pkl",
+        "pt",
+        "pth",
+        "safetensors",
+        "tflite",
+        "txt",
+        "yaml",
+        "yml",
+    }
+)
+_TRAILING_PATH_DELIMITERS = ".,;:)]}'\""
+_URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>`()"
+_PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
+_MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
+_MAX_URL_TEXT_LOOKUP_BYTES = 4096
+_MAX_SNIPPET_URL_EXPANSION_BYTES = 4096
+_MIN_CAPABILITY_TOKEN_ENTROPY = 3.5
+_MIN_URLSAFE_FILENAME_STEM_ENTROPY = 4.0
+_PUBLIC_MODEL_REPOSITORY_HOSTS = frozenset({"huggingface.co", "hf.co"})
+_PUBLIC_MODEL_API_REPOSITORY_TYPES = frozenset({"datasets", "models", "spaces"})
+_PUBLIC_MODEL_REPOSITORY_MARKERS = frozenset({"blob", "resolve", "tree"})
+_PUBLIC_MODEL_REPOSITORY_PREFIXES = frozenset({"datasets", "spaces"})
+_PUBLIC_SOURCE_REPOSITORY_HOSTS = frozenset({"github.com", "www.github.com", "raw.githubusercontent.com"})
+_PATH_STYLE_CLOUD_HOSTS = frozenset({"s3.amazonaws.com", "storage.googleapis.com", "storage.cloud.google.com"})
+_S3_REGIONAL_HOST_PATTERN = re.compile(r"^s3[.-][a-z0-9-]+\.amazonaws\.com$")
+_AZURE_STORAGE_HOST_SUFFIXES = (".blob.core.windows.net", ".dfs.core.windows.net")
+_AZURE_AUTHORITY_CONTAINER_SCHEMES = frozenset({"wasb", "wasbs", "abfs", "abfss"})
+_AZURE_CONTAINER_NAME_PATTERN = re.compile(r"^(?:\$root|[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?)$")
+
+
+def _split_trailing_path_delimiters(segment: str) -> tuple[str, str]:
+    stripped = segment.rstrip(_TRAILING_PATH_DELIMITERS)
+    return stripped, segment[len(stripped) :]
+
+
+def _split_path_token_boundary(decoded: str) -> tuple[str, str] | None:
+    match = _PATH_TOKEN_BOUNDARY_PATTERN.search(decoded)
+    if match is None or match.start() == 0:
+        return None
+    return decoded[: match.start()], decoded[match.start() :]
+
+
+def _shannon_entropy_per_char(value: str) -> float:
+    counts = Counter(value)
+    length = len(value)
+    return -sum((count / length) * math.log2(count / length) for count in counts.values())
+
+
+def _looks_like_high_entropy_filename_stem(stem: str) -> bool:
+    if len(stem) < 20 or not re.fullmatch(r"[A-Za-z0-9_-]+", stem):
+        return False
+
+    character_classes = sum(bool(pattern.search(stem)) for pattern in _PATH_TOKEN_CHARACTER_CLASS_PATTERNS[:3])
+    if re.search(r"[-_]", stem) and not re.search(r"[A-Z]", stem):
+        return character_classes >= 2 and _shannon_entropy_per_char(stem) >= _MIN_URLSAFE_FILENAME_STEM_ENTROPY
+
+    return character_classes >= 2 and _shannon_entropy_per_char(stem) >= _MIN_CAPABILITY_TOKEN_ENTROPY
+
+
+def _redact_known_token_filename(segment: str) -> str | None:
+    token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+    decoded = unquote(token_candidate)
+    if not _ARTIFACT_FILENAME_PATTERN.fullmatch(decoded):
+        return None
+
+    stem, separator, suffix = decoded.rpartition(".")
+    if separator and (
+        _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(stem)
+        or (suffix.lower() in _KNOWN_ARTIFACT_FILENAME_EXTENSIONS and _looks_like_high_entropy_filename_stem(stem))
+    ):
+        return f"{_REDACTED_PATH_TOKEN}.{suffix}{trailing_delimiters}"
+    return None
+
+
+def _looks_like_known_artifact_filename(decoded: str) -> bool:
+    if not _ARTIFACT_FILENAME_PATTERN.fullmatch(decoded):
+        return False
+
+    _stem, separator, suffix = decoded.rpartition(".")
+    return bool(separator and suffix.lower() in _KNOWN_ARTIFACT_FILENAME_EXTENSIONS)
+
+
+def _looks_like_capability_path_token(segment: str) -> bool:
+    token_candidate, _trailing_delimiters = _split_trailing_path_delimiters(segment)
+    decoded = unquote(token_candidate)
+    if "/" in decoded:
+        return any(_looks_like_capability_path_token(part) for part in decoded.split("/") if part)
+    if ":" in decoded:
+        return any(_looks_like_capability_path_token(part) for part in decoded.split(":") if part)
+    boundary_parts = _split_path_token_boundary(decoded)
+    if boundary_parts is not None:
+        prefix, _suffix = boundary_parts
+        return _looks_like_capability_path_token(prefix)
+    if _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(decoded):
+        return True
+    if _redact_known_token_filename(segment) is not None:
+        return True
+
+    if _looks_like_known_artifact_filename(decoded):
+        return False
+    if len(decoded) < 20:
+        return False
+    if _HEX_PATH_TOKEN_PATTERN.fullmatch(decoded):
+        return _shannon_entropy_per_char(decoded) >= _MIN_CAPABILITY_TOKEN_ENTROPY
+    invalid_character_match = re.search(r"[^A-Za-z0-9._~+/=\-]", decoded)
+    if invalid_character_match is not None:
+        prefix = decoded[: invalid_character_match.start()]
+        return bool(prefix and _looks_like_capability_path_token(prefix))
+
+    character_classes = sum(bool(pattern.search(decoded)) for pattern in _PATH_TOKEN_CHARACTER_CLASS_PATTERNS)
+    return character_classes >= 2 and _shannon_entropy_per_char(decoded) >= _MIN_CAPABILITY_TOKEN_ENTROPY
+
+
+def _redact_encoded_path_separator_tokens(segment: str) -> str | None:
+    token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+    decoded = unquote(token_candidate)
+    if "/" not in decoded:
+        return None
+
+    parts = decoded.split("/")
+    if (
+        len(parts) > 1
+        and all(re.fullmatch(r"=*", part) for part in parts[1:])
+        and parts[0]
+        and _looks_like_capability_path_token(parts[0])
+    ):
+        return f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+
+    changed = False
+    for index, part in enumerate(parts):
+        if part and _looks_like_capability_path_token(part):
+            parts[index] = _REDACTED_PATH_TOKEN
+            changed = True
+
+    if not changed:
+        return None
+    if any(part and part != _REDACTED_PATH_TOKEN and not _looks_like_known_artifact_filename(part) for part in parts):
+        return f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+    return f"{'%2F'.join(parts)}{trailing_delimiters}"
+
+
+def _redact_colon_delimited_path_tokens(segment: str) -> str | None:
+    token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+    decoded = unquote(token_candidate)
+    if ":" not in decoded:
+        return None
+
+    parts = decoded.split(":")
+    changed = False
+    for index, part in enumerate(parts):
+        if part and _looks_like_capability_path_token(part):
+            parts[index] = _REDACTED_PATH_TOKEN
+            changed = True
+
+    if not changed:
+        return None
+    return f"{':'.join(parts)}{trailing_delimiters}"
+
+
+def _redact_boundary_component(component: str) -> tuple[str, bool]:
+    if not component:
+        return component, False
+
+    key, separator, value = component.partition("=")
+    if separator:
+        changed = False
+        if key and _looks_like_capability_path_token(key):
+            key = _REDACTED_PATH_TOKEN
+            changed = True
+        if value and _looks_like_capability_path_token(value):
+            value = _REDACTED_PATH_TOKEN
+            changed = True
+        if changed:
+            return f"{key}{separator}{value}", True
+
+    if _looks_like_capability_path_token(component):
+        return _REDACTED_PATH_TOKEN, True
+    return component, False
+
+
+def _redact_boundary_delimited_path_tokens(segment: str) -> str | None:
+    token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+    decoded = unquote(token_candidate)
+    if _PATH_TOKEN_BOUNDARY_PATTERN.search(decoded) is None:
+        return None
+
+    changed = False
+    redacted_parts: list[str] = []
+    cursor = 0
+    for match in _PATH_TOKEN_BOUNDARY_PATTERN.finditer(decoded):
+        redacted_component, component_changed = _redact_boundary_component(decoded[cursor : match.start()])
+        redacted_parts.append(redacted_component)
+        redacted_parts.append(match.group())
+        changed = changed or component_changed
+        cursor = match.end()
+
+    redacted_component, component_changed = _redact_boundary_component(decoded[cursor:])
+    redacted_parts.append(redacted_component)
+    changed = changed or component_changed
+    if not changed:
+        return None
+    return f"{''.join(redacted_parts)}{trailing_delimiters}"
+
+
+def _is_public_model_repository_segment(hostname: str, segments: list[str], index: int) -> bool:
+    if hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS:
+        return False
+
+    path_segments = [segment.lower() for segment in segments[1:] if segment]
+    if len(path_segments) == 1:
+        return index == 1
+
+    has_repository_prefix = bool(path_segments and path_segments[0] in _PUBLIC_MODEL_REPOSITORY_PREFIXES)
+    repository_indexes = {1, 2, 3} if has_repository_prefix else {1, 2}
+    if len(path_segments) == len(repository_indexes):
+        return index in repository_indexes
+
+    if not any(segment.lower() in _PUBLIC_MODEL_REPOSITORY_MARKERS for segment in segments[index + 1 :]):
+        return False
+    return index in repository_indexes
+
+
+def _is_public_model_api_repository_segment(hostname: str, segments: list[str], index: int) -> bool:
+    if hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS or len(segments) < 4:
+        return False
+    if segments[1].lower() != "api" or segments[2].lower() not in _PUBLIC_MODEL_API_REPOSITORY_TYPES:
+        return False
+    return index in {3, 4}
+
+
+def _is_public_model_revision_segment(hostname: str, segments: list[str], index: int) -> bool:
+    if hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS or index == 0:
+        return False
+    return segments[index - 1].lower() in _PUBLIC_MODEL_REPOSITORY_MARKERS
+
+
+def _is_public_source_repository_segment(hostname: str, segments: list[str], index: int) -> bool:
+    if hostname not in _PUBLIC_SOURCE_REPOSITORY_HOSTS or index not in {1, 2}:
+        return False
+    if len(segments) <= 3:
+        return False
+    if hostname == "raw.githubusercontent.com":
+        return True
+    return any(segment.lower() in {"blob", "raw", "releases", "tree"} for segment in segments[3:])
+
+
+def _is_public_source_ref_segment(hostname: str, segments: list[str], index: int) -> bool:
+    if hostname not in _PUBLIC_SOURCE_REPOSITORY_HOSTS:
+        return False
+    if hostname == "raw.githubusercontent.com":
+        return index == 3 and len(segments) > 4
+    if len(segments) <= 4:
+        return False
+
+    route = segments[3].lower()
+    if route in {"blob", "raw", "tree"}:
+        return index == 4
+    return route == "releases" and len(segments) > 5 and segments[4].lower() == "download" and index == 5
+
+
+def _is_path_style_cloud_bucket_segment(scheme: str, hostname: str, index: int) -> bool:
+    if index != 1:
+        return False
+    if hostname in _PATH_STYLE_CLOUD_HOSTS or _S3_REGIONAL_HOST_PATTERN.fullmatch(hostname) is not None:
+        return True
+    return scheme in {"http", "https"} and hostname.endswith(_AZURE_STORAGE_HOST_SUFFIXES)
+
+
+def _is_gcs_api_bucket_segment(hostname: str, segments: list[str], index: int) -> bool:
+    if hostname != "storage.googleapis.com" or index == 0 or segments[index - 1].lower() != "b":
+        return False
+
+    route = [segment.lower() for segment in segments[1 : index - 1] if segment]
+    return route in (["storage", "v1"], ["download", "storage", "v1"])
+
+
+def _is_azure_authority_container(container: str) -> bool:
+    decoded = unquote(container)
+    return decoded == container and _AZURE_CONTAINER_NAME_PATTERN.fullmatch(container) is not None
+
+
+def _redact_path_parameter_tokens(segment: str) -> str | None:
+    token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+    decoded = unquote(token_candidate)
+    if _MATRIX_PARAMETER_SEPARATOR_PATTERN.search(decoded) is None:
+        return None
+
+    parts = _MATRIX_PARAMETER_SEPARATOR_PATTERN.split(decoded)
+    changed = False
+    if parts[0] and _looks_like_capability_path_token(parts[0]):
+        parts[0] = _REDACTED_PATH_TOKEN
+        changed = True
+
+    for index, part in enumerate(parts[1:], start=1):
+        if not part:
+            continue
+        if "=" not in part:
+            if _looks_like_capability_path_token(part):
+                parts[index] = _REDACTED_PATH_TOKEN
+                changed = True
+            continue
+        key, value = part.split("=", 1)
+        if _looks_like_capability_path_token(key):
+            key = _REDACTED_PATH_TOKEN
+            changed = True
+        if _looks_like_capability_path_token(value):
+            value = _REDACTED_PATH_TOKEN
+            changed = True
+        parts[index] = f"{key}={value}"
+
+    if changed:
+        return f"{';'.join(parts)}{trailing_delimiters}"
+    return None
+
+
+def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
+    segments = path.split("/")
+    for index, segment in enumerate(segments):
+        if not segment:
+            continue
+        is_slack_webhook_secret = (
+            hostname == "hooks.slack.com" and len(segments) > 2 and segments[1].lower() == "services" and index > 1
+        )
+        filename_redaction = _redact_known_token_filename(segment)
+        if filename_redaction is not None:
+            segments[index] = filename_redaction
+            continue
+        if _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(unquote(_split_trailing_path_delimiters(segment)[0])):
+            _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+            segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+            continue
+        encoded_separator_redaction = _redact_encoded_path_separator_tokens(segment)
+        if encoded_separator_redaction is not None:
+            segments[index] = encoded_separator_redaction
+            continue
+        colon_redaction = _redact_colon_delimited_path_tokens(segment)
+        if colon_redaction is not None:
+            segments[index] = colon_redaction
+            continue
+        boundary_redaction = _redact_boundary_delimited_path_tokens(segment)
+        if boundary_redaction is not None:
+            segments[index] = boundary_redaction
+            continue
+        parameter_redaction = _redact_path_parameter_tokens(segment)
+        if parameter_redaction is not None:
+            segments[index] = parameter_redaction
+            continue
+
+        if _is_public_model_repository_segment(hostname, segments, index):
+            continue
+        if _is_public_model_api_repository_segment(hostname, segments, index):
+            continue
+        if _is_public_model_revision_segment(hostname, segments, index):
+            continue
+        if _is_public_source_repository_segment(hostname, segments, index):
+            continue
+        if _is_public_source_ref_segment(hostname, segments, index):
+            continue
+        if _is_path_style_cloud_bucket_segment(scheme, hostname, index):
+            continue
+        if _is_gcs_api_bucket_segment(hostname, segments, index):
+            continue
+        if is_slack_webhook_secret or _looks_like_capability_path_token(segment):
+            _token_candidate, trailing_delimiters = _split_trailing_path_delimiters(segment)
+            segments[index] = f"{_REDACTED_PATH_TOKEN}{trailing_delimiters}"
+    return "/".join(segments)
 
 
 def _redact_url_for_finding(url: str) -> str:
@@ -32,8 +441,99 @@ def _redact_url_for_finding(url: str) -> str:
     except ValueError:
         port = None
 
-    netloc = f"{hostname}:{port}" if port is not None else hostname
-    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    netloc_host = f"{hostname}:{port}" if port is not None else hostname
+    netloc = netloc_host
+    scheme = parsed.scheme.lower()
+    if scheme in _AZURE_AUTHORITY_CONTAINER_SCHEMES and "@" in parsed.netloc:
+        container, _separator, _host = parsed.netloc.rpartition("@")
+        if _is_azure_authority_container(container):
+            netloc = f"{container}@{netloc_host}"
+
+    safe_path = _redact_url_path_tokens(scheme, hostname.lower(), parsed.path)
+    return urlunsplit((parsed.scheme, netloc, safe_path, "", ""))
+
+
+def _redact_urls_in_text(text: str) -> str:
+    return _URL_IN_TEXT_PATTERN.sub(lambda match: _redact_url_for_finding(match.group()), text)
+
+
+def _bounded_url_start_before_match(data: bytes, match_start: int, scan_start: int) -> int | None:
+    scheme_marker = data.rfind(b"://", scan_start, match_start)
+    if scheme_marker < 0:
+        return None
+
+    url_start = scheme_marker
+    while url_start > scan_start and data[url_start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
+        url_start -= 1
+    return url_start
+
+
+def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *, before: int, after: int) -> str:
+    start = max(0, match_start - before)
+    end = min(len(data), match_end + after)
+    scan_start = max(0, start - _MAX_SNIPPET_URL_EXPANSION_BYTES)
+    scan_end = min(len(data), end + _MAX_SNIPPET_URL_EXPANSION_BYTES)
+
+    url_start = _bounded_url_start_before_match(data, match_start, scan_start)
+    if url_start is not None:
+        start = min(start, url_start)
+        url_end = match_end
+        while url_end < scan_end and data[url_end] not in _URL_TEXT_BOUNDARY_BYTES:
+            url_end += 1
+        end = max(end, url_end)
+    else:
+        scheme_marker = data.find(b"://", match_end, min(len(data), match_end + after))
+        if scheme_marker >= 0:
+            url_start = scheme_marker
+            while url_start > scan_start and data[url_start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
+                url_start -= 1
+            url_end = scheme_marker + 3
+            while url_end < scan_end and data[url_end] not in _URL_TEXT_BOUNDARY_BYTES:
+                url_end += 1
+            start = min(start, url_start)
+            end = max(end, url_end)
+
+    return _redact_urls_in_text(data[start:end].decode("utf-8", errors="ignore"))
+
+
+def _url_text_containing_offset(data: bytes, offset: int) -> str | None:
+    scan_start = max(0, offset - _MAX_URL_TEXT_LOOKUP_BYTES)
+    scan_end = min(len(data), offset + _MAX_URL_TEXT_LOOKUP_BYTES)
+
+    start = offset
+    while start > scan_start and data[start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
+        start -= 1
+    if start == scan_start and start > 0 and data[start - 1] not in _URL_TEXT_BOUNDARY_BYTES:
+        return None
+
+    end = offset
+    while end < scan_end and data[end] not in _URL_TEXT_BOUNDARY_BYTES:
+        end += 1
+    if end == scan_end and end < len(data) and data[end] not in _URL_TEXT_BOUNDARY_BYTES:
+        return None
+
+    candidate = data[start:end]
+    if b"://" not in candidate:
+        return None
+    return candidate.decode("utf-8", errors="ignore")
+
+
+def _is_domain_match_redacted_from_url_path(data: bytes, match_start: int, domain: str) -> bool:
+    url = _url_text_containing_offset(data, match_start)
+    if url is None:
+        return False
+
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+
+    hostname = parsed.hostname
+    if not hostname or domain == hostname.lower():
+        return False
+    if domain not in parsed.path.lower():
+        return False
+    return domain not in _redact_url_for_finding(url).lower()
 
 
 _DOC_CONTEXT_EXTENSIONS: tuple[str, ...] = (
@@ -702,6 +1202,8 @@ class NetworkCommDetector:
             # Skip common false positives
             if domain in seen_domains:
                 continue
+            if _is_domain_match_redacted_from_url_path(data, match.start(), domain):
+                continue
             if domain.endswith((".pkl", ".pt", ".h5", ".pb", ".onnx", ".json")):
                 continue  # File extensions
             if domain in ["numpy.org", "pytorch.org", "tensorflow.org"]:
@@ -857,9 +1359,7 @@ class NetworkCommDetector:
                     continue
 
                 # Try to get some context around the function call
-                start = max(0, idx - 50)
-                end = min(len(data), idx + 100)
-                snippet = data[start:end].decode("utf-8", errors="ignore")
+                snippet = _redacted_snippet_for_match(data, idx, idx + len(func), before=50, after=100)
 
                 confidence = 0.6
                 severity = "HIGH"
@@ -890,10 +1390,7 @@ class NetworkCommDetector:
             if idx < 0:
                 continue
 
-            # Get context
-            start = max(0, idx - 30)
-            end = min(len(data), idx + len(pattern) + 30)
-            snippet = data[start:end].decode("utf-8", errors="ignore")
+            snippet = _redacted_snippet_for_match(data, idx, idx + len(pattern), before=30, after=30)
 
             confidence = 0.8
             severity = "CRITICAL"
@@ -1000,7 +1497,7 @@ class NetworkCommDetector:
                     printable_ratio = sum(c.isprintable() for c in context_str) / len(context_str)
 
                     if printable_ratio > 0.7:  # High ratio of printable characters
-                        matched_text = match.group().decode("utf-8", errors="ignore")
+                        matched_text = _redact_urls_in_text(match.group().decode("utf-8", errors="ignore"))
                         self.findings.append(
                             {
                                 "type": "explicit_network_pattern",

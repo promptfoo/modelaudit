@@ -29,6 +29,8 @@ import sys
 import tempfile
 from typing import Any, ClassVar, cast
 
+from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
+from ..utils.file.detection import has_jax_json_checkpoint_structure
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
@@ -47,9 +49,33 @@ SUSPICIOUS_JSON_PATTERNS = [
 _INERT_JSON_SECURITY_PATHS: frozenset[tuple[str | int, ...]] = frozenset({("learner", "feature_names")})
 XGBOOST_DEFAULT_MAX_FILE_READ_SIZE = 256 * 1024 * 1024
 XGBOOST_JSON_ROUTING_CHUNK_BYTES = 64 * 1024
+XGBOOST_CONTENT_ROUTED_JSON_CONFIG_KEY = "_xgboost_content_routed_json"
 XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY = "_xgboost_content_routed_ubjson"
 _JSON_KEY_MAX_BYTES = 256
 _JSON_WHITESPACE_BYTES = frozenset(b" \t\r\n")
+_JSON_ROUTING_MAX_DEPTH = 64
+_XGBOOST_OVERLAP_STRONG_LEARNER_KEYS = frozenset(
+    {
+        "gradient_booster",
+        "learner_model_param",
+        "gbtree_model_param",
+        "tree_info",
+        "gbtree",
+        "gblinear",
+        "dart",
+    }
+)
+
+
+def configure_content_routed_json_scan(config: dict[str, Any], *, max_bytes: int) -> None:
+    """Route renamed JSON through XGBoost while preserving the tighter discovery bound."""
+    config[XGBOOST_CONTENT_ROUTED_JSON_CONFIG_KEY] = True
+    limits = [max_bytes]
+    for key in ("max_file_read_size", "max_file_size"):
+        value = config.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            limits.append(value)
+    config["max_file_read_size"] = min(limits)
 
 
 def _check_xgboost_available() -> bool:
@@ -168,6 +194,8 @@ def _json_file_has_xgboost_markers(path: str, max_bytes: int) -> bool:
                         continue
                     started_version_array = record_value_marker(byte, awaiting_value_for)
                     awaiting_value_for = None
+                    if found_version and found_learner:
+                        return True
                 else:
                     started_version_array = False
 
@@ -195,8 +223,12 @@ def _json_file_has_xgboost_markers(path: str, max_bytes: int) -> bool:
                     continue
 
                 if byte == ord("{"):
+                    if len(stack) >= _JSON_ROUTING_MAX_DEPTH:
+                        return False
                     stack.append(ord("}"))
                 elif byte == ord("["):
+                    if len(stack) >= _JSON_ROUTING_MAX_DEPTH:
+                        return False
                     stack.append(ord("]"))
                 elif byte in {ord("}"), ord("]")}:
                     if not stack or stack[-1] != byte:
@@ -208,6 +240,143 @@ def _json_file_has_xgboost_markers(path: str, max_bytes: int) -> bool:
                     expecting_key = True
 
     return False
+
+
+def _json_file_has_probable_xgboost_overlap_markers(path: str, max_bytes: int) -> bool:
+    """Find malformed XGBoost overlap markers without matching nested MXNet metadata."""
+    found_version = False
+    found_learner = False
+    found_strong_learner_key = False
+    bytes_read = 0
+    started = False
+    stack: list[int] = []
+    in_string = False
+    escaped = False
+    collecting_key = False
+    collecting_key_depth: int | None = None
+    key_overflow = False
+    raw_key = bytearray()
+    expecting_key = False
+    awaiting_colon = False
+    pending_key: str | None = None
+    pending_key_depth: int | None = None
+    awaiting_value_for: tuple[str, int] | None = None
+    learner_depth: int | None = None
+
+    with open(path, "rb") as f:
+        initial = f.read(3)
+        if initial != b"\xef\xbb\xbf":
+            f.seek(0)
+
+        while bytes_read < max_bytes:
+            chunk = f.read(min(XGBOOST_JSON_ROUTING_CHUNK_BYTES, max_bytes - bytes_read))
+            if not chunk:
+                break
+            bytes_read += len(chunk)
+
+            for byte in chunk:
+                opened_learner_object = False
+                if in_string:
+                    if collecting_key:
+                        if len(raw_key) < _JSON_KEY_MAX_BYTES:
+                            raw_key.append(byte)
+                        else:
+                            key_overflow = True
+
+                    if escaped:
+                        escaped = False
+                    elif byte == ord("\\"):
+                        escaped = True
+                    elif byte == ord('"'):
+                        in_string = False
+                        if collecting_key:
+                            pending_key = _decode_json_key(bytes(raw_key), key_overflow)
+                            pending_key_depth = collecting_key_depth
+                            awaiting_colon = True
+                            collecting_key = False
+                            collecting_key_depth = None
+                            key_overflow = False
+                            expecting_key = False
+                    continue
+
+                if not started:
+                    if byte in _JSON_WHITESPACE_BYTES:
+                        continue
+                    if byte != ord("{"):
+                        return False
+                    started = True
+                    stack.append(ord("}"))
+                    expecting_key = True
+                    continue
+
+                if awaiting_colon:
+                    if byte in _JSON_WHITESPACE_BYTES:
+                        continue
+                    if byte != ord(":") or pending_key is None or pending_key_depth is None:
+                        return False
+                    awaiting_value_for = (pending_key, pending_key_depth)
+                    pending_key = None
+                    pending_key_depth = None
+                    awaiting_colon = False
+                    expecting_key = False
+                    continue
+
+                if awaiting_value_for is not None:
+                    if byte in _JSON_WHITESPACE_BYTES:
+                        continue
+                    key, key_depth = awaiting_value_for
+                    if key_depth == 1:
+                        if key == "version":
+                            found_version = True
+                        elif key == "learner" and byte == ord("{"):
+                            found_learner = True
+                            learner_depth = len(stack) + 1
+                            opened_learner_object = True
+                    elif (
+                        learner_depth is not None
+                        and key_depth == learner_depth
+                        and key in _XGBOOST_OVERLAP_STRONG_LEARNER_KEYS
+                    ):
+                        found_strong_learner_key = True
+                    awaiting_value_for = None
+                    if found_version and found_learner and found_strong_learner_key:
+                        return True
+
+                if byte == ord('"'):
+                    if expecting_key and (
+                        len(stack) == 1 or (learner_depth is not None and len(stack) == learner_depth)
+                    ):
+                        collecting_key = True
+                        collecting_key_depth = len(stack)
+                        raw_key = bytearray(b'"')
+                    in_string = True
+                    escaped = False
+                    continue
+
+                if byte == ord("{"):
+                    if len(stack) >= _JSON_ROUTING_MAX_DEPTH:
+                        return False
+                    stack.append(ord("}"))
+                    if opened_learner_object:
+                        expecting_key = True
+                elif byte == ord("["):
+                    if len(stack) >= _JSON_ROUTING_MAX_DEPTH:
+                        return False
+                    stack.append(ord("]"))
+                elif byte in {ord("}"), ord("]")}:
+                    if not stack or stack[-1] != byte:
+                        return False
+                    if learner_depth is not None and len(stack) == learner_depth:
+                        learner_depth = None
+                    if len(stack) == 1:
+                        return found_version and found_learner and found_strong_learner_key
+                    stack.pop()
+                elif byte == ord(",") and (
+                    len(stack) == 1 or (learner_depth is not None and len(stack) == learner_depth)
+                ):
+                    expecting_key = True
+
+    return found_version and found_learner and found_strong_learner_key
 
 
 class XGBoostScanner(BaseScanner):
@@ -265,6 +434,7 @@ class XGBoostScanner(BaseScanner):
         "json_parse_failed": "xgboost_json_parse_failed",
         "json_analysis_failed": "xgboost_json_analysis_failed",
         "json_structure_invalid": "xgboost_json_structure_invalid",
+        "json_mxnet_overlap": "xgboost_mxnet_symbol_overlap",
         "ubj_dependency_missing": "xgboost_ubj_dependency_missing",
         "ubj_analysis_failed": "xgboost_ubj_analysis_failed",
         "ubj_array_limit_exceeded": "xgboost_ubj_array_limit_exceeded",
@@ -369,7 +539,28 @@ class XGBoostScanner(BaseScanner):
         return any(marker in probe for marker in cls._JSON_STRONG_MARKERS)
 
     @classmethod
-    def _is_xgboost_json(cls, path: str) -> bool:
+    def _is_probable_mxnet_overlap_candidate(cls, path: str, *, max_bytes: int | None = None) -> bool:
+        """Recognize probable XGBoost ownership using only top-level overlap fields."""
+        try:
+            return _json_file_has_probable_xgboost_overlap_markers(
+                path,
+                max_bytes or cls._JSON_PROBE_READ_BYTES,
+            )
+        except OSError:
+            return False
+
+    @classmethod
+    def _is_probable_parsed_mxnet_overlap(cls, data: dict[str, Any]) -> bool:
+        """Recognize a parsed malformed XGBoost model without matching MXNet metadata."""
+        learner = data.get("learner")
+        return (
+            "version" in data
+            and isinstance(learner, dict)
+            and any(key in learner for key in _XGBOOST_OVERLAP_STRONG_LEARNER_KEYS)
+        )
+
+    @classmethod
+    def _is_xgboost_json(cls, path: str, *, max_bytes: int | None = None) -> bool:
         """
         Bounded structural check for XGBoost JSON format.
 
@@ -384,7 +575,7 @@ class XGBoostScanner(BaseScanner):
         This matches what _validate_xgboost_json_schema() checks.
         """
         try:
-            return _json_file_has_xgboost_markers(path, cls.default_max_file_read_size)
+            return _json_file_has_xgboost_markers(path, max_bytes or cls.default_max_file_read_size)
         except OSError:
             return False
 
@@ -409,7 +600,9 @@ class XGBoostScanner(BaseScanner):
             # Hashing reads the model content and is part of available scan coverage.
             self.add_file_integrity_check(path, result)
 
-            if self.config.get(XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY) is True:
+            if self.config.get(XGBOOST_CONTENT_ROUTED_JSON_CONFIG_KEY) is True:
+                self._scan_json_model(path, result)
+            elif self.config.get(XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY) is True:
                 self._scan_ubj_model(path, result)
             elif file_ext == ".json":
                 self._scan_json_model(path, result)
@@ -445,10 +638,15 @@ class XGBoostScanner(BaseScanner):
 
     def _scan_json_model(self, path: str, result: ScanResult) -> None:
         """Scan XGBoost JSON model for security issues."""
+        from ..utils.file.detection import inspect_mxnet_symbol_root_keys
+
         file_size = os.path.getsize(path)
+        params_overlap_composed = self._compose_content_routed_mxnet_params_security(path, result)
 
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, "rb") as f:
+                duplicate_mxnet_root_keys = inspect_mxnet_symbol_root_keys(f)
+            with open(path, encoding="utf-8-sig") as f:
                 model_data = json.load(f)
 
             result.add_check(
@@ -459,11 +657,16 @@ class XGBoostScanner(BaseScanner):
                 details={"file_size": file_size},
             )
 
-            # Validate XGBoost JSON schema
-            self._validate_xgboost_json_schema(model_data, result, path)
-
-            # Check for suspicious content in JSON
-            self._check_json_for_malicious_content(model_data, result, path)
+            self.scan_parsed_json_security(path, model_data, result)
+            self._scan_filename_owned_json_overlap(path, result, model_data)
+            self._record_duplicate_mxnet_root_keys(duplicate_mxnet_root_keys, result, path)
+            self._record_mxnet_symbol_overlap(
+                model_data,
+                result,
+                path,
+                duplicate_mxnet_root_keys,
+                params_overlap_composed=params_overlap_composed,
+            )
 
         except json.JSONDecodeError as e:
             result.add_check(
@@ -476,6 +679,7 @@ class XGBoostScanner(BaseScanner):
                 why="Malformed JSON may indicate file corruption or crafted exploit",
             )
             self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["json_parse_failed"])
+            self._scan_filename_owned_json_overlap(path, result)
         except OSError as e:
             self._record_read_failure(path, result, e)
         except Exception as e:
@@ -488,6 +692,158 @@ class XGBoostScanner(BaseScanner):
                 details={"exception": str(e)},
             )
             self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["json_analysis_failed"])
+            self._scan_filename_owned_json_overlap(path, result)
+
+    def _compose_content_routed_mxnet_params_security(self, path: str, result: ScanResult) -> bool:
+        """Preserve raw params checks before JSON decoding can fail or shadow content."""
+        if self.config.get(XGBOOST_CONTENT_ROUTED_JSON_CONFIG_KEY) is not True:
+            return False
+        if os.path.splitext(path)[1].lower() != ".params":
+            return False
+
+        from .mxnet_scanner import MXNetScanner
+
+        scanner_selection = policy_from_config(self.config)
+        if scanner_selection.allows("mxnet"):
+            MXNetScanner(config=self.config).scan_params_file_security(path, result)
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "mxnet",
+                scanner_selection,
+                context="overlapping JSON analysis",
+            )
+        return True
+
+    def scan_parsed_json_security(self, path: str, data: dict[str, Any], result: ScanResult) -> None:
+        """Apply XGBoost JSON-specific security checks to an already parsed overlap."""
+        self._validate_xgboost_json_schema(data, result, path)
+        self._check_json_for_malicious_content(data, result, path)
+
+    def _merge_filename_owned_result(self, result: ScanResult, owner_result: ScanResult) -> None:
+        """Merge an owner scan without dropping existing incomplete-coverage reasons."""
+        existing_reasons = list(result.metadata.get("scan_outcome_reasons", []))
+        result.merge(owner_result)
+        for reason in existing_reasons:
+            self._mark_inconclusive_scan_result(result, reason)
+
+    def _scan_filename_owned_json_overlap(
+        self,
+        path: str,
+        result: ScanResult,
+        parsed_payload: object | None = None,
+    ) -> None:
+        """Preserve additional JSON analyses for XGBoost-shaped content."""
+        from .jax_checkpoint_scanner import JaxCheckpointScanner
+        from .jinja2_template_scanner import Jinja2TemplateScanner
+        from .manifest_scanner import ManifestScanner
+
+        scanner_selection = policy_from_config(self.config)
+        if parsed_payload is not None and has_jax_json_checkpoint_structure(parsed_payload):
+            if scanner_selection.allows("jax_checkpoint"):
+                self._merge_filename_owned_result(result, JaxCheckpointScanner(config=self.config).scan(path))
+            elif scanner_selection.active:
+                add_scanner_selection_skip_check(
+                    result,
+                    path,
+                    "jax_checkpoint",
+                    scanner_selection,
+                    context="overlapping JAX JSON analysis",
+                )
+        manifest_covered_templates = False
+        if ManifestScanner.can_handle(path):
+            if scanner_selection.allows("manifest"):
+                manifest_result = ManifestScanner(config=self.config).scan(path)
+                self._merge_filename_owned_result(result, manifest_result)
+                manifest_covered_templates = manifest_result.metadata.get("analysis_incomplete") is not True
+            elif scanner_selection.active:
+                add_scanner_selection_skip_check(
+                    result,
+                    path,
+                    "manifest",
+                    scanner_selection,
+                    context="overlapping manifest JSON analysis",
+                )
+        if not manifest_covered_templates and Jinja2TemplateScanner.can_handle(path):
+            if scanner_selection.allows("jinja2_template"):
+                self._merge_filename_owned_result(result, Jinja2TemplateScanner(config=self.config).scan(path))
+            elif scanner_selection.active:
+                add_scanner_selection_skip_check(
+                    result,
+                    path,
+                    "jinja2_template",
+                    scanner_selection,
+                    context="overlapping Jinja JSON analysis",
+                )
+
+    def _record_duplicate_mxnet_root_keys(self, duplicate_keys: set[str], result: ScanResult, path: str) -> None:
+        """Fail closed when JSON key shadowing can discard MXNet graph content."""
+        if not duplicate_keys:
+            return
+        reason = self._INCONCLUSIVE_REASONS["json_mxnet_overlap"]
+        result.add_check(
+            name="XGBoost / MXNet JSON Routing",
+            passed=False,
+            message="JSON model contains duplicate MXNet graph keys; shadowed graph content cannot be safely analyzed",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+                "duplicate_root_keys": sorted(duplicate_keys),
+            },
+        )
+        self._mark_inconclusive_scan_result(result, reason)
+
+    def _record_mxnet_symbol_overlap(
+        self,
+        data: object,
+        result: ScanResult,
+        path: str,
+        duplicate_root_keys: set[str] | None = None,
+        *,
+        params_overlap_composed: bool = False,
+    ) -> None:
+        """Run MXNet security checks and fail closed when JSON ownership overlaps."""
+        from ..utils.file.detection import has_mxnet_symbol_graph_structure
+        from .mxnet_scanner import MXNetScanner
+
+        is_mxnet_symbol = has_mxnet_symbol_graph_structure(data)
+        needs_params_byte_analysis = os.path.splitext(path)[1].lower() == ".params"
+        if not is_mxnet_symbol and not (duplicate_root_keys and needs_params_byte_analysis):
+            return
+
+        scanner_selection = policy_from_config(self.config)
+        if scanner_selection.allows("mxnet"):
+            mxnet_scanner = MXNetScanner(config=self.config)
+            if needs_params_byte_analysis and not params_overlap_composed:
+                mxnet_scanner.scan_params_file_security(path, result)
+            if is_mxnet_symbol:
+                mxnet_scanner.scan_parsed_symbol_security(path, cast(dict[str, Any], data), result)
+            analysis_message = "both static analyses ran but format ownership is ambiguous"
+        else:
+            if not params_overlap_composed:
+                add_scanner_selection_skip_check(
+                    result,
+                    path,
+                    "mxnet",
+                    scanner_selection,
+                    context="overlapping JSON analysis",
+                )
+            return
+        if not is_mxnet_symbol:
+            return
+        reason = self._INCONCLUSIVE_REASONS["json_mxnet_overlap"]
+        result.add_check(
+            name="XGBoost / MXNet JSON Routing",
+            passed=False,
+            message=(f"JSON model matches both XGBoost and MXNet contracts; {analysis_message}"),
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={"analysis_incomplete": True, "scan_outcome_reason": reason},
+        )
+        self._mark_inconclusive_scan_result(result, reason)
 
     def _scan_ubj_model(self, path: str, result: ScanResult) -> None:
         """Scan XGBoost UBJ (Universal Binary JSON) model for security issues."""
@@ -691,28 +1047,40 @@ class XGBoostScanner(BaseScanner):
         # Validate version
         version = data.get("version")
         if not isinstance(version, list | tuple) or len(version) < 2:
+            reason = self._INCONCLUSIVE_REASONS["json_structure_invalid"]
             result.add_check(
                 name="XGBoost Version Validation",
                 passed=False,
                 message=f"Invalid XGBoost version format: {version}",
                 severity=IssueSeverity.INFO,
                 location=path,
-                details={"version": version},
+                details={
+                    "version": version,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
+                },
                 why="Invalid version information may indicate file tampering",
             )
+            self._mark_inconclusive_scan_result(result, reason)
 
         # Validate learner structure
         learner = data.get("learner", {})
         if not isinstance(learner, dict):
+            reason = self._INCONCLUSIVE_REASONS["json_structure_invalid"]
             result.add_check(
                 name="Learner Structure Validation",
                 passed=False,
                 message="XGBoost learner section is not a dictionary",
                 severity=IssueSeverity.INFO,
                 location=path,
-                details={"learner_type": type(learner).__name__},
+                details={
+                    "learner_type": type(learner).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
+                },
                 why="Invalid learner structure may indicate malformed or malicious content",
             )
+            self._mark_inconclusive_scan_result(result, reason)
             return
 
         # Check learner parameters for sanity

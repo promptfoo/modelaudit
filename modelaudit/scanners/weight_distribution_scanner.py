@@ -7,7 +7,14 @@ import zipfile
 from contextlib import suppress
 from typing import Any, ClassVar
 
+from ..scanner_results import mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
+
+_ANALYSIS_INCONCLUSIVE_REASON = "weight_distribution_analysis_incomplete"
+_PATCHED_TORCH_WEIGHTS_ONLY_VERSION = (2, 6, 0)
+_TORCH_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?")
+_TORCH_PRERELEASE_MARKER_PATTERN = re.compile(r"(?i)^(?:a|b|c|rc|alpha|beta|pre|preview|dev)")
+_TORCH_STABLE_SUFFIX_PATTERN = re.compile(r"(?i)^post\d*(?:\+.*)?$")
 
 
 class WeightDistributionScanner(BaseScanner):
@@ -47,6 +54,9 @@ class WeightDistributionScanner(BaseScanner):
         # Flag set when weight extraction would be unsafe
         self.extraction_unsafe = False
         self.extraction_unsafe_reason: str | None = None
+        self.extraction_incomplete = False
+        self.extraction_incomplete_reasons: list[str] = []
+        self.extraction_incomplete_details: dict[str, Any] = {}
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -114,6 +124,9 @@ class WeightDistributionScanner(BaseScanner):
         # Reset flag before extraction
         self.extraction_unsafe = False
         self.extraction_unsafe_reason = None
+        self.extraction_incomplete = False
+        self.extraction_incomplete_reasons = []
+        self.extraction_incomplete_details = {}
 
         try:
             # Extract weights based on file format
@@ -146,18 +159,29 @@ class WeightDistributionScanner(BaseScanner):
                     return result
 
             if not weights_info:
-                message = "Failed to extract weights from model"
+                if self.extraction_incomplete:
+                    self._mark_analysis_incomplete(
+                        result,
+                        path,
+                        message="Model tensor analysis incomplete; no readable matching tensors were available.",
+                    )
+                    result.finish(success=False)
+                    return result
+
+                message = "No numeric model tensors available for distribution analysis"
                 severity = IssueSeverity.DEBUG
+                rule_code = None
                 if self.extraction_unsafe:
                     message = self.extraction_unsafe_reason or "Unsafe to extract weights from model"
                     severity = IssueSeverity.WARNING
+                    rule_code = "S801"
                 result.add_check(
                     name="Weight Extraction",
                     passed=False,
                     message=message,
                     severity=severity,
                     location=path,
-                    rule_code="S801",
+                    rule_code=rule_code,
                 )
                 result.finish(success=True)
                 return result
@@ -184,20 +208,92 @@ class WeightDistributionScanner(BaseScanner):
 
             result.bytes_scanned = file_size
 
+            if self.extraction_incomplete:
+                self._mark_analysis_incomplete(
+                    result,
+                    path,
+                    message="Model tensor analysis incomplete; one or more matching tensors could not be read.",
+                )
+                result.finish(success=False)
+                return result
+
         except Exception as e:
-            result.add_check(
-                name="Weight Distribution Analysis",
-                passed=False,
-                message=f"Error analyzing weight distributions: {e!s}",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+            self._mark_analysis_incomplete(
+                result,
+                path,
+                message="Model tensor analysis incomplete.",
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                },
             )
             result.finish(success=False)
             return result
 
         result.finish(success=True)
         return result
+
+    @staticmethod
+    def _torch_weights_only_is_patched_version(version: object) -> bool:
+        version_text = str(version).strip()
+        match = _TORCH_RELEASE_VERSION_PATTERN.match(version_text)
+        if not match:
+            return False
+
+        release = tuple(int(part or 0) for part in match.groups())
+        suffix = version_text[match.end() :].strip()
+        normalized_suffix = suffix.lstrip("._-")
+        if _TORCH_PRERELEASE_MARKER_PATTERN.match(normalized_suffix):
+            return False
+        if suffix and not suffix.startswith("+") and _TORCH_STABLE_SUFFIX_PATTERN.fullmatch(normalized_suffix) is None:
+            return False
+        return release >= _PATCHED_TORCH_WEIGHTS_ONLY_VERSION
+
+    def _record_extraction_incomplete(self, reason: str, **details: Any) -> None:
+        """Record incomplete tensor extraction while preserving already-read tensors."""
+        self.extraction_incomplete = True
+        if reason not in self.extraction_incomplete_reasons:
+            self.extraction_incomplete_reasons.append(reason)
+
+        for key, value in details.items():
+            if value is None:
+                continue
+            existing = self.extraction_incomplete_details.get(key)
+            if isinstance(existing, int) and isinstance(value, int):
+                self.extraction_incomplete_details[key] = existing + value
+            elif isinstance(existing, list):
+                if isinstance(value, list):
+                    existing.extend(value)
+                else:
+                    existing.append(value)
+            elif key in self.extraction_incomplete_details:
+                self.extraction_incomplete_details[key] = [existing, value]
+            else:
+                self.extraction_incomplete_details[key] = value
+
+    def _mark_analysis_incomplete(
+        self,
+        result: ScanResult,
+        path: str,
+        *,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        mark_inconclusive_scan_result(result, _ANALYSIS_INCONCLUSIVE_REASON)
+        result.add_check(
+            name="Weight Distribution Analysis",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "analysis_incomplete": True,
+                "scan_outcome_reason": _ANALYSIS_INCONCLUSIVE_REASON,
+                "extraction_incomplete_reasons": self.extraction_incomplete_reasons,
+                **self.extraction_incomplete_details,
+                **(details or {}),
+            },
+        )
 
     def _extract_pytorch_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from PyTorch model files"""
@@ -227,18 +323,14 @@ class WeightDistributionScanner(BaseScanner):
 
             if supports_weights_only:
                 load_kwargs["weights_only"] = True
-                version_match = re.match(r"^(\d+)\.(\d+)", str(torch_version))
-                is_patched_version = False
-                if version_match:
-                    major = int(version_match.group(1))
-                    minor = int(version_match.group(2))
-                    is_patched_version = (major, minor) >= (2, 6)
+                is_patched_version = self._torch_weights_only_is_patched_version(torch_version)
 
                 if not is_patched_version and not self.enable_unsafe_torch_load:
                     self.extraction_unsafe = True
                     self.extraction_unsafe_reason = (
-                        "Blocked torch.load: weights_only=True on PyTorch versions below 2.6 "
-                        "is vulnerable to RCE. Set enable_unsafe_torch_load=true to override."
+                        "Blocked torch.load: weights_only=True is only treated as safe on stable "
+                        "PyTorch 2.6.0 or newer. Prerelease, dev, and unknown versions may still "
+                        "be vulnerable to RCE. Set enable_unsafe_torch_load=true to override."
                     )
                     raise RuntimeError(self.extraction_unsafe_reason)
             elif not self.enable_unsafe_torch_load:
@@ -378,13 +470,31 @@ class WeightDistributionScanner(BaseScanner):
             with h5py.File(path, "r") as f:
                 # Navigate through the HDF5 structure to find weights
                 def extract_weights(name, obj):
-                    if isinstance(obj, h5py.Dataset) and ("kernel" in name or "weight" in name):
-                        weights_info[name] = np.array(obj)
+                    if (
+                        isinstance(obj, h5py.Dataset)
+                        and ("kernel" in name or "weight" in name)
+                        and np.issubdtype(obj.dtype, np.number)
+                    ):
+                        try:
+                            array = np.array(obj)
+                        except Exception as exc:
+                            logger.warning("Weight tensor '%s' could not be read from %s: %s", name, path, exc)
+                            self._record_extraction_incomplete(
+                                "keras_tensor_read_failed",
+                                failed_tensors=[name],
+                                tensor_read_failures=1,
+                                exception_type=type(exc).__name__,
+                            )
+                            return
+                        weights_info[name] = array
 
                 f.visititems(extract_weights)
 
         except Exception as e:
             logger.debug(f"Failed to extract weights from {path}: {e}")
+            if os.path.splitext(path)[1].lower() == ".keras" and zipfile.is_zipfile(path):
+                return {}
+            raise RuntimeError(f"Failed to extract Keras weights from {path}") from e
 
         return weights_info
 
@@ -412,8 +522,20 @@ class WeightDistributionScanner(BaseScanner):
                     for name, _shape in tf.train.list_variables(ckpt_prefix):
                         if "weight" not in name.lower() and "kernel" not in name.lower():
                             continue
-                        tensor = tf.train.load_variable(ckpt_prefix, name)
-                        array = np.array(tensor)
+                        try:
+                            tensor = tf.train.load_variable(ckpt_prefix, name)
+                            array = np.array(tensor)
+                        except Exception as exc:
+                            logger.warning(
+                                "TensorFlow weight variable '%s' could not be read from %s: %s", name, path, exc
+                            )
+                            self._record_extraction_incomplete(
+                                "tensorflow_tensor_read_failed",
+                                failed_tensors=[name],
+                                tensor_read_failures=1,
+                                exception_type=type(exc).__name__,
+                            )
+                            continue
                         if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
                             continue
                         # Only include 2D+ tensors for consistency with .pb file handling
@@ -460,7 +582,15 @@ class WeightDistributionScanner(BaseScanner):
                             max_tensor_bytes=self.max_array_size,
                         )
                     except Exception as exc:
-                        logger.debug("Skipping TensorFlow weight tensor %s: %s", node.name, exc)
+                        logger.warning(
+                            "TensorFlow weight tensor '%s' could not be decoded from %s: %s", node.name, path, exc
+                        )
+                        self._record_extraction_incomplete(
+                            "tensorflow_tensor_decode_failed",
+                            failed_tensors=[node.name],
+                            tensor_read_failures=1,
+                            exception_type=type(exc).__name__,
+                        )
                         continue
 
                     if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
@@ -469,6 +599,7 @@ class WeightDistributionScanner(BaseScanner):
                         weights_info[node.name] = array
         except Exception as e:
             logger.warning(f"Weight analysis incomplete for {path}: {e}")
+            raise RuntimeError(f"Failed to extract TensorFlow weights from {path}") from e
 
         return weights_info
 
@@ -500,24 +631,39 @@ class WeightDistributionScanner(BaseScanner):
             import numpy as np
 
             for initializer in model.graph.initializer:
-                if len(initializer.dims) >= 2:
-                    # Pre-check estimated byte size before materializing the
-                    # full array — avoids memory exhaustion on huge tensors.
-                    with suppress(Exception):
-                        _onnx_mapping = getattr(onnx, "mapping", None)
-                        if _onnx_mapping is not None and hasattr(_onnx_mapping, "TENSOR_TYPE_TO_NP_TYPE"):
-                            tensor_dtype = _onnx_mapping.TENSOR_TYPE_TO_NP_TYPE[initializer.data_type]
-                            estimated_size = int(np.prod(initializer.dims)) * np.dtype(tensor_dtype).itemsize
-                            if self.max_array_size and self.max_array_size > 0 and estimated_size > self.max_array_size:
-                                continue
+                if len(initializer.dims) < 2:
+                    continue
 
+                # Pre-check estimated byte size before materializing the
+                # full array — avoids memory exhaustion on huge tensors.
+                with suppress(Exception):
+                    _onnx_mapping = getattr(onnx, "mapping", None)
+                    if _onnx_mapping is not None and hasattr(_onnx_mapping, "TENSOR_TYPE_TO_NP_TYPE"):
+                        tensor_dtype = _onnx_mapping.TENSOR_TYPE_TO_NP_TYPE[initializer.data_type]
+                        estimated_size = int(np.prod(initializer.dims)) * np.dtype(tensor_dtype).itemsize
+                        if self.max_array_size and self.max_array_size > 0 and estimated_size > self.max_array_size:
+                            continue
+
+                try:
                     arr = onnx.numpy_helper.to_array(initializer)  # type: ignore[possibly-unresolved-reference]
-                    if self.max_array_size and self.max_array_size > 0 and arr.nbytes > self.max_array_size:
-                        continue
-                    weights_info[initializer.name] = arr
+                except Exception as exc:
+                    logger.warning(
+                        "ONNX weight initializer '%s' could not be read from %s: %s", initializer.name, path, exc
+                    )
+                    self._record_extraction_incomplete(
+                        "onnx_initializer_read_failed",
+                        failed_tensors=[initializer.name],
+                        tensor_read_failures=1,
+                        exception_type=type(exc).__name__,
+                    )
+                    continue
+                if self.max_array_size and self.max_array_size > 0 and arr.nbytes > self.max_array_size:
+                    continue
+                weights_info[initializer.name] = arr
 
         except Exception as e:
             logger.warning(f"Failed to extract ONNX weights from {path}: {e}")
+            raise RuntimeError(f"Failed to extract ONNX weights from {path}") from e
 
         return weights_info
 
@@ -538,6 +684,7 @@ class WeightDistributionScanner(BaseScanner):
 
         except Exception as e:
             logger.debug(f"Failed to extract weights from {path}: {e}")
+            raise RuntimeError(f"Failed to extract SafeTensors weights from {path}") from e
 
         return weights_info
 
