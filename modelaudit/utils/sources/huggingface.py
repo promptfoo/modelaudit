@@ -20,6 +20,10 @@ from .huggingface_paths import (
 
 logger = logging.getLogger(__name__)
 
+_HF_CONTENT_SNIFF_BYTES = 512
+_TFLITE_MAGIC_OFFSET = 4
+_TFLITE_MAGIC_BYTES = b"TFL3"
+
 __all__ = [
     "download_file_from_hf",
     "download_model",
@@ -54,6 +58,77 @@ def _build_extension_allow_patterns() -> list[str]:
     patterns = {f"*{ext}" for ext in extensions}
     patterns.update(f"**/*{ext}" for ext in extensions)
     return sorted(patterns)
+
+
+def _has_model_extension(filename: str, model_extensions: set[str]) -> bool:
+    return any(filename.endswith(ext) for ext in model_extensions)
+
+
+def _detect_huggingface_content_route_format(repo_id: str, filename: str) -> str | None:
+    """Return a content-routed model format for a remote file, if cheaply identifiable."""
+    try:
+        import requests
+        from huggingface_hub import hf_hub_url
+        from huggingface_hub.utils import build_hf_headers
+
+        file_url = hf_hub_url(repo_id=repo_id, filename=filename)
+        headers = build_hf_headers(
+            token=None,
+            headers={"Range": f"bytes=0-{_HF_CONTENT_SNIFF_BYTES - 1}"},
+        )
+        with requests.get(file_url, headers=headers, stream=True, timeout=30, allow_redirects=True) as response:
+            response.raise_for_status()
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=_HF_CONTENT_SNIFF_BYTES):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= _HF_CONTENT_SNIFF_BYTES:
+                    break
+        prefix = b"".join(chunks)[:_HF_CONTENT_SNIFF_BYTES]
+    except Exception as exc:
+        raise ValueError(
+            "Hugging Face selective filtering incomplete: unable to inspect skipped file "
+            f"{repo_id}/{filename}: {redact_huggingface_urls_in_text(str(exc))}"
+        ) from exc
+
+    if not prefix:
+        return None
+
+    from modelaudit.utils.file.detection import detect_format_from_magic_bytes
+
+    detected_format = detect_format_from_magic_bytes(
+        prefix[:4],
+        prefix[:8],
+        prefix[:16],
+        max(len(prefix), 1),
+        None,
+    )
+    if (
+        detected_format == "unknown"
+        and prefix[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + len(_TFLITE_MAGIC_BYTES)] == _TFLITE_MAGIC_BYTES
+    ):
+        return "tflite"
+    return None if detected_format == "unknown" else detected_format
+
+
+def _select_huggingface_model_files(repo_id: str, repo_files: list[str], model_extensions: set[str]) -> list[str]:
+    """Select extension-matching files plus bounded content-routed renamed model files."""
+    model_files = [filename for filename in repo_files if _has_model_extension(filename, model_extensions)]
+    selected_files = set(model_files)
+
+    for filename in repo_files:
+        if filename in selected_files:
+            continue
+        detected_format = _detect_huggingface_content_route_format(repo_id, filename)
+        if detected_format is None:
+            continue
+        model_files.append(filename)
+        selected_files.add(filename)
+
+    return model_files
 
 
 def _get_hf_cache_root() -> Path:
@@ -280,7 +355,9 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
 
         # Find model files in the repository (using centralized model extensions)
         model_extensions = _get_model_extensions()
-        model_files = [f for f in repo_files if any(f.endswith(ext) for ext in model_extensions)]
+        model_files = (
+            [] if repo_listing_failed else _select_huggingface_model_files(repo_id, repo_files, model_extensions)
+        )
 
         # Download strategy:
         # - When cache_dir is provided: Use local_dir to place files directly there (safer)
@@ -405,7 +482,7 @@ def download_model_streaming(
 
         # Filter for model files
         model_extensions = _get_model_extensions()
-        model_files = [f for f in repo_files if any(f.endswith(ext) for ext in model_extensions)]
+        model_files = _select_huggingface_model_files(repo_id, repo_files, model_extensions)
 
         if not model_files:
             # Fallback: download all files if no recognized extensions found

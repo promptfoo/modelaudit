@@ -1,5 +1,6 @@
 """Tests for HuggingFace URL handling."""
 
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -21,6 +22,23 @@ from modelaudit.utils.sources.huggingface import (
     parse_huggingface_url,
     redact_huggingface_url_for_display,
 )
+
+
+class _FakeRangeResponse:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+    def __enter__(self) -> "_FakeRangeResponse":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_content(self, chunk_size: int) -> Iterator[bytes]:
+        yield self.payload[:chunk_size]
 
 
 class TestHuggingFaceURLDetection:
@@ -358,12 +376,73 @@ class TestModelDownload:
         assert error is None
         mock_repo_info.assert_called_once_with("test/model", timeout=7, files_metadata=False)
 
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "evil.payload", "preview.png"], None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_includes_content_routed_skipped_file(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Selective snapshot downloads should include renamed content-routed model files."""
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "pytorch_model.bin").write_bytes(b"weights")
+        (download_path / "evil.payload").write_bytes(b"\x08\x00\x00\x00TFL3" + b"\x00" * 16)
+        mock_snapshot_download.return_value = str(download_path)
+
+        def get_side_effect(url: str, **_kwargs: object) -> _FakeRangeResponse:
+            if url.endswith("/evil.payload"):
+                return _FakeRangeResponse(b"\x08\x00\x00\x00TFL3" + b"\x00" * 16)
+            return _FakeRangeResponse(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+
+        mock_requests_get.side_effect = get_side_effect
+
+        download_model("https://huggingface.co/test/model")
+
+        allow_patterns = mock_snapshot_download.call_args.kwargs["allow_patterns"]
+        assert allow_patterns == ["pytorch_model.bin", "evil.payload"]
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "evil.payload"], None),
+    )
+    @patch("requests.get", side_effect=PermissionError("denied https://huggingface.co/test/model?token=hf_secret"))
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_fails_closed_when_skipped_file_cannot_be_inspected(
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+    ) -> None:
+        """Skipped remote files must be inspectable before selective filtering excludes them."""
+        with pytest.raises(Exception) as excinfo:
+            download_model("https://huggingface.co/test/model")
+
+        error = str(excinfo.value)
+        assert "selective filtering incomplete" in error
+        assert "evil.payload" in error
+        assert "hf_secret" not in error
+        assert "token=" not in error
+        mock_snapshot_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=(["notes.unknown"], None))
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_listing_success_without_scannable_files_keeps_full_snapshot_fallback(
         self,
         mock_snapshot_download: MagicMock,
         _mock_list_repo_files: MagicMock,
+        _mock_detect_content: MagicMock,
         tmp_path: Path,
     ) -> None:
         """A successful listing with no scannable files should preserve the existing full-snapshot fallback."""
@@ -413,6 +492,7 @@ class TestModelDownload:
 class TestModelDownloadStreaming:
     """Test streaming model downloads from HuggingFace."""
 
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -424,6 +504,7 @@ class TestModelDownloadStreaming:
         mock_hf_hub_download: MagicMock,
         _mock_list_repo_files: MagicMock,
         _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
         tmp_path: Path,
     ) -> None:
         """Streaming downloads should only request recognized scannable files."""
@@ -439,6 +520,45 @@ class TestModelDownloadStreaming:
             cache_dir=str(tmp_path / "huggingface"),
             local_dir=str(tmp_path / "huggingface" / "test" / "model"),
         )
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "evil.payload", "preview.png"], None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_includes_content_routed_skipped_file(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Streaming downloads should include renamed content-routed model files."""
+
+        def get_side_effect(url: str, **_kwargs: object) -> _FakeRangeResponse:
+            if url.endswith("/evil.payload"):
+                return _FakeRangeResponse(b"\x08\x00\x00\x00TFL3" + b"\x00" * 16)
+            return _FakeRangeResponse(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+
+        def download_side_effect(*, repo_id: str, filename: str, **_kwargs: object) -> str:
+            assert repo_id == "test/model"
+            path = tmp_path / filename
+            path.write_bytes(b"downloaded")
+            return str(path)
+
+        mock_requests_get.side_effect = get_side_effect
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        results = list(download_model_streaming("https://huggingface.co/test/model"))
+
+        assert results == [(tmp_path / "pytorch_model.bin", False), (tmp_path / "evil.payload", True)]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "pytorch_model.bin",
+            "evil.payload",
+        ]
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
