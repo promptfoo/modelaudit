@@ -57,6 +57,10 @@ _TensorFlowProtoRoute = Literal[
 ]
 _TensorFlowOuterHint = Literal["unknown", "tf_metagraph", "tf_savedmodel"]
 _TORCH7_SIGNATURE_READ_BYTES = 4096
+_TORCH7_ACTIONABLE_LUA_READ_BYTES = 64 * 1024
+_TORCH7_ACTIONABLE_LUA_PATTERN = re.compile(
+    rb"(?i)\b(?:os\.execute|io\.popen|loadstring|dofile|loadfile|setfenv|getfenv|package\.loadlib|ffi\.load|loadlib)\b"
+)
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
 _ONNX_MODEL_MAX_ROUTING_FIELDS = 4096
 _ONNX_GRAPH_MAX_ROUTING_FIELDS = 4096
@@ -2942,7 +2946,9 @@ def _has_torch7_binary_object_structure(prefix: bytes, offset: int = 0) -> bool:
     """Return whether binary Torch7 magic has nearby serialized Torch structure."""
     if len(prefix) - offset < 8 or not prefix.startswith(b"T7\x00\x00", offset):
         return False
-    window = prefix[offset : offset + _TORCH7_SIGNATURE_READ_BYTES]
+    next_marker = prefix.find(b"T7\x00\x00", offset + len(b"T7\x00\x00"))
+    window_end = offset + _TORCH7_SIGNATURE_READ_BYTES if next_marker == -1 else next_marker
+    window = prefix[offset:window_end]
     lowered = window.lower()
     has_torch_marker = b"torch" in lowered or b"luat" in lowered
     has_structure_marker = b"nn." in lowered or b"tensor" in lowered or b"thnn" in lowered
@@ -2952,14 +2958,35 @@ def _has_torch7_binary_object_structure(prefix: bytes, offset: int = 0) -> bool:
 def _find_torch7_binary_object_signature_offset(prefix: bytes) -> int | None:
     """Return the offset of a binary Torch7 candidate payload."""
     search_offset = 0
-    first_magic_offset: int | None = None
     while True:
         match_offset = prefix.find(b"T7\x00\x00", search_offset)
         if match_offset == -1:
-            return first_magic_offset
-        if first_magic_offset is None:
-            first_magic_offset = match_offset
+            return None
         if _has_torch7_binary_object_structure(prefix, match_offset):
+            return match_offset
+        search_offset = match_offset + 1
+
+
+def _has_torch7_binary_magic_with_actionable_lua(prefix: bytes, offset: int = 0) -> bool:
+    """Return whether a bare binary Torch7 marker has nearby Lua risk signal."""
+    if len(prefix) - offset < 8 or not prefix.startswith(b"T7\x00\x00", offset):
+        return False
+    next_marker = prefix.find(b"T7\x00\x00", offset + len(b"T7\x00\x00"))
+    window_end = offset + _TORCH7_ACTIONABLE_LUA_READ_BYTES if next_marker == -1 else next_marker
+    window = prefix[offset:window_end]
+    return _TORCH7_ACTIONABLE_LUA_PATTERN.search(window) is not None
+
+
+def _find_torch7_binary_candidate_offset(prefix: bytes) -> int | None:
+    """Return the offset of a binary Torch7 candidate worth secondary analysis."""
+    search_offset = 0
+    while True:
+        match_offset = prefix.find(b"T7\x00\x00", search_offset)
+        if match_offset == -1:
+            return None
+        if _has_torch7_binary_object_structure(prefix, match_offset) or _has_torch7_binary_magic_with_actionable_lua(
+            prefix, match_offset
+        ):
             return match_offset
         search_offset = match_offset + 1
 
@@ -2982,6 +3009,14 @@ def _is_torch7_signature(prefix: bytes) -> bool:
 def find_structural_torch7_offset(payload: bytes) -> int | None:
     """Return the earliest explicit serialized Torch7 signature offset in bytes."""
     binary_offset = _find_torch7_binary_object_signature_offset(payload)
+    ascii_offset = _find_torch7_ascii_object_signature_offset(payload)
+    offsets = [offset for offset in (binary_offset, ascii_offset) if offset is not None and offset >= 0]
+    return min(offsets) if offsets else None
+
+
+def find_torch7_candidate_offset(payload: bytes) -> int | None:
+    """Return the earliest Torch7 candidate with structure or nearby Lua risk signal."""
+    binary_offset = _find_torch7_binary_candidate_offset(payload)
     ascii_offset = _find_torch7_ascii_object_signature_offset(payload)
     offsets = [offset for offset in (binary_offset, ascii_offset) if offset is not None and offset >= 0]
     return min(offsets) if offsets else None

@@ -3,12 +3,13 @@ from __future__ import annotations
 import hashlib
 import struct
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.llamafile_scanner import (
     LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON,
     LLAMAFILE_ROUTE_SCAN_BYTES,
@@ -203,6 +204,43 @@ def test_llamafile_skips_bare_torch7_decoy_before_appended_payload(tmp_path: Pat
     )
 
 
+def test_llamafile_bounds_torch7_scan_attempts_after_marker_decoys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "many-torch7-marker-decoys.llamafile"
+    valid_gguf = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    decoys = b"".join(b"T7\x00\x00" + (b"A" * 32) for _ in range(256))
+    torch7_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id')\n"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=valid_gguf + decoys + torch7_payload))
+
+    scanned_offsets: list[int] = []
+    original_scan_candidate = LlamafileScanner._scan_embedded_torch7_candidate
+
+    def counting_scan_candidate(
+        self: LlamafileScanner,
+        path: Path,
+        scanner: Any,
+        result: ScanResult,
+        offset: int,
+    ) -> tuple[ScanResult | None, int]:
+        scanned_offsets.append(offset)
+        return original_scan_candidate(self, path, scanner, result, offset)
+
+    monkeypatch.setattr(LlamafileScanner, "_scan_embedded_torch7_candidate", counting_scan_candidate)
+
+    result = LlamafileScanner(config={"torch7_max_scan_bytes": 128}).scan(str(binary))
+
+    assert scanned_offsets == [binary.read_bytes().index(torch7_payload)]
+    assert result.metadata["embedded_torch7_offset"] == scanned_offsets[0]
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+
+
 def test_llamafile_continues_after_structural_torch7_decoy(tmp_path: Path) -> None:
     binary = tmp_path / "torch7-structural-decoy-then-payload.llamafile"
     valid_gguf = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
@@ -222,6 +260,27 @@ def test_llamafile_continues_after_structural_torch7_decoy(tmp_path: Path) -> No
     )
 
 
+def test_llamafile_preserves_later_same_severity_distinct_torch7_findings(tmp_path: Path) -> None:
+    binary = tmp_path / "torch7-two-warning-candidates.llamafile"
+    dynamic_load_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\npackage.loadlib('libx.so', 'luaopen_x')\n"
+    exec_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id')\n"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=dynamic_load_payload + (b"A" * 8192) + exec_payload))
+
+    result = LlamafileScanner(config={"torch7_max_scan_bytes": 128}).scan(str(binary))
+
+    failed_warning_checks = {
+        check.name
+        for check in result.checks
+        if check.status == CheckStatus.FAILED and check.severity == IssueSeverity.WARNING
+    }
+    assert "Torch7 Dynamic Module Load Analysis" in failed_warning_checks
+    assert "Torch7 Lua Execution Primitive Analysis" in failed_warning_checks
+    assert [candidate["offset"] for candidate in result.metadata["embedded_torch7_candidates"]] == [
+        binary.read_bytes().index(dynamic_load_payload),
+        binary.read_bytes().index(exec_payload),
+    ]
+
+
 def test_llamafile_prefers_later_critical_torch7_candidate_over_warning_decoy(tmp_path: Path) -> None:
     binary = tmp_path / "torch7-warning-decoy-then-critical.llamafile"
     warning_decoy = b"T7\x00\x00torch.FloatTensor nn.Sequential\npackage.loadlib('libx.so', 'luaopen_x')\n"
@@ -238,6 +297,17 @@ def test_llamafile_prefers_later_critical_torch7_candidate_over_warning_decoy(tm
         and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
     )
+
+
+def test_llamafile_ignores_benign_torch7_magic_only_marker(tmp_path: Path) -> None:
+    binary = tmp_path / "benign-torch7-marker-only.llamafile"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=b"T7\x00\x00" + (b"A" * 8192)))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert "embedded_torch7_offset" not in result.metadata
+    assert not any(check.name.startswith("Torch7 ") for check in result.checks)
 
 
 def test_llamafile_preserves_magic_only_binary_torch7_payload(tmp_path: Path) -> None:

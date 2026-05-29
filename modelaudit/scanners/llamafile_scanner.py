@@ -14,7 +14,7 @@ from ..utils.file.detection import (
     LLAMAFILE_MARKER,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
-    find_structural_torch7_offset,
+    find_torch7_candidate_offset,
     is_llamafile_executable,
 )
 from ._evidence_redaction import redact_evidence_string
@@ -29,6 +29,7 @@ LLAMAFILE_RUNTIME_PREVIEW_READ_REASON = "llamafile_runtime_preview_read_failed"
 LLAMAFILE_TORCH7_CARVE_FAILURE_REASON = "llamafile_torch7_payload_carve_failed"
 LLAMAFILE_TORCH7_ANALYSIS_INCOMPLETE_REASON = "llamafile_torch7_analysis_incomplete"
 TORCH7_SIGNATURE_WINDOW_BYTES = 4096
+LLAMAFILE_TORCH7_MAX_CANDIDATE_SCANS = 16
 
 ELF_MAGIC = b"\x7fELF"
 PE_MAGIC = b"MZ"
@@ -134,6 +135,9 @@ class LlamafileScanner(BaseScanner):
         self.preview_bytes = int(self.config.get("llamafile_preview_bytes", 2 * 1024 * 1024))
         self.max_payload_scan_bytes = int(self.config.get("llamafile_payload_scan_bytes", 512 * 1024 * 1024))
         self.max_payload_carve_bytes = int(self.config.get("llamafile_payload_carve_bytes", 256 * 1024 * 1024))
+        self.max_torch7_candidate_scans = int(
+            self.config.get("llamafile_torch7_max_candidate_scans", LLAMAFILE_TORCH7_MAX_CANDIDATE_SCANS)
+        )
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -488,21 +492,29 @@ class LlamafileScanner(BaseScanner):
         from .torch7_scanner import Torch7Scanner
 
         scanner = Torch7Scanner(config=self.config)
-        best_actionable: tuple[ScanResult, int, int, IssueSeverity] | None = None
+        actionable_results: list[tuple[ScanResult, int, int, IssueSeverity]] = []
+        actionable_keys: set[tuple[str, str, str, str]] = set()
+        best_actionable_rank = 0
         deferred_incomplete: tuple[ScanResult, int, int] | None = None
         next_offset: int | None = offset
+        candidate_scans = 0
 
-        while next_offset is not None:
+        while next_offset is not None and candidate_scans < self.max_torch7_candidate_scans:
+            candidate_scans += 1
             embedded_result, carve_size = self._scan_embedded_torch7_candidate(path, scanner, result, next_offset)
             if embedded_result is not None:
                 actionable_severity = self._torch7_result_actionable_severity(embedded_result)
                 if actionable_severity is not None:
-                    if best_actionable is None or self._torch7_severity_rank(
-                        actionable_severity
-                    ) > self._torch7_severity_rank(best_actionable[3]):
-                        best_actionable = (embedded_result, next_offset, carve_size, actionable_severity)
-                    if actionable_severity == IssueSeverity.CRITICAL:
-                        break
+                    actionable_rank = self._torch7_severity_rank(actionable_severity)
+                    if actionable_rank > best_actionable_rank:
+                        actionable_results = []
+                        actionable_keys.clear()
+                        best_actionable_rank = actionable_rank
+                    if actionable_rank == best_actionable_rank:
+                        candidate_keys = self._torch7_actionable_finding_keys(embedded_result)
+                        if not candidate_keys or not candidate_keys.issubset(actionable_keys):
+                            actionable_results.append((embedded_result, next_offset, carve_size, actionable_severity))
+                            actionable_keys.update(candidate_keys)
                 if deferred_incomplete is None and self._torch7_result_is_incomplete(embedded_result):
                     deferred_incomplete = (embedded_result, next_offset, carve_size)
 
@@ -512,11 +524,16 @@ class LlamafileScanner(BaseScanner):
                 start_offset=next_offset + 1,
             )
 
-        if best_actionable is not None:
-            embedded_result, actionable_offset, carve_size, _ = best_actionable
+        if actionable_results:
+            _, actionable_offset, carve_size, _ = actionable_results[0]
             result.metadata["embedded_torch7_offset"] = actionable_offset
             result.metadata["embedded_torch7_size"] = carve_size
-            self._append_torch7_findings(result, embedded_result, actionable_offset)
+            result.metadata["embedded_torch7_candidates"] = [
+                {"offset": candidate_offset, "size": candidate_size, "severity": severity.value}
+                for _, candidate_offset, candidate_size, severity in actionable_results
+            ]
+            for embedded_result, candidate_offset, _, _ in actionable_results:
+                self._append_torch7_findings(result, embedded_result, candidate_offset)
             return
 
         if deferred_incomplete is not None:
@@ -577,6 +594,27 @@ class LlamafileScanner(BaseScanner):
     @staticmethod
     def _torch7_severity_rank(severity: IssueSeverity) -> int:
         return 2 if severity == IssueSeverity.CRITICAL else 1
+
+    @staticmethod
+    def _torch7_actionable_finding_keys(result: ScanResult) -> set[tuple[str, str, str, str]]:
+        keys: set[tuple[str, str, str, str]] = set()
+        for check in result.checks:
+            if check.status == CheckStatus.FAILED and check.severity in {
+                IssueSeverity.WARNING,
+                IssueSeverity.CRITICAL,
+            }:
+                keys.add(
+                    (
+                        "check",
+                        check.name,
+                        check.severity.value,
+                        str(check.details.get("signal", "")),
+                    )
+                )
+        for issue in result.issues:
+            if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}:
+                keys.add(("issue", issue.message, issue.severity.value, str(issue.details.get("signal", ""))))
+        return keys
 
     @staticmethod
     def _torch7_result_is_incomplete(result: ScanResult) -> bool:
@@ -662,7 +700,7 @@ class LlamafileScanner(BaseScanner):
                     torch7_window = (
                         haystack if not stop_at_gguf or gguf_relative_index == -1 else haystack[:gguf_relative_index]
                     )
-                    torch7_relative_index = find_structural_torch7_offset(torch7_window)
+                    torch7_relative_index = find_torch7_candidate_offset(torch7_window)
                     if torch7_relative_index is not None:
                         torch7_offset = window_offset + torch7_relative_index
 
@@ -696,7 +734,7 @@ class LlamafileScanner(BaseScanner):
 
                 haystack = carry + chunk
                 window_offset = scanned - len(carry)
-                torch7_relative_index = find_structural_torch7_offset(haystack)
+                torch7_relative_index = find_torch7_candidate_offset(haystack)
                 if torch7_relative_index is not None:
                     return window_offset + torch7_relative_index
 
