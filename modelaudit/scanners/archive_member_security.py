@@ -284,6 +284,21 @@ def _is_overwritable_high_risk_reference(name: str) -> bool:
     )
 
 
+def _ctypes_loader_member_load_names(resolved_roots: frozenset[str], attr_name: str | None) -> frozenset[str]:
+    library_name = attr_name or _CTYPES_DYNAMIC_LIBRARY_NAME
+    if attr_name is not None and (
+        attr_name.startswith("_")
+        or attr_name in _CTYPES_LIBRARY_LOADER_NON_LOADING_ATTRIBUTES
+        or attr_name in {"LoadLibrary", "__getitem__"}
+    ):
+        return frozenset()
+    return frozenset(
+        f"{resolved_root}.{library_name}"
+        for resolved_root in resolved_roots
+        if _is_ctypes_library_loader_object_root(resolved_root)
+    )
+
+
 def _split_env_shebang_command(value: str) -> str | None:
     try:
         split_parts = shlex.split(value)
@@ -751,14 +766,18 @@ def _resolve_getattr_call_names(
         if resolved_target_roots is None or attr_name is None:
             return None
         if attr_name in {"__getitem__", "LoadLibrary"}:
-            loader_method_roots = resolved_target_roots & _CTYPES_LIBRARY_LOADER_OBJECTS
+            loader_method_roots = frozenset(
+                resolved_root
+                for resolved_root in resolved_target_roots
+                if _is_ctypes_library_loader_object_root(resolved_root)
+            )
             if loader_method_roots:
                 return _apply_aliases_to_names(
                     frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in loader_method_roots),
                     alias_scopes,
                 )
         resolved_target_roots = frozenset(
-            root for root in resolved_target_roots if root not in _CTYPES_LIBRARY_LOADER_OBJECTS
+            root for root in resolved_target_roots if not _is_ctypes_library_loader_object_root(root)
         )
         if not resolved_target_roots:
             return None
@@ -767,30 +786,28 @@ def _resolve_getattr_call_names(
             alias_scopes,
         )
 
-    getattr_accessor_names = (
-        frozenset(
-            normalized_helper_name.rsplit(".", maxsplit=1)[0]
-            for normalized_helper_name in normalized_helper_names
-            if normalized_helper_name.endswith(".__getattr__")
-        )
-        & _CTYPES_LIBRARY_LOADER_OBJECTS
+    getattr_accessor_names = frozenset(
+        root
+        for normalized_helper_name in normalized_helper_names
+        for root in (normalized_helper_name.rsplit(".", maxsplit=1)[0],)
+        if normalized_helper_name.endswith(".__getattr__") and _is_ctypes_library_loader_object_root(root)
     )
-    getattribute_accessor_names = (
-        frozenset(
-            normalized_helper_name.rsplit(".", maxsplit=1)[0]
-            for normalized_helper_name in normalized_helper_names
-            if normalized_helper_name.endswith(".__getattribute__")
-        )
-        - _CTYPES_LIBRARY_LOADER_OBJECTS
+    getattribute_accessor_names = frozenset(
+        root
+        for normalized_helper_name in normalized_helper_names
+        for root in (normalized_helper_name.rsplit(".", maxsplit=1)[0],)
+        if normalized_helper_name.endswith(".__getattribute__") and not _is_ctypes_library_loader_object_root(root)
     )
     accessor_names = getattr_accessor_names | getattribute_accessor_names
     if accessor_names:
         if len(node.args) != 1 or node.keywords:
             return None
         attr_name = _resolve_static_string(node.args[0])
-        if attr_name is None:
+        if attr_name is None and not getattr_accessor_names:
             return None
-        resolved_names: set[str] = {f"{target_root}.{attr_name}" for target_root in getattr_accessor_names}
+        resolved_names: set[str] = set(_ctypes_loader_member_load_names(getattr_accessor_names, attr_name))
+        if attr_name is None:
+            return frozenset(resolved_names) or None
         getattribute_names = _apply_aliases_to_names(
             frozenset(f"{target_root}.{attr_name}" for target_root in getattribute_accessor_names),
             alias_scopes,
@@ -808,9 +825,6 @@ def _resolve_getattr_call_names(
     attr_name_node = node.args[1]
 
     attr_name = _resolve_static_string(attr_name_node)
-    if attr_name is None:
-        return None
-
     resolved_target_roots = _resolve_static_reference_names(
         target_root_node,
         alias_scopes,
@@ -819,6 +833,8 @@ def _resolve_getattr_call_names(
     )
     if resolved_target_roots is None:
         return None
+    if attr_name is None:
+        return _ctypes_loader_member_load_names(resolved_target_roots, attr_name) or None
     return _apply_aliases_to_names(
         frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots),
         alias_scopes,
@@ -1853,6 +1869,23 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 continue
             self._bind_name(f"{root}.{key}", resolved_value)
 
+    def _record_setattr_call(self, node: ast.Call) -> None:
+        if len(node.args) != 3 or node.keywords:
+            return
+        resolved_func_names = self._resolve_reference_names(node.func)
+        if not resolved_func_names or not (resolved_func_names & {"setattr", "builtins.setattr"}):
+            return
+        attr_name = _resolve_static_string(node.args[1])
+        if attr_name is None:
+            return
+        resolved_target_roots = self._resolve_reference_names(node.args[0])
+        if resolved_target_roots is None:
+            return
+        resolved_value = self._resolve_binding_value_names(node.args[2])
+        for target_name in (f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots):
+            if _is_overwritable_high_risk_reference(target_name):
+                self._bind_name(target_name, resolved_value)
+
     def _shadow_binding_target(self, target: ast.AST) -> None:
         for name in _binding_names(target):
             self._bind_name(name, None)
@@ -2101,6 +2134,17 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         aliases = class_scope.get(func.attr)
         return aliases if isinstance(aliases, frozenset) else frozenset()
 
+    @staticmethod
+    def _direct_scope_calls(body: list[ast.stmt]) -> Iterator[ast.Call]:
+        pending: list[ast.AST] = list(reversed(body))
+        while pending:
+            node = pending.pop()
+            if isinstance(node, ast.Call):
+                yield node
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            pending.extend(reversed(list(ast.iter_child_nodes(node))))
+
     def _class_preserves_ctypes_loader_init(self, node: ast.ClassDef, class_scope: _AliasScope) -> bool:
         init_method = next(
             (
@@ -2117,9 +2161,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if node.bases
             else frozenset()
         )
-        for child in ast.walk(init_method):
-            if not isinstance(child, ast.Call):
-                continue
+        for child in self._direct_scope_calls(init_method.body):
             if (
                 first_base_loader_types
                 and isinstance(child.func, ast.Attribute)
@@ -2392,6 +2434,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if normalized_name is not None:
                 self.risky_calls.add(normalized_name)
         self._record_namespace_write_call(node)
+        self._record_setattr_call(node)
         self.generic_visit(node)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:

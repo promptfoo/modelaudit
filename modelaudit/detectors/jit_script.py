@@ -259,10 +259,11 @@ def _candidate_embedded_python_snippets(
             continue
         if any(block_start == start for block_start, _block_end in block_spans) and start not in priority_starts:
             continue
-        if _is_indented_start_with_enclosing_header(bounded, start):
-            continue
-        span = (start, len(bounded))
-        candidates.append((bounded[start:], span, (span,)))
+        line_start = bounded.rfind(b"\n", 0, start) + 1
+        header_segments = _enclosing_compound_header_segments(bounded, line_start)
+        candidate_start = header_segments[0][0] if header_segments else start
+        span = (candidate_start, len(bounded))
+        candidates.append((bounded[candidate_start:], span, (span,)))
 
     return candidates
 
@@ -526,7 +527,7 @@ def _line_calls_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> b
 
 
 def _line_shadows_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
-    assignment_operators = rb"=|\+=|-=|\*=|/=|//=|%=|\*\*=|@=|&=|\|=|\^=|>>=|<<="
+    assignment_operators = rb"\+=|-=|\*=|/=|//=|%=|\*\*=|@=|&=|\|=|\^=|>>=|<<=|=(?!=)"
     return any(
         re.search(
             rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?::[^=\n]+)?\s*(?:" + assignment_operators + rb")",

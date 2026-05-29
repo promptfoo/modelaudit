@@ -1021,6 +1021,36 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
+    def test_scan_model_detects_indented_priority_import_after_default_cap(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        source = b"\x00\xff" + leading_blocks + b"if True:\n    import runpy\n    runpy.run_path('payload.py')\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_does_not_count_comparisons_as_priority_alias_shadowing(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        comparisons = b"".join(b"c == None\n" for _ in range(jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES + 2))
+        source = b"\x00\xff" + leading_blocks + b"import ctypes as c\n" + padding + comparisons + b"c.cdll.msvcrt\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
+        )
+
     def test_scan_model_ignores_unrelated_assignment_alias_before_delayed_priority_call(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
@@ -1919,6 +1949,20 @@ class TestJITScriptDetector:
             b"            self.init(name)\n"
             b"    ctypes.LibraryLoader(OverwrittenInitCDLL).payload\n"
             b"    OverwrittenInitCDLL('/missing')\n"
+            b"    class SafeNestedCDLL(ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            def later() -> None:\n"
+            b"                ctypes.CDLL.__init__(self, name)\n"
+            b"    ctypes.LibraryLoader(SafeNestedCDLL).payload\n"
+            b"    SafeNestedCDLL('/missing')\n"
+            b"    setattr(ctypes.windll, 'kernel32', len)\n"
+            b"    ctypes.windll.kernel32\n"
+            b"    safe_loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    setattr(safe_loader, 'payload', len)\n"
+            b"    safe_loader.payload([])\n"
+            b"    safe_browser = webbrowser.get()\n"
+            b"    setattr(safe_browser, 'open', len)\n"
+            b"    safe_browser.open([])\n"
             b"    return load.__name__\n"
             b"\x00MODEL-FRAMING"
         )
