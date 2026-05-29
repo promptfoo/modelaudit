@@ -488,6 +488,39 @@ class LlamafileScanner(BaseScanner):
         from .torch7_scanner import Torch7Scanner
 
         scanner = Torch7Scanner(config=self.config)
+        deferred_incomplete: tuple[ScanResult, int, int] | None = None
+        next_offset: int | None = offset
+
+        while next_offset is not None:
+            embedded_result, carve_size = self._scan_embedded_torch7_candidate(path, scanner, result, next_offset)
+            if embedded_result is not None:
+                if self._torch7_result_has_actionable_findings(embedded_result):
+                    result.metadata["embedded_torch7_offset"] = next_offset
+                    result.metadata["embedded_torch7_size"] = carve_size
+                    self._append_torch7_findings(result, embedded_result, next_offset)
+                    return
+                if deferred_incomplete is None and self._torch7_result_is_incomplete(embedded_result):
+                    deferred_incomplete = (embedded_result, next_offset, carve_size)
+
+            next_offset = self._find_embedded_torch7_offset(
+                path,
+                self.max_payload_scan_bytes,
+                start_offset=next_offset + 1,
+            )
+
+        if deferred_incomplete is not None:
+            embedded_result, incomplete_offset, carve_size = deferred_incomplete
+            result.metadata["embedded_torch7_offset"] = incomplete_offset
+            result.metadata["embedded_torch7_size"] = carve_size
+            self._append_torch7_findings(result, embedded_result, incomplete_offset)
+
+    def _scan_embedded_torch7_candidate(
+        self,
+        path: Path,
+        scanner: Any,
+        result: ScanResult,
+        offset: int,
+    ) -> tuple[ScanResult | None, int]:
         payload_available = max(0, self.get_file_size(str(path)) - offset)
         carve_size = min(payload_available, scanner.max_scan_bytes + 1)
         carved_path = self._carve_payload(path, offset, carve_size, suffix=".t7")
@@ -502,18 +535,28 @@ class LlamafileScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=f"{path} (llamafile:{offset})",
             )
-            return
+            return None, carve_size
 
         try:
             if not scanner.can_handle(str(carved_path)):
-                return
+                return None, carve_size
 
-            result.metadata["embedded_torch7_offset"] = offset
-            result.metadata["embedded_torch7_size"] = carve_size
-            embedded_result = scanner.scan(str(carved_path))
-            self._append_torch7_findings(result, embedded_result, offset)
+            return scanner.scan(str(carved_path)), carve_size
         finally:
             carved_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _torch7_result_has_actionable_findings(result: ScanResult) -> bool:
+        return any(
+            check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            for check in result.checks
+        ) or any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    @staticmethod
+    def _torch7_result_is_incomplete(result: ScanResult) -> bool:
+        return result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME or (
+            not result.success and not result.has_errors
+        )
 
     def _append_torch7_findings(self, result: ScanResult, embedded: ScanResult, offset: int) -> None:
         embedded_location = f"{self.current_file_path} (llamafile:{offset})"

@@ -2938,24 +2938,28 @@ def _has_torch7_ascii_object_signature(prefix: bytes) -> bool:
     return _find_torch7_ascii_object_signature_offset(prefix) is not None
 
 
-def _has_torch7_binary_object_structure(prefix: bytes) -> bool:
+def _has_torch7_binary_object_structure(prefix: bytes, offset: int = 0) -> bool:
     """Return whether binary Torch7 magic has nearby serialized Torch structure."""
-    if len(prefix) < 8 or not prefix.startswith(b"T7\x00\x00"):
+    if len(prefix) - offset < 8 or not prefix.startswith(b"T7\x00\x00", offset):
         return False
-    lowered = prefix[:_TORCH7_SIGNATURE_READ_BYTES].lower()
+    window = prefix[offset : offset + _TORCH7_SIGNATURE_READ_BYTES]
+    lowered = window.lower()
     has_torch_marker = b"torch" in lowered or b"luat" in lowered
     has_structure_marker = b"nn." in lowered or b"tensor" in lowered or b"thnn" in lowered
     return has_torch_marker and has_structure_marker
 
 
 def _find_torch7_binary_object_signature_offset(prefix: bytes) -> int | None:
-    """Return the offset of a structural binary Torch7 serialized payload."""
+    """Return the offset of a binary Torch7 candidate payload."""
     search_offset = 0
+    first_magic_offset: int | None = None
     while True:
         match_offset = prefix.find(b"T7\x00\x00", search_offset)
         if match_offset == -1:
-            return None
-        if _has_torch7_binary_object_structure(prefix[match_offset:]):
+            return first_magic_offset
+        if first_magic_offset is None:
+            first_magic_offset = match_offset
+        if _has_torch7_binary_object_structure(prefix, match_offset):
             return match_offset
         search_offset = match_offset + 1
 

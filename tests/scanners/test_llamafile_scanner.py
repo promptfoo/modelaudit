@@ -203,6 +203,41 @@ def test_llamafile_skips_bare_torch7_decoy_before_appended_payload(tmp_path: Pat
     )
 
 
+def test_llamafile_continues_after_structural_torch7_decoy(tmp_path: Path) -> None:
+    binary = tmp_path / "torch7-structural-decoy-then-payload.llamafile"
+    valid_gguf = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    structural_decoy = b"T7\x00\x00torch.FloatTensor tensor placeholder\n"
+    torch7_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id')\n"
+    embedded_payload = valid_gguf + structural_decoy + (b"A" * 8192) + torch7_payload
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=embedded_payload))
+
+    result = LlamafileScanner(config={"torch7_max_scan_bytes": 128}).scan(str(binary))
+
+    assert result.metadata["embedded_torch7_offset"] == binary.read_bytes().index(torch7_payload)
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+
+
+def test_llamafile_preserves_magic_only_binary_torch7_payload(tmp_path: Path) -> None:
+    binary = tmp_path / "magic-only-binary-torch7.llamafile"
+    torch7_payload = b"T7\x00\x00" + (b"\x01\x02\x03\x04" * 1024) + b"cmd = os.execute('id')\n"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=torch7_payload))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["embedded_torch7_offset"] == binary.read_bytes().index(torch7_payload)
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+
+
 def test_llamafile_ignores_truncated_embedded_torch7_marker(tmp_path: Path) -> None:
     binary = tmp_path / "truncated-torch7-marker.llamafile"
     binary.write_bytes(_build_llamafile_blob(embedded_payload=b"T7\x00\x00"))
