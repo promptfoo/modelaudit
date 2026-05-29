@@ -742,6 +742,20 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
+    def test_scan_model_detects_tail_alias_call_with_comment_parenthesis_in_prefix_import(self) -> None:
+        detector = JITScriptDetector()
+        filler_line = b"# filler\n"
+        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        source = (
+            b"\x00\xffimport runpy as rp  # (\n" + filler + b"def payload():\n    return rp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
     def test_scan_model_detects_tail_runpy_alias_from_framed_prefix_assignment_context(self) -> None:
         detector = JITScriptDetector()
         filler_line = b"# filler\n"
@@ -829,11 +843,41 @@ class TestJITScriptDetector:
 
         assert host_candidate not in selected
         assert system_candidate not in selected
-        assert os_candidate in selected
-        assert aliased_runpy_candidate in selected
-        assert continued_runpy_candidate in selected
-        assert continued_from_runpy_candidate in selected
-        assert runpy_candidate in selected
+        selected_candidates = {candidate for candidate, _span in selected}
+        assert os_candidate[0] in selected_candidates
+        assert aliased_runpy_candidate[0] in selected_candidates
+        assert continued_runpy_candidate[0] in selected_candidates
+        assert continued_from_runpy_candidate[0] in selected_candidates
+        assert runpy_candidate[0] in selected_candidates
+
+    def test_priority_snippets_are_budgeted_and_bounded_after_default_cap(self) -> None:
+        leading_candidates = [
+            (f"import harmless_{index}\n".encode(), (index, index + 1))
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
+        ]
+        priority_payload = b"import os\n" + (b"# pad\n" * 4000)
+        priority_candidates = [
+            (
+                priority_payload,
+                (
+                    1_000 + index * len(priority_payload),
+                    1_000 + (index + 1) * len(priority_payload),
+                ),
+            )
+            for index in range(jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS + 4)
+        ]
+
+        selected = jit_script_module._prioritized_embedded_python_snippets([*leading_candidates, *priority_candidates])
+
+        assert len(selected) == (
+            jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS
+            + jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS
+        )
+        priority_selected = selected[jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS :]
+        assert all(
+            len(candidate) <= jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES
+            for candidate, _span in priority_selected
+        )
 
     def test_scan_model_ignores_binary_framed_top_level_replaced_runpy_execution(self) -> None:
         detector = JITScriptDetector()

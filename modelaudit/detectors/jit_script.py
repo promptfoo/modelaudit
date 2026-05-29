@@ -131,6 +131,8 @@ _DANGEROUS_IMPORT_PATTERNS = {
 }
 _MAX_SNIPPET_PARSE_TRIM_ATTEMPTS = 8
 _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS = 10
+_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS = 16
+_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES = 16_384
 _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES = 1_000_000
 _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES = 16_384
 _EMBEDDED_PYTHON_START_MARKERS = (b"def ", b"async def ", b"class ", b"import ", b"from ")
@@ -260,6 +262,23 @@ def _span_contains_priority_offset(span: tuple[int, int], priority_offsets: list
     return index < len(priority_offsets) and priority_offsets[index] < span[1]
 
 
+def _bounded_priority_embedded_python_candidate(
+    candidate: bytes,
+    span: tuple[int, int],
+    priority_offsets: list[int],
+) -> tuple[bytes, tuple[int, int]]:
+    index = bisect_left(priority_offsets, span[0])
+    if index >= len(priority_offsets) or priority_offsets[index] >= span[1]:
+        return candidate, span
+    priority_relative_offset = priority_offsets[index] - span[0]
+    if priority_relative_offset >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
+        line_start = candidate.rfind(b"\n", 0, priority_relative_offset) + 1
+    else:
+        line_start = 0
+    bounded_end = min(len(candidate), line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
+    return candidate[line_start:bounded_end], (span[0] + line_start, span[0] + bounded_end)
+
+
 def _prioritized_embedded_python_snippets(
     candidates: list[tuple[bytes, tuple[int, int]]],
     bounded: bytes | None = None,
@@ -267,14 +286,24 @@ def _prioritized_embedded_python_snippets(
     selected: list[tuple[bytes, tuple[int, int]]] = []
     selected_spans: set[tuple[int, int]] = set()
     priority_offsets = _priority_import_offsets(bounded) if bounded is not None else []
+    selected_priority_candidates = 0
     for index, (candidate, span) in enumerate(candidates):
         has_priority_marker = (
             _span_contains_priority_offset(span, priority_offsets)
             if bounded is not None
             else _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(candidate.lower()) is not None
         )
-        if index >= _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS and not has_priority_marker:
-            continue
+        if index >= _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:
+            if not has_priority_marker:
+                continue
+            if selected_priority_candidates >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
+                continue
+            if bounded is not None:
+                candidate, span = _bounded_priority_embedded_python_candidate(candidate, span, priority_offsets)
+            else:
+                candidate = candidate[:_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES]
+                span = (span[0], span[0] + len(candidate))
+            selected_priority_candidates += 1
         if span in selected_spans:
             continue
         selected_spans.add(span)
@@ -302,11 +331,33 @@ def _embedded_python_scan_windows(data: bytes) -> list[bytes]:
     return [data[:_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES], data[-_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:]]
 
 
+def _strip_python_comment_bytes(line: bytes) -> bytes:
+    quote: int | None = None
+    escaped = False
+    for index, byte in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if byte == ord("\\") and quote is not None:
+            escaped = True
+            continue
+        if byte in {ord("'"), ord('"')}:
+            if quote is None:
+                quote = byte
+            elif quote == byte:
+                quote = None
+            continue
+        if byte == ord("#") and quote is None:
+            return line[:index]
+    return line
+
+
 def _line_has_explicit_continuation(line: bytes) -> bool:
-    return line.rstrip().endswith(b"\\")
+    return _strip_python_comment_bytes(line).rstrip().endswith(b"\\")
 
 
 def _line_parenthesis_delta(line: bytes) -> int:
+    line = _strip_python_comment_bytes(line)
     return line.count(b"(") - line.count(b")")
 
 
