@@ -56,6 +56,13 @@ def _build_extension_allow_patterns() -> list[str]:
     return sorted(patterns)
 
 
+def _raise_no_scannable_hf_files(repo_id: str) -> None:
+    raise Exception(
+        f"Refusing to download full snapshot for {repo_id}: "
+        "repository listing contains no recognized ModelAudit-scannable files"
+    )
+
+
 def _get_hf_cache_root() -> Path:
     """Return the HuggingFace hub cache root."""
     try:
@@ -309,12 +316,10 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
                     f"Refusing to download full snapshot for {repo_id}: no selective allowlist patterns available"
                 )
             download_kwargs["allow_patterns"] = extension_allow_patterns
-
-        if "allow_patterns" in download_kwargs:
-            local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
         else:
-            # Fallback: download everything if no model files identified
-            local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
+            _raise_no_scannable_hf_files(repo_id)
+
+        local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
 
         # Verify we actually got model files
         downloaded_path = Path(local_path)
@@ -408,9 +413,7 @@ def download_model_streaming(
         model_files = [f for f in repo_files if any(f.endswith(ext) for ext in model_extensions)]
 
         if not model_files:
-            # Fallback: download all files if no recognized extensions found
-            # This maintains parity with download_model() behavior
-            model_files = repo_files
+            _raise_no_scannable_hf_files(repo_id)
 
         # Setup cache directory
         download_path = None

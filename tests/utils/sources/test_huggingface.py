@@ -360,21 +360,43 @@ class TestModelDownload:
 
     @patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=(["notes.unknown"], None))
     @patch("huggingface_hub.snapshot_download")
-    def test_download_model_listing_success_without_scannable_files_keeps_full_snapshot_fallback(
+    def test_download_model_listing_success_without_scannable_files_fails_closed(
         self,
         mock_snapshot_download: MagicMock,
         _mock_list_repo_files: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """A successful listing with no scannable files should preserve the existing full-snapshot fallback."""
+        """A successful listing with no scannable files must not fall back to a full snapshot."""
         download_path = tmp_path / "download"
         download_path.mkdir()
         (download_path / "config.json").write_text("{}")
         mock_snapshot_download.return_value = str(download_path)
 
-        download_model("https://huggingface.co/test/model")
+        with pytest.raises(
+            Exception,
+            match="Refusing to download full snapshot for test/model: "
+            "repository listing contains no recognized ModelAudit-scannable files",
+        ):
+            download_model("https://huggingface.co/test/model")
 
-        assert "allow_patterns" not in mock_snapshot_download.call_args.kwargs
+        mock_snapshot_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=([], None))
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_empty_listing_fails_closed(
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+    ) -> None:
+        """An empty successful listing should not trigger a full-snapshot download."""
+        with pytest.raises(
+            Exception,
+            match="Refusing to download full snapshot for test/model: "
+            "repository listing contains no recognized ModelAudit-scannable files",
+        ):
+            download_model("https://huggingface.co/test/model")
+
+        mock_snapshot_download.assert_not_called()
 
     @patch("huggingface_hub.snapshot_download")
     @patch("shutil.rmtree")
@@ -470,6 +492,47 @@ class TestModelDownloadStreaming:
         with pytest.raises(
             Exception,
             match="Failed listing files in repository test/model: repository listing unavailable",
+        ):
+            list(download_model_streaming("https://huggingface.co/test/model"))
+
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["README.md", "notes.txt"], None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_listing_success_without_scannable_files_fails_closed(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+    ) -> None:
+        """Streaming mode must not download every repo file when no scannable files are listed."""
+        with pytest.raises(
+            Exception,
+            match="Refusing to download full snapshot for test/model: "
+            "repository listing contains no recognized ModelAudit-scannable files",
+        ):
+            list(download_model_streaming("https://huggingface.co/test/model"))
+
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=([], None))
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_empty_listing_fails_closed(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+    ) -> None:
+        """An empty successful listing should not make streaming mode download all repo files."""
+        with pytest.raises(
+            Exception,
+            match="Refusing to download full snapshot for test/model: "
+            "repository listing contains no recognized ModelAudit-scannable files",
         ):
             list(download_model_streaming("https://huggingface.co/test/model"))
 
