@@ -659,7 +659,7 @@ class TestJITScriptDetector:
     def test_scan_model_detects_late_priority_runpy_import_after_large_function_preamble(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
-            f"def benign_{index}():\n    return {index}\n\x00".encode()
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
             for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
         )
         padding = b"    # pad\n" * 600
@@ -775,7 +775,7 @@ class TestJITScriptDetector:
     def test_scan_model_detects_deep_priority_import_in_function_context(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
-            f"def benign_{index}():\n    return {index}\n\x00".encode()
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
             for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
         )
         padding_line = b"    # pad\n"
@@ -800,7 +800,7 @@ class TestJITScriptDetector:
     def test_scan_model_detects_late_priority_alias_call_after_import_window(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
-            f"def benign_{index}():\n    return {index}\n\x00".encode()
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
             for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
         )
         padding_line = b"# pad\n"
@@ -812,6 +812,32 @@ class TestJITScriptDetector:
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
         assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_does_not_report_safe_late_priority_overwrite_from_compact_span(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"    # pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"def payload():\n"
+            + padding
+            + b"    import runpy\n"
+            + b"    runpy.run_path = len\n"
+            + b"    return runpy.run_path([])\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
@@ -843,12 +869,51 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
+    def test_scan_model_detects_tail_alias_after_noisy_prefix_context_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        detector = JITScriptDetector()
+        monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 4096)
+        long_alias = "unused_" + "x" * 900
+        noise = b"".join(f"import runpy as {long_alias}_{index}\n".encode() for index in range(20))
+        filler_line = b"# filler\n"
+        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        source = (
+            b"\x00\xff"
+            + noise
+            + b"import runpy as rp\n"
+            + filler
+            + b"def payload():\n    return rp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
     def test_scan_model_detects_tail_alias_call_from_prefix_annotated_assignment_context(self) -> None:
         detector = JITScriptDetector()
         filler_line = b"# filler\n"
         filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
         source = (
             b"\x00\xffimport runpy\nrun: object = runpy.run_path\n"
+            + filler
+            + b"def payload():\n    return run('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_tail_alias_call_from_prefix_unpack_assignment_context(self) -> None:
+        detector = JITScriptDetector()
+        filler_line = b"# filler\n"
+        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        source = (
+            b"\x00\xffimport runpy\n(run,) = (runpy.run_path,)\n"
             + filler
             + b"def payload():\n    return run('payload.py')\n"
         )
@@ -903,6 +968,14 @@ class TestJITScriptDetector:
         assert not any(
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
+
+    def test_scan_model_does_not_parse_docstring_priority_import_as_statement(self) -> None:
+        detector = JITScriptDetector()
+        source = b'\x00\xffdef payload():\n    """\n    import os\n    """\n    return 1\n\x00MODEL-FRAMING'
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(f.type in {"dangerous_import", "code_execution_pattern"} for f in findings)
 
     def test_scan_model_does_not_hoist_prefix_import_from_triple_quoted_string(self) -> None:
         detector = JITScriptDetector()

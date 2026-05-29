@@ -154,8 +154,8 @@ _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN = re.compile(
     rb"from\s+(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s]|\\\r?\n|$)"
     rb")"
 )
-_EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN = rb"[A-Za-z_]\w*(?:\s*:[^=\n#]+)?"
-_EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+")
+_EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN = rb"(?:[A-Za-z_]\w*(?:\s*:[^=\n#]+)?|[\(\[][A-Za-z_][^=\n#]*[\)\]])"
+_EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}\x00]+|class\s+\w+[^}\x00]+")
 _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])"
     rb"(?:(?:async\s+)?def\s+\w+|class\s+\w+|import\s+[A-Za-z_][\w.]*|"
@@ -241,10 +241,9 @@ def _candidate_embedded_python_snippets(
     for start in start_offsets:
         if include_full_source and start == 0:
             continue
-        if (
-            any(block_start <= start < block_end for block_start, block_end in block_spans)
-            and start not in priority_starts
-        ):
+        if any(block_start < start < block_end for block_start, block_end in block_spans):
+            continue
+        if any(block_start == start for block_start, _block_end in block_spans) and start not in priority_starts:
             continue
         candidates.append((bounded[start:], (start, len(bounded))))
 
@@ -282,31 +281,47 @@ def _bounded_priority_embedded_python_candidate(
         ):
             bounded_end = min(len(candidate), line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
             compact_candidate = candidate[: block_header_end + 1] + candidate[line_start:bounded_end]
-            return _append_late_priority_alias_usage(candidate, compact_candidate, bounded_end, span[0])
+            return _append_late_priority_alias_usage(
+                candidate,
+                compact_candidate,
+                bounded_end,
+                span[0],
+                span[0] + line_start,
+                span[0] + bounded_end,
+            )
     else:
         line_start = 0
     bounded_end = min(len(candidate), line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
     bounded_candidate = candidate[line_start:bounded_end]
-    return _append_late_priority_alias_usage(candidate, bounded_candidate, bounded_end, span[0] + line_start)
+    return _append_late_priority_alias_usage(
+        candidate,
+        bounded_candidate,
+        bounded_end,
+        span[0],
+        span[0] + line_start,
+        span[0] + bounded_end,
+    )
 
 
 def _append_late_priority_alias_usage(
     candidate: bytes,
     bounded_candidate: bytes,
     search_start: int,
+    candidate_span_start: int,
     span_start: int,
+    span_end: int,
 ) -> tuple[bytes, tuple[int, int]]:
     aliases = _priority_import_aliases(bounded_candidate)
     if not aliases:
-        return bounded_candidate, (span_start, span_start + len(bounded_candidate))
+        return bounded_candidate, (span_start, span_end)
 
     usage_line = _priority_alias_usage_line(candidate, aliases, search_start)
     if usage_line is None:
-        return bounded_candidate, (span_start, span_start + len(bounded_candidate))
+        return bounded_candidate, (span_start, span_end)
 
     usage_start, usage_end = usage_line
     compact_candidate = bounded_candidate.rstrip() + b"\n" + candidate[usage_start:usage_end]
-    return compact_candidate, (span_start, span_start + len(compact_candidate))
+    return compact_candidate, (span_start, max(span_end, candidate_span_start + usage_end))
 
 
 def _priority_import_aliases(candidate: bytes) -> frozenset[bytes]:
@@ -510,8 +525,7 @@ def _assignment_targets(tree: ast.AST) -> list[str]:
     for statement in getattr(tree, "body", []):
         if isinstance(statement, ast.Assign):
             for target in statement.targets:
-                if isinstance(target, ast.Name):
-                    targets.append(target.id)
+                targets.extend(_assignment_target_names(target))
         elif (
             isinstance(statement, ast.AnnAssign)
             and statement.value is not None
@@ -519,6 +533,16 @@ def _assignment_targets(tree: ast.AST) -> list[str]:
         ):
             targets.append(statement.target.id)
     return targets
+
+
+def _assignment_target_names(target: ast.AST) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Starred):
+        return _assignment_target_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for element in target.elts for name in _assignment_target_names(element)]
+    return []
 
 
 def _is_priority_assignment_context(context: bytes, statement: bytes) -> bool:
@@ -585,8 +609,11 @@ def _extract_priority_prefix_context(data: bytes) -> bytes:
             multiline_quote = statement_line_quote
             index += 1
             continue
-        if context_size + len(statement) > _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES:
-            break
+        if len(statement) > _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES:
+            index += 1
+            continue
+        while context and context_size + len(statement) > _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES:
+            context_size -= len(context.pop(0))
         context.append(statement)
         context_size += len(statement)
         index += 1
@@ -815,6 +842,23 @@ class JITScriptDetector:
         patterns = _DANGEROUS_IMPORT_PATTERNS.get(dangerous_import)
         import_pattern, from_pattern = patterns or _compile_dangerous_import_patterns(dangerous_import)
         return import_pattern.search(source) is not None or from_pattern.search(source) is not None
+
+    @staticmethod
+    def _dangerous_imports_in_tree(tree: ast.AST) -> set[str]:
+        dangerous_imports: set[str] = set()
+        for node in ast.walk(tree):
+            imported_modules: list[str] = []
+            if isinstance(node, ast.Import):
+                imported_modules.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imported_modules.append(node.module)
+            for module_name in imported_modules:
+                dangerous_imports.update(
+                    dangerous_import
+                    for dangerous_import in DANGEROUS_IMPORTS
+                    if module_name == dangerous_import or module_name.startswith(f"{dangerous_import}.")
+                )
+        return dangerous_imports
 
     def scan_torchscript(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Scan TorchScript model data for dangerous operations.
@@ -1117,9 +1161,14 @@ class JITScriptDetector:
                             parsed_snippet = completed_parsed_snippet
                             span = completed_span
 
+                parsed_imports = (
+                    self._dangerous_imports_in_tree(parsed_snippet[0]) if parsed_snippet is not None else None
+                )
                 # Check for dangerous imports
                 for dangerous_import in DANGEROUS_IMPORTS:
-                    if self._contains_dangerous_import(code_str, dangerous_import):
+                    if self._contains_dangerous_import(code_str, dangerous_import) and (
+                        parsed_imports is None or dangerous_import in parsed_imports
+                    ):
                         findings.append(
                             create_jit_finding(
                                 message=f"Dangerous import '{dangerous_import}' in embedded code",
