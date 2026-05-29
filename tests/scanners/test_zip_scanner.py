@@ -867,6 +867,151 @@ def test_scan_zip_ignores_invalid_ctypes_initializer_delegates(tmp_path: Path) -
     )
 
 
+def test_scan_zip_restores_dynamic_member_defaults_after_namespace_rebinds(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import webbrowser\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.payload = len\n"
+        "globals()['loader'] = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.payload\n"
+        "browser = webbrowser.get()\n"
+        "browser.open = len\n"
+        "globals().update(browser=webbrowser.get())\n"
+        "browser.open('https://example.invalid')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S109", "S110"}
+    assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
+    assert "ctypes.LibraryLoader.payload" in checks_by_rule["S110"].details["reason"]
+
+
+def test_scan_zip_keeps_dynamic_member_deletes_child_scope_local(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import webbrowser\n"
+        "ctypes.windll.payload = len\n"
+        "browser = webbrowser.get()\n"
+        "browser.open = len\n"
+        "def child():\n"
+        "    del ctypes.windll.payload\n"
+        "    del browser.open\n"
+        "ctypes.windll.payload\n"
+        "browser.open([])\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_zip_flags_empty_kwargs_loader_constructor_and_current_super(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "ctypes.LibraryLoader(ctypes.CDLL, **{}).emptykwargs\n"
+        "class CurrentSuperCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super(CurrentSuperCDLL, self).__init__(name)\n"
+        "ctypes.LibraryLoader(CurrentSuperCDLL).currentsuperlib\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S110"}
+    s110_reason = checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.emptykwargs" in s110_reason
+    assert "ctypes.LibraryLoader.currentsuperlib" in s110_reason
+
+
+def test_scan_zip_resolves_imports_inside_ctypes_subclass_initializers(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "class ImportAliasCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        import ctypes as ct\n"
+        "        ct.CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(ImportAliasCDLL).importaliaslib\n"
+        "class FromImportCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        from ctypes import CDLL\n"
+        "        CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(FromImportCDLL).fromimportlib\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S110"}
+    s110_reason = checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.importaliaslib" in s110_reason
+    assert "ctypes.LibraryLoader.fromimportlib" in s110_reason
+
+
+def test_scan_zip_ignores_unreachable_new_returns_async_init_and_hasattr_alias(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import os\n"
+        "class ReachableInstanceCDLL(ctypes.CDLL):\n"
+        "    def __new__(cls, name: str):\n"
+        "        return super().__new__(cls)\n"
+        "        return object()\n"
+        "ctypes.LibraryLoader(ReachableInstanceCDLL).reachablelib\n"
+        "class AsyncInitCDLL(ctypes.CDLL):\n"
+        "    async def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(AsyncInitCDLL).payload\n"
+        "f = hasattr(os, 'system')\n"
+        "f('id')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S110"}
+    assert checks_by_rule["S110"].details["reason"] == "high-risk calls: ctypes.LibraryLoader.reachablelib"
+
+
 def test_scan_zip_flags_extensionless_runpy_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:

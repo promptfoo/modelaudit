@@ -476,6 +476,7 @@ def _priority_alias_usage_lines(
     candidate: bytes, aliases: frozenset[bytes], search_start: int
 ) -> list[tuple[int, int]]:
     usage_lines: list[tuple[int, int]] = []
+    alias_use_lines = 0
     line_start = search_start
     multiline_quote: bytes | None = _multiline_string_state_after_line(candidate[:search_start], None)
     while line_start < len(candidate):
@@ -492,11 +493,10 @@ def _priority_alias_usage_lines(
         code_line = _python_structural_line_bytes(line)
         if _line_shadows_priority_alias(code_line, aliases):
             usage_lines.append((line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)))
-            if len(usage_lines) >= _MAX_PRIORITY_ALIAS_USAGE_LINES:
-                return usage_lines
         elif _line_uses_priority_alias(code_line, aliases):
             usage_lines.append((line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)))
-            if _line_calls_priority_alias(code_line, aliases) or len(usage_lines) >= _MAX_PRIORITY_ALIAS_USAGE_LINES:
+            alias_use_lines += 1
+            if _line_calls_priority_alias(code_line, aliases) or alias_use_lines >= _MAX_PRIORITY_ALIAS_USAGE_LINES:
                 return usage_lines
         multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
         line_start = line_end

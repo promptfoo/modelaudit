@@ -732,7 +732,17 @@ def _single_static_call_argument(
     *,
     keyword_name: str,
 ) -> ast.AST | None:
-    if len(args) == 1 and not keywords:
+    meaningful_keywords = [
+        keyword
+        for keyword in keywords
+        if not (
+            keyword.arg is None
+            and isinstance(keyword.value, ast.Dict)
+            and not keyword.value.keys
+            and not keyword.value.values
+        )
+    ]
+    if len(args) == 1 and not meaningful_keywords:
         argument = args[0]
         if isinstance(argument, ast.Starred):
             value = argument.value
@@ -740,10 +750,10 @@ def _single_static_call_argument(
                 return value.elts[0]
             return None
         return argument
-    if args or len(keywords) != 1:
+    if args or len(meaningful_keywords) != 1:
         return None
 
-    keyword = keywords[0]
+    keyword = meaningful_keywords[0]
     if keyword.arg == keyword_name:
         return keyword.value
     if keyword.arg is not None:
@@ -896,6 +906,11 @@ def _resolve_getattr_call_names(
     )
     if resolved_target_roots is None:
         return None
+    if has_hasattr_helper and not has_getattr_helper:
+        ctypes_member_names = _ctypes_loader_member_load_names(resolved_target_roots, attr_name)
+        if not ctypes_member_names:
+            return None
+        return _apply_aliases_to_names(ctypes_member_names, alias_scopes)
     if attr_name is None:
         return _ctypes_loader_member_load_names(resolved_target_roots, attr_name) or None
     return _apply_aliases_to_names(
@@ -1672,7 +1687,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         return not found or (isinstance(root_aliases, frozenset) and root_name in root_aliases)
 
     def _localize_instance_binding_value(
-        self, local_name: str, value: ast.AST, resolved_names: _AliasValue
+        self, local_name: str, value: ast.AST | None, resolved_names: _AliasValue
     ) -> _AliasValue:
         if not isinstance(resolved_names, frozenset):
             return resolved_names
@@ -1682,11 +1697,15 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             localized_names.add(
                 self._localized_instance_root_for_binding(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT, local_name)
             )
-        webbrowser_controller_roots = _resolve_webbrowser_controller_factory_roots(
-            value,
-            self.alias_scopes,
-            allow_module_locals_mapping=self._non_module_scope_depth == 0,
-            allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+        webbrowser_controller_roots = (
+            _resolve_webbrowser_controller_factory_roots(
+                value,
+                self.alias_scopes,
+                allow_module_locals_mapping=self._non_module_scope_depth == 0,
+                allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+            )
+            if value is not None
+            else None
         )
         for controller_root in webbrowser_controller_roots or frozenset():
             if controller_root in localized_names:
@@ -1709,6 +1728,21 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for scope in self.alias_scopes:
             scope.pop(name, None)
             scope.pop(module_write_name, None)
+
+    def _restore_deleted_dynamic_target_bindings(
+        self, target_names: frozenset[str] | set[str], syntactic_name: str | None
+    ) -> bool:
+        dynamic_target_names = frozenset(
+            target_name for target_name in target_names if _is_dynamic_overwritable_high_risk_reference(target_name)
+        )
+        if not dynamic_target_names:
+            return False
+        current_scope = self.alias_scopes[-1]
+        for target_name in dynamic_target_names:
+            current_scope[target_name] = frozenset({target_name})
+        if syntactic_name is not None:
+            current_scope[syntactic_name] = dynamic_target_names
+        return True
 
     def _resolve_binding_value_names(self, value: ast.AST | None) -> _AliasValue:
         if value is None:
@@ -1764,14 +1798,17 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             )
             if key is not None and roots is not None:
                 resolved_value = self._resolve_binding_value_names(value)
+                localized_value = self._localize_instance_binding_value(key, value, resolved_value)
                 for root in roots:
                     if root in _TRACKED_MODULE_NAMESPACE_ALIASES:
-                        self._bind_module_namespace_key(key, resolved_value)
+                        self._bind_module_namespace_key(key, localized_value)
+                        self._restore_reassigned_instance_member_defaults(key, localized_value)
                         continue
                     if root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
-                        self._bind_name(key, resolved_value)
+                        self._bind_name(key, localized_value)
+                        self._restore_reassigned_instance_member_defaults(key, localized_value)
                         continue
-                    self._bind_name(f"{root}.{key}", resolved_value)
+                    self._bind_name(f"{root}.{key}", localized_value)
         elif isinstance(target, ast.Attribute):
             syntactic_name, target_names = self._overwritable_target_names(target)
             if not target_names:
@@ -1837,11 +1874,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             dynamic_target_names = {
                 target_name for target_name in target_names if _is_dynamic_overwritable_high_risk_reference(target_name)
             }
-            if dynamic_target_names:
-                for target_name in dynamic_target_names:
-                    self._delete_alias_binding(target_name)
-                if syntactic_name is not None:
-                    self._delete_alias_binding(syntactic_name)
+            if dynamic_target_names and self._restore_deleted_dynamic_target_bindings(target_names, syntactic_name):
                 return
             for target_name in target_names:
                 self._bind_name(target_name, None)
@@ -1898,6 +1931,21 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             return None
         return method_name, roots, key, value_node
 
+    def _resolve_namespace_keyword_update_call(self, node: ast.Call) -> list[tuple[frozenset[str], str, ast.AST]]:
+        if not (isinstance(node.func, ast.Attribute) and node.func.attr == "update" and not node.args):
+            return []
+        if any(keyword.arg is None for keyword in node.keywords):
+            return []
+        roots = _resolve_namespace_mapping_roots(
+            node.func.value,
+            self.alias_scopes,
+            allow_module_locals_mapping=self._non_module_scope_depth == 0,
+            allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+        )
+        if roots is None:
+            return []
+        return [(roots, keyword.arg, keyword.value) for keyword in node.keywords if keyword.arg is not None]
+
     @staticmethod
     def _merge_alias_values(*values: _AliasValue) -> _AliasValue:
         concrete = frozenset(alias for value in values if isinstance(value, frozenset) for alias in value)
@@ -1950,6 +1998,21 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             scope.pop(dotted_name, None)
 
     def _record_namespace_write_call(self, node: ast.Call) -> None:
+        for roots, key, keyword_value_node in self._resolve_namespace_keyword_update_call(node):
+            resolved_value = self._resolve_binding_value_names(keyword_value_node)
+            for root in roots:
+                if root in _TRACKED_MODULE_NAMESPACE_ALIASES:
+                    localized_value = self._localize_instance_binding_value(key, keyword_value_node, resolved_value)
+                    self._bind_module_namespace_key(key, localized_value)
+                    self._restore_reassigned_instance_member_defaults(key, localized_value)
+                    continue
+                if root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
+                    localized_value = self._localize_instance_binding_value(key, keyword_value_node, resolved_value)
+                    self._bind_name(key, localized_value)
+                    self._restore_reassigned_instance_member_defaults(key, localized_value)
+                    continue
+                self._bind_name(f"{root}.{key}", resolved_value)
+
         write_call = self._resolve_namespace_write_call(node)
         if write_call is None:
             return
@@ -1966,10 +2029,14 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 self._setdefault_value_for_key(root, key, value_names) if method_name == "setdefault" else value_names
             )
             if root in _TRACKED_MODULE_NAMESPACE_ALIASES:
-                self._bind_module_namespace_key(key, resolved_value)
+                localized_value = self._localize_instance_binding_value(key, value_node, resolved_value)
+                self._bind_module_namespace_key(key, localized_value)
+                self._restore_reassigned_instance_member_defaults(key, localized_value)
                 continue
             if root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
-                self._bind_name(key, resolved_value)
+                localized_value = self._localize_instance_binding_value(key, value_node, resolved_value)
+                self._bind_name(key, localized_value)
+                self._restore_reassigned_instance_member_defaults(key, localized_value)
                 continue
             self._bind_name(f"{root}.{key}", resolved_value)
 
@@ -2023,10 +2090,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         syntactic_target_name = f"{syntactic_target_root}.{attr_name}" if syntactic_target_root is not None else None
         if syntactic_target_name is not None and target_names:
             target_names.add(syntactic_target_name)
+        if self._restore_deleted_dynamic_target_bindings(target_names, syntactic_target_name):
+            return
         for target_name in target_names:
-            if target_name == syntactic_target_name or _is_dynamic_overwritable_high_risk_reference(target_name):
-                self._delete_alias_binding(target_name)
-            elif _is_overwritable_high_risk_reference(target_name):
+            if _is_overwritable_high_risk_reference(target_name):
                 self._bind_name(target_name, None)
 
     def _shadow_binding_target(self, target: ast.AST) -> None:
@@ -2293,6 +2360,23 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         ):
             yield f"{target.value.id}.{target.attr}"
 
+    @staticmethod
+    def _initializer_import_bindings(statement: ast.Import | ast.ImportFrom) -> _AliasScope:
+        bindings: _AliasScope = {}
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                bindings[local_name] = frozenset({alias.name})
+            return bindings
+        if statement.level != 0 or statement.module is None:
+            return bindings
+        for alias in statement.names:
+            if alias.name == "*":
+                continue
+            local_name = alias.asname or alias.name
+            bindings[local_name] = frozenset({f"{statement.module}.{alias.name}"})
+        return bindings
+
     def _resolve_initializer_reference_names(
         self,
         node: ast.AST,
@@ -2329,6 +2413,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def _super_call_preserves_ctypes_loader_init(
         self,
         super_call: ast.Call,
+        class_name: str,
         base_identity_names: list[frozenset[str]],
         loader_base_indices: frozenset[int],
     ) -> bool:
@@ -2339,6 +2424,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if len(super_call.args) != 2:
             return False
         first_arg_names = self._reference_identity_names(super_call.args[0])
+        if class_name in first_arg_names:
+            return bool(loader_base_indices)
         for index, base_names in enumerate(base_identity_names):
             if first_arg_names & base_names:
                 return any(loader_index > index for loader_index in loader_base_indices)
@@ -2392,6 +2479,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             and isinstance(call.func.value, ast.Call)
             and self._super_call_preserves_ctypes_loader_init(
                 call.func.value,
+                class_name,
                 base_identity_names,
                 loader_base_indices,
             )
@@ -2478,6 +2566,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         loader_base_indices: frozenset[int],
     ) -> bool:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return False
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            initializer_scope.update(self._initializer_import_bindings(statement))
             return False
         if isinstance(statement, ast.If):
             constant_bool = self._constant_bool(statement.test)
@@ -2627,12 +2718,47 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _class_new_may_skip_init(self, node: ast.ClassDef) -> bool:
         new_method = self._class_method(node, "__new__")
-        if new_method is None:
+        if new_method is None or isinstance(new_method, ast.AsyncFunctionDef):
             return False
-        return any(
-            isinstance(statement, ast.Return) and self._return_value_is_obvious_non_instance(statement.value)
-            for statement in new_method.body
-        )
+        return self._statements_may_reach_non_instance_return(new_method.body)
+
+    def _statements_may_reach_non_instance_return(self, statements: list[ast.stmt]) -> bool:
+        for statement in statements:
+            if isinstance(statement, ast.Return):
+                return self._return_value_is_obvious_non_instance(statement.value)
+            if isinstance(statement, ast.If):
+                constant_bool = self._constant_bool(statement.test)
+                if constant_bool is True:
+                    return self._statements_may_reach_non_instance_return(statement.body)
+                if constant_bool is False:
+                    if self._statements_may_reach_non_instance_return(statement.orelse):
+                        return True
+                    if self._statements_always_return(statement.orelse):
+                        return False
+                    continue
+                if self._statements_may_reach_non_instance_return(
+                    statement.body
+                ) or self._statements_may_reach_non_instance_return(statement.orelse):
+                    return True
+                if self._statements_always_return(statement.body) and self._statements_always_return(statement.orelse):
+                    return False
+        return False
+
+    @staticmethod
+    def _statements_always_return(statements: list[ast.stmt]) -> bool:
+        for statement in statements:
+            if isinstance(statement, ast.Return):
+                return True
+            if isinstance(statement, ast.If):
+                constant_bool = _HighRiskPythonCallVisitor._constant_bool(statement.test)
+                if constant_bool is True:
+                    return _HighRiskPythonCallVisitor._statements_always_return(statement.body)
+                if constant_bool is False:
+                    return _HighRiskPythonCallVisitor._statements_always_return(statement.orelse)
+                return _HighRiskPythonCallVisitor._statements_always_return(
+                    statement.body
+                ) and _HighRiskPythonCallVisitor._statements_always_return(statement.orelse)
+        return False
 
     def _class_preserves_ctypes_loader_init(self, node: ast.ClassDef, class_scope: _AliasScope) -> bool:
         base_identity_names = [self._reference_identity_names(base) for base in node.bases]
@@ -2643,6 +2769,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         )
         init_method = self._class_method(node, "__init__")
         if self._class_new_may_skip_init(node):
+            return False
+        if isinstance(init_method, ast.AsyncFunctionDef):
             return False
         if init_method is None:
             class_init_alias = class_scope.get("__init__")
