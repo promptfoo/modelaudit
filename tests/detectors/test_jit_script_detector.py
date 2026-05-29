@@ -658,6 +658,8 @@ class TestJITScriptDetector:
             b"    import ctypes\n"
             b"    import webbrowser\n"
             b"    webbrowser.get().open.__call__('https://example.invalid')\n"
+            b"    webbrowser.get().__getattribute__('open')('https://example.invalid')\n"
+            b"    ctypes.windll.kernel32\n"
             b"    ctypes.cdll['msvcrt'].printf(b'x')\n"
             b"    ctypes.cdll.__getitem__('msvcrt')\n"
             b"    loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
@@ -685,6 +687,28 @@ class TestJITScriptDetector:
 
         assert not any(
             finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_safe_webbrowser_method_overwrite_and_invalid_libraryloader(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    import webbrowser\n"
+            b"    browser = webbrowser.get()\n"
+            b"    browser.open = len\n"
+            b"    browser.open([])\n"
+            b"    loader = ctypes.LibraryLoader(len)\n"
+            b"    return loader.payload.printf(b'x')\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern"
+            and finding.pattern in {"Web browser launch detected", "Native library loading detected"}
             for finding in findings
         )
 

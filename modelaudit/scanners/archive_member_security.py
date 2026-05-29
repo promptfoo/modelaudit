@@ -112,6 +112,14 @@ _CTYPES_LIBRARY_LOADER_OBJECTS = frozenset(
 )
 _CTYPES_LIBRARY_LOADER_NON_LOADING_ATTRIBUTES = frozenset({"_FuncPtr", "_dlltype", "_handle", "_name"})
 _CTYPES_LIBRARY_LOADER_CONSTRUCTORS = frozenset({"ctypes.LibraryLoader"})
+_CTYPES_LIBRARY_LOADER_TYPES = frozenset(
+    {
+        "ctypes.CDLL",
+        "ctypes.OleDLL",
+        "ctypes.PyDLL",
+        "ctypes.WinDLL",
+    }
+)
 _CTYPES_NATIVE_LIBRARY_LOADING_CALLS = frozenset(
     {
         "ctypes.CDLL",
@@ -607,16 +615,24 @@ def _resolve_getattr_call_names(
         return None
 
     helper_name = _resolve_call_name(node.func)
-    resolved_helper_names = (
-        _apply_aliases(helper_name, alias_scopes)
-        if helper_name is not None
-        else _resolve_getattr_call_names(
-            node.func,
-            alias_scopes,
-            allow_module_locals_mapping=allow_module_locals_mapping,
-            allow_local_namespace_mapping=allow_local_namespace_mapping,
-        )
-    )
+    if helper_name is not None:
+        resolved_helper_names = _apply_aliases(helper_name, alias_scopes)
+    else:
+        resolved_helper_names = None
+        if not isinstance(node.func, ast.Call):
+            resolved_helper_names = _resolve_static_reference_names(
+                node.func,
+                alias_scopes,
+                allow_module_locals_mapping=allow_module_locals_mapping,
+                allow_local_namespace_mapping=allow_local_namespace_mapping,
+            )
+        if resolved_helper_names is None:
+            resolved_helper_names = _resolve_getattr_call_names(
+                node.func,
+                alias_scopes,
+                allow_module_locals_mapping=allow_module_locals_mapping,
+                allow_local_namespace_mapping=allow_local_namespace_mapping,
+            )
     if resolved_helper_names is None:
         return None
 
@@ -1132,8 +1148,20 @@ def _resolve_ctypes_library_loader_instance_roots(
     if resolved_func_names is None:
         return None
 
+    loader_roots: set[str] = set()
     constructor_roots = resolved_func_names & _CTYPES_LIBRARY_LOADER_CONSTRUCTORS
-    loader_roots: set[str] = set(constructor_roots)
+    if constructor_roots:
+        if len(node.args) != 1 or node.keywords:
+            return None
+        resolved_loader_types = _resolve_static_reference_names(
+            node.args[0],
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if resolved_loader_types is None or not (resolved_loader_types & _CTYPES_LIBRARY_LOADER_TYPES):
+            return None
+        loader_roots.update(constructor_roots)
     if len(node.args) == 1 and not node.keywords:
         library_name = _resolve_static_string(node.args[0])
         for resolved_func_name in resolved_func_names:
@@ -1381,7 +1409,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             resolved_value = self._resolve_binding_value_names(value)
             syntactic_name = _resolve_call_name(target)
             for target_name in resolved_target_names:
-                if target_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
+                if (
+                    target_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
+                    or _webbrowser_controller_launch_call_name(target_name) is not None
+                    or _ctypes_loader_attribute_load_name(target_name) is not None
+                ):
                     self._bind_name(target_name, resolved_value)
                     if syntactic_name is not None:
                         self._bind_name(syntactic_name, resolved_value)
@@ -1946,6 +1978,16 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if resolved_names is not None:
                 for resolved_name in resolved_names:
                     normalized_name = _normalized_high_risk_python_call_name(resolved_name)
+                    if normalized_name is not None:
+                        self.risky_calls.add(normalized_name)
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if isinstance(node.ctx, ast.Load):
+            resolved_names = self._resolve_reference_names(node)
+            if resolved_names is not None:
+                for resolved_name in resolved_names:
+                    normalized_name = _ctypes_loader_attribute_load_name(resolved_name)
                     if normalized_name is not None:
                         self.risky_calls.add(normalized_name)
         self.generic_visit(node)
