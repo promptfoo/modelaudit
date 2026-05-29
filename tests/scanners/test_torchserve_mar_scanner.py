@@ -747,6 +747,16 @@ def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
             b"import os\ndef handle(data, context):\n    os.posix_spawn = len\n    return os.posix_spawn([])\n",
             "os.posix_spawn",
         ),
+        (
+            b"import asyncio\nasync def handle(data, context):\n"
+            b"    return await asyncio.create_subprocess_shell('id')\n",
+            "asyncio.create_subprocess_shell",
+        ),
+        (
+            b"from asyncio import create_subprocess_exec as launch\nasync def handle(data, context):\n"
+            b"    return await launch('id')\n",
+            "asyncio.create_subprocess_exec",
+        ),
     ],
 )
 def test_scan_detects_os_process_launch_handler_execution_primitive(

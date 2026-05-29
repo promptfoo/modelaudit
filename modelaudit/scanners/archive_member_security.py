@@ -68,6 +68,14 @@ _OS_PROCESS_EXECUTION_CALLS = frozenset(
         "os.system",
     }
 )
+_ASYNCIO_PROCESS_EXECUTION_CALLS = frozenset(
+    {
+        "asyncio.create_subprocess_exec",
+        "asyncio.create_subprocess_shell",
+        "asyncio.subprocess.create_subprocess_exec",
+        "asyncio.subprocess.create_subprocess_shell",
+    }
+)
 _HIGH_RISK_PYTHON_CALLS = {
     "__import__",
     "builtins.__import__",
@@ -84,6 +92,7 @@ _HIGH_RISK_PYTHON_CALLS = {
     "subprocess.Popen",
     "subprocess.run",
     *_OS_PROCESS_EXECUTION_CALLS,
+    *_ASYNCIO_PROCESS_EXECUTION_CALLS,
 }
 
 
@@ -112,6 +121,7 @@ _HIGH_RISK_PYTHON_CALL_RULE_CODES: dict[str, str] = {
     "pickle.load": "S213",
     "pickle.loads": "S213",
     **dict.fromkeys(_OS_PROCESS_EXECUTION_CALLS, "S101"),
+    **dict.fromkeys(_ASYNCIO_PROCESS_EXECUTION_CALLS, "S103"),
 }
 _HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES: tuple[tuple[str, str], ...] = (("subprocess.", "S103"),)
 _FALLBACK_HIGH_RISK_RULE_CODE = "S104"

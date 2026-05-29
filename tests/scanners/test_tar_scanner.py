@@ -356,6 +356,45 @@ class TestTarScanner:
         assert python_checks[0].rule_code == "S101"
         assert python_checks[0].details["reason"] == "high-risk calls: os.posix_spawn"
 
+    @pytest.mark.parametrize(
+        ("payload", "dangerous_name"),
+        [
+            (
+                b"import asyncio\nasyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
+                "asyncio.create_subprocess_exec",
+            ),
+            (
+                b"from asyncio import create_subprocess_shell as run\nrun('id')\n",
+                "asyncio.create_subprocess_shell",
+            ),
+            (
+                b"import asyncio.subprocess\nasyncio.subprocess.create_subprocess_shell('id')\n",
+                "asyncio.subprocess.create_subprocess_shell",
+            ),
+            (
+                b"import asyncio\nasyncio.create_subprocess_shell = len\nasyncio.create_subprocess_shell([])\n",
+                "asyncio.create_subprocess_shell",
+            ),
+        ],
+    )
+    def test_scan_tar_flags_asyncio_subprocess_python_member(
+        self, tmp_path: Path, payload: bytes, dangerous_name: str
+    ) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].rule_code == "S103"
+        assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
     def test_scan_tar_ignores_safe_namespace_slot_rebinding(self, tmp_path: Path) -> None:
         """A safe final callable bound through a module dictionary should remain clean."""
         archive_path = tmp_path / "model_bundle.tar"
