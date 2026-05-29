@@ -154,6 +154,7 @@ _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN = re.compile(
     rb"from\s+(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s]|\\\r?\n|$)"
     rb")"
 )
+_EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN = rb"[A-Za-z_]\w*(?:\s*:[^=\n#]+)?"
 _EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+")
 _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])"
@@ -161,8 +162,9 @@ _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"from\s+[A-Za-z_][\w.]*(?:\s|\\\r?\n)+import)"
 )
 _EMBEDDED_PYTHON_CONTEXT_START_PATTERN = re.compile(
-    rb"(?<![A-Za-z0-9_'\".])"
-    rb"(?:import\s+[A-Za-z_][\w.]*|from\s+[A-Za-z_][\w.]*|[A-Za-z_]\w*(?:\s*:[^=\n#]+)?\s*=)"
+    rb"(?<![A-Za-z0-9_'\".])(?:import\s+[A-Za-z_][\w.]*|from\s+[A-Za-z_][\w.]*|"
+    + _EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN
+    + rb"\s*=)"
 )
 
 
@@ -450,7 +452,11 @@ def _assignment_targets(tree: ast.AST) -> list[str]:
             for target in statement.targets:
                 if isinstance(target, ast.Name):
                     targets.append(target.id)
-        elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+        elif (
+            isinstance(statement, ast.AnnAssign)
+            and statement.value is not None
+            and isinstance(statement.target, ast.Name)
+        ):
             targets.append(statement.target.id)
     return targets
 
