@@ -128,6 +128,7 @@ def _compile_dangerous_import_patterns(dangerous_import: str) -> tuple[re.Patter
 _DANGEROUS_IMPORT_PATTERNS = {
     dangerous_import: _compile_dangerous_import_patterns(dangerous_import) for dangerous_import in DANGEROUS_IMPORTS
 }
+_MAX_SNIPPET_PARSE_TRIM_ATTEMPTS = 8
 
 
 def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
@@ -137,23 +138,86 @@ def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
     return {(call.name, call.rule_code) for call in high_risk_python_calls_in_tree(tree)}
 
 
-def _parse_embedded_python_snippet(code_str: str) -> ast.AST | None:
+def _parse_embedded_python_snippet(code_str: str) -> tuple[ast.AST, int] | None:
     """Parse an extracted Python snippet, trimming trailing binary framing when needed."""
     try:
-        return ast.parse(code_str)
-    except (SyntaxError, ValueError):
-        pass
+        return ast.parse(code_str), len(code_str)
+    except (SyntaxError, ValueError) as exc:
+        initial_error = exc
 
-    lines = code_str.splitlines()
-    for end in range(len(lines) - 1, 0, -1):
-        candidate = "\n".join(lines[:end])
+    lines = code_str.splitlines(keepends=True)
+    candidate_lengths: list[int] = []
+    null_offset = code_str.find("\x00")
+    if null_offset > 0:
+        candidate_lengths.append(null_offset)
+
+    candidate_ends: list[int] = []
+    if isinstance(initial_error, SyntaxError) and initial_error.lineno is not None:
+        candidate_ends.append(max(1, initial_error.lineno - 1))
+    candidate_ends.extend(range(len(lines) - 1, max(0, len(lines) - _MAX_SNIPPET_PARSE_TRIM_ATTEMPTS - 1), -1))
+
+    for end in candidate_ends:
+        candidate_lengths.append(sum(len(line) for line in lines[:end]))
+
+    seen_lengths: set[int] = set()
+    for length in candidate_lengths:
+        if length <= 0 or length in seen_lengths:
+            continue
+        seen_lengths.add(length)
+        candidate = code_str[:length]
         if candidate.strip() == "":
             continue
         try:
-            return ast.parse(f"{candidate}\n")
+            return ast.parse(f"{candidate}\n"), length
         except (SyntaxError, ValueError):
             continue
     return None
+
+
+def _has_raw_match_outside_parsed_spans(raw_spans: list[tuple[int, int]], parsed_spans: list[tuple[int, int]]) -> bool:
+    """Return whether any raw regex hit sits outside AST-validated source."""
+    for raw_start, raw_end in raw_spans:
+        if not any(parsed_start <= raw_start and raw_end <= parsed_end for parsed_start, parsed_end in parsed_spans):
+            return True
+    return False
+
+
+def _decode_utf8_with_byte_offsets(data: bytes) -> tuple[str, list[int]]:
+    """Decode UTF-8 like errors='ignore' while mapping decoded character offsets to byte offsets."""
+    chars: list[str] = []
+    byte_offsets = [0]
+    index = 0
+    while index < len(data):
+        byte = data[index]
+        if byte < 0x80:
+            chars.append(chr(byte))
+            index += 1
+            byte_offsets.append(index)
+            continue
+
+        if 0xC2 <= byte <= 0xDF:
+            length = 2
+        elif 0xE0 <= byte <= 0xEF:
+            length = 3
+        elif 0xF0 <= byte <= 0xF4:
+            length = 4
+        else:
+            index += 1
+            continue
+
+        chunk = data[index : index + length]
+        if len(chunk) != length or any((continuation & 0xC0) != 0x80 for continuation in chunk[1:]):
+            index += 1
+            continue
+        try:
+            chars.append(chunk.decode("utf-8"))
+        except UnicodeDecodeError:
+            index += 1
+            continue
+        index += length
+        byte_offsets.append(index)
+
+    return "".join(chars), byte_offsets
 
 
 # Patterns that indicate code execution attempts
@@ -553,9 +617,14 @@ class JITScriptDetector:
 
         bounded = data if include_full_source else data[:1000000]
         python_code_pattern = rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+"
-        matches = [bounded] if include_full_source else re.findall(python_code_pattern, bounded)
+        matches = (
+            [(bounded, (0, len(bounded)))]
+            if include_full_source
+            else [(match.group(0), match.span()) for match in re.finditer(python_code_pattern, bounded)]
+        )
         bounded_high_risk_calls: set[tuple[str, str]] | None = None
         snippet_high_risk_calls: set[tuple[str, str]] = set()
+        parsed_snippet_spans: list[tuple[int, int]] = []
         try:
             bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
             bounded_high_risk_calls = _resolve_alias_aware_high_risk_calls(bounded_tree)
@@ -564,9 +633,9 @@ class JITScriptDetector:
             # raw pattern detection active and fall back to extracted snippets.
             bounded_high_risk_calls = None
 
-        for match in matches[:10]:  # Analyze first 10 code snippets
+        for match, span in matches[:10]:  # Analyze first 10 code snippets
             try:
-                code_str = match.decode("utf-8", errors="ignore")
+                code_str, byte_offsets = _decode_utf8_with_byte_offsets(match)
 
                 # Check for dangerous imports
                 for dangerous_import in DANGEROUS_IMPORTS:
@@ -609,8 +678,11 @@ class JITScriptDetector:
                         )
 
                 # Try to parse as AST for deeper analysis.
-                tree = _parse_embedded_python_snippet(code_str)
-                if tree is not None:
+                parsed_snippet = _parse_embedded_python_snippet(code_str)
+                if parsed_snippet is not None:
+                    tree, parsed_chars = parsed_snippet
+                    parsed_byte_length = byte_offsets[parsed_chars]
+                    parsed_snippet_spans.append((span[0], min(span[1], span[0] + parsed_byte_length)))
                     snippet_high_risk_calls.update(_resolve_alias_aware_high_risk_calls(tree))
                     ast_findings = self._analyze_ast(tree, framework, context)
                     findings.extend(ast_findings)
@@ -622,12 +694,16 @@ class JITScriptDetector:
         # Check for common code execution patterns in binary
         resolved_high_risk_calls = (bounded_high_risk_calls or set()) | snippet_high_risk_calls
         for pattern, description in CODE_EXECUTION_PATTERNS:
-            pattern_match = re.search(pattern, bounded) is not None
+            raw_pattern_spans = [match.span() for match in re.finditer(pattern, bounded)]
+            pattern_match = len(raw_pattern_spans) > 0
             if description == _SUBPROCESS_CODE_EXECUTION_DESCRIPTION:
                 resolved_subprocess_call = any(code == "S103" for _, code in resolved_high_risk_calls)
+                raw_match_only_in_parsed_snippets = bool(
+                    parsed_snippet_spans
+                ) and not _has_raw_match_outside_parsed_spans(raw_pattern_spans, parsed_snippet_spans)
                 if resolved_subprocess_call:
                     pattern_match = True
-                elif bounded_high_risk_calls is not None:
+                elif bounded_high_risk_calls is not None or raw_match_only_in_parsed_snippets:
                     continue
             if description == _OS_CODE_EXECUTION_DESCRIPTION:
                 resolved_os_process_call = any(code == "S101" for _, code in resolved_high_risk_calls)

@@ -1,5 +1,6 @@
 """Tests for JIT/Script code execution detection."""
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -394,6 +395,92 @@ class TestJITScriptDetector:
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
         assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_binary_framed_string_literal_asyncio_subprocess_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xffdef payload():\n    return \"asyncio.create_subprocess_shell('id')\"\n\x00\xffMODEL-FRAMING"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_lossy_decoded_string_literal_asyncio_subprocess_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    # ignored invalid bytes: "
+            + (b"\xff" * 64)
+            + b"\n    return \"asyncio.create_subprocess_shell('id')\"\n\x00\xffMODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_parse_embedded_python_snippet_caps_trim_attempts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        parse_calls = 0
+
+        def fail_parse(_source: str) -> ast.AST:
+            nonlocal parse_calls
+            parse_calls += 1
+            raise SyntaxError("bad syntax", ("<embedded>", 1, 1, "bad"))
+
+        monkeypatch.setattr(jit_script_module.ast, "parse", fail_parse)
+
+        tree = jit_script_module._parse_embedded_python_snippet(
+            "def payload():\n" + "\n".join("bad" for _ in range(1000))
+        )
+
+        assert tree is None
+        assert parse_calls <= jit_script_module._MAX_SNIPPET_PARSE_TRIM_ATTEMPTS + 2
+
+    def test_scan_model_detects_binary_framed_long_tail_alias_aware_asyncio_subprocess_launch(self) -> None:
+        detector = JITScriptDetector()
+        tail = b"\n".join(b"tail" for _ in range(jit_script_module._MAX_SNIPPET_PARSE_TRIM_ATTEMPTS + 20))
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    from asyncio import create_subprocess_shell as launch\n"
+            b"    return launch('id')\n"
+            b"\x00" + tail
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_binary_framed_long_tail_alias_aware_os_process_launch(self) -> None:
+        detector = JITScriptDetector()
+        tail = b"\n".join(b"tail" for _ in range(jit_script_module._MAX_SNIPPET_PARSE_TRIM_ATTEMPTS + 20))
+        source = b"\x00\xffdef payload():\n    import os as o\n    return getattr(o, 'system')('id')\n\x00" + tail
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    def test_scan_model_preserves_raw_asyncio_match_in_unparsed_snippet_after_benign_parse(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def benign():\n"
+            b"    return \"asyncio.create_subprocess_shell('id')\"\n"
+            b"}\n"
+            b"def payload():\n"
+            b"if True print('broken')\n"
+            b"asyncio.create_subprocess_shell('id')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
             f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
         )
 

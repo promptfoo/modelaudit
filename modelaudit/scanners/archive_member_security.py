@@ -1070,6 +1070,8 @@ def _wildcard_import_aliases(module: str) -> Iterator[tuple[str, str]]:
         if not call_name.startswith(prefix):
             continue
         exported_name = call_name.removeprefix(prefix).split(".", maxsplit=1)[0]
+        if module == "asyncio" and exported_name == "subprocess":
+            continue
         yield exported_name, f"{module}.{exported_name}"
 
 
