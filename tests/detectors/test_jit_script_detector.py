@@ -1058,6 +1058,28 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
         )
 
+    @pytest.mark.parametrize("filler_line", [b"foo(c=1)\n", b"obj.c = 1\n"])
+    def test_scan_model_ignores_nonbinding_alias_syntax_before_late_priority_attribute_load(
+        self, filler_line: bytes
+    ) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        filler = filler_line * jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES
+        source = b"\x00\xff" + leading_blocks + b"import ctypes as c\n" + padding + filler + b"c.cdll.msvcrt\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
+        )
+
     def test_scan_model_ignores_unrelated_assignment_alias_before_delayed_priority_call(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
@@ -1828,6 +1850,28 @@ class TestJITScriptDetector:
         assert "Web browser launch detected" in patterns
         assert "Native library loading detected" in patterns
 
+    def test_scan_model_detects_hasattr_ctypes_load_and_local_init_alias(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    hasattr(ctypes.cdll, 'hasattrlib')\n"
+            b"    hasattr(ctypes.LibraryLoader(ctypes.CDLL), 'hasattrpayload')\n"
+            b"    class LocalAliasCDLL(ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            init = ctypes.CDLL.__init__\n"
+            b"            init(self, name)\n"
+            b"    ctypes.LibraryLoader(LocalAliasCDLL).localaliaslib\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
     def test_scan_model_preserves_dynamic_member_risk_after_reassignment_and_delete(self) -> None:
         detector = JITScriptDetector()
         source = (
@@ -1903,6 +1947,34 @@ class TestJITScriptDetector:
 
         assert not any(
             finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_non_loading_ctypes_subclass_initializers(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    class Safe:\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            self.name = name\n"
+            b"    class NoLoad(Safe, ctypes.CDLL):\n"
+            b"        pass\n"
+            b"    ctypes.LibraryLoader(NoLoad).payload\n"
+            b"    NoLoad('/missing')\n"
+            b"    class DeadDelegateCDLL(ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            if False:\n"
+            b"                ctypes.CDLL.__init__(self, name)\n"
+            b"    ctypes.LibraryLoader(DeadDelegateCDLL).payload\n"
+            b"    DeadDelegateCDLL('/missing')\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
             for finding in findings
         )
 

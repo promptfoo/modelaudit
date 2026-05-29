@@ -635,6 +635,13 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "loader_getattr = ctypes.LibraryLoader(ctypes.CDLL)\n"
         "loader_getattr.__getattr__('localizedgetattr')\n"
         "loader_getattr.__getattr__(library_name)\n"
+        "hasattr(ctypes.cdll, 'hasattrlib')\n"
+        "hasattr(ctypes.LibraryLoader(ctypes.CDLL), 'hasattrpayload')\n"
+        "class LocalAliasCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        init = ctypes.CDLL.__init__\n"
+        "        init(self, name)\n"
+        "ctypes.LibraryLoader(LocalAliasCDLL).localaliaslib\n"
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
@@ -679,6 +686,9 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.LibraryLoader.<dynamic>" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.user32" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.advapi32" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.hasattrlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.hasattrpayload" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.localaliaslib" in checks_by_rule["S110"].details["reason"]
 
 
 def test_scan_zip_flags_webbrowser_controller_getattribute_launch(tmp_path: Path) -> None:
@@ -1168,9 +1178,24 @@ def test_scan_zip_preserves_safe_runpy_overwrite_before_conditional(tmp_path: Pa
             "    def __init__(self, name: str) -> None:\n"
             "        self.name = name\n"
             "class NoLoad(Safe, ctypes.CDLL):\n"
+            "    pass\n"
+            "ctypes.LibraryLoader(NoLoad).payload\nNoLoad('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass Safe:\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        self.name = name\n"
+            "class NoLoad(Safe, ctypes.CDLL):\n"
             "    def __init__(self, name: str) -> None:\n"
             "        super().__init__(name)\n"
             "ctypes.LibraryLoader(NoLoad).payload\nNoLoad('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass DeadDelegateCDLL(ctypes.CDLL):\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        if False:\n"
+            "            ctypes.CDLL.__init__(self, name)\n"
+            "ctypes.LibraryLoader(DeadDelegateCDLL).payload\nDeadDelegateCDLL('/missing')\n"
         ),
         (
             "import ctypes\nclass SafeCDLL(ctypes.CDLL):\n"
