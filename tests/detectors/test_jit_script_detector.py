@@ -903,6 +903,54 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
+    def test_scan_model_preserves_raw_runpy_call_between_compact_priority_segments(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_before = b"# before\n" * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# before\n") + 8
+        )
+        padding_after = b"# after\n" * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# after\n") + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import os\n"
+            + padding_before
+            + b"runpy.run_path('payload.py')\n"
+            + padding_after
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_late_alias_call_after_non_call_alias_use(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy as rp\n"
+            + padding
+            + b"rp.other = 1\nrp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
     def test_scan_model_detects_late_assignment_alias_call_after_priority_window(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
@@ -1114,6 +1162,36 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
+    def test_scan_model_detects_tail_call_from_prefix_module_alias_context(self) -> None:
+        detector = JITScriptDetector()
+        filler_line = b"# filler\n"
+        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        source = (
+            b"\x00\xffimport runpy\nrp = runpy\n" + filler + b"def payload():\n    return rp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_tail_call_from_literal_true_compound_import_context(self) -> None:
+        detector = JITScriptDetector()
+        filler_line = b"# filler\n"
+        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        source = (
+            b"\x00\xffif True: import runpy as rp\n"
+            + filler
+            + b"def payload():\n    return rp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
     def test_scan_model_detects_tail_one_hop_alias_after_prefix_from_import(self) -> None:
         detector = JITScriptDetector()
         filler_line = b"# filler\n"
@@ -1136,6 +1214,27 @@ class TestJITScriptDetector:
         filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
         source = (
             b"\x00\xffimport runpy as rp\n" + filler + b"\x00\xffdef payload():\n    return rp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_prefix_alias_call_after_middle_tail_start(self) -> None:
+        detector = JITScriptDetector()
+        filler_line = b"# filler\n"
+        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        harmless_tail = b"".join(
+            f"def harmless_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(2 * jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 4)
+        )
+        source = (
+            b"\x00\xffimport runpy as rp\n"
+            + filler
+            + harmless_tail
+            + b"def payload():\n    return rp.run_path('payload.py')\n"
         )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
@@ -1181,12 +1280,49 @@ class TestJITScriptDetector:
 
         assert not any(f.type in {"dangerous_import", "code_execution_pattern"} for f in findings)
 
+    def test_scan_model_ignores_late_priority_alias_use_inside_multiline_string_with_trigger(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy as rp\n"
+            + padding
+            + b'import os\ntext = """\nrp.run_path("payload.py")\n"""\n'
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
     def test_scan_model_does_not_hoist_prefix_import_from_triple_quoted_string(self) -> None:
         detector = JITScriptDetector()
         filler_line = b"# filler\n"
         filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
         source = (
             b'\x00\xfftext = """\nimport runpy as rp\n"""\n'
+            + filler
+            + b"def payload():\n    return rp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_does_not_hoist_prefix_import_after_escaped_triple_quote(self) -> None:
+        detector = JITScriptDetector()
+        filler_line = b"# filler\n"
+        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        source = (
+            b'\x00\xfftext = """\nnot close \\"""\nimport runpy as rp\n"""\n'
             + filler
             + b"def payload():\n    return rp.run_path('payload.py')\n"
         )
@@ -1246,17 +1382,22 @@ class TestJITScriptDetector:
         )
 
     def test_priority_snippets_require_import_boundaries_after_cap(self) -> None:
+        def candidate(
+            value: tuple[bytes, tuple[int, int]],
+        ) -> tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]:
+            return value[0], value[1], (value[1],)
+
         leading_candidates = [
-            (f"import harmless_{index}\n".encode(), (index, index + 1))
+            candidate((f"import harmless_{index}\n".encode(), (index, index + 1)))
             for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
         ]
-        host_candidate = (b"import host_123\n", (100, 101))
-        system_candidate = (b"class System:\n    pass\n", (200, 201))
-        os_candidate = (b"import os\n", (300, 301))
-        aliased_runpy_candidate = (b"import harmless as h, runpy as rp\n", (350, 351))
-        continued_runpy_candidate = (b"import harmless as h, \\\n    runpy as rp\n", (375, 376))
-        continued_from_runpy_candidate = (b"from runpy\\\n import run_path\n", (400, 401))
-        runpy_candidate = (b"from runpy import run_path\n", (425, 426))
+        host_candidate = candidate((b"import host_123\n", (100, 101)))
+        system_candidate = candidate((b"class System:\n    pass\n", (200, 201)))
+        os_candidate = candidate((b"import os\n", (300, 301)))
+        aliased_runpy_candidate = candidate((b"import harmless as h, runpy as rp\n", (350, 351)))
+        continued_runpy_candidate = candidate((b"import harmless as h, \\\n    runpy as rp\n", (375, 376)))
+        continued_from_runpy_candidate = candidate((b"from runpy\\\n import run_path\n", (400, 401)))
+        runpy_candidate = candidate((b"from runpy import run_path\n", (425, 426)))
 
         selected = jit_script_module._prioritized_embedded_python_snippets(
             [
@@ -1271,9 +1412,9 @@ class TestJITScriptDetector:
             ]
         )
 
-        assert host_candidate not in selected
-        assert system_candidate not in selected
-        selected_candidates = {candidate for candidate, _span in selected}
+        selected_candidates = {candidate for candidate, _span, _real_ranges in selected}
+        assert host_candidate[0] not in selected_candidates
+        assert system_candidate[0] not in selected_candidates
         assert os_candidate[0] in selected_candidates
         assert aliased_runpy_candidate[0] in selected_candidates
         assert continued_runpy_candidate[0] in selected_candidates
@@ -1281,18 +1422,25 @@ class TestJITScriptDetector:
         assert runpy_candidate[0] in selected_candidates
 
     def test_priority_snippets_are_budgeted_and_bounded_after_default_cap(self) -> None:
+        def candidate(
+            value: tuple[bytes, tuple[int, int]],
+        ) -> tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]:
+            return value[0], value[1], (value[1],)
+
         leading_candidates = [
-            (f"import harmless_{index}\n".encode(), (index, index + 1))
+            candidate((f"import harmless_{index}\n".encode(), (index, index + 1)))
             for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
         ]
         priority_payload = b"import os\n" + (b"# pad\n" * 4000)
         priority_candidates = [
-            (
-                priority_payload,
+            candidate(
                 (
-                    1_000 + index * len(priority_payload),
-                    1_000 + (index + 1) * len(priority_payload),
-                ),
+                    priority_payload,
+                    (
+                        1_000 + index * len(priority_payload),
+                        1_000 + (index + 1) * len(priority_payload),
+                    ),
+                )
             )
             for index in range(jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS + 4)
         ]
@@ -1306,7 +1454,7 @@ class TestJITScriptDetector:
         priority_selected = selected[jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS :]
         assert all(
             len(candidate) <= jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES
-            for candidate, _span in priority_selected
+            for candidate, _span, _real_ranges in priority_selected
         )
 
     def test_scan_model_ignores_binary_framed_top_level_replaced_runpy_execution(self) -> None:
