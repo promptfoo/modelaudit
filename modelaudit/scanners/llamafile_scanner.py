@@ -53,9 +53,9 @@ TORCH7_EXEC_PRIMITIVE_BYTES_RE = re.compile(
 )
 TORCH7_DYNAMIC_LOAD_BYTES_RE = re.compile(rb"(?i)\b(?:package\.loadlib|ffi\.load|loadlib)\b")
 TORCH7_REQUIRE_BYTES_RE = re.compile(
-    rb"(?is)\brequire(?:\s|--[^\r\n]*(?:\r?\n|$))*"
-    rb"(?:\((?:\s|--[^\r\n]*(?:\r?\n|$))*(?:['\"]([^'\"]+)['\"]|\[(=*)\[(.*?)\]\2\])"
-    rb"(?:\s|--[^\r\n]*(?:\r?\n|$))*\)|['\"]([^'\"]+)['\"]|\[(=*)\[(.*?)\]\5\])"
+    rb"(?is)\brequire(?:\s|--[^\r\n]*(?:\r?\n|\Z))*"
+    rb"(?:\((?:\s|--[^\r\n]*(?:\r?\n|\Z))*(?:['\"]([^'\"]+)['\"]|\[(=*)\[(.*?)\]\2\])"
+    rb"(?:\s|--[^\r\n]*(?:\r?\n|\Z))*\)|['\"]([^'\"]+)['\"]|\[(=*)\[(.*?)\]\5\])"
 )
 TORCH7_SAFE_REQUIRE_MODULES = frozenset(
     {
