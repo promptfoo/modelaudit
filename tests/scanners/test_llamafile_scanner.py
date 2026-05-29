@@ -340,6 +340,25 @@ def test_llamafile_keeps_searching_after_non_actionable_candidate_cap(tmp_path: 
     )
 
 
+def test_llamafile_keeps_searching_after_cap_for_require_only_torch7_payload(tmp_path: Path) -> None:
+    binary = tmp_path / "torch7-many-benign-candidates-then-require-payload.llamafile"
+    benign_candidates = b"".join(b"T7\x00\x00torch.FloatTensor tensor placeholder\n" for _ in range(8))
+    torch7_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\nrequire('evil.module')\n"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=benign_candidates + torch7_payload))
+
+    result = LlamafileScanner(config={"llamafile_torch7_max_candidate_scans": 4, "torch7_max_scan_bytes": 128}).scan(
+        str(binary)
+    )
+
+    assert result.metadata["embedded_torch7_offset"] == binary.read_bytes().index(torch7_payload)
+    assert any(
+        check.name == "Torch7 Dynamic Module Load Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+
+
 def test_llamafile_torch7_actionable_signal_probe_stops_at_next_marker(tmp_path: Path) -> None:
     binary = tmp_path / "torch7-signal-after-next-marker.llamafile"
     first_candidate = b"T7\x00\x00" + (b"A" * 64)

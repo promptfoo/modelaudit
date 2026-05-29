@@ -47,7 +47,8 @@ MACHO_MAGICS = {
 
 PRINTABLE_TEXT_RE = re.compile(rb"[ -~]{8,}")
 TORCH7_ACTIONABLE_BYTES_RE = re.compile(
-    rb"(?i)\b(?:os\.execute|io\.popen|loadstring|dofile|loadfile|setfenv|getfenv|package\.loadlib|ffi\.load|loadlib)\b"
+    rb"(?i)\b(?:os\.execute|io\.popen|loadstring|dofile|loadfile|setfenv|getfenv|"
+    rb"package\.loadlib|ffi\.load|loadlib|require)\b"
 )
 SAFE_LOCALHOST_URL_RE = re.compile(
     r"https?://(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\]|::1)(?::\d+)?(?:/[^\s]*)?",
