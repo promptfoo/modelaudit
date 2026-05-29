@@ -46,9 +46,13 @@ MACHO_MAGICS = {
 }
 
 PRINTABLE_TEXT_RE = re.compile(rb"[ -~]{8,}")
-TORCH7_ACTIONABLE_BYTES_RE = re.compile(
-    rb"(?i)\b(?:os\.execute|io\.popen|loadstring|dofile|loadfile|setfenv|getfenv|"
-    rb"package\.loadlib|ffi\.load|loadlib|require)\b"
+TORCH7_EXEC_PRIMITIVE_BYTES_RE = re.compile(
+    rb"(?i)\b(?:os\.execute|io\.popen|loadstring|dofile|loadfile|setfenv|getfenv)\s*\("
+)
+TORCH7_DYNAMIC_LOAD_BYTES_RE = re.compile(rb"(?i)\b(?:package\.loadlib|ffi\.load|loadlib|require)\b")
+TORCH7_NETWORK_OR_SHELL_BYTES_RE = re.compile(
+    rb"(?i)\b(?:https?://|ftp://|socket\.|luasocket|curl|wget|powershell(?:\.exe)?|"
+    rb"cmd(?:\.exe)?\s+/c|/bin/sh|/bin/bash|bash\s+-c|sh\s+-c|netcat|nc\s+)"
 )
 SAFE_LOCALHOST_URL_RE = re.compile(
     r"https?://(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\]|::1)(?::\d+)?(?:/[^\s]*)?",
@@ -505,13 +509,17 @@ class LlamafileScanner(BaseScanner):
         deferred_incomplete: tuple[ScanResult, int, int] | None = None
         next_offset: int | None = offset
         non_actionable_scans = 0
+        actionable_scans = 0
+        best_scanned_signal_rank = 0
+        actionable_scan_limited = False
 
         while next_offset is not None:
             structurally_credible = self._embedded_torch7_candidate_is_structural(path, next_offset)
             has_binary_payload = self._embedded_torch7_candidate_has_binary_payload_bytes(path, next_offset)
-            has_actionable_signal = self._embedded_torch7_candidate_has_actionable_signal(
+            actionable_signal_rank = self._embedded_torch7_candidate_actionable_signal_rank(
                 path, next_offset, scanner.max_scan_bytes
             )
+            has_actionable_signal = actionable_signal_rank > 0
             if not (structurally_credible or has_binary_payload or has_actionable_signal):
                 next_offset = self._find_embedded_torch7_offset(
                     path,
@@ -526,6 +534,22 @@ class LlamafileScanner(BaseScanner):
                     start_offset=next_offset + 1,
                 )
                 continue
+            if (
+                has_actionable_signal
+                and actionable_scans >= self.max_torch7_candidate_scans
+                and actionable_signal_rank <= best_scanned_signal_rank
+            ):
+                actionable_scan_limited = True
+                next_offset = self._find_embedded_torch7_offset(
+                    path,
+                    self.max_payload_scan_bytes,
+                    start_offset=next_offset + 1,
+                )
+                continue
+
+            if has_actionable_signal:
+                actionable_scans += 1
+                best_scanned_signal_rank = max(best_scanned_signal_rank, actionable_signal_rank)
 
             embedded_result, carve_size = self._scan_embedded_torch7_candidate(path, scanner, result, next_offset)
             if embedded_result is not None:
@@ -564,6 +588,9 @@ class LlamafileScanner(BaseScanner):
                 {"offset": candidate_offset, "size": candidate_size, "severity": severity.value}
                 for _, candidate_offset, candidate_size, severity in actionable_results
             ]
+            if actionable_scan_limited:
+                result.metadata["embedded_torch7_candidate_scan_limited"] = True
+                result.metadata["embedded_torch7_actionable_candidate_scans"] = actionable_scans
             for embedded_result, candidate_offset, _, _ in actionable_results:
                 self._append_torch7_findings(result, embedded_result, candidate_offset)
             return
@@ -572,7 +599,13 @@ class LlamafileScanner(BaseScanner):
             embedded_result, incomplete_offset, carve_size = deferred_incomplete
             result.metadata["embedded_torch7_offset"] = incomplete_offset
             result.metadata["embedded_torch7_size"] = carve_size
+            if actionable_scan_limited:
+                result.metadata["embedded_torch7_candidate_scan_limited"] = True
+                result.metadata["embedded_torch7_actionable_candidate_scans"] = actionable_scans
             self._append_torch7_findings(result, embedded_result, incomplete_offset)
+        elif actionable_scan_limited:
+            result.metadata["embedded_torch7_candidate_scan_limited"] = True
+            result.metadata["embedded_torch7_actionable_candidate_scans"] = actionable_scans
 
     @staticmethod
     def _embedded_torch7_candidate_is_structural(path: Path, offset: int) -> bool:
@@ -600,7 +633,17 @@ class LlamafileScanner(BaseScanner):
         return any(byte not in b"\t\n\r" + bytes(range(0x20, 0x7F)) for byte in window)
 
     @staticmethod
-    def _embedded_torch7_candidate_has_actionable_signal(path: Path, offset: int, max_scan_bytes: int) -> bool:
+    def _torch7_actionable_signal_rank(window: bytes) -> int:
+        has_exec = TORCH7_EXEC_PRIMITIVE_BYTES_RE.search(window) is not None
+        if has_exec and TORCH7_NETWORK_OR_SHELL_BYTES_RE.search(window) is not None:
+            return 2
+        if has_exec or TORCH7_DYNAMIC_LOAD_BYTES_RE.search(window) is not None:
+            return 1
+        return 0
+
+    @classmethod
+    def _embedded_torch7_candidate_actionable_signal_rank(cls, path: Path, offset: int, max_scan_bytes: int) -> int:
+        best_rank = 0
         try:
             with path.open("rb") as handle:
                 handle.seek(offset)
@@ -610,23 +653,28 @@ class LlamafileScanner(BaseScanner):
                 while remaining > 0:
                     chunk = handle.read(min(TORCH7_ACTIONABLE_SIGNAL_CHUNK_BYTES, remaining))
                     if not chunk:
-                        return False
+                        return best_rank
 
                     haystack = carry + chunk
                     marker_search_start = len(carry) + (len(b"T7\x00\x00") if first_chunk else 0)
                     next_marker = haystack.find(b"T7\x00\x00", marker_search_start)
                     signal_window = haystack if next_marker == -1 else haystack[:next_marker]
-                    if TORCH7_ACTIONABLE_BYTES_RE.search(signal_window) is not None:
-                        return True
+                    best_rank = max(best_rank, cls._torch7_actionable_signal_rank(signal_window))
+                    if best_rank == 2:
+                        return best_rank
                     if next_marker != -1:
-                        return False
+                        return best_rank
 
                     carry = haystack[-TORCH7_ACTIONABLE_SIGNAL_CARRY_BYTES:]
                     remaining -= len(chunk)
                     first_chunk = False
         except OSError:
-            return False
-        return False
+            return 0
+        return best_rank
+
+    @classmethod
+    def _embedded_torch7_candidate_has_actionable_signal(cls, path: Path, offset: int, max_scan_bytes: int) -> bool:
+        return cls._embedded_torch7_candidate_actionable_signal_rank(path, offset, max_scan_bytes) > 0
 
     def _scan_embedded_torch7_candidate(
         self,

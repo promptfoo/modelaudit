@@ -321,6 +321,54 @@ def test_llamafile_prefers_later_critical_torch7_candidate_over_warning_decoy(tm
     )
 
 
+def test_llamafile_bounds_actionable_candidate_scans_but_keeps_higher_severity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "torch7-many-actionable-decoys-then-critical.llamafile"
+    warning_candidates = [
+        f"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id-{index}')\n".encode() + (b"A" * 256)
+        for index in range(8)
+    ]
+    critical_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('bash -c id')\n"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=b"".join(warning_candidates) + critical_payload))
+
+    scanned_offsets: list[int] = []
+    original_scan_candidate = LlamafileScanner._scan_embedded_torch7_candidate
+
+    def counting_scan_candidate(
+        self: LlamafileScanner,
+        path: Path,
+        scanner: Any,
+        result: ScanResult,
+        offset: int,
+    ) -> tuple[ScanResult | None, int]:
+        scanned_offsets.append(offset)
+        return original_scan_candidate(self, path, scanner, result, offset)
+
+    monkeypatch.setattr(LlamafileScanner, "_scan_embedded_torch7_candidate", counting_scan_candidate)
+
+    result = LlamafileScanner(config={"llamafile_torch7_max_candidate_scans": 2, "torch7_max_scan_bytes": 128}).scan(
+        str(binary)
+    )
+
+    critical_offset = binary.read_bytes().index(critical_payload)
+    assert scanned_offsets == [
+        binary.read_bytes().index(warning_candidates[0]),
+        binary.read_bytes().index(warning_candidates[1]),
+        critical_offset,
+    ]
+    assert result.metadata["embedded_torch7_candidate_scan_limited"] is True
+    assert result.metadata["embedded_torch7_actionable_candidate_scans"] == 3
+    assert result.metadata["embedded_torch7_offset"] == critical_offset
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
 def test_llamafile_keeps_searching_after_non_actionable_candidate_cap(tmp_path: Path) -> None:
     binary = tmp_path / "torch7-many-benign-candidates-then-payload.llamafile"
     benign_candidates = b"".join(b"T7\x00\x00" + (b"A" * 64) for _ in range(32))
