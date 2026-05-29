@@ -636,27 +636,6 @@ class LlamafileScanner(BaseScanner):
         window = prefix[len(TORCH7_BINARY_MARKER) : window_end]
         return any(byte not in b"\t\n\r" + bytes(range(0x20, 0x7F)) for byte in window)
 
-    @classmethod
-    def _embedded_torch7_candidate_has_binary_payload_bytes(cls, path: Path, offset: int) -> bool:
-        try:
-            with path.open("rb") as handle:
-                handle.seek(offset)
-                prefix = handle.read(TORCH7_SIGNATURE_WINDOW_BYTES)
-        except OSError:
-            return False
-        return cls._torch7_candidate_prefix_has_binary_payload_bytes(prefix)
-
-    @staticmethod
-    def _torch7_has_suspicious_require(window: bytes) -> bool:
-        for quoted_paren, _, long_paren, quoted_bare, _, long_bare in TORCH7_REQUIRE_BYTES_RE.findall(window):
-            module = next(
-                (candidate.lower() for candidate in (quoted_paren, long_paren, quoted_bare, long_bare) if candidate),
-                b"",
-            )
-            if module and module not in TORCH7_SAFE_REQUIRE_MODULES and not module.startswith(b"torch."):
-                return True
-        return False
-
     @staticmethod
     def _torch7_has_suspicious_require(window: bytes) -> bool:
         for quoted_paren, _, long_paren, quoted_bare, _, long_bare in TORCH7_REQUIRE_BYTES_RE.findall(window):
