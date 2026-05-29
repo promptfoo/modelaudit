@@ -178,6 +178,9 @@ _EMBEDDED_PYTHON_CONTEXT_START_PATTERN = re.compile(
 _EMBEDDED_PYTHON_COMPOUND_CONTEXT_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])if\s+(?:True|1)\s*:\s*(?:import|from)\s+"
 )
+_COMPOUND_HEADER_MATCH_PATTERN = re.compile(
+    rb"\b(?:async\s+def|if|elif|else|for|while|try|except|finally|with|class|def)\b"
+)
 _EmbeddedPythonCandidate = tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]
 
 
@@ -535,6 +538,12 @@ def _target_binds_priority_alias(target: ast.AST, aliases: frozenset[bytes]) -> 
 
 
 def _statement_binds_priority_alias(statement: ast.stmt, aliases: frozenset[bytes]) -> bool:
+    if isinstance(statement, ast.Import):
+        return any(
+            (alias.asname or alias.name.split(".", maxsplit=1)[0]).encode() in aliases for alias in statement.names
+        )
+    if isinstance(statement, ast.ImportFrom):
+        return any(alias.name != "*" and (alias.asname or alias.name).encode() in aliases for alias in statement.names)
     if isinstance(statement, ast.Assign):
         return any(_target_binds_priority_alias(target, aliases) for target in statement.targets)
     if isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
@@ -580,6 +589,115 @@ def _line_indent_width(line: bytes) -> int:
     return len(line) - len(line.lstrip(b" \t"))
 
 
+def _compound_header_keyword(structural_line: bytes) -> bytes | None:
+    stripped = structural_line.lstrip()
+    for keyword in (b"async def", b"elif", b"else", b"except", b"finally", b"if", b"for", b"while", b"try"):
+        if stripped == keyword + b":" or stripped.startswith(keyword + b" ") or stripped.startswith(keyword + b":"):
+            return keyword
+    return None
+
+
+def _line_end_offset(candidate: bytes, line_start: int) -> int:
+    line_end = candidate.find(b"\n", line_start)
+    return len(candidate) if line_end == -1 else line_end + 1
+
+
+def _compound_header_start(line_start: int, structural_line: bytes) -> int:
+    header_match = _COMPOUND_HEADER_MATCH_PATTERN.search(structural_line)
+    if header_match is None:
+        return line_start
+    prefix = structural_line[: header_match.start()]
+    if _is_embedded_top_level_prefix(prefix):
+        return line_start + header_match.start()
+    return line_start
+
+
+def _first_body_statement_segment(candidate: bytes, header_line_end: int, header_indent: int) -> tuple[int, int] | None:
+    line_start = header_line_end
+    while line_start < len(candidate):
+        line_end = _line_end_offset(candidate, line_start)
+        line = candidate[line_start:line_end]
+        structural_line = _python_structural_line_bytes(line).rstrip()
+        if not structural_line:
+            line_start = line_end
+            continue
+        if _line_indent_width(line) <= header_indent:
+            return None
+
+        statement_end = line_end
+        paren_depth = _line_parenthesis_delta(line)
+        while (
+            _line_has_explicit_continuation(candidate[line_start:statement_end]) or paren_depth > 0
+        ) and statement_end < len(candidate):
+            continuation_start = statement_end
+            statement_end = _line_end_offset(candidate, continuation_start)
+            paren_depth += _line_parenthesis_delta(candidate[continuation_start:statement_end])
+
+        if structural_line.endswith(b":"):
+            nested_segment = _first_body_statement_segment(candidate, statement_end, _line_indent_width(line))
+            if nested_segment is not None:
+                statement_end = nested_segment[1]
+        return line_start, statement_end
+    return None
+
+
+def _previous_header_context_segments(
+    candidate: bytes,
+    before_line_start: int,
+    indent: int,
+    keywords: set[bytes],
+) -> list[tuple[int, int]]:
+    search_end = before_line_start
+    while search_end > 0:
+        previous_line_end = search_end - 1
+        previous_line_start = candidate.rfind(b"\n", 0, previous_line_end) + 1
+        previous_line = candidate[previous_line_start:search_end]
+        search_end = previous_line_start
+        structural_line = _python_structural_line_bytes(previous_line).rstrip()
+        if not structural_line:
+            continue
+        previous_indent = _line_indent_width(previous_line)
+        if previous_indent < indent:
+            return []
+        if previous_indent != indent:
+            continue
+        keyword = _compound_header_keyword(structural_line)
+        if keyword not in keywords or not structural_line.endswith(b":"):
+            continue
+        header_start = _compound_header_start(previous_line_start, structural_line)
+        header_segment = (header_start, previous_line_start + len(previous_line))
+        body_segment = _first_body_statement_segment(candidate, previous_line_start + len(previous_line), indent)
+        if body_segment is None:
+            return [header_segment]
+        return [header_segment, body_segment]
+    return []
+
+
+def _try_else_context_segments(candidate: bytes, clause_line_start: int, indent: int) -> list[tuple[int, int]]:
+    except_context = _previous_header_context_segments(candidate, clause_line_start, indent, {b"except"})
+    try_context = _previous_header_context_segments(candidate, clause_line_start, indent, {b"try"})
+    if try_context and except_context:
+        return [*try_context, *except_context]
+    return []
+
+
+def _matching_clause_context_segments(
+    candidate: bytes,
+    clause_line_start: int,
+    indent: int,
+    clause_keyword: bytes | None,
+) -> list[tuple[int, int]]:
+    if clause_keyword in {b"else", b"elif"}:
+        context = _previous_header_context_segments(candidate, clause_line_start, indent, {b"if", b"for", b"while"})
+        if context:
+            return context
+        if clause_keyword == b"else":
+            return _try_else_context_segments(candidate, clause_line_start, indent)
+    if clause_keyword in {b"except", b"finally"}:
+        return _previous_header_context_segments(candidate, clause_line_start, indent, {b"try"})
+    return []
+
+
 def _enclosing_compound_header_segments(candidate: bytes, line_start: int) -> list[tuple[int, int]]:
     line_end = candidate.find(b"\n", line_start)
     if line_end == -1:
@@ -600,9 +718,16 @@ def _enclosing_compound_header_segments(candidate: bytes, line_start: int) -> li
             continue
         previous_indent = _line_indent_width(previous_line)
         if previous_indent < current_indent and structural_line.endswith(b":"):
-            header_match = re.search(rb"\b(?:if|for|while|try|with|class|def|async\s+def)\b", structural_line)
-            header_start = previous_line_start + (header_match.start() if header_match is not None else 0)
-            segments.append((header_start, previous_line_start + len(previous_line)))
+            header_start = _compound_header_start(previous_line_start, structural_line)
+            header_segment = (header_start, previous_line_start + len(previous_line))
+            clause_context = _matching_clause_context_segments(
+                candidate,
+                previous_line_start,
+                previous_indent,
+                _compound_header_keyword(structural_line),
+            )
+            segments.append(header_segment)
+            segments.extend(reversed(clause_context))
             current_indent = previous_indent
     return list(reversed(segments))
 
