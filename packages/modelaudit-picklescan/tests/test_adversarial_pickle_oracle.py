@@ -2285,6 +2285,75 @@ def _builtins_type_new_dynamic_del_finalizer_payload(marker: Path, *, drop_insta
     return b"".join(parts)
 
 
+def _builtins_type_call_dynamic_del_finalizer_payload(marker: Path, *, drop_instance: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type.__call__"), b"\x93"]
+    parts += [b"("]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [_text_operand("DerivedPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85", b"}", _dynamic_dunder_name_payload("del")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"s", b"tR\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R"]
+    if drop_instance:
+        parts += [b"0N"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _builtins_type_dict_constructor_dynamic_del_finalizer_payload(marker: Path, *, drop_instance: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"(", _text_operand("DerivedPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85"]
+    pair = _tuple_payload_operands(
+        [
+            _dynamic_dunder_name_payload("del"),
+            _short_binunicode(b"pathlib") + _short_binunicode(b"Path.touch") + b"\x93",
+        ]
+    )
+    pair_iterable = _tuple_payload_operands([pair])
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"dict"), b"\x93"]
+    parts += [_tuple_payload_operands([pair_iterable]), b"R"]
+    parts += [b"tR\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R"]
+    if drop_instance:
+        parts += [b"0N"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _builtins_type_mutated_namespace_dynamic_del_finalizer_payload(
+    marker: Path,
+    *,
+    drop_instance: bool,
+    mutator_module: bytes,
+    mutator_name: bytes,
+) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"}\x940"]
+    parts += [_short_binunicode(mutator_module), _short_binunicode(mutator_name), b"\x93"]
+    parts += [
+        b"h\x00",
+        _dynamic_dunder_name_payload("del"),
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(b"Path.touch"),
+        b"\x93",
+        b"\x87R0",
+    ]
+    parts += [b"(", _text_operand("DerivedPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85", b"h\x00", b"tR\x94"]
+    parts += [b"0", b"h\x01", _text_operand(str(marker)), b"\x85R"]
+    if drop_instance:
+        parts += [b"0N"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
 def _builtins_type_eq_comparison_payload(marker: Path, *, include_call: bool) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
@@ -5533,6 +5602,117 @@ def test_scan_bytes_blocks_type_new_dynamic_del_finalizer_rce(tmp_path: Path) ->
     type(control_result).__del__ = _noop_del
 
     report = scan_bytes(payload, source="builtins-type-new-dynamic-del-finalizer-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_dynamic_type_callable_attribute_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_type_call_dynamic_del_finalizer_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "builtins_type_call_dynamic_del_finalizer_rce_marker"
+    control_payload = _builtins_type_call_dynamic_del_finalizer_payload(marker, drop_instance=False)
+    payload = _builtins_type_call_dynamic_del_finalizer_payload(marker, drop_instance=True)
+
+    control_report = scan_bytes(
+        control_payload,
+        source="builtins-type-call-dynamic-del-finalizer-control.pkl",
+    )
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_dynamic_type_callable_attribute_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DerivedPath"
+    assert not marker.exists()
+    type(control_result).__del__ = _noop_del
+
+    report = scan_bytes(payload, source="builtins-type-call-dynamic-del-finalizer-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_dynamic_type_callable_attribute_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_dict_constructor_dynamic_type_namespace_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "builtins_type_dict_constructor_dynamic_del_marker"
+    control_payload = _builtins_type_dict_constructor_dynamic_del_finalizer_payload(marker, drop_instance=False)
+    payload = _builtins_type_dict_constructor_dynamic_del_finalizer_payload(marker, drop_instance=True)
+
+    control_report = scan_bytes(
+        control_payload,
+        source="builtins-type-dict-constructor-dynamic-del-control.pkl",
+    )
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_dynamic_type_unknown_key_overflow_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DerivedPath"
+    assert not marker.exists()
+    type(control_result).__del__ = _noop_del
+
+    report = scan_bytes(payload, source="builtins-type-dict-constructor-dynamic-del-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_dynamic_type_unknown_key_overflow_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("mutator_module", "mutator_name"),
+    [
+        (b"operator", b"setitem"),
+        (b"builtins", b"dict.__setitem__"),
+    ],
+)
+def test_scan_bytes_blocks_mutated_dynamic_type_namespace_rce(
+    tmp_path: Path,
+    mutator_module: bytes,
+    mutator_name: bytes,
+) -> None:
+    marker = tmp_path / f"{mutator_module.decode()}_{mutator_name.decode().replace('.', '_')}_dynamic_del_marker"
+    control_payload = _builtins_type_mutated_namespace_dynamic_del_finalizer_payload(
+        marker,
+        drop_instance=False,
+        mutator_module=mutator_module,
+        mutator_name=mutator_name,
+    )
+    payload = _builtins_type_mutated_namespace_dynamic_del_finalizer_payload(
+        marker,
+        drop_instance=True,
+        mutator_module=mutator_module,
+        mutator_name=mutator_name,
+    )
+
+    control_report = scan_bytes(
+        control_payload,
+        source=f"{mutator_module.decode()}-{mutator_name.decode()}-dynamic-del-control.pkl",
+    )
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_dynamic_type_callable_attribute_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DerivedPath"
+    assert not marker.exists()
+    type(control_result).__del__ = _noop_del
+
+    report = scan_bytes(
+        payload,
+        source=f"{mutator_module.decode()}-{mutator_name.decode()}-dynamic-del-rce.pkl",
+    )
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert _has_dynamic_type_callable_attribute_finding(report)

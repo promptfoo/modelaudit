@@ -1517,6 +1517,10 @@ impl<'a> ScanState<'a> {
             opcode.name,
             position,
         );
+        self.apply_callable_tracked_dict_mutation(
+            callable_value.as_ref(),
+            argument_values.as_deref(),
+        );
 
         let mut invocations = Vec::new();
         if let Some(invocation) = Self::callable_invocation_for_value(
@@ -1733,6 +1737,12 @@ impl<'a> ScanState<'a> {
         {
             return Some(&arguments[1..]);
         }
+        if reference.name == "type.__call__"
+            && arguments.len() == 4
+            && Self::is_builtin_type_value(arguments.first())
+        {
+            return Some(&arguments[1..]);
+        }
         None
     }
 
@@ -1758,7 +1768,11 @@ impl<'a> ScanState<'a> {
             memo_index,
         } = namespace
         else {
-            return Vec::new();
+            return vec![DynamicTypeCallableAttribute {
+                attribute_name: None,
+                callable: None,
+                unknown_key_values_overflowed: true,
+            }];
         };
 
         let mut attributes = Vec::new();
@@ -1795,6 +1809,72 @@ impl<'a> ScanState<'a> {
             });
         }
         attributes
+    }
+
+    fn apply_callable_tracked_dict_mutation(
+        &mut self,
+        callable_value: Option<&StackValue>,
+        arguments: Option<&[StackValue]>,
+    ) {
+        if !Self::is_tracked_dict_setitem_callable(callable_value) {
+            return;
+        }
+        let Some(arguments) = arguments else {
+            return;
+        };
+        let [target, key, value] = arguments else {
+            return;
+        };
+        self.record_tracked_dict_mutation(target, key, value);
+    }
+
+    fn is_tracked_dict_setitem_callable(callable_value: Option<&StackValue>) -> bool {
+        let Some(StackValue::Global(reference)) = callable_value else {
+            return false;
+        };
+        if reference.malformed {
+            return false;
+        }
+        matches!(
+            (reference.module.as_str(), reference.name.as_str()),
+            ("operator" | "_operator", "setitem")
+                | (
+                    "builtins" | "__builtin__" | "__builtins__",
+                    "dict.__setitem__"
+                )
+        )
+    }
+
+    fn record_tracked_dict_mutation(
+        &mut self,
+        target: &StackValue,
+        key: &StackValue,
+        value: &StackValue,
+    ) {
+        let StackValue::TrackedDict { memo_index, .. } = target else {
+            return;
+        };
+        let Some(memo_index) = *memo_index else {
+            return;
+        };
+        let key = stack_value_string(key, self.payload);
+        if let Some(StackValue::TrackedDict {
+            entries,
+            unknown_key_values,
+            unknown_key_values_overflowed,
+            ..
+        }) = self.memo.get_mut(&memo_index)
+        {
+            if let Some(key) = key {
+                Self::insert_tracked_dict_entry(entries, key, value.clone());
+            } else {
+                Self::insert_tracked_dict_unknown_key_value(
+                    unknown_key_values,
+                    unknown_key_values_overflowed,
+                    value.clone(),
+                );
+            }
+        }
     }
 
     fn protocol_dispatch_invocations(
@@ -3659,6 +3739,10 @@ impl<'a> ScanState<'a> {
             self.stack.push(mapping_wrapper);
             return;
         }
+        if let Some(tracked_dict) = self.dict_constructor_result(values) {
+            self.stack.push(tracked_dict);
+            return;
+        }
         if let Some(template) = self.string_template_result(values) {
             self.stack.push(template);
             return;
@@ -4088,6 +4172,91 @@ impl<'a> ScanState<'a> {
         }
         let default_factory = Self::callable_reference_from_value(arguments.first())?;
         Some(StackValue::DefaultDict { default_factory })
+    }
+
+    fn dict_constructor_result(&self, values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || !matches!(
+                callable_reference.module.as_str(),
+                "builtins" | "__builtin__" | "__builtins__"
+            )
+            || callable_reference.name != "dict"
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        match arguments.as_slice() {
+            [] => Some(StackValue::TrackedDict {
+                entries: Vec::new(),
+                unknown_key_values: Vec::new(),
+                unknown_key_values_overflowed: false,
+                memo_index: None,
+            }),
+            [StackValue::TrackedDict {
+                entries,
+                unknown_key_values,
+                unknown_key_values_overflowed,
+                ..
+            }] => Some(StackValue::TrackedDict {
+                entries: entries.clone(),
+                unknown_key_values: unknown_key_values.clone(),
+                unknown_key_values_overflowed: *unknown_key_values_overflowed,
+                memo_index: None,
+            }),
+            [iterable] => self.tracked_dict_from_pair_iterable(iterable),
+            _ => None,
+        }
+    }
+
+    fn tracked_dict_from_pair_iterable(&self, iterable: &StackValue) -> Option<StackValue> {
+        let mut iterable = iterable;
+        let items = loop {
+            let StackValue::Tuple(items) = iterable else {
+                return None;
+            };
+            if items.is_empty()
+                || items
+                    .iter()
+                    .all(|item| matches!(item, StackValue::Tuple(pair) if pair.len() == 2))
+            {
+                break items;
+            }
+            let [wrapped] = items.as_slice() else {
+                return None;
+            };
+            iterable = wrapped;
+        };
+        let mut entries = Vec::new();
+        let mut unknown_key_values = Vec::new();
+        let mut unknown_key_values_overflowed = false;
+        for item in items {
+            let StackValue::Tuple(pair) = item else {
+                return None;
+            };
+            let [key, value] = pair.as_slice() else {
+                return None;
+            };
+            if let Some(key) = stack_value_string(key, self.payload) {
+                Self::insert_tracked_dict_entry(&mut entries, key, value.clone());
+            } else {
+                Self::insert_tracked_dict_unknown_key_value(
+                    &mut unknown_key_values,
+                    &mut unknown_key_values_overflowed,
+                    value.clone(),
+                );
+            }
+        }
+        Some(StackValue::TrackedDict {
+            entries,
+            unknown_key_values,
+            unknown_key_values_overflowed,
+            memo_index: None,
+        })
     }
 
     fn mapping_wrapper_result(&self, values: &[StackValue]) -> Option<StackValue> {

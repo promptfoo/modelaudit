@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use crate::opcode::ArgValue;
 
 const MAX_TRACKED_TUPLE_ITEMS: usize = 16;
-const MAX_TRACKED_TUPLE_DEPTH: usize = 2;
+const MAX_TRACKED_TUPLE_DEPTH: usize = 4;
 const MAX_STACK_BYTES_PREVIEW: usize = 4096;
 
 #[derive(Clone)]
