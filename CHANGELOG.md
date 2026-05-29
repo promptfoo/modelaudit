@@ -9,69 +9,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- detect dangerous Python calls retrieved through module namespace dictionaries in ZIP and TAR members
+- detect embedded Python `os.exec*`, `os.spawn*`, `os.posix_spawn*`, and `os.startfile` process-launch calls in archives and JIT-scanned content
+- detect embedded Python `asyncio.create_subprocess_*` calls and resolved JIT `subprocess` launch aliases
+- detect embedded Python `runpy.run_module` and `runpy.run_path` dynamic-module execution calls
+- scan dangerous RKNN safe-key metadata values instead of suppressing the whole key-value string
+- scan ONNX external data initializers in nested graphs, functions, and training graphs
+- route protocol-0 JAX checkpoint pickles through pickle opcode security checks
+- harden legacy JAX checkpoint pickle routing against bounded-prefix bypasses and benign sidecar false positives
+- detect dangerous Python calls retrieved or installed through module namespace dictionaries in ZIP and TAR members, while avoiding comprehension-local false positives
+- preflight and stream-enforce cumulative SevenZip extraction budgets before writing oversized archives
+- mark oversized structured JSON/YAML Jinja template fields as incomplete coverage instead of clean
+- redact capability tokens embedded in network URL path segments
+- redact secret-shaped dictionary keys from embedded-secret detector finding contexts
+- redact compound credential names and malformed userinfo URLs in scanner evidence
+- restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- inspect every parsed GGUF chat template when duplicate or trailing malformed metadata could otherwise hide SSTI payloads
+- bound GGUF declared metadata and tensor collections, and cap reported tensor summaries, so oversized structures fail closed without exhausting scanner resources
+- redact secret-shaped dictionary keys from embedded-secret detector finding contexts
+- redact compound credential names and malformed userinfo URLs in scanner evidence
+- restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- redact compound credential names and malformed userinfo URLs in scanner evidence
+- restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
+- treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
+- detect external references in weights-only Keras HDF5 layouts without Keras metadata
+- restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- classify unavailable metadata document reads and timed-out metadata scans as operationally incomplete rather than security findings
+- route renamed structured JAX/Orbax JSON checkpoints, conservatively report observable bounded-prefix threats, and fail closed for oversized identified metadata
+- classify Flax MessagePack recursion-limit analysis gaps as inconclusive coverage
+- classify incomplete JAX/Orbax metadata, pickle, and NumPy analysis as inconclusive coverage
+- route renamed structured JAX/Orbax JSON checkpoints and fail closed for oversized identified metadata
+- route renamed structurally valid Flax/JAX MessagePack checkpoints through bounded, fail-closed security analysis
+- preserve Flax/JAX MessagePack routing under skipped text/configuration suffixes and pickle-shaped prefixes with bounded fail-closed ambiguity handling
+- avoid emitting sensitive scanner finding or loader error payloads in logs
+- fail closed when PyTorch ZIP analysis cannot complete configured blacklist inspection or a required scan phase
+- fail closed when standalone Jinja2 templates exceed the configured analysis size limit or cannot be decoded as UTF-8 text
+- classify bounded, unreadable, or malformed PMML analysis gaps as inconclusive instead of security findings
+- classify unavailable Joblib reads as inconclusive rather than security findings
 - avoid repeatedly scanning sharded model families during directory scans
 - keep shard sibling discovery within the requested scan root
 - preserve per-shard metadata when aggregating sharded model families
 - prevent picklescan call-graph alias cycles from hanging scans
 - preserve HuggingFace snapshot shard paths while grouping cache-backed families
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
-- detect Python operators declared in nested ONNX graphs and functions
+- classify unavailable manifest and ML text reads as inconclusive rather than security findings, including routing, preflight, and stale cache transitions
+- classify unavailable manifest cloud-reference inspection as inconclusive rather than reporting complete coverage
+- detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
+- route renamed R workspace artifacts only from complete workspace serialization headers without promoting text near-matches
+- report incomplete R serialized coverage without treating extraction ceilings alone as suspicious payloads, and preserve detection across printable-chunk boundaries
+- mark compressed-wrapper partial-analysis outcomes explicitly inconclusive
+- scan decompressed Python and content-disguised executable payloads through bounded security checks without caching ephemeral inner files
+- detect executable PyTorch ZIP sidecars hidden behind ordinary filenames while excluding raw tensor-storage bytes
+- scan 7-Zip Python members and content-disguised executable sidecars through shared archive security checks
+- skip non-numeric weight metadata and report incomplete weight-distribution analysis accurately
+- classify unavailable Paddle, NumPy, PyTorch binary, and SavedModel reads as inconclusive rather than security findings
+- classify unavailable CoreML, SafeTensors, and TensorRT reads as inconclusive rather than security findings
+- classify unavailable TensorFlow MetaGraph reads as operational errors rather than security findings, including stale cache transitions
+- classify unavailable CNTK and LightGBM reads as inconclusive rather than security findings
 - route renamed and unknown-field-prefixed CoreML models, including valid unknown groups, reordered fields, and bounded routing candidates, through custom-code and metadata analysis
 - avoid inconclusive protobuf-candidate noise for fully inspected scalar-only text and Keras-owned JSON members while preserving binary-tailed candidates for analysis
 - preserve archive member incomplete-outcome reasons when nested tentative analysis also fails closed
 - route renamed TensorFlow SavedModel and MetaGraph protobufs through unsafe-operation analysis
 - route renamed ONNX protobuf models with prefixed unknown fields through content analysis and fail closed on unresolved or incomplete structure
 - preserve ambiguous budget-exhausted protobuf candidates for tentative analysis without misclassifying non-ONNX payloads
-- route signature-confirmed CNTK and LightGBM artifacts with misleading filenames through security analysis
-- share trusted-content routing across direct, nested, and helper scans so renamed specialized archives retain their format-specific analysis
-- preserve dangerous callable findings when embedded source captures a callable before a later safe overwrite
-- detect high-risk embedded Python callables invoked through explicit `.__call__` wrappers
-- avoid embedded Python execution findings after statically certain safe `setattr` replacement
-- avoid embedded Python execution findings after statically certain namespace-mapping replacement
-- model reflective and saved namespace-map replacements when their receiver remains certain
-- model deterministic mapping-helper replacements when their helper and receiver remain certain
-- avoid embedded Python execution findings after a certain discarded namespace-map removal
-- avoid embedded Python execution findings after certain key-specific namespace deletion
-- avoid embedded Python execution findings after certain namespace-map clearing or certain map mutator calls themselves
-- avoid embedded Python process-execution findings for known non-executing `subprocess` formatting and result/error APIs
-- detect embedded Python `os.exec*`, `os.spawn*`, `os.posix_spawn*`, and `os.startfile` process-launch calls
-- detect JIT-scanned embedded Python `os.posix_spawn*` and `os.startfile` process-launch calls while suppressing certain safe replacements
-- detect JIT-scanned embedded Python `subprocess.check_call`, `getoutput`, and `getstatusoutput` calls while suppressing certain safe replacements
-- detect embedded Python `asyncio.create_subprocess_exec` and `asyncio.create_subprocess_shell` process-launch calls
-- detect embedded Python `pty.spawn` launches and report statically resolved JIT process-launch aliases
-- detect embedded Python `runpy.run_module` and `runpy.run_path` dynamic-module execution calls
-- register emitted `S112`-`S114` dynamic-code rule identifiers so they can be listed and configured
-- avoid duplicate JIT findings when a complete embedded Python source payload is analyzed through multiple paths
-- preserve embedded Python execution findings when a replacement receiver is conditional, aliased, or a runtime argument
-- fail closed when nested NeMo checkpoint or referenced-artifact analysis is explicitly incomplete
-- preserve concrete nested security findings from checkpoint and referenced artifacts inside NeMo archives
-- keep PyTorch ZIP path traversal findings attributed to archive safety rules regardless of member names
-- classify executable archive members by their hazard type rather than attacker-controlled name fragments
-- preserve Keras ZIP Python and executable member attribution when filenames contain misleading pickle terms
-- classify incomplete ExecuTorch format scans and embedded Python members without misreporting eval/exec findings
-- classify corrupt magic-confirmed TAR parsing as incomplete analysis rather than a security finding
-- preserve PyTorch ZIP findings when later analysis fails and classify parse failures as incomplete coverage
-- classify Keras ZIP archive-read failures as incomplete coverage while preserving earlier security findings
-- classify Keras H5 read failures as incomplete coverage while preserving earlier security findings
-- classify CoreML parser and traversal coverage gaps as incomplete analysis while preserving concrete findings
-- classify malformed recognized ONNX model parsing as incomplete coverage rather than a security finding
-- preserve MetaGraph security findings from malformed content-routed payloads while reporting incomplete coverage
-- preserve SavedModel security findings from malformed content-routed payloads while reporting incomplete coverage
-- avoid reporting ordinary `sklearn` references in Skops model-card prose as unsafe joblib fallback evidence
-- detect high-risk Python archive-member calls dispatched through static namespace and attribute lookup indirection
-- inspect nested PMML extension attributes for code-shaped execution indicators
-- detect statically obscured high-risk calls in TorchServe handler source
-- avoid classifying SafeTensors documentation examples as executable metadata payloads
-- detect statically obscured builtin execution calls in embedded JIT source analysis
-- share intrinsic builtin namespace execution detection across embedded Python entrypoints
-- route signature-confirmed RKNN artifacts with misleading filenames through security analysis
-- detect embedded Python builtin execution recovered through static global namespace lookups
-- detect embedded Python builtin execution reached through aliased global namespace mappings
-- avoid embedded Python builtin execution findings after statically safe callable overwrites
-- detect embedded Python builtin execution dispatched through aliased namespace accessors
-- avoid embedded Python builtin execution findings after statically safe direct namespace mutations
-- avoid embedded Python builtin execution findings after statically certain aliased namespace mutations
+- classify unavailable ZIP traversal, member, manifest-less TorchServe handler, and Keras artifact scan coverage as inconclusive while preserving archive-depth security findings
+- classify unavailable TAR traversal and member scan coverage as inconclusive while preserving depth-limit security findings
+- classify unavailable Skops member and schema coverage as inconclusive rather than security findings
+- classify bounded, unreadable, or unparseable TorchServe MAR analysis gaps as inconclusive rather than security findings
+- detect manifest-declared TorchServe extra files and PyTorch ZIP members disguised with executable content
+- classify incomplete SevenZip coverage as inconclusive and avoid caching temporary extracted members
+- classify uninspected OCI layers and members as inconclusive analysis instead of security findings, without caching extracted temporary members
+- route renamed ONNX protobuf models with prefixed unknown fields through content analysis and fail closed on unresolved or incomplete structure
+- mark compressed-wrapper partial-analysis outcomes explicitly inconclusive
+- retain oversized renamed SafeTensors candidates for bounded fail-closed analysis
+- route renamed TensorFlow SavedModel and MetaGraph protobufs through unsafe-operation analysis
+- detect and scan signature-valid CNTK and LightGBM payloads even when renamed with misleading suffixes
+- mark CNTK read failures and string-extraction limits as inconclusive analysis while retaining strict CNTK ownership and fail-closed ambiguous Flax overlap coverage
+- detect and scan signature-valid RKNN, TFLite, and ExecuTorch payloads under non-conflicting renamed suffixes while preserving owned routes, and classify unavailable ExecuTorch reads as inconclusive
+- mark CatBoost text-fragment extraction limits and unavailable reads as inconclusive analysis
+- mark RKNN and Torch7 string-extraction limits and unavailable reads as inconclusive analysis
+- classify unavailable TFLite parsing coverage as inconclusive rather than a security finding
+- classify unavailable MXNet artifact reads as inconclusive rather than security findings
+- detect dangerous OpenVINO layers inside namespace-qualified IR models
+- classify unavailable pickle reads and stream coverage as inconclusive rather than security findings
+- route renamed structurally valid MXNet symbol graphs through existing suspicious-reference analysis
+- harden renamed MXNet symbol routing with fail-closed bounded ambiguity and XGBoost overlap handling
+- restore content routing for extensionless XGBoost UBJSON models and classify unavailable or undecodable XGBoost reads as inconclusive
+- detect NeMo Hydra targets that invoke PyTorch C++ extension loaders
+- route renamed TAR-backed NeMo archives with relative archive-root model configs through Hydra `_target_` analysis while retaining generic embedded-member checks
+- avoid reporting non-extractable forward-hardlinked NeMo config or checkpoint aliases as executable findings
+- honor descriptor-owned header aliases during helper scanner selection for renamed HDF5, GGML, and compressed payloads
+- detect signature-valid Torch7 payloads even when renamed with misleading suffixes
+- detect acquired executable Llamafile payloads with misleading suffixes, retain archive-polyglot coverage, and classify unavailable runtime previews as inconclusive
+
+### Performance Improvements
+
+- reuse source-validated pickle call-graph analysis across multiple directory dispatches when supported by installed picklescan
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 

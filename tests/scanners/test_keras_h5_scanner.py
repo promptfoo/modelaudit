@@ -12,8 +12,8 @@ pytest.importorskip("h5py")
 import h5py
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 
 ASSETS_DIR = Path(__file__).parent.parent / "assets" / "samples" / "keras"
@@ -321,6 +321,36 @@ def _assert_inconclusive_keras_h5_scan(
     assert determine_exit_code(audit_result) == 2
 
 
+def _assert_inconclusive_keras_h5_scan_not_cached(model_path: Path, reason: str, cache_dir: Path) -> None:
+    reset_cache_manager()
+    try:
+        first_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for audit_result in (first_result, second_result):
+            metadata = audit_result.file_metadata[str(model_path)]
+            assert determine_exit_code(audit_result) == 2
+            assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            assert reason in metadata.get("scan_outcome_reasons")
+            assert not any(
+                issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in audit_result.issues
+            )
+
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 @pytest.mark.parametrize(
     ("model_config", "reason", "expected_check_name", "expected_message_substring"),
     [
@@ -405,48 +435,64 @@ def test_keras_h5_malformed_model_config_json_returns_inconclusive_exit2(tmp_pat
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
-def test_keras_h5_corrupt_magic_confirmed_file_is_inconclusive_and_uncached(tmp_path: Path) -> None:
-    """A routed but unreadable HDF5 container is incomplete coverage, not malicious evidence."""
-    model_path = tmp_path / "corrupt_magic_confirmed.h5"
-    model_path.write_bytes(b"\x89HDF\r\n\x1a\n" + b"truncated")
-    cache_dir = tmp_path / "cache"
+def test_keras_h5_read_failure_returns_inconclusive_exit2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unavailable Keras H5 content is incomplete analysis, not evidence of malicious content."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {"class_name": "Sequential", "config": {"layers": []}},
+        file_name="unavailable_content.h5",
+    )
 
-    direct_result = KerasH5Scanner().scan(str(model_path))
-    routed_result = scan_file(str(model_path), config={"cache_scan_results": False})
+    def raise_os_error(_self: KerasH5Scanner, _h5_file: Any, _result: Any, _path: str) -> None:
+        raise OSError("simulated Keras H5 content read failure")
 
-    assert routed_result.scanner_name == "keras_h5"
-    assert direct_result.success is False
-    assert direct_result.has_errors is False
-    assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "keras_h5_read_failed" in direct_result.metadata["scan_outcome_reasons"]
-    assert any(check.name == "Keras H5 Read" and check.status == CheckStatus.FAILED for check in direct_result.checks)
-    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in direct_result.issues)
+    monkeypatch.setattr(KerasH5Scanner, "_check_hdf5_external_references", raise_os_error)
 
-    reset_cache_manager()
-    try:
-        first_result = scan_model_directory_or_file(
-            str(model_path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        second_result = scan_model_directory_or_file(
-            str(model_path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
+    _assert_inconclusive_keras_h5_scan(
+        model_path,
+        "keras_h5_read_failed",
+        "Keras H5 File Read",
+        "Unable to read Keras H5 content",
+    )
+    result = KerasH5Scanner().scan(str(model_path))
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+    _assert_inconclusive_keras_h5_scan_not_cached(
+        model_path,
+        "keras_h5_read_failed",
+        tmp_path / "read-failure-cache",
+    )
 
-        for result in (first_result, second_result):
-            metadata = result.file_metadata[str(model_path)]
-            assert determine_exit_code(result) == 2
-            assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-            assert "keras_h5_read_failed" in metadata.get("scan_outcome_reasons")
-            assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+def test_keras_h5_unexpected_scan_failure_returns_inconclusive_exit2_without_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unexpected unavailable H5 analysis is incomplete, not a critical model finding."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {"class_name": "Sequential", "config": {"layers": []}},
+        file_name="unexpected_scan_failure.h5",
+    )
+
+    def fail_config_scan(_self: KerasH5Scanner, _model_config: dict[str, Any], _result: Any) -> None:
+        raise RuntimeError("simulated unexpected Keras H5 scan failure")
+
+    monkeypatch.setattr(KerasH5Scanner, "_scan_model_config", fail_config_scan)
+
+    _assert_inconclusive_keras_h5_scan(
+        model_path,
+        "keras_h5_scan_failed",
+        "Keras H5 File Scan",
+        "Error scanning Keras H5 file",
+    )
+    _assert_inconclusive_keras_h5_scan_not_cached(
+        model_path,
+        "keras_h5_scan_failed",
+        tmp_path / "scan-failure-cache",
+    )
 
 
 @pytest.mark.parametrize(
@@ -533,46 +579,6 @@ def test_keras_h5_inconclusive_training_config_preserves_security_exit1(tmp_path
     assert determine_exit_code(audit_result) == 1
 
 
-def test_keras_h5_read_failure_preserves_prior_security_finding_exit1(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A later HDF5 read failure must not discard an already identified malicious layer."""
-    model_path = create_raw_config_h5_file(
-        tmp_path,
-        model_config_attr=json.dumps(
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": "Lambda",
-                            "config": {"function": "lambda x: eval('1')"},
-                        }
-                    ]
-                },
-            }
-        ),
-        training_config_attr=json.dumps({}),
-        keras_version="3.11.2",
-        file_name="lambda_with_hdf5_read_failure.h5",
-    )
-
-    def fail_training_config(self: KerasH5Scanner, training_config: Any, result: ScanResult) -> None:
-        raise OSError("damaged training metadata")
-
-    monkeypatch.setattr(KerasH5Scanner, "_scan_training_config", fail_training_config)
-
-    result = KerasH5Scanner().scan(str(model_path))
-    audit_result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
-
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "keras_h5_read_failed" in result.metadata["scan_outcome_reasons"]
-    assert any(check.name == "Keras H5 Read" and check.status == CheckStatus.FAILED for check in result.checks)
-    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-    assert determine_exit_code(audit_result) == 1
-
-
 def test_keras_h5_inconclusive_scan_outcome_uncached_rerun_preserves_exit2(tmp_path: Path) -> None:
     """Uncached Keras H5 inconclusive results must still produce exit 2 on subsequent scans."""
     model_path = create_custom_h5_file(
@@ -618,6 +624,124 @@ def test_keras_h5_scanner_skips_generic_hdf5_external_links_without_keras_metada
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
+def test_keras_h5_scanner_skips_generic_nested_weight_like_groups(tmp_path: Path) -> None:
+    """Nested generic groups named vars/weights must not imply a Keras weights file."""
+    generic_path = tmp_path / "generic_nested.h5"
+    with h5py.File(generic_path, "w") as f:
+        experiment_vars = f.create_group("experiment").create_group("vars")
+        experiment_vars["linked"] = h5py.ExternalLink("external_source.h5", "/payload")
+
+    result = KerasH5Scanner().scan(str(generic_path))
+
+    assert result.success is True
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def test_keras_h5_scanner_skips_generic_root_weight_like_groups(tmp_path: Path) -> None:
+    """Generic root vars/weights groups are common outside Keras and should stay quiet."""
+    generic_path = tmp_path / "generic_root_vars.h5"
+    with h5py.File(generic_path, "w") as f:
+        f["vars"] = h5py.ExternalLink("external_source.h5", "/payload")
+
+    result = KerasH5Scanner().scan(str(generic_path))
+
+    assert result.success is True
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def test_keras_h5_scanner_skips_generic_layer_names_attr_without_weight_groups(tmp_path: Path) -> None:
+    """Generic HDF5 metadata named layer_names is not enough for Keras attribution."""
+    generic_path = tmp_path / "generic_layer_names.h5"
+    with h5py.File(generic_path, "w") as f:
+        f.attrs["layer_names"] = [b"experiment"]
+        f.create_group("experiment")
+        f["linked"] = h5py.ExternalLink("external_source.h5", "/payload")
+
+    result = KerasH5Scanner().scan(str(generic_path))
+
+    assert result.success is True
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def test_keras_h5_scanner_flags_weights_only_external_link_without_keras_metadata(tmp_path: Path) -> None:
+    """Weights-only HDF5 files can still be Keras load inputs and must not skip external references."""
+    external_source = tmp_path / "external_source.h5"
+    with h5py.File(external_source, "w") as f:
+        f.create_dataset("payload", data=[1.0])
+
+    weights_path = tmp_path / "weights_only.h5"
+    with h5py.File(weights_path, "w") as f:
+        f.attrs["layer_names"] = [b"dense"]
+        dense = f.create_group("dense")
+        dense.attrs["weight_names"] = [b"kernel:0"]
+        dense["kernel:0"] = h5py.ExternalLink(external_source.name, "/payload")
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].severity == IssueSeverity.WARNING
+    assert cve_issues[0].details["parse_status"] == "unknown"
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/dense/kernel:0",
+            "filename": "external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
+def test_keras_h5_scanner_flags_keras3_weights_external_link_without_legacy_attrs(tmp_path: Path) -> None:
+    """Keras 3 .weights.h5 files use layers/*/vars rather than legacy attrs."""
+    external_source = tmp_path / "external_source.h5"
+    with h5py.File(external_source, "w") as f:
+        f.create_dataset("payload", data=[1.0])
+
+    weights_path = tmp_path / "model.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        vars_group = f.create_group("layers").create_group("dense").create_group("vars")
+        vars_group["0"] = h5py.ExternalLink(external_source.name, "/payload")
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["parse_status"] == "unknown"
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/layers/dense/vars/0",
+            "filename": "external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
+def test_keras_h5_scanner_flags_keras3_weights_external_link_without_resolving_it(tmp_path: Path) -> None:
+    """Keras 3 layout probing should not follow attacker-controlled external links."""
+    weights_path = tmp_path / "model.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        layers = f.create_group("layers")
+        layers["dense"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/layers/dense",
+            "filename": "missing_external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
 def test_keras_h5_scanner_malicious_model(tmp_path):
     """Test scanning a malicious Keras H5 model."""
     model_path = create_mock_h5_file(tmp_path, malicious=True)
@@ -634,7 +758,7 @@ def test_keras_h5_scanner_malicious_model(tmp_path):
 
 
 def test_keras_h5_scanner_invalid_h5(tmp_path: Path) -> None:
-    """A directly scanned invalid H5 file should report incomplete coverage."""
+    """Corrupt H5 input should fail closed without becoming a security finding."""
     # Create an invalid H5 file (without magic bytes)
     invalid_path = tmp_path / "invalid.h5"
     invalid_path.write_bytes(b"This is not a valid HDF5 file")
@@ -645,8 +769,8 @@ def test_keras_h5_scanner_invalid_h5(tmp_path: Path) -> None:
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "keras_h5_read_failed" in result.metadata["scan_outcome_reasons"]
-    assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
-    assert any(check.name == "Keras H5 Read" and check.status == CheckStatus.FAILED for check in result.checks)
+    assert any("Unable to read Keras H5 content" in issue.message for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
 def test_keras_h5_scanner_with_blacklist(tmp_path):

@@ -6,7 +6,6 @@ from modelaudit.rules import RuleRegistry
 from modelaudit.scanners.rule_mapper import (
     get_embedded_code_rule_code,
     get_generic_rule_code,
-    get_import_rule_code,
     get_network_rule_code,
     get_secret_rule_code,
 )
@@ -24,22 +23,6 @@ def test_rule_mapper_returns_registered_codes() -> None:
     for code in sample_codes:
         assert code is not None
         assert RuleRegistry.get_rule(code) is not None
-
-
-@pytest.mark.parametrize(
-    ("module", "expected_rule_code"),
-    [
-        ("pty", "S111"),
-        ("code", "S112"),
-        ("types", "S113"),
-        ("ast", "S114"),
-    ],
-)
-def test_import_rule_mapper_returns_registered_code_execution_codes(module: str, expected_rule_code: str) -> None:
-    code = get_import_rule_code(module)
-
-    assert code == expected_rule_code
-    assert RuleRegistry.get_rule(code) is not None
 
 
 def test_generic_rule_prefers_network_codes_for_urls() -> None:

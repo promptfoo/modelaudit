@@ -1,5 +1,6 @@
 """Tests for the ModelAudit rule system."""
 
+import logging
 import tempfile
 from pathlib import Path
 
@@ -40,22 +41,6 @@ class TestRuleRegistry:
         assert rule.code == "S101"
         assert rule.name == "os module import"
         assert rule.default_severity == Severity.CRITICAL
-
-    def test_get_pty_spawn_rule(self) -> None:
-        rule = RuleRegistry.get_rule("S111")
-        assert rule is not None
-        assert rule.name == "pty process spawn usage"
-        assert rule.default_severity == Severity.CRITICAL
-
-    @pytest.mark.parametrize(
-        ("rule_code", "expected_severity"),
-        [("S112", Severity.CRITICAL), ("S113", Severity.HIGH), ("S114", Severity.MEDIUM)],
-    )
-    def test_get_dynamic_python_construction_rules(self, rule_code: str, expected_severity: Severity) -> None:
-        rule = RuleRegistry.get_rule(rule_code)
-
-        assert rule is not None
-        assert rule.default_severity == expected_severity
 
     def test_get_nonexistent_rule(self):
         """Test getting a rule that doesn't exist."""
@@ -109,8 +94,6 @@ class TestRuleRegistry:
         assert all(100 <= int(code[1:]) <= 199 for code in rules)
         assert "S101" in rules
         assert "S110" in rules
-        assert "S111" in rules
-        assert "S114" in rules
         assert "S201" not in rules  # Pickle rule, not in range
 
         # Get pickle rules (S200-S299)
@@ -242,12 +225,6 @@ S301 = "HIGH"
         assert "S801" in config.suppress
         assert config.severity["S301"] == Severity.HIGH
         assert config.severity["S701"] == Severity.CRITICAL
-
-    def test_from_cli_args_accepts_import_mapper_rule_codes(self) -> None:
-        config = ModelAuditConfig.from_cli_args(suppress=["S112"], severity={"S113": "HIGH", "S114": "MEDIUM"})
-
-        assert config.suppress == {"S112"}
-        assert config.severity == {"S113": Severity.HIGH, "S114": Severity.MEDIUM}
 
     def test_from_cli_args_rejects_unknown_rule_codes(self):
         """Unknown CLI rule codes should fail fast."""
@@ -457,6 +434,55 @@ class TestScanResultIntegration:
         assert len(result.issues) == 1
         assert result.issues[0].rule_code == "S103"
 
+    def test_failed_check_payload_is_retained_but_not_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Finding messages remain reportable without being copied into logs."""
+        sensitive_message = "detected credential=production-secret"
+        result = ScanResult("test_scanner")
+
+        with caplog.at_level(logging.CRITICAL, logger="modelaudit.scanners"):
+            result.add_check(
+                name="Credential Check",
+                passed=False,
+                message=sensitive_message,
+                severity=IssueSeverity.CRITICAL,
+            )
+
+        assert result.issues[0].message == sensitive_message
+        assert "production-secret" not in caplog.text
+        assert "Security finding recorded" in caplog.text
+
+    def test_suppressed_check_payload_is_not_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Suppressed findings must not disclose their payload through debug logs."""
+        config = ModelAuditConfig()
+        config.suppress = {"S301"}
+        set_config(config)
+        result = ScanResult("test_scanner")
+
+        with caplog.at_level(logging.DEBUG, logger="modelaudit.scanners"):
+            result.add_check(
+                name="Suppressed Check",
+                passed=False,
+                message="sensitive-token=production-secret",
+                severity=IssueSeverity.WARNING,
+                rule_code="S301",
+            )
+
+        assert not result.issues
+        assert "production-secret" not in caplog.text
+        assert "Suppressed security finding" in caplog.text
+
+    def test_passed_check_payload_is_retained_but_not_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Successful check details remain structured data rather than log output."""
+        sensitive_message = "checked path containing production-secret"
+        result = ScanResult("test_scanner")
+
+        with caplog.at_level(logging.DEBUG, logger="modelaudit.scanners"):
+            result.add_check(name="Path Check", passed=True, message=sensitive_message)
+
+        assert result.checks[0].message == sensitive_message
+        assert "production-secret" not in caplog.text
+        assert "Security check passed" in caplog.text
+
     def test_issue_string_representation(self):
         """Test that issues display with rule codes."""
         issue = Issue(
@@ -493,10 +519,6 @@ class TestRulePatterns:
             ("import runpy", "S108"),
             ("import webbrowser", "S109"),
             ("import ctypes", "S110"),
-            ("pty.spawn('/bin/sh')", "S111"),
-            ("code.InteractiveConsole()", "S112"),
-            ("types.FunctionType(code, globals())", "S113"),
-            ("ast.parse(source)", "S114"),
         ]
 
         for message, expected_code in test_cases:

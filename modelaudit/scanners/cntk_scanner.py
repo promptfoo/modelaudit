@@ -6,8 +6,9 @@ import os
 import re
 from typing import ClassVar
 
+from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 # Discovery assumptions captured from upstream CNTK sources:
 # 1) Legacy CNTK models begin with UTF-16LE "BCN" marker bytes and contain
@@ -15,15 +16,16 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 # 2) CNTKv2 protobuf artifacts include protobuf key markers for "version" and
 #    "uid", typically alongside structure keys like "CompositeFunction" and
 #    "primitive_functions".
-# 3) Strict content markers disambiguate CNTK from formats that share common
-#    extensions such as XGBoost's ".model".
+# 3) ".model" is intentionally excluded from v1 scanner ownership because it
+#    overlaps with XGBoost's ".model" extension in this codebase.
 DISCOVERY_ASSUMPTIONS = [
     "Legacy CNTK marker uses UTF-16LE BCN/BVersion section headers.",
     "CNTKv2 artifacts expose protobuf key markers for version/uid and graph structure fields.",
-    "Strict content markers permit CNTK ownership independently of a file extension.",
+    "The .model extension is excluded in v1 to avoid ambiguity with XGBoost .model files.",
 ]
 
 _CNTK_SUPPORTED_EXTENSIONS = frozenset({".dnn", ".cmf"})
+_CNTK_EXCLUDED_EXTENSIONS = frozenset({".model"})
 
 _MAX_SIGNATURE_BYTES = 4096
 _MAX_SCAN_BYTES = 10 * 1024 * 1024  # 10MB parser budget per file
@@ -102,11 +104,8 @@ _KNOWN_SAFE_METADATA_KEYS = frozenset(
 
 
 def _read_prefix(path: str, limit: int = _MAX_SIGNATURE_BYTES) -> bytes:
-    try:
-        with open(path, "rb") as f:
-            return f.read(limit)
-    except OSError:
-        return b""
+    with open(path, "rb") as f:
+        return f.read(limit)
 
 
 def _read_bounded(path: str, limit: int) -> tuple[bytes, bool]:
@@ -123,7 +122,10 @@ def _has_cntkv2_structure_markers(prefix: bytes) -> bool:
     return any(marker in prefix for marker in _CNTK_V2_STRUCTURE_MARKERS)
 
 
-def _detect_cntk_variant(prefix: bytes) -> tuple[str, str]:
+def _detect_cntk_variant(prefix: bytes, extension: str) -> tuple[str, str]:
+    if extension in _CNTK_EXCLUDED_EXTENSIONS:
+        return "unsupported_cntk_variant", "model_extension_excluded_for_xgboost_overlap"
+
     if prefix.startswith(_CNTK_LEGACY_MAGIC):
         if _CNTK_LEGACY_VERSION_MARKER in prefix:
             return "legacy_v1", "legacy_bcn_and_bversion_markers"
@@ -137,28 +139,28 @@ def _detect_cntk_variant(prefix: bytes) -> tuple[str, str]:
     return "not_cntk", "no_cntk_markers_detected"
 
 
-def _extract_candidate_strings(data: bytes) -> list[str]:
+def _extract_candidate_strings(data: bytes) -> tuple[list[str], bool]:
     candidates: list[str] = []
     seen: set[str] = set()
 
     for match in _ASCII_STRING_RE.finditer(data):
         text = match.group(0).decode("utf-8", "ignore").strip()
         if text and text not in seen:
+            if len(candidates) >= _MAX_EXTRACTED_STRINGS:
+                return candidates, True
             seen.add(text)
             candidates.append(text)
-            if len(candidates) >= _MAX_EXTRACTED_STRINGS:
-                return candidates
 
     for match in _UTF16LE_STRING_RE.finditer(data):
         raw = match.group(0)
         text = raw[::2].decode("ascii", "ignore").strip()
         if text and text not in seen:
+            if len(candidates) >= _MAX_EXTRACTED_STRINGS:
+                return candidates, True
             seen.add(text)
             candidates.append(text)
-            if len(candidates) >= _MAX_EXTRACTED_STRINGS:
-                break
 
-    return candidates
+    return candidates, False
 
 
 def _normalize(text: str) -> str:
@@ -261,7 +263,7 @@ class CntkScanner(BaseScanner):
     """Scanner for CNTK model files with strict format detection."""
 
     name = "cntk"
-    description = "Scans signature-confirmed CNTK model artifacts for load-time execution indicators"
+    description = "Scans signature-validated CNTK model artifacts for load-time execution indicators"
     supported_extensions: ClassVar[list[str]] = [".dnn", ".cmf"]
 
     @classmethod
@@ -269,13 +271,50 @@ class CntkScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        prefix = _read_prefix(path)
-        variant, _reason = _detect_cntk_variant(prefix)
+        extension = os.path.splitext(path)[1].lower()
+        if extension in _CNTK_EXCLUDED_EXTENSIONS:
+            return False
+
+        try:
+            prefix = _read_prefix(path)
+        except OSError:
+            return extension in _CNTK_SUPPORTED_EXTENSIONS
+        variant, _reason = _detect_cntk_variant(prefix, extension)
         return variant in {"legacy_v1", "cntk_v2"}
+
+    @staticmethod
+    def _is_unreadable_path_result(result: ScanResult) -> bool:
+        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    @staticmethod
+    def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
+        mark_inconclusive_scan_result(result, "cntk_read_failed")
+        mark_operational_scan_error(result, "cntk_read_failed")
+        result.add_check(
+            name="CNTK File Read",
+            passed=False,
+            message=f"Error reading CNTK file: {error}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "cntk_read_failed",
+            },
+        )
+        result.finish(success=False)
+        return result
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
+            if self._is_unreadable_path_result(path_check_result):
+                return self._finish_read_failure(
+                    self._create_result(),
+                    path,
+                    PermissionError(f"Path is not readable: {path}"),
+                )
             return path_check_result
 
         size_check = self._check_size_limit(path)
@@ -287,8 +326,12 @@ class CntkScanner(BaseScanner):
         result.metadata["scan_byte_limit"] = _MAX_SCAN_BYTES
         result.metadata["discovery_assumptions"] = DISCOVERY_ASSUMPTIONS
 
-        signature_prefix = _read_prefix(path)
-        variant, variant_reason = _detect_cntk_variant(signature_prefix)
+        extension = os.path.splitext(path)[1].lower()
+        try:
+            signature_prefix = _read_prefix(path)
+        except OSError as e:
+            return self._finish_read_failure(result, path, e)
+        variant, variant_reason = _detect_cntk_variant(signature_prefix, extension)
         result.metadata["cntk_variant"] = variant
         result.metadata["variant_reason"] = variant_reason
         result.metadata["signature_prefix_bytes"] = min(len(signature_prefix), _MAX_SIGNATURE_BYTES)
@@ -299,7 +342,8 @@ class CntkScanner(BaseScanner):
                 passed=False,
                 message=(
                     "Unsupported or out-of-scope CNTK variant detected. "
-                    "Current scanner supports only variants with strict CNTK content signatures."
+                    "The scanner supports signature-backed CNTK artifacts but excludes .model "
+                    "because that extension overlaps with XGBoost."
                 ),
                 severity=IssueSeverity.INFO,
                 location=path,
@@ -307,6 +351,7 @@ class CntkScanner(BaseScanner):
                     "variant": variant,
                     "reason": variant_reason,
                     "supported_extensions": sorted(_CNTK_SUPPORTED_EXTENSIONS),
+                    "excluded_extensions": sorted(_CNTK_EXCLUDED_EXTENSIONS),
                 },
             )
             result.finish(success=False)
@@ -315,16 +360,7 @@ class CntkScanner(BaseScanner):
         try:
             data, truncated = _read_bounded(path, _MAX_SCAN_BYTES)
         except OSError as e:
-            result.add_check(
-                name="CNTK File Read",
-                passed=False,
-                message=f"Error reading CNTK file: {e}",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
-            )
-            result.finish(success=False)
-            return result
+            return self._finish_read_failure(result, path, e)
 
         result.bytes_scanned = len(data)
         result.metadata["scan_truncated"] = truncated
@@ -343,8 +379,26 @@ class CntkScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        extracted_strings = _extract_candidate_strings(data)
+        extracted_strings, strings_truncated = _extract_candidate_strings(data)
         result.metadata["extracted_string_count"] = len(extracted_strings)
+        result.metadata["string_extraction_truncated"] = strings_truncated
+        if strings_truncated:
+            mark_inconclusive_scan_result(result, "cntk_string_extraction_limit_exceeded")
+        result.add_check(
+            name="CNTK Text Fragment Budget",
+            passed=not strings_truncated,
+            message=(
+                "CNTK text fragment analysis stopped at the configured extraction limit"
+                if strings_truncated
+                else "CNTK text fragment analysis completed within the configured extraction limit"
+            ),
+            severity=IssueSeverity.INFO if strings_truncated else None,
+            location=path,
+            details={
+                "max_extracted_strings": _MAX_EXTRACTED_STRINGS,
+                "analysis_incomplete": strings_truncated,
+            },
+        )
         evidence = _collect_security_evidence(extracted_strings)
 
         signal_count = sum(1 for snippets in evidence.values() if snippets)
@@ -394,5 +448,7 @@ class CntkScanner(BaseScanner):
                 },
             )
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=not result.has_errors and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        )
         return result

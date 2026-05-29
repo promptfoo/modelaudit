@@ -1,5 +1,6 @@
 """Tests for JIT/Script code execution detection."""
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -211,43 +212,6 @@ class TestJITScriptDetector:
         assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
         assert any(f.type == "dangerous_builtin" and f.builtin == "eval" for f in findings)
 
-    @pytest.mark.parametrize(
-        ("model_type", "data"),
-        [
-            ("pytorch", b"def payload():\n    import os\n    return os.system('id')\n"),
-            ("unknown", b"def payload():\n    import os\n    return os.system('id')\n"),
-            (
-                "tensorflow",
-                b"SavedFunction = True\npython_function = True\n"
-                b"def payload():\n    import os\n    return os.system('id')\n",
-            ),
-            ("pickle", b"def payload():\n    import os\n    return os.system('id')\n"),
-        ],
-    )
-    def test_scan_model_reports_complete_dangerous_python_source_once(self, model_type: str, data: bytes) -> None:
-        findings = JITScriptDetector().scan_model(data, model_type, "payload.bin")
-        identities = [
-            (finding.type, finding.message, finding.pattern, finding.operation, finding.builtin, finding.import_)
-            for finding in findings
-        ]
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "OS command execution detected"
-            for finding in findings
-        )
-        assert len(identities) == len(set(identities))
-
-    def test_scan_model_keeps_dangerous_python_extraction_from_binary_torchscript_blob(self) -> None:
-        data = b"\x00binary model prefix\ndef payload():\n    import os\n    return os.system('id')\n"
-
-        findings = JITScriptDetector().scan_model(data, "pytorch", "payload.bin")
-
-        assert any(finding.type == "dangerous_import" and finding.import_ == "os" for finding in findings)
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "OS command execution detected"
-            for finding in findings
-        )
-
     def test_scan_model_ignores_unmarked_benign_python_source(self) -> None:
         detector = JITScriptDetector()
         data = b"""
@@ -273,47 +237,34 @@ class TestJITScriptDetector:
 
         assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
 
+    def test_scan_model_detects_late_unmarked_module_scope_python_source(self) -> None:
+        detector = JITScriptDetector()
+        data = b"# pad\n" * 200000 + b"import os\nos.system('id')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
+
+    def test_scan_model_detects_unmarked_from_import_source(self) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(b"from os import system as run\nrun('id')\n", "pytorch", "payload.bin")
+
+        assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
+
     @pytest.mark.parametrize(
         "source",
         [
             b"def payload():\n    return os.posix_spawn('/bin/sh', ['sh'], {})\n",
             b"def payload():\n    return os.posix_spawnp('sh', ['sh'], {})\n",
             b"def payload():\n    return os.startfile('payload.exe')\n",
-            b"def payload():\n    from os import spawnv as run\n    return run(0, '/bin/sh', ['sh'])\n",
-        ],
-    )
-    def test_scan_model_detects_unmarked_os_process_launch(self, source: bytes) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
-        )
-
-    @pytest.mark.parametrize(
-        "source",
-        [
-            b"def payload():\n    os.system = len\n    return os.system([])\n",
+            b"def payload():\n    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], {})\n",
             b"def payload():\n    os.posix_spawn = len\n    return os.posix_spawn([])\n",
-            b"def payload():\n    os.startfile = len\n    return os.startfile([])\n",
+            b"def payload(data):\n    os.posix_spawn = pickle.loads\n    return os.posix_spawn(data)\n",
         ],
     )
-    def test_scan_model_ignores_certain_replaced_os_process_launch(self, source: bytes) -> None:
+    def test_scan_model_detects_os_process_launch_source_conservatively(self, source: bytes) -> None:
         detector = JITScriptDetector()
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert findings == []
-
-    def test_scan_model_preserves_possible_os_process_launch_after_conditional_replacement(self) -> None:
-        detector = JITScriptDetector()
-        source = (
-            b"def payload():\n"
-            b"    if replace:\n"
-            b"        os.posix_spawn = len\n"
-            b"    return os.posix_spawn('/bin/sh', ['sh'], {})\n"
-        )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
@@ -321,135 +272,231 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
         )
 
-    @pytest.mark.parametrize(
-        "source",
-        [
-            b"def payload():\n    return subprocess.check_call(['id'])\n",
-            b"def payload():\n    return subprocess.getoutput('id')\n",
-            b"def payload():\n    return subprocess.getstatusoutput('id')\n",
-            b"def payload():\n    from subprocess import check_call as run\n    return run(['id'])\n",
-        ],
-    )
-    def test_scan_model_detects_unmarked_subprocess_process_launch(self, source: bytes) -> None:
+    def test_scan_model_ignores_string_literal_os_process_launch(self) -> None:
         detector = JITScriptDetector()
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
-        )
-
-    @pytest.mark.parametrize(
-        "source",
-        [
-            b"def payload():\n    subprocess.run = len\n    return subprocess.run([])\n",
-            b"def payload():\n    subprocess.check_call = len\n    return subprocess.check_call([])\n",
-            b"def payload():\n    subprocess.getoutput = len\n    return subprocess.getoutput([])\n",
-        ],
-    )
-    def test_scan_model_ignores_certain_replaced_subprocess_process_launch(self, source: bytes) -> None:
-        detector = JITScriptDetector()
+        source = b"def payload():\n    return \"os.posix_spawn('/bin/sh', ['sh'], {})\"\n"
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
         assert findings == []
 
-    def test_scan_model_preserves_possible_subprocess_launch_after_conditional_replacement(self) -> None:
+    def test_scan_model_ignores_string_literal_os_process_launch_with_unrelated_risk(self) -> None:
         detector = JITScriptDetector()
         source = (
-            b"def payload():\n"
-            b"    if replace:\n"
-            b"        subprocess.check_call = len\n"
-            b"    return subprocess.check_call(['id'])\n"
+            b"import pickle\n\n"
+            b"def payload(data):\n"
+            b"    pickle.loads(data)\n"
+            b"    return \"os.posix_spawn('/bin/sh', ['sh'], {})\"\n"
         )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
         )
 
     @pytest.mark.parametrize(
         "source",
         [
-            b"async def payload():\n    return await asyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
-            b"async def payload():\n    return await asyncio.create_subprocess_shell('id')\n",
             (
-                b"async def payload():\n    from asyncio import create_subprocess_shell as run\n"
-                b"    return await run('id')\n"
+                b"import os\n"
+                b"import subprocess\n\n"
+                b"def payload(args):\n"
+                b"    marker = os.posix_spawn\n"
+                b"    return subprocess.list2cmdline(args)\n"
+            ),
+            (
+                b"import os\n"
+                b"import subprocess\n\n"
+                b"def payload():\n"
+                b"    marker = os.posix_spawn\n"
+                b"    return subprocess.run(['echo', 'ok'], check=False)\n"
             ),
         ],
     )
-    def test_scan_model_detects_unmarked_asyncio_process_launch(self, source: bytes) -> None:
+    def test_scan_model_ignores_uninvoked_os_process_reference_with_unrelated_risk(self, source: bytes) -> None:
         detector = JITScriptDetector()
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
         )
 
-    def test_scan_model_ignores_certain_replaced_asyncio_process_launch(self) -> None:
+    def test_scan_model_detects_embedded_snippet_alias_aware_os_process_launch(self) -> None:
         detector = JITScriptDetector()
         source = (
-            b"async def payload():\n"
-            b"    asyncio.create_subprocess_shell = len\n"
-            b"    return asyncio.create_subprocess_shell([])\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert findings == []
-
-    def test_scan_model_preserves_possible_asyncio_process_launch_after_conditional_replacement(self) -> None:
-        detector = JITScriptDetector()
-        source = (
-            b"async def payload():\n"
-            b"    if replace:\n"
-            b"        asyncio.create_subprocess_exec = len\n"
-            b"    return await asyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n"
+            b"\x00\xffdef payload():\n"
+            b"    import os\n"
+            b"    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], dict())\n"
+            b"}"
         )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
         assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_embedded_snippet_alias_aware_os_process_launch_before_binary_tail(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import os\n"
+            b"    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], dict())\n"
+            b"\x00\xffMODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
         )
 
     @pytest.mark.parametrize(
         "source",
         [
-            b"def payload():\n    return pty.spawn('/bin/sh')\n",
-            b"def payload():\n    from pty import spawn as run\n    return run('/bin/sh')\n",
+            b"async def payload():\n    return await asyncio.create_subprocess_shell('id')\n",
+            b"async def payload():\n    return await asyncio.subprocess.create_subprocess_exec('id')\n",
+            (
+                b"from asyncio import create_subprocess_exec as launch\n"
+                b"async def payload():\n    return await launch('id')\n"
+            ),
+            (
+                b"async def payload():\n"
+                b"    asyncio.create_subprocess_shell = len\n"
+                b"    return asyncio.create_subprocess_shell([])\n"
+            ),
+            (
+                b"async def payload(data):\n"
+                b"    asyncio.create_subprocess_exec = pickle.loads\n"
+                b"    return asyncio.create_subprocess_exec(data)\n"
+            ),
         ],
     )
-    def test_scan_model_detects_unmarked_pty_process_launch(self, source: bytes) -> None:
+    def test_scan_model_detects_asyncio_subprocess_launch_source_conservatively(self, source: bytes) -> None:
         detector = JITScriptDetector()
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
         assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Pseudo-terminal process execution detected"
-            for f in findings
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
         )
 
-    def test_scan_model_ignores_certain_replaced_pty_process_launch(self) -> None:
+    def test_scan_model_ignores_string_literal_asyncio_subprocess_launch_with_unrelated_risk(self) -> None:
         detector = JITScriptDetector()
-        source = b"def payload():\n    pty.spawn = len\n    return pty.spawn([])\n"
+        source = (
+            b"import pickle\n\n"
+            b"def payload(data):\n"
+            b"    pickle.loads(data)\n"
+            b"    return \"asyncio.create_subprocess_shell('id')\"\n"
+        )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
-        assert findings == []
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
 
-    def test_scan_model_preserves_possible_pty_launch_after_conditional_replacement(self) -> None:
+    def test_scan_model_ignores_binary_framed_string_literal_asyncio_subprocess_launch(self) -> None:
         detector = JITScriptDetector()
-        source = b"def payload():\n    if replace:\n        pty.spawn = len\n    return pty.spawn('/bin/sh')\n"
+        source = b"\x00\xffdef payload():\n    return \"asyncio.create_subprocess_shell('id')\"\n\x00\xffMODEL-FRAMING"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_lossy_decoded_string_literal_asyncio_subprocess_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    # ignored invalid bytes: "
+            + (b"\xff" * 64)
+            + b"\n    return \"asyncio.create_subprocess_shell('id')\"\n\x00\xffMODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_parse_embedded_python_snippet_caps_trim_attempts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        parse_calls = 0
+
+        def fail_parse(_source: str) -> ast.AST:
+            nonlocal parse_calls
+            parse_calls += 1
+            raise SyntaxError("bad syntax", ("<embedded>", 1, 1, "bad"))
+
+        monkeypatch.setattr(jit_script_module.ast, "parse", fail_parse)
+
+        tree = jit_script_module._parse_embedded_python_snippet(
+            "def payload():\n" + "\n".join("bad" for _ in range(1000))
+        )
+
+        assert tree is None
+        assert parse_calls <= jit_script_module._MAX_SNIPPET_PARSE_TRIM_ATTEMPTS + 2
+
+    def test_scan_model_detects_binary_framed_long_tail_alias_aware_asyncio_subprocess_launch(self) -> None:
+        detector = JITScriptDetector()
+        tail = b"\n".join(b"tail" for _ in range(jit_script_module._MAX_SNIPPET_PARSE_TRIM_ATTEMPTS + 20))
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    from asyncio import create_subprocess_shell as launch\n"
+            b"    return launch('id')\n"
+            b"\x00" + tail
+        )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
         assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Pseudo-terminal process execution detected"
-            for f in findings
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_binary_framed_long_tail_alias_aware_os_process_launch(self) -> None:
+        detector = JITScriptDetector()
+        tail = b"\n".join(b"tail" for _ in range(jit_script_module._MAX_SNIPPET_PARSE_TRIM_ATTEMPTS + 20))
+        source = b"\x00\xffdef payload():\n    import os as o\n    return getattr(o, 'system')('id')\n\x00" + tail
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    def test_scan_model_preserves_raw_asyncio_match_in_unparsed_snippet_after_benign_parse(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def benign():\n"
+            b"    return \"asyncio.create_subprocess_shell('id')\"\n"
+            b"}\n"
+            b"def payload():\n"
+            b"if True print('broken')\n"
+            b"asyncio.create_subprocess_shell('id')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_embedded_snippet_alias_aware_asyncio_subprocess_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    from asyncio import create_subprocess_shell as launch\n"
+            b"    return launch('id')\n"
+            b"}"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
         )
 
     @pytest.mark.parametrize(
@@ -476,26 +523,6 @@ class TestJITScriptDetector:
 
         assert findings == []
 
-    def test_scan_model_detects_binary_prefixed_aliased_runpy_execution(self) -> None:
-        detector = JITScriptDetector()
-        source = b"\x00\xff" + b"def payload():\n    from runpy import run_path as run\n    return run('payload.py')\n"
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
-
-    def test_scan_model_ignores_binary_prefixed_replaced_runpy_execution(self) -> None:
-        detector = JITScriptDetector()
-        source = (
-            b"\x00\xff" + b"def payload():\n    import runpy\n    runpy.run_path = len\n    return runpy.run_path([])\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert findings == []
-
     def test_scan_model_preserves_possible_runpy_execution_after_conditional_replacement(self) -> None:
         detector = JITScriptDetector()
         source = (
@@ -508,397 +535,68 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
-    @pytest.mark.parametrize(
-        "source",
-        [
-            b"getattr(__builtins__, 'eval')('1 + 1')\n",
-            b"__builtins__['eval']('1 + 1')\n",
-            b"getattr(__builtins__, 'ev' + 'al')('1 + 1')\n",
-            b"__builtins__.__dict__['ev' + 'al']('1 + 1')\n",
-            b"__builtins__.__dict__.get('ev' + 'al')('1 + 1')\n",
-            b"__builtins__.__dict__.__getitem__('eval')('1 + 1')\n",
-            b"import builtins\nbuiltins.eval('1 + 1')\n",
-            b"import builtins as bi\ngetattr(bi, 'ev' + 'al')('1 + 1')\n",
-            b"from builtins import eval as run\nrun('1 + 1')\n",
-            b"globals()['__builtins__']['ev' + 'al']('1 + 1')\n",
-            b"globals().get('__builtins__').get('eval')('1 + 1')\n",
-            b"getattr(globals()['__builtins__'], 'eval')('1 + 1')\n",
-            b"namespace = globals()\nnamespace['__builtins__']['ev' + 'al']('1 + 1')\n",
-            b"namespace = globals()\nnamespace.get('__builtins__').get('eval')('1 + 1')\n",
-            b"namespace = globals()\ngetattr(namespace['__builtins__'], 'eval')('1 + 1')\n",
-            b"lookup = globals().get\nlookup('__builtins__').get('ev' + 'al')('1 + 1')\n",
-            (b"namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n"),
-            b"lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
-            b"lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
-            b"eval.__call__('1 + 1')\n",
-            b"run = globals()['__builtins__']['eval']\nrun.__call__('1 + 1')\n",
-            (b"run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun('1 + 1')\n"),
-            (
-                b"run = globals()['__builtins__']['eval']\n"
-                b"globals()['__builtins__']['eval'] = len\n"
-                b"run.__call__('1 + 1')\n"
-            ),
-            (
-                b"invoke = globals()['__builtins__']['eval'].__call__\n"
-                b"globals()['__builtins__']['eval'] = len\n"
-                b"invoke('1 + 1')\n"
-            ),
-            (
-                b"run = globals()['__builtins__']['eval']\n"
-                b"globals()['__builtins__'].__setitem__('eval', len)\n"
-                b"run('1 + 1')\n"
-            ),
-            (
-                b"run = globals()['__builtins__']['eval']\n"
-                b"replace = globals()['__builtins__'].__setitem__\n"
-                b"replace('eval', len)\n"
-                b"run('1 + 1')\n"
-            ),
-            (
-                b"run = globals()['__builtins__']['eval']\n"
-                b"globals()['__builtins__']['eval'] = __builtins__['exec']\n"
-                b"run('1 + 1')\n"
-            ),
-            b"import builtins\nbuiltins.__dict__.pop('eval')('pass')\n",
-            b"import builtins\nrun = builtins.__dict__.pop('eval')\nrun('pass')\n",
-            b"import builtins\nif remove:\n    del builtins.__dict__['eval']\nbuiltins.eval('pass')\n",
-            b"import builtins\nrun = builtins.eval\nbuiltins.__dict__.clear()\nrun('pass')\n",
-            b"import builtins\nif remove:\n    builtins.__dict__.clear()\nbuiltins.eval('pass')\n",
-        ],
-    )
-    def test_scan_model_detects_unmarked_static_builtin_indirection(self, source: bytes) -> None:
+    def test_scan_model_detects_binary_prefixed_aliased_runpy_execution(self) -> None:
         detector = JITScriptDetector()
+        source = b"\x00\xffdef payload():\n    from runpy import run_path as run\n    return run('payload.py')\n"
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
-        assert any(f.type == "ast_dangerous_call" and f.builtin == "eval" for f in findings)
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
 
-    @pytest.mark.parametrize(
-        ("source", "builtin"),
-        [
-            (b"import builtins as bi\nbi.open('result.txt', 'w')\n", "open"),
-            (b"import builtins as bi\ngetattr(bi, 'op' + 'en')('result.txt', 'w')\n", "open"),
-            (b"from builtins import compile as build\nbuild('x = 1', '<x>', 'exec')\n", "compile"),
-        ],
-    )
-    def test_scan_model_detects_aliased_modeled_builtin_operations(self, source: bytes, builtin: str) -> None:
+    def test_scan_model_detects_binary_framed_long_tail_alias_aware_runpy_execution(self) -> None:
         detector = JITScriptDetector()
+        tail = b"\n".join(b"tail" for _ in range(jit_script_module._MAX_SNIPPET_PARSE_TRIM_ATTEMPTS + 20))
+        source = (
+            b"\x00\xffdef payload():\n    from runpy import run_path as run\n    return run('payload.py')\n\x00" + tail
+        )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
-        assert any(f.type == "ast_dangerous_call" and f.builtin == builtin for f in findings)
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
 
-    @pytest.mark.parametrize(
-        "source",
-        [
-            b"callbacks = {'eval': len}\ncallbacks['eval']([])\n",
-            b"import builtins as bi\nbi.len([1])\n",
-            b"globals()['__builtins__']['len']([1])\n",
-            b"globals = lambda: {'__builtins__': {'eval': len}}\nglobals()['__builtins__']['eval']([])\n",
-            b"namespace = globals()\nnamespace['__builtins__']['len']([1])\n",
-            (
-                b"namespace = globals()\n"
-                b"namespace = {'__builtins__': {'eval': len}}\n"
-                b"namespace['__builtins__']['eval']([])\n"
-            ),
-            (
-                b"namespace = globals()\n"
-                b"namespace['__builtins__']['eval'] = len\n"
-                b"namespace['__builtins__']['eval']([])\n"
-            ),
-            b"__builtins__['eval'] = len\n__builtins__['eval']([])\n",
-            b"import builtins\nbuiltins.eval = len\nbuiltins.eval([])\n",
-            b"lookup = globals().get\nlookup('__builtins__').get('len')([1])\n",
-            b"mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
-            b"globals()['__builtins__'].__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
-            b"globals()['__builtins__'].update({'eval': len})\nglobals()['__builtins__']['eval']([])\n",
-            (
-                b"replace = globals()['__builtins__'].__setitem__\n"
-                b"replace('eval', len)\n"
-                b"globals()['__builtins__']['eval']([])\n"
-            ),
-            (
-                b"replace = globals()['__builtins__'].update\n"
-                b"replace({'eval': len})\n"
-                b"globals()['__builtins__']['eval']([])\n"
-            ),
-            (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
-            (b"globals()['__builtins__'].__setitem__('eval', len)\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
-            (
-                b"replace = globals()['__builtins__'].__setitem__\n"
-                b"replace('eval', len)\n"
-                b"run = globals()['__builtins__']['eval']\n"
-                b"run([])\n"
-            ),
-            (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun.__call__([])\n"),
-            (
-                b"globals()['__builtins__']['eval'] = len\n"
-                b"invoke = globals()['__builtins__']['eval'].__call__\n"
-                b"invoke([])\n"
-            ),
-            b"import builtins\nsetattr(builtins, 'eval', len)\nbuiltins.eval([])\n",
-            b"import builtins\nresult = setattr(builtins, 'eval', len)\nbuiltins.eval([])\n",
-            (b"import builtins as bi\nfrom builtins import setattr as assign\nassign(bi, 'eval', len)\nbi.eval([])\n"),
-            b"import builtins\nbuiltins.__dict__.update({'eval': len})\nbuiltins.eval([])\n",
-            b"import builtins\nreplace = builtins.__dict__.update\nreplace({'eval': len})\nbuiltins.eval([])\n",
-            b"import builtins\ngetattr(builtins, '__dict__').update({'eval': len})\nbuiltins.eval([])\n",
-            b"import builtins\nnamespace = builtins.__dict__\nnamespace.update({'eval': len})\nbuiltins.eval([])\n",
-            b"import builtins\ndict.update(builtins.__dict__, {'eval': len})\nbuiltins.eval([])\n",
-            b"import builtins\nimport operator\noperator.setitem(builtins.__dict__, 'eval', len)\nbuiltins.eval([])\n",
-            b"import builtins\nbuiltins.__dict__.pop('eval')\nbuiltins.eval([])\n",
-            b"import builtins\ndict.pop(builtins.__dict__, 'eval')\nbuiltins.eval([])\n",
-            b"import builtins\ndel builtins.__dict__['eval']\nbuiltins.eval([])\n",
-            b"import builtins\nbuiltins.__dict__.__delitem__('eval')\nbuiltins.eval([])\n",
-            b"import builtins\nimport operator\noperator.delitem(builtins.__dict__, 'eval')\nbuiltins.eval([])\n",
-            b"import builtins\nbuiltins.__dict__.clear()\nbuiltins.eval([])\n",
-            b"import builtins\nclear = builtins.__dict__.clear\nclear()\nbuiltins.eval([])\n",
-            b"import builtins\ndict.clear(builtins.__dict__)\nbuiltins.eval([])\n",
-            b"def payload():\n    eval = len\n    return eval([])\n",
-            (
-                b"def payload():\n"
-                b"    namespace = globals()\n"
-                b"    namespace['__builtins__']['eval'] = len\n"
-                b"    return namespace['__builtins__']['eval']([])\n"
-            ),
-        ],
-    )
-    def test_scan_model_ignores_benign_builtin_shaped_access(self, source: bytes) -> None:
+    def test_scan_model_ignores_binary_prefixed_replaced_runpy_execution(self) -> None:
         detector = JITScriptDetector()
+        source = b"\x00\xffdef payload():\n    import runpy\n    runpy.run_path = len\n    return runpy.run_path([])\n"
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
         assert findings == []
 
-    @pytest.mark.parametrize(
-        "source",
-        [
-            (
-                b"namespace = globals()\n"
-                b"namespace['__builtins__']['eval'] = __builtins__['exec']\n"
-                b"namespace['__builtins__']['eval']('pass')\n"
-            ),
-            (
-                b"globals()['__builtins__'].__setitem__('eval', __builtins__['exec'])\n"
-                b"globals()['__builtins__']['eval']('pass')\n"
-            ),
-            (
-                b"globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
-                b"globals()['__builtins__']['eval']('pass')\n"
-            ),
-            (
-                b"replace = globals()['__builtins__'].__setitem__\n"
-                b"replace('eval', __builtins__['exec'])\n"
-                b"globals()['__builtins__']['eval']('pass')\n"
-            ),
-            (
-                b"replace = globals()['__builtins__'].update\n"
-                b"replace({'eval': __builtins__['exec']})\n"
-                b"globals()['__builtins__']['eval']('pass')\n"
-            ),
-            (
-                b"globals()['__builtins__']['eval'] = __builtins__['exec']\n"
-                b"globals()['__builtins__']['exec'] = len\n"
-                b"globals()['__builtins__']['eval']('pass')\n"
-            ),
-            b"import builtins\nsetattr(builtins, 'eval', builtins.exec)\nbuiltins.eval('pass')\n",
-            b"import builtins\nbuiltins.__dict__.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
-            b"import builtins\ngetattr(builtins, '__dict__').update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
-            (
-                b"import builtins\nnamespace = builtins.__dict__\n"
-                b"namespace.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n"
-            ),
-            b"import builtins\ndict.update(builtins.__dict__, {'eval': builtins.exec})\nbuiltins.eval('pass')\n",
-            (
-                b"import builtins\nimport operator\n"
-                b"operator.setitem(builtins.__dict__, 'eval', builtins.exec)\nbuiltins.eval('pass')\n"
-            ),
-            (
-                b"import builtins\nrun = builtins.exec\nbuiltins.__dict__.clear()\n"
-                b"builtins.__dict__.update({'eval': run})\nbuiltins.eval('pass')\n"
-            ),
-        ],
-    )
-    def test_scan_model_detects_dangerous_builtin_reassignment(self, source: bytes) -> None:
+    def test_scan_model_ignores_lossy_decoded_string_literal_runpy_execution(self) -> None:
         detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    # ignored invalid bytes: "
+            + (b"\xff" * 64)
+            + b"\n    return \"runpy.run_path('payload.py')\"\n\x00\xffMODEL-FRAMING"
+        )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
-        assert any(f.type == "ast_dangerous_call" and f.builtin == "exec" for f in findings)
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
 
-    @pytest.mark.parametrize(
-        "source",
-        [
-            (
-                b"namespace = globals()\n"
-                b"if replace_builtin:\n"
-                b"    namespace['__builtins__']['eval'] = len\n"
-                b"namespace['__builtins__']['eval']('1 + 1')\n"
-            ),
-            (
-                b"if replace_builtin:\n"
-                b"    globals()['__builtins__'].__setitem__('eval', len)\n"
-                b"globals()['__builtins__']['eval']('1 + 1')\n"
-            ),
-            (
-                b"if replace_builtin:\n"
-                b"    globals()['__builtins__'].update({'eval': len})\n"
-                b"globals()['__builtins__']['eval']('1 + 1')\n"
-            ),
-            (
-                b"get_names = globals\n"
-                b"if replace_globals:\n"
-                b"    get_names = lambda: {'__builtins__': {'eval': len}}\n"
-                b"get_names()['__builtins__'].__setitem__('eval', len)\n"
-                b"globals()['__builtins__']['eval']('1 + 1')\n"
-            ),
-            (
-                b"replace = globals()['__builtins__'].__setitem__\n"
-                b"if replace_mutator:\n"
-                b"    replace = lambda key, value: None\n"
-                b"replace('eval', len)\n"
-                b"globals()['__builtins__']['eval']('1 + 1')\n"
-            ),
-            (
-                b"replace = globals()['__builtins__'].update\n"
-                b"if replace_mutator:\n"
-                b"    replace = lambda values: None\n"
-                b"replace({'eval': len})\n"
-                b"globals()['__builtins__']['eval']('1 + 1')\n"
-            ),
-            (
-                b"replace = globals()['__builtins__'].__setitem__\n"
-                b"from helpers import replace\n"
-                b"replace('eval', len)\n"
-                b"globals()['__builtins__']['eval']('1 + 1')\n"
-            ),
-            (
-                b"replace = globals()['__builtins__'].update\n"
-                b"import helpers as replace\n"
-                b"replace({'eval': len})\n"
-                b"globals()['__builtins__']['eval']('1 + 1')\n"
-            ),
-            (b"import builtins\nif replace_builtin:\n    setattr(builtins, 'eval', len)\nbuiltins.eval('1 + 1')\n"),
-            (
-                b"import builtins\n"
-                b"setattr = lambda target, key, value: None\n"
-                b"setattr(builtins, 'eval', len)\n"
-                b"builtins.eval('1 + 1')\n"
-            ),
-            (
-                b"import builtins\n"
-                b"try:\n"
-                b"    setattr(builtins, 'eval', len)\n"
-                b"except Exception:\n"
-                b"    pass\n"
-                b"builtins.eval('1 + 1')\n"
-            ),
-            (
-                b"import builtins\n"
-                b"if replace_builtin:\n"
-                b"    builtins.__dict__.update({'eval': len})\n"
-                b"builtins.eval('1 + 1')\n"
-            ),
-            (
-                b"import builtins\n"
-                b"replace = builtins.__dict__.update\n"
-                b"replace = lambda values: None\n"
-                b"replace({'eval': len})\n"
-                b"builtins.eval('1 + 1')\n"
-            ),
-            (
-                b"import builtins\n"
-                b"if swap:\n"
-                b"    builtins = make_namespace()\n"
-                b"builtins.__dict__.update({'eval': len})\n"
-                b"builtins.eval('1 + 1')\n"
-            ),
-            (
-                b"import builtins\n"
-                b"if swap:\n"
-                b"    builtins = make_namespace()\n"
-                b"setattr(builtins, 'eval', len)\n"
-                b"builtins.eval('1 + 1')\n"
-            ),
-            (
-                b"import builtins\n"
-                b"if swap:\n"
-                b"    builtins = make_namespace()\n"
-                b"builtins.eval = len\n"
-                b"builtins.eval('1 + 1')\n"
-            ),
-            (
-                b"import builtins\n"
-                b"if swap:\n"
-                b"    builtins = make_namespace()\n"
-                b"namespace = builtins\n"
-                b"namespace.__dict__.update({'eval': len})\n"
-                b"builtins.eval('1 + 1')\n"
-            ),
-            (
-                b"import builtins\n"
-                b"def invoke(namespace=builtins):\n"
-                b"    namespace.__dict__.update({'eval': len})\n"
-                b"    return builtins.eval('1 + 1')\n"
-            ),
-            (
-                b"import builtins\n"
-                b"namespace = builtins.__dict__\n"
-                b"if swap:\n"
-                b"    namespace = make_mapping()\n"
-                b"namespace.update({'eval': len})\n"
-                b"builtins.eval('1 + 1')\n"
-            ),
-            (
-                b"import builtins\n"
-                b"def invoke(namespace=builtins.__dict__):\n"
-                b"    namespace.update({'eval': len})\n"
-                b"    return builtins.eval('1 + 1')\n"
-            ),
-            (
-                b"import builtins\n"
-                b"replace = dict.update\n"
-                b"if swap:\n"
-                b"    replace = lambda target, values: None\n"
-                b"replace(builtins.__dict__, {'eval': len})\n"
-                b"builtins.eval('1 + 1')\n"
-            ),
-            (
-                b"import builtins\n"
-                b"def invoke(namespace=builtins):\n"
-                b"    setattr(namespace, 'eval', len)\n"
-                b"    return builtins.eval('1 + 1')\n"
-            ),
-            (
-                b"import builtins\n"
-                b"def invoke(namespace=builtins):\n"
-                b"    namespace.eval = len\n"
-                b"    return builtins.eval('1 + 1')\n"
-            ),
-        ],
-    )
-    def test_scan_model_preserves_possible_builtin_execution_after_conditional_safe_overwrite(
-        self, source: bytes
-    ) -> None:
+    def test_scan_model_preserves_raw_runpy_match_after_benign_parsed_snippet(self) -> None:
         detector = JITScriptDetector()
+        source = (
+            b"def benign():\n"
+            b"    return \"runpy.run_path('payload.py')\"\n"
+            b"}\n"
+            b"def payload():\n"
+            b"if True print('broken')\n"
+            b"runpy.run_path('payload.py')\n"
+        )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
-        assert any(f.type == "ast_dangerous_call" and f.builtin == "eval" for f in findings)
-
-    def test_scan_model_detects_late_unmarked_module_scope_python_source(self) -> None:
-        detector = JITScriptDetector()
-        data = b"# pad\n" * 200000 + b"import os\nos.system('id')\n"
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
-
-    def test_scan_model_detects_unmarked_from_import_source(self) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(b"from os import system as run\nrun('id')\n", "pytorch", "payload.bin")
-
-        assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
 
     def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""

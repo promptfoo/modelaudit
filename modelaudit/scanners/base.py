@@ -824,10 +824,8 @@ class BaseScanner(ABC):
                 details = finding.__dict__ if hasattr(finding, "__dict__") else {"object": str(finding)}
 
             jit_indicator = f"{details.get('type', '')} {message} {model_type}".strip()
-            jit_rule_code = None
             pattern_text = f"{details.get('pattern', '')} {message}".lower()
-            if "dynamic module execution" in pattern_text:
-                jit_rule_code = "S108"
+            jit_rule_code = "S108" if "dynamic module execution" in pattern_text else None
             if not jit_rule_code:
                 jit_rule_code = get_embedded_code_rule_code(jit_indicator)
             if not jit_rule_code:

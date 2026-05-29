@@ -106,6 +106,20 @@ def test_perf_workflow_comments_only_on_same_repo_prs() -> None:
     assert "github.rest.issues.createComment" in script
 
 
+def test_perf_workflow_runs_retained_memory_guard_as_blocking_step() -> None:
+    workflow = _load_perf_workflow()
+    guard_step = _step_by_name(_job_steps(workflow), "Run retained-memory stability guard")
+
+    assert guard_step.get("continue-on-error") is None
+    env = guard_step["env"]
+    assert isinstance(env, dict)
+    assert env["PROMPTFOO_DISABLE_TELEMETRY"] == "1"
+
+    run = guard_step["run"]
+    assert "uv run --locked --with psutil pytest" in run
+    assert "tests/test_performance_benchmarks.py::TestPerformanceBenchmarks::test_memory_usage_stability" in run
+
+
 def test_nightly_windows_lane_defers_performance_benchmarks_to_linux() -> None:
     workflow = _load_workflow("nightly.yml")
     jobs = workflow["jobs"]

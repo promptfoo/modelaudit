@@ -1,11 +1,10 @@
-"""Scanner for Rockchip RKNN model artifacts (.rknn)."""
+"""Scanner for Rockchip RKNN model artifacts."""
 
 from __future__ import annotations
 
 import ipaddress
 import os
 import re
-from pathlib import Path
 from typing import Any, ClassVar
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
@@ -18,6 +17,7 @@ MIN_RKNN_SIZE = 16
 MAX_SIGNATURE_BYTES = 64
 MAX_SCAN_BYTES = 12 * 1024 * 1024
 MAX_EXTRACTED_STRINGS = 4000
+CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset({".bin", ".meta", ".pb"})
 PRINTABLE_TEXT_PATTERN = re.compile(rb"[ -~]{6,512}")
 
 ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[a-zA-Z]:[\\/]|/|~)")
@@ -70,7 +70,7 @@ class RknnScanner(BaseScanner):
     """Static scanner for RKNN models."""
 
     name = "rknn"
-    description = "Scans RKNN .rknn model files for suspicious metadata references and command/network indicators"
+    description = "Scans RKNN model files for suspicious metadata references and command/network indicators"
     supported_extensions: ClassVar[list[str]] = [".rknn"]
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
@@ -86,7 +86,7 @@ class RknnScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         if not os.path.isfile(path):
             return False
-        if Path(path).suffix.lower() not in cls.supported_extensions:
+        if os.path.splitext(path)[1].lower() in CONTENT_ROUTE_BLOCKED_EXTENSIONS:
             return False
 
         try:
@@ -119,13 +119,19 @@ class RknnScanner(BaseScanner):
             with open(path, "rb") as file_obj:
                 data = file_obj.read(self.max_scan_bytes + 1)
         except OSError as exc:
+            mark_inconclusive_scan_result(result, "rknn_read_failed")
             result.add_check(
                 name="RKNN File Read",
                 passed=False,
                 message=f"Failed to read RKNN file: {exc!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(exc), "exception_type": type(exc).__name__},
+                details={
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "rknn_read_failed",
+                },
             )
             result.finish(success=False)
             return result
@@ -203,8 +209,27 @@ class RknnScanner(BaseScanner):
                 location=path,
             )
 
-        extracted_strings = self._extract_strings(payload)
+        extracted_strings, strings_truncated = self._extract_strings(payload)
         result.metadata["extracted_string_count"] = len(extracted_strings)
+        result.metadata["string_extraction_truncated"] = strings_truncated
+
+        if strings_truncated:
+            mark_inconclusive_scan_result(result, "rknn_string_extraction_limit_exceeded")
+        result.add_check(
+            name="RKNN Text Fragment Budget",
+            passed=not strings_truncated,
+            message=(
+                "RKNN text fragment analysis stopped at the configured extraction limit"
+                if strings_truncated
+                else "RKNN text fragment analysis completed within the configured extraction limit"
+            ),
+            severity=IssueSeverity.INFO if strings_truncated else None,
+            location=path,
+            details={
+                "max_extracted_strings": self.max_extracted_strings,
+                "analysis_incomplete": strings_truncated,
+            },
+        )
 
         self._check_path_references(path, extracted_strings, result)
         self._check_command_and_network_indicators(path, extracted_strings, result)
@@ -249,7 +274,7 @@ class RknnScanner(BaseScanner):
             idx = pos + 4
         return count
 
-    def _extract_strings(self, payload: bytes) -> list[str]:
+    def _extract_strings(self, payload: bytes) -> tuple[list[str], bool]:
         return extract_bounded_printable_strings(
             payload,
             PRINTABLE_TEXT_PATTERN,
@@ -265,11 +290,13 @@ class RknnScanner(BaseScanner):
         return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast)
 
     @staticmethod
-    def _is_safe_metadata_string(text: str) -> bool:
+    def _metadata_value_for_scanning(text: str) -> str:
         if "=" not in text:
-            return False
-        key = text.split("=", 1)[0].strip().lower()
-        return key in KNOWN_SAFE_KEYS
+            return text
+        key, value = text.split("=", 1)
+        if key.strip().lower() in KNOWN_SAFE_KEYS:
+            return value.strip()
+        return text
 
     @staticmethod
     def _snippet(text: str, max_chars: int = 180) -> str:
@@ -278,21 +305,22 @@ class RknnScanner(BaseScanner):
     def _check_path_references(self, path: str, extracted_strings: list[str], result: ScanResult) -> None:
         risky_references: list[dict[str, str]] = []
         for text in extracted_strings:
-            if self._is_safe_metadata_string(text):
+            scan_text = self._metadata_value_for_scanning(text)
+            if not scan_text:
                 continue
 
-            if TRAVERSAL_PATH_PATTERN.search(text):
-                risky_references.append({"reference": self._snippet(text), "type": "filesystem_path"})
+            if TRAVERSAL_PATH_PATTERN.search(scan_text):
+                risky_references.append({"reference": self._snippet(scan_text), "type": "filesystem_path"})
                 continue
-            if REAL_FS_PREFIX_PATTERN.search(text):
+            if REAL_FS_PREFIX_PATTERN.search(scan_text):
                 # Short strings matching ~/ are likely binary noise, not real
                 # home-directory references — require a minimum length.
-                if text.startswith("~/") and len(text) < 8:
+                if scan_text.startswith("~/") and len(scan_text) < 8:
                     continue
-                risky_references.append({"reference": self._snippet(text), "type": "filesystem_path"})
+                risky_references.append({"reference": self._snippet(scan_text), "type": "filesystem_path"})
                 continue
-            if URL_PATTERN.search(text):
-                risky_references.append({"reference": self._snippet(text), "type": "url_reference"})
+            if URL_PATTERN.search(scan_text):
+                risky_references.append({"reference": self._snippet(scan_text), "type": "url_reference"})
 
         if risky_references:
             result.add_check(
@@ -321,16 +349,17 @@ class RknnScanner(BaseScanner):
         command_network_hits: list[str] = []
 
         for text in extracted_strings:
-            if self._is_safe_metadata_string(text):
+            scan_text = self._metadata_value_for_scanning(text)
+            if not scan_text:
                 continue
 
-            command_match = COMMAND_PATTERN.search(text)
+            command_match = COMMAND_PATTERN.search(scan_text)
             if not command_match:
                 continue
 
-            snippet = self._snippet(text)
-            has_network_context = bool(NETWORK_CONTEXT_PATTERN.search(text) or URL_PATTERN.search(text))
-            has_public_ip = any(self._is_public_ip(candidate) for candidate in IP_PATTERN.findall(text))
+            snippet = self._snippet(scan_text)
+            has_network_context = bool(NETWORK_CONTEXT_PATTERN.search(scan_text) or URL_PATTERN.search(scan_text))
+            has_public_ip = any(self._is_public_ip(candidate) for candidate in IP_PATTERN.findall(scan_text))
 
             if has_network_context or has_public_ip:
                 command_network_hits.append(snippet)
@@ -367,13 +396,14 @@ class RknnScanner(BaseScanner):
         obfuscated_hits: list[str] = []
 
         for text in extracted_strings:
-            if not BASE64_BLOB_PATTERN.search(text):
+            scan_text = self._metadata_value_for_scanning(text)
+            if not BASE64_BLOB_PATTERN.search(scan_text):
                 continue
-            if not DECODE_CONTEXT_PATTERN.search(text):
+            if not DECODE_CONTEXT_PATTERN.search(scan_text):
                 continue
-            if not (EXEC_CONTEXT_PATTERN.search(text) or COMMAND_PATTERN.search(text)):
+            if not (EXEC_CONTEXT_PATTERN.search(scan_text) or COMMAND_PATTERN.search(scan_text)):
                 continue
-            obfuscated_hits.append(self._snippet(text))
+            obfuscated_hits.append(self._snippet(scan_text))
 
         if obfuscated_hits:
             result.add_check(

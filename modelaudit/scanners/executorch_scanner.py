@@ -19,6 +19,8 @@ from .picklescan_adapter import (
     apply_pickle_member_context,
 )
 
+CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset({".bin", ".meta", ".pb"})
+
 
 class ExecuTorchScanner(BaseScanner):
     """Scanner for PyTorch Mobile/ExecuTorch archives (.ptl, .pte)."""
@@ -38,15 +40,40 @@ class ExecuTorchScanner(BaseScanner):
         ext = os.path.splitext(path)[1].lower()
         if ext in cls.supported_extensions:
             return True
-        return is_executorch_archive(path)
+        if ext in CONTENT_ROUTE_BLOCKED_EXTENSIONS:
+            return False
+        try:
+            header = cls._read_header(path, length=8)
+        except OSError:
+            return False
+        return (_is_executorch_binary_signature(header) and _is_valid_executorch_binary(path)) or is_executorch_archive(
+            path
+        )
 
     @staticmethod
     def _read_header(path: str, length: int = 4) -> bytes:
-        try:
-            with open(path, "rb") as f:
-                return f.read(length)
-        except Exception:
-            return b""
+        with open(path, "rb") as f:
+            return f.read(length)
+
+    @staticmethod
+    def _finish_read_failure(result: ScanResult, path: str, exc: OSError) -> ScanResult:
+        mark_inconclusive_scan_result(result, "executorch_read_failed")
+        result.add_check(
+            name="ExecuTorch File Read",
+            passed=False,
+            message=f"Unable to read ExecuTorch content: {exc!s}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(exc),
+                "exception_type": type(exc).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "executorch_read_failed",
+            },
+            rule_code="S902",
+        )
+        result.finish(success=False)
+        return result
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
@@ -61,8 +88,14 @@ class ExecuTorchScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
-        header = self._read_header(path, length=8)
-        valid_binary_program = _is_executorch_binary_signature(header) and _is_valid_executorch_binary(path)
+        try:
+            header = self._read_header(path, length=8)
+            valid_binary_program = _is_executorch_binary_signature(header) and _is_valid_executorch_binary(
+                path,
+                propagate_io_errors=True,
+            )
+        except OSError as exc:
+            return self._finish_read_failure(result, path, exc)
         if valid_binary_program:
             result.add_check(
                 name="ExecuTorch Binary Format Validation",
@@ -73,11 +106,11 @@ class ExecuTorchScanner(BaseScanner):
             )
 
         should_scan_archive = header.startswith(b"PK")
-        if valid_binary_program and not should_scan_archive:
+        if not should_scan_archive:
             try:
                 should_scan_archive = zipfile.is_zipfile(path)
-            except OSError:
-                should_scan_archive = False
+            except OSError as exc:
+                return self._finish_read_failure(result, path, exc)
 
         if valid_binary_program and not should_scan_archive:
             result.bytes_scanned = file_size
@@ -89,12 +122,11 @@ class ExecuTorchScanner(BaseScanner):
                 name="ExecuTorch Archive Format Validation",
                 passed=False,
                 message=f"Not a valid ExecuTorch archive: {path}",
-                severity=IssueSeverity.INFO,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
-                rule_code="S902",
+                rule_code="S104",
             )
-            mark_inconclusive_scan_result(result, "executorch_format_unrecognized")
             result.finish(success=False)
             return result
 
@@ -150,10 +182,19 @@ class ExecuTorchScanner(BaseScanner):
                             name="Python File Detection",
                             passed=False,
                             message=f"Python code file found in ExecuTorch model: {name}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=f"{path}:{name}",
                             details={"file": name},
                             rule_code="S507",  # Python embedded code
+                        )
+                        result.add_check(
+                            name="Executable File Detection",
+                            passed=False,
+                            message=f"Executable file found in ExecuTorch model: {name}",
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{path}:{name}",
+                            details={"file": name},
+                            rule_code="S104",
                         )
 
                 result.bytes_scanned = bytes_scanned
@@ -162,20 +203,21 @@ class ExecuTorchScanner(BaseScanner):
                 name="ZIP File Format Validation",
                 passed=False,
                 message=f"Not a valid zip file: {path}",
-                severity=IssueSeverity.INFO,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
                 rule_code="S902",
             )
-            mark_inconclusive_scan_result(result, "executorch_zip_parse_failed")
             result.finish(success=False)
             return result
+        except OSError as exc:
+            return self._finish_read_failure(result, path, exc)
         except Exception as e:  # pragma: no cover - unexpected errors
             result.add_check(
                 name="ExecuTorch File Scan",
                 passed=False,
                 message=f"Error scanning ExecuTorch file: {e!s}",
-                severity=IssueSeverity.INFO,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={
                     "exception": str(e),
@@ -183,7 +225,6 @@ class ExecuTorchScanner(BaseScanner):
                 },
                 rule_code="S902",
             )
-            mark_inconclusive_scan_result(result, "executorch_scan_failed")
             result.finish(success=False)
             return result
 

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Iterator
+import shlex
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -14,36 +15,19 @@ from .base import IssueSeverity
 if TYPE_CHECKING:
     from .base import ScanResult
 
-_EXECUTABLE_ARCHIVE_MEMBER_SUFFIXES = (
-    ".sh",
-    ".bash",
-    ".cmd",
-    ".exe",
-    ".dll",
-    ".so",
-    ".dylib",
-    ".scr",
-    ".com",
-    ".bat",
-    ".ps1",
-)
-_EXECUTABLE_ARCHIVE_MEMBER_SUFFIX_RULE_CODES = (
-    ((".exe", ".dll", ".scr", ".com"), "S501"),
-    ((".so",), "S502"),
-    ((".dylib",), "S503"),
-    ((".sh", ".bash"), "S504"),
-    ((".cmd", ".bat"), "S505"),
-    ((".ps1",), "S506"),
-)
 _EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES = 1024
 _PORTABLE_EXECUTABLE_POINTER_OFFSET = 0x3C
 _PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET = 0x40
 _PORTABLE_EXECUTABLE_MAX_HEADER_OFFSET = 1024 * 1024
 _PORTABLE_EXECUTABLE_SIGNATURE = b"PE\x00\x00"
-_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_RULE_CODES = (
-    ((b"\x7fELF",), "S502"),
-    ((b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe"), "S503"),
-    ((b"#!",), "S504"),
+ExecutableArchiveMemberProbeOutcome = Literal["detected", "absent", "incomplete"]
+_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_PREFIXES = (
+    b"\x7fELF",
+    b"\xfe\xed\xfa\xce",
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+    b"\xce\xfa\xed\xfe",
+    b"#!",
 )
 _MACHO_FAT_MAGIC_32_BE = b"\xca\xfe\xba\xbe"
 _MACHO_FAT_MAGIC_32_LE = b"\xbe\xba\xfe\xca"
@@ -57,6 +41,8 @@ _MACHO_FAT_MAGICS = {
 }
 _VERSIONED_SHARED_OBJECT_SUFFIX_RE = re.compile(r"\.so(?:\.[0-9]+)+$")
 _PYTHON_ARCHIVE_MEMBER_SUFFIXES = (".py", ".pyw")
+_PYTHON_SHEBANG_COMMAND_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?w?|pypy(?:\d+(?:\.\d+)*)?)$")
+_ENV_SHEBANG_OPTIONS_WITH_ARGUMENT = frozenset({"-u", "--unset", "-C", "--chdir"})
 _OS_PROCESS_EXECUTION_CALLS = frozenset(
     {
         "os.execl",
@@ -86,9 +72,10 @@ _ASYNCIO_PROCESS_EXECUTION_CALLS = frozenset(
     {
         "asyncio.create_subprocess_exec",
         "asyncio.create_subprocess_shell",
+        "asyncio.subprocess.create_subprocess_exec",
+        "asyncio.subprocess.create_subprocess_shell",
     }
 )
-_PTY_PROCESS_EXECUTION_CALLS = frozenset({"pty.spawn"})
 _RUNPY_CODE_EXECUTION_CALLS = frozenset(
     {
         "runpy.run_module",
@@ -97,12 +84,6 @@ _RUNPY_CODE_EXECUTION_CALLS = frozenset(
 )
 _HIGH_RISK_PYTHON_CALLS = {
     "__import__",
-    "__builtin__.__import__",
-    "__builtin__.eval",
-    "__builtin__.exec",
-    "__builtins__.__import__",
-    "__builtins__.eval",
-    "__builtins__.exec",
     "builtins.__import__",
     "builtins.eval",
     "builtins.exec",
@@ -118,17 +99,19 @@ _HIGH_RISK_PYTHON_CALLS = {
     "subprocess.run",
     *_OS_PROCESS_EXECUTION_CALLS,
     *_ASYNCIO_PROCESS_EXECUTION_CALLS,
-    *_PTY_PROCESS_EXECUTION_CALLS,
     *_RUNPY_CODE_EXECUTION_CALLS,
 }
-# Retain broad subprocess coverage while excluding public APIs that only construct data.
-_KNOWN_NON_EXECUTING_SUBPROCESS_CALLS = {
-    "subprocess.CalledProcessError",
-    "subprocess.CompletedProcess",
-    "subprocess.SubprocessError",
-    "subprocess.TimeoutExpired",
-    "subprocess.list2cmdline",
-}
+
+
+def _split_env_shebang_command(value: str) -> str | None:
+    try:
+        split_parts = shlex.split(value)
+    except ValueError:
+        split_parts = value.split()
+    if not split_parts:
+        return None
+    return split_parts[0].rsplit("/", 1)[-1].lower()
+
 
 # Map each high-risk call name to the rule code that best describes its risk
 # category. SARIF consumers, dashboards, and per-rule severity overrides rely
@@ -136,13 +119,7 @@ _KNOWN_NON_EXECUTING_SUBPROCESS_CALLS = {
 # (eval/exec) just because the scanner hard-coded a single fallback.
 _HIGH_RISK_PYTHON_CALL_RULE_CODES: dict[str, str] = {
     "__import__": "S106",
-    "__builtin__.__import__": "S106",
-    "__builtins__.__import__": "S106",
     "builtins.__import__": "S106",
-    "__builtin__.eval": "S104",
-    "__builtin__.exec": "S104",
-    "__builtins__.eval": "S104",
-    "__builtins__.exec": "S104",
     "builtins.eval": "S104",
     "builtins.exec": "S104",
     "eval": "S104",
@@ -152,7 +129,6 @@ _HIGH_RISK_PYTHON_CALL_RULE_CODES: dict[str, str] = {
     "pickle.loads": "S213",
     **dict.fromkeys(_OS_PROCESS_EXECUTION_CALLS, "S101"),
     **dict.fromkeys(_ASYNCIO_PROCESS_EXECUTION_CALLS, "S103"),
-    **dict.fromkeys(_PTY_PROCESS_EXECUTION_CALLS, "S111"),
     **dict.fromkeys(_RUNPY_CODE_EXECUTION_CALLS, "S108"),
 }
 _HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES: tuple[tuple[str, str], ...] = (("subprocess.", "S103"),)
@@ -185,55 +161,74 @@ class PythonArchiveMemberParseError(Exception):
 _AliasValue = frozenset[str] | None
 _AliasScope = dict[str, _AliasValue]
 _AliasScopes = list[_AliasScope]
-_MISSING_ALIAS = object()
+_GLOBALS_MAPPING_ALIAS = "<globals mapping>"
+_MODULE_LOCALS_MAPPING_ALIAS = "<module locals mapping>"
+_LOCAL_NAMESPACE_MAPPING_ALIAS = "<local mapping>"
+_TRACKED_MODULE_NAMESPACE_ALIASES = frozenset({_GLOBALS_MAPPING_ALIAS, _MODULE_LOCALS_MAPPING_ALIAS})
+_MODULE_NAMESPACE_WRITE_PREFIX = "<module namespace write>."
 
 
 def is_executable_archive_member_name(member_name: str) -> bool:
     """Return True when an archive member name has an executable/native-library suffix."""
-    normalized_name = member_name.lower()
-    return normalized_name.endswith(_EXECUTABLE_ARCHIVE_MEMBER_SUFFIXES) or bool(
-        _VERSIONED_SHARED_OBJECT_SUFFIX_RE.search(normalized_name)
-    )
+    return executable_archive_member_name_rule_code(member_name) is not None
 
 
-def executable_archive_member_rule_code(member_name: str, *, path: str | None = None) -> str | None:
-    """Return the rule code for an executable archive member name or content probe."""
+def executable_archive_member_name_rule_code(member_name: str) -> str | None:
+    """Return the executable rule code implied by an archive member name."""
     normalized_name = member_name.lower()
-    for suffixes, rule_code in _EXECUTABLE_ARCHIVE_MEMBER_SUFFIX_RULE_CODES:
-        if normalized_name.endswith(suffixes):
-            return rule_code
-    if _VERSIONED_SHARED_OBJECT_SUFFIX_RE.search(normalized_name):
+    if normalized_name.endswith((".exe", ".dll", ".scr", ".com")):
+        return "S501"
+    if normalized_name.endswith(".so") or _VERSIONED_SHARED_OBJECT_SUFFIX_RE.search(normalized_name):
         return "S502"
-    if path is not None:
-        return _executable_archive_member_content_rule_code(path)
+    if normalized_name.endswith(".dylib"):
+        return "S503"
+    if normalized_name.endswith((".sh", ".bash")):
+        return "S504"
+    if normalized_name.endswith((".bat", ".cmd")):
+        return "S505"
+    if normalized_name.endswith(".ps1"):
+        return "S506"
     return None
 
 
-def _looks_like_portable_executable(prefix: bytes, *, path: str) -> bool:
+def _looks_like_portable_executable(
+    prefix: bytes,
+    *,
+    read_prefix: Callable[[int], bytes] | None = None,
+) -> ExecutableArchiveMemberProbeOutcome:
     if not prefix.startswith(b"MZ"):
-        return False
+        return "absent"
     if b"This program cannot be run in DOS mode" in prefix[:512]:
-        return True
+        return "detected"
     if len(prefix) < _PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET:
-        return False
+        return "absent"
 
     pe_offset = int.from_bytes(
         prefix[_PORTABLE_EXECUTABLE_POINTER_OFFSET : _PORTABLE_EXECUTABLE_POINTER_OFFSET + 4],
         "little",
         signed=False,
     )
-    if not _PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET <= pe_offset <= _PORTABLE_EXECUTABLE_MAX_HEADER_OFFSET:
-        return False
+    if pe_offset < _PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET:
+        return "absent"
+    if pe_offset > _PORTABLE_EXECUTABLE_MAX_HEADER_OFFSET:
+        return "incomplete"
 
     if pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE) <= len(prefix):
-        return prefix[pe_offset : pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE)] == _PORTABLE_EXECUTABLE_SIGNATURE
+        if prefix[pe_offset : pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE)] == _PORTABLE_EXECUTABLE_SIGNATURE:
+            return "detected"
+        return "absent"
 
-    try:
-        with open(path, "rb") as member_file:
-            member_file.seek(pe_offset)
-            return member_file.read(len(_PORTABLE_EXECUTABLE_SIGNATURE)) == _PORTABLE_EXECUTABLE_SIGNATURE
-    except OSError:
-        return False
+    if read_prefix is None:
+        return "absent"
+
+    expanded_prefix = read_prefix(pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE))
+    if (
+        len(expanded_prefix) >= pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE)
+        and expanded_prefix[pe_offset : pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE)]
+        == _PORTABLE_EXECUTABLE_SIGNATURE
+    ):
+        return "detected"
+    return "absent"
 
 
 def _looks_like_macho_fat_binary(prefix: bytes) -> bool:
@@ -252,27 +247,159 @@ def _looks_like_macho_fat_binary(prefix: bytes) -> bool:
     return len(prefix) >= 8 + (arch_count * arch_entry_size)
 
 
-def _executable_archive_member_content_rule_code(path: str) -> str | None:
-    """Return the rule code for a bounded executable-content signature probe."""
+def probe_executable_archive_member_signature(
+    read_prefix: Callable[[int], bytes],
+) -> ExecutableArchiveMemberProbeOutcome:
+    """Classify strong executable signatures without reading beyond the bounded PE budget."""
+    prefix = read_prefix(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES)
+    if prefix.startswith(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_PREFIXES):
+        return "detected"
+    if _looks_like_macho_fat_binary(prefix):
+        return "detected"
+    return _looks_like_portable_executable(prefix, read_prefix=read_prefix)
+
+
+def has_executable_archive_member_signature(read_prefix: Callable[[int], bytes]) -> bool:
+    """Return True when a bounded prefix reader exposes a confirmed executable signature."""
+    return probe_executable_archive_member_signature(read_prefix) == "detected"
+
+
+def probe_executable_archive_member_content(path: str) -> ExecutableArchiveMemberProbeOutcome:
+    """Classify executable bytes in an extracted archive member."""
     try:
         with open(path, "rb") as member_file:
-            prefix = member_file.read(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES)
-    except OSError:
-        return None
 
-    for prefixes, rule_code in _EXECUTABLE_ARCHIVE_MEMBER_MAGIC_RULE_CODES:
-        if prefix.startswith(prefixes):
-            return rule_code
-    if _looks_like_macho_fat_binary(prefix):
-        return "S503"
-    if _looks_like_portable_executable(prefix, path=path):
-        return "S501"
-    return None
+            def read_prefix(limit: int) -> bytes:
+                member_file.seek(0)
+                return member_file.read(limit)
+
+            return probe_executable_archive_member_signature(read_prefix)
+    except OSError:
+        return "absent"
 
 
 def is_executable_archive_member_content(path: str) -> bool:
-    """Return True when a member begins with a strong executable signature."""
-    return _executable_archive_member_content_rule_code(path) is not None
+    """Return True when a member begins with a confirmed executable signature."""
+    return probe_executable_archive_member_content(path) == "detected"
+
+
+def _shebang_command_name(source_bytes: bytes) -> str | None:
+    if not source_bytes.startswith(b"#!"):
+        return None
+    first_line = source_bytes.splitlines()[0][2:].decode("utf-8", errors="ignore").strip()
+    if not first_line:
+        return None
+    try:
+        parts = shlex.split(first_line)
+    except ValueError:
+        parts = first_line.split()
+    if not parts:
+        return None
+
+    command = parts[0].rsplit("/", 1)[-1].lower()
+    if command != "env":
+        return command
+
+    index = 1
+    while index < len(parts):
+        token = parts[index]
+        if token in {"-S", "--split-string"}:
+            if index + 1 >= len(parts):
+                return None
+            return _split_env_shebang_command(parts[index + 1])
+        if token.startswith("--split-string="):
+            return _split_env_shebang_command(token.split("=", 1)[1])
+        if token.startswith("-S") and token != "-S":
+            return _split_env_shebang_command(token[2:])
+        if token in _ENV_SHEBANG_OPTIONS_WITH_ARGUMENT:
+            index += 2
+            continue
+        if token == "--" or token.startswith("--unset=") or token.startswith("--chdir="):
+            index += 1
+            continue
+        if token.startswith("-") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            index += 1
+            continue
+        return token.rsplit("/", 1)[-1].lower()
+    return None
+
+
+def _python_member_has_non_python_shebang(source_bytes: bytes) -> bool:
+    if not source_bytes.startswith(b"#!"):
+        return False
+    command = _shebang_command_name(source_bytes)
+    return command is None or _PYTHON_SHEBANG_COMMAND_RE.fullmatch(command) is None
+
+
+def _probe_python_archive_member_executable_content(path: str) -> ExecutableArchiveMemberProbeOutcome:
+    try:
+        with open(path, "rb") as member_file:
+            prefix_cache = member_file.read(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES)
+            if prefix_cache.startswith(b"#!"):
+                return "detected" if _python_member_has_non_python_shebang(prefix_cache) else "absent"
+
+            def read_prefix(limit: int) -> bytes:
+                nonlocal prefix_cache
+                if limit <= len(prefix_cache) or not prefix_cache.startswith(b"MZ"):
+                    return prefix_cache[:limit]
+                member_file.seek(0)
+                expanded_prefix = member_file.read(limit)
+                if len(expanded_prefix) > len(prefix_cache):
+                    prefix_cache = expanded_prefix
+                return prefix_cache[:limit]
+
+            return probe_executable_archive_member_signature(read_prefix)
+    except OSError:
+        return "absent"
+
+
+def executable_archive_member_content_rule_code(path: str) -> str | None:
+    """Return the executable rule code implied by an archive member's content."""
+    try:
+        with open(path, "rb") as member_file:
+            prefix_cache = member_file.read(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES)
+
+            def read_prefix(limit: int) -> bytes:
+                nonlocal prefix_cache
+                if limit <= len(prefix_cache) or not prefix_cache.startswith(b"MZ"):
+                    return prefix_cache[:limit]
+                member_file.seek(0)
+                expanded_prefix = member_file.read(limit)
+                if len(expanded_prefix) > len(prefix_cache):
+                    prefix_cache = expanded_prefix
+                return prefix_cache[:limit]
+
+            return _executable_archive_member_content_rule_code(prefix_cache, read_prefix=read_prefix)
+    except OSError:
+        return None
+
+
+def executable_archive_member_content_rule_code_from_bytes(content: bytes) -> str | None:
+    """Return the executable rule code implied by bounded member bytes."""
+    return _executable_archive_member_content_rule_code(content)
+
+
+def _executable_archive_member_content_rule_code(
+    prefix: bytes,
+    *,
+    read_prefix: Callable[[int], bytes] | None = None,
+) -> str | None:
+    if _looks_like_portable_executable(prefix, read_prefix=read_prefix) == "detected":
+        return "S501"
+    if prefix.startswith(b"\x7fELF"):
+        return "S502"
+    if prefix.startswith((b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe")):
+        return "S503"
+    if _looks_like_macho_fat_binary(prefix):
+        return "S503"
+    if prefix.startswith(b"#!"):
+        return "S504"
+    return None
+
+
+def executable_archive_member_rule_code(member_name: str, path: str) -> str | None:
+    """Return the best executable rule code for an archive member."""
+    return executable_archive_member_content_rule_code(path) or executable_archive_member_name_rule_code(member_name)
 
 
 def is_python_archive_member_name(member_name: str) -> bool:
@@ -291,14 +418,27 @@ def _resolve_call_name(node: ast.AST) -> str | None:
     return None
 
 
-def _resolve_aliases(name: str, alias_scopes: _AliasScopes) -> _AliasValue:
+def _lookup_bound_alias(name: str, alias_scopes: _AliasScopes) -> tuple[_AliasValue, bool]:
     for aliases in reversed(alias_scopes):
         if name in aliases:
-            return aliases[name]
+            return aliases[name], True
+        module_write_name = f"{_MODULE_NAMESPACE_WRITE_PREFIX}{name}"
+        if module_write_name in aliases:
+            return aliases[module_write_name], True
+    return None, False
+
+
+def _resolve_aliases(name: str, alias_scopes: _AliasScopes) -> _AliasValue:
+    aliases, found = _lookup_bound_alias(name, alias_scopes)
+    if found:
+        return aliases
     return frozenset({name})
 
 
 def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    direct_aliases, direct_found = _lookup_bound_alias(call_name, alias_scopes)
+    if direct_found:
+        return direct_aliases
     head, *tail = call_name.split(".")
     resolved_heads = _resolve_aliases(head, alias_scopes)
     if resolved_heads is None:
@@ -307,6 +447,19 @@ def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str]
         return resolved_heads
     suffix = ".".join(tail)
     return frozenset(f"{resolved_head}.{suffix}" for resolved_head in resolved_heads)
+
+
+def _normalize_implicit_builtins_names(
+    names: frozenset[str] | None, alias_scopes: _AliasScopes
+) -> frozenset[str] | None:
+    if names is None or _resolve_aliases("__builtins__", alias_scopes) != frozenset({"__builtins__"}):
+        return names
+    return frozenset(
+        f"builtins{name.removeprefix('__builtins__')}"
+        if name == "__builtins__" or name.startswith("__builtins__.")
+        else name
+        for name in names
+    )
 
 
 _MAX_STATIC_STRING_LENGTH = 1024
@@ -339,207 +492,74 @@ def _resolve_static_string(node: ast.AST) -> str | None:
     return "".join(parts)
 
 
-_NAMESPACE_MAPPING_ACCESSORS = {"get", "__getitem__", "pop", "setdefault"}
-_GLOBAL_NAMESPACE_HELPERS = {"globals", "builtins.globals"}
-_GLOBAL_NAMESPACE_MAPPING_MARKER = "<globals mapping>"
-_STATIC_REFERENCE_OVERRIDE_PREFIX = "<static reference override>:"
-_STATIC_CLEARED_NAMESPACE_PREFIX = "<static cleared namespace>:"
-_STATIC_MAPPING_MUTATION_ALIAS_PREFIX = "<static mapping mutation alias>:"
-_STATIC_UNCERTAIN_BINDING_PREFIX = "<uncertain static binding>:"
-_CAPTURED_CALLABLE_REFERENCE_PREFIX = "<captured callable>:"
-_BUILTIN_NAMESPACE_NAMES = {"__builtin__", "__builtins__"}
-_STATIC_MAPPING_MUTATORS = {"__delitem__", "__setitem__", "clear", "pop", "update"}
-_STATIC_ATTRIBUTE_MUTATION_HELPERS = {
-    "setattr",
-    "__builtin__.setattr",
-    "__builtins__.setattr",
-    "builtins.setattr",
-}
-_STATIC_MAPPING_FUNCTION_MUTATORS = {
-    "dict.__setitem__": "__setitem__",
-    "builtins.dict.__setitem__": "__setitem__",
-    "dict.__delitem__": "__delitem__",
-    "builtins.dict.__delitem__": "__delitem__",
-    "dict.clear": "clear",
-    "builtins.dict.clear": "clear",
-    "dict.update": "update",
-    "builtins.dict.update": "update",
-    "dict.pop": "pop",
-    "builtins.dict.pop": "pop",
-    "operator.delitem": "__delitem__",
-    "operator.setitem": "__setitem__",
-}
-
-
-def _has_uncertain_static_binding(node: ast.AST, alias_scopes: _AliasScopes) -> bool:
-    """Return whether ``node`` uses a name whose identity diverged across branches."""
-    for child in ast.walk(node):
-        if not isinstance(child, ast.Name):
-            continue
-        uncertainty_key = f"{_STATIC_UNCERTAIN_BINDING_PREFIX}{child.id}"
-        for aliases in reversed(alias_scopes):
-            if uncertainty_key in aliases:
-                if aliases[uncertainty_key] is None:
-                    return True
-                break
-    return False
-
-
-def _resolve_global_namespace_mappings(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    """Resolve the mapping returned by an unshadowed zero-argument ``globals()`` call."""
-    if isinstance(node, ast.Call) and not node.args and not node.keywords:
-        helper_name = _resolve_call_name(node.func)
-        resolved_helper_names = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
-        if resolved_helper_names is not None and resolved_helper_names & _GLOBAL_NAMESPACE_HELPERS:
-            return frozenset({_GLOBAL_NAMESPACE_MAPPING_MARKER})
-
-    namespace_name = _resolve_call_name(node)
-    resolved_namespace_names = _apply_aliases(namespace_name, alias_scopes) if namespace_name is not None else None
-    if resolved_namespace_names is not None and _GLOBAL_NAMESPACE_MAPPING_MARKER in resolved_namespace_names:
-        return frozenset({_GLOBAL_NAMESPACE_MAPPING_MARKER})
-    return None
-
-
-def _resolve_aliased_mapping_accessor_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    """Resolve receivers for a statically aliased mapping accessor invocation."""
-    if not isinstance(node, ast.Call) or not node.args:
-        return None
-
-    helper_name = _resolve_call_name(node.func)
-    resolved_helper_names = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
-    if resolved_helper_names is None:
-        return None
-
-    roots = {
-        helper_name.rsplit(".", maxsplit=1)[0]
-        for helper_name in resolved_helper_names
-        if "." in helper_name and helper_name.rsplit(".", maxsplit=1)[1] in _NAMESPACE_MAPPING_ACCESSORS
-    }
-    return frozenset(roots) if roots else None
-
-
-def _resolve_global_builtin_namespace_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    """Resolve a statically addressed builtin namespace obtained from ``globals()``."""
-    namespace_node: ast.AST | None
-    attr_name_node: ast.AST
-    if isinstance(node, ast.Subscript):
-        namespace_node = node.value
-        attr_name_node = node.slice
-    elif (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in _NAMESPACE_MAPPING_ACCESSORS
-        and node.args
-    ):
-        namespace_node = node.func.value
-        attr_name_node = node.args[0]
-    elif isinstance(node, ast.Call) and node.args:
-        accessor_roots = _resolve_aliased_mapping_accessor_roots(node, alias_scopes)
-        if accessor_roots is None or _GLOBAL_NAMESPACE_MAPPING_MARKER not in accessor_roots:
-            return None
-        namespace_node = None
-        attr_name_node = node.args[0]
-    else:
-        return None
-
-    attr_name = _resolve_static_string(attr_name_node)
-    if attr_name not in _BUILTIN_NAMESPACE_NAMES:
-        return None
-    if namespace_node is not None and _resolve_global_namespace_mappings(namespace_node, alias_scopes) is None:
-        return None
-    return frozenset({attr_name})
-
-
-def _resolve_direct_global_builtin_namespace_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    """Resolve builtin mappings fetched directly from an unshadowed ``globals()`` call."""
-    namespace_node: ast.AST
-    attr_name_node: ast.AST
-    if isinstance(node, ast.Subscript):
-        namespace_node = node.value
-        attr_name_node = node.slice
-    elif (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in _NAMESPACE_MAPPING_ACCESSORS
-        and node.args
-    ):
-        namespace_node = node.func.value
-        attr_name_node = node.args[0]
-    else:
-        return None
-
-    if (
-        not isinstance(namespace_node, ast.Call)
-        or namespace_node.args
-        or namespace_node.keywords
-        or not isinstance(namespace_node.func, ast.Name)
-        or namespace_node.func.id != "globals"
-        or any("globals" in aliases for aliases in alias_scopes)
-    ):
-        return None
-    attr_name = _resolve_static_string(attr_name_node)
-    if attr_name not in _BUILTIN_NAMESPACE_NAMES:
-        return None
-    return frozenset({attr_name})
-
-
-def _resolve_certain_namespace_mutation_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    """Resolve namespace mappings whose mutation target is statically certain."""
-    direct_builtin_roots = _resolve_direct_global_builtin_namespace_roots(node, alias_scopes)
-    if direct_builtin_roots is not None:
-        return direct_builtin_roots
-
-    if _has_uncertain_static_binding(node, alias_scopes):
-        return None
-
-    target_roots = _resolve_namespace_dict_roots(node, alias_scopes)
-    return target_roots if target_roots is not None and len(target_roots) == 1 else None
-
-
-def _resolve_static_mapping_mutator_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    """Resolve mutation methods bound from one certain namespace mapping."""
-    if not isinstance(node, ast.Attribute) or node.attr not in _STATIC_MAPPING_MUTATORS:
-        return None
-
-    target_roots = _resolve_certain_namespace_mutation_roots(node.value, alias_scopes)
-    if target_roots is None:
-        return None
-    return frozenset(f"{target_root}.{node.attr}" for target_root in target_roots)
-
-
-def _resolve_static_attribute_names(
-    target_root_node: ast.AST, attr_name_node: ast.AST, alias_scopes: _AliasScopes
+def _resolve_getattr_call_names(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
 ) -> frozenset[str] | None:
-    attr_name = _resolve_static_string(attr_name_node)
-    if attr_name is None:
-        return None
-
-    resolved_target_roots = _resolve_global_builtin_namespace_roots(target_root_node, alias_scopes)
-    if resolved_target_roots is None:
-        target_root = _resolve_call_name(target_root_node)
-        if target_root is None:
-            return None
-        resolved_target_roots = _apply_aliases(target_root, alias_scopes)
-    if resolved_target_roots is None:
-        return None
-    return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
-
-
-def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
     # Resolve literal names and compile-time string concatenation. Runtime-built
     # names still fall outside this static member analysis by design.
     if isinstance(node, ast.Attribute) and node.attr == "__call__":
-        return _resolve_getattr_call_names(node.value, alias_scopes)
+        return _resolve_getattr_call_names(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
 
     if not isinstance(node, ast.Call):
         return None
 
     helper_name = _resolve_call_name(node.func)
-    if helper_name is None:
+    resolved_helper_names = (
+        _apply_aliases(helper_name, alias_scopes)
+        if helper_name is not None
+        else _resolve_getattr_call_names(
+            node.func,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+    )
+    if resolved_helper_names is None:
         return None
 
-    resolved_helper_names = _apply_aliases(helper_name, alias_scopes)
-    if resolved_helper_names is None or not (resolved_helper_names & {"getattr", "builtins.getattr"}):
+    normalized_helper_names: set[str] = set()
+    for resolved_helper_name in resolved_helper_names:
+        while resolved_helper_name.endswith(".__call__"):
+            resolved_helper_name = resolved_helper_name.removesuffix(".__call__")
+        normalized_helper_names.add(resolved_helper_name)
+
+    if normalized_helper_names & {"object.__getattribute__", "builtins.object.__getattribute__"}:
+        if len(node.args) != 2 or node.keywords:
+            return None
+        resolved_target_roots = _resolve_static_reference_names(
+            node.args[0],
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        attr_name = _resolve_static_string(node.args[1])
+        if resolved_target_roots is None or attr_name is None:
+            return None
+        return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
+
+    accessor_names = frozenset(
+        normalized_helper_name.removesuffix(".__getattribute__")
+        for normalized_helper_name in normalized_helper_names
+        if normalized_helper_name.endswith(".__getattribute__")
+    )
+    if accessor_names:
+        if len(node.args) != 1 or node.keywords:
+            return None
+        attr_name = _resolve_static_string(node.args[0])
+        if attr_name is None:
+            return None
+        return frozenset(f"{target_root}.{attr_name}" for target_root in accessor_names)
+
+    if not (normalized_helper_names & {"getattr", "builtins.getattr"}):
         return None
 
     target_root_node: ast.AST | None = node.args[0] if node.args else None
@@ -553,192 +573,513 @@ def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> fr
     if target_root_node is None or attr_name_node is None:
         return None
 
-    return _resolve_static_attribute_names(target_root_node, attr_name_node, alias_scopes)
-
-
-def _resolve_dunder_getattribute_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    if isinstance(node, ast.Attribute) and node.attr == "__call__":
-        return _resolve_dunder_getattribute_call_names(node.value, alias_scopes)
-
-    if not isinstance(node, ast.Call):
-        return None
-
-    helper_name = _resolve_call_name(node.func)
-    resolved_helper_names = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
-    if resolved_helper_names is not None and resolved_helper_names & {
-        "object.__getattribute__",
-        "builtins.object.__getattribute__",
-    }:
-        if len(node.args) < 2:
-            return None
-        return _resolve_static_attribute_names(node.args[0], node.args[1], alias_scopes)
-
-    if not isinstance(node.func, ast.Attribute) or node.func.attr != "__getattribute__" or not node.args:
-        return None
-    return _resolve_static_attribute_names(node.func.value, node.args[0], alias_scopes)
-
-
-def _resolve_namespace_dict_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    global_builtin_roots = _resolve_global_builtin_namespace_roots(node, alias_scopes)
-    if global_builtin_roots is not None:
-        return global_builtin_roots
-
-    target_root_node: ast.AST | None = None
-    namespace_node = node
-    if isinstance(namespace_node, ast.Attribute) and namespace_node.attr == "__dict__":
-        target_root_node = namespace_node.value
-    elif isinstance(namespace_node, ast.Call) and len(namespace_node.args) == 1 and not namespace_node.keywords:
-        helper_name = _resolve_call_name(namespace_node.func)
-        resolved_helper_names = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
-        if resolved_helper_names is not None and resolved_helper_names & {"vars", "builtins.vars"}:
-            target_root_node = namespace_node.args[0]
-
-    if target_root_node is not None:
-        global_builtin_roots = _resolve_global_builtin_namespace_roots(target_root_node, alias_scopes)
-        if global_builtin_roots is not None:
-            return global_builtin_roots
-        target_root = _resolve_call_name(target_root_node)
-        return _apply_aliases(target_root, alias_scopes) if target_root is not None else None
-
-    namespace_name = _resolve_call_name(namespace_node)
-    resolved_namespace_names = _apply_aliases(namespace_name, alias_scopes) if namespace_name is not None else None
-    if resolved_namespace_names is not None:
-        roots = {
-            resolved_name.removesuffix(".__dict__")
-            for resolved_name in resolved_namespace_names
-            if resolved_name.endswith(".__dict__")
-        }
-        roots.update(
-            resolved_name for resolved_name in resolved_namespace_names if resolved_name in _BUILTIN_NAMESPACE_NAMES
-        )
-        if roots:
-            return frozenset(roots)
-
-    resolved_namespace_names = _resolve_getattr_call_names(namespace_node, alias_scopes)
-    if resolved_namespace_names is None:
-        resolved_namespace_names = _resolve_dunder_getattribute_call_names(namespace_node, alias_scopes)
-    if resolved_namespace_names is None:
-        return None
-
-    roots = {
-        resolved_name.removesuffix(".__dict__")
-        for resolved_name in resolved_namespace_names
-        if resolved_name.endswith(".__dict__")
-    }
-    return frozenset(roots) if roots else None
-
-
-def _resolve_namespace_dict_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    """Resolve bounded calls dispatched through a statically known namespace mapping."""
-    if isinstance(node, ast.Attribute) and node.attr == "__call__":
-        return _resolve_namespace_dict_call_names(node.value, alias_scopes)
-
-    namespace_node: ast.AST | None = None
-    attr_name_node: ast.AST
-    resolved_target_roots: frozenset[str] | None = None
-    if isinstance(node, ast.Subscript):
-        namespace_node = node.value
-        attr_name_node = node.slice
-    elif (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in _NAMESPACE_MAPPING_ACCESSORS
-        and node.args
-    ):
-        namespace_node = node.func.value
-        attr_name_node = node.args[0]
-    elif isinstance(node, ast.Call) and node.args:
-        accessor_roots = _resolve_aliased_mapping_accessor_roots(node, alias_scopes)
-        if accessor_roots is None:
-            return None
-        roots = {
-            accessor_root.removesuffix(".__dict__")
-            for accessor_root in accessor_roots
-            if accessor_root.endswith(".__dict__")
-        }
-        roots.update(
-            accessor_root
-            for accessor_root in accessor_roots
-            if accessor_root in _BUILTIN_NAMESPACE_NAMES or accessor_root == "builtins"
-        )
-        if not roots:
-            return None
-        resolved_target_roots = frozenset(roots)
-        attr_name_node = node.args[0]
-    else:
-        return None
-
     attr_name = _resolve_static_string(attr_name_node)
     if attr_name is None:
         return None
 
-    if resolved_target_roots is None:
-        assert namespace_node is not None
-        resolved_target_roots = _resolve_namespace_dict_roots(namespace_node, alias_scopes)
+    resolved_target_roots = _resolve_static_reference_names(
+        target_root_node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
     if resolved_target_roots is None:
         return None
     return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
 
 
-def _resolve_bound_namespace_accessor_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    """Resolve aliased accessor methods on known global or builtin mappings."""
-    if not isinstance(node, ast.Attribute) or node.attr not in _NAMESPACE_MAPPING_ACCESSORS:
+def _resolve_namespace_mapping_roots(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    """Resolve statically selected namespace mappings relevant to risky lookups."""
+    implicit_builtins_roots = _resolve_globals_builtins_mapping_roots(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if implicit_builtins_roots is not None:
+        return implicit_builtins_roots
+
+    mapping_aliases = _resolve_globals_mapping_alias(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if mapping_aliases is not None:
+        return mapping_aliases
+
+    if isinstance(node, ast.Attribute) and node.attr == "__dict__":
+        nested_roots = _resolve_namespace_mapping_roots(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if nested_roots is not None:
+            return nested_roots
+
+    mapping_name = _resolve_call_name(node)
+    if mapping_name is not None:
+        resolved_mapping_names = _apply_aliases(mapping_name, alias_scopes)
+        if resolved_mapping_names is not None:
+            if mapping_name == "__builtins__" and resolved_mapping_names == frozenset({"__builtins__"}):
+                return frozenset({"builtins"})
+            resolved_mapping_names = _normalize_implicit_builtins_names(resolved_mapping_names, alias_scopes)
+            if resolved_mapping_names is None:
+                return None
+            namespace_roots = frozenset(
+                name.removesuffix(".__dict__") for name in resolved_mapping_names if name.endswith(".__dict__")
+            )
+            if namespace_roots:
+                return namespace_roots
+
+    getattr_names = _resolve_getattr_call_names(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if getattr_names is not None:
+        getattr_names = _normalize_implicit_builtins_names(getattr_names, alias_scopes)
+        if getattr_names is None:
+            return None
+        namespace_roots = frozenset(
+            name.removesuffix(".__dict__") for name in getattr_names if name.endswith(".__dict__")
+        )
+        if namespace_roots:
+            return namespace_roots
+
+    lookup_names = _resolve_namespace_mapping_lookup_names(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if lookup_names is not None:
+        namespace_roots = frozenset(
+            name.removesuffix(".__dict__") for name in lookup_names if name == "builtins" or name.endswith(".__dict__")
+        )
+        if namespace_roots:
+            return namespace_roots
+
+    if not isinstance(node, ast.Call):
         return None
 
-    target_roots = _resolve_global_namespace_mappings(node.value, alias_scopes)
-    if target_roots is None:
-        target_roots = _resolve_global_builtin_namespace_roots(node.value, alias_scopes)
-    if target_roots is None:
+    resolved_helper_names = _resolve_static_reference_names(
+        node.func,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if resolved_helper_names is None or not (resolved_helper_names & {"vars", "builtins.vars"}):
         return None
-    return frozenset(f"{target_root}.{node.attr}" for target_root in target_roots)
+    if len(node.args) != 1 or node.keywords:
+        return None
+
+    target_root = _resolve_call_name(node.args[0])
+    resolved_roots = _apply_aliases(target_root, alias_scopes) if target_root is not None else None
+    if resolved_roots is None:
+        return None
+    return _normalize_implicit_builtins_names(resolved_roots, alias_scopes)
 
 
-def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    global_namespace_mappings = _resolve_global_namespace_mappings(node, alias_scopes)
-    if global_namespace_mappings is not None:
-        return global_namespace_mappings
-    bound_namespace_accessors = _resolve_bound_namespace_accessor_names(node, alias_scopes)
-    if bound_namespace_accessors is not None:
-        return bound_namespace_accessors
+def _resolve_globals_mapping_alias(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    """Resolve statically tracked mappings returned by globals(), locals(), or vars()."""
+    if isinstance(node, ast.Call):
+        if node.args or node.keywords:
+            return None
+        helper_name = _resolve_call_name(node.func)
+        resolved_helpers = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
+        if resolved_helpers is not None and resolved_helpers & {"globals", "builtins.globals"}:
+            return frozenset({_GLOBALS_MAPPING_ALIAS})
+        locals_helpers = {"locals", "builtins.locals", "vars", "builtins.vars"}
+        if resolved_helpers is None or not (resolved_helpers & locals_helpers):
+            return None
+        if allow_module_locals_mapping:
+            return frozenset({_MODULE_LOCALS_MAPPING_ALIAS})
+        if allow_local_namespace_mapping:
+            return frozenset({_LOCAL_NAMESPACE_MAPPING_ALIAS})
+        return None
+
+    reference_name = _resolve_call_name(node)
+    if reference_name is None:
+        return None
+    resolved_names = _apply_aliases(reference_name, alias_scopes)
+    if resolved_names is None:
+        return None
+    namespace_aliases = resolved_names & _TRACKED_MODULE_NAMESPACE_ALIASES
+    return namespace_aliases or None
+
+
+_NAMESPACE_LOOKUP_METHODS = frozenset({"get", "__getitem__", "pop", "setdefault"})
+_NAMESPACE_LOOKUP_METHODS_WITH_DEFAULTS = frozenset({"get", "pop", "setdefault"})
+_NAMESPACE_LOOKUP_DESCRIPTORS = frozenset(
+    f"{prefix}.{method}" for prefix in ("dict", "builtins.dict") for method in _NAMESPACE_LOOKUP_METHODS
+)
+_NAMESPACE_WRITE_METHODS = frozenset({"__setitem__", "setdefault"})
+_NAMESPACE_MUTATION_METHODS = _NAMESPACE_WRITE_METHODS | frozenset({"pop"})
+_NAMESPACE_MUTATION_DESCRIPTORS = frozenset(
+    f"{prefix}.{method}" for prefix in ("dict", "builtins.dict") for method in _NAMESPACE_MUTATION_METHODS
+)
+_NAMESPACE_MAPPING_METHODS = _NAMESPACE_LOOKUP_METHODS | _NAMESPACE_WRITE_METHODS
+
+
+def _resolve_module_namespace_key_names(
+    key: str, alias_scopes: _AliasScopes, *, allow_module_locals_mapping: bool
+) -> tuple[frozenset[str] | None, bool]:
+    """Resolve a literal key selected from the current module namespace."""
+    write_name = f"{_MODULE_NAMESPACE_WRITE_PREFIX}{key}"
+    for scope in reversed(alias_scopes):
+        if write_name in scope:
+            return scope[write_name], True
+    visible_scopes = alias_scopes if allow_module_locals_mapping else alias_scopes[:1]
+    for scope in reversed(visible_scopes):
+        if key not in scope:
+            continue
+        names = scope[key]
+        if key == "__builtins__" and names == frozenset({"__builtins__"}):
+            return frozenset({"builtins", "builtins.__dict__"}), True
+        return names, True
+    if key == "__builtins__":
+        return frozenset({"builtins", "builtins.__dict__"}), True
+    return frozenset({key}), False
+
+
+def _resolve_local_namespace_key_names(key: str, alias_scopes: _AliasScopes) -> tuple[frozenset[str] | None, bool]:
+    current_scope = alias_scopes[-1]
+    if key not in current_scope:
+        return None, False
+    return current_scope[key], True
+
+
+def _resolve_globals_builtins_mapping_roots(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    """Resolve the implicit builtins mapping read from a tracked namespace."""
+    mapping_node: ast.AST
+    key_node: ast.AST
+    if isinstance(node, ast.Subscript):
+        mapping_node = node.value
+        key_node = node.slice
+    elif (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _NAMESPACE_LOOKUP_METHODS
+        and node.args
+        and not node.keywords
+    ):
+        if node.func.attr == "__getitem__" and len(node.args) != 1:
+            return None
+        if node.func.attr in _NAMESPACE_LOOKUP_METHODS_WITH_DEFAULTS and len(node.args) not in {1, 2}:
+            return None
+        mapping_node = node.func.value
+        key_node = node.args[0]
+    else:
+        return None
+
+    if _resolve_static_string(key_node) != "__builtins__":
+        return None
+    mapping_aliases = _resolve_globals_mapping_alias(
+        mapping_node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if mapping_aliases is None:
+        return None
+    if mapping_aliases & {_LOCAL_NAMESPACE_MAPPING_ALIAS}:
+        selected_names, _guaranteed = _resolve_local_namespace_key_names("__builtins__", alias_scopes)
+    elif mapping_aliases & _TRACKED_MODULE_NAMESPACE_ALIASES:
+        selected_names, _guaranteed = _resolve_module_namespace_key_names(
+            "__builtins__", alias_scopes, allow_module_locals_mapping=allow_module_locals_mapping
+        )
+    else:
+        return None
+    if selected_names is None:
+        return None
+    roots = frozenset(name.removesuffix(".__dict__") for name in selected_names if name.endswith(".__dict__"))
+    return roots or None
+
+
+def _resolve_namespace_mapping_lookup_names(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    """Resolve bounded literal callable retrieval from a tracked namespace."""
+    if isinstance(node, ast.Attribute) and node.attr == "__call__":
+        return _resolve_namespace_mapping_lookup_names(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+
+    mapping_node: ast.AST | None = None
+    key_node: ast.AST
+    default_node: ast.AST | None = None
+    resolved_roots: frozenset[str] | None = None
+    lookup_methods: frozenset[str] = frozenset()
+    if isinstance(node, ast.Subscript):
+        mapping_node = node.value
+        key_node = node.slice
+        lookup_methods = frozenset({"__getitem__"})
+    elif (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _NAMESPACE_LOOKUP_METHODS
+        and node.args
+        and not node.keywords
+    ):
+        descriptor_name = _resolve_call_name(node.func)
+        resolved_descriptor_names = (
+            _apply_aliases(descriptor_name, alias_scopes) if descriptor_name is not None else None
+        )
+        is_descriptor = bool(resolved_descriptor_names and resolved_descriptor_names & _NAMESPACE_LOOKUP_DESCRIPTORS)
+        argument_offset = 1 if is_descriptor else 0
+        expected_lengths = {2} if node.func.attr == "__getitem__" and is_descriptor else {1}
+        if node.func.attr in _NAMESPACE_LOOKUP_METHODS_WITH_DEFAULTS:
+            expected_lengths = {2, 3} if is_descriptor else {1, 2}
+        if len(node.args) not in expected_lengths:
+            return None
+        mapping_node = node.args[0] if is_descriptor else node.func.value
+        key_node = node.args[argument_offset]
+        if node.func.attr in _NAMESPACE_LOOKUP_METHODS_WITH_DEFAULTS and len(node.args) == max(expected_lengths):
+            default_node = node.args[argument_offset + 1]
+        lookup_methods = frozenset({node.func.attr})
+    elif isinstance(node, ast.Call) and node.args and not node.keywords:
+        method_name = _resolve_call_name(node.func)
+        resolved_method_names = _apply_aliases(method_name, alias_scopes) if method_name is not None else None
+        normalized_method_names = set()
+        for resolved_method_name in resolved_method_names or ():
+            while resolved_method_name.endswith(".__call__"):
+                resolved_method_name = resolved_method_name.removesuffix(".__call__")
+            normalized_method_names.add(resolved_method_name)
+        getattr_names = _resolve_getattr_call_names(
+            node.func,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        for getattr_name in getattr_names or ():
+            while getattr_name.endswith(".__call__"):
+                getattr_name = getattr_name.removesuffix(".__call__")
+            normalized_method_names.add(getattr_name)
+        descriptor_methods = {
+            method
+            for method in _NAMESPACE_LOOKUP_METHODS
+            if normalized_method_names & {f"dict.{method}", f"builtins.dict.{method}"}
+        }
+        valid_descriptor_methods = {
+            method
+            for method in descriptor_methods
+            if (method == "__getitem__" and len(node.args) == 2)
+            or (method in _NAMESPACE_LOOKUP_METHODS_WITH_DEFAULTS and len(node.args) in {2, 3})
+        }
+        if valid_descriptor_methods:
+            resolved_roots = _resolve_namespace_mapping_roots(
+                node.args[0],
+                alias_scopes,
+                allow_module_locals_mapping=allow_module_locals_mapping,
+                allow_local_namespace_mapping=allow_local_namespace_mapping,
+            )
+            if resolved_roots is None:
+                return None
+            key_node = node.args[1]
+            lookup_methods = frozenset(valid_descriptor_methods)
+            if len(node.args) == 3:
+                default_node = node.args[2]
+        else:
+            resolved_mapping_method_roots = {
+                (method, name.removesuffix(f".__dict__.{method}"))
+                for name in normalized_method_names
+                for method in _NAMESPACE_LOOKUP_METHODS
+                if name.endswith(f".__dict__.{method}")
+            }
+            valid_methods = {
+                method
+                for method, _root in resolved_mapping_method_roots
+                if (method == "__getitem__" and len(node.args) == 1)
+                or (method in _NAMESPACE_LOOKUP_METHODS_WITH_DEFAULTS and len(node.args) in {1, 2})
+            }
+            if not valid_methods:
+                return None
+            resolved_roots = _normalize_implicit_builtins_names(
+                frozenset(root for method, root in resolved_mapping_method_roots if method in valid_methods),
+                alias_scopes,
+            )
+            if not resolved_roots:
+                return None
+            key_node = node.args[0]
+            lookup_methods = frozenset(valid_methods)
+            if len(node.args) == 2:
+                default_node = node.args[1]
+    else:
+        return None
+
+    if resolved_roots is None and mapping_node is not None:
+        resolved_roots = _resolve_namespace_mapping_roots(
+            mapping_node,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+    default_names: frozenset[str] | None = None
+    if default_node is not None and lookup_methods & _NAMESPACE_LOOKUP_METHODS_WITH_DEFAULTS:
+        default_names = _resolve_static_reference_names(
+            default_node,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+    key = _resolve_static_string(key_node)
+    if resolved_roots is None or key is None:
+        return default_names
+    selected_names: set[str] = set()
+    selected_value_guaranteed = bool(resolved_roots)
+    for resolved_root in resolved_roots:
+        if resolved_root in _TRACKED_MODULE_NAMESPACE_ALIASES:
+            namespace_names, guaranteed = _resolve_module_namespace_key_names(
+                key, alias_scopes, allow_module_locals_mapping=allow_module_locals_mapping
+            )
+            if namespace_names is not None:
+                selected_names.update(namespace_names)
+            selected_value_guaranteed = selected_value_guaranteed and guaranteed
+            continue
+        if resolved_root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
+            namespace_names, guaranteed = _resolve_local_namespace_key_names(key, alias_scopes)
+            if namespace_names is not None:
+                selected_names.update(namespace_names)
+            selected_value_guaranteed = selected_value_guaranteed and guaranteed
+            continue
+        member_name = f"{resolved_root}.{key}"
+        member_names, member_is_bound = _lookup_bound_alias(member_name, alias_scopes)
+        if not member_is_bound:
+            member_names = frozenset({member_name})
+        if member_names is not None:
+            selected_names.update(member_names)
+        selected_value_guaranteed = selected_value_guaranteed and member_is_bound
+    resolved_names = frozenset(selected_names)
+    if default_names is not None and not selected_value_guaranteed:
+        resolved_names = resolved_names | default_names
+    return resolved_names
+
+
+def _resolve_static_reference_names(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    if isinstance(node, ast.Attribute) and node.attr == "__call__":
+        callable_names = _resolve_static_reference_names(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if callable_names is not None and any(
+            name.endswith(f".__dict__.{method}") for name in callable_names for method in _NAMESPACE_MAPPING_METHODS
+        ):
+            return frozenset(f"{name}.__call__" for name in callable_names)
+    if isinstance(node, ast.Attribute) and node.attr in _NAMESPACE_MAPPING_METHODS:
+        mapping_method_roots = _resolve_namespace_mapping_roots(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if mapping_method_roots is not None:
+            return frozenset(f"{root}.__dict__.{node.attr}" for root in mapping_method_roots)
     call_name = _resolve_call_name(node)
     if call_name is not None:
-        return _apply_aliases(call_name, alias_scopes)
-    getattr_names = _resolve_getattr_call_names(node, alias_scopes)
+        resolved_names = _apply_aliases(call_name, alias_scopes)
+        if call_name == "__builtins__" and resolved_names == frozenset({"__builtins__"}):
+            return frozenset({"builtins", "builtins.__dict__"})
+        return _normalize_implicit_builtins_names(resolved_names, alias_scopes)
+    getattr_names = _resolve_getattr_call_names(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
     if getattr_names is not None:
-        return getattr_names
-    getattribute_names = _resolve_dunder_getattribute_call_names(node, alias_scopes)
-    if getattribute_names is not None:
-        return getattribute_names
-    namespace_call_names = _resolve_namespace_dict_call_names(node, alias_scopes)
-    if namespace_call_names is not None:
-        return namespace_call_names
-    namespace_roots = _resolve_namespace_dict_roots(node, alias_scopes)
-    return frozenset(f"{namespace_root}.__dict__" for namespace_root in namespace_roots) if namespace_roots else None
-
-
-def _resolve_static_assignment_target_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    """Resolve member targets whose later static call identity can be overwritten."""
-    if isinstance(node, ast.Attribute):
-        return _resolve_static_attribute_names(node.value, ast.Constant(value=node.attr), alias_scopes)
-    if isinstance(node, ast.Subscript):
-        return _resolve_static_reference_names(node, alias_scopes)
+        return _normalize_implicit_builtins_names(getattr_names, alias_scopes)
+    if isinstance(node, ast.Attribute) and node.attr != "__call__":
+        selected_names = _resolve_namespace_mapping_lookup_names(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if selected_names is not None:
+            return frozenset(f"{name}.{node.attr}" for name in selected_names)
+        attribute_roots = _resolve_namespace_mapping_roots(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if attribute_roots is not None:
+            return frozenset(f"{root}.{node.attr}" for root in attribute_roots)
+    mapping_lookup_names = _resolve_namespace_mapping_lookup_names(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if mapping_lookup_names is not None:
+        return mapping_lookup_names
+    mapping_roots = _resolve_namespace_mapping_roots(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if mapping_roots is not None:
+        return frozenset(name for root in mapping_roots for name in (root, f"{root}.__dict__"))
+    globals_mapping_alias = _resolve_globals_mapping_alias(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if globals_mapping_alias is not None:
+        return globals_mapping_alias
     return None
 
 
 def _is_high_risk_python_call_name(name: str) -> bool:
-    return name in _HIGH_RISK_PYTHON_CALLS or (
-        name.startswith("subprocess.") and name not in _KNOWN_NON_EXECUTING_SUBPROCESS_CALLS
-    )
+    return name in _HIGH_RISK_PYTHON_CALLS or name.startswith("subprocess.")
 
 
-def _wildcard_import_aliases(
-    module: str, tracked_call_names: frozenset[str] | None = None
-) -> Iterator[tuple[str, str]]:
+def _wildcard_import_aliases(module: str) -> Iterator[tuple[str, str]]:
     prefix = f"{module}."
-    for call_name in sorted(_HIGH_RISK_PYTHON_CALLS if tracked_call_names is None else tracked_call_names):
+    for call_name in sorted(_HIGH_RISK_PYTHON_CALLS):
         if not call_name.startswith(prefix):
             continue
         exported_name = call_name.removeprefix(prefix).split(".", maxsplit=1)[0]
+        if module == "asyncio" and exported_name == "subprocess":
+            continue
         yield exported_name, f"{module}.{exported_name}"
 
 
@@ -753,260 +1094,84 @@ def _binding_names(target: ast.AST) -> Iterator[str]:
 
 
 class _HighRiskPythonCallVisitor(ast.NodeVisitor):
-    def __init__(self, tracked_call_names: frozenset[str] | None = None) -> None:
+    def __init__(self) -> None:
         self.alias_scopes: _AliasScopes = [{}]
         self._class_scope_ids: set[int] = set()
+        self._comprehension_outer_scope_indices: list[int] = []
+        self._call_result_aliases: dict[int, _AliasValue] = {}
+        self._non_module_scope_depth = 0
         self.risky_calls: set[str] = set()
-        self.tracked_call_names = tracked_call_names
 
-    def _bind_import_name(self, local_name: str, import_name: str) -> None:
-        effective_names = self._effective_reference_names(frozenset({import_name}))
-        self._bind_name(local_name, self._capture_callable_names(effective_names))
+    def _resolve_reference_names(self, node: ast.AST) -> frozenset[str] | None:
+        return _resolve_static_reference_names(
+            node,
+            self.alias_scopes,
+            allow_module_locals_mapping=self._non_module_scope_depth == 0,
+            allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+        )
 
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
-        self._bind_import_name(alias.asname or alias.name, import_name)
+        self.alias_scopes[-1][alias.asname or alias.name] = frozenset({import_name})
 
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
         self.alias_scopes[-1][name] = resolved_names
-        if not name.startswith("<"):
-            self.alias_scopes[-1][self._static_uncertain_binding_key(name)] = frozenset()
-            if self._lookup_static_mapping_mutation_alias(name) is not None:
-                self.alias_scopes[-1][self._static_mapping_mutation_alias_key(name)] = None
 
-    @staticmethod
-    def _static_reference_override_key(reference_name: str) -> str:
-        return f"{_STATIC_REFERENCE_OVERRIDE_PREFIX}{reference_name}"
+    def _bind_name_in_scope(self, scope_index: int, name: str, resolved_names: _AliasValue) -> None:
+        self.alias_scopes[scope_index][name] = resolved_names
 
-    @staticmethod
-    def _static_cleared_namespace_key(namespace_root: str) -> str:
-        return f"{_STATIC_CLEARED_NAMESPACE_PREFIX}{namespace_root}"
+    def _bind_module_namespace_key(self, key: str, resolved_names: _AliasValue) -> None:
+        self._bind_name(f"{_MODULE_NAMESPACE_WRITE_PREFIX}{key}", resolved_names)
+        if self._non_module_scope_depth == 0:
+            self._bind_name(key, resolved_names)
 
-    @staticmethod
-    def _static_mapping_mutation_alias_key(name: str) -> str:
-        return f"{_STATIC_MAPPING_MUTATION_ALIAS_PREFIX}{name}"
-
-    @staticmethod
-    def _static_uncertain_binding_key(name: str) -> str:
-        return f"{_STATIC_UNCERTAIN_BINDING_PREFIX}{name}"
-
-    def _lookup_static_reference_override(self, reference_name: str) -> _AliasValue:
-        override_key = self._static_reference_override_key(reference_name)
-        for aliases in reversed(self.alias_scopes):
-            if override_key in aliases:
-                return aliases[override_key]
-            for key, value in aliases.items():
-                if (
-                    key.startswith(_STATIC_CLEARED_NAMESPACE_PREFIX)
-                    and value is None
-                    and reference_name.startswith(f"{key.removeprefix(_STATIC_CLEARED_NAMESPACE_PREFIX)}.")
-                ):
-                    return None
-        return frozenset({reference_name})
-
-    def _lookup_static_mapping_mutation_alias(self, name: str) -> _AliasValue:
-        alias_key = self._static_mapping_mutation_alias_key(name)
-        for aliases in reversed(self.alias_scopes):
-            if alias_key in aliases:
-                return aliases[alias_key]
-        return None
-
-    def _resolve_certain_static_mapping_mutator_names(self, node: ast.AST) -> frozenset[str] | None:
-        mutator_names = _resolve_static_mapping_mutator_names(node, self.alias_scopes)
-        if mutator_names is not None:
-            return mutator_names
-        if isinstance(node, ast.Name):
-            return self._lookup_static_mapping_mutation_alias(node.id)
-        return None
-
-    def _is_tracked_call_name(self, name: str) -> bool:
-        return (
-            name in self.tracked_call_names
-            if self.tracked_call_names is not None
-            else _is_high_risk_python_call_name(name)
-        )
-
-    @staticmethod
-    def _captured_callable_reference_name(name: str) -> str:
-        return f"{_CAPTURED_CALLABLE_REFERENCE_PREFIX}{name}"
-
-    def _capture_callable_names(self, resolved_names: _AliasValue) -> _AliasValue:
-        if resolved_names is None:
+    def _resolve_binding_value_names(self, value: ast.AST | None) -> _AliasValue:
+        if value is None:
             return None
-        return frozenset(
-            self._captured_callable_reference_name(name) if self._is_tracked_call_name(name) else name
-            for name in resolved_names
-        )
+        if isinstance(value, ast.Call) and id(value) in self._call_result_aliases:
+            return self._call_result_aliases[id(value)]
+        value_name = _resolve_call_name(value)
+        if value_name is not None and _is_high_risk_python_call_name(value_name):
+            return frozenset({value_name})
+        return self._resolve_reference_names(value)
 
-    def _effective_reference_names(self, resolved_names: frozenset[str]) -> frozenset[str] | None:
-        effective_names: set[str] = set()
-        for resolved_name in resolved_names:
-            if resolved_name.startswith(_CAPTURED_CALLABLE_REFERENCE_PREFIX):
-                effective_names.add(resolved_name.removeprefix(_CAPTURED_CALLABLE_REFERENCE_PREFIX))
-                continue
-            override_names = self._lookup_static_reference_override(resolved_name)
-            if override_names is not None:
-                effective_names.update(
-                    override_name.removeprefix(_CAPTURED_CALLABLE_REFERENCE_PREFIX)
-                    if override_name.startswith(_CAPTURED_CALLABLE_REFERENCE_PREFIX)
-                    else override_name
-                    for override_name in override_names
-                )
-        return frozenset(effective_names) if effective_names else None
+    def _push_alias_scope(self, scope: _AliasScope | None = None) -> None:
+        self.alias_scopes.append(scope if scope is not None else {})
 
-    @staticmethod
-    def _invoked_callable_reference_name(name: str) -> str:
-        while name.endswith(".__call__"):
-            name = name.removesuffix(".__call__")
-        return name
-
-    def _resolve_invoked_reference_names(self, node: ast.AST) -> frozenset[str] | None:
-        resolved_names = _resolve_static_reference_names(node, self.alias_scopes)
-        if resolved_names is None:
-            return None
-        callable_names = frozenset(self._invoked_callable_reference_name(name) for name in resolved_names)
-        return self._effective_reference_names(callable_names)
-
-    def _resolve_bound_value_names(self, node: ast.AST) -> _AliasValue:
-        return self._capture_callable_names(self._resolve_invoked_reference_names(node))
-
-    def _bind_static_reference_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
-        if _has_uncertain_static_binding(target, self.alias_scopes):
-            return
-        target_names = _resolve_static_assignment_target_names(target, self.alias_scopes)
-        if target_names is None:
-            return
-
-        self._bind_static_reference_names_to_value(target_names, value)
-
-    def _bind_static_reference_names_to_value(self, target_names: frozenset[str], value: ast.AST) -> None:
-        resolved_value_names = self._resolve_bound_value_names(value)
-        for target_name in target_names:
-            self._bind_name(self._static_reference_override_key(target_name), resolved_value_names)
-
-    def _bind_static_reference_names_as_removed(self, target_names: frozenset[str]) -> None:
-        for target_name in target_names:
-            self._bind_name(self._static_reference_override_key(target_name), None)
-
-    def _bind_static_namespace_roots_as_cleared(self, namespace_roots: frozenset[str]) -> None:
-        current_scope = self.alias_scopes[-1]
-        for namespace_root in namespace_roots:
-            reference_prefix = f"{_STATIC_REFERENCE_OVERRIDE_PREFIX}{namespace_root}."
-            for key in list(current_scope):
-                if key.startswith(reference_prefix):
-                    del current_scope[key]
-            self._bind_name(self._static_cleared_namespace_key(namespace_root), None)
-
-    def _bind_static_reference_target_as_removed(self, target: ast.AST) -> None:
-        if _has_uncertain_static_binding(target, self.alias_scopes):
-            return
-        target_names = _resolve_static_assignment_target_names(target, self.alias_scopes)
-        if target_names is not None:
-            self._bind_static_reference_names_as_removed(target_names)
-
-    def _bind_static_mapping_mutation(self, node: ast.Call, *, model_discarded_removals: bool = False) -> None:
-        """Model unconditional writes through one certain namespace mapping."""
-        if node.keywords:
-            return
-
-        mutator_names = self._resolve_certain_static_mapping_mutator_names(node.func)
-        mutation_args = node.args
-        if mutator_names is not None:
-            methods = {mutator_name.rsplit(".", maxsplit=1)[1] for mutator_name in mutator_names}
-            if len(methods) != 1:
-                return
-            method = next(iter(methods))
-            target_roots = frozenset(mutator_name.rsplit(".", maxsplit=1)[0] for mutator_name in mutator_names)
-        else:
-            if _has_uncertain_static_binding(node.func, self.alias_scopes) or not node.args:
-                return
-            helper_names = self._resolve_invoked_reference_names(node.func)
-            if helper_names is None:
-                return
-            helper_methods = {_STATIC_MAPPING_FUNCTION_MUTATORS.get(helper_name) for helper_name in helper_names}
-            if None in helper_methods or len(helper_methods) != 1:
-                return
-            method = next(helper_method for helper_method in helper_methods if helper_method is not None)
-            resolved_target_roots = _resolve_certain_namespace_mutation_roots(node.args[0], self.alias_scopes)
-            if resolved_target_roots is None:
-                return
-            target_roots = resolved_target_roots
-            mutation_args = node.args[1:]
-
-        mutations: list[tuple[frozenset[str], ast.AST | None]] = []
-        if method == "__setitem__":
-            if len(mutation_args) != 2:
-                return
-            attr_name = _resolve_static_string(mutation_args[0])
-            if attr_name is None:
-                return
-            mutations.append(
-                (frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), mutation_args[1])
-            )
-        elif method == "__delitem__":
-            if len(mutation_args) != 1:
-                return
-            attr_name = _resolve_static_string(mutation_args[0])
-            if attr_name is None:
-                return
-            mutations.append((frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), None))
-        elif method == "clear":
-            if mutation_args:
-                return
-            self._bind_static_namespace_roots_as_cleared(target_roots)
-            return
-        elif method == "update":
-            if len(mutation_args) != 1 or not isinstance(mutation_args[0], ast.Dict):
-                return
-            for attr_name_node, value_node in zip(mutation_args[0].keys, mutation_args[0].values, strict=True):
-                if attr_name_node is None:
-                    return
-                attr_name = _resolve_static_string(attr_name_node)
-                if attr_name is None:
-                    return
-                mutations.append((frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), value_node))
-        elif method == "pop":
-            if not model_discarded_removals or len(mutation_args) not in {1, 2}:
-                return
-            attr_name = _resolve_static_string(mutation_args[0])
-            if attr_name is None:
-                return
-            mutations.append((frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), None))
-        else:
-            return
-
-        for target_names, value in mutations:
-            if value is None:
-                self._bind_static_reference_names_as_removed(target_names)
-            else:
-                self._bind_static_reference_names_to_value(target_names, value)
-
-    def _bind_static_setattr_mutation(self, node: ast.Call) -> None:
-        """Model certain builtin ``setattr`` writes to one resolved reference."""
-        if len(node.args) != 3 or node.keywords:
-            return
-        if _has_uncertain_static_binding(node.args[0], self.alias_scopes):
-            return
-
-        helper_names = self._resolve_invoked_reference_names(node.func)
-        if helper_names is None or not helper_names.issubset(_STATIC_ATTRIBUTE_MUTATION_HELPERS):
-            return
-
-        target_names = _resolve_static_attribute_names(node.args[0], node.args[1], self.alias_scopes)
-        if target_names is None or len(target_names) != 1:
-            return
-        self._bind_static_reference_names_to_value(target_names, node.args[2])
+    def _pop_alias_scope(self) -> None:
+        self.alias_scopes.pop()
 
     def _bind_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         if isinstance(target, ast.Name):
-            value_binding_is_uncertain = _has_uncertain_static_binding(value, self.alias_scopes)
-            self._bind_name(target.id, self._resolve_bound_value_names(value))
-            if value_binding_is_uncertain:
-                self.alias_scopes[-1][self._static_uncertain_binding_key(target.id)] = None
-            mutator_names = self._resolve_certain_static_mapping_mutator_names(value)
-            if mutator_names is not None:
-                self._bind_name(self._static_mapping_mutation_alias_key(target.id), mutator_names)
-        elif isinstance(target, (ast.Attribute, ast.Subscript)):
-            self._bind_static_reference_target_to_value(target, value)
+            self._bind_name(target.id, self._resolve_binding_value_names(value))
+        elif isinstance(target, ast.Subscript):
+            key = _resolve_static_string(target.slice)
+            roots = _resolve_namespace_mapping_roots(
+                target.value,
+                self.alias_scopes,
+                allow_module_locals_mapping=self._non_module_scope_depth == 0,
+                allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+            )
+            if key is not None and roots is not None:
+                resolved_value = self._resolve_binding_value_names(value)
+                for root in roots:
+                    if root in _TRACKED_MODULE_NAMESPACE_ALIASES:
+                        self._bind_module_namespace_key(key, resolved_value)
+                        continue
+                    if root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
+                        self._bind_name(key, resolved_value)
+                        continue
+                    self._bind_name(f"{root}.{key}", resolved_value)
+        elif isinstance(target, ast.Attribute):
+            resolved_target_names = self._resolve_reference_names(target)
+            if resolved_target_names is None:
+                return
+            resolved_value = self._resolve_binding_value_names(value)
+            syntactic_name = _resolve_call_name(target)
+            for target_name in resolved_target_names:
+                if target_name in _RUNPY_CODE_EXECUTION_CALLS:
+                    self._bind_name(target_name, resolved_value)
+                    if syntactic_name is not None:
+                        self._bind_name(syntactic_name, resolved_value)
         elif isinstance(target, ast.Starred):
             # Starred unpacking (``a, *b = seq``) binds ``b`` to a list slice,
             # which is not a single static reference; drop the binding so we
@@ -1020,34 +1185,182 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 for name in _binding_names(target):
                     self._bind_name(name, None)
 
+    def _resolve_namespace_write_call(self, node: ast.Call) -> tuple[str, frozenset[str], str, ast.AST | None] | None:
+        if node.keywords:
+            return None
+
+        method_name: str
+        mapping_node: ast.AST
+        key_node: ast.AST
+        value_node: ast.AST | None
+        if isinstance(node.func, ast.Attribute) and node.func.attr in _NAMESPACE_MUTATION_METHODS:
+            descriptor_name = _resolve_call_name(node.func)
+            resolved_descriptor_names = (
+                _apply_aliases(descriptor_name, self.alias_scopes) if descriptor_name is not None else None
+            )
+            is_descriptor = bool(
+                resolved_descriptor_names and resolved_descriptor_names & _NAMESPACE_MUTATION_DESCRIPTORS
+            )
+            method_name = node.func.attr
+            argument_offset = 1 if is_descriptor else 0
+            if method_name == "__setitem__":
+                expected_arg_counts = {3} if is_descriptor else {2}
+            else:
+                expected_arg_counts = {2, 3} if is_descriptor else {1, 2}
+            if len(node.args) not in expected_arg_counts:
+                return None
+            mapping_node = node.args[0] if is_descriptor else node.func.value
+            key_node = node.args[argument_offset]
+            value_node = (
+                node.args[argument_offset + 1]
+                if method_name in _NAMESPACE_WRITE_METHODS and len(node.args) > argument_offset + 1
+                else None
+            )
+        else:
+            return None
+
+        roots = _resolve_namespace_mapping_roots(
+            mapping_node,
+            self.alias_scopes,
+            allow_module_locals_mapping=self._non_module_scope_depth == 0,
+            allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+        )
+        key = _resolve_static_string(key_node)
+        if roots is None or key is None:
+            return None
+        return method_name, roots, key, value_node
+
+    @staticmethod
+    def _merge_alias_values(*values: _AliasValue) -> _AliasValue:
+        concrete = frozenset(alias for value in values if isinstance(value, frozenset) for alias in value)
+        if concrete:
+            return concrete
+        if any(value is None for value in values):
+            return None
+        return frozenset()
+
+    def _setdefault_value_for_key(self, root: str, key: str, default_names: _AliasValue) -> _AliasValue:
+        if root in _TRACKED_MODULE_NAMESPACE_ALIASES:
+            existing_names, guaranteed = _resolve_module_namespace_key_names(
+                key,
+                self.alias_scopes,
+                allow_module_locals_mapping=self._non_module_scope_depth == 0,
+            )
+            if guaranteed:
+                return existing_names
+            return self._merge_alias_values(existing_names, default_names)
+        if root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
+            existing_names, guaranteed = _resolve_local_namespace_key_names(key, self.alias_scopes)
+            if guaranteed:
+                return existing_names
+            return self._merge_alias_values(default_names)
+
+        member_name = f"{root}.{key}"
+        existing_names, guaranteed = _lookup_bound_alias(member_name, self.alias_scopes)
+        if guaranteed:
+            return existing_names
+        return self._merge_alias_values(frozenset({member_name}), default_names)
+
+    def _delete_module_namespace_key(self, key: str) -> None:
+        write_name = f"{_MODULE_NAMESPACE_WRITE_PREFIX}{key}"
+        for scope in self.alias_scopes:
+            scope.pop(write_name, None)
+        self.alias_scopes[0].pop(key, None)
+        if self._non_module_scope_depth == 0:
+            for scope in self.alias_scopes[1:]:
+                scope.pop(key, None)
+
+    def _delete_namespace_key(self, root: str, key: str) -> None:
+        if root in _TRACKED_MODULE_NAMESPACE_ALIASES:
+            self._delete_module_namespace_key(key)
+            return
+        if root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
+            self.alias_scopes[-1].pop(key, None)
+            return
+        dotted_name = f"{root}.{key}"
+        for scope in self.alias_scopes:
+            scope.pop(dotted_name, None)
+
+    def _record_namespace_write_call(self, node: ast.Call) -> None:
+        write_call = self._resolve_namespace_write_call(node)
+        if write_call is None:
+            return
+
+        method_name, roots, key, value_node = write_call
+        if method_name == "pop":
+            for root in roots:
+                self._delete_namespace_key(root, key)
+            return
+
+        value_names = self._resolve_binding_value_names(value_node) if value_node is not None else None
+        for root in roots:
+            resolved_value = (
+                self._setdefault_value_for_key(root, key, value_names) if method_name == "setdefault" else value_names
+            )
+            if root in _TRACKED_MODULE_NAMESPACE_ALIASES:
+                self._bind_module_namespace_key(key, resolved_value)
+                continue
+            if root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
+                self._bind_name(key, resolved_value)
+                continue
+            self._bind_name(f"{root}.{key}", resolved_value)
+
     def _shadow_binding_target(self, target: ast.AST) -> None:
         for name in _binding_names(target):
             self._bind_name(name, None)
 
+    def _resolve_target_bindings(self, target: ast.AST, value: ast.AST) -> _AliasScope:
+        if isinstance(target, ast.Name):
+            return {target.id: self._resolve_binding_value_names(value)}
+        if (
+            isinstance(target, (ast.Tuple, ast.List))
+            and isinstance(value, (ast.Tuple, ast.List))
+            and len(target.elts) == len(value.elts)
+        ):
+            bindings: _AliasScope = {}
+            for target_element, value_element in zip(target.elts, value.elts, strict=True):
+                bindings.update(self._resolve_target_bindings(target_element, value_element))
+            return bindings
+        return dict.fromkeys(_binding_names(target), None)
+
+    def _bind_comprehension_target(self, target: ast.AST, iterable: ast.AST) -> None:
+        if not isinstance(iterable, (ast.Tuple, ast.List, ast.Set)):
+            self._shadow_binding_target(target)
+            return
+        candidate_bindings = [self._resolve_target_bindings(target, element) for element in iterable.elts]
+        for name in _binding_names(target):
+            resolved_names = frozenset(
+                alias for bindings in candidate_bindings for alias in (bindings.get(name) or frozenset())
+            )
+            self._bind_name(name, resolved_names or None)
+
     def _bind_arguments(self, arguments: ast.arguments) -> None:
         positional_args = [*arguments.posonlyargs, *arguments.args]
         positional_default_start = len(positional_args) - len(arguments.defaults)
+        resolved_bindings: list[tuple[str, _AliasValue]] = []
         for index, arg in enumerate(positional_args):
             default = (
                 arguments.defaults[index - positional_default_start] if index >= positional_default_start else None
             )
-            self._bind_name(
-                arg.arg,
-                self._resolve_bound_value_names(default) if default is not None else None,
+            resolved_bindings.append(
+                (
+                    arg.arg,
+                    self._resolve_binding_value_names(default) if default is not None else None,
+                )
             )
-            self.alias_scopes[-1][self._static_uncertain_binding_key(arg.arg)] = None
         for arg, default in zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True):
-            self._bind_name(
-                arg.arg,
-                self._resolve_bound_value_names(default) if default is not None else None,
+            resolved_bindings.append(
+                (
+                    arg.arg,
+                    self._resolve_binding_value_names(default) if default is not None else None,
+                )
             )
-            self.alias_scopes[-1][self._static_uncertain_binding_key(arg.arg)] = None
+        for name, resolved_names in resolved_bindings:
+            self._bind_name(name, resolved_names)
         if arguments.vararg is not None:
             self._bind_name(arguments.vararg.arg, None)
-            self.alias_scopes[-1][self._static_uncertain_binding_key(arguments.vararg.arg)] = None
         if arguments.kwarg is not None:
             self._bind_name(arguments.kwarg.arg, None)
-            self.alias_scopes[-1][self._static_uncertain_binding_key(arguments.kwarg.arg)] = None
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -1058,23 +1371,23 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             return
         for alias in node.names:
             if alias.name == "*":
-                for local_name, import_name in _wildcard_import_aliases(node.module, self.tracked_call_names):
-                    self._bind_import_name(local_name, import_name)
+                for local_name, import_name in _wildcard_import_aliases(node.module):
+                    self._bind_name(local_name, frozenset({import_name}))
                 continue
             self._record_import(alias, f"{node.module}.{alias.name}")
 
     def _visit_child_scope(self, body: list[ast.stmt]) -> None:
-        self.alias_scopes.append({})
+        self._push_alias_scope()
         try:
             for statement in body:
                 self.visit(statement)
         finally:
-            self.alias_scopes.pop()
+            self._pop_alias_scope()
 
     def _visit_conditional_branch(self, body: list[ast.stmt]) -> _AliasScope:
         branch_scope: _AliasScope = {}
         parent_is_class_scope = id(self.alias_scopes[-1]) in self._class_scope_ids
-        self.alias_scopes.append(branch_scope)
+        self._push_alias_scope(branch_scope)
         if parent_is_class_scope:
             self._class_scope_ids.add(id(branch_scope))
         try:
@@ -1084,7 +1397,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         finally:
             if parent_is_class_scope:
                 self._class_scope_ids.discard(id(branch_scope))
-            self.alias_scopes.pop()
+            self._pop_alias_scope()
 
     @staticmethod
     def _constant_bool(node: ast.AST) -> bool | None:
@@ -1106,46 +1419,23 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         current_scope = self.alias_scopes[-1]
         branch_names = {name for scope in branch_scopes for name in scope}
         for name in branch_names:
-            if name.startswith(_STATIC_UNCERTAIN_BINDING_PREFIX):
-                uncertainty_base_value = current_scope.get(name, frozenset())
-                uncertainty_values = [scope.get(name, uncertainty_base_value) for scope in branch_scopes]
-                current_scope[name] = (
-                    None
-                    if current_scope.get(name) is None or any(value is None for value in uncertainty_values)
-                    else frozenset()
+            implicit_builtins = name == "__builtins__" and len(self.alias_scopes) == 1
+            if name.startswith(_MODULE_NAMESPACE_WRITE_PREFIX):
+                key = name.removeprefix(_MODULE_NAMESPACE_WRITE_PREFIX)
+                base_value, _guaranteed = _resolve_module_namespace_key_names(
+                    key,
+                    self.alias_scopes,
+                    allow_module_locals_mapping=self._non_module_scope_depth == 0,
                 )
-                continue
-            if name.startswith(_STATIC_MAPPING_MUTATION_ALIAS_PREFIX):
-                certainty_base_value: _AliasValue | object = current_scope.get(name, _MISSING_ALIAS)
-                certainty_values = [scope.get(name, certainty_base_value) for scope in branch_scopes]
-                first_value = certainty_values[0]
-                current_scope[name] = (
-                    first_value
-                    if isinstance(first_value, frozenset) and all(value == first_value for value in certainty_values)
-                    else None
-                )
-                continue
-            if name.startswith(_STATIC_CLEARED_NAMESPACE_PREFIX):
-                cleared_base_value = current_scope.get(name, frozenset())
-                cleared_values = [scope.get(name, cleared_base_value) for scope in branch_scopes]
-                current_scope[name] = None if all(value is None for value in cleared_values) else frozenset()
-                continue
-            base_value: _AliasValue | object
-            if name.startswith(_STATIC_REFERENCE_OVERRIDE_PREFIX):
-                base_value = self._lookup_static_reference_override(
-                    name.removeprefix(_STATIC_REFERENCE_OVERRIDE_PREFIX)
-                )
+            elif name in _RUNPY_CODE_EXECUTION_CALLS:
+                base_value = frozenset({name})
             else:
-                base_value = current_scope.get(name, _MISSING_ALIAS)
-            branch_values = [scope.get(name, base_value) for scope in branch_scopes]
-            if not name.startswith("<") and any(value != branch_values[0] for value in branch_values[1:]):
-                current_scope[self._static_uncertain_binding_key(name)] = None
-            concrete_aliases = frozenset(
-                alias for value in branch_values if isinstance(value, frozenset) for alias in value
-            )
+                base_value = current_scope.get(name, frozenset({name}) if implicit_builtins else None)
+            values = [scope.get(name, base_value) for scope in branch_scopes]
+            concrete_aliases = frozenset(alias for value in values if isinstance(value, frozenset) for alias in value)
             if concrete_aliases:
                 current_scope[name] = concrete_aliases
-            elif any(value is None for value in branch_values):
+            elif any(value is None for value in values):
                 current_scope[name] = None
 
     def _visit_child_scope_without_class_locals(self, body: list[ast.stmt]) -> None:
@@ -1159,14 +1449,22 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _visit_class_scope(self, body: list[ast.stmt]) -> None:
         class_scope: _AliasScope = {}
-        self.alias_scopes.append(class_scope)
+        self._push_alias_scope(class_scope)
         self._class_scope_ids.add(id(class_scope))
+        self._non_module_scope_depth += 1
         try:
             for statement in body:
                 self.visit(statement)
         finally:
+            self._non_module_scope_depth -= 1
             self._class_scope_ids.discard(id(class_scope))
-            self.alias_scopes.pop()
+            self._pop_alias_scope()
+        for name, value in class_scope.items():
+            if name.startswith(_MODULE_NAMESPACE_WRITE_PREFIX):
+                self._bind_name(name, value)
+                self._bind_name(name.removeprefix(_MODULE_NAMESPACE_WRITE_PREFIX), value)
+            elif "." in name:
+                self._bind_name(name, value)
 
     def _visit_function_scope(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         for decorator in node.decorator_list:
@@ -1176,12 +1474,16 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 self.visit(default)
         if node.returns is not None:
             self.visit(node.returns)
-        self.alias_scopes.append({})
+        self._push_alias_scope()
         try:
             self._bind_arguments(node.args)
-            self._visit_child_scope_without_class_locals(node.body)
+            self._non_module_scope_depth += 1
+            try:
+                self._visit_child_scope_without_class_locals(node.body)
+            finally:
+                self._non_module_scope_depth -= 1
         finally:
-            self.alias_scopes.pop()
+            self._pop_alias_scope()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._visit_function_scope(node)
@@ -1205,18 +1507,63 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for default in [*node.args.defaults, *node.args.kw_defaults]:
             if default is not None:
                 self.visit(default)
-        self.alias_scopes.append({})
+        self._push_alias_scope()
         try:
             self._bind_arguments(node.args)
-            self.visit(node.body)
+            self._non_module_scope_depth += 1
+            try:
+                self.visit(node.body)
+            finally:
+                self._non_module_scope_depth -= 1
         finally:
-            self.alias_scopes.pop()
+            self._pop_alias_scope()
+
+    def _visit_comprehension(
+        self, generators: list[ast.comprehension], result_nodes: list[ast.AST], *, inline_module_scope: bool
+    ) -> None:
+        if not generators:
+            return
+        self.visit(generators[0].iter)
+        outer_scope_index = len(self.alias_scopes) - 1
+        self._push_alias_scope()
+        self._comprehension_outer_scope_indices.append(outer_scope_index)
+        has_module_locals = inline_module_scope and self._non_module_scope_depth == 0
+        if not has_module_locals:
+            self._non_module_scope_depth += 1
+        try:
+            first_generator, *remaining_generators = generators
+            self._bind_comprehension_target(first_generator.target, first_generator.iter)
+            self.visit(first_generator.target)
+            for condition in first_generator.ifs:
+                self.visit(condition)
+            for generator in remaining_generators:
+                self.visit(generator.iter)
+                self._bind_comprehension_target(generator.target, generator.iter)
+                self.visit(generator.target)
+                for condition in generator.ifs:
+                    self.visit(condition)
+            for result_node in result_nodes:
+                self.visit(result_node)
+        finally:
+            if not has_module_locals:
+                self._non_module_scope_depth -= 1
+            self._comprehension_outer_scope_indices.pop()
+            self._pop_alias_scope()
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node.generators, [node.elt], inline_module_scope=False)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node.generators, [node.elt], inline_module_scope=False)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node.generators, [node.elt], inline_module_scope=False)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node.generators, [node.key, node.value], inline_module_scope=False)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
-        if isinstance(node.value, ast.Call):
-            self._bind_static_mapping_mutation(node.value)
-            self._bind_static_setattr_mutation(node.value)
         for target in node.targets:
             self._bind_target_to_value(target, node.value)
             self.visit(target)
@@ -1226,9 +1573,6 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self.visit(node.annotation)
         if node.value is not None:
             self.visit(node.value)
-            if isinstance(node.value, ast.Call):
-                self._bind_static_mapping_mutation(node.value)
-                self._bind_static_setattr_mutation(node.value)
             self._bind_target_to_value(node.target, node.value)
         else:
             self._shadow_binding_target(node.target)
@@ -1241,19 +1585,15 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
-        self._bind_target_to_value(node.target, node.value)
+        if isinstance(node.target, ast.Name) and self._comprehension_outer_scope_indices:
+            self._bind_name_in_scope(
+                self._comprehension_outer_scope_indices[-1],
+                node.target.id,
+                self._resolve_binding_value_names(node.value),
+            )
+        else:
+            self._bind_target_to_value(node.target, node.value)
         self.visit(node.target)
-
-    def visit_Delete(self, node: ast.Delete) -> None:
-        for target in node.targets:
-            self._bind_static_reference_target_as_removed(target)
-            self.visit(target)
-
-    def visit_Expr(self, node: ast.Expr) -> None:
-        self.visit(node.value)
-        if isinstance(node.value, ast.Call):
-            self._bind_static_mapping_mutation(node.value, model_discarded_removals=True)
-            self._bind_static_setattr_mutation(node.value)
 
     def _visit_loop(self, node: ast.For | ast.AsyncFor) -> None:
         self.visit(node.iter)
@@ -1264,7 +1604,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             return
 
         body_scope: _AliasScope = {}
-        self.alias_scopes.append(body_scope)
+        self._push_alias_scope(body_scope)
         try:
             self._shadow_binding_target(node.target)
             self.visit(node.target)
@@ -1272,7 +1612,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 self.visit(statement)
             body_scope = dict(body_scope)
         finally:
-            self.alias_scopes.pop()
+            self._pop_alias_scope()
         branch_scopes = [body_scope]
         if iter_truth is not True:
             branch_scopes.append({})
@@ -1323,7 +1663,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if handler.type is not None:
                 self.visit(handler.type)
             branch_scope: _AliasScope = {}
-            self.alias_scopes.append(branch_scope)
+            self._push_alias_scope(branch_scope)
             try:
                 if handler.name is not None:
                     self._bind_name(handler.name, None)
@@ -1331,7 +1671,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     self.visit(statement)
                 branch_scope = dict(branch_scope)
             finally:
-                self.alias_scopes.pop()
+                self._pop_alias_scope()
             branch_scopes.append(branch_scope)
         self._merge_conditional_branch_scopes(branch_scopes)
         for statement in node.finalbody:
@@ -1361,23 +1701,40 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self.visit(statement)
 
     def visit_Call(self, node: ast.Call) -> None:
-        resolved_names = self._resolve_invoked_reference_names(node.func)
-        if resolved_names is not None and self._resolve_certain_static_mapping_mutator_names(node.func) is None:
+        call_result_names = self._resolve_reference_names(node)
+        if call_result_names is not None:
+            self._call_result_aliases[id(node)] = call_result_names
+
+        direct_call_name = _resolve_call_name(node.func)
+        direct_call_head = direct_call_name.split(".", maxsplit=1)[0] if direct_call_name is not None else None
+        direct_head_names = (
+            _resolve_aliases(direct_call_head, self.alias_scopes) if direct_call_head is not None else None
+        )
+        direct_call_shadowed = (
+            direct_call_name is not None
+            and direct_call_name in _RUNPY_CODE_EXECUTION_CALLS
+            and _lookup_bound_alias(direct_call_name, self.alias_scopes)[1]
+        )
+        if (
+            direct_call_name is not None
+            and _is_high_risk_python_call_name(direct_call_name)
+            and direct_head_names == frozenset({direct_call_head})
+            and not direct_call_shadowed
+        ):
+            self.risky_calls.add(direct_call_name)
+        else:
+            resolved_names = self._resolve_reference_names(node.func)
+            if resolved_names is None:
+                resolved_names = frozenset()
             for resolved_name in resolved_names:
-                if self._is_tracked_call_name(resolved_name):
+                if _is_high_risk_python_call_name(resolved_name):
                     self.risky_calls.add(resolved_name)
+        self._record_namespace_write_call(node)
         self.generic_visit(node)
 
 
-def statically_resolved_python_call_names_in_tree(tree: ast.AST, tracked_call_names: frozenset[str]) -> set[str]:
-    """Return caller-selected static call targets resolved from an AST."""
-    visitor = _HighRiskPythonCallVisitor(tracked_call_names)
-    visitor.visit(tree)
-    return visitor.risky_calls
-
-
 def high_risk_python_calls_in_tree(tree: ast.AST) -> set[HighRiskPythonCall]:
-    """Return the set of high-risk Python calls resolvable from an AST."""
+    """Return high-risk calls resolvable from an already parsed Python tree."""
     visitor = _HighRiskPythonCallVisitor()
     visitor.visit(tree)
     return {
@@ -1407,30 +1764,69 @@ _PYTHON_MEMBER_CHECK_NAME = "Python Archive Member Security"
 _EXECUTABLE_MEMBER_CHECK_NAME = "Executable Archive Member Detection"
 
 
+def _add_executable_archive_member_check(
+    *,
+    archive_kind: str,
+    archive_path: str,
+    member_name: str,
+    result: ScanResult,
+) -> None:
+    result.add_check(
+        name=_EXECUTABLE_MEMBER_CHECK_NAME,
+        passed=False,
+        message=f"Executable file found in {archive_kind} archive: {member_name}",
+        severity=IssueSeverity.WARNING,
+        location=f"{archive_path}:{member_name}",
+        details={"entry": member_name},
+    )
+
+
+def _add_incomplete_executable_archive_member_check(
+    *,
+    archive_kind: str,
+    archive_path: str,
+    member_name: str,
+    result: ScanResult,
+    incomplete_reason: str,
+) -> None:
+    mark_archive_scan_incomplete(result, incomplete_reason)
+    result.add_check(
+        name=_EXECUTABLE_MEMBER_CHECK_NAME,
+        passed=False,
+        message=f"Executable content probe was inconclusive for {archive_kind} archive member: {member_name}",
+        severity=IssueSeverity.INFO,
+        location=f"{archive_path}:{member_name}",
+        details={"entry": member_name, "analysis_incomplete": True},
+    )
+
+
 def scan_archive_member_for_known_risks(
     *,
     archive_kind: str,
     archive_path: str,
     member_name: str,
-    tmp_path: str,
+    tmp_path: str | None,
     total_size: int,
     result: ScanResult,
     max_python_analysis_bytes: int,
     python_analysis_incomplete_reason: str,
+    executable_analysis_incomplete_reason: str,
+    analyze_python_source: bool = True,
+    analyze_executable_content: bool = True,
 ) -> None:
     """Inspect generic archive members that nested dispatch would otherwise ignore.
 
-    ``archive_kind`` is a short label (``"ZIP"`` / ``"TAR"``) used only for the
+    ``archive_kind`` is a short label (``"ZIP"`` / ``"TAR"`` / ``"NeMo"``) used only for the
     human-readable message text. The dispatcher (1) routes Python-looking
-    members through bounded AST analysis, (2) flags native/script executable-
-    suffix members, and (3) leaves everything else to the caller's normal
-    nested routing.
+    members through bounded AST analysis unless content routing already owns
+    the member, (2) flags native/script executable-suffix members, and (3)
+    leaves everything else to the caller's normal nested routing.
     """
     normalized_name = member_name.replace("\\", "/").lstrip("/")
     normalized_lower = normalized_name.lower()
     location = f"{archive_path}:{member_name}"
 
-    if is_python_archive_member_name(normalized_lower):
+    if is_python_archive_member_name(normalized_lower) and analyze_python_source:
         if total_size > max_python_analysis_bytes:
             mark_archive_scan_incomplete(result, python_analysis_incomplete_reason)
             result.add_check(
@@ -1446,12 +1842,70 @@ def scan_archive_member_for_known_risks(
                     "analysis_incomplete": True,
                 },
             )
+            if analyze_executable_content and tmp_path is not None:
+                executable_probe_outcome = _probe_python_archive_member_executable_content(tmp_path)
+                if executable_probe_outcome == "detected":
+                    _add_executable_archive_member_check(
+                        archive_kind=archive_kind,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        result=result,
+                    )
+                elif executable_probe_outcome == "incomplete":
+                    _add_incomplete_executable_archive_member_check(
+                        archive_kind=archive_kind,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        result=result,
+                        incomplete_reason=executable_analysis_incomplete_reason,
+                    )
+            return
+
+        if tmp_path is None:
+            mark_archive_scan_incomplete(result, python_analysis_incomplete_reason)
+            result.add_check(
+                name=_PYTHON_MEMBER_CHECK_NAME,
+                passed=False,
+                message=f"Python archive member could not be extracted for bounded security analysis: {member_name}",
+                severity=IssueSeverity.INFO,
+                location=location,
+                details={"entry": member_name, "analysis_incomplete": True},
+            )
             return
 
         try:
             with open(tmp_path, "rb") as member_file:
-                calls = high_risk_python_calls_in_source(member_file.read())
+                source_bytes = member_file.read()
+            if analyze_executable_content and _python_member_has_non_python_shebang(source_bytes):
+                _add_executable_archive_member_check(
+                    archive_kind=archive_kind,
+                    archive_path=archive_path,
+                    member_name=member_name,
+                    result=result,
+                )
+                return
+            calls = high_risk_python_calls_in_source(source_bytes)
         except PythonArchiveMemberParseError as exc:
+            if analyze_executable_content:
+                executable_probe_outcome = _probe_python_archive_member_executable_content(tmp_path)
+                if executable_probe_outcome == "detected":
+                    _add_executable_archive_member_check(
+                        archive_kind=archive_kind,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        result=result,
+                    )
+                    return
+                if executable_probe_outcome == "incomplete":
+                    _add_incomplete_executable_archive_member_check(
+                        archive_kind=archive_kind,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        result=result,
+                        incomplete_reason=executable_analysis_incomplete_reason,
+                    )
+                    return
+
             mark_archive_scan_incomplete(result, python_analysis_incomplete_reason)
             result.add_check(
                 name=_PYTHON_MEMBER_CHECK_NAME,
@@ -1489,14 +1943,31 @@ def scan_archive_member_for_known_risks(
             )
         return
 
-    executable_rule_code = executable_archive_member_rule_code(normalized_lower, path=tmp_path)
-    if executable_rule_code is not None:
-        result.add_check(
-            name=_EXECUTABLE_MEMBER_CHECK_NAME,
-            passed=False,
-            message=f"Executable file found in {archive_kind} archive: {member_name}",
-            severity=IssueSeverity.WARNING,
-            location=location,
-            details={"entry": member_name},
-            rule_code=executable_rule_code,
+    if is_executable_archive_member_name(normalized_lower):
+        _add_executable_archive_member_check(
+            archive_kind=archive_kind,
+            archive_path=archive_path,
+            member_name=member_name,
+            result=result,
+        )
+        return
+
+    if tmp_path is None or not analyze_executable_content:
+        return
+
+    executable_probe_outcome = probe_executable_archive_member_content(tmp_path)
+    if executable_probe_outcome == "detected":
+        _add_executable_archive_member_check(
+            archive_kind=archive_kind,
+            archive_path=archive_path,
+            member_name=member_name,
+            result=result,
+        )
+    elif executable_probe_outcome == "incomplete":
+        _add_incomplete_executable_archive_member_check(
+            archive_kind=archive_kind,
+            archive_path=archive_path,
+            member_name=member_name,
+            result=result,
+            incomplete_reason=executable_analysis_incomplete_reason,
         )

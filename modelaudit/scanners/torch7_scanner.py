@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-from pathlib import Path
 from typing import Any, ClassVar
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
@@ -16,6 +15,7 @@ TORCH7_SIGNATURE_READ_BYTES = 4096
 MAX_SCAN_BYTES = 12 * 1024 * 1024
 MAX_EXTRACTED_STRINGS = 5000
 MIN_TORCH7_SIZE = 8
+CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset({".bin", ".meta", ".pb"})
 
 PRINTABLE_TEXT_PATTERN = re.compile(rb"[\t\n\r -~]{6,512}")
 
@@ -54,7 +54,7 @@ SAFE_REQUIRE_MODULES = frozenset(
 
 
 class Torch7Scanner(BaseScanner):
-    """Static scanner for Torch7 `.t7` / `.th` / `.net` artifacts."""
+    """Static scanner for signature-valid Torch7 serialized artifacts."""
 
     name = "torch7"
     description = "Scans Torch7 serialized model files for Lua execution and dynamic loading indicators"
@@ -67,9 +67,10 @@ class Torch7Scanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
+        """Recognize Torch7 content unless a conflicting suffix retains primary ownership."""
         if not os.path.isfile(path):
             return False
-        if Path(path).suffix.lower() not in cls.supported_extensions:
+        if os.path.splitext(path)[1].lower() in CONTENT_ROUTE_BLOCKED_EXTENSIONS:
             return False
 
         try:
@@ -101,13 +102,19 @@ class Torch7Scanner(BaseScanner):
             with open(path, "rb") as file_obj:
                 data = file_obj.read(self.max_scan_bytes + 1)
         except OSError as exc:
+            mark_inconclusive_scan_result(result, "torch7_read_failed")
             result.add_check(
                 name="Torch7 File Read",
                 passed=False,
                 message=f"Failed to read Torch7 file: {exc!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(exc), "exception_type": type(exc).__name__},
+                details={
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torch7_read_failed",
+                },
             )
             result.finish(success=False)
             return result
@@ -166,8 +173,27 @@ class Torch7Scanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        extracted_strings = self._extract_strings(payload)
+        extracted_strings, strings_truncated = self._extract_strings(payload)
         result.metadata["extracted_string_count"] = len(extracted_strings)
+        result.metadata["string_extraction_truncated"] = strings_truncated
+
+        if strings_truncated:
+            mark_inconclusive_scan_result(result, "torch7_string_extraction_limit_exceeded")
+        result.add_check(
+            name="Torch7 Text Fragment Budget",
+            passed=not strings_truncated,
+            message=(
+                "Torch7 text fragment analysis stopped at the configured extraction limit"
+                if strings_truncated
+                else "Torch7 text fragment analysis completed within the configured extraction limit"
+            ),
+            severity=IssueSeverity.INFO if strings_truncated else None,
+            location=path,
+            details={
+                "max_extracted_strings": self.max_extracted_strings,
+                "analysis_incomplete": strings_truncated,
+            },
+        )
 
         self._analyze_execution_primitives(path, extracted_strings, result)
         self._analyze_dynamic_loads(path, extracted_strings, result)
@@ -178,7 +204,7 @@ class Torch7Scanner(BaseScanner):
         )
         return result
 
-    def _extract_strings(self, payload: bytes) -> list[str]:
+    def _extract_strings(self, payload: bytes) -> tuple[list[str], bool]:
         return extract_bounded_printable_strings(
             payload,
             PRINTABLE_TEXT_PATTERN,

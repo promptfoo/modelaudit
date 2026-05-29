@@ -1,5 +1,6 @@
 """Tests for embedded secrets detection in ML models."""
 
+import json
 import pickle
 
 import pytest
@@ -235,6 +236,44 @@ class TestSecretsDetector:
         assert len(findings) >= 2
         assert any("OpenAI" in f["secret_type"] for f in findings)
         assert any("MongoDB" in f["secret_type"] for f in findings)
+
+    def test_scan_dict_redacts_secret_keys_from_context(self) -> None:
+        """Secret-shaped dictionary keys should not leak through finding context paths."""
+        detector = SecretsDetector()
+        raw_key = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ12"
+        nested_password = "super_secret_password_123"
+
+        findings = detector.scan_dict({raw_key: {"nested": f"password={nested_password}"}})
+
+        assert any(finding["secret_type"] == "OpenAI API Key" for finding in findings)
+        assert any(finding["secret_type"] == "Hardcoded Password" for finding in findings)
+        serialized = json.dumps(findings, sort_keys=True)
+        assert raw_key not in serialized
+        assert nested_password not in serialized
+        assert "<redacted-secret>" in serialized
+
+    def test_scan_dict_redacts_secret_values_from_serialized_findings(self) -> None:
+        """Secret values should stay out of every serialized finding field."""
+        detector = SecretsDetector()
+        raw_secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ12"
+
+        findings = detector.scan_dict({"config": {"api_key": raw_secret}})
+
+        assert any(finding["secret_type"] == "OpenAI API Key" for finding in findings)
+        serialized = json.dumps(findings, sort_keys=True)
+        assert raw_secret not in serialized
+
+    def test_context_redaction_does_not_change_uuid_false_positive_filtering(self) -> None:
+        """Redaction markers should not introduce secret hints into detector scoring."""
+        detector = SecretsDetector()
+        raw_key = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ12"
+        benign_uuid = "550e8400-e29b-41d4-a716-446655440000"
+
+        findings = detector.scan_dict({raw_key: {"id": benign_uuid}})
+
+        assert not any(finding["secret_type"] == "UUID (potential secret)" for finding in findings)
+        serialized = json.dumps(findings, sort_keys=True)
+        assert raw_key not in serialized
 
 
 class TestPickleScannerWithSecrets:
