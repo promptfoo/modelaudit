@@ -128,6 +128,7 @@ def _compile_dangerous_import_patterns(dangerous_import: str) -> tuple[re.Patter
 _DANGEROUS_IMPORT_PATTERNS = {
     dangerous_import: _compile_dangerous_import_patterns(dangerous_import) for dangerous_import in DANGEROUS_IMPORTS
 }
+_MAX_SNIPPET_PARSE_TRIM_ATTEMPTS = 8
 
 
 def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
@@ -141,11 +142,20 @@ def _parse_embedded_python_snippet(code_str: str) -> ast.AST | None:
     """Parse an extracted Python snippet, trimming trailing binary framing when needed."""
     try:
         return ast.parse(code_str)
-    except (SyntaxError, ValueError):
-        pass
+    except (SyntaxError, ValueError) as exc:
+        initial_error = exc
 
     lines = code_str.splitlines()
-    for end in range(len(lines) - 1, 0, -1):
+    candidate_ends: list[int] = []
+    if isinstance(initial_error, SyntaxError) and initial_error.lineno is not None:
+        candidate_ends.append(max(1, initial_error.lineno - 1))
+    candidate_ends.extend(range(len(lines) - 1, max(0, len(lines) - _MAX_SNIPPET_PARSE_TRIM_ATTEMPTS - 1), -1))
+
+    seen_ends: set[int] = set()
+    for end in candidate_ends:
+        if end <= 0 or end in seen_ends:
+            continue
+        seen_ends.add(end)
         candidate = "\n".join(lines[:end])
         if candidate.strip() == "":
             continue
@@ -556,6 +566,7 @@ class JITScriptDetector:
         matches = [bounded] if include_full_source else re.findall(python_code_pattern, bounded)
         bounded_high_risk_calls: set[tuple[str, str]] | None = None
         snippet_high_risk_calls: set[tuple[str, str]] = set()
+        snippet_parse_succeeded = False
         try:
             bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
             bounded_high_risk_calls = _resolve_alias_aware_high_risk_calls(bounded_tree)
@@ -611,6 +622,7 @@ class JITScriptDetector:
                 # Try to parse as AST for deeper analysis.
                 tree = _parse_embedded_python_snippet(code_str)
                 if tree is not None:
+                    snippet_parse_succeeded = True
                     snippet_high_risk_calls.update(_resolve_alias_aware_high_risk_calls(tree))
                     ast_findings = self._analyze_ast(tree, framework, context)
                     findings.extend(ast_findings)
@@ -627,7 +639,7 @@ class JITScriptDetector:
                 resolved_subprocess_call = any(code == "S103" for _, code in resolved_high_risk_calls)
                 if resolved_subprocess_call:
                     pattern_match = True
-                elif bounded_high_risk_calls is not None:
+                elif bounded_high_risk_calls is not None or snippet_parse_succeeded:
                     continue
             if description == _OS_CODE_EXECUTION_DESCRIPTION:
                 resolved_os_process_call = any(code == "S101" for _, code in resolved_high_risk_calls)
