@@ -764,7 +764,7 @@ class JaxCheckpointScanner(BaseScanner):
             return False
 
         read_limit = max(len(header), min(self.max_pickle_scan_bytes, self._LEGACY_PICKLE_PREFIX_PROBE_BYTES))
-        with suppress(Exception):
+        with suppress(ValueError):
             file_size = os.path.getsize(path)
             with open(path, "rb") as source:
                 data = source.read(read_limit)
@@ -774,8 +774,7 @@ class JaxCheckpointScanner(BaseScanner):
             memo_indices: set[int] = set()
             next_memo_index = 0
             parsed_opcode = False
-            parsed_opcode_count = 0
-            saw_dangerous_global = False
+            observed_security_relevant_opcode = False
 
             def _memo_index(value: Any) -> int | None:
                 try:
@@ -818,14 +817,12 @@ class JaxCheckpointScanner(BaseScanner):
             try:
                 for opcode, arg, _pos in pickletools.genops(data):
                     parsed_opcode = True
-                    parsed_opcode_count += 1
                     if opcode.name == "GLOBAL" and isinstance(arg, str):
                         parsed_global = self._parse_pickle_global_reference(arg)
-                        if parsed_global is not None:
-                            module_name, global_name = parsed_global
-                            saw_dangerous_global = saw_dangerous_global or self._is_dangerous_pickle_global(
-                                module_name, global_name
-                            )
+                        if parsed_global is not None and self._is_dangerous_pickle_global(*parsed_global):
+                            observed_security_relevant_opcode = True
+                    elif opcode.name in {"STACK_GLOBAL", "REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST"}:
+                        observed_security_relevant_opcode = True
                     if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
                         if not stack:
                             return False
@@ -848,9 +845,9 @@ class JaxCheckpointScanner(BaseScanner):
                         return True
             except ValueError as e:
                 if "pickle exhausted before seeing STOP" in str(e):
-                    if parsed_opcode_count == 1 and not saw_dangerous_global:
-                        return False
-                    return parsed_opcode
+                    if file_size > len(data):
+                        return parsed_opcode or self._header_starts_with_legacy_pickle_opcode(header)
+                    return parsed_opcode and observed_security_relevant_opcode
                 if file_size > len(data) and self._is_truncated_pickle_parse_error(e):
                     return parsed_opcode or self._header_starts_with_legacy_pickle_opcode(header)
 
@@ -861,12 +858,9 @@ class JaxCheckpointScanner(BaseScanner):
         if not cls._header_starts_with_legacy_pickle_opcode(header):
             return False
 
-        with suppress(Exception):
-            with open(path, "rb") as source:
-                data = source.read(max(8192, len(header)))
-            return cls._contains_jax_indicator(data.decode("utf-8", errors="ignore"))
-
-        return False
+        with open(path, "rb") as source:
+            data = source.read(max(8192, len(header)))
+        return cls._contains_jax_indicator(data.decode("utf-8", errors="ignore"))
 
     @classmethod
     def _is_likely_jax_file(cls, path: str) -> bool:

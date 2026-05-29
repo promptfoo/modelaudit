@@ -433,6 +433,102 @@ def test_empty_orbax_checkpoint_file_does_not_scan_as_pickle(tmp_path: Path) -> 
     assert "jax_pickle_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
 
 
+def test_orbax_plaintext_checkpoint_with_global_shaped_prefix_does_not_scan_as_pickle(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "plaintext_orbax"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "checkpoint").write_text("configuration\nmetadata\n", encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert not any(check.name == "Pickle Checkpoint Scan" for check in result.checks)
+    assert "jax_pickle_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_orbax_legacy_probe_read_failure_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir = tmp_path / "unreadable_legacy_orbax"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    checkpoint_file.write_bytes(b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
+    original_open = builtins.open
+    checkpoint_open_count = 0
+
+    def fail_second_checkpoint_read(file: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal checkpoint_open_count
+        if file == str(checkpoint_file) and args and args[0] == "rb":
+            checkpoint_open_count += 1
+            if checkpoint_open_count == 2:
+                raise OSError("simulated legacy pickle probe read failure")
+        return original_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fail_second_checkpoint_read)
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is False
+    assert "jax_checkpoint_file_scan_failed" in result.metadata.get("scan_outcome_reasons", [])
+    assert any(
+        check.name == "Checkpoint File Scan"
+        and check.details.get("scan_outcome_reason") == "jax_checkpoint_file_scan_failed"
+        for check in result.checks
+    )
+
+
+def test_single_file_legacy_indicator_read_failure_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_file = tmp_path / "legacy_jax.checkpoint"
+    checkpoint_file.write_bytes(b"Vjax\n.")
+    scanner = JaxCheckpointScanner()
+
+    monkeypatch.setattr(scanner, "_has_structural_legacy_pickle_prefix", lambda _path, _header: True)
+
+    def fail_indicator_read(_path: str, _header: bytes) -> bool:
+        raise OSError("simulated JAX indicator read failure")
+
+    monkeypatch.setattr(scanner, "_legacy_pickle_header_has_jax_indicator", fail_indicator_read)
+
+    result = scanner.scan(str(checkpoint_file))
+
+    assert result.success is False
+    assert "jax_checkpoint_file_scan_failed" in result.metadata.get("scan_outcome_reasons", [])
+    assert any(
+        check.name == "Checkpoint File Scan"
+        and check.details.get("scan_outcome_reason") == "jax_checkpoint_file_scan_failed"
+        for check in result.checks
+    )
+
+
+def test_orbax_legacy_pickle_dangerous_global_after_probe_boundary_is_detected(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_probe_boundary"
+    checkpoint_dir.mkdir()
+    checkpoint_file = checkpoint_dir / "checkpoint"
+    harmless_prefix = b"N0" * (JaxCheckpointScanner._LEGACY_PICKLE_PREFIX_PROBE_BYTES // 2)
+    checkpoint_file.write_bytes(harmless_prefix + b"cposix\nsystem\n(Vid\ntR.")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert not any(
+        check.name == "Checkpoint Format Detection" and check.details.get("format") == "unknown"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
 def test_orbax_protocol_zero_persid_checkpoint_scans_pickle(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "orbax_persid"
     checkpoint_dir.mkdir()
@@ -508,11 +604,12 @@ def test_eof_truncated_orbax_legacy_pickle_is_scanned_inconclusive(tmp_path: Pat
     assert "jax_pickle_scan_failed" in result.metadata.get("scan_outcome_reasons", [])
 
 
-def test_orbax_binbytes_prefix_scans_pickle(tmp_path: Path) -> None:
+@pytest.mark.parametrize("bytes_prefix", [b"B\x03\x00\x00\x00abc", b"C\x03abc"])
+def test_orbax_binbytes_prefix_scans_pickle(tmp_path: Path, bytes_prefix: bytes) -> None:
     checkpoint_dir = tmp_path / "orbax_binbytes"
     checkpoint_dir.mkdir()
     checkpoint_file = checkpoint_dir / "checkpoint"
-    checkpoint_file.write_bytes(b"B\x03\x00\x00\x00abccposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
+    checkpoint_file.write_bytes(bytes_prefix + b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
 
     assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
 
