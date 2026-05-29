@@ -1375,12 +1375,15 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                         continue
                     self._bind_name(f"{root}.{key}", resolved_value)
         elif isinstance(target, ast.Attribute):
+            syntactic_name = _resolve_call_name(target)
             resolved_target_names = self._resolve_reference_names(target)
-            if resolved_target_names is None:
+            target_names = set(resolved_target_names or frozenset())
+            if syntactic_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
+                target_names.add(syntactic_name)
+            if not target_names:
                 return
             resolved_value = self._resolve_binding_value_names(value)
-            syntactic_name = _resolve_call_name(target)
-            for target_name in resolved_target_names:
+            for target_name in target_names:
                 if target_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
                     self._bind_name(target_name, resolved_value)
                     if syntactic_name is not None:

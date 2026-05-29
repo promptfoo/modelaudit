@@ -636,10 +636,52 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
-    def test_scan_model_preserves_prefix_runpy_overwrite_in_tail_window(self) -> None:
+    @pytest.mark.parametrize(
+        "continued_import",
+        [
+            b"from runpy\\\n import run_path as run\n",
+            b"from runpy \\\n import run_path as run\n",
+            b"from runpy\\\r\n import run_path as run\r\n",
+            b"from runpy \\\r\n import run_path as run\r\n",
+        ],
+    )
+    def test_scan_model_detects_late_priority_runpy_continued_from_import(self, continued_import: bytes) -> None:
+        detector = JITScriptDetector()
+        leading_imports = b"".join(f"import harmless_{index}\n\x00".encode() for index in range(12))
+        source = b"\x00\xff" + leading_imports + continued_import + b"run('payload.py')\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_late_priority_runpy_import_after_large_function_preamble(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding = b"    # pad\n" * 600
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"def payload():\n"
+            + padding
+            + b"    import runpy as rp\n"
+            + b"    return rp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_reports_tail_runpy_after_prefix_overwrite_across_gap(self) -> None:
         detector = JITScriptDetector()
         filler_line = b"# filler\n"
-        filler = filler_line * (jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
         source = (
             b"\x00\xffimport runpy\n"
             b"runpy.run_path = len\n" + filler + b"def payload():\n    return runpy.run_path([])\n"
@@ -647,7 +689,60 @@ class TestJITScriptDetector:
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
-        assert not any(
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_reports_tail_runpy_when_omitted_middle_may_restore_overwrite(self) -> None:
+        detector = JITScriptDetector()
+        filler_line = b"# filler\n"
+        filler = filler_line * (jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        source = (
+            b"\x00\xffimport runpy\n"
+            b"runpy.run_path = len\n"
+            + filler
+            + b"runpy.__dict__['run_path'] = runpy.run_module\n"
+            + filler
+            + b"def payload():\n    return runpy.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_reports_tail_runpy_when_safe_middle_state_is_omitted(self) -> None:
+        detector = JITScriptDetector()
+        filler_line = b"# filler\n"
+        filler = filler_line * (jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        source = (
+            b"\x00\xffimport runpy\n"
+            + filler
+            + b"runpy.run_path = len\n"
+            + filler
+            + b"def payload():\n    return runpy.run_path([])\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_restored_runpy_execution_after_static_overwrite(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def payload():\n"
+            b"    original = runpy.run_path\n"
+            b"    runpy.run_path = len\n"
+            b"    runpy.run_path = original\n"
+            b"    return runpy.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
@@ -661,7 +756,8 @@ class TestJITScriptDetector:
         os_candidate = (b"import os\n", (300, 301))
         aliased_runpy_candidate = (b"import harmless as h, runpy as rp\n", (350, 351))
         continued_runpy_candidate = (b"import harmless as h, \\\n    runpy as rp\n", (375, 376))
-        runpy_candidate = (b"from runpy import run_path\n", (400, 401))
+        continued_from_runpy_candidate = (b"from runpy\\\n import run_path\n", (400, 401))
+        runpy_candidate = (b"from runpy import run_path\n", (425, 426))
 
         selected = jit_script_module._prioritized_embedded_python_snippets(
             [
@@ -671,6 +767,7 @@ class TestJITScriptDetector:
                 os_candidate,
                 aliased_runpy_candidate,
                 continued_runpy_candidate,
+                continued_from_runpy_candidate,
                 runpy_candidate,
             ]
         )
@@ -680,6 +777,7 @@ class TestJITScriptDetector:
         assert os_candidate in selected
         assert aliased_runpy_candidate in selected
         assert continued_runpy_candidate in selected
+        assert continued_from_runpy_candidate in selected
         assert runpy_candidate in selected
 
     def test_scan_model_ignores_binary_framed_top_level_replaced_runpy_execution(self) -> None:
@@ -764,6 +862,33 @@ class TestJITScriptDetector:
         patterns = {finding.pattern for finding in findings if finding.type == "code_execution_pattern"}
         assert "Web browser launch detected" in patterns
         assert "Native library loading detected" in patterns
+
+    @pytest.mark.parametrize(
+        ("payload", "expected_pattern"),
+        [
+            (
+                b"def payload():\n    import webbrowser as wb\n    return wb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+            ),
+            (
+                b"def payload():\n    import ctypes as ct\n    return ct.CDLL('libpayload.so')\n",
+                "Native library loading detected",
+            ),
+        ],
+    )
+    def test_scan_model_detects_late_priority_webbrowser_and_ctypes_aliases(
+        self, payload: bytes, expected_pattern: str
+    ) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        source = b"\x00\xff" + leading_blocks + payload
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(f.type == "code_execution_pattern" and f.pattern == expected_pattern for f in findings)
 
     def test_scan_model_ignores_safe_webbrowser_get_overwrite(self) -> None:
         detector = JITScriptDetector()

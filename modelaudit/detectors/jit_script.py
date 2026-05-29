@@ -12,6 +12,7 @@ Part of ModelAudit's critical security validation suite.
 import ast
 import re
 import textwrap
+from bisect import bisect_left, bisect_right
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -131,10 +132,11 @@ _DANGEROUS_IMPORT_PATTERNS = {
 _MAX_SNIPPET_PARSE_TRIM_ATTEMPTS = 8
 _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS = 10
 _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES = 1_000_000
+_MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES = 16_384
 _EMBEDDED_PYTHON_START_MARKERS = (b"def ", b"async def ", b"class ", b"import ", b"from ")
 _PRIORITY_EMBEDDED_PYTHON_MODULES = tuple(
     sorted(
-        {marker.lower() for marker in (*DANGEROUS_IMPORTS, "asyncio", "runpy", "subprocess")},
+        {marker.lower() for marker in (*DANGEROUS_IMPORTS, "asyncio", "ctypes", "runpy", "subprocess", "webbrowser")},
         key=len,
         reverse=True,
     )
@@ -147,13 +149,14 @@ _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN = re.compile(
     rb"import\s+(?:[a-z_][\w.]*(?:\s+as\s+[a-z_]\w*)?\s*,(?:\s|\\\r?\n)*)*(?:"
     + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN
     + rb")(?:[.\s,]|$)|"
-    rb"from\s+(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s]|$)"
+    rb"from\s+(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s]|\\\r?\n|$)"
     rb")"
 )
 _EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+")
 _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])"
-    rb"(?:(?:async\s+)?def\s+\w+|class\s+\w+|import\s+[A-Za-z_][\w.]*|from\s+[A-Za-z_][\w.]*\s+import)"
+    rb"(?:(?:async\s+)?def\s+\w+|class\s+\w+|import\s+[A-Za-z_][\w.]*|"
+    rb"from\s+[A-Za-z_][\w.]*(?:\s|\\\r?\n)+import)"
 )
 
 
@@ -207,6 +210,16 @@ def _candidate_embedded_python_snippets(
 ) -> list[tuple[bytes, tuple[int, int]]]:
     candidates: list[tuple[bytes, tuple[int, int]]] = []
     block_spans: list[tuple[int, int]] = []
+    start_offsets = [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(bounded)]
+    priority_starts: set[int] = set()
+    for priority_offset in _priority_import_offsets(bounded):
+        insertion_index = bisect_right(start_offsets, priority_offset)
+        if insertion_index == 0:
+            continue
+        priority_starts.add(start_offsets[insertion_index - 1])
+        if insertion_index >= 2:
+            priority_starts.add(start_offsets[insertion_index - 2])
+
     if include_full_source:
         candidates.append((bounded, (0, len(bounded))))
 
@@ -217,25 +230,46 @@ def _candidate_embedded_python_snippets(
         block_spans.append(span)
         candidates.append((match.group(0), span))
 
-    for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(bounded):
-        start = match.start()
+    for start in start_offsets:
         if include_full_source and start == 0:
             continue
-        if any(block_start <= start < block_end for block_start, block_end in block_spans):
+        if (
+            any(block_start <= start < block_end for block_start, block_end in block_spans)
+            and start not in priority_starts
+        ):
             continue
         candidates.append((bounded[start:], (start, len(bounded))))
 
     return candidates
 
 
+def _priority_import_offsets(bounded: bytes) -> list[int]:
+    lowered = bounded.lower()
+    return [
+        match.start()
+        for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(lowered)
+        if _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.match(lowered[match.start() :]) is not None
+    ]
+
+
+def _span_contains_priority_offset(span: tuple[int, int], priority_offsets: list[int]) -> bool:
+    index = bisect_left(priority_offsets, span[0])
+    return index < len(priority_offsets) and priority_offsets[index] < span[1]
+
+
 def _prioritized_embedded_python_snippets(
     candidates: list[tuple[bytes, tuple[int, int]]],
+    bounded: bytes | None = None,
 ) -> list[tuple[bytes, tuple[int, int]]]:
     selected: list[tuple[bytes, tuple[int, int]]] = []
     selected_spans: set[tuple[int, int]] = set()
+    priority_offsets = _priority_import_offsets(bounded) if bounded is not None else []
     for index, (candidate, span) in enumerate(candidates):
-        candidate_prefix = candidate[:4096].lower()
-        has_priority_marker = _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(candidate_prefix) is not None
+        has_priority_marker = (
+            _span_contains_priority_offset(span, priority_offsets)
+            if bounded is not None
+            else _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(candidate.lower()) is not None
+        )
         if index >= _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS and not has_priority_marker:
             continue
         if span in selected_spans:
@@ -265,17 +299,64 @@ def _embedded_python_scan_windows(data: bytes) -> list[bytes]:
     return [data[:_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES], data[-_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:]]
 
 
+def _line_has_explicit_continuation(line: bytes) -> bool:
+    return line.rstrip().endswith(b"\\")
+
+
+def _line_parenthesis_delta(line: bytes) -> int:
+    return line.count(b"(") - line.count(b")")
+
+
+def _extract_priority_import_context(data: bytes) -> bytes:
+    """Return bounded dangerous import statements from a prefix window."""
+    context: list[bytes] = []
+    context_size = 0
+    lines = data.splitlines(keepends=True)
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].lstrip()
+        if not stripped.startswith((b"import ", b"from ")):
+            index += 1
+            continue
+
+        statement_lines = [stripped]
+        paren_depth = _line_parenthesis_delta(stripped)
+        while (_line_has_explicit_continuation(statement_lines[-1]) or paren_depth > 0) and index + 1 < len(lines):
+            index += 1
+            continuation = lines[index].lstrip()
+            statement_lines.append(continuation)
+            paren_depth += _line_parenthesis_delta(continuation)
+
+        statement = b"".join(statement_lines).rstrip() + b"\n"
+        if _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(statement.lower()) is None:
+            index += 1
+            continue
+        code_str, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
+        try:
+            ast.parse(code_str)
+        except (SyntaxError, ValueError):
+            index += 1
+            continue
+        if context_size + len(statement) > _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES:
+            break
+        context.append(statement)
+        context_size += len(statement)
+        index += 1
+
+    return b"".join(context)
+
+
 def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]:
     windows = _embedded_python_scan_windows(data)
     if len(windows) == 1:
         return [(windows[0], False)]
 
-    # Keep top-of-source alias overwrites visible when checking bounded tail code.
-    prefix = windows[0]
-    first_python_start = _EMBEDDED_PYTHON_START_PATTERN.search(prefix)
-    if first_python_start is not None:
-        prefix = prefix[first_python_start.start() :]
-    return [(prefix + b"\n" + windows[1], True)]
+    prefix, tail = windows
+    extraction_windows = [(prefix, False), (tail, False)]
+    import_context = _extract_priority_import_context(prefix)
+    if import_context:
+        extraction_windows.append((import_context + b"\n" + tail, True))
+    return extraction_windows
 
 
 def _has_raw_match_outside_parsed_spans(raw_spans: list[tuple[int, int]], parsed_spans: list[tuple[int, int]]) -> bool:
@@ -762,7 +843,7 @@ class JITScriptDetector:
             # raw pattern detection active and fall back to extracted snippets.
             bounded_high_risk_calls = None
 
-        for match, span in _prioritized_embedded_python_snippets(matches):
+        for match, span in _prioritized_embedded_python_snippets(matches, bounded=bounded):
             try:
                 if _is_span_inside_parsed_spans(span, parsed_snippet_spans):
                     continue
