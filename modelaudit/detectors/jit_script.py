@@ -561,7 +561,7 @@ def _statement_binds_priority_alias(statement: ast.stmt, aliases: frozenset[byte
 def _line_assigns_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
     try:
         tree = ast.parse(code_line.decode("utf-8", errors="ignore"))
-    except SyntaxError:
+    except (SyntaxError, ValueError):
         return False
 
     pending = list(reversed(tree.body))
