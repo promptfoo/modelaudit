@@ -583,6 +583,8 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "import ctypes\n"
         "import webbrowser\n"
         "webbrowser.get().open.__call__('https://example.invalid')\n"
+        "webbrowser.get().__getattribute__('open')('https://example.invalid')\n"
+        "ctypes.windll.kernel32\n"
         "ctypes.cdll['msvcrt'].printf(b'x')\n"
         "ctypes.cdll.__getitem__('msvcrt')\n"
         "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
@@ -604,7 +606,26 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
     assert checks_by_rule["S110"].severity == IssueSeverity.CRITICAL
     assert "ctypes.cdll.msvcrt" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.windll.kernel32" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.msvcrt" in checks_by_rule["S110"].details["reason"]
+
+
+def test_scan_zip_flags_webbrowser_controller_getattribute_launch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import webbrowser\nwebbrowser.get().__getattribute__('open')('https://example.invalid')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S109"
+    assert python_checks[0].details["reason"] == "high-risk calls: webbrowser.open"
 
 
 def test_scan_zip_flags_extensionless_runpy_python_member(tmp_path: Path) -> None:
@@ -694,7 +715,11 @@ def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite
         ("import os\nrunner = os.system\nif True:\n    globals()['runner'] = print\nglobals()['runner']('safe')\n"),
         "import runpy\nrunpy.run_path = len\nrunpy.run_path([])\n",
         "import webbrowser\nwebbrowser.get = len\nwebbrowser.get([]).open('https://example.invalid')\n",
+        "import webbrowser\nbrowser = webbrowser.get()\nbrowser.open = len\nbrowser.open([])\n",
         "import ctypes\nctypes.cdll = len\nctypes.cdll['msvcrt'].printf(b'x')\n",
+        "import ctypes\nloader = ctypes.LibraryLoader(len)\nloader.payload.printf(b'x')\n",
+        "import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL, object)\nloader.payload.printf(b'x')\n",
+        "import ctypes\nloader = ctypes.LibraryLoader(loader=ctypes.CDLL)\nloader.payload.printf(b'x')\n",
     ],
 )
 def test_scan_zip_ignores_benign_namespace_mapping_call(tmp_path: Path, source: str) -> None:
