@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ import msgpack
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.integrations.sarif_formatter import _create_results
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner, _matching_jax_transforms
@@ -686,6 +688,132 @@ def test_flax_msgpack_jax_specific_threats(tmp_path):
     assert any("__jax_array__" in msg or "JAX array" in msg for msg in issues_messages)
     # Negative dimensions check - may not be implemented in all scanner versions
     # assert any("negative dimensions" in msg for msg in issues_messages)
+
+
+def test_flax_msgpack_redacts_suspicious_string_evidence(tmp_path: Path) -> None:
+    path = tmp_path / "leaky_code.msgpack"
+    secret = "CLIENTSECRET123456789"
+    url_token = "HFSECRETTOKEN123"
+    data = {
+        "params": {"w": [1, 2, 3]},
+        "code": (
+            f"eval('payload') client_secret='{secret}' https://user:pass@example.com/model?token={url_token}&ok=1"
+        ),
+    }
+    create_msgpack_file(path, data)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+    sample = next(check.details["sample"] for check in result.checks if check.name == "Code Pattern Security Check")
+    serialized = result.to_json()
+
+    assert "eval('payload')" in sample
+    assert "client_secret='<redacted>'" in sample
+    assert "https://<credentials-redacted>@example.com/model?token=<redacted>&ok=1" in sample
+    assert secret not in serialized
+    assert url_token not in serialized
+    assert "user:pass" not in serialized
+
+
+def test_flax_msgpack_redacts_jax_transform_context(tmp_path: Path) -> None:
+    path = tmp_path / "leaky_transform.jax"
+    api_key = "JAXAPIKEY123456789"
+    data = {
+        "params": {"w": [1, 2, 3]},
+        "custom_transform": f"runtime_eval api_key={api_key}",
+    }
+    create_msgpack_file(path, data)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+    context = next(check.details["context"] for check in result.checks if check.name == "JAX Transform Security Check")
+    serialized = result.to_json()
+
+    assert "runtime_eval" in context
+    assert "api_key=<redacted>" in context
+    assert api_key not in serialized
+
+
+def test_flax_msgpack_redacts_model_controlled_key_locations(tmp_path: Path) -> None:
+    path = tmp_path / "leaky_location.jax"
+    secret = "LOCATIONSECRET123456789"
+    data = {
+        "params": {"w": [1, 2, 3]},
+        f"runtime_eval?token={secret}": "benign transform metadata",
+    }
+    create_msgpack_file(path, data)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+    locations = [issue.location or "" for issue in result.issues]
+    serialized = result.to_json()
+    sarif_results = json.dumps(_create_results(result.issues, prefiltered=True))
+
+    assert any("runtime_eval?token=<redacted>" in location for location in locations)
+    assert any(issue.message == "Suspicious JAX transform detected: runtime_eval" for issue in result.issues)
+    assert secret not in serialized
+    assert secret not in sarif_results
+
+
+def test_flax_msgpack_redaction_preserves_non_secret_suspicious_evidence(tmp_path: Path) -> None:
+    path = tmp_path / "non_secret_evidence.msgpack"
+    data = {
+        "params": {"w": [1, 2, 3]},
+        "code": 'eval("https://evil.example/run?mode=test")',
+    }
+    create_msgpack_file(path, data)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+    sample = next(check.details["sample"] for check in result.checks if check.name == "Code Pattern Security Check")
+
+    assert "eval(" in sample
+    assert "evil.example" in sample
+    assert "mode=test" in sample
+
+
+def test_flax_msgpack_redacts_function_metadata_value_sample(tmp_path: Path) -> None:
+    path = tmp_path / "leaky_function_metadata.msgpack"
+    token = "FUNCTIONTOKEN123456789"
+    dangerous_value = f"custom.loader token={token}"
+    data = {
+        "params": {"w": [1, 2, 3]},
+        "transform_fn": dangerous_value,
+    }
+    create_msgpack_file(path, data)
+
+    scanner = FlaxMsgpackScanner(config={"dangerous_callable_names": {dangerous_value.lower()}})
+    result = scanner.scan(str(path))
+    value_sample = next(
+        check.details["value_sample"] for check in result.checks if check.name == "Object Attribute Security Check"
+    )
+    serialized = result.to_json()
+
+    assert "custom.loader" in value_sample
+    assert "token=<redacted>" in value_sample
+    assert token not in serialized
+
+
+def test_flax_msgpack_function_metadata_value_sample_requires_exact_callable(tmp_path: Path) -> None:
+    exact_path = tmp_path / "exact_callable.msgpack"
+    noisy_path = tmp_path / "noisy_callable.msgpack"
+    secret = "NOISYFUNCTIONTOKEN123456789"
+    create_msgpack_file(exact_path, {"params": {"w": [1, 2, 3]}, "eval_fn": "eval"})
+    create_msgpack_file(noisy_path, {"params": {"w": [1, 2, 3]}, "eval_fn": f"eval token={secret}"})
+
+    exact_result = FlaxMsgpackScanner().scan(str(exact_path))
+    noisy_result = FlaxMsgpackScanner().scan(str(noisy_path))
+
+    exact_value_sample = next(
+        check.details["value_sample"]
+        for check in exact_result.checks
+        if check.name == "Object Attribute Security Check"
+        and check.message == "Suspicious object attribute value detected: eval_fn"
+    )
+
+    assert exact_value_sample == "eval"
+    assert not any(
+        check.name == "Object Attribute Security Check"
+        and check.message == "Suspicious object attribute value detected: eval_fn"
+        for check in noisy_result.checks
+    )
+    assert secret not in noisy_result.to_json()
 
 
 def test_flax_msgpack_large_model_support(tmp_path):
