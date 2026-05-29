@@ -152,6 +152,13 @@ _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN = re.compile(
     rb"from\s+(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s]|\\\r?\n|$)"
     rb")"
 )
+_EMBEDDED_PYTHON_CONTEXT_STATEMENT_START_PATTERN = re.compile(
+    rb"(?<![A-Za-z0-9_'\".])(?:(?:import|from)\s+|[A-Za-z_]\w*\s*=)"
+)
+_PRIORITY_EMBEDDED_PYTHON_ALIAS_ASSIGNMENT_PATTERN = re.compile(rb"(?m)^\s*[a-z_]\w*\s*=\s*[a-z_]\w*(?:\.[a-z_]\w*)+")
+_DIRECT_PRIORITY_EMBEDDED_PYTHON_ALIAS_ASSIGNMENT_PATTERN = re.compile(
+    rb"(?m)^\s*[a-z_]\w*\s*=\s*(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")\."
+)
 _EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+")
 _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])"
@@ -307,6 +314,26 @@ def _line_parenthesis_delta(line: bytes) -> int:
     return line.count(b"(") - line.count(b")")
 
 
+def _embedded_python_context_statement_start(line: bytes) -> int | None:
+    for match in _EMBEDDED_PYTHON_CONTEXT_STATEMENT_START_PATTERN.finditer(line):
+        prefix = line[: match.start()]
+        if prefix and prefix.strip() == b"":
+            continue
+        if prefix and any(0x20 <= byte < 0x7F for byte in prefix.strip()):
+            continue
+        return match.start()
+    return None
+
+
+def _is_priority_import_context_statement(statement: bytes, *, has_context: bool) -> bool:
+    lowered = statement.lower()
+    if _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(lowered) is not None:
+        return True
+    if _DIRECT_PRIORITY_EMBEDDED_PYTHON_ALIAS_ASSIGNMENT_PATTERN.match(lowered) is not None:
+        return True
+    return has_context and _PRIORITY_EMBEDDED_PYTHON_ALIAS_ASSIGNMENT_PATTERN.match(lowered) is not None
+
+
 def _extract_priority_import_context(data: bytes) -> bytes:
     """Return bounded dangerous import statements from a prefix window."""
     context: list[bytes] = []
@@ -314,13 +341,13 @@ def _extract_priority_import_context(data: bytes) -> bytes:
     lines = data.splitlines(keepends=True)
     index = 0
     while index < len(lines):
-        stripped = lines[index].lstrip()
-        if not stripped.startswith((b"import ", b"from ")):
+        statement_start = _embedded_python_context_statement_start(lines[index])
+        if statement_start is None:
             index += 1
             continue
 
-        statement_lines = [stripped]
-        paren_depth = _line_parenthesis_delta(stripped)
+        statement_lines = [lines[index][statement_start:]]
+        paren_depth = _line_parenthesis_delta(statement_lines[0])
         while (_line_has_explicit_continuation(statement_lines[-1]) or paren_depth > 0) and index + 1 < len(lines):
             index += 1
             continuation = lines[index].lstrip()
@@ -328,7 +355,7 @@ def _extract_priority_import_context(data: bytes) -> bytes:
             paren_depth += _line_parenthesis_delta(continuation)
 
         statement = b"".join(statement_lines).rstrip() + b"\n"
-        if _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(statement.lower()) is None:
+        if not _is_priority_import_context_statement(statement, has_context=bool(context)):
             index += 1
             continue
         code_str, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
@@ -491,8 +518,11 @@ class JITScriptDetector:
         """Return whether a bounded binary blob has parseable dangerous Python framing."""
         if not any(marker in data for marker in _EMBEDDED_PYTHON_START_MARKERS):
             return False
-        for window in _embedded_python_scan_windows(data):
-            for candidate, _span in _candidate_embedded_python_snippets(window):
+        for window, include_full_source in _embedded_python_extraction_windows(data):
+            for candidate, _span in _candidate_embedded_python_snippets(
+                window,
+                include_full_source=include_full_source,
+            ):
                 code_str, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
                 parsed_snippet = _parse_embedded_python_snippet(code_str)
                 if parsed_snippet is None:

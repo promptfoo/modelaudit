@@ -1324,13 +1324,22 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         )
 
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
-        self.alias_scopes[-1][alias.asname or alias.name] = frozenset({import_name})
+        local_name = alias.asname or alias.name
+        self.alias_scopes[-1][local_name] = frozenset({import_name})
+        self._refresh_imported_static_members(local_name, import_name)
 
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
         self.alias_scopes[-1][name] = resolved_names
 
     def _bind_name_in_scope(self, scope_index: int, name: str, resolved_names: _AliasValue) -> None:
         self.alias_scopes[scope_index][name] = resolved_names
+
+    def _refresh_imported_static_members(self, local_name: str, import_name: str) -> None:
+        for reference_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
+            if reference_name != import_name and not reference_name.startswith(f"{import_name}."):
+                continue
+            suffix = reference_name.removeprefix(import_name)
+            self._bind_name(f"{local_name}{suffix}", frozenset({reference_name}))
 
     def _bind_module_namespace_key(self, key: str, resolved_names: _AliasValue) -> None:
         self._bind_name(f"{_MODULE_NAMESPACE_WRITE_PREFIX}{key}", resolved_names)
