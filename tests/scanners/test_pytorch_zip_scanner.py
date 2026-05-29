@@ -1580,6 +1580,41 @@ def test_pytorch_zip_scans_unmarked_runpy_execution_in_archive_data(tmp_path: Pa
     assert all(check.rule_code == "S108" for check in matching_failures)
 
 
+def test_pytorch_zip_scans_webbrowser_and_ctypes_execution_in_archive_data(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    payload = (
+        b"\x00\xffdef payload():\n"
+        b"    import ctypes\n"
+        b"    import webbrowser\n"
+        b"    webbrowser.get().open.__call__('https://example.invalid')\n"
+        b"    ctypes.cdll['msvcrt'].printf(b'x')\n"
+        b"    ctypes.cdll.__getitem__('msvcrt')\n"
+        b"    loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        b"    return loader.msvcrt.printf(b'x')\n"
+        b"\x00MODEL-FRAMING"
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    matching_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+    ]
+    assert any(
+        check.rule_code == "S109" and "Web browser launch detected" in check.message for check in matching_failures
+    )
+    assert any(
+        check.rule_code == "S110" and "Native library loading detected" in check.message for check in matching_failures
+    )
+
+
 def test_pytorch_zip_ignores_certain_replaced_runpy_execution_in_archive_data(tmp_path: Path) -> None:
     zip_path = tmp_path / "model.pt"
     payload = b"\x00\xffimport runpy\nrunpy.run_path = len\nrunpy.run_path([])\n\x00MODEL-FRAMING"
