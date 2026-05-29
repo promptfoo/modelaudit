@@ -1829,19 +1829,31 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
-    def test_scan_model_restores_dynamic_member_risk_after_delete(self) -> None:
+    def test_scan_model_preserves_dynamic_member_risk_after_reassignment_and_delete(self) -> None:
         detector = JITScriptDetector()
         source = (
             b"\x00\xffdef payload():\n"
             b"    import ctypes\n"
             b"    import webbrowser\n"
-            b"    browser = webbrowser.get()\n"
+            b"    browser = webbrowser.get('safe')\n"
             b"    browser.open = len\n"
-            b"    del browser.open\n"
+            b"    browser = webbrowser.get('other')\n"
             b"    browser.open('https://example.invalid')\n"
-            b"    ctypes.cdll.payload = len\n"
-            b"    del ctypes.cdll.payload\n"
-            b"    return ctypes.cdll.payload\n"
+            b"    other = webbrowser.get()\n"
+            b"    other.open = len\n"
+            b"    del other.open\n"
+            b"    other.open('https://example.invalid')\n"
+            b"    loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    loader.payload = len\n"
+            b"    loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    loader.payload\n"
+            b"    other_loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    other_loader.payload = len\n"
+            b"    del other_loader.payload\n"
+            b"    other_loader.payload\n"
+            b"    ctypes.windll.payload = len\n"
+            b"    del ctypes.windll.payload\n"
+            b"    return ctypes.windll.payload\n"
             b"\x00MODEL-FRAMING"
         )
 
@@ -1969,6 +1981,22 @@ class TestJITScriptDetector:
             b"            pass\n"
             b"    ctypes.LibraryLoader(SafeCDLL).payload\n"
             b"    SafeCDLL('/missing')\n"
+            b"    class Safe:\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            self.name = name\n"
+            b"    class NoLoad(Safe, ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            super().__init__(name)\n"
+            b"    ctypes.LibraryLoader(NoLoad).payload\n"
+            b"    NoLoad('/missing')\n"
+            b"    class OverwrittenInitCDLL(ctypes.CDLL):\n"
+            b"        init = ctypes.CDLL.__init__\n"
+            b"        def init(self, name: str) -> None:\n"
+            b"            pass\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            self.init(name)\n"
+            b"    ctypes.LibraryLoader(OverwrittenInitCDLL).payload\n"
+            b"    OverwrittenInitCDLL('/missing')\n"
             b"    return load.__name__\n"
             b"\x00MODEL-FRAMING"
         )

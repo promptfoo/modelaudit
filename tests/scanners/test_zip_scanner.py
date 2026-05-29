@@ -788,6 +788,32 @@ def test_scan_zip_preserves_library_loader_member_risk_after_other_instance_over
     assert python_checks[0].details["reason"] == "high-risk calls: ctypes.LibraryLoader.payload"
 
 
+def test_scan_zip_preserves_webbrowser_controller_member_risk_after_other_instance_overwrite(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import webbrowser\n"
+        "safe = webbrowser.get('safe')\n"
+        "safe.open = len\n"
+        "other = webbrowser.get('other')\n"
+        "other.open('https://example.invalid')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S109"
+    assert python_checks[0].details["reason"] == "high-risk calls: webbrowser.open"
+
+
 def test_scan_zip_preserves_webbrowser_member_risk_after_other_controller_overwrite(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = (
@@ -811,42 +837,19 @@ def test_scan_zip_preserves_webbrowser_member_risk_after_other_controller_overwr
     assert python_checks[0].details["reason"] == "high-risk calls: webbrowser.open"
 
 
-def test_scan_zip_keeps_webbrowser_member_overwrites_controller_local(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    source = (
-        "import webbrowser\n"
-        "safe_browser = webbrowser.get('safe')\n"
-        "safe_browser.open = len\n"
-        "other_browser = webbrowser.get('other')\n"
-        "other_browser.open('https://example.invalid')\n"
-    )
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S109"
-    assert python_checks[0].details["reason"] == "high-risk calls: webbrowser.open"
-
-
-def test_scan_zip_restores_dynamic_member_risk_after_delete(tmp_path: Path) -> None:
+def test_scan_zip_preserves_dynamic_member_risk_after_same_name_reassignment(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = (
         "import ctypes\n"
         "import webbrowser\n"
-        "browser = webbrowser.get()\n"
+        "browser = webbrowser.get('safe')\n"
         "browser.open = len\n"
-        "del browser.open\n"
+        "browser = webbrowser.get('other')\n"
         "browser.open('https://example.invalid')\n"
-        "ctypes.cdll.payload = len\n"
-        "del ctypes.cdll.payload\n"
-        "ctypes.cdll.payload\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.payload = len\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.payload\n"
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
@@ -860,10 +863,43 @@ def test_scan_zip_restores_dynamic_member_risk_after_delete(tmp_path: Path) -> N
     ]
     checks_by_rule = {check.rule_code: check for check in python_checks}
     assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
-    assert checks_by_rule["S110"].details["reason"] == "high-risk calls: ctypes.cdll.payload"
+    assert checks_by_rule["S110"].details["reason"] == "high-risk calls: ctypes.LibraryLoader.payload"
 
 
-def test_scan_zip_flags_ctypes_cdll_subclass_class_local_initializer_alias(tmp_path: Path) -> None:
+def test_scan_zip_restores_dynamic_member_risk_after_delete(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import webbrowser\n"
+        "browser = webbrowser.get()\n"
+        "browser.open = len\n"
+        "del browser.open\n"
+        "browser.open('https://example.invalid')\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.payload = len\n"
+        "del loader.payload\n"
+        "loader.payload\n"
+        "ctypes.windll.payload = len\n"
+        "del ctypes.windll.payload\n"
+        "ctypes.windll.payload\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
+    assert "ctypes.LibraryLoader.payload" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.windll.payload" in checks_by_rule["S110"].details["reason"]
+
+
+def test_scan_zip_preserves_ctypes_subclass_with_class_local_init_alias(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = (
         "import ctypes\n"
@@ -871,6 +907,7 @@ def test_scan_zip_flags_ctypes_cdll_subclass_class_local_initializer_alias(tmp_p
         "    init = ctypes.CDLL.__init__\n"
         "    def __init__(self, name: str) -> None:\n"
         "        self.init(name)\n"
+        "MyCDLL('/tmp/payload.so')\n"
         "ctypes.LibraryLoader(MyCDLL).payload\n"
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -885,7 +922,7 @@ def test_scan_zip_flags_ctypes_cdll_subclass_class_local_initializer_alias(tmp_p
     ]
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S110"
-    assert python_checks[0].details["reason"] == "high-risk calls: ctypes.LibraryLoader.payload"
+    assert python_checks[0].details["reason"] == "high-risk calls: ctypes.CDLL, ctypes.LibraryLoader.payload"
 
 
 def test_scan_zip_ignores_unreachable_ctypes_cdll_subclass_initializer(tmp_path: Path) -> None:
@@ -1095,6 +1132,24 @@ def test_scan_zip_preserves_safe_runpy_overwrite_before_conditional(tmp_path: Pa
             "import ctypes\nclass SafeCDLL(ctypes.CDLL):\n"
             "    def __init__(self, name: str) -> None:\n"
             "        pass\n"
+            "ctypes.LibraryLoader(SafeCDLL).payload\nSafeCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass Safe:\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        self.name = name\n"
+            "class NoLoad(Safe, ctypes.CDLL):\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        super().__init__(name)\n"
+            "ctypes.LibraryLoader(NoLoad).payload\nNoLoad('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass SafeCDLL(ctypes.CDLL):\n"
+            "    init = ctypes.CDLL.__init__\n"
+            "    def init(self, name: str) -> None:\n"
+            "        pass\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        self.init(name)\n"
             "ctypes.LibraryLoader(SafeCDLL).payload\nSafeCDLL('/missing')\n"
         ),
     ],
