@@ -926,6 +926,12 @@ def test_scan_zip_flags_empty_kwargs_loader_constructor_and_current_super(tmp_pa
     source = (
         "import ctypes\n"
         "ctypes.LibraryLoader(ctypes.CDLL, **{}).emptykwargs\n"
+        "class Empty:\n"
+        "    pass\n"
+        "class EmptyBaseSuperCDLL(Empty, ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super().__init__(name)\n"
+        "ctypes.LibraryLoader(EmptyBaseSuperCDLL).emptybasesuperlib\n"
         "class CurrentSuperCDLL(ctypes.CDLL):\n"
         "    def __init__(self, name: str) -> None:\n"
         "        super(CurrentSuperCDLL, self).__init__(name)\n"
@@ -945,7 +951,35 @@ def test_scan_zip_flags_empty_kwargs_loader_constructor_and_current_super(tmp_pa
     assert set(checks_by_rule) == {"S110"}
     s110_reason = checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.emptykwargs" in s110_reason
+    assert "ctypes.LibraryLoader.emptybasesuperlib" in s110_reason
     assert "ctypes.LibraryLoader.currentsuperlib" in s110_reason
+
+
+def test_scan_zip_resolves_initializer_delete_before_class_alias_fallback(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "class DeletedShadowCDLL(ctypes.CDLL):\n"
+        "    init = ctypes.CDLL.__init__\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        self.init = len\n"
+        "        del self.init\n"
+        "        self.init(name)\n"
+        "ctypes.LibraryLoader(DeletedShadowCDLL).deletedshadowlib\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S110"}
+    assert "ctypes.LibraryLoader.deletedshadowlib" in checks_by_rule["S110"].details["reason"]
 
 
 def test_scan_zip_resolves_imports_inside_ctypes_subclass_initializers(tmp_path: Path) -> None:
@@ -994,6 +1028,19 @@ def test_scan_zip_ignores_unreachable_new_returns_async_init_and_hasattr_alias(t
         "    async def __init__(self, name: str) -> None:\n"
         "        ctypes.CDLL.__init__(self, name)\n"
         "ctypes.LibraryLoader(AsyncInitCDLL).payload\n"
+        "class StaticInitCDLL(ctypes.CDLL):\n"
+        "    @staticmethod\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(StaticInitCDLL).payload\n"
+        "class SafeBase:\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        self.name = name\n"
+        "class SafeSuperCDLL(SafeBase, ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super().__init__(name)\n"
+        "ctypes.LibraryLoader(SafeSuperCDLL).payload\n"
+        "ctypes.LibraryLoader(**{'dlltype': ctypes.CDLL, 'bad': 1}).payload\n"
         "f = hasattr(os, 'system')\n"
         "f('id')\n"
     )

@@ -761,12 +761,17 @@ def _single_static_call_argument(
     mapping = keyword.value
     if not isinstance(mapping, ast.Dict):
         return None
+    static_items: list[tuple[str, ast.AST]] = []
     for key_node, value_node in zip(mapping.keys, mapping.values, strict=True):
         if key_node is None:
-            continue
-        if _resolve_static_string(key_node) == keyword_name:
-            return value_node
-    return None
+            return None
+        key = _resolve_static_string(key_node)
+        if key is None:
+            return None
+        static_items.append((key, value_node))
+    if len(static_items) != 1 or static_items[0][0] != keyword_name:
+        return None
+    return static_items[0][1]
 
 
 def _resolve_getattr_call_names(
@@ -1617,6 +1622,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self._class_scope_ids: set[int] = set()
         self._comprehension_outer_scope_indices: list[int] = []
         self._call_result_aliases: dict[int, _AliasValue] = {}
+        self._known_class_names: set[str] = set()
+        self._classes_with_local_initializers: set[str] = set()
         self._instance_binding_generations: dict[str, int] = {}
         self._non_module_scope_depth = 0
         self.risky_calls: set[str] = set()
@@ -2360,6 +2367,15 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         ):
             yield f"{target.value.id}.{target.attr}"
 
+    def _delete_initializer_binding(self, target: ast.AST, initializer_scope: _AliasScope) -> None:
+        for name in self._initializer_binding_names(target):
+            initializer_scope.pop(name, None)
+        if isinstance(target, ast.Starred):
+            self._delete_initializer_binding(target.value, initializer_scope)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                self._delete_initializer_binding(element, initializer_scope)
+
     @staticmethod
     def _initializer_import_bindings(statement: ast.Import | ast.ImportFrom) -> _AliasScope:
         bindings: _AliasScope = {}
@@ -2420,7 +2436,13 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if _resolve_call_name(super_call.func) != "super" or not loader_base_indices or super_call.keywords:
             return False
         if not super_call.args:
-            return 0 in loader_base_indices
+            return any(
+                not any(
+                    self._base_definitely_defines_initializer(base_names)
+                    for base_names in base_identity_names[:loader_index]
+                )
+                for loader_index in loader_base_indices
+            )
         if len(super_call.args) != 2:
             return False
         first_arg_names = self._reference_identity_names(super_call.args[0])
@@ -2430,6 +2452,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if first_arg_names & base_names:
                 return any(loader_index > index for loader_index in loader_base_indices)
         return False
+
+    def _base_definitely_defines_initializer(self, base_names: frozenset[str]) -> bool:
+        known_base_names = base_names & self._known_class_names
+        if not known_base_names:
+            return False
+        return any(base_name in self._classes_with_local_initializers for base_name in known_base_names)
 
     @staticmethod
     def _initializer_self_names(arguments: ast.arguments) -> frozenset[str]:
@@ -2570,6 +2598,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if isinstance(statement, (ast.Import, ast.ImportFrom)):
             initializer_scope.update(self._initializer_import_bindings(statement))
             return False
+        if isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                self._delete_initializer_binding(target, initializer_scope)
+            return False
         if isinstance(statement, ast.If):
             constant_bool = self._constant_bool(statement.test)
             if constant_bool is True:
@@ -2707,6 +2739,21 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         )
 
     @staticmethod
+    def _class_method_has_decorator(
+        method: ast.FunctionDef | ast.AsyncFunctionDef,
+        decorator_names: frozenset[str],
+    ) -> bool:
+        return any(_resolve_call_name(decorator) in decorator_names for decorator in method.decorator_list)
+
+    def _class_has_local_initializer(
+        self,
+        node: ast.ClassDef,
+        class_scope: _AliasScope,
+        init_method: ast.FunctionDef | ast.AsyncFunctionDef | None,
+    ) -> bool:
+        return init_method is not None or "__init__" in class_scope
+
+    @staticmethod
     def _return_value_is_obvious_non_instance(value: ast.AST | None) -> bool:
         if value is None:
             return False
@@ -2770,7 +2817,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         init_method = self._class_method(node, "__init__")
         if self._class_new_may_skip_init(node):
             return False
-        if isinstance(init_method, ast.AsyncFunctionDef):
+        if isinstance(init_method, ast.AsyncFunctionDef) or (
+            init_method is not None
+            and self._class_method_has_decorator(init_method, frozenset({"staticmethod", "builtins.staticmethod"}))
+        ):
             return False
         if init_method is None:
             class_init_alias = class_scope.get("__init__")
@@ -2804,6 +2854,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for keyword in node.keywords:
             self.visit(keyword)
         class_scope = self._visit_class_scope(node.body)
+        self._known_class_names.add(node.name)
+        if self._class_has_local_initializer(node, class_scope, self._class_method(node, "__init__")):
+            self._classes_with_local_initializers.add(node.name)
         ctypes_loader_type_aliases = (
             base_ctypes_loader_aliases if self._class_preserves_ctypes_loader_init(node, class_scope) else frozenset()
         )
