@@ -1708,6 +1708,30 @@ def test_detect_r_serialized_magic_headers(tmp_path: Path) -> None:
     assert validate_file_type(str(rds)) is True
 
 
+def test_detect_renamed_r_workspace_by_strong_header(tmp_path: Path) -> None:
+    disguised_workspace = tmp_path / "model.jpg"
+    disguised_workspace.write_bytes(b"RDX3\nX\nworkspace\nmodel")
+
+    assert detect_file_format_from_magic(str(disguised_workspace)) == "r_serialized"
+    assert detect_file_format(str(disguised_workspace)) == "r_serialized"
+
+
+def test_detect_r_raw_marker_requires_r_extension(tmp_path: Path) -> None:
+    explicit_rds = tmp_path / "model.rds"
+    explicit_rds.write_bytes(b"X\nmodel\nweights")
+    ambiguous_text = tmp_path / "notes.jpg"
+    ambiguous_text.write_bytes(b"X\nordinary exported table\n")
+    incomplete_workspace = tmp_path / "workspace.jpg"
+    incomplete_workspace.write_bytes(b"RDX3\nQ\nordinary exported table\n")
+
+    assert detect_file_format_from_magic(str(explicit_rds)) == "r_serialized"
+    assert detect_file_format(str(explicit_rds)) == "r_serialized"
+    assert detect_file_format_from_magic(str(ambiguous_text)) == "unknown"
+    assert detect_file_format(str(ambiguous_text)) == "unknown"
+    assert detect_file_format_from_magic(str(incomplete_workspace)) == "unknown"
+    assert detect_file_format(str(incomplete_workspace)) == "unknown"
+
+
 def test_detect_cntk_formats_by_signature(tmp_path: Path) -> None:
     legacy_path = tmp_path / "legacy.dnn"
     legacy_path.write_bytes(
