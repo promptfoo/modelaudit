@@ -1328,7 +1328,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for reference in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
             if not reference.startswith(prefix):
                 continue
-            self.alias_scopes[-1][f"{local_name}{reference.removeprefix(import_name)}"] = frozenset({reference})
+            self.alias_scopes[-1][f"{local_name}{reference.removeprefix(import_name)}"] = _resolve_aliases(
+                reference,
+                self.alias_scopes,
+            )
 
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
         local_name = alias.asname or alias.name
@@ -1344,6 +1347,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if "." not in name:
             self._shadow_static_member_aliases_in_scope(scope_index, name)
         self.alias_scopes[scope_index][name] = resolved_names
+
+    def _should_track_syntactic_static_reference(self, syntactic_name: str) -> bool:
+        root_name = syntactic_name.split(".", maxsplit=1)[0]
+        root_aliases, found = _lookup_bound_alias(root_name, self.alias_scopes)
+        return not found or root_aliases is not None
 
     def _shadow_static_member_aliases(self, local_name: str) -> None:
         self._shadow_static_member_aliases_in_scope(len(self.alias_scopes) - 1, local_name)
@@ -1402,7 +1410,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             syntactic_name = _resolve_call_name(target)
             resolved_target_names = self._resolve_reference_names(target)
             target_names = set(resolved_target_names or frozenset())
-            if syntactic_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
+            if (
+                syntactic_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
+                and self._should_track_syntactic_static_reference(syntactic_name)
+            ):
                 target_names.add(syntactic_name)
             if not target_names:
                 return
