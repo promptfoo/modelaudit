@@ -36,10 +36,15 @@ DEFAULT_MAX_DECOMPRESSED_BYTES = 512 * 1024 * 1024
 DEFAULT_MAX_DECOMPRESSION_RATIO = 250.0
 ARCHIVE_MEMBER_COPY_CHUNK_BYTES = 64 * 1024
 MAX_TAR_PYTHON_ANALYSIS_BYTES = 10 * 1024 * 1024
+TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY = "_tar_security_only_nested_member_entries"
 
 _GZIP_MAGIC = b"\x1f\x8b"
 _BZIP2_MAGIC = b"BZh"
 _XZ_MAGIC = b"\xfd7zXZ\x00"
+
+
+class _TarEntryExtractionIncomplete(ValueError):
+    """Raised when a TAR member cannot be inspected within extraction policy."""
 
 
 class TarScanner(BaseScanner):
@@ -129,15 +134,7 @@ class TarScanner(BaseScanner):
             result.finish(success=False)
             return result
         except Exception as e:
-            result.add_check(
-                name="TAR File Scan",
-                passed=False,
-                message=f"Error scanning tar file: {e!s}",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
-            )
-            mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
+            self._record_incomplete_tar_scan(result, path, e)
             result.finish(success=False)
             return result
 
@@ -227,10 +224,12 @@ class TarScanner(BaseScanner):
         """Stream a TAR member to disk while enforcing the configured size limit."""
         max_entry_size = self._get_max_entry_size()
         if member.size > max_entry_size:
-            raise ValueError(f"TAR entry {member.name} exceeds maximum size of {max_entry_size} bytes")
+            raise _TarEntryExtractionIncomplete(
+                f"TAR entry {member.name} exceeds maximum size of {max_entry_size} bytes"
+            )
         fileobj = tar.extractfile(member)
         if fileobj is None:
-            raise ValueError(f"Unable to extract TAR entry: {member.name}")
+            raise _TarEntryExtractionIncomplete(f"Unable to extract TAR entry: {member.name}")
 
         total_size = 0
         tmp_path: str | None = None
@@ -243,7 +242,9 @@ class TarScanner(BaseScanner):
                         break
                     total_size += len(chunk)
                     if total_size > max_entry_size:
-                        raise ValueError(f"TAR entry {member.name} exceeds maximum size of {max_entry_size} bytes")
+                        raise _TarEntryExtractionIncomplete(
+                            f"TAR entry {member.name} exceeds maximum size of {max_entry_size} bytes"
+                        )
                     tmp.write(chunk)
         except Exception:
             if tmp_path and os.path.exists(tmp_path):
@@ -453,12 +454,32 @@ class TarScanner(BaseScanner):
 
         return True
 
+    @staticmethod
+    def _record_incomplete_tar_scan(result: ScanResult, path: str, exc: Exception) -> None:
+        """Record unavailable TAR traversal without discarding findings already collected."""
+        mark_archive_scan_incomplete(result, "tar_scan_incomplete")
+        result.add_check(
+            name="TAR File Scan",
+            passed=False,
+            message=f"Error scanning tar file: {exc!s}",
+            severity=IssueSeverity.INFO,
+            rule_code="S902",
+            location=path,
+            details={
+                "exception": str(exc),
+                "exception_type": type(exc).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "tar_scan_incomplete",
+            },
+        )
+
     def _scan_tar_file(self, path: str, depth: int = 0) -> ScanResult:
         result = ScanResult(scanner_name=self.name)
         contents: list[dict[str, Any]] = []
         scan_complete = True
 
         if depth >= self.max_depth:
+            mark_archive_scan_incomplete(result, "tar_depth_limit")
             result.add_check(
                 name="TAR Depth Bomb Protection",
                 passed=False,
@@ -466,9 +487,13 @@ class TarScanner(BaseScanner):
                 rule_code="S902",
                 severity=IssueSeverity.WARNING,
                 location=path,
-                details={"depth": depth, "max_depth": self.max_depth},
+                details={
+                    "depth": depth,
+                    "max_depth": self.max_depth,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "tar_depth_limit",
+                },
             )
-            mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
             result.finish(success=False)
             return result
         else:
@@ -489,13 +514,24 @@ class TarScanner(BaseScanner):
             return result
 
         with tarfile.open(path, "r:*") as tar:
+            security_only_nested_entries = self.config.get(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY)
+            if not isinstance(security_only_nested_entries, set):
+                security_only_nested_entries = set()
             while True:
                 try:
                     member = tar.next()
                 except OSError as exc:
                     if not contents and exc.errno == errno.EINVAL and self._is_empty_tar_archive(path):
                         break
+                    scan_complete = False
+                    self._record_incomplete_tar_scan(result, path, exc)
+                    break
+                except tarfile.TarError:
                     raise
+                except Exception as exc:
+                    scan_complete = False
+                    self._record_incomplete_tar_scan(result, path, exc)
+                    break
 
                 if member is None:
                     break
@@ -580,7 +616,13 @@ class TarScanner(BaseScanner):
                     tmp_path, total_size = self._extract_member_to_tempfile(tar, member, suffix=suffix)
                     try:
                         if is_tar_extension and tarfile.is_tarfile(tmp_path):
-                            nested_result = self._scan_tar_file(tmp_path, depth + 1)
+                            nested_config = dict(self.config)
+                            nested_config.pop(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY, None)
+                            # Extracted members are deleted below, so temporary paths
+                            # cannot serve as reusable cache keys.
+                            nested_config["cache_enabled"] = False
+                            nested_config["_archive_depth"] = depth + 1
+                            nested_result = self._scan_nested_archive_entry(tmp_path, nested_config)
                             if member_scan_incomplete(nested_result):
                                 scan_complete = False
 
@@ -597,39 +639,69 @@ class TarScanner(BaseScanner):
                                 result=result,
                                 max_python_analysis_bytes=MAX_TAR_PYTHON_ANALYSIS_BYTES,
                                 python_analysis_incomplete_reason="tar_python_member_analysis_incomplete",
+                                executable_analysis_incomplete_reason="tar_executable_member_analysis_incomplete",
                             )
 
-                            nested_config = dict(self.config)
-                            nested_config["_archive_depth"] = depth + 1
-                            file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
-                            if member_scan_incomplete(file_result):
-                                scan_complete = False
-
-                            self._rewrite_nested_result_context(file_result, tmp_path, path, name)
-                            result.merge(file_result)
-                            asset_entry = asset_from_scan_result(f"{path}:{name}", file_result)
-
-                            if file_result.scanner_name == "unknown":
+                            if name in security_only_nested_entries:
                                 result.bytes_scanned += total_size
+                                asset_entry = {"path": f"{path}:{name}", "type": "nemo_managed"}
+                            else:
+                                nested_config = dict(self.config)
+                                nested_config.pop(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY, None)
+                                # Extracted members are deleted below, so temporary paths
+                                # cannot serve as reusable cache keys.
+                                nested_config["cache_enabled"] = False
+                                nested_config["_archive_depth"] = depth + 1
+                                file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
+                                self._rewrite_nested_result_context(file_result, tmp_path, path, name)
+                                if member_scan_incomplete(file_result):
+                                    scan_complete = False
+
+                                result.merge(file_result)
+                                asset_entry = asset_from_scan_result(f"{path}:{name}", file_result)
+
+                                if file_result.scanner_name == "unknown":
+                                    result.bytes_scanned += total_size
 
                         asset_entry.setdefault("size", member.size)
                         contents.append(asset_entry)
                     finally:
                         os.unlink(tmp_path)
-                except Exception as exc:
+                except _TarEntryExtractionIncomplete as exc:
                     scan_complete = False
+                    mark_archive_scan_incomplete(result, "tar_entry_extraction_incomplete")
                     result.add_check(
                         name="TAR Entry Scan",
                         passed=False,
-                        message=f"Error scanning TAR entry {name}: {exc!s}",
-                        severity=IssueSeverity.WARNING,
+                        message=f"Unable to fully inspect TAR entry {name}: {exc!s}",
+                        severity=IssueSeverity.INFO,
+                        rule_code="S902",
                         location=f"{path}:{name}",
                         details={
                             "entry": name,
                             "exception": str(exc),
                             "exception_type": type(exc).__name__,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "tar_entry_extraction_incomplete",
                         },
+                    )
+                except Exception as exc:
+                    scan_complete = False
+                    mark_archive_scan_incomplete(result, "tar_entry_scan_incomplete")
+                    result.add_check(
+                        name="TAR Entry Scan",
+                        passed=False,
+                        message=f"Error scanning TAR entry {name}: {exc!s}",
+                        severity=IssueSeverity.INFO,
                         rule_code="S902",
+                        location=f"{path}:{name}",
+                        details={
+                            "entry": name,
+                            "exception": str(exc),
+                            "exception_type": type(exc).__name__,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "tar_entry_scan_incomplete",
+                        },
                     )
 
         result.metadata["contents"] = contents

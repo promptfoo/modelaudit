@@ -7,6 +7,7 @@ import shutil
 import sys
 import tempfile
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, Mock, patch
@@ -117,6 +118,7 @@ def pytest_runtest_setup(item):
             "test_regular_scan_hash.py",  # Regular scan mode hash generation tests
             "test_core_asset_extraction.py",  # Check consolidation and location parsing regressions
             "test_manifest_scanner.py",  # Manifest scanner tests
+            "test_text_scanner.py",  # ML-related text scanner outcome tests
             "test_metadata_scanner.py",  # Metadata scanner tests
             "test_metadata_extractor.py",  # Metadata extractor helper routing and CLI tests
             "test_weak_hash_detection.py",  # Weak hash detection tests
@@ -133,12 +135,17 @@ def pytest_runtest_setup(item):
             "test_onnx_scanner.py",  # ONNX scanner CVE-2025-51480 tests
             "test_pmml_scanner.py",  # PMML suspicious-content false-positive regressions
             "test_safetensors_scanner.py",  # SafeTensors scanner dtype and metadata tests
+            "test_weight_distribution_scanner.py",  # Weight-distribution false-positive and coverage tests
             "test_rule_mapper.py",  # Rule mapper validity and network mapping tests
             "test_rule_code_registry_consistency.py",  # Scanner literal rule-code registry consistency
+            "test_network_comm_detector.py",  # Network URL/path redaction tests
+            "test_secrets_detector.py",  # Embedded secret detector redaction tests
+            "test_jit_script_detector.py",  # JIT embedded Python execution regressions
             "test_keras_h5_scanner.py",  # Keras H5 scanner CVE-2025-9905 tests
             "test_cve_detection.py",  # CVE detection tests
             "test_jit_script_detector.py",  # JIT embedded Python execution detector tests
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
+            "test_pytorch_binary_scanner.py",  # PyTorch binary scanner outcome regressions
             "test_paddle_scanner.py",  # PaddlePaddle scanner tests
             "test_cve_2025_10155_bin_pickle.py",  # CVE-2025-10155 .bin pickle detection tests
             "test_compressed_scanner.py",  # standalone compressed wrapper scanner tests
@@ -151,6 +158,7 @@ def pytest_runtest_setup(item):
             "test_llamafile_scanner.py",  # Llamafile executable scanner tests
             "test_coreml_scanner.py",  # CoreML scanner tests
             "test_mxnet_scanner.py",  # MXNet scanner tests
+            "test_openvino_scanner.py",  # OpenVINO namespace and sidecar safety tests
             "test_filetype.py",  # File type detection and validation tests
             "test_tf_metagraph_scanner.py",  # TensorFlow MetaGraph scanner tests
             "test_tf_savedmodel_scanner.py",  # TensorFlow SavedModel scanner tests
@@ -158,6 +166,7 @@ def pytest_runtest_setup(item):
             "test_tensorrt_scanner.py",  # TensorRT scanner tests
             "test_torchserve_mar_scanner.py",  # TorchServe .mar scanner tests
             "test_jinja2_template_scanner.py",  # Jinja2 template parse fallback regression tests
+            "test_evidence_redaction.py",  # Shared scanner evidence redaction tests
             "test_executorch_scanner.py",  # ExecuTorch scanner tests
             "test_telemetry.py",  # telemetry payload and availability tests
             "test_telemetry_decoupling.py",  # telemetry failure-isolation tests
@@ -201,9 +210,17 @@ def pytest_runtest_setup(item):
             "test_docker_workflow.py",  # Docker workflow regression tests
             "test_perf_workflow.py",  # Performance benchmark workflow regression tests
         ]
+        allowed_test_nodeids = [
+            "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_vulnerable_pytorch_prereleases",
+            "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_allows_torch_load_for_stable_patched_pytorch",
+            "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_unknown_pytorch_version",
+            "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_unknown_patched_version_suffixes",
+        ]
 
         # Check if this is an allowed test file
-        if any(allowed_file in test_file for allowed_file in allowed_test_files):
+        if any(allowed_file in test_file for allowed_file in allowed_test_files) or any(
+            item.nodeid.startswith(allowed_nodeid) for allowed_nodeid in allowed_test_nodeids
+        ):
             pass  # Allow these tests to continue to framework check
         else:
             # Skip all other tests on Python 3.10/3.12/3.13 to prevent CI issues
@@ -214,6 +231,16 @@ def pytest_runtest_setup(item):
         marker = item.get_closest_marker(marker_name)
         if marker is not None and not _check_framework(module_name):
             pytest.skip(f"{marker_name} is not installed")
+
+
+@pytest.fixture(autouse=True)
+def reset_rule_config_between_tests() -> Iterator[None]:
+    """Keep CLI rule suppressions from leaking between tests."""
+    from modelaudit.config import reset_config
+
+    reset_config()
+    yield
+    reset_config()
 
 
 @pytest.fixture(autouse=True)

@@ -18,12 +18,24 @@ from modelaudit.detectors.jit_script import JITScriptDetector
 from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import (
-    ONNX_PARSE_INCONCLUSIVE_REASON,
     ONNX_STRUCTURE_INCONCLUSIVE_REASON,
     OnnxScanner,
     _confirmed_python_operator_findings,
 )
 from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
+def _make_external_tensor(name: str, data_type: int, dims: list[int], external_path: str) -> Any:
+    tensor = onnx.TensorProto()
+    tensor.name = name
+    tensor.data_type = data_type
+    tensor.dims.extend(dims)
+    tensor.data_location = onnx.TensorProto.EXTERNAL
+    entry = StringStringEntryProto()
+    entry.key = "location"
+    entry.value = external_path
+    tensor.external_data.append(entry)
+    return tensor
 
 
 def create_onnx_model(
@@ -101,6 +113,316 @@ def create_python_onnx_model(tmp_path: Path) -> Path:
     return path
 
 
+def create_onnx_model_with_nested_external_initializer(
+    tmp_path: Path,
+    *,
+    external_path: str,
+    missing_external: bool = False,
+) -> Path:
+    tensor = helper.make_tensor("nested_W", TensorProto.FLOAT, [1], vals=[1.0])
+    tensor.data_location = onnx.TensorProto.EXTERNAL
+    entry = StringStringEntryProto()
+    entry.key = "location"
+    entry.value = external_path
+    tensor.external_data.append(entry)
+
+    then_branch = helper.make_graph(
+        [helper.make_node("Identity", ["nested_W"], ["Z"])],
+        "then_branch",
+        [],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+        initializer=[tensor],
+    )
+    else_tensor = helper.make_tensor("else_W", TensorProto.FLOAT, [1], vals=[0.0])
+    else_branch = helper.make_graph(
+        [helper.make_node("Identity", ["else_W"], ["Z"])],
+        "else_branch",
+        [],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+        initializer=[else_tensor],
+    )
+    condition = helper.make_tensor("cond", TensorProto.BOOL, [], vals=[True])
+    graph = helper.make_graph(
+        [helper.make_node("If", ["cond"], ["Y"], then_branch=then_branch, else_branch=else_branch)],
+        "graph",
+        [],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+        initializer=[condition],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / "nested_external.onnx"
+    onnx.save(model, str(path))
+
+    if not missing_external:
+        external_file = tmp_path / external_path
+        external_file.parent.mkdir(parents=True, exist_ok=True)
+        external_file.write_bytes(struct.pack("f", 1.0))
+
+    return path
+
+
+def create_onnx_model_with_nested_external_sparse_initializer(
+    tmp_path: Path,
+    *,
+    external_path: str,
+    external_tensor: str = "values",
+    missing_external: bool = False,
+) -> Path:
+    assert external_tensor in {"values", "indices"}
+    values = (
+        _make_external_tensor("nested_sparse_W", TensorProto.FLOAT, [1], external_path)
+        if external_tensor == "values"
+        else helper.make_tensor("nested_sparse_W", TensorProto.FLOAT, [1], vals=[1.0])
+    )
+    indices = (
+        _make_external_tensor("nested_sparse_indices", TensorProto.INT64, [1], external_path)
+        if external_tensor == "indices"
+        else helper.make_tensor("nested_sparse_indices", TensorProto.INT64, [1], vals=[0])
+    )
+    sparse_tensor = helper.make_sparse_tensor(values, indices, [1])
+
+    then_branch = helper.make_graph(
+        [helper.make_node("Identity", ["nested_sparse_W"], ["Z"])],
+        "then_branch",
+        [],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+        sparse_initializer=[sparse_tensor],
+    )
+    else_branch = helper.make_graph(
+        [helper.make_node("Identity", ["X"], ["Z"])],
+        "else_branch",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+    )
+    condition = helper.make_tensor("cond", TensorProto.BOOL, [], vals=[True])
+    input_value = helper.make_tensor("X", TensorProto.FLOAT, [1], vals=[0.0])
+    graph = helper.make_graph(
+        [helper.make_node("If", ["cond"], ["Y"], then_branch=then_branch, else_branch=else_branch)],
+        "graph",
+        [],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+        initializer=[condition, input_value],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / "nested_sparse_external.onnx"
+    onnx.save(model, str(path))
+
+    if not missing_external:
+        external_file = tmp_path / external_path
+        external_file.parent.mkdir(parents=True, exist_ok=True)
+        external_file.write_bytes(
+            struct.pack("f" if external_tensor == "values" else "q", 1 if external_tensor == "values" else 0)
+        )
+
+    return path
+
+
+def create_onnx_model_with_nested_external_tensor_attribute(
+    tmp_path: Path,
+    *,
+    external_path: str,
+    attribute_kind: str,
+    external_tensor: str = "values",
+    missing_external: bool = False,
+) -> Path:
+    assert attribute_kind in {"dense", "sparse"}
+    assert external_tensor in {"values", "indices"}
+    values = (
+        _make_external_tensor("nested_attr_W", TensorProto.FLOAT, [1], external_path)
+        if external_tensor == "values"
+        else helper.make_tensor("nested_attr_W", TensorProto.FLOAT, [1], vals=[1.0])
+    )
+    indices = (
+        _make_external_tensor("nested_attr_indices", TensorProto.INT64, [1], external_path)
+        if external_tensor == "indices"
+        else helper.make_tensor("nested_attr_indices", TensorProto.INT64, [1], vals=[0])
+    )
+    attribute = (
+        {"value": values}
+        if attribute_kind == "dense"
+        else {"sparse_value": helper.make_sparse_tensor(values, indices, [1])}
+    )
+
+    then_branch = helper.make_graph(
+        [helper.make_node("Constant", [], ["Z"], **attribute)],
+        "then_branch",
+        [],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+    )
+    else_branch = helper.make_graph(
+        [helper.make_node("Identity", ["X"], ["Z"])],
+        "else_branch",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+    )
+    condition = helper.make_tensor("cond", TensorProto.BOOL, [], vals=[True])
+    input_value = helper.make_tensor("X", TensorProto.FLOAT, [1], vals=[0.0])
+    graph = helper.make_graph(
+        [helper.make_node("If", ["cond"], ["Y"], then_branch=then_branch, else_branch=else_branch)],
+        "graph",
+        [],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+        initializer=[condition, input_value],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / f"nested_{attribute_kind}_attribute_external.onnx"
+    onnx.save(model, str(path))
+
+    if not missing_external:
+        external_file = tmp_path / external_path
+        external_file.parent.mkdir(parents=True, exist_ok=True)
+        external_file.write_bytes(
+            struct.pack("f" if external_tensor == "values" else "q", 1 if external_tensor == "values" else 0)
+        )
+
+    return path
+
+
+def create_onnx_model_with_function_default_external_tensor_attribute(
+    tmp_path: Path,
+    *,
+    external_path: str,
+    attribute_kind: str,
+    external_tensor: str = "values",
+    missing_external: bool = False,
+) -> Path:
+    assert attribute_kind in {"dense", "sparse"}
+    assert external_tensor in {"values", "indices"}
+    values = (
+        _make_external_tensor("default_W", TensorProto.FLOAT, [1], external_path)
+        if external_tensor == "values"
+        else helper.make_tensor("default_W", TensorProto.FLOAT, [1], vals=[1.0])
+    )
+    indices = (
+        _make_external_tensor("default_indices", TensorProto.INT64, [1], external_path)
+        if external_tensor == "indices"
+        else helper.make_tensor("default_indices", TensorProto.INT64, [1], vals=[0])
+    )
+    attr_name = "default_value"
+    attr_type = onnx.AttributeProto.TENSOR
+    attr_value: Any = values
+    node_attribute_name = "value"
+    if attribute_kind == "sparse":
+        attr_type = onnx.AttributeProto.SPARSE_TENSOR
+        attr_value = helper.make_sparse_tensor(values, indices, [1])
+        node_attribute_name = "sparse_value"
+    node = helper.make_node("Constant", [], ["Y"])
+    node.attribute.extend(
+        [
+            onnx.AttributeProto(
+                name=node_attribute_name,
+                ref_attr_name=attr_name,
+                type=attr_type,
+            )
+        ]
+    )
+    function = helper.make_function(
+        "local",
+        "ExternalDefault",
+        [],
+        ["Y"],
+        [node],
+        [helper.make_opsetid("", 13)],
+        attribute_protos=[helper.make_attribute(attr_name, attr_value)],
+    )
+    graph = helper.make_graph(
+        [helper.make_node("ExternalDefault", [], ["Y"], domain="local")],
+        "graph",
+        [],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+    )
+    model = helper.make_model(
+        graph,
+        functions=[function],
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+    )
+    model.ir_version = 9
+    path = tmp_path / f"function_default_{attribute_kind}_external.onnx"
+    onnx.save(model, str(path))
+
+    if not missing_external:
+        external_file = tmp_path / external_path
+        external_file.parent.mkdir(parents=True, exist_ok=True)
+        external_file.write_bytes(
+            struct.pack("f" if external_tensor == "values" else "q", 1 if external_tensor == "values" else 0)
+        )
+
+    return path
+
+
+def create_onnx_model_with_function_body_external_initializer(
+    tmp_path: Path,
+    *,
+    external_path: str,
+    missing_external: bool = False,
+) -> Path:
+    tensor = onnx.TensorProto()
+    tensor.name = "function_W"
+    tensor.data_type = TensorProto.FLOAT
+    tensor.dims.append(1)
+    tensor.data_location = onnx.TensorProto.EXTERNAL
+    entry = StringStringEntryProto()
+    entry.key = "location"
+    entry.value = external_path
+    tensor.external_data.append(entry)
+
+    then_branch = helper.make_graph(
+        [helper.make_node("Identity", ["function_W"], ["Z"])],
+        "function_then_branch",
+        [],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+        initializer=[tensor],
+    )
+    else_branch = helper.make_graph(
+        [helper.make_node("Identity", ["X"], ["Z"])],
+        "function_else_branch",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+    )
+    if_node = helper.make_node(
+        "If",
+        ["cond"],
+        ["Y"],
+        then_branch=then_branch,
+        else_branch=else_branch,
+    )
+    function = helper.make_function(
+        "local",
+        "SelectExternal",
+        ["cond", "X"],
+        ["Y"],
+        [if_node],
+        [helper.make_opsetid("", 13)],
+    )
+    condition = helper.make_tensor("cond", TensorProto.BOOL, [], vals=[True])
+    input_value = helper.make_tensor("X", TensorProto.FLOAT, [1], vals=[0.0])
+    graph = helper.make_graph(
+        [helper.make_node("SelectExternal", ["cond", "X"], ["Y"], domain="local")],
+        "graph",
+        [],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+        initializer=[condition, input_value],
+    )
+    model = helper.make_model(
+        graph,
+        functions=[function],
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+    )
+    model.ir_version = 9
+    path = tmp_path / "function_body_external.onnx"
+    onnx.save(model, str(path))
+
+    if not missing_external:
+        external_file = tmp_path / external_path
+        external_file.parent.mkdir(parents=True, exist_ok=True)
+        external_file.write_bytes(struct.pack("f", 1.0))
+
+    return path
+
+
 def _failed_custom_domain_checks(result: Any) -> list[Any]:
     return [c for c in result.checks if c.name == "Custom Operator Domain Check" and c.status == CheckStatus.FAILED]
 
@@ -144,7 +466,7 @@ def test_onnx_scanner_unknown_only_payload_is_inconclusive(tmp_path: Path) -> No
     assert check.details["ir_version"] == 0
 
 
-def test_onnx_scanner_tentative_protobuf_parse_failure_is_rejected_cleanly(tmp_path: Path) -> None:
+def test_onnx_scanner_tentative_protobuf_parse_failure_is_inconclusive(tmp_path: Path) -> None:
     model_path = tmp_path / "ambiguous.jpg"
     model_path.write_bytes(b"\x12\x05oops")
     scanner = OnnxScanner(
@@ -158,10 +480,27 @@ def test_onnx_scanner_tentative_protobuf_parse_failure_is_rejected_cleanly(tmp_p
     result = scanner.scan(str(model_path))
 
     assert result.scanner_name == "unknown"
-    assert result.success is True
-    assert result.issues == []
-    assert result.metadata["tentative_protobuf_candidate_rejected"] is True
-    assert "scan_outcome" not in result.metadata
+    assert result.success is False
+    assert result.bytes_scanned == model_path.stat().st_size
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["tentative_protobuf_candidate_unanalyzed"] == "onnx_parse_failed"
+    assert "onnx_tentative_candidate_parse_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
+
+
+def test_onnx_scanner_tentative_invalid_version_still_detects_python_operator(tmp_path: Path) -> None:
+    model_path = create_python_onnx_model(tmp_path)
+    model = onnx.load(str(model_path))
+    model.ir_version = 0
+    onnx.save(model, str(model_path))
+    scanner = OnnxScanner({FORMAT_VALIDATION_CONFIG_KEY: {"routed_format": PROTOBUF_MODEL_CANDIDATE_FORMAT}})
+
+    result = scanner.scan(str(model_path))
+
+    assert result.scanner_name == "onnx"
+    assert result.success is False
+    assert ONNX_STRUCTURE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
 
 
 def test_onnx_scanner_reuses_raw_bytes_for_model_parse(
@@ -666,6 +1005,77 @@ def test_onnx_scanner_subgraph_snake_python_op_still_flagged(tmp_path: Path) -> 
     )
 
 
+def test_onnx_scanner_function_default_graph_python_op_still_flagged(tmp_path: Path) -> None:
+    """A Python op in a graph-valued function default must be inspected."""
+    then_branch = helper.make_graph(
+        [helper.make_node("Python_Op", ["X"], ["Y"])],
+        "then",
+        [],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+    )
+    else_branch = helper.make_graph(
+        [helper.make_node("Identity", ["X"], ["Y"])],
+        "else",
+        [],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+    )
+    if_node = helper.make_node("If", ["cond"], ["Y"])
+    if_node.attribute.extend(
+        [
+            onnx.AttributeProto(
+                name="then_branch",
+                ref_attr_name="then_graph",
+                type=onnx.AttributeProto.GRAPH,
+            ),
+            onnx.AttributeProto(
+                name="else_branch",
+                ref_attr_name="else_graph",
+                type=onnx.AttributeProto.GRAPH,
+            ),
+        ]
+    )
+    function = helper.make_function(
+        "local",
+        "Select",
+        ["cond", "X"],
+        ["Y"],
+        [if_node],
+        [helper.make_opsetid("", 13)],
+        attribute_protos=[
+            helper.make_attribute("then_graph", then_branch),
+            helper.make_attribute("else_graph", else_branch),
+        ],
+    )
+    graph = helper.make_graph(
+        [helper.make_node("Select", ["cond", "X"], ["Y"], domain="local")],
+        "graph",
+        [
+            helper.make_tensor_value_info("cond", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, [1]),
+        ],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+    )
+    model = helper.make_model(
+        graph,
+        functions=[function],
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+    )
+    model.ir_version = 9
+    onnx.checker.check_model(model)
+    model_path = tmp_path / "function_default_graph_python_op.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Python Operator Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("op_type") == "Python_Op"
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize("training_graph_field", ["initialization", "algorithm"])
 def test_onnx_scanner_training_graph_pyop_still_flagged(tmp_path: Path, training_graph_field: str) -> None:
     """A PyOp in either training graph must not be discarded as weight-data noise."""
@@ -999,6 +1409,237 @@ class TestCVE202427318NestedPathTraversal:
         assert len(cve_checks) > 0
         assert cve_checks[0].details["cwe"] == "CWE-22"
         assert cve_checks[0].details["cvss"] == 7.5
+
+    def test_nested_graph_initializer_traversal_detected(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model_with_nested_external_initializer(
+            tmp_path,
+            external_path="weights/../../../tmp/exfil",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is False
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2024-27318"]
+        assert len(cve_checks) > 0
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["tensor"] == "nested_W"
+
+    @pytest.mark.parametrize(
+        ("external_tensor", "tensor_name"),
+        [("values", "nested_sparse_W"), ("indices", "nested_sparse_indices")],
+    )
+    def test_nested_graph_sparse_initializer_traversal_detected(
+        self,
+        tmp_path: Path,
+        external_tensor: str,
+        tensor_name: str,
+    ) -> None:
+        model_path = create_onnx_model_with_nested_external_sparse_initializer(
+            tmp_path,
+            external_path="weights/../../../tmp/exfil",
+            external_tensor=external_tensor,
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is False
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2024-27318"]
+        assert len(cve_checks) > 0
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["tensor"] == tensor_name
+
+    @pytest.mark.parametrize(
+        ("attribute_kind", "external_tensor", "tensor_name"),
+        [
+            ("dense", "values", "nested_attr_W"),
+            ("sparse", "values", "nested_attr_W"),
+            ("sparse", "indices", "nested_attr_indices"),
+        ],
+    )
+    def test_nested_graph_tensor_attribute_traversal_detected(
+        self,
+        tmp_path: Path,
+        attribute_kind: str,
+        external_tensor: str,
+        tensor_name: str,
+    ) -> None:
+        model_path = create_onnx_model_with_nested_external_tensor_attribute(
+            tmp_path,
+            external_path="weights/../../../tmp/exfil",
+            attribute_kind=attribute_kind,
+            external_tensor=external_tensor,
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is False
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2024-27318"]
+        assert len(cve_checks) > 0
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["tensor"] == tensor_name
+
+    @pytest.mark.parametrize(
+        ("attribute_kind", "external_tensor", "tensor_name"),
+        [
+            ("dense", "values", "default_W"),
+            ("sparse", "values", "default_W"),
+            ("sparse", "indices", "default_indices"),
+        ],
+    )
+    def test_function_default_tensor_attribute_traversal_detected(
+        self,
+        tmp_path: Path,
+        attribute_kind: str,
+        external_tensor: str,
+        tensor_name: str,
+    ) -> None:
+        model_path = create_onnx_model_with_function_default_external_tensor_attribute(
+            tmp_path,
+            external_path="weights/../../../tmp/exfil",
+            attribute_kind=attribute_kind,
+            external_tensor=external_tensor,
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is False
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2024-27318"]
+        assert len(cve_checks) > 0
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["tensor"] == tensor_name
+
+    def test_nested_graph_initializer_in_dir_dotdot_not_flagged(self, tmp_path: Path) -> None:
+        (tmp_path / "nested_weights.bin").write_bytes(struct.pack("f", 1.0))
+        model_path = create_onnx_model_with_nested_external_initializer(
+            tmp_path,
+            external_path="weights/../nested_weights.bin",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        traversal_checks = [
+            c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
+        ]
+        assert traversal_checks == []
+        size_checks = [
+            c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.PASSED
+        ]
+        assert len(size_checks) > 0
+        assert size_checks[0].details["tensor"] == "nested_W"
+
+    def test_nested_graph_sparse_initializer_in_dir_dotdot_not_flagged(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model_with_nested_external_sparse_initializer(
+            tmp_path,
+            external_path="weights/../nested_weights.bin",
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        traversal_checks = [
+            c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
+        ]
+        assert traversal_checks == []
+        size_checks = [
+            c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.PASSED
+        ]
+        assert len(size_checks) > 0
+        assert size_checks[0].details["tensor"] == "nested_sparse_W"
+
+    def test_nested_graph_sparse_attribute_in_dir_dotdot_not_flagged(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model_with_nested_external_tensor_attribute(
+            tmp_path,
+            external_path="weights/../nested_weights.bin",
+            attribute_kind="sparse",
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        traversal_checks = [
+            c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
+        ]
+        assert traversal_checks == []
+        size_checks = [
+            c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.PASSED
+        ]
+        assert len(size_checks) > 0
+        assert size_checks[0].details["tensor"] == "nested_attr_W"
+
+    def test_function_default_sparse_attribute_in_dir_dotdot_not_flagged(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model_with_function_default_external_tensor_attribute(
+            tmp_path,
+            external_path="weights/../nested_weights.bin",
+            attribute_kind="sparse",
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        traversal_checks = [
+            c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
+        ]
+        assert traversal_checks == []
+        size_checks = [
+            c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.PASSED
+        ]
+        assert len(size_checks) > 0
+        assert size_checks[0].details["tensor"] == "default_W"
+
+    def test_nested_graph_initializer_missing_external_data_reported(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model_with_nested_external_initializer(
+            tmp_path,
+            external_path="missing_nested_weights.bin",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        missing_checks = [
+            c for c in result.checks if c.name == "External Data Reference Check" and c.status == CheckStatus.FAILED
+        ]
+        assert len(missing_checks) == 1
+        assert missing_checks[0].severity == IssueSeverity.WARNING
+        assert missing_checks[0].details["sample_tensors"] == ["nested_W"]
+
+    def test_function_body_initializer_traversal_detected(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model_with_function_body_external_initializer(
+            tmp_path,
+            external_path="weights/../../../tmp/exfil",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is False
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2024-27318"]
+        assert len(cve_checks) > 0
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["tensor"] == "function_W"
+
+    def test_function_body_initializer_in_dir_dotdot_not_flagged(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model_with_function_body_external_initializer(
+            tmp_path,
+            external_path="weights/../function_weights.bin",
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        traversal_checks = [
+            c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
+        ]
+        assert traversal_checks == []
+        size_checks = [
+            c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.PASSED
+        ]
+        assert len(size_checks) > 0
+        assert size_checks[0].details["tensor"] == "function_W"
 
     def test_windows_absolute_path_is_flagged_on_posix_hosts(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(

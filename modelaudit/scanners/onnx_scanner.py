@@ -63,6 +63,7 @@ ONNX_PARSE_INCONCLUSIVE_REASON = "onnx_model_parse_failed"
 ONNX_RAW_DETECTION_INCONCLUSIVE_REASON = "onnx_raw_detection_analysis_incomplete"
 ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
 ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON = "onnx_tentative_candidate_analysis_unavailable"
+ONNX_TENTATIVE_CANDIDATE_PARSE_INCOMPLETE_REASON = "onnx_tentative_candidate_parse_incomplete"
 _PYTHON_OPERATOR_TYPES: frozenset[str] = frozenset(
     {
         "pyfunc",
@@ -113,28 +114,93 @@ def _is_python_operator(op_type: str) -> bool:
     return False
 
 
+def _iter_attribute_graphs(attribute: Any) -> Any:
+    """Yield graph values declared by an ONNX attribute."""
+    yield from attribute.graphs
+    try:
+        if attribute.HasField("g"):
+            yield attribute.g
+    except (ValueError, AttributeError):  # pragma: no cover - proto edge case
+        pass
+
+
 def _iter_graph_nodes(graph: Any) -> Any:
     """Yield every node in an ONNX graph or function, recursing into subgraphs."""
     for node in graph.node:
         yield node
         for attribute in node.attribute:
-            subgraphs = list(attribute.graphs)
-            try:
-                if attribute.HasField("g"):
-                    subgraphs.append(attribute.g)
-            except (ValueError, AttributeError):  # pragma: no cover - proto edge case
-                pass
-            for subgraph in subgraphs:
+            for subgraph in _iter_attribute_graphs(attribute):
                 yield from _iter_graph_nodes(subgraph)
 
 
 def _iter_model_graphs(model: Any) -> Any:
     """Yield graph-bearing ONNX model fields that may declare operators."""
     yield model.graph
-    yield from getattr(model, "functions", [])
+    for function in getattr(model, "functions", []):
+        yield function
+        for attribute in getattr(function, "attribute_proto", []):
+            yield from _iter_attribute_graphs(attribute)
     for training_info in getattr(model, "training_info", []):
         yield training_info.initialization
         yield training_info.algorithm
+
+
+def _iter_graph_and_subgraphs(graph: Any) -> Any:
+    """Yield an ONNX graph and every graph nested below node attributes."""
+    yield graph
+    for node in getattr(graph, "node", []):
+        for attribute in getattr(node, "attribute", []):
+            for subgraph in _iter_attribute_graphs(attribute):
+                yield from _iter_graph_and_subgraphs(subgraph)
+
+
+def _iter_model_initializer_graphs(model: Any) -> Any:
+    """Yield every ONNX graph that can carry tensor initializers."""
+    yield from _iter_graph_and_subgraphs(model.graph)
+    for function in getattr(model, "functions", []):
+        yield from _iter_graph_and_subgraphs(function)
+        for attribute in getattr(function, "attribute_proto", []):
+            for subgraph in _iter_attribute_graphs(attribute):
+                yield from _iter_graph_and_subgraphs(subgraph)
+    for training_info in getattr(model, "training_info", []):
+        yield from _iter_graph_and_subgraphs(training_info.initialization)
+        yield from _iter_graph_and_subgraphs(training_info.algorithm)
+
+
+def _iter_attribute_external_data_tensors(attribute: Any) -> Any:
+    """Yield tensor values declared by an ONNX attribute."""
+    yield from getattr(attribute, "tensors", [])
+    for sparse_tensor in getattr(attribute, "sparse_tensors", []):
+        yield sparse_tensor.values
+        yield sparse_tensor.indices
+    try:
+        if attribute.HasField("t"):
+            yield attribute.t
+        if attribute.HasField("sparse_tensor"):
+            yield attribute.sparse_tensor.values
+            yield attribute.sparse_tensor.indices
+    except (ValueError, AttributeError):  # pragma: no cover - proto edge case
+        pass
+
+
+def _iter_graph_external_data_tensors(graph: Any) -> Any:
+    """Yield graph-owned tensors that can carry external_data references."""
+    yield from getattr(graph, "initializer", [])
+    for sparse_tensor in getattr(graph, "sparse_initializer", []):
+        yield sparse_tensor.values
+        yield sparse_tensor.indices
+    for node in getattr(graph, "node", []):
+        for attribute in getattr(node, "attribute", []):
+            yield from _iter_attribute_external_data_tensors(attribute)
+
+
+def _iter_model_external_data_tensor_groups(model: Any) -> Any:
+    """Yield model tensor groups that can declare external_data."""
+    for graph in _iter_model_initializer_graphs(model):
+        yield _iter_graph_external_data_tensors(graph)
+    for function in getattr(model, "functions", []):
+        for attribute in getattr(function, "attribute_proto", []):
+            yield _iter_attribute_external_data_tensors(attribute)
 
 
 def _model_declares_python_operator(model: Any) -> bool:
@@ -308,6 +374,7 @@ class OnnxScanner(BaseScanner):
 
         if not _check_onnx():
             if self._is_tentative_protobuf_route():
+                result.bytes_scanned = file_size
                 result.scanner_name = "unknown"
                 result.metadata["tentative_protobuf_candidate_unanalyzed"] = "onnx_dependency_unavailable"
                 _mark_inconclusive_scan_result(result, ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON)
@@ -376,12 +443,27 @@ class OnnxScanner(BaseScanner):
             # Re-raise keyboard interrupt for graceful shutdown
             raise
         except Exception as e:  # pragma: no cover - unexpected parse errors
+            result.bytes_scanned = file_size
             if self._is_tentative_protobuf_route():
                 result.scanner_name = "unknown"
-                result.metadata["tentative_protobuf_candidate_rejected"] = True
-                result.finish(success=True)
+                result.metadata["tentative_protobuf_candidate_unanalyzed"] = "onnx_parse_failed"
+                _mark_inconclusive_scan_result(result, ONNX_TENTATIVE_CANDIDATE_PARSE_INCOMPLETE_REASON)
+                result.add_check(
+                    name="ONNX Candidate Analysis",
+                    passed=False,
+                    message=f"ONNX tentative candidate parsing failed; analysis incomplete: {e}",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "exception": str(e),
+                        "exception_type": type(e).__name__,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": ONNX_TENTATIVE_CANDIDATE_PARSE_INCOMPLETE_REASON,
+                    },
+                    rule_code="S902",
+                )
+                _finish_scan_result(result)
                 return result
-            _mark_inconclusive_scan_result(result, ONNX_PARSE_INCONCLUSIVE_REASON)
             result.add_check(
                 name="ONNX Model Parsing",
                 passed=False,
@@ -401,7 +483,7 @@ class OnnxScanner(BaseScanner):
 
         has_graph = model.HasField("graph")
         if model.ir_version <= 0 or not has_graph:
-            if self._is_tentative_protobuf_route():
+            if self._is_tentative_protobuf_route() and not has_graph:
                 result.scanner_name = "unknown"
                 result.metadata["tentative_protobuf_candidate_rejected"] = True
                 result.finish(success=True)
@@ -606,10 +688,12 @@ class OnnxScanner(BaseScanner):
         traversal_files: dict[str, list[str]] = {}  # file -> [tensor_names]
         safe_files: set[str] = set()
 
-        for tensor in model.graph.initializer:
-            self.check_interrupted()
+        for tensors in _iter_model_external_data_tensor_groups(model):
+            for tensor in tensors:
+                self.check_interrupted()
 
-            if tensor.data_location == onnx.TensorProto.EXTERNAL:
+                if tensor.data_location != onnx.TensorProto.EXTERNAL:
+                    continue
                 info = {entry.key: entry.value for entry in tensor.external_data}
                 location = info.get("location")
                 if not location:

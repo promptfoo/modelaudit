@@ -20,8 +20,9 @@ from modelaudit.utils.helpers.code_validation import (
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 
+from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .keras_utils import find_case_insensitive_substrings
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,8 @@ _ASSET_MACHO_HEADERS = (
 _ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
 _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
+_MAX_PROTOBUF_PARSE_BYTES = 20 * 1024 * 1024
+_MAX_COLLECTION_VALUE_BYTES = 256 * 1024
 _CORE_ROOT_MODEL_FILES = frozenset({"saved_model.pb", "keras_metadata.pb", "fingerprint.pb"})
 _CORE_ROOT_MODEL_DIRS = frozenset({"assets", "assets.extra", "variables"})
 _CORE_ROOT_ASSET_DIRS = frozenset({"assets", "assets.extra"})
@@ -97,6 +100,24 @@ _SUSPICIOUS_FUNCTION_NAME_PATTERNS = (
     ("subprocess", re.compile(r"(?:^|[^a-z0-9])subprocess(?:[^a-z0-9]|$)")),
     ("pickle", re.compile(r"(?:^|[^a-z0-9])pickle(?:[^a-z0-9]|$)")),
     ("marshal", re.compile(r"(?:^|[^a-z0-9])marshal(?:[^a-z0-9]|$)")),
+)
+_COLLECTION_EXEC_HINTS = (
+    "script",
+    "command",
+    "entrypoint",
+    "hook",
+    "callback",
+    "runtime",
+    "plugin",
+    "library",
+)
+_COLLECTION_COMMAND_RE = re.compile(
+    r"(?i)(?:\bos\.system\b|\bsubprocess\.(?:run|popen|call|check_call|check_output)\b|"
+    r"\b(?:bash|sh|zsh|powershell(?:\.exe)?|cmd(?:\.exe)?)\b|\b(?:curl|wget)\b\s+https?://|"
+    r"\bpython\s+-c\b|/bin/(?:sh|bash))"
+)
+_COLLECTION_NETWORK_RE = re.compile(
+    r"(?i)(?:https?://|wss?://|ftp://|tcp://|udp://|\bsocket\b|\b(?:\d{1,3}\.){3}\d{1,3}\b)"
 )
 
 
@@ -182,11 +203,41 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return os.path.exists(os.path.join(path, "saved_model.pb"))
         return False
 
+    @staticmethod
+    def _is_unreadable_path_result(result: ScanResult) -> bool:
+        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    @staticmethod
+    def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
+        mark_inconclusive_scan_result(result, "savedmodel_read_failed")
+        mark_operational_scan_error(result, "savedmodel_read_failed")
+        result.add_check(
+            name="SavedModel File Read",
+            passed=False,
+            message=f"Unable to read TF SavedModel file: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "savedmodel_read_failed",
+            },
+        )
+        result.finish(success=False)
+        return result
+
     def scan(self, path: str) -> ScanResult:
         """Scan a TensorFlow SavedModel file or directory"""
         # Check if path is valid
         path_check_result = self._check_path(path)
         if path_check_result:
+            if self._is_unreadable_path_result(path_check_result):
+                return self._finish_read_failure(
+                    self._create_result(),
+                    path,
+                    PermissionError(f"Path is not readable: {path}"),
+                )
             return path_check_result
 
         size_check = self._check_size_limit(path)
@@ -238,6 +289,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
+        result.metadata["scan_byte_limit"] = _MAX_PROTOBUF_PARSE_BYTES
 
         # Add file integrity check for compliance
         self.add_file_integrity_check(path, result)
@@ -246,7 +298,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # Check if this is a keras_metadata.pb file
         if path.endswith("keras_metadata.pb"):
             # Scan it for Lambda layers
-            self._scan_keras_metadata(path, result)
+            try:
+                self._scan_keras_metadata(path, result)
+            except OSError as e:
+                return self._finish_read_failure(result, path, e)
             result.finish(success=not result.has_errors)
             return result
 
@@ -258,8 +313,22 @@ class TensorFlowSavedModelScanner(BaseScanner):
             from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
             with open(path, "rb") as f:
-                content = f.read()
-                result.bytes_scanned = len(content)
+                content = f.read(_MAX_PROTOBUF_PARSE_BYTES + 1)
+                result.bytes_scanned = min(len(content), _MAX_PROTOBUF_PARSE_BYTES)
+
+                if len(content) > _MAX_PROTOBUF_PARSE_BYTES:
+                    result.metadata["operational_error"] = True
+                    result.metadata["operational_error_reason"] = "savedmodel_parse_budget_exceeded"
+                    result.add_check(
+                        name="SavedModel Parse Budget",
+                        passed=False,
+                        message="SavedModel exceeds bounded parse budget",
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={"max_parse_bytes": _MAX_PROTOBUF_PARSE_BYTES},
+                    )
+                    result.finish(success=False)
+                    return result
 
                 saved_model = SavedModel()
                 try:
@@ -292,6 +361,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
                 self._analyze_saved_model(saved_model, result)
 
+        except OSError as e:
+            return self._finish_read_failure(result, path, e)
         except Exception as e:
             result.add_check(
                 name="SavedModel Parsing",
@@ -335,7 +406,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # Check for keras_metadata.pb which contains Lambda layer definitions
         keras_metadata_path = model_root / "keras_metadata.pb"
         if keras_metadata_path.exists():
-            self._scan_keras_metadata(str(keras_metadata_path), result)
+            try:
+                self._scan_keras_metadata(str(keras_metadata_path), result)
+            except OSError as e:
+                result.merge(self._finish_read_failure(self._create_result(), str(keras_metadata_path), e))
 
         self._scan_saved_model_assets(model_root, result)
         self._scan_saved_model_root_siblings(model_root, result)
@@ -831,6 +905,51 @@ class TensorFlowSavedModelScanner(BaseScanner):
         for meta_graph in saved_model.meta_graphs:
             yield from self._iter_meta_graph_node_contexts(meta_graph)
 
+    def _scan_collection_defs(self, saved_model: Any, result: ScanResult) -> None:
+        """Scan MetaGraph collection payloads embedded in SavedModel files."""
+        for meta_graph in saved_model.meta_graphs:
+            meta_graph_tag = self._get_meta_graph_tag(meta_graph)
+            for key, collection in meta_graph.collection_def.items():
+                key_lower = key.lower()
+                if not hasattr(collection, "bytes_list"):
+                    continue
+
+                for index, value in enumerate(collection.bytes_list.value):
+                    if len(value) > _MAX_COLLECTION_VALUE_BYTES:
+                        result.add_check(
+                            name="SavedModel Collection Size Anomaly",
+                            passed=False,
+                            message="Large collection bytes entry detected (possible payload stuffing)",
+                            severity=IssueSeverity.WARNING,
+                            location=self.current_file_path,
+                            details={
+                                "collection_key": key,
+                                "index": index,
+                                "entry_size": len(value),
+                                "max_expected": _MAX_COLLECTION_VALUE_BYTES,
+                                "meta_graph": meta_graph_tag,
+                            },
+                        )
+
+                    if not any(hint in key_lower for hint in _COLLECTION_EXEC_HINTS):
+                        continue
+
+                    decoded = value[:_MAX_COLLECTION_VALUE_BYTES].decode("utf-8", errors="ignore")
+                    if _COLLECTION_COMMAND_RE.search(decoded) and _COLLECTION_NETWORK_RE.search(decoded):
+                        result.add_check(
+                            name="SavedModel Collection Executable Pattern",
+                            passed=False,
+                            message="Collection metadata contains command+network pattern in executable key context",
+                            severity=IssueSeverity.WARNING,
+                            location=self.current_file_path,
+                            details={
+                                "collection_key": key,
+                                "index": index,
+                                "value_preview": decoded[:200],
+                                "meta_graph": meta_graph_tag,
+                            },
+                        )
+
     def _build_node_location(
         self,
         node_context: SavedModelNodeContext,
@@ -998,6 +1117,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 "model inference, which poses a security risk."
                             ),
                         )
+
+        self._scan_collection_defs(saved_model, result)
 
         # Add operation counts to metadata
         result.metadata["op_counts"] = op_counts
@@ -1305,6 +1426,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             why=f"The pattern '{pattern}' suggests {description} capability in the model.",
                         )
 
+        except OSError:
+            raise
         except Exception as e:
             result.add_check(
                 name="Keras Metadata Scan",

@@ -17,6 +17,6 @@ Python CI ignores documentation-only PRs, which are handled by the documentation
 The performance workflow compares workload-oriented benchmarks between the PR
 base and head, posts a sticky summary comment on same-repo PRs, uploads JSON and
 Markdown artifacts, and reports comparative regressions without blocking the
-PR. It separately runs the retained-memory stability guard from
+PR. It separately runs the cache-disabled retained-memory stability guard from
 `tests/test_performance_benchmarks.py`, which fails the workflow if repeat scans
 retain excessive memory.

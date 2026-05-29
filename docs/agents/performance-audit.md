@@ -32,7 +32,7 @@ The PR benchmark lane lives in:
 
 - `tests/benchmarks/test_scan_benchmarks.py`
 - `tests/benchmarks/test_picklescan_benchmarks.py`
-- `tests/test_performance_benchmarks.py` (`test_memory_usage_stability` guard only)
+- `tests/test_performance_benchmarks.py` (`test_memory_usage_stability` cache-disabled guard only)
 - `.github/workflows/perf.yml`
 - `scripts/benchmark_report.py`
 
@@ -66,7 +66,7 @@ user-relevant workload or guards a security-critical hot path.
 
 The GitHub Actions performance workflow runs the benchmark suite on the PR base
 and head, posts a sticky summary comment, and uploads JSON plus Markdown
-artifacts. It also runs the retained-memory stability guard from
+artifacts. It also runs the cache-disabled retained-memory stability guard from
 `tests/test_performance_benchmarks.py`; older timing-sensitive tests in that
 module remain outside the PR lane. The comparative benchmark report is
 advisory, while a failed retained-memory guard fails the workflow.
@@ -123,16 +123,17 @@ These are the main measured areas that still deserve attention:
 
 ## Recent Wins Worth Preserving
 
-| Area                                   | Why it mattered                                               |
-| -------------------------------------- | ------------------------------------------------------------- |
-| scanner-selection reuse                | removed repeated registry and alias work in large directories |
-| Hugging Face bookkeeping short-circuit | avoided expensive non-HF path checks on ordinary folders      |
-| nearby-license reuse                   | cut repeated sibling-directory scans                          |
-| report-scoped call-graph cache sharing | reduced repeated AST work in pickle-heavy scans               |
-| bounded ordinary license-header reads  | removed long scans over huge non-license text files           |
-| cache-key hash reuse                   | avoided one duplicate full-file hash on cache miss            |
-| ONNX raw-buffer reuse                  | avoided rereading successful ONNX scans                       |
-| native-only pickle validation          | kept a validation path from doing full enrichment work        |
+| Area                                   | Why it mattered                                                               |
+| -------------------------------------- | ----------------------------------------------------------------------------- |
+| scanner-selection reuse                | removed repeated registry and alias work in large directories                 |
+| Hugging Face bookkeeping short-circuit | avoided expensive non-HF path checks on ordinary folders                      |
+| nearby-license reuse                   | cut repeated sibling-directory scans                                          |
+| report-scoped call-graph cache sharing | reduced repeated AST work in pickle-heavy scans                               |
+| scan-scoped call-graph cache sharing   | reuses source-validated installed-source analysis across directory dispatches |
+| bounded ordinary license-header reads  | removed long scans over huge non-license text files                           |
+| cache-key hash reuse                   | avoided one duplicate full-file hash on cache miss                            |
+| ONNX raw-buffer reuse                  | avoided rereading successful ONNX scans                                       |
+| native-only pickle validation          | kept a validation path from doing full enrichment work                        |
 
 ## Decision Checklist
 
@@ -150,7 +151,7 @@ Before landing a performance change, record:
 Priority 1:
 
 - unify or reuse remaining hashing passes
-- replace report-scoped call-graph sharing with safe source-aware invalidation
+- extend scan-scoped call-graph reuse only with source-refresh regression coverage
 - measure duplicate-aware reuse only for scanners proven path-independent
 
 Priority 2:

@@ -54,6 +54,7 @@ def test_tentative_protobuf_candidate_without_onnx_dependency_is_inconclusive(tm
 
     assert result.scanner_name == "unknown"
     assert result.success is False
+    assert result.bytes_scanned == candidate_path.stat().st_size
     assert result.metadata["scan_outcome"] == "inconclusive"
     assert "onnx_tentative_candidate_analysis_unavailable" in result.metadata["scan_outcome_reasons"]
     assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)

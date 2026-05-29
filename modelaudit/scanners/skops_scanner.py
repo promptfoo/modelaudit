@@ -15,6 +15,10 @@ from typing import Any, ClassVar
 
 from ..utils.file.detection import is_skops_archive, read_magic_bytes
 from ._archive_outcomes import mark_archive_scan_incomplete
+from .archive_dispatch import (
+    KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY,
+    SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY,
+)
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 
@@ -26,8 +30,12 @@ class SkopsScanner(BaseScanner):
     supported_extensions: ClassVar[list[str]] = [".skops"]
     _OVERSIZED_ENTRY_REASON: ClassVar[str] = "skops_zip_entry_size_limited"
     _OVERSIZED_ENTRY_METADATA_KEY: ClassVar[str] = "oversized_zip_entries"
+    _UNREADABLE_ENTRY_REASON: ClassVar[str] = "skops_zip_entry_read_failed"
+    _UNREADABLE_ENTRY_METADATA_KEY: ClassVar[str] = "unreadable_zip_entries"
+    _UNREADABLE_ENTRY_OFFSETS_METADATA_KEY: ClassVar[str] = KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY
     _NOT_ZIP_REASON: ClassVar[str] = "skops_not_zip_archive"
     _BAD_ZIP_REASON: ClassVar[str] = "skops_bad_zip_file"
+    _SCAN_FAILURE_REASON: ClassVar[str] = "skops_scan_failed"
     _FILE_COUNT_LIMIT_REASON: ClassVar[str] = "skops_archive_file_count_limited"
     _UNCOMPRESSED_SIZE_LIMIT_REASON: ClassVar[str] = "skops_archive_uncompressed_size_limited"
     _STRUCTURED_JSON_PARSE_REASON: ClassVar[str] = "skops_structured_json_parse_failed"
@@ -68,12 +76,14 @@ class SkopsScanner(BaseScanner):
                 f"Skipped oversized ZIP entry {file_info.filename} "
                 f"({file_info.file_size} bytes > {self.max_zip_entry_read_size} byte read limit)"
             ),
-            severity=IssueSeverity.WARNING,
+            severity=IssueSeverity.INFO,
             location=f"{zip_path}:{file_info.filename}",
             details={
                 "entry": file_info.filename,
                 "entry_size": file_info.file_size,
                 "max_zip_entry_read_size": self.max_zip_entry_read_size,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": self._OVERSIZED_ENTRY_REASON,
             },
             why=(
                 "The scanner did not inspect this archive member because reading it would exceed the configured "
@@ -81,6 +91,45 @@ class SkopsScanner(BaseScanner):
             ),
         )
         mark_archive_scan_incomplete(result, self._OVERSIZED_ENTRY_REASON)
+
+    def _record_unreadable_zip_entry(
+        self,
+        result: ScanResult,
+        zip_path: str,
+        file_info: zipfile.ZipInfo,
+        exc: Exception,
+    ) -> None:
+        unreadable_offsets = result.metadata.setdefault(self._UNREADABLE_ENTRY_OFFSETS_METADATA_KEY, [])
+        if not isinstance(unreadable_offsets, list):
+            unreadable_offsets = []
+            result.metadata[self._UNREADABLE_ENTRY_OFFSETS_METADATA_KEY] = unreadable_offsets
+        if file_info.header_offset not in unreadable_offsets:
+            unreadable_offsets.append(file_info.header_offset)
+
+        unreadable_entries = result.metadata.setdefault(self._UNREADABLE_ENTRY_METADATA_KEY, [])
+        if not isinstance(unreadable_entries, list):
+            unreadable_entries = []
+            result.metadata[self._UNREADABLE_ENTRY_METADATA_KEY] = unreadable_entries
+
+        if file_info.filename in unreadable_entries:
+            return
+
+        unreadable_entries.append(file_info.filename)
+        result.add_check(
+            name="Skops ZIP Entry Read",
+            passed=False,
+            message=f"Unable to read ZIP entry {file_info.filename} for Skops analysis: {exc}",
+            severity=IssueSeverity.INFO,
+            location=f"{zip_path}:{file_info.filename}",
+            details={
+                "entry": file_info.filename,
+                "exception_type": type(exc).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": self._UNREADABLE_ENTRY_REASON,
+            },
+            why="Skops CVE coverage is incomplete because this archive member could not be read.",
+        )
+        mark_archive_scan_incomplete(result, self._UNREADABLE_ENTRY_REASON)
 
     def _read_zip_entry_safely(
         self,
@@ -96,8 +145,13 @@ class SkopsScanner(BaseScanner):
                 self._record_oversized_zip_entry(result, zip_path, file_info)
             return None
 
-        with zip_file.open(file_info, "r") as entry:
-            content = entry.read(self.max_zip_entry_read_size + 1)
+        try:
+            with zip_file.open(file_info, "r") as entry:
+                content = entry.read(self.max_zip_entry_read_size + 1)
+        except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+            if result is not None and zip_path is not None:
+                self._record_unreadable_zip_entry(result, zip_path, file_info, exc)
+            return None
 
         if len(content) > self.max_zip_entry_read_size:
             if result is not None and zip_path is not None and not self._is_nested_array_payload(file_info.filename):
@@ -352,9 +406,13 @@ class SkopsScanner(BaseScanner):
                         name="Skops Structured JSON Parse Check",
                         passed=False,
                         message=f"Unable to parse Skops JSON entry {file_info.filename}: {exc}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=f"{zip_path}:{file_info.filename}",
-                        details={"entry": file_info.filename},
+                        details={
+                            "entry": file_info.filename,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": self._STRUCTURED_JSON_PARSE_REASON,
+                        },
                         why="Structured Skops loader inspection was incomplete for this archive member.",
                     )
                 mark_archive_scan_incomplete(result, self._STRUCTURED_JSON_PARSE_REASON)
@@ -411,10 +469,32 @@ class SkopsScanner(BaseScanner):
 
     def _scan_archive_members(self, path: str, result: ScanResult) -> None:
         """Recursively scan embedded archive members through the generic ZIP pipeline."""
+        if self.config.get(SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY):
+            return
+
         from .zip_scanner import ZipScanner
 
-        zip_scanner = ZipScanner(config=self.config)
+        unreadable_offsets = result.metadata.pop(self._UNREADABLE_ENTRY_OFFSETS_METADATA_KEY, ())
+        nested_config = dict(self.config)
+        known_unreadable_offsets = (
+            {offset for offset in unreadable_offsets if isinstance(offset, int) and not isinstance(offset, bool)}
+            if isinstance(unreadable_offsets, list)
+            else set()
+        )
+
+        if known_unreadable_offsets:
+            nested_config[KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY] = sorted(known_unreadable_offsets)
+
+        existing_reasons = result.metadata.get("scan_outcome_reasons")
+        preserved_reasons = (
+            [reason for reason in existing_reasons if isinstance(reason, str)]
+            if isinstance(existing_reasons, list)
+            else []
+        )
+        zip_scanner = ZipScanner(config=nested_config)
         result.merge(zip_scanner.scan_archive_members(path))
+        for reason in preserved_reasons:
+            mark_archive_scan_incomplete(result, reason)
 
     def scan(self, path: str) -> ScanResult:
         """Scan a skops file for security vulnerabilities."""
@@ -436,7 +516,7 @@ class SkopsScanner(BaseScanner):
 
             # Verify it's a ZIP file
             magic = read_magic_bytes(path, 4)
-            if not magic.startswith(b"PK"):
+            if not magic.startswith(b"PK") and not zipfile.is_zipfile(path):
                 result.add_check(
                     name="Skops File Format Check",
                     passed=False,
@@ -534,13 +614,19 @@ class SkopsScanner(BaseScanner):
             result.finish(success=False)
             return result
         except Exception as e:
+            mark_archive_scan_incomplete(result, self._SCAN_FAILURE_REASON)
             result.add_check(
                 name="Skops File Scan",
                 passed=False,
                 message=f"Error scanning skops file: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self._SCAN_FAILURE_REASON,
+                },
             )
             result.finish(success=False)
             return result

@@ -4,17 +4,17 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit import core
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.executorch_scanner import ExecuTorchScanner
+from modelaudit.utils.file.detection import detect_file_format
 
 _ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
 
 
-def create_executorch_binary(tmp_path: Path, *, identifier: bytes = b"ET12") -> Path:
-    binary_path = tmp_path / "program.pte"
+def create_executorch_binary(tmp_path: Path, *, identifier: bytes = b"ET12", filename: str = "program.pte") -> Path:
+    binary_path = tmp_path / filename
     # Minimal valid FlatBuffer with the ExecuTorch file identifier.
     binary_path.write_bytes(b"\x0c\x00\x00\x00" + identifier + b"\x04\x00\x04\x00\x04\x00\x00\x00")
     return binary_path
@@ -93,6 +93,144 @@ def test_executorch_scanner_accepts_versioned_binary_program_header(tmp_path: Pa
     assert result.success is True
     assert result.bytes_scanned == file_path.stat().st_size
     assert not result.issues
+
+
+def test_executorch_header_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = create_executorch_binary(tmp_path)
+
+    def raise_os_error(_path: str, length: int = 4) -> bytes:
+        raise OSError(f"simulated ExecuTorch header read failure at {length} bytes")
+
+    monkeypatch.setattr(ExecuTorchScanner, "_read_header", staticmethod(raise_os_error))
+
+    direct = ExecuTorchScanner().scan(str(file_path))
+    monkeypatch.setattr(ExecuTorchScanner, "can_handle", classmethod(lambda _cls, _path: True))
+    aggregate = core.scan_model_directory_or_file(str(file_path), cache_scan_results=False)
+
+    assert direct.success is False
+    assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert "executorch_read_failed" in direct.metadata.get("scan_outcome_reasons", [])
+    assert any(
+        check.name == "ExecuTorch File Read"
+        and "Unable to read ExecuTorch content" in check.message
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("scan_outcome_reason") == "executorch_read_failed"
+        for check in direct.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+    assert aggregate.file_metadata[str(file_path)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert core.determine_exit_code(aggregate) == 2
+
+
+def test_executorch_read_failure_result_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = create_executorch_binary(tmp_path)
+    cache_dir = tmp_path / "cache"
+
+    def raise_os_error(_path: str, length: int = 4) -> bytes:
+        raise OSError(f"simulated ExecuTorch header read failure at {length} bytes")
+
+    monkeypatch.setattr(ExecuTorchScanner, "_read_header", staticmethod(raise_os_error))
+    monkeypatch.setattr(ExecuTorchScanner, "can_handle", classmethod(lambda _cls, _path: True))
+
+    reset_cache_manager()
+    try:
+        first = core.scan_model_directory_or_file(
+            str(file_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = core.scan_model_directory_or_file(
+            str(file_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(file_path)]
+            assert aggregate.success is False
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert "executorch_read_failed" in metadata["scan_outcome_reasons"]
+            assert any("Unable to read ExecuTorch content" in issue.message for issue in aggregate.issues)
+            assert core.determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_executorch_structure_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = create_executorch_binary(tmp_path)
+
+    def raise_os_error(_path: str, *, propagate_io_errors: bool = False) -> bool:
+        assert propagate_io_errors is True
+        raise OSError("simulated ExecuTorch structure read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.executorch_scanner._is_valid_executorch_binary", raise_os_error)
+
+    result = ExecuTorchScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert "executorch_read_failed" in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_renamed_executorch_binary_routes_through_directory_scan(tmp_path: Path) -> None:
+    file_path = create_executorch_binary(tmp_path, filename="program.jpg")
+
+    assert ExecuTorchScanner.can_handle(str(file_path))
+    assert detect_file_format(str(file_path)) == "executorch"
+    assert core.scan_file(str(file_path)).scanner_name == "executorch"
+
+    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    assert directory.files_scanned == 1
+    assert "executorch" in directory.scanner_names
+
+
+def test_renamed_executorch_structure_read_failure_routes_to_inconclusive_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = create_executorch_binary(tmp_path, filename="program.jpg")
+
+    def fail_structural_probe(_path: str | Path, *, propagate_io_errors: bool = False) -> bool:
+        if propagate_io_errors:
+            raise OSError("simulated renamed ExecuTorch structure read failure")
+        return False
+
+    monkeypatch.setattr("modelaudit.utils.file.detection._is_valid_executorch_binary", fail_structural_probe)
+    monkeypatch.setattr("modelaudit.scanners.executorch_scanner._is_valid_executorch_binary", fail_structural_probe)
+
+    assert detect_file_format(str(file_path)) == "executorch"
+
+    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    metadata = directory.file_metadata[str(file_path)]
+
+    assert directory.files_scanned == 1
+    assert "executorch" in directory.scanner_names
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "executorch_read_failed" in metadata["scan_outcome_reasons"]
+    assert core.determine_exit_code(directory) == 2
+
+
+def test_renamed_executorch_near_match_remains_skipped(tmp_path: Path) -> None:
+    file_path = create_executorch_binary(tmp_path, identifier=b"ETXX", filename="program.jpg")
+
+    assert not ExecuTorchScanner.can_handle(str(file_path))
+    assert detect_file_format(str(file_path)) == "unknown"
+
+    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    assert directory.files_scanned == 0
 
 
 def test_executorch_scanner_rejects_invalid_binary_signature_match(tmp_path: Path) -> None:
@@ -189,6 +327,17 @@ def test_executorch_scanner_scans_polyglot_binary_zip_payload(tmp_path: Path) ->
     assert len(python_issues) == 1
     assert python_issues[0].severity == IssueSeverity.CRITICAL
     assert not any(issue.rule_code == "S104" for issue in result.issues)
+
+
+def test_executorch_scanner_scans_stubbed_zip_payload(tmp_path: Path) -> None:
+    file_path = create_executorch_archive(tmp_path, malicious=True)
+    file_path.write_bytes(b"launcher-stub" + file_path.read_bytes())
+
+    assert zipfile.is_zipfile(file_path)
+
+    result = ExecuTorchScanner().scan(str(file_path))
+
+    assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
 
 
 def test_executorch_scanner_preserves_legacy_pickle_rule_codes_for_embedded_members(tmp_path: Path) -> None:

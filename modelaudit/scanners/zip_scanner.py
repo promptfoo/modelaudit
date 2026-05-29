@@ -6,13 +6,18 @@ import tempfile
 import zipfile
 from typing import Any, ClassVar
 
+from ..core_results import mark_operational_scan_error
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
-from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
-from .archive_member_security import scan_archive_member_for_known_risks
+from .archive_dispatch import (
+    KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY,
+    NESTED_SCAN_CALLBACK_CONFIG_KEY,
+    scan_nested_file,
+)
+from .archive_member_security import is_executable_archive_member_name, scan_archive_member_for_known_risks
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -29,6 +34,7 @@ CRITICAL_SYSTEM_PATHS = [
     "C:\\Windows",
 ]
 ARCHIVE_MEMBER_COPY_CHUNK_BYTES = 64 * 1024
+ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY = "_zip_security_only_member_entries"
 
 
 class ZipScanner(BaseScanner):
@@ -58,13 +64,17 @@ class ZipScanner(BaseScanner):
             self.config.get("zip_min_compression_bomb_uncompressed_size"),
             self.MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE,
         )
-        raw_skip_entries = self.config.get("skip_archive_entries", ())
-        if isinstance(raw_skip_entries, str):
-            raw_skip_entries = (raw_skip_entries,)
-        if not isinstance(raw_skip_entries, (list, tuple, set, frozenset)):
-            raw_skip_entries = ()
-        self.skip_archive_entries = {
-            self._normalize_skip_entry_name(entry) for entry in raw_skip_entries if isinstance(entry, str)
+        self.skip_archive_entries = self._normalize_archive_entry_names(self.config.get("skip_archive_entries", ()))
+        self.known_unreadable_archive_entry_offsets = self._normalize_archive_entry_offsets(
+            self.config.get(KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, ())
+        )
+        raw_security_only_entries = self.config.get(ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY, ())
+        if isinstance(raw_security_only_entries, str):
+            raw_security_only_entries = (raw_security_only_entries,)
+        if not isinstance(raw_security_only_entries, (list, tuple, set, frozenset)):
+            raw_security_only_entries = ()
+        self.security_only_member_entries = {
+            self._normalize_skip_entry_name(entry) for entry in raw_security_only_entries if isinstance(entry, str)
         }
 
     def _get_zip_depth(self) -> int:
@@ -125,8 +135,30 @@ class ZipScanner(BaseScanner):
             normalized = normalized[2:]
         return normalized.lstrip("/")
 
+    @classmethod
+    def _normalize_archive_entry_names(cls, entries: Any) -> set[str]:
+        if isinstance(entries, str):
+            entries = (entries,)
+        if not isinstance(entries, (list, tuple, set, frozenset)):
+            return set()
+        return {cls._normalize_skip_entry_name(entry) for entry in entries if isinstance(entry, str)}
+
+    @staticmethod
+    def _normalize_archive_entry_offsets(offsets: Any) -> set[int]:
+        if isinstance(offsets, int) and not isinstance(offsets, bool):
+            offsets = (offsets,)
+        if not isinstance(offsets, (list, tuple, set, frozenset)):
+            return set()
+        return {offset for offset in offsets if isinstance(offset, int) and not isinstance(offset, bool)}
+
     def _should_skip_archive_entry(self, name: str) -> bool:
         return self._normalize_skip_entry_name(name) in self.skip_archive_entries
+
+    def _is_security_only_member_entry(self, name: str) -> bool:
+        return self._normalize_skip_entry_name(name) in self.security_only_member_entries
+
+    def _is_known_unreadable_archive_entry(self, info: zipfile.ZipInfo) -> bool:
+        return info.header_offset in self.known_unreadable_archive_entry_offsets
 
     def _read_symlink_target(self, archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
         """Read a symlink target with a hard cap to avoid materializing large archive members."""
@@ -157,6 +189,8 @@ class ZipScanner(BaseScanner):
             return True
         except zipfile.BadZipFile:
             return False
+        except OSError:
+            return os.path.splitext(path)[1].lower() in cls.supported_extensions
         except Exception:
             return False
 
@@ -176,6 +210,20 @@ class ZipScanner(BaseScanner):
             scan_result = self.scan_archive_members(path)
             result.merge(scan_result)
 
+        except OSError as e:
+            result.add_check(
+                name="ZIP File Scan",
+                passed=False,
+                message=f"Error scanning zip file: {e!s}",
+                severity=IssueSeverity.INFO,
+                rule_code="S902",  # Scan error
+                location=path,
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )
+            mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
+            mark_operational_scan_error(result, "zip_analysis_incomplete")
+            result.finish(success=False)
+            return result
         except zipfile.BadZipFile:
             result.add_check(
                 name="ZIP File Format Validation",
@@ -289,20 +337,35 @@ class ZipScanner(BaseScanner):
 
         is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
         if is_symlink:
+            if self._is_known_unreadable_archive_entry(info):
+                result.add_check(
+                    name="ZIP Member Analysis Coverage",
+                    passed=False,
+                    message=f"Skipped ZIP symlink target validation for known unreadable member: {name}",
+                    severity=IssueSeverity.INFO,
+                    rule_code="S902",
+                    location=f"{archive_path}:{name}",
+                    details={"entry": name, "reason": "known_unreadable_archive_member_skip"},
+                )
+                return False, False
+
             try:
                 target = self._read_symlink_target(archive, info)
             except Exception as exc:
+                mark_archive_scan_incomplete(result, "zip_symlink_target_read_incomplete")
                 result.add_check(
                     name="Symlink Safety Validation",
                     passed=False,
                     message=f"Unable to read symlink target for {name}: {exc!s}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     rule_code="S902",
                     location=f"{archive_path}:{name}",
                     details={
                         "entry": name,
                         "exception": str(exc),
                         "exception_type": type(exc).__name__,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "zip_symlink_target_read_incomplete",
                     },
                 )
                 return False, False
@@ -365,6 +428,7 @@ class ZipScanner(BaseScanner):
 
         # Check depth to prevent zip bomb attacks
         if depth >= self.max_depth:
+            mark_archive_scan_incomplete(result, "zip_depth_limit")
             result.add_check(
                 name="ZIP Depth Bomb Protection",
                 passed=False,
@@ -372,9 +436,13 @@ class ZipScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 rule_code="S410",  # Archive bomb
                 location=path,
-                details={"depth": depth, "max_depth": self.max_depth},
+                details={
+                    "depth": depth,
+                    "max_depth": self.max_depth,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "zip_depth_limit",
+                },
             )
-            mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
             result.finish(success=False)
             return result
         else:
@@ -532,6 +600,42 @@ class ZipScanner(BaseScanner):
                             rule_code=None,  # Passing check
                         )
 
+                is_known_unreadable = self._is_known_unreadable_archive_entry(info)
+                is_configured_skip = self._should_skip_archive_entry(name)
+                if is_known_unreadable or is_configured_skip:
+                    scan_complete = False
+                    if is_executable_archive_member_name(name):
+                        scan_archive_member_for_known_risks(
+                            archive_kind="ZIP",
+                            archive_path=path,
+                            member_name=name,
+                            tmp_path=None,
+                            total_size=info.file_size,
+                            result=result,
+                            max_python_analysis_bytes=self._max_python_member_analysis_bytes(),
+                            python_analysis_incomplete_reason="zip_python_member_analysis_incomplete",
+                            executable_analysis_incomplete_reason="zip_executable_member_analysis_incomplete",
+                        )
+                    if is_known_unreadable:
+                        skip_message = f"Skipped ZIP member analysis for known unreadable member: {name}"
+                        skip_reason = "known_unreadable_archive_member_skip"
+                    else:
+                        skip_message = f"Skipped ZIP member analysis by configured request: {name}"
+                        skip_reason = "configured_archive_member_skip"
+                    result.add_check(
+                        name="ZIP Member Analysis Coverage",
+                        passed=False,
+                        message=skip_message,
+                        severity=IssueSeverity.INFO,
+                        rule_code="S902",
+                        location=f"{path}:{name}",
+                        details={"entry": name, "reason": skip_reason},
+                    )
+                    continue
+
+                if self._is_security_only_member_entry(name):
+                    continue
+
                 # Extract and scan the file
                 tmp_path: str | None = None
                 try:
@@ -585,9 +689,16 @@ class ZipScanner(BaseScanner):
                                 result=result,
                                 max_python_analysis_bytes=self._max_python_member_analysis_bytes(),
                                 python_analysis_incomplete_reason="zip_python_member_analysis_incomplete",
+                                executable_analysis_incomplete_reason="zip_executable_member_analysis_incomplete",
                             )
 
                         nested_config = dict(self.config)
+                        nested_config.pop("skip_archive_entries", None)
+                        nested_config.pop(ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY, None)
+                        nested_config.pop(KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, None)
+                        # Extracted members are deleted below and cannot provide
+                        # stable cache keys for a subsequent scan.
+                        nested_config["cache_enabled"] = False
                         nested_config["_archive_depth"] = depth + 1
                         if zipfile.is_zipfile(tmp_path):
                             nested_config["_zip_depth"] = depth + 1
@@ -620,14 +731,21 @@ class ZipScanner(BaseScanner):
 
                 except Exception as e:
                     scan_complete = False
+                    mark_archive_scan_incomplete(result, "zip_entry_scan_incomplete")
                     result.add_check(
                         name="ZIP Entry Scan",
                         passed=False,
                         message=f"Error scanning ZIP entry {name}: {e!s}",
-                        severity=IssueSeverity.WARNING,
-                        rule_code="S902",  # Scan error
+                        severity=IssueSeverity.INFO,
+                        rule_code="S902",
                         location=f"{path}:{name}",
-                        details={"entry": name, "exception": str(e), "exception_type": type(e).__name__},
+                        details={
+                            "entry": name,
+                            "exception": str(e),
+                            "exception_type": type(e).__name__,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "zip_entry_scan_incomplete",
+                        },
                     )
 
         result.metadata["contents"] = contents
@@ -656,6 +774,7 @@ class ZipScanner(BaseScanner):
 
         if entry_size > max_analysis_bytes:
             result = ScanResult(scanner_name=self.name)
+            mark_archive_scan_incomplete(result, "torchserve_handler_size_limit")
             result.add_check(
                 name="TorchServe Handler Static Analysis",
                 passed=False,
@@ -663,9 +782,15 @@ class ZipScanner(BaseScanner):
                     f"Skipped Python handler static analysis for oversized entry ({entry_size} bytes); "
                     f"limit is {max_analysis_bytes} bytes"
                 ),
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=f"{archive_path}:{entry_name}",
-                details={"entry": entry_name, "entry_size": entry_size, "size_limit": max_analysis_bytes},
+                details={
+                    "entry": entry_name,
+                    "entry_size": entry_size,
+                    "size_limit": max_analysis_bytes,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torchserve_handler_size_limit",
+                },
             )
             result.finish(success=False)
             return result
@@ -675,13 +800,19 @@ class ZipScanner(BaseScanner):
                 source_bytes = source_file.read()
         except OSError as exc:
             result = ScanResult(scanner_name=self.name)
+            mark_archive_scan_incomplete(result, "torchserve_handler_read_failed")
             result.add_check(
                 name="TorchServe Handler Static Analysis",
                 passed=False,
                 message=f"Unable to read Python entry for static analysis: {exc}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=f"{archive_path}:{entry_name}",
-                details={"entry": entry_name, "exception_type": type(exc).__name__},
+                details={
+                    "entry": entry_name,
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torchserve_handler_read_failed",
+                },
             )
             result.finish(success=False)
             return result
@@ -695,13 +826,20 @@ class ZipScanner(BaseScanner):
 
         result = ScanResult(scanner_name=self.name)
         if parse_error is not None:
+            mark_archive_scan_incomplete(result, "torchserve_handler_parse_failed")
             result.add_check(
                 name="TorchServe Handler Static Analysis",
                 passed=False,
                 message=f"Unable to parse Python entry for static analysis: {parse_error}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=f"{archive_path}:{entry_name}",
-                details={"entry": entry_name, "analysis_kind": "syntax", "parse_error": parse_error},
+                details={
+                    "entry": entry_name,
+                    "analysis_kind": "syntax",
+                    "parse_error": parse_error,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torchserve_handler_parse_failed",
+                },
             )
         else:
             result.add_check(

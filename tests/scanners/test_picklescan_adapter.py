@@ -1356,6 +1356,8 @@ def test_pickle_report_to_scan_result_maps_empty_input_to_info_issue() -> None:
 
     assert result.success is False
     assert result.metadata["operational_error_reason"] == "empty_input"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["empty_input"]
     assert result.has_errors is False
     issue = next(issue for issue in result.issues if issue.details.get("category") == "empty_input")
     assert issue.severity == IssueSeverity.INFO
@@ -1394,7 +1396,7 @@ def test_pickle_report_to_scan_result_keeps_parse_errors_inconclusive() -> None:
     assert result.issues[0].details["parsing_failed"] is True
 
 
-def test_pickle_report_to_scan_result_maps_non_parse_errors_to_operational_errors() -> None:
+def test_pickle_report_to_scan_result_maps_non_parse_errors_to_inconclusive_info_issues() -> None:
     report = PickleReport(
         source="broken.pkl",
         status=ScanStatus.ERROR,
@@ -1414,8 +1416,46 @@ def test_pickle_report_to_scan_result_maps_non_parse_errors_to_operational_error
     assert result.success is False
     assert result.metadata["operational_error"] is True
     assert result.metadata["operational_error_reason"] == "io_error"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["io_error"]
     assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].rule_code == "S902"
+
+
+def test_pickle_report_to_scan_result_preserves_security_finding_with_operational_error() -> None:
+    report = PickleReport(
+        source="partially-read.pkl",
+        status=ScanStatus.ERROR,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Found dangerous global reference: posix.system",
+                severity=Severity.CRITICAL,
+                location="partially-read.pkl (pos 12)",
+                rule_code="DANGEROUS_GLOBAL",
+                details={"module": "posix", "name": "system"},
+                why="Dangerous globals can execute code.",
+            ),
+        ),
+        errors=(
+            ScanError(
+                message="Could not read remainder of pickle stream",
+                category="io_error",
+                location="partially-read.pkl",
+                exception_type="OSError",
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "io_error"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(
+        issue.details.get("category") == "io_error" and issue.severity == IssueSeverity.INFO for issue in result.issues
+    )
 
 
 def test_pytorch_zip_scanner_does_not_duplicate_member_path_in_pickle_locations(tmp_path: Path) -> None:

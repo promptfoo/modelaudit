@@ -83,12 +83,13 @@ class TestCacheCLI:
 
     def test_cache_cleanup_with_max_age(self):
         """Test cache cleanup with custom max age."""
-        runner = CliRunner()
-        result = runner.invoke(cli, ["cache", "cleanup", "--max-age", "60"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = CliRunner()
+            result = runner.invoke(cli, ["cache", "cleanup", "--cache-dir", temp_dir, "--max-age", "60"])
 
-        assert result.exit_code == 0
-        # Should either report removed count or no entries found
-        assert ("Removed" in result.output) or ("No old cache entries found" in result.output)
+            assert result.exit_code == 0
+            # Should either report removed count or no entries found
+            assert ("Removed" in result.output) or ("No old cache entries found" in result.output)
 
     def test_cache_clear_with_custom_dir(self, tmp_path):
         """Test cache clear with custom cache directory."""

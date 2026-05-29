@@ -7,15 +7,31 @@ Python callables, enabling RCE when loaded via hydra.utils.instantiate().
 
 import logging
 import os
+import posixpath
 import re
 import tarfile
 import tempfile
 from typing import Any, ClassVar
 
+from ..core_results import (
+    OPERATIONAL_ERROR_REASON_METADATA_KEY,
+    mark_operational_scan_error,
+    scan_result_has_operational_error,
+)
 from ..utils import is_absolute_archive_path, sanitize_archive_path
-from ..utils.file.detection import detect_file_format_from_magic
+from ..utils.file.detection import is_nemo_archive
 from ._archive_locations import rewrite_extracted_member_location
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from ._archive_outcomes import mark_archive_scan_incomplete
+from .archive_member_security import (
+    is_executable_archive_member_name,
+    is_python_archive_member_name,
+    scan_archive_member_for_known_risks,
+)
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from .tar_scanner import (
+    TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY,
+    TarScanner,
+)
 
 try:
     import yaml
@@ -35,7 +51,6 @@ _SAFE_TARGET_PREFIXES = (
     "lightning.",
     "torch.optim.",
     "torch.nn.",
-    "torch.utils.",
     "transformers.",
     "omegaconf.",
     "hydra.",
@@ -44,6 +59,28 @@ _SAFE_TARGET_PREFIXES = (
     "numpy.",
     "dataclasses.",
 )
+
+# Exact safe _target_ values for utility namespaces that also contain unsafe
+# callables. Keep this list narrow instead of trusting whole namespaces.
+_SAFE_TARGETS = {
+    "torch.utils.data.BatchSampler",
+    "torch.utils.data.ConcatDataset",
+    "torch.utils.data.DataLoader",
+    "torch.utils.data.RandomSampler",
+    "torch.utils.data.SequentialSampler",
+    "torch.utils.data.Subset",
+    "torch.utils.data.TensorDataset",
+    "torch.utils.data.WeightedRandomSampler",
+    "torch.utils.data.distributed.DistributedSampler",
+    "torch.utils.data.dataloader.DataLoader",
+    "torch.utils.data.dataset.ConcatDataset",
+    "torch.utils.data.dataset.Subset",
+    "torch.utils.data.dataset.TensorDataset",
+    "torch.utils.data.sampler.BatchSampler",
+    "torch.utils.data.sampler.RandomSampler",
+    "torch.utils.data.sampler.SequentialSampler",
+    "torch.utils.data.sampler.WeightedRandomSampler",
+}
 
 # Dangerous _target_ values that indicate exploitation
 _DANGEROUS_TARGETS = {
@@ -90,6 +127,11 @@ _DANGEROUS_TARGETS = {
     "torch.package.PackageImporter",
     "torch.package.PackageImporter.load_pickle",
     "torch.serialization.load",
+    "torch.utils.cpp_extension._import_module_from_library",
+    "torch.utils.cpp_extension._jit_compile",
+    "torch.utils.cpp_extension._run_ninja_build",
+    "torch.utils.cpp_extension.load",
+    "torch.utils.cpp_extension.load_inline",
     "torch.utils.model_zoo.load_url",
     "shutil.rmtree",
     "pathlib.Path.unlink",
@@ -130,12 +172,21 @@ CVE_2025_23304_REMEDIATION = (
 )
 NEMO_CHECKPOINT_MEMBER_EXTENSIONS = frozenset({".ckpt", ".pt", ".pth", ".pkl", ".pickle"})
 NEMO_MAX_CHECKPOINT_SCAN_BYTES = 50 * 1024 * 1024
-_NESTED_NON_DESERIALIZATION_RULE_CODES = frozenset(
-    {"S405", "S406", "S408", "S410", "S501", "S502", "S503", "S504", "S505", "S506"}
-)
+NEMO_MAX_PYTHON_ANALYSIS_BYTES = 10 * 1024 * 1024
+NEMO_MAX_LINK_RESOLUTION_MEMBER_VISITS = 100_000
+NEMO_EXECUTABLE_INITIAL_PROBE_BYTES = 1024
+NEMO_EXECUTABLE_PE_PROBE_BYTES = (1024 * 1024) + 4
 
 _INCONCLUSIVE_METADATA_KEY = "scan_outcome"
 _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
+_NESTED_OPERATIONAL_CHECK_NAMES = {
+    "joblib_wrapper_decode_failed": "Compression Bomb Detection",
+    "llamafile_routing_incomplete": "Llamafile Routing",
+    "nemo_routing_incomplete": "NeMo Routing",
+    "recognized_format_scanner_unavailable": "Format Detection",
+    "xml_model_routing_incomplete": "XML Model Routing",
+}
+_NESTED_OPERATIONAL_REASON_FALLBACK = "nemo_referenced_nested_operational_error"
 
 
 def _find_suspicious_target_pattern(target: str) -> str | None:
@@ -197,10 +248,10 @@ class NemoScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
         ext = os.path.splitext(path)[1].lower()
-        if ext not in cls.supported_extensions:
-            return False
-        # Verify it's actually a tar archive
-        return tarfile.is_tarfile(path)
+        if ext in cls.supported_extensions:
+            # Preserve legacy coverage for `.nemo` archives whose config is malformed or missing.
+            return tarfile.is_tarfile(path)
+        return is_nemo_archive(path)
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
@@ -210,7 +261,33 @@ class NemoScanner(BaseScanner):
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
+        is_declared_nemo = os.path.splitext(path)[1].lower() in self.supported_extensions
 
+        tar_scanner = TarScanner(config=dict(self.config))
+        try:
+            archive_depth = max(int(self.config.get("_archive_depth", 0)), 0)
+        except (TypeError, ValueError):
+            archive_depth = 0
+        if archive_depth >= tar_scanner.max_depth:
+            result.merge(tar_scanner.scan(path))
+            result.bytes_scanned = file_size
+            self._finish_scan_result(result)
+            return result
+
+        preflight_result = ScanResult(scanner_name="tar")
+        if not tar_scanner._preflight_tar_archive(path, preflight_result):
+            mark_archive_scan_incomplete(preflight_result, "tar_analysis_incomplete")
+            preflight_result.finish(success=False)
+            result.merge(preflight_result)
+            result.bytes_scanned = file_size
+            self._finish_scan_result(result)
+            return result
+
+        if is_declared_nemo:
+            preflight_result.finish(success=True)
+            result.merge(preflight_result)
+
+        nemo_owned_entries: set[str] = set()
         if not HAS_YAML:
             result.add_check(
                 name="YAML Parser Availability",
@@ -219,20 +296,31 @@ class NemoScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=path,
             )
-            result.bytes_scanned = file_size
-            return result
+        else:
+            try:
+                self._scan_nemo_archive(
+                    path,
+                    result,
+                    nemo_owned_entries,
+                    inspect_embedded_members=is_declared_nemo,
+                )
+            except tarfile.TarError as e:
+                result.add_check(
+                    name="NeMo Archive Integrity",
+                    passed=False,
+                    message=f"Failed to open NeMo archive: {e}",
+                    severity=IssueSeverity.WARNING,
+                    location=path,
+                )
+                result.success = False
 
-        try:
-            self._scan_nemo_archive(path, result)
-        except tarfile.TarError as e:
-            result.add_check(
-                name="NeMo Archive Integrity",
-                passed=False,
-                message=f"Failed to open NeMo archive: {e}",
-                severity=IssueSeverity.WARNING,
-                location=path,
-            )
-            result.success = False
+        if not is_declared_nemo:
+            tar_config = dict(self.config)
+            tar_config[TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY] = nemo_owned_entries
+            # The enclosing NeMo result controls whether this artifact is
+            # complete enough to cache; nested TAR dispatch must not persist partial results.
+            tar_config["cache_enabled"] = False
+            result.merge(TarScanner(config=tar_config).scan(path))
 
         result.bytes_scanned = file_size
         self._finish_scan_result(result)
@@ -268,6 +356,10 @@ class NemoScanner(BaseScanner):
 
     @staticmethod
     def _finish_scan_result(result: ScanResult) -> None:
+        if result.metadata.get("analysis_incomplete") is True:
+            result.finish(success=False)
+            return
+
         if result.metadata.get(
             _INCONCLUSIVE_METADATA_KEY
         ) == INCONCLUSIVE_SCAN_OUTCOME and not _scan_result_has_security_findings(result):
@@ -276,13 +368,72 @@ class NemoScanner(BaseScanner):
 
         result.finish(success=result.success and not result.has_errors)
 
-    def _scan_nemo_archive(self, path: str, result: ScanResult) -> None:
+    def _scan_nemo_archive(
+        self,
+        path: str,
+        result: ScanResult,
+        nemo_owned_entries: set[str],
+        *,
+        inspect_embedded_members: bool,
+    ) -> None:
         """Extract and scan YAML configs from a NeMo tar archive."""
         yaml_configs_found = 0
         yaml_config_files_found = 0
         scanned_member_entries: set[str] = set()
+        scanned_regular_checkpoint_sources: set[tuple[str, int]] = set()
+        referenced_member_contexts: dict[str, tuple[str, str]] = {}
+        scanned_yaml_sources: set[tuple[str, int]] = set()
+        link_resolution_budget = [NEMO_MAX_LINK_RESOLUTION_MEMBER_VISITS]
+        link_resolution_budget_reported = False
+        linked_loaded_path_reported = False
 
         with tarfile.open(path, "r:*") as tar:
+            archive_members = tar.getmembers()
+            members_by_normalized_name: dict[str, list[tarfile.TarInfo]] = {}
+            linked_loaded_paths: set[str] = set()
+            loaded_path_link_present = self._archive_has_link_mediated_loaded_path(
+                archive_members,
+                link_resolution_budget,
+            )
+            for archive_member in archive_members:
+                normalized_member_name = self._normalize_safe_archive_member_name(archive_member.name)
+                if normalized_member_name is not None:
+                    members_by_normalized_name.setdefault(normalized_member_name, []).append(archive_member)
+                    if (
+                        (archive_member.issym() or archive_member.islnk())
+                        and self._resolve_archive_link_member_name(archive_member) is not None
+                        and (
+                            self._is_root_config_member_name(archive_member.name)
+                            or archive_member.name.lower().endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS))
+                        )
+                    ):
+                        linked_loaded_paths.add(normalized_member_name)
+
+            def mark_linked_loaded_path_inconclusive() -> None:
+                nonlocal linked_loaded_path_reported
+                if linked_loaded_path_reported:
+                    return
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_link_semantics_incomplete",
+                    check_name="NeMo Link Semantics",
+                    message=("NeMo loaded content is referenced through archive links; analysis is conservative"),
+                    location=path,
+                )
+                linked_loaded_path_reported = True
+
+            if loaded_path_link_present:
+                mark_linked_loaded_path_inconclusive()
+            if link_resolution_budget[0] < 0:
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_link_resolution_budget_exceeded",
+                    check_name="NeMo Link Resolution",
+                    message="NeMo link analysis exceeded the member-visit safety limit",
+                    location=path,
+                )
+                link_resolution_budget_reported = True
+
             for member in tar:
                 self.check_interrupted()
 
@@ -309,6 +460,10 @@ class NemoScanner(BaseScanner):
                             target=member.linkname,
                         )
                     elif name_lower.endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS)):
+                        nemo_owned_entries.add(member.name)
+                        if not self._is_final_archive_member_for_path(member, members_by_normalized_name):
+                            continue
+                        mark_linked_loaded_path_inconclusive()
                         link_target_name = self._resolve_archive_link_member_name(member)
                         if link_target_name is None:
                             self._mark_inconclusive_scan_result(
@@ -320,9 +475,14 @@ class NemoScanner(BaseScanner):
                                 details={"entry": member.name, "target": member.linkname},
                             )
                         else:
-                            try:
-                                target_member = tar.getmember(link_target_name)
-                            except KeyError:
+                            target_members = members_by_normalized_name.get(link_target_name, [])
+                            regular_target_member = self._resolve_extractable_regular_link_target(
+                                member,
+                                members_by_normalized_name,
+                                archive_members,
+                                link_resolution_budget,
+                            )
+                            if not target_members:
                                 self._mark_inconclusive_scan_result(
                                     result,
                                     reason="nemo_checkpoint_link_target_missing",
@@ -331,29 +491,109 @@ class NemoScanner(BaseScanner):
                                     location=f"{path}:{member.name}",
                                     details={"entry": member.name, "target": member.linkname},
                                 )
-                            else:
-                                if target_member.isfile():
-                                    self._scan_checkpoint_member(
-                                        tar,
-                                        target_member,
-                                        path,
-                                        result,
-                                        entry_name=member.name,
-                                    )
-                                    scanned_member_entries.add(member.name)
-                                else:
+                            elif member.islnk() and all(
+                                target_member.offset >= member.offset for target_member in target_members
+                            ):
+                                self._mark_inconclusive_scan_result(
+                                    result,
+                                    reason="nemo_checkpoint_link_target_unresolved",
+                                    check_name="NeMo Checkpoint Nested Scan",
+                                    message=f"Checkpoint hardlink target appears after link entry: {member.name}",
+                                    location=f"{path}:{member.name}",
+                                    details={"entry": member.name, "target": member.linkname},
+                                )
+                            elif link_resolution_budget[0] < 0:
+                                if not link_resolution_budget_reported:
+                                    analysis_unsupported = link_resolution_budget[0] == -2
                                     self._mark_inconclusive_scan_result(
                                         result,
-                                        reason="nemo_checkpoint_link_target_not_file",
-                                        check_name="NeMo Checkpoint Nested Scan",
-                                        message=f"Checkpoint link target is not a regular file: {member.name}",
-                                        location=f"{path}:{member.name}",
-                                        details={"entry": member.name, "target": member.linkname},
+                                        reason=(
+                                            "nemo_link_resolution_unsupported"
+                                            if analysis_unsupported
+                                            else "nemo_link_resolution_budget_exceeded"
+                                        ),
+                                        check_name="NeMo Link Resolution",
+                                        message=(
+                                            "NeMo link analysis could not safely model mixed link mutation"
+                                            if analysis_unsupported
+                                            else "NeMo link analysis exceeded the member-visit safety limit"
+                                        ),
+                                        location=path,
                                     )
+                                    link_resolution_budget_reported = True
+                            elif regular_target_member is not None:
+                                self._scan_checkpoint_member(
+                                    tar,
+                                    regular_target_member,
+                                    path,
+                                    result,
+                                    entry_name=member.name,
+                                )
+                            else:
+                                self._mark_inconclusive_scan_result(
+                                    result,
+                                    reason="nemo_checkpoint_link_target_not_file",
+                                    check_name="NeMo Checkpoint Nested Scan",
+                                    message=f"Checkpoint link target is not a regular file: {member.name}",
+                                    location=f"{path}:{member.name}",
+                                    details={"entry": member.name, "target": member.linkname},
+                                )
+                    elif self._is_root_config_member_name(member.name):
+                        if not self._is_final_archive_member_for_path(member, members_by_normalized_name):
+                            continue
+                        mark_linked_loaded_path_inconclusive()
+                        link_target_name = self._resolve_archive_link_member_name(member)
+                        if link_target_name is not None:
+                            regular_target_member = self._resolve_extractable_regular_link_target(
+                                member,
+                                members_by_normalized_name,
+                                archive_members,
+                                link_resolution_budget,
+                            )
+                            if regular_target_member is not None:
+                                target_member = regular_target_member
+                                target_identity = self._tar_member_identity(target_member)
+                                if target_identity in scanned_yaml_sources:
+                                    continue
+                                yaml_config_files_found += 1
+                                if self._scan_yaml_config_member(
+                                    tar,
+                                    target_member,
+                                    member.name,
+                                    path,
+                                    result,
+                                    nemo_owned_entries,
+                                    scanned_member_entries,
+                                    scanned_regular_checkpoint_sources,
+                                    referenced_member_contexts,
+                                ):
+                                    yaml_configs_found += 1
+                                scanned_yaml_sources.add(target_identity)
+                            elif link_resolution_budget[0] < 0 and not link_resolution_budget_reported:
+                                analysis_unsupported = link_resolution_budget[0] == -2
+                                self._mark_inconclusive_scan_result(
+                                    result,
+                                    reason=(
+                                        "nemo_link_resolution_unsupported"
+                                        if analysis_unsupported
+                                        else "nemo_link_resolution_budget_exceeded"
+                                    ),
+                                    check_name="NeMo Link Resolution",
+                                    message=(
+                                        "NeMo link analysis could not safely model mixed link mutation"
+                                        if analysis_unsupported
+                                        else "NeMo link analysis exceeded the member-visit safety limit"
+                                    ),
+                                    location=path,
+                                )
+                                link_resolution_budget_reported = True
                     continue
 
-                if not member.isfile():
+                if not self._tar_member_materializes_file_content(member):
                     continue
+
+                if inspect_embedded_members:
+                    self._scan_embedded_member_for_known_risks(tar, member, path, result)
 
                 # Check for suspicious files in the archive
                 if name_lower.endswith((".py", ".sh", ".bat", ".cmd", ".ps1")):
@@ -368,93 +608,67 @@ class NemoScanner(BaseScanner):
 
                 # Parse YAML config files
                 if name_lower.endswith((".yaml", ".yml")):
+                    normalized_member_name = self._normalize_safe_archive_member_name(member.name)
+                    if normalized_member_name in linked_loaded_paths and self._is_root_config_member_name(member.name):
+                        mark_linked_loaded_path_inconclusive()
+                    member_identity = self._tar_member_identity(member)
+                    if member_identity in scanned_yaml_sources:
+                        continue
                     yaml_config_files_found += 1
-                    if member.size > self.MAX_CONFIG_SIZE:
-                        self._mark_inconclusive_scan_result(
-                            result,
-                            reason="nemo_config_size_limit",
-                            check_name="NeMo Config Size Check",
-                            message=(f"Config file too large: {member.name} ({member.size} bytes)"),
-                            location=f"{path}:{member.name}",
-                            severity=IssueSeverity.WARNING,
-                            details={
-                                "config_file": member.name,
-                                "size_bytes": member.size,
-                                "max_config_size": self.MAX_CONFIG_SIZE,
-                            },
-                        )
-                        continue
-
-                    f = tar.extractfile(member)
-                    if f is None:
-                        continue
-                    with f:
-                        try:
-                            raw = f.read(self.MAX_CONFIG_SIZE + 1)
-                            if len(raw) > self.MAX_CONFIG_SIZE:
-                                self._mark_inconclusive_scan_result(
-                                    result,
-                                    reason="nemo_config_size_limit",
-                                    check_name="NeMo Config Size Check",
-                                    message=(f"Config file too large: {member.name} ({len(raw)} bytes)"),
-                                    location=f"{path}:{member.name}",
-                                    severity=IssueSeverity.WARNING,
-                                    details={
-                                        "config_file": member.name,
-                                        "size_bytes": len(raw),
-                                        "max_config_size": self.MAX_CONFIG_SIZE,
-                                    },
-                                )
-                                continue
-                            config = yaml.safe_load(raw)
-                            if isinstance(config, dict | list):
-                                yaml_configs_found += 1
-                                self._check_hydra_targets(config, member.name, path, result)
-                                for config_path, referenced_member_name in self._collect_nemo_member_references(config):
-                                    if referenced_member_name in scanned_member_entries:
-                                        continue
-                                    referenced_member_scanned = self._scan_config_referenced_member(
-                                        tar,
-                                        referenced_member_name,
-                                        path,
-                                        result,
-                                        config_file=member.name,
-                                        config_path=config_path,
-                                    )
-                                    if referenced_member_scanned:
-                                        scanned_member_entries.add(referenced_member_name)
-                            else:
-                                self._mark_inconclusive_scan_result(
-                                    result,
-                                    reason="nemo_config_invalid_structure",
-                                    check_name="NeMo Config Structure",
-                                    message=(
-                                        f"YAML config {member.name} has unsupported "
-                                        f"top-level type: {type(config).__name__}"
-                                    ),
-                                    location=f"{path}:{member.name}",
-                                    details={
-                                        "config_file": member.name,
-                                        "expected_type": "dict_or_list",
-                                        "actual_type": type(config).__name__,
-                                    },
-                                )
-                        except yaml.YAMLError:
-                            logger.debug("Failed to parse YAML config %s in %s", member.name, path)
-                            self._mark_inconclusive_scan_result(
-                                result,
-                                reason="nemo_config_yaml_parse_failed",
-                                check_name="NeMo Config YAML Parsing",
-                                message=f"Failed to parse YAML config {member.name}",
-                                location=f"{path}:{member.name}",
-                                details={"config_file": member.name},
-                            )
+                    if self._scan_yaml_config_member(
+                        tar,
+                        member,
+                        member.name,
+                        path,
+                        result,
+                        nemo_owned_entries,
+                        scanned_member_entries,
+                        scanned_regular_checkpoint_sources,
+                        referenced_member_contexts,
+                    ):
+                        yaml_configs_found += 1
+                    scanned_yaml_sources.add(member_identity)
 
                 if name_lower.endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS)):
-                    if member.name in scanned_member_entries:
+                    nemo_owned_entries.add(member.name)
+                    normalized_member_name = self._normalize_safe_archive_member_name(member.name)
+                    if normalized_member_name in linked_loaded_paths:
+                        mark_linked_loaded_path_inconclusive()
+                    member_identity = self._tar_member_identity(member)
+                    if member.name in scanned_member_entries or member_identity in scanned_regular_checkpoint_sources:
                         continue
                     self._scan_checkpoint_member(tar, member, path, result)
-                    scanned_member_entries.add(member.name)
+                    scanned_regular_checkpoint_sources.add(member_identity)
+
+        if referenced_member_contexts:
+            referenced_link_mutation = self._archive_has_link_mediated_loaded_path(
+                archive_members,
+                link_resolution_budget,
+                additional_loaded_member_names=set(referenced_member_contexts),
+                include_default_loaded_member_names=False,
+            )
+            if referenced_link_mutation:
+                referenced_entries = sorted(referenced_member_contexts)
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_referenced_link_semantics_incomplete",
+                    check_name="NeMo Referenced Link Semantics",
+                    message=("NeMo referenced content can be mutated through archive links; analysis is conservative"),
+                    location=path,
+                    details={
+                        "entries": referenced_entries[:20],
+                        "entry_count": len(referenced_entries),
+                    },
+                )
+            elif link_resolution_budget[0] < 0:
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_link_resolution_budget_exceeded",
+                    check_name="NeMo Link Resolution",
+                    message="NeMo link analysis exceeded the member-visit safety limit",
+                    location=path,
+                    details={"entry_count": len(referenced_member_contexts)},
+                )
 
         if yaml_configs_found == 0:
             message = (
@@ -486,6 +700,456 @@ class NemoScanner(BaseScanner):
                 location=path,
             )
 
+    def _scan_embedded_member_for_known_risks(
+        self,
+        tar: tarfile.TarFile,
+        member: tarfile.TarInfo,
+        archive_path: str,
+        result: ScanResult,
+    ) -> None:
+        """Apply bounded generic archive-member security checks inside NeMo files."""
+        member_name_lower = member.name.lower()
+        is_python_member = is_python_archive_member_name(member_name_lower)
+        if is_executable_archive_member_name(member_name_lower):
+            scan_archive_member_for_known_risks(
+                archive_kind="NeMo",
+                archive_path=archive_path,
+                member_name=member.name,
+                tmp_path=None,
+                total_size=member.size,
+                result=result,
+                max_python_analysis_bytes=NEMO_MAX_PYTHON_ANALYSIS_BYTES,
+                python_analysis_incomplete_reason="nemo_python_member_analysis_incomplete",
+                executable_analysis_incomplete_reason="nemo_executable_member_analysis_incomplete",
+            )
+            return
+
+        if is_python_member and member.size > NEMO_MAX_PYTHON_ANALYSIS_BYTES:
+            scan_archive_member_for_known_risks(
+                archive_kind="NeMo",
+                archive_path=archive_path,
+                member_name=member.name,
+                tmp_path=None,
+                total_size=member.size,
+                result=result,
+                max_python_analysis_bytes=NEMO_MAX_PYTHON_ANALYSIS_BYTES,
+                python_analysis_incomplete_reason="nemo_python_member_analysis_incomplete",
+                executable_analysis_incomplete_reason="nemo_executable_member_analysis_incomplete",
+            )
+            return
+
+        max_bytes = None
+        if not is_python_member:
+            max_bytes = (
+                NEMO_EXECUTABLE_PE_PROBE_BYTES
+                if self._member_starts_with_portable_executable_magic(tar, member)
+                else NEMO_EXECUTABLE_INITIAL_PROBE_BYTES
+            )
+        extracted_path = self._extract_member_to_tempfile(tar, member, max_bytes=max_bytes)
+        if extracted_path is None:
+            return
+
+        try:
+            scan_archive_member_for_known_risks(
+                archive_kind="NeMo",
+                archive_path=archive_path,
+                member_name=member.name,
+                tmp_path=extracted_path,
+                total_size=member.size,
+                result=result,
+                max_python_analysis_bytes=NEMO_MAX_PYTHON_ANALYSIS_BYTES,
+                python_analysis_incomplete_reason="nemo_python_member_analysis_incomplete",
+                executable_analysis_incomplete_reason="nemo_executable_member_analysis_incomplete",
+            )
+        finally:
+            try:
+                os.unlink(extracted_path)
+            except OSError:
+                logger.debug("Failed to remove temporary NeMo member security file: %s", extracted_path)
+
+    @staticmethod
+    def _member_starts_with_portable_executable_magic(tar: tarfile.TarFile, member: tarfile.TarInfo) -> bool:
+        member_file = tar.extractfile(member)
+        if member_file is None:
+            return False
+        with member_file:
+            return member_file.read(2) == b"MZ"
+
+    def _scan_yaml_config_member(
+        self,
+        tar: tarfile.TarFile,
+        member: tarfile.TarInfo,
+        config_file: str,
+        archive_path: str,
+        result: ScanResult,
+        nemo_owned_entries: set[str],
+        scanned_member_entries: set[str],
+        scanned_regular_checkpoint_sources: set[tuple[str, int]],
+        referenced_member_contexts: dict[str, tuple[str, str]],
+    ) -> bool:
+        """Analyze one YAML config entry, including a safe root-config link target."""
+        if member.size > self.MAX_CONFIG_SIZE:
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_config_size_limit",
+                check_name="NeMo Config Size Check",
+                message=f"Config file too large: {config_file} ({member.size} bytes)",
+                location=f"{archive_path}:{config_file}",
+                severity=IssueSeverity.WARNING,
+                details={
+                    "config_file": config_file,
+                    "size_bytes": member.size,
+                    "max_config_size": self.MAX_CONFIG_SIZE,
+                },
+            )
+            return False
+
+        member_file = tar.extractfile(member)
+        if member_file is None:
+            return False
+        with member_file:
+            try:
+                raw = member_file.read(self.MAX_CONFIG_SIZE + 1)
+                if len(raw) > self.MAX_CONFIG_SIZE:
+                    self._mark_inconclusive_scan_result(
+                        result,
+                        reason="nemo_config_size_limit",
+                        check_name="NeMo Config Size Check",
+                        message=f"Config file too large: {config_file} ({len(raw)} bytes)",
+                        location=f"{archive_path}:{config_file}",
+                        severity=IssueSeverity.WARNING,
+                        details={
+                            "config_file": config_file,
+                            "size_bytes": len(raw),
+                            "max_config_size": self.MAX_CONFIG_SIZE,
+                        },
+                    )
+                    return False
+                config = yaml.safe_load(raw)
+            except yaml.YAMLError:
+                logger.debug("Failed to parse YAML config %s in %s", config_file, archive_path)
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_config_yaml_parse_failed",
+                    check_name="NeMo Config YAML Parsing",
+                    message=f"Failed to parse YAML config {config_file}",
+                    location=f"{archive_path}:{config_file}",
+                    details={"config_file": config_file},
+                )
+                return False
+
+        if not isinstance(config, dict | list):
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_config_invalid_structure",
+                check_name="NeMo Config Structure",
+                message=f"YAML config {config_file} has unsupported top-level type: {type(config).__name__}",
+                location=f"{archive_path}:{config_file}",
+                details={
+                    "config_file": config_file,
+                    "expected_type": "dict_or_list",
+                    "actual_type": type(config).__name__,
+                },
+            )
+            return False
+
+        self._check_hydra_targets(config, config_file, archive_path, result)
+        for config_path, referenced_member_name in self._collect_nemo_member_references(config):
+            nemo_owned_entries.add(referenced_member_name)
+            referenced_member_contexts.setdefault(referenced_member_name, (config_file, config_path))
+            if referenced_member_name in scanned_member_entries:
+                continue
+            referenced_member_scanned = self._scan_config_referenced_member(
+                tar,
+                referenced_member_name,
+                archive_path,
+                result,
+                config_file=config_file,
+                config_path=config_path,
+                scanned_regular_checkpoint_sources=scanned_regular_checkpoint_sources,
+            )
+            if referenced_member_scanned:
+                scanned_member_entries.add(referenced_member_name)
+        return True
+
+    @staticmethod
+    def _is_root_config_member_name(member_name: str) -> bool:
+        normalized_name = NemoScanner._normalize_safe_archive_member_name(member_name)
+        return normalized_name is not None and normalized_name.lower() in {"model_config.yaml", "model_config.yml"}
+
+    @classmethod
+    def _is_loaded_member_name(cls, member_name: str) -> bool:
+        normalized_name = cls._normalize_safe_archive_member_name(member_name)
+        return normalized_name is not None and (
+            normalized_name.lower() in {"model_config.yaml", "model_config.yml"}
+            or normalized_name.lower().endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS))
+        )
+
+    @classmethod
+    def _archive_has_link_mediated_loaded_path(
+        cls,
+        archive_members: list[tarfile.TarInfo],
+        member_visit_budget: list[int],
+        *,
+        additional_loaded_member_names: set[str] | None = None,
+        include_default_loaded_member_names: bool = True,
+    ) -> bool:
+        """Return whether extracted link behavior can mutate loaded NeMo content."""
+        additional_loaded_names = {
+            normalized_name
+            for member_name in additional_loaded_member_names or set()
+            if (normalized_name := cls._normalize_safe_archive_member_name(member_name)) is not None
+        }
+
+        def is_loaded_member_name(member_name: str) -> bool:
+            normalized_name = cls._normalize_safe_archive_member_name(member_name)
+            return normalized_name is not None and (
+                (include_default_loaded_member_names and cls._is_loaded_member_name(normalized_name))
+                or normalized_name in additional_loaded_names
+            )
+
+        members_by_normalized_name: dict[str, list[tarfile.TarInfo]] = {}
+        for archive_member in archive_members:
+            normalized_name = cls._normalize_safe_archive_member_name(archive_member.name)
+            if normalized_name is not None:
+                members_by_normalized_name.setdefault(normalized_name, []).append(archive_member)
+
+        symlink_targets: dict[str, str] = {}
+        loaded_inode_paths: set[str] = set()
+        occupied_names: set[str] = set()
+        for member in archive_members:
+            normalized_name = cls._normalize_safe_archive_member_name(member.name)
+            if normalized_name is None:
+                continue
+            if member.issym():
+                destination_name = cls._resolve_archive_path_through_symlinks(
+                    normalized_name,
+                    symlink_targets,
+                    member_visit_budget,
+                    follow_final_symlink=False,
+                )
+                if destination_name is None:
+                    continue
+                target_name = cls._resolve_archive_symlink_target_at_destination(member, destination_name)
+                if target_name is None:
+                    continue
+                if is_loaded_member_name(destination_name):
+                    return True
+                loaded_inode_paths.discard(destination_name)
+                occupied_names.add(destination_name)
+                symlink_targets[destination_name] = target_name
+                continue
+            if member.islnk():
+                destination_name = cls._resolve_archive_path_through_symlinks(
+                    normalized_name,
+                    symlink_targets,
+                    member_visit_budget,
+                    follow_final_symlink=False,
+                )
+                redirected_destination = cls._resolve_archive_path_through_symlinks(
+                    normalized_name,
+                    symlink_targets,
+                    member_visit_budget,
+                )
+                target_name = cls._resolve_archive_link_member_name(member)
+                if destination_name is None or target_name is None:
+                    continue
+                if is_loaded_member_name(destination_name):
+                    return True
+                if destination_name in occupied_names:
+                    fallback_member = cls._resolve_hardlink_fallback_member(
+                        member,
+                        members_by_normalized_name,
+                        member_visit_budget,
+                    )
+                    if fallback_member is None:
+                        if redirected_destination is not None and (
+                            is_loaded_member_name(redirected_destination)
+                            or redirected_destination in loaded_inode_paths
+                        ):
+                            return True
+                        continue
+                    if fallback_member.issym():
+                        loaded_inode_paths.discard(destination_name)
+                        symlink_targets.pop(destination_name, None)
+                        fallback_target = cls._resolve_archive_symlink_target_at_destination(
+                            fallback_member,
+                            destination_name,
+                        )
+                        if fallback_target is not None:
+                            symlink_targets[destination_name] = fallback_target
+                        continue
+                    redirected_write = cls._resolve_archive_path_through_symlinks(
+                        destination_name,
+                        symlink_targets,
+                        member_visit_budget,
+                    )
+                    if redirected_write is not None and (
+                        is_loaded_member_name(redirected_write) or redirected_write in loaded_inode_paths
+                    ):
+                        return True
+                    continue
+                occupied_names.add(destination_name)
+                redirected_target = cls._resolve_archive_path_through_symlinks(
+                    target_name,
+                    symlink_targets,
+                    member_visit_budget,
+                )
+                if redirected_target is None:
+                    continue
+                fallback_member = cls._resolve_hardlink_fallback_member(
+                    member,
+                    members_by_normalized_name,
+                    member_visit_budget,
+                )
+                if fallback_member is not None and fallback_member.issym() and redirected_target not in occupied_names:
+                    fallback_target = cls._resolve_archive_symlink_target_at_destination(
+                        fallback_member,
+                        destination_name,
+                    )
+                    if fallback_target is not None:
+                        symlink_targets[destination_name] = fallback_target
+                    continue
+                if redirected_target in loaded_inode_paths:
+                    loaded_inode_paths.add(destination_name)
+                continue
+            if not cls._tar_member_materializes_file_content(member):
+                continue
+            destination_name = cls._resolve_archive_path_through_symlinks(
+                normalized_name,
+                symlink_targets,
+                member_visit_budget,
+            )
+            if destination_name is None:
+                continue
+            physical_destination = cls._resolve_archive_path_through_symlinks(
+                normalized_name,
+                symlink_targets,
+                member_visit_budget,
+                follow_final_symlink=False,
+            )
+            if physical_destination is not None:
+                occupied_names.add(physical_destination)
+            if (destination_name != normalized_name and is_loaded_member_name(destination_name)) or (
+                destination_name in loaded_inode_paths and not is_loaded_member_name(normalized_name)
+            ):
+                return True
+            if is_loaded_member_name(destination_name):
+                loaded_inode_paths.add(destination_name)
+        return False
+
+    @classmethod
+    def _resolve_archive_path_through_symlinks(
+        cls,
+        member_name: str,
+        symlink_targets: dict[str, str],
+        member_visit_budget: list[int],
+        *,
+        follow_final_symlink: bool = True,
+    ) -> str | None:
+        """Resolve an extraction destination through symlinks already created."""
+        current_name = cls._normalize_safe_archive_member_name(member_name)
+        if current_name is None:
+            return None
+        seen: set[str] = set()
+        while current_name not in seen:
+            seen.add(current_name)
+            if not symlink_targets:
+                return current_name
+            components = current_name.split("/")
+            maximum_length = len(components) if follow_final_symlink else len(components) - 1
+            if not cls._consume_archive_prefix_probe_budget(
+                components,
+                maximum_length,
+                member_visit_budget,
+            ):
+                return None
+            for length in range(maximum_length, 0, -1):
+                prefix = "/".join(components[:length])
+                target_name = symlink_targets.get(prefix)
+                if target_name is None:
+                    continue
+                suffix = "/".join(components[length:])
+                redirected_name = target_name if not suffix else posixpath.join(target_name, suffix)
+                if posixpath.normpath(redirected_name) == ".":
+                    current_name = "."
+                else:
+                    current_name = cls._normalize_safe_archive_member_name(redirected_name)
+                    if current_name is None:
+                        return None
+                break
+            else:
+                return current_name
+        return None
+
+    @staticmethod
+    def _consume_archive_prefix_probe_budget(
+        components: list[str],
+        maximum_length: int,
+        member_visit_budget: list[int],
+    ) -> bool:
+        """Bound total prefix-string work before resolving symlink components."""
+        prefix_length = 0
+        probe_cost = 0
+        for index, component in enumerate(components[:maximum_length]):
+            prefix_length += len(component) + (1 if index else 0)
+            probe_cost += prefix_length
+            if probe_cost > member_visit_budget[0]:
+                member_visit_budget[0] = -1
+                return False
+        member_visit_budget[0] -= probe_cost
+        return True
+
+    @classmethod
+    def _resolve_archive_symlink_target_at_destination(
+        cls,
+        member: tarfile.TarInfo,
+        destination_name: str,
+    ) -> str | None:
+        """Resolve a symlink target relative to its extracted destination."""
+        linkname = member.linkname.replace("\\", "/")
+        if is_absolute_archive_path(linkname):
+            return None
+        candidate = posixpath.join(posixpath.dirname(destination_name), linkname)
+        if posixpath.normpath(candidate) == ".":
+            return "."
+        return cls._normalize_safe_archive_member_name(candidate)
+
+    @staticmethod
+    def _tar_member_identity(member: tarfile.TarInfo) -> tuple[str, int]:
+        """Return an identity that distinguishes duplicate TAR entry headers."""
+        return member.name, member.offset
+
+    @classmethod
+    def _is_final_archive_member_for_path(
+        cls,
+        member: tarfile.TarInfo,
+        members_by_normalized_name: dict[str, list[tarfile.TarInfo]],
+    ) -> bool:
+        """Return whether this header determines the extracted pathname."""
+        normalized_name = cls._normalize_safe_archive_member_name(member.name)
+        if normalized_name is None:
+            return False
+        path_members = members_by_normalized_name.get(normalized_name, [])
+        return bool(path_members) and path_members[-1].offset == member.offset
+
+    @staticmethod
+    def _tar_member_materializes_file_content(member: tarfile.TarInfo) -> bool:
+        """Mirror tarfile members extracted through makefile or makeunknown."""
+        return not (
+            member.isdir() or member.isfifo() or member.ischr() or member.isblk() or member.islnk() or member.issym()
+        )
+
+    @staticmethod
+    def _normalize_safe_archive_member_name(member_name: str) -> str | None:
+        """Normalize an archive member path that cannot escape extraction root."""
+        normalized_name = posixpath.normpath(member_name.replace("\\", "/"))
+        if is_absolute_archive_path(normalized_name):
+            return None
+        if normalized_name in {"", ".", ".."} or normalized_name.startswith("../"):
+            return None
+        return normalized_name
+
     @staticmethod
     def _resolve_archive_link_member_name(member: tarfile.TarInfo) -> str | None:
         """Resolve a tar link target to a normalized archive member name."""
@@ -493,11 +1157,482 @@ class NemoScanner(BaseScanner):
         if is_absolute_archive_path(linkname):
             return None
 
-        member_dir = os.path.dirname(member.name.replace("\\", "/"))
-        candidate = os.path.normpath(os.path.join(member_dir, linkname)).replace("\\", "/")
-        if candidate in {"", "."} or candidate == ".." or candidate.startswith("../"):
+        if member.islnk():
+            candidate = linkname
+        else:
+            member_dir = posixpath.dirname(member.name.replace("\\", "/"))
+            candidate = posixpath.join(member_dir, linkname)
+        if posixpath.normpath(candidate) == ".":
+            return "."
+        return NemoScanner._normalize_safe_archive_member_name(candidate)
+
+    @classmethod
+    def _resolve_extractable_regular_link_target(
+        cls,
+        root_link: tarfile.TarInfo,
+        members_by_normalized_name: dict[str, list[tarfile.TarInfo]],
+        archive_members: list[tarfile.TarInfo],
+        member_visit_budget: list[int],
+    ) -> tarfile.TarInfo | None:
+        """Resolve a safe TAR link chain to the regular entry extraction materializes."""
+        pending = [root_link]
+        seen: set[tuple[str, int]] = set()
+        hardlink_members: list[tarfile.TarInfo] = []
+        while pending:
+            if member_visit_budget[0] <= 0:
+                member_visit_budget[0] = -1
+                return None
+            member_visit_budget[0] -= 1
+            member = pending.pop()
+            identity = cls._tar_member_identity(member)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if cls._tar_member_materializes_file_content(member):
+                if hardlink_members:
+                    return cls._resolve_hardlink_inode_content(
+                        root_link,
+                        member,
+                        members_by_normalized_name,
+                        archive_members,
+                        member_visit_budget,
+                    )
+                if root_link.issym():
+                    return cls._resolve_symlink_only_content(
+                        root_link,
+                        archive_members,
+                        member_visit_budget,
+                    )
+                return member
+            if not (member.issym() or member.islnk()):
+                continue
+            if member.issym() and hardlink_members and root_link.islnk():
+                member_visit_budget[0] = -2
+                return None
+            if member.islnk():
+                hardlink_members.append(member)
+            linked_member = cls._effective_archive_link_target_member(member, members_by_normalized_name)
+            if linked_member is not None:
+                pending.append(linked_member)
+        return None
+
+    @classmethod
+    def _resolve_symlink_only_content(
+        cls,
+        observed_link: tarfile.TarInfo,
+        archive_members: list[tarfile.TarInfo],
+        member_visit_budget: list[int],
+    ) -> tarfile.TarInfo | None:
+        """Replay writes through an externally loaded symlink-only path."""
+        if member_visit_budget[0] < len(archive_members):
+            member_visit_budget[0] = -1
             return None
-        return candidate.lstrip("./")
+        member_visit_budget[0] -= len(archive_members)
+
+        symlink_targets: dict[str, str] = {}
+        content_by_name: dict[str, tarfile.TarInfo] = {}
+        for archive_member in archive_members:
+            member_name = cls._normalize_safe_archive_member_name(archive_member.name)
+            if member_name is None:
+                continue
+            if archive_member.issym():
+                destination_name = cls._resolve_archive_path_through_symlinks(
+                    member_name,
+                    symlink_targets,
+                    member_visit_budget,
+                    follow_final_symlink=False,
+                )
+                if destination_name is None:
+                    return None
+                target_name = cls._resolve_symlink_at_destination(archive_member, destination_name)
+                if target_name is None:
+                    return None
+                symlink_targets[destination_name] = target_name
+                content_by_name.pop(destination_name, None)
+                continue
+            if archive_member.islnk():
+                member_visit_budget[0] = -2
+                return None
+            if cls._tar_member_materializes_file_content(archive_member):
+                terminal_name = cls._resolve_symlink_terminal_name(
+                    member_name,
+                    symlink_targets,
+                    member_visit_budget,
+                )
+                if terminal_name is None:
+                    return None
+                content_by_name[terminal_name] = archive_member
+
+        observed_name = cls._normalize_safe_archive_member_name(observed_link.name)
+        if observed_name is None:
+            return None
+        terminal_name = cls._resolve_symlink_terminal_name(observed_name, symlink_targets, member_visit_budget)
+        if terminal_name is None:
+            return None
+        return content_by_name.get(terminal_name)
+
+    @classmethod
+    def _resolve_hardlink_inode_content(
+        cls,
+        observed_link: tarfile.TarInfo,
+        initial_content: tarfile.TarInfo,
+        members_by_normalized_name: dict[str, list[tarfile.TarInfo]],
+        archive_members: list[tarfile.TarInfo],
+        member_visit_budget: list[int],
+    ) -> tarfile.TarInfo | None:
+        """Return final regular content of an extracted hardlink inode."""
+        initial_name = cls._normalize_safe_archive_member_name(initial_content.name)
+        observed_name = cls._normalize_safe_archive_member_name(observed_link.name)
+        if initial_name is None or observed_name is None:
+            return None
+        if member_visit_budget[0] < len(archive_members):
+            member_visit_budget[0] = -1
+            return None
+        member_visit_budget[0] -= len(archive_members)
+
+        symlink_targets: dict[str, str] = {}
+        ambiguous_fallback_symlink_destinations: set[str] = set()
+        occupied_names: set[str] = set()
+        for archive_member in archive_members:
+            if archive_member.offset > initial_content.offset:
+                break
+            member_name = cls._normalize_safe_archive_member_name(archive_member.name)
+            if member_name is None:
+                continue
+            destination_name = cls._resolve_archive_path_through_symlinks(
+                member_name,
+                symlink_targets,
+                member_visit_budget,
+                follow_final_symlink=False,
+            )
+            if destination_name is None:
+                return None
+            if archive_member.issym():
+                symlink_target_name = cls._resolve_symlink_at_destination(
+                    archive_member,
+                    destination_name,
+                )
+                if symlink_target_name is None:
+                    return None
+                symlink_targets[destination_name] = symlink_target_name
+                ambiguous_fallback_symlink_destinations.discard(destination_name)
+            elif archive_member.islnk():
+                fallback_member = cls._resolve_hardlink_fallback_member(
+                    archive_member,
+                    members_by_normalized_name,
+                    member_visit_budget,
+                )
+                if fallback_member is None:
+                    return None
+                if fallback_member.issym():
+                    symlink_targets.pop(destination_name, None)
+                    symlink_target_name = cls._resolve_symlink_at_destination(
+                        fallback_member,
+                        destination_name,
+                    )
+                    if symlink_target_name is None:
+                        return None
+                    symlink_targets[destination_name] = symlink_target_name
+                    if destination_name in occupied_names:
+                        ambiguous_fallback_symlink_destinations.discard(destination_name)
+                    else:
+                        ambiguous_fallback_symlink_destinations.add(destination_name)
+            occupied_names.add(destination_name)
+        initial_destination_name = cls._resolve_archive_path_through_symlinks(
+            initial_name,
+            symlink_targets,
+            member_visit_budget,
+        )
+        if initial_destination_name is None:
+            return None
+        if observed_link.islnk() and initial_destination_name != initial_name:
+            member_visit_budget[0] = -2
+            return None
+        active_names = {initial_destination_name}
+        effective_content = initial_content
+
+        def traverses_ambiguous_fallback_symlink(member_name: str) -> bool:
+            for ambiguous_destination in ambiguous_fallback_symlink_destinations:
+                if cls._symlink_path_traverses_name(
+                    member_name,
+                    ambiguous_destination,
+                    symlink_targets,
+                    member_visit_budget,
+                ):
+                    return True
+                if member_visit_budget[0] < 0:
+                    return False
+            return False
+
+        for archive_member in archive_members:
+            if archive_member.offset <= initial_content.offset:
+                continue
+            member_name = cls._normalize_safe_archive_member_name(archive_member.name)
+            if member_name is None:
+                continue
+            destination_name = cls._resolve_archive_path_through_symlinks(
+                member_name,
+                symlink_targets,
+                member_visit_budget,
+                follow_final_symlink=False,
+            )
+            if destination_name is None:
+                return None
+            if cls._tar_member_materializes_file_content(archive_member):
+                occupied_names.add(destination_name)
+                resolves_to_inode = cls._path_resolves_to_hardlink_inode(
+                    member_name,
+                    active_names,
+                    symlink_targets,
+                    member_visit_budget,
+                )
+                if member_visit_budget[0] < 0:
+                    return None
+                if resolves_to_inode:
+                    if traverses_ambiguous_fallback_symlink(member_name):
+                        member_visit_budget[0] = -2
+                        return None
+                    if member_visit_budget[0] < 0:
+                        return None
+                    effective_content = archive_member
+                continue
+
+            if archive_member.islnk():
+                destination_reaches_inode = cls._path_resolves_to_hardlink_inode(
+                    member_name,
+                    active_names,
+                    symlink_targets,
+                    member_visit_budget,
+                )
+                if member_visit_budget[0] < 0:
+                    return None
+                hardlink_target_name = cls._resolve_archive_link_member_name(archive_member)
+                if destination_name in occupied_names:
+                    destination_on_observed_path = cls._tar_member_identity(archive_member) == cls._tar_member_identity(
+                        observed_link
+                    ) or (
+                        observed_link.issym()
+                        and cls._symlink_path_traverses_name(
+                            observed_name,
+                            destination_name,
+                            symlink_targets,
+                            member_visit_budget,
+                        )
+                    )
+                    if member_visit_budget[0] < 0:
+                        return None
+                    fallback_member = cls._resolve_hardlink_fallback_member(
+                        archive_member,
+                        members_by_normalized_name,
+                        member_visit_budget,
+                    )
+                    if fallback_member is None:
+                        return None
+                    if fallback_member.issym():
+                        active_names.discard(destination_name)
+                        symlink_targets.pop(destination_name, None)
+                        symlink_target_name = cls._resolve_symlink_at_destination(
+                            fallback_member,
+                            destination_name,
+                        )
+                        if symlink_target_name is None:
+                            return None
+                        symlink_targets[destination_name] = symlink_target_name
+                        ambiguous_fallback_symlink_destinations.discard(destination_name)
+                        continue
+                    if destination_reaches_inode or destination_on_observed_path:
+                        if cls._tar_member_materializes_file_content(fallback_member):
+                            effective_content = fallback_member
+                            if destination_on_observed_path and not destination_reaches_inode:
+                                symlink_targets.pop(destination_name, None)
+                                active_names.add(destination_name)
+                        else:
+                            return None
+                    continue
+                occupied_names.add(destination_name)
+                if hardlink_target_name is not None:
+                    target_reaches_inode = cls._path_resolves_to_hardlink_inode(
+                        hardlink_target_name,
+                        active_names,
+                        symlink_targets,
+                        member_visit_budget,
+                    )
+                    if member_visit_budget[0] < 0:
+                        return None
+                    if target_reaches_inode:
+                        if traverses_ambiguous_fallback_symlink(hardlink_target_name):
+                            member_visit_budget[0] = -2
+                            return None
+                        if member_visit_budget[0] < 0:
+                            return None
+                        active_names.add(destination_name)
+                    else:
+                        fallback_member = cls._resolve_hardlink_fallback_member(
+                            archive_member,
+                            members_by_normalized_name,
+                            member_visit_budget,
+                        )
+                        if fallback_member is not None and fallback_member.issym():
+                            symlink_target_name = cls._resolve_symlink_at_destination(
+                                fallback_member,
+                                destination_name,
+                            )
+                            if symlink_target_name is None:
+                                return None
+                            symlink_targets[destination_name] = symlink_target_name
+                            ambiguous_fallback_symlink_destinations.add(destination_name)
+            elif archive_member.issym():
+                active_names.discard(destination_name)
+                symlink_targets.pop(destination_name, None)
+                occupied_names.add(destination_name)
+                symlink_target_name = cls._resolve_symlink_at_destination(
+                    archive_member,
+                    destination_name,
+                )
+                if symlink_target_name is not None:
+                    symlink_targets[destination_name] = symlink_target_name
+                    ambiguous_fallback_symlink_destinations.discard(destination_name)
+
+        observed_reaches_inode = cls._path_resolves_to_hardlink_inode(
+            observed_name,
+            active_names,
+            symlink_targets,
+            member_visit_budget,
+        )
+        if member_visit_budget[0] < 0:
+            return None
+        return effective_content if observed_reaches_inode else None
+
+    @classmethod
+    def _symlink_path_traverses_name(
+        cls,
+        start_name: str,
+        candidate_name: str,
+        symlink_targets: dict[str, str],
+        member_visit_budget: list[int],
+    ) -> bool:
+        """Return whether a symlink path currently traverses a candidate name."""
+        normalized_candidate = cls._normalize_safe_archive_member_name(candidate_name)
+        current_name = cls._normalize_safe_archive_member_name(start_name)
+        if normalized_candidate is None or current_name is None:
+            return False
+        seen: set[str] = set()
+        while current_name not in seen:
+            if current_name == normalized_candidate:
+                return True
+            seen.add(current_name)
+            if not symlink_targets:
+                return False
+            components = current_name.split("/")
+            if not cls._consume_archive_prefix_probe_budget(
+                components,
+                len(components),
+                member_visit_budget,
+            ):
+                return False
+            for length in range(len(components), 0, -1):
+                prefix = "/".join(components[:length])
+                target_name = symlink_targets.get(prefix)
+                if target_name is None:
+                    continue
+                if prefix == normalized_candidate:
+                    return True
+                suffix = "/".join(components[length:])
+                redirected_name = target_name if not suffix else posixpath.join(target_name, suffix)
+                if posixpath.normpath(redirected_name) == ".":
+                    current_name = "."
+                    break
+                normalized_redirected = cls._normalize_safe_archive_member_name(redirected_name)
+                if normalized_redirected is None:
+                    return False
+                current_name = normalized_redirected
+                break
+            else:
+                return False
+        return False
+
+    @classmethod
+    def _resolve_hardlink_fallback_member(
+        cls,
+        hardlink: tarfile.TarInfo,
+        members_by_normalized_name: dict[str, list[tarfile.TarInfo]],
+        member_visit_budget: list[int],
+    ) -> tarfile.TarInfo | None:
+        """Resolve the member extracted by a colliding hardlink fallback."""
+        pending = hardlink
+        seen: set[tuple[str, int]] = set()
+        while pending.islnk():
+            if member_visit_budget[0] <= 0:
+                member_visit_budget[0] = -1
+                return None
+            member_visit_budget[0] -= 1
+            identity = cls._tar_member_identity(pending)
+            if identity in seen:
+                return None
+            seen.add(identity)
+            target_member = cls._effective_archive_link_target_member(pending, members_by_normalized_name)
+            if target_member is None:
+                return None
+            if cls._tar_member_materializes_file_content(target_member) or target_member.issym():
+                return target_member
+            pending = target_member
+        return None
+
+    @classmethod
+    def _resolve_symlink_at_destination(cls, symlink: tarfile.TarInfo, destination_name: str) -> str | None:
+        """Resolve a fallback symlink relative to the path where TAR installs it."""
+        linkname = symlink.linkname.replace("\\", "/")
+        if is_absolute_archive_path(linkname):
+            return None
+        candidate = posixpath.join(posixpath.dirname(destination_name), linkname)
+        if posixpath.normpath(candidate) == ".":
+            return "."
+        return cls._normalize_safe_archive_member_name(candidate)
+
+    @classmethod
+    def _path_resolves_to_hardlink_inode(
+        cls,
+        member_name: str,
+        active_names: set[str],
+        symlink_targets: dict[str, str],
+        member_visit_budget: list[int],
+    ) -> bool:
+        """Return whether opening a safe path reaches the tracked hardlink inode."""
+        terminal_name = cls._resolve_archive_path_through_symlinks(
+            member_name,
+            symlink_targets,
+            member_visit_budget,
+        )
+        return terminal_name is not None and terminal_name in active_names
+
+    @classmethod
+    def _resolve_symlink_terminal_name(
+        cls,
+        member_name: str,
+        symlink_targets: dict[str, str],
+        member_visit_budget: list[int],
+    ) -> str | None:
+        """Resolve a safe extracted symlink chain to its terminal pathname."""
+        return cls._resolve_archive_path_through_symlinks(
+            member_name,
+            symlink_targets,
+            member_visit_budget,
+        )
+
+    @classmethod
+    def _effective_archive_link_target_member(
+        cls,
+        member: tarfile.TarInfo,
+        members_by_normalized_name: dict[str, list[tarfile.TarInfo]],
+    ) -> tarfile.TarInfo | None:
+        """Return the single target entry TAR extraction would use for a link."""
+        target_name = cls._resolve_archive_link_member_name(member)
+        if target_name is None:
+            return None
+        target_members = members_by_normalized_name.get(target_name, [])
+        if member.islnk():
+            target_members = [target_member for target_member in target_members if target_member.offset < member.offset]
+        return target_members[-1] if target_members else None
 
     def _add_archive_path_traversal_check(
         self,
@@ -626,28 +1761,12 @@ class NemoScanner(BaseScanner):
                 )
                 return
 
-            self._propagate_nested_incomplete_result(
-                result,
-                nested_result,
-                reason="nemo_checkpoint_nested_scan_incomplete",
-                message=f"Nested scan was incomplete for checkpoint member: {report_entry}",
-                archive_path=archive_path,
-                entry=report_entry,
-                source_entry=member.name,
-            )
-            self._propagate_nested_security_findings(
-                result,
-                nested_result,
-                extracted_path=extracted_path,
-                archive_path=archive_path,
-                entry=report_entry,
-                source_entry=member.name,
-            )
-
+            self._merge_nested_security_findings(result, nested_result, extracted_path, archive_path, report_entry)
             critical_issues = [
                 issue
                 for issue in nested_result.issues
-                if issue.severity == IssueSeverity.CRITICAL and self._is_nested_checkpoint_deserialization_issue(issue)
+                if issue.severity == IssueSeverity.CRITICAL
+                and self._is_nested_checkpoint_deserialization_issue(issue, nested_result.scanner_name)
             ]
             if critical_issues:
                 self._add_checkpoint_deserialization_check(
@@ -672,12 +1791,20 @@ class NemoScanner(BaseScanner):
         *,
         config_file: str,
         config_path: str,
+        scanned_regular_checkpoint_sources: set[tuple[str, int]],
     ) -> bool:
         """Scan `nemo:`-referenced archive members through content-based nested dispatch."""
         try:
             member = tar.getmember(referenced_member_name)
         except KeyError:
             return False
+
+        if (
+            member.isfile()
+            and referenced_member_name.lower().endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS))
+            and self._tar_member_identity(member) in scanned_regular_checkpoint_sources
+        ):
+            return True
 
         if member.issym() or member.islnk():
             resolved_name = self._resolve_archive_link_member_name(member)
@@ -753,41 +1880,18 @@ class NemoScanner(BaseScanner):
                 )
                 return True
 
-            trusted_content_format = detect_file_format_from_magic(extracted_path)
-            is_declared_checkpoint = referenced_member_name.lower().endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS))
-            if trusted_content_format != "unknown" or is_declared_checkpoint:
-                self._propagate_nested_incomplete_result(
-                    result,
-                    nested_result,
-                    reason="nemo_referenced_nested_scan_incomplete",
-                    message=f"Nested scan was incomplete for referenced member: {referenced_member_name}",
-                    archive_path=archive_path,
-                    entry=referenced_member_name,
-                    source_entry=member.name,
-                    extra_details={
-                        "config_file": config_file,
-                        "config_path": config_path,
-                        "trusted_content_format": trusted_content_format,
-                    },
-                )
-            self._propagate_nested_security_findings(
+            self._merge_nested_security_findings(
                 result,
                 nested_result,
-                extracted_path=extracted_path,
-                archive_path=archive_path,
-                entry=referenced_member_name,
-                source_entry=member.name,
-                extra_details={
-                    "config_file": config_file,
-                    "config_path": config_path,
-                    "trusted_content_format": trusted_content_format,
-                },
+                extracted_path,
+                archive_path,
+                referenced_member_name,
             )
-
             critical_issues = [
                 issue
                 for issue in nested_result.issues
-                if issue.severity == IssueSeverity.CRITICAL and self._is_nested_checkpoint_deserialization_issue(issue)
+                if issue.severity == IssueSeverity.CRITICAL
+                and self._is_nested_checkpoint_deserialization_issue(issue, nested_result.scanner_name)
             ]
             if critical_issues:
                 self._add_checkpoint_deserialization_check(
@@ -809,82 +1913,52 @@ class NemoScanner(BaseScanner):
             except OSError:
                 logger.debug("Failed to remove temporary NeMo referenced scan file: %s", extracted_path)
 
-    def _propagate_nested_security_findings(
-        self,
+    @staticmethod
+    def _merge_nested_security_findings(
         result: ScanResult,
         nested_result: ScanResult,
-        *,
         extracted_path: str,
         archive_path: str,
-        entry: str,
-        source_entry: str,
-        extra_details: dict[str, Any] | None = None,
+        entry_name: str,
     ) -> None:
-        """Preserve concrete findings from nested artifact scans with NeMo provenance."""
-        for issue in nested_result.issues:
-            if issue.severity not in (IssueSeverity.WARNING, IssueSeverity.CRITICAL):
-                continue
-            if issue.severity == IssueSeverity.CRITICAL and self._is_nested_checkpoint_deserialization_issue(issue):
-                continue
-
-            result.add_check(
-                name="NeMo Nested Member Security Finding",
-                passed=False,
-                message=issue.message,
-                severity=issue.severity,
-                location=rewrite_extracted_member_location(
-                    issue.location,
-                    extracted_path,
-                    f"{archive_path}:{entry}",
-                    preserve_non_delimited_suffix=True,
-                ),
-                details={
-                    **issue.details,
-                    "entry": entry,
-                    "source_entry": source_entry,
-                    "nested_scanner": nested_result.scanner_name,
-                    "nested_issue_type": issue.type,
-                    **(extra_details or {}),
-                },
-                why=issue.why,
-                rule_code=issue.rule_code,
-            )
-
-    def _propagate_nested_incomplete_result(
-        self,
-        result: ScanResult,
-        nested_result: ScanResult,
-        *,
-        reason: str,
-        message: str,
-        archive_path: str,
-        entry: str,
-        source_entry: str,
-        extra_details: dict[str, Any] | None = None,
-    ) -> None:
-        """Preserve explicit incomplete coverage from a nested NeMo member scan."""
-        if (
-            nested_result.metadata.get("analysis_incomplete") is not True
-            and nested_result.metadata.get(_INCONCLUSIVE_METADATA_KEY) != INCONCLUSIVE_SCAN_OUTCOME
-        ):
-            return
-
-        nested_reasons = nested_result.metadata.get(_INCONCLUSIVE_REASONS_METADATA_KEY)
-        self._mark_inconclusive_scan_result(
-            result,
-            reason=reason,
-            check_name="NeMo Checkpoint Nested Scan",
-            message=message,
-            location=f"{archive_path}:{entry}",
-            details={
-                "entry": entry,
-                "source_entry": source_entry,
-                "nested_scanner": nested_result.scanner_name,
-                "nested_scan_outcome": nested_result.metadata.get(_INCONCLUSIVE_METADATA_KEY),
-                "nested_scan_outcome_reasons": list(nested_reasons) if isinstance(nested_reasons, list) else [],
-                **(extra_details or {}),
-            },
+        """Preserve actionable nested findings while NeMo adds CVE attribution."""
+        archive_location = f"{archive_path}:{entry_name}"
+        actionable_severities = {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        raw_operational_reason = nested_result.metadata.get(OPERATIONAL_ERROR_REASON_METADATA_KEY)
+        operational_reason = (
+            raw_operational_reason if isinstance(raw_operational_reason, str) else _NESTED_OPERATIONAL_REASON_FALLBACK
         )
+        nested_operational = scan_result_has_operational_error(nested_result)
+        if nested_operational:
+            mark_archive_scan_incomplete(result, operational_reason)
+            mark_operational_scan_error(result, operational_reason)
+
+        for check in nested_result.checks:
+            is_operational_diagnostic = nested_operational and (
+                check.name == _NESTED_OPERATIONAL_CHECK_NAMES.get(operational_reason)
+                or check.details.get("scan_outcome_reason") == operational_reason
+            )
+            if check.status != CheckStatus.FAILED or (
+                check.severity not in actionable_severities and not is_operational_diagnostic
+            ):
+                continue
+            check.location = rewrite_extracted_member_location(
+                check.location,
+                extracted_path,
+                archive_location,
+                preserve_non_delimited_suffix=False,
+            )
+            result.checks.append(check)
+        for issue in nested_result.issues:
+            if issue.severity not in actionable_severities:
+                continue
+            issue.location = rewrite_extracted_member_location(
+                issue.location,
+                extracted_path,
+                archive_location,
+                preserve_non_delimited_suffix=False,
+            )
+            result.issues.append(issue)
 
     @classmethod
     def _collect_nemo_member_references(
@@ -943,11 +2017,11 @@ class NemoScanner(BaseScanner):
         return normalized_member.lstrip("./")
 
     @staticmethod
-    def _is_nested_checkpoint_deserialization_issue(issue: Any) -> bool:
-        if issue.rule_code in _NESTED_NON_DESERIALIZATION_RULE_CODES:
-            return False
-
+    def _is_nested_checkpoint_deserialization_issue(issue: Any, nested_scanner: str | None = None) -> bool:
         details = issue.details if isinstance(issue.details, dict) else {}
+        if nested_scanner == "torch7" and details.get("signal") == "exec_with_network_shell_context":
+            return True
+
         text = " ".join(
             str(part).lower()
             for part in (
@@ -983,6 +2057,7 @@ class NemoScanner(BaseScanner):
         member: tarfile.TarInfo,
         *,
         suffix_source: str | None = None,
+        max_bytes: int | None = None,
     ) -> str | None:
         member_file = tar.extractfile(member)
         if member_file is None:
@@ -990,11 +2065,16 @@ class NemoScanner(BaseScanner):
 
         _root, suffix = os.path.splitext(suffix_source or member.name)
         with member_file, tempfile.NamedTemporaryFile(suffix=suffix or ".bin", delete=False) as temp_file:
+            remaining = max_bytes
             while True:
-                chunk = member_file.read(64 * 1024)
+                if remaining is not None and remaining <= 0:
+                    break
+                chunk = member_file.read(64 * 1024 if remaining is None else min(64 * 1024, remaining))
                 if not chunk:
                     break
                 temp_file.write(chunk)
+                if remaining is not None:
+                    remaining -= len(chunk)
             return temp_file.name
 
     def _add_checkpoint_deserialization_check(
@@ -1112,7 +2192,7 @@ class NemoScanner(BaseScanner):
             return
 
         # Trusted namespaces can still hide obviously dangerous leaf names.
-        if any(target.startswith(prefix) for prefix in _SAFE_TARGET_PREFIXES):
+        if target in _SAFE_TARGETS or any(target.startswith(prefix) for prefix in _SAFE_TARGET_PREFIXES):
             pattern = _find_suspicious_safe_prefixed_target_pattern(target)
             if pattern is not None:
                 self._add_suspicious_target_check(

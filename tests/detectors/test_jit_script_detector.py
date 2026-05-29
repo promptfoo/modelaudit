@@ -1,5 +1,6 @@
 """Tests for JIT/Script code execution detection."""
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -1067,6 +1068,373 @@ class TestJITScriptDetector:
         findings = detector.scan_model(b"from os import system as run\nrun('id')\n", "pytorch", "payload.bin")
 
         assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"def payload():\n    return os.posix_spawn('/bin/sh', ['sh'], {})\n",
+            b"def payload():\n    return os.posix_spawnp('sh', ['sh'], {})\n",
+            b"def payload():\n    return os.startfile('payload.exe')\n",
+            b"def payload():\n    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], {})\n",
+            b"def payload():\n    os.posix_spawn = len\n    return os.posix_spawn([])\n",
+            b"def payload(data):\n    os.posix_spawn = pickle.loads\n    return os.posix_spawn(data)\n",
+        ],
+    )
+    def test_scan_model_detects_os_process_launch_source_conservatively(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_string_literal_os_process_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = b"def payload():\n    return \"os.posix_spawn('/bin/sh', ['sh'], {})\"\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_ignores_string_literal_os_process_launch_with_unrelated_risk(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"import pickle\n\n"
+            b"def payload(data):\n"
+            b"    pickle.loads(data)\n"
+            b"    return \"os.posix_spawn('/bin/sh', ['sh'], {})\"\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            (
+                b"import os\n"
+                b"import subprocess\n\n"
+                b"def payload(args):\n"
+                b"    marker = os.posix_spawn\n"
+                b"    return subprocess.list2cmdline(args)\n"
+            ),
+            (
+                b"import os\n"
+                b"import subprocess\n\n"
+                b"def payload():\n"
+                b"    marker = os.posix_spawn\n"
+                b"    return subprocess.run(['echo', 'ok'], check=False)\n"
+            ),
+        ],
+    )
+    def test_scan_model_ignores_uninvoked_os_process_reference_with_unrelated_risk(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_embedded_snippet_alias_aware_os_process_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import os\n"
+            b"    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], dict())\n"
+            b"}"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_embedded_snippet_alias_aware_os_process_launch_before_binary_tail(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import os\n"
+            b"    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], dict())\n"
+            b"\x00\xffMODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"async def payload():\n    return await asyncio.create_subprocess_shell('id')\n",
+            b"async def payload():\n    return await asyncio.subprocess.create_subprocess_exec('id')\n",
+            (
+                b"from asyncio import create_subprocess_exec as launch\n"
+                b"async def payload():\n    return await launch('id')\n"
+            ),
+            (
+                b"async def payload():\n"
+                b"    asyncio.create_subprocess_shell = len\n"
+                b"    return asyncio.create_subprocess_shell([])\n"
+            ),
+            (
+                b"async def payload(data):\n"
+                b"    asyncio.create_subprocess_exec = pickle.loads\n"
+                b"    return asyncio.create_subprocess_exec(data)\n"
+            ),
+        ],
+    )
+    def test_scan_model_detects_asyncio_subprocess_launch_source_conservatively(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_string_literal_asyncio_subprocess_launch_with_unrelated_risk(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"import pickle\n\n"
+            b"def payload(data):\n"
+            b"    pickle.loads(data)\n"
+            b"    return \"asyncio.create_subprocess_shell('id')\"\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_binary_framed_string_literal_asyncio_subprocess_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xffdef payload():\n    return \"asyncio.create_subprocess_shell('id')\"\n\x00\xffMODEL-FRAMING"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_lossy_decoded_string_literal_asyncio_subprocess_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    # ignored invalid bytes: "
+            + (b"\xff" * 64)
+            + b"\n    return \"asyncio.create_subprocess_shell('id')\"\n\x00\xffMODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_parse_embedded_python_snippet_caps_trim_attempts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        parse_calls = 0
+
+        def fail_parse(_source: str) -> ast.AST:
+            nonlocal parse_calls
+            parse_calls += 1
+            raise SyntaxError("bad syntax", ("<embedded>", 1, 1, "bad"))
+
+        monkeypatch.setattr(jit_script_module.ast, "parse", fail_parse)
+
+        tree = jit_script_module._parse_embedded_python_snippet(
+            "def payload():\n" + "\n".join("bad" for _ in range(1000))
+        )
+
+        assert tree is None
+        assert parse_calls <= jit_script_module._MAX_SNIPPET_PARSE_TRIM_ATTEMPTS + 2
+
+    def test_scan_model_detects_binary_framed_long_tail_alias_aware_asyncio_subprocess_launch(self) -> None:
+        detector = JITScriptDetector()
+        tail = b"\n".join(b"tail" for _ in range(jit_script_module._MAX_SNIPPET_PARSE_TRIM_ATTEMPTS + 20))
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    from asyncio import create_subprocess_shell as launch\n"
+            b"    return launch('id')\n"
+            b"\x00" + tail
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_binary_framed_long_tail_alias_aware_os_process_launch(self) -> None:
+        detector = JITScriptDetector()
+        tail = b"\n".join(b"tail" for _ in range(jit_script_module._MAX_SNIPPET_PARSE_TRIM_ATTEMPTS + 20))
+        source = b"\x00\xffdef payload():\n    import os as o\n    return getattr(o, 'system')('id')\n\x00" + tail
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    def test_scan_model_preserves_raw_asyncio_match_in_unparsed_snippet_after_benign_parse(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def benign():\n"
+            b"    return \"asyncio.create_subprocess_shell('id')\"\n"
+            b"}\n"
+            b"def payload():\n"
+            b"if True print('broken')\n"
+            b"asyncio.create_subprocess_shell('id')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_embedded_snippet_alias_aware_asyncio_subprocess_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    from asyncio import create_subprocess_shell as launch\n"
+            b"    return launch('id')\n"
+            b"}"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"def payload():\n    return runpy._run_module_as_main('payload')\n",
+            b"def payload():\n    return runpy.run_module('payload')\n",
+            b"def payload():\n    from runpy import run_path as run\n    return run('payload.py')\n",
+        ],
+    )
+    def test_scan_model_detects_unmarked_runpy_execution(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_certain_replaced_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = b"def payload():\n    runpy.run_path = len\n    return runpy.run_path([])\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_preserves_possible_runpy_execution_after_conditional_replacement(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def payload():\n    if replace:\n        runpy.run_path = len\n    return runpy.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_binary_prefixed_aliased_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xffdef payload():\n    from runpy import run_path as run\n    return run('payload.py')\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_binary_framed_top_level_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xfffrom runpy import run_path as run\nrun('payload.py')\n\x00MODEL-FRAMING"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_binary_framed_top_level_replaced_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xffimport runpy\nrunpy.run_path = len\nrunpy.run_path([])\n\x00MODEL-FRAMING"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_binary_framed_long_tail_alias_aware_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        tail = b"\n".join(b"tail" for _ in range(jit_script_module._MAX_SNIPPET_PARSE_TRIM_ATTEMPTS + 20))
+        source = (
+            b"\x00\xffdef payload():\n    from runpy import run_path as run\n    return run('payload.py')\n\x00" + tail
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_binary_prefixed_replaced_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xffdef payload():\n    import runpy\n    runpy.run_path = len\n    return runpy.run_path([])\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_ignores_lossy_decoded_string_literal_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    # ignored invalid bytes: "
+            + (b"\xff" * 64)
+            + b"\n    return \"runpy.run_path('payload.py')\"\n\x00\xffMODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_preserves_raw_runpy_match_after_benign_parsed_snippet(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def benign():\n"
+            b"    return \"runpy.run_path('payload.py')\"\n"
+            b"}\n"
+            b"def payload():\n"
+            b"if True print('broken')\n"
+            b"runpy.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
 
     def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""

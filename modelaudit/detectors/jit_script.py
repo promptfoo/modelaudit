@@ -133,97 +133,157 @@ def _compile_dangerous_import_patterns(dangerous_import: str) -> tuple[re.Patter
 _DANGEROUS_IMPORT_PATTERNS = {
     dangerous_import: _compile_dangerous_import_patterns(dangerous_import) for dangerous_import in DANGEROUS_IMPORTS
 }
-_SNIPPET_IMPORT_CONTEXT_LINES = 50
+_MAX_SNIPPET_PARSE_TRIM_ATTEMPTS = 8
+_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES = 1_000_000
+_EMBEDDED_PYTHON_START_MARKERS = (b"def ", b"async def ", b"class ", b"import ", b"from ")
+_EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+")
+_EMBEDDED_PYTHON_START_PATTERN = re.compile(
+    rb"(?<![A-Za-z0-9_'\".])"
+    rb"(?:(?:async\s+)?def\s+\w+|class\s+\w+|import\s+[A-Za-z_][\w.]*|from\s+[A-Za-z_][\w.]*\s+import)"
+)
 
 
-def _extract_nearby_python_prelude_line(line: bytes) -> bytes | None:
-    stripped = line.lstrip()
-    if stripped.startswith((b"import ", b"from ")):
-        return stripped
-    import_fragment = re.search(rb"(?a)(?:^|[^A-Za-z0-9_])((?:from|import)\s+[^\r\n]+)$", stripped)
-    if import_fragment is not None:
-        return import_fragment.group(1)
-    if re.match(rb"(?a)^[A-Za-z_][A-Za-z0-9_]*\s*=", stripped):
-        return stripped
+def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
+    """Return high-risk calls reached through shared static resolution."""
+    from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_tree
+
+    return {(call.name, call.rule_code) for call in high_risk_python_calls_in_tree(tree)}
+
+
+def _parse_embedded_python_snippet(code_str: str) -> tuple[ast.AST, int] | None:
+    """Parse an extracted Python snippet, trimming trailing binary framing when needed."""
+    try:
+        return ast.parse(code_str), len(code_str)
+    except (SyntaxError, ValueError) as exc:
+        initial_error = exc
+
+    lines = code_str.splitlines(keepends=True)
+    candidate_lengths: list[int] = []
+    null_offset = code_str.find("\x00")
+    if null_offset > 0:
+        candidate_lengths.append(null_offset)
+
+    candidate_ends: list[int] = []
+    if isinstance(initial_error, SyntaxError) and initial_error.lineno is not None:
+        candidate_ends.append(max(1, initial_error.lineno - 1))
+    candidate_ends.extend(range(len(lines) - 1, max(0, len(lines) - _MAX_SNIPPET_PARSE_TRIM_ATTEMPTS - 1), -1))
+
+    for end in candidate_ends:
+        candidate_lengths.append(sum(len(line) for line in lines[:end]))
+
+    seen_lengths: set[int] = set()
+    for length in candidate_lengths:
+        if length <= 0 or length in seen_lengths:
+            continue
+        seen_lengths.add(length)
+        candidate = code_str[:length]
+        if candidate.strip() == "":
+            continue
+        try:
+            return ast.parse(f"{candidate}\n"), length
+        except (SyntaxError, ValueError):
+            continue
     return None
 
 
-def _prepend_nearby_imports(bounded: bytes, match: re.Match[bytes]) -> bytes:
-    """Carry nearby module-scope aliases into extracted functions without parsing the whole blob."""
-    prelude_lines = [
-        prelude_line
-        for line in bounded[: match.start()].splitlines()[-_SNIPPET_IMPORT_CONTEXT_LINES:]
-        if (prelude_line := _extract_nearby_python_prelude_line(line)) is not None
-    ]
-    if not prelude_lines:
-        return match.group(0)
-    return b"\n".join([*prelude_lines, match.group(0)])
+def _candidate_embedded_python_snippets(
+    bounded: bytes,
+    *,
+    include_full_source: bool = False,
+) -> list[tuple[bytes, tuple[int, int]]]:
+    candidates: list[tuple[bytes, tuple[int, int]]] = []
+    block_spans: list[tuple[int, int]] = []
+    if include_full_source:
+        candidates.append((bounded, (0, len(bounded))))
 
-
-def _resolve_alias_aware_dangerous_builtins(tree: ast.AST) -> set[str]:
-    """Return dangerous builtins reached through shared bounded source resolution."""
-    from modelaudit.scanners.archive_member_security import statically_resolved_python_call_names_in_tree
-
-    dangerous_builtins: set[str] = set()
-    for call_name in statically_resolved_python_call_names_in_tree(tree, _JIT_DANGEROUS_BUILTIN_CALL_NAMES):
-        if call_name in DANGEROUS_BUILTINS:
-            dangerous_builtins.add(call_name)
+    for match in _EMBEDDED_PYTHON_BLOCK_PATTERN.finditer(bounded):
+        span = match.span()
+        if include_full_source and span[0] == 0:
             continue
-        for prefix in _BUILTIN_NAMESPACE_PREFIXES:
-            if call_name.startswith(prefix):
-                builtin_name = call_name.removeprefix(prefix)
-                if builtin_name in DANGEROUS_BUILTINS:
-                    dangerous_builtins.add(builtin_name)
-                break
-    return dangerous_builtins
+        block_spans.append(span)
+        candidates.append((match.group(0), span))
+
+    for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(bounded):
+        start = match.start()
+        if include_full_source and start == 0:
+            continue
+        if any(block_start <= start < block_end for block_start, block_end in block_spans):
+            continue
+        candidates.append((bounded[start:], (start, len(bounded))))
+
+    return candidates
 
 
-def _resolve_alias_aware_execution_calls(
-    tree: ast.AST,
-) -> tuple[set[str], set[str], set[str], set[str], set[str], set[str]]:
-    """Return modeled process and dynamic-module execution calls reached through static resolution."""
-    from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_tree
+def _embedded_python_scan_windows(data: bytes) -> list[bytes]:
+    if len(data) <= _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:
+        return [data]
+    return [data[:_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES], data[-_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:]]
 
-    calls = high_risk_python_calls_in_tree(tree)
-    return (
-        {call.name for call in calls if call.rule_code == "S101"},
-        {call.name for call in calls if call.rule_code == "S103"},
-        {call.name for call in calls if call.rule_code == "S111"},
-        {call.name for call in calls if call.rule_code == "S108"},
-        {call.name for call in calls if call.rule_code == "S109"},
-        {call.name for call in calls if call.rule_code == "S110"},
-    )
+
+def _has_raw_match_outside_parsed_spans(raw_spans: list[tuple[int, int]], parsed_spans: list[tuple[int, int]]) -> bool:
+    """Return whether any raw regex hit sits outside AST-validated source."""
+    for raw_start, raw_end in raw_spans:
+        if not any(parsed_start <= raw_start and raw_end <= parsed_end for parsed_start, parsed_end in parsed_spans):
+            return True
+    return False
+
+
+def _decode_utf8_with_byte_offsets(data: bytes) -> tuple[str, list[int]]:
+    """Decode UTF-8 like errors='ignore' while mapping decoded character offsets to byte offsets."""
+    chars: list[str] = []
+    byte_offsets = [0]
+    index = 0
+    while index < len(data):
+        byte = data[index]
+        if byte < 0x80:
+            chars.append(chr(byte))
+            index += 1
+            byte_offsets.append(index)
+            continue
+
+        if 0xC2 <= byte <= 0xDF:
+            length = 2
+        elif 0xE0 <= byte <= 0xEF:
+            length = 3
+        elif 0xF0 <= byte <= 0xF4:
+            length = 4
+        else:
+            index += 1
+            continue
+
+        chunk = data[index : index + length]
+        if len(chunk) != length or any((continuation & 0xC0) != 0x80 for continuation in chunk[1:]):
+            index += 1
+            continue
+        try:
+            chars.append(chunk.decode("utf-8"))
+        except UnicodeDecodeError:
+            index += 1
+            continue
+        index += length
+        byte_offsets.append(index)
+
+    return "".join(chars), byte_offsets
 
 
 # Patterns that indicate code execution attempts
 _SUBPROCESS_CODE_EXECUTION_DESCRIPTION = "Subprocess execution detected"
 _OS_CODE_EXECUTION_DESCRIPTION = "OS command execution detected"
-_PTY_CODE_EXECUTION_DESCRIPTION = "Pseudo-terminal process execution detected"
 _RUNPY_CODE_EXECUTION_DESCRIPTION = "Dynamic module execution detected"
-_WEBBROWSER_LAUNCH_DESCRIPTION = "Web browser launch detected"
-_CTYPES_NATIVE_LOADING_DESCRIPTION = "Native library loading detected"
 CODE_EXECUTION_PATTERNS = [
     # Direct execution patterns
     (rb"exec\s*\(", "exec() call detected"),
     (rb"eval\s*\(", "eval() call detected"),
     (rb"compile\s*\(", "compile() call detected"),
     (rb"__import__\s*\(", "__import__() call detected"),
-    # Subprocess patterns
+    # Process and dynamic execution patterns
     (
-        rb"subprocess\.(call|run|Popen|check_call|check_output|getoutput|getstatusoutput)",
+        rb"(?:subprocess\.(?:call|run|Popen|check_call|check_output|getoutput|getstatusoutput)"
+        rb"|asyncio\.(?:subprocess\.)?create_subprocess_(?:exec|shell))",
         _SUBPROCESS_CODE_EXECUTION_DESCRIPTION,
     ),
-    (rb"asyncio\.create_subprocess_(?:exec|shell)", _SUBPROCESS_CODE_EXECUTION_DESCRIPTION),
     (rb"os\.(system|popen|exec\w*|spawn\w*|posix_spawnp?|startfile)", _OS_CODE_EXECUTION_DESCRIPTION),
-    (rb"pty\.spawn", _PTY_CODE_EXECUTION_DESCRIPTION),
-    (rb"runpy\.(?:run_module|run_path)", _RUNPY_CODE_EXECUTION_DESCRIPTION),
-    (rb"webbrowser\.open(?:_new(?:_tab)?)?\s*\(", _WEBBROWSER_LAUNCH_DESCRIPTION),
-    (
-        rb"(?:_ctypes\.dlopen\s*\(|ctypes\.(?:(?:CDLL|OleDLL|PyDLL|WinDLL)\s*\(|"
-        rb"LibraryLoader\s*\([^)]*\)\.LoadLibrary\s*\(|"
-        rb"(?:cdll|oledll|pydll|windll)\.(?:LoadLibrary\s*\(|(?!LoadLibrary\b)[A-Za-z_]\w*\b)))",
-        _CTYPES_NATIVE_LOADING_DESCRIPTION,
-    ),
+    (rb"runpy\.(?:_run_module_as_main|run_module|run_path)", _RUNPY_CODE_EXECUTION_DESCRIPTION),
     # Network patterns
     (rb"socket\.(socket|create_connection)", "Socket creation detected"),
     (rb"urllib\.(request|urlopen)", "URL request detected"),
@@ -274,35 +334,35 @@ class JITScriptDetector:
     @staticmethod
     def _looks_like_dangerous_python_source(data: bytes) -> bool:
         """Return whether marker-free bytes look like dangerous embedded Python source."""
+        bounded = data
         try:
-            source = textwrap.dedent(data.decode("utf-8"))
-            tree = ast.parse(source)
+            source = textwrap.dedent(bounded.decode("utf-8"))
+            full_tree = ast.parse(source)
         except (SyntaxError, UnicodeDecodeError, ValueError):
             return False
 
-        return JITScriptDetector._ast_contains_dangerous_python(tree)
+        return JITScriptDetector._ast_contains_dangerous_python(full_tree)
+
+    @staticmethod
+    def _looks_like_framed_dangerous_python_source(data: bytes) -> bool:
+        """Return whether a bounded binary blob has parseable dangerous Python framing."""
+        if not any(marker in data for marker in _EMBEDDED_PYTHON_START_MARKERS):
+            return False
+        for window in _embedded_python_scan_windows(data):
+            for candidate, _span in _candidate_embedded_python_snippets(window):
+                code_str, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
+                parsed_snippet = _parse_embedded_python_snippet(code_str)
+                if parsed_snippet is None:
+                    continue
+                snippet_tree, _parsed_chars = parsed_snippet
+                if JITScriptDetector._ast_contains_dangerous_python(snippet_tree):
+                    return True
+        return False
 
     @staticmethod
     def _ast_contains_dangerous_python(tree: ast.AST) -> bool:
         """Return whether parsed Python contains modeled dangerous operations."""
-        if _resolve_alias_aware_dangerous_builtins(tree):
-            return True
-        (
-            os_process_calls,
-            subprocess_calls,
-            pty_process_calls,
-            runpy_execution_calls,
-            webbrowser_launch_calls,
-            ctypes_native_loading_calls,
-        ) = _resolve_alias_aware_execution_calls(tree)
-        if (
-            os_process_calls
-            or subprocess_calls
-            or pty_process_calls
-            or runpy_execution_calls
-            or webbrowser_launch_calls
-            or ctypes_native_loading_calls
-        ):
+        if _resolve_alias_aware_high_risk_calls(tree):
             return True
 
         def is_dangerous_import(module_name: str) -> bool:
@@ -627,46 +687,21 @@ class JITScriptDetector:
             return findings
 
         bounded = data if include_full_source else data[:1000000]
-        python_code_pattern = rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+"
-        matches = (
-            [bounded]
-            if include_full_source
-            else [_prepend_nearby_imports(bounded, match) for match in re.finditer(python_code_pattern, bounded)]
-        )
-        bounded_dangerous_builtins: set[str] | None = None
-        bounded_os_process_calls: set[str] | None = None
-        bounded_subprocess_calls: set[str] | None = None
-        bounded_pty_process_calls: set[str] | None = None
-        bounded_runpy_execution_calls: set[str] | None = None
-        bounded_webbrowser_launch_calls: set[str] | None = None
-        bounded_ctypes_native_loading_calls: set[str] | None = None
-        snippet_os_process_calls: set[str] = set()
-        snippet_subprocess_calls: set[str] = set()
-        snippet_pty_process_calls: set[str] = set()
-        snippet_runpy_execution_calls: set[str] = set()
-        snippet_webbrowser_launch_calls: set[str] = set()
-        snippet_ctypes_native_loading_calls: set[str] = set()
-        saw_snippet_ast = False
+        matches = _candidate_embedded_python_snippets(bounded, include_full_source=include_full_source)
+        bounded_high_risk_calls: set[tuple[str, str]] | None = None
+        snippet_high_risk_calls: set[tuple[str, str]] = set()
+        parsed_snippet_spans: list[tuple[int, int]] = []
         try:
             bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
-            bounded_dangerous_builtins = _resolve_alias_aware_dangerous_builtins(bounded_tree)
-            (
-                bounded_os_process_calls,
-                bounded_subprocess_calls,
-                bounded_pty_process_calls,
-                bounded_runpy_execution_calls,
-                bounded_webbrowser_launch_calls,
-                bounded_ctypes_native_loading_calls,
-            ) = _resolve_alias_aware_execution_calls(bounded_tree)
+            bounded_high_risk_calls = _resolve_alias_aware_high_risk_calls(bounded_tree)
         except (SyntaxError, UnicodeDecodeError, ValueError):
-            pass
+            # Binary model blobs commonly contain non-Python framing bytes; keep
+            # raw pattern detection active and fall back to extracted snippets.
+            bounded_high_risk_calls = None
 
-        for match in matches[:10]:  # Analyze first 10 code snippets
+        for match, span in matches[:10]:  # Analyze first 10 code snippets
             try:
-                code_str = textwrap.dedent(match.decode("utf-8", errors="ignore"))
-                tree: ast.AST | None = None
-                with contextlib.suppress(SyntaxError):
-                    tree = ast.parse(code_str)
+                code_str, byte_offsets = _decode_utf8_with_byte_offsets(match)
 
                 # Check for dangerous imports
                 for dangerous_import in DANGEROUS_IMPORTS:
@@ -712,23 +747,13 @@ class JITScriptDetector:
                         )
                     )
 
-                # Try to parse as AST for deeper analysis
-                if tree is not None:
-                    saw_snippet_ast = True
-                    (
-                        snippet_os_calls,
-                        snippet_subprocess,
-                        snippet_pty_calls,
-                        snippet_runpy_calls,
-                        snippet_webbrowser_calls,
-                        snippet_ctypes_calls,
-                    ) = _resolve_alias_aware_execution_calls(tree)
-                    snippet_os_process_calls.update(snippet_os_calls)
-                    snippet_subprocess_calls.update(snippet_subprocess)
-                    snippet_pty_process_calls.update(snippet_pty_calls)
-                    snippet_runpy_execution_calls.update(snippet_runpy_calls)
-                    snippet_webbrowser_launch_calls.update(snippet_webbrowser_calls)
-                    snippet_ctypes_native_loading_calls.update(snippet_ctypes_calls)
+                # Try to parse as AST for deeper analysis.
+                parsed_snippet = _parse_embedded_python_snippet(code_str)
+                if parsed_snippet is not None:
+                    tree, parsed_chars = parsed_snippet
+                    parsed_byte_length = byte_offsets[parsed_chars]
+                    parsed_snippet_spans.append((span[0], min(span[1], span[0] + parsed_byte_length)))
+                    snippet_high_risk_calls.update(_resolve_alias_aware_high_risk_calls(tree))
                     ast_findings = self._analyze_ast(tree, framework, context)
                     findings.extend(ast_findings)
 
@@ -769,65 +794,51 @@ class JITScriptDetector:
             )
 
         # Check for common code execution patterns in binary
+        resolved_high_risk_calls = (bounded_high_risk_calls or set()) | snippet_high_risk_calls
         for pattern, description in CODE_EXECUTION_PATTERNS:
-            builtin_name = _BUILTIN_CODE_EXECUTION_PATTERN_NAMES.get(description)
-            if (
-                builtin_name is not None
-                and bounded_dangerous_builtins is not None
-                and builtin_name not in bounded_dangerous_builtins
-            ):
-                continue
-            if (
-                description == _SUBPROCESS_CODE_EXECUTION_DESCRIPTION
-                and bounded_subprocess_calls is not None
-                and not bounded_subprocess_calls
-            ):
-                continue
-            if (
-                description == _OS_CODE_EXECUTION_DESCRIPTION
-                and bounded_os_process_calls is not None
-                and not bounded_os_process_calls
-            ):
-                continue
-            if (
-                description == _PTY_CODE_EXECUTION_DESCRIPTION
-                and bounded_pty_process_calls is not None
-                and not bounded_pty_process_calls
-            ):
-                continue
-            if (
-                description == _RUNPY_CODE_EXECUTION_DESCRIPTION
-                and bounded_runpy_execution_calls is not None
-                and not bounded_runpy_execution_calls
-            ):
-                continue
-            if (
-                description == _WEBBROWSER_LAUNCH_DESCRIPTION
-                and bounded_webbrowser_launch_calls is not None
-                and not bounded_webbrowser_launch_calls
-            ):
-                continue
-            if (
-                description == _CTYPES_NATIVE_LOADING_DESCRIPTION
-                and bounded_ctypes_native_loading_calls is not None
-                and not bounded_ctypes_native_loading_calls
-            ):
-                continue
-            if re.search(pattern, bounded):  # Limit search size
-                add_code_execution_pattern_finding(description)
-
-        reported_patterns = {finding.pattern for finding in findings if finding.type == "code_execution_pattern"}
-        for calls, description in (
-            (bounded_os_process_calls, _OS_CODE_EXECUTION_DESCRIPTION),
-            (bounded_subprocess_calls, _SUBPROCESS_CODE_EXECUTION_DESCRIPTION),
-            (bounded_pty_process_calls, _PTY_CODE_EXECUTION_DESCRIPTION),
-            (bounded_runpy_execution_calls, _RUNPY_CODE_EXECUTION_DESCRIPTION),
-            (bounded_webbrowser_launch_calls, _WEBBROWSER_LAUNCH_DESCRIPTION),
-            (bounded_ctypes_native_loading_calls, _CTYPES_NATIVE_LOADING_DESCRIPTION),
-        ):
-            if calls and description not in reported_patterns:
-                add_code_execution_pattern_finding(description)
-                reported_patterns.add(description)
+            raw_pattern_spans = [match.span() for match in re.finditer(pattern, bounded)]
+            pattern_match = len(raw_pattern_spans) > 0
+            if description == _SUBPROCESS_CODE_EXECUTION_DESCRIPTION:
+                resolved_subprocess_call = any(code == "S103" for _, code in resolved_high_risk_calls)
+                raw_match_only_in_parsed_snippets = bool(
+                    parsed_snippet_spans
+                ) and not _has_raw_match_outside_parsed_spans(raw_pattern_spans, parsed_snippet_spans)
+                if resolved_subprocess_call:
+                    pattern_match = True
+                elif bounded_high_risk_calls is not None or raw_match_only_in_parsed_snippets:
+                    continue
+            if description == _OS_CODE_EXECUTION_DESCRIPTION:
+                resolved_os_process_call = any(code == "S101" for _, code in resolved_high_risk_calls)
+                if resolved_os_process_call:
+                    pattern_match = True
+                elif bounded_high_risk_calls is not None:
+                    continue
+            if description == _RUNPY_CODE_EXECUTION_DESCRIPTION:
+                resolved_runpy_call = any(code == "S108" for _, code in resolved_high_risk_calls)
+                raw_match_only_in_parsed_snippets = bool(
+                    parsed_snippet_spans
+                ) and not _has_raw_match_outside_parsed_spans(raw_pattern_spans, parsed_snippet_spans)
+                if resolved_runpy_call:
+                    pattern_match = True
+                elif bounded_high_risk_calls is not None or raw_match_only_in_parsed_snippets:
+                    continue
+            if pattern_match:  # Limit search size
+                findings.append(
+                    create_jit_finding(
+                        message=description,
+                        severity="CRITICAL",
+                        context=context,
+                        pattern=description,
+                        recommendation="This pattern indicates potential code execution - review carefully",
+                        confidence=0.8,
+                        framework=framework,
+                        code_snippet=None,
+                        type="code_execution_pattern",
+                        operation=None,
+                        builtin=None,
+                        import_=None,
+                    )
+                )
 
         return findings
 
@@ -1211,6 +1222,8 @@ class JITScriptDetector:
                     include_full_source=True,
                 )
             )
+        elif self._looks_like_framed_dangerous_python_source(data):
+            findings.extend(self._extract_and_check_python_code(data, "Generic Python", context))
 
         return findings
 

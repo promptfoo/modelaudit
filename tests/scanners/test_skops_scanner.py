@@ -1,6 +1,7 @@
 """Tests for SkopsScanner covering CVE-2025-54412, CVE-2025-54413, CVE-2025-54886."""
 
 import os
+import stat
 import textwrap
 import zipfile
 from pathlib import Path
@@ -535,7 +536,20 @@ class TestSkopsScannerEdgeCases:
         parse_checks = [check for check in result.checks if check.name == "Skops Structured JSON Parse Check"]
         assert len(parse_checks) == 1
         assert parse_checks[0].status == CheckStatus.FAILED
+        assert parse_checks[0].severity == IssueSeverity.INFO
         assert parse_checks[0].details["entry"] == entry_name
+        cache_dir = tmp_path / "parse-cache"
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(skops_file, cache_dir)
+            for aggregate in (first, second):
+                metadata = aggregate.file_metadata[str(skops_file)]
+                _assert_inconclusive_reason(metadata, "skops_structured_json_parse_failed")
+                assert determine_exit_code(aggregate) == 2
+            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            assert stats["cache_hits"] == 0
+        finally:
+            reset_cache_manager()
 
     @pytest.mark.parametrize(
         ("loader_name", "payload"),
@@ -597,6 +611,7 @@ class TestSkopsScannerEdgeCases:
         _assert_inconclusive_reason(result.metadata, "skops_zip_entry_size_limited")
         oversized_checks = [c for c in result.checks if c.name == "Skops Oversized ZIP Entry"]
         assert len(oversized_checks) == 1
+        assert oversized_checks[0].severity == IssueSeverity.INFO
         assert oversized_checks[0].details["entry"] == "README.md"
         cve_checks = [c for c in result.checks if "CVE-2025-54886" in c.name and c.status == CheckStatus.FAILED]
         assert len(cve_checks) == 0
@@ -616,8 +631,65 @@ class TestSkopsScannerEdgeCases:
         oversized_checks = [c for c in result.checks if c.name == "Skops Oversized ZIP Entry"]
         assert len(oversized_checks) == 0
 
-    def test_oversized_entry_warning_is_emitted_once(self, tmp_path: Path) -> None:
-        """Repeated detector passes over one oversized member should emit one incomplete warning."""
+    def test_unreadable_numpy_payload_marks_skops_incomplete(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unreadable numeric payload has no nested coverage and must fail closed."""
+        skops_file = tmp_path / "unreadable_array.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("step/0/content/0.npy", _make_numeric_npy())
+
+        original_open = zipfile.ZipFile.open
+
+        def open_with_failure(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            if isinstance(name, zipfile.ZipInfo) and name.filename == "step/0/content/0.npy":
+                raise zipfile.BadZipFile("CRC mismatch")
+            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+
+        result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
+
+        metadata = result.file_metadata[str(skops_file)]
+        _assert_inconclusive_reason(metadata, "skops_zip_entry_read_failed")
+        assert "_known_unreadable_archive_entry_offsets" not in metadata
+        assert not any("Error scanning ZIP entry step/0/content/0.npy" in issue.message for issue in result.issues)
+        assert determine_exit_code(result) == 2
+
+    def test_detected_cve_before_oversized_entry_preserves_security_exit_code(self, tmp_path: Path) -> None:
+        """Observed CVE payloads remain findings even when later coverage is bounded."""
+        skops_file = tmp_path / "detected_before_oversized_entry.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(
+                "schema.json",
+                '{"__loader__":"OperatorFuncNode","__module__":"builtins","__class__":"eval"}',
+            )
+            zf.writestr("README.md", "ordinary documentation " * 512)
+
+        result = scan_model_directory_or_file(
+            str(skops_file),
+            cache_enabled=False,
+            max_zip_entry_read_size=128,
+            max_skops_file_size=10 * 1024 * 1024,
+        )
+
+        metadata = result.file_metadata[str(skops_file)]
+        _assert_inconclusive_reason(metadata, "skops_zip_entry_size_limited")
+        assert any("CVE-2025-54412" in str(issue.message) for issue in result.issues)
+        assert determine_exit_code(result) == 1
+
+    def test_oversized_entry_diagnostic_is_emitted_once(self, tmp_path: Path) -> None:
+        """Repeated detector passes over one oversized member should emit one incomplete diagnostic."""
         skops_file = tmp_path / "oversized_methodnode.skops"
         with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("payload.bin", "MethodNode __getattr__" * 512)
@@ -628,15 +700,262 @@ class TestSkopsScannerEdgeCases:
 
         oversized_checks = [c for c in result.checks if c.name == "Skops Oversized ZIP Entry"]
         assert len(oversized_checks) == 1
+        assert oversized_checks[0].severity == IssueSeverity.INFO
         assert oversized_checks[0].details["entry"] == "payload.bin"
         assert result.success is False
         assert result.metadata["oversized_zip_entries"] == ["payload.bin"]
 
-    def test_oversized_entry_core_exits_one_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
+    def test_oversized_executable_member_is_still_checked_by_nested_scanner(self, tmp_path: Path) -> None:
+        """A Skops detector read limit must not suppress a generic security finding."""
+        skops_file = tmp_path / "oversized_executable_member.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("bin/run.sh", "#!/bin/sh\n" + ("echo hidden\n" * 32))
+
+        result = scan_model_directory_or_file(
+            str(skops_file),
+            cache_enabled=False,
+            max_zip_entry_read_size=128,
+            max_skops_file_size=10 * 1024 * 1024,
+        )
+
+        metadata = result.file_metadata[str(skops_file)]
+        _assert_inconclusive_reason(metadata, "skops_zip_entry_size_limited")
+        assert any(
+            issue.severity == IssueSeverity.WARNING
+            and issue.message == "Executable file found in ZIP archive: bin/run.sh"
+            and issue.details.get("entry") == "bin/run.sh"
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
+
+    @pytest.mark.parametrize(
+        ("exception_type", "message"),
+        [
+            (zipfile.BadZipFile, "CRC mismatch"),
+            (NotImplementedError, "unsupported compression method"),
+        ],
+    )
+    def test_unreadable_entry_core_exits_two_and_avoids_cache_reuse(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        exception_type: type[Exception],
+        message: str,
+    ) -> None:
+        """Member read failures are unavailable coverage, not observed vulnerabilities."""
+        skops_file = tmp_path / "unreadable_readme.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("README.md", "ordinary documentation")
+
+        original_open = zipfile.ZipFile.open
+
+        def open_with_failure(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            filename = name.filename if isinstance(name, zipfile.ZipInfo) else name
+            if filename == "README.md":
+                raise exception_type(message)
+            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+
+        cache_dir = tmp_path / f"unreadable-cache-{exception_type.__name__}"
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(skops_file, cache_dir)
+            for aggregate in (first, second):
+                metadata = aggregate.file_metadata[str(skops_file)]
+                _assert_inconclusive_reason(metadata, "skops_zip_entry_read_failed")
+                assert determine_exit_code(aggregate) == 2
+                read_issues = [
+                    issue for issue in aggregate.issues if "Unable to read ZIP entry README.md" in issue.message
+                ]
+                assert len(read_issues) == 1
+                assert read_issues[0].severity == IssueSeverity.INFO
+                assert not any("Error scanning ZIP entry README.md" in issue.message for issue in aggregate.issues)
+            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            assert stats["cache_hits"] == 0
+            assert stats["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_unreadable_executable_member_name_remains_a_security_finding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Skipping duplicate reads must not suppress an executable-name signal."""
+        skops_file = tmp_path / "unreadable_executable.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("bin/run.sh", "#!/bin/sh\necho hidden\n")
+
+        original_open = zipfile.ZipFile.open
+
+        def open_with_failure(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            filename = name.filename if isinstance(name, zipfile.ZipInfo) else name
+            if filename == "bin/run.sh":
+                raise zipfile.BadZipFile("CRC mismatch")
+            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+
+        result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
+
+        metadata = result.file_metadata[str(skops_file)]
+        _assert_inconclusive_reason(metadata, "skops_zip_entry_read_failed")
+        assert any(
+            issue.severity == IssueSeverity.WARNING
+            and issue.message == "Executable file found in ZIP archive: bin/run.sh"
+            and issue.details.get("entry") == "bin/run.sh"
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
+
+    def test_unreadable_member_alias_does_not_suppress_readable_pickle_finding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unreadable alias must not suppress scanning a distinct readable pickle member."""
+        skops_file = tmp_path / "unreadable_alias_payload.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("./payload.pkl", b"unreadable alias")
+            zf.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+        original_open = zipfile.ZipFile.open
+
+        def open_with_failure(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            if isinstance(name, zipfile.ZipInfo) and name.filename == "./payload.pkl":
+                raise zipfile.BadZipFile("CRC mismatch")
+            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+
+        result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
+
+        metadata = result.file_metadata[str(skops_file)]
+        _assert_inconclusive_reason(metadata, "skops_zip_entry_read_failed")
+        assert "_known_unreadable_archive_entry_offsets" not in metadata
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
+
+    def test_unreadable_symlink_member_remains_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A known unreadable symlink must not be reopened by nested ZIP metadata checks."""
+        skops_file = tmp_path / "unreadable_symlink.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            symlink_info = zipfile.ZipInfo("weights_link")
+            symlink_info.create_system = 3
+            symlink_info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            zf.writestr(symlink_info, "safe-target.bin")
+
+        original_open = zipfile.ZipFile.open
+
+        def open_with_failure(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            filename = name.filename if isinstance(name, zipfile.ZipInfo) else name
+            if filename == "weights_link":
+                raise zipfile.BadZipFile("CRC mismatch")
+            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+
+        result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
+
+        metadata = result.file_metadata[str(skops_file)]
+        _assert_inconclusive_reason(metadata, "skops_zip_entry_read_failed")
+        assert not any("Unable to read symlink target" in issue.message for issue in result.issues)
+        assert determine_exit_code(result) == 2
+
+    def test_unreadable_symlink_alias_does_not_suppress_readable_escape_finding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unreadable symlink alias must not suppress a separate escaping symlink."""
+        skops_file = tmp_path / "unreadable_symlink_alias.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            unreadable_info = zipfile.ZipInfo("./weights_link")
+            unreadable_info.create_system = 3
+            unreadable_info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            zf.writestr(unreadable_info, "safe-target.bin")
+            readable_info = zipfile.ZipInfo("weights_link")
+            readable_info.create_system = 3
+            readable_info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            zf.writestr(readable_info, "../outside.bin")
+
+        original_open = zipfile.ZipFile.open
+
+        def open_with_failure(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            if isinstance(name, zipfile.ZipInfo) and name.filename == "./weights_link":
+                raise zipfile.BadZipFile("CRC mismatch")
+            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+
+        result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
+
+        metadata = result.file_metadata[str(skops_file)]
+        _assert_inconclusive_reason(metadata, "skops_zip_entry_read_failed")
+        assert "_known_unreadable_archive_entry_offsets" not in metadata
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("entry") == "weights_link"
+            and "resolves outside extraction directory" in issue.message
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
+
+    def test_oversized_entry_core_exits_two_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
         """Aggregate scans should preserve fail-closed exit and avoid reusing incomplete outer results."""
         skops_file = tmp_path / "oversized_readme.skops"
         with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("README.md", "get_model via joblib.load" * 512)
+            zf.writestr("README.md", "ordinary model documentation " * 512)
             zf.writestr("schema.json", '{"version": "1.0"}')
 
         cache_dir = tmp_path / "cache"
@@ -650,12 +969,13 @@ class TestSkopsScannerEdgeCases:
             )
 
             for result in (first, second):
-                assert result.success is True
-                assert determine_exit_code(result) == 1
+                assert result.success is False
+                assert determine_exit_code(result) == 2
                 assert "skops" in result.scanner_names
                 metadata = result.file_metadata[str(skops_file)]
                 _assert_inconclusive_reason(metadata, "skops_zip_entry_size_limited")
                 assert any("Skipped oversized ZIP entry README.md" in str(issue.message) for issue in result.issues)
+                assert not any("Error scanning ZIP entry README.md" in str(issue.message) for issue in result.issues)
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["cache_hits"] == 0
         finally:
@@ -760,6 +1080,37 @@ class TestSkopsScannerEdgeCases:
                 _assert_inconclusive_reason(metadata, "skops_bad_zip_file")
                 assert any("Invalid ZIP file" in str(issue.message) for issue in result.issues)
 
+            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            assert stats["cache_hits"] == 0
+            assert stats["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_unexpected_scan_failure_core_exits_two_and_avoids_cache_reuse(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Unexpected scanner failures stay fail closed without becoming findings."""
+        skops_file = tmp_path / "unexpected_scan_failure.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        def fail_member_scan(_self: SkopsScanner, _path: str, _result: ScanResult) -> None:
+            raise RuntimeError("unexpected nested scan failure")
+
+        monkeypatch.setattr(SkopsScanner, "_scan_archive_members", fail_member_scan)
+        cache_dir = tmp_path / "unexpected-failure-cache"
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(skops_file, cache_dir)
+            for aggregate in (first, second):
+                metadata = aggregate.file_metadata[str(skops_file)]
+                _assert_inconclusive_reason(metadata, "skops_scan_failed")
+                assert determine_exit_code(aggregate) == 2
+                scan_issues = [issue for issue in aggregate.issues if "Error scanning skops file" in issue.message]
+                assert len(scan_issues) == 1
+                assert scan_issues[0].severity == IssueSeverity.INFO
             stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
             assert stats["cache_hits"] == 0
             assert stats["total_entries"] == 0

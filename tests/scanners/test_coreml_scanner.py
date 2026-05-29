@@ -5,11 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
+from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, CheckStatus, IssueSeverity
 from modelaudit.scanners.coreml_scanner import CoreMLScanner
-from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
+from modelaudit.utils.file.detection import (
+    PROTOBUF_MODEL_CANDIDATE_FORMAT,
+    detect_file_format,
+    detect_format_from_extension,
+)
 
 
 def _encode_varint(value: int) -> bytes:
@@ -129,6 +133,38 @@ def test_coreml_scanner_can_handle_strict_detection(tmp_path: Path) -> None:
     assert CoreMLScanner.can_handle(str(renamed_text)) is False
 
 
+def test_coreml_scanner_rejects_empty_model_type_payload(tmp_path: Path) -> None:
+    model_path = _write_model(
+        tmp_path / "empty_model_type.mlmodel",
+        _field_varint(1, 8) + _field_bytes(2, _build_description(metadata=_build_metadata())) + _field_bytes(500, b""),
+    )
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert any(check.name == "CoreML Structural Validation" for check in result.checks)
+
+
+def test_coreml_tentative_candidate_field_limit_remains_inconclusive(tmp_path: Path) -> None:
+    model_path = _write_model(
+        tmp_path / "field_budget_candidate.jpg",
+        (b"\x9a\x06\x00" * (CoreMLScanner.MAX_TOP_LEVEL_FIELDS + 1))
+        + _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            neural_network=_build_neural_network(layers=[_build_layer("dense_1")]),
+        ),
+    )
+
+    result = CoreMLScanner(
+        config={FORMAT_VALIDATION_CONFIG_KEY: {"routed_format": PROTOBUF_MODEL_CANDIDATE_FORMAT}}
+    ).scan(str(model_path))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "coreml_top_level_field_limit" in result.metadata["scan_outcome_reasons"]
+
+
 def test_coreml_scanner_benign_model(tmp_path: Path) -> None:
     safe_model_path = _write_model(
         tmp_path / "safe.mlmodel",
@@ -154,6 +190,96 @@ def test_coreml_scanner_benign_model(tmp_path: Path) -> None:
     assert result.metadata.get("specification_version") == 8
     assert detect_file_format(str(safe_model_path)) == "coreml"
     assert detect_format_from_extension(str(safe_model_path)) == "coreml"
+
+
+def test_coreml_can_handle_stat_failure_for_owned_extension(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = _write_model(
+        tmp_path / "unreadable.mlmodel",
+        _build_model(description=_build_description(metadata=_build_metadata())),
+    )
+
+    def raise_os_error(_path: str) -> int:
+        raise OSError("simulated CoreML stat failure")
+
+    monkeypatch.setattr("modelaudit.scanners.coreml_scanner.os.path.getsize", raise_os_error)
+
+    assert CoreMLScanner.can_handle(str(model_path)) is True
+
+
+def test_coreml_unavailable_read_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = _write_model(
+        tmp_path / "unreadable.mlmodel",
+        _build_model(description=_build_description(metadata=_build_metadata())),
+    )
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated CoreML read failure")
+
+    def raise_detection_error(_path: str) -> str:
+        raise OSError("simulated CoreML detection read failure")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.coreml_scanner.open", raise_os_error, raising=False)
+    monkeypatch.setattr("modelaudit.core.detect_file_format", raise_detection_error)
+    monkeypatch.setattr("modelaudit.core.detect_file_format_from_magic", lambda _path: "unknown")
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+
+    direct = CoreMLScanner().scan(str(model_path))
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    read_checks = [check for check in direct.checks if check.name == "CoreML File Read"]
+    assert direct.success is False
+    assert aggregate.success is False
+    assert len(read_checks) == 1
+    assert read_checks[0].status == CheckStatus.FAILED
+    assert "Failed to read CoreML file" in read_checks[0].message
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "coreml_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "coreml_read_failed" in direct.metadata["scan_outcome_reasons"]
+    assert direct.metadata["operational_error_reason"] == "coreml_read_failed"
+    metadata = aggregate.file_metadata[str(model_path)]
+    assert "coreml_read_failed" in metadata["scan_outcome_reasons"]
+    assert metadata["operational_error_reason"] == "coreml_read_failed"
+    assert any(
+        check.name == "CoreML File Read" and "Failed to read CoreML file" in check.message for check in aggregate.checks
+    )
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_coreml_unreadable_path_preflight_is_operational_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = _write_model(
+        tmp_path / "permission-denied.mlmodel",
+        _build_model(description=_build_description(metadata=_build_metadata())),
+    )
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
+
+    direct = CoreMLScanner().scan(str(model_path))
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert direct.metadata["scan_outcome_reasons"] == ["coreml_read_failed"]
+    assert direct.metadata["operational_error_reason"] == "coreml_read_failed"
+    assert aggregate.file_metadata[str(model_path)]["operational_error_reason"] == "coreml_read_failed"
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_coreml_scanner_preserves_metadata_for_root_and_nested_models(tmp_path: Path) -> None:
@@ -551,6 +677,26 @@ def test_coreml_scanner_detects_custom_model_nested_in_pipeline_models(tmp_path:
         and "CoreML custom model class detected" in issue.message
         and issue.details.get("class_name") == "NestedPipelineRuntime"
         and "][1:0][555].className" in issue.details.get("field_path", "")
+        for issue in result.issues
+    )
+
+
+def test_coreml_routing_is_not_stolen_by_tensorflow_content_probe(tmp_path: Path) -> None:
+    model_path = _write_model(
+        tmp_path / "custom_model.mlmodel",
+        _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            custom_model_class="EvilRuntimeModel",
+        ),
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "coreml"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and "CoreML custom model class detected" in issue.message
+        and issue.details.get("class_name") == "EvilRuntimeModel"
         for issue in result.issues
     )
 
