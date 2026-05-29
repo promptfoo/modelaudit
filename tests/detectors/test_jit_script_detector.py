@@ -1102,7 +1102,43 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
         )
 
-    @pytest.mark.parametrize("shadow_line", [b"run, other = len, 1\n", b"(run) = len\n", b"[run] = [len]\n"])
+    def test_scan_model_bounds_shadow_only_priority_lines_before_late_call(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        shadows = b"c = len\n" * jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import ctypes as c\n"
+            + padding
+            + shadows
+            + b"import ctypes as c\n"
+            + b"c.cdll.msvcrt\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "shadow_line",
+        [
+            b"run, other = len, 1\n",
+            b"(run) = len\n",
+            b"[run] = [len]\n",
+            b"other, (run, final) = 1, (len, 2)\n",
+            b"*run, other = [len], 1\n",
+        ],
+    )
     def test_scan_model_honors_destructured_alias_shadowing_before_late_priority_call(self, shadow_line: bytes) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
@@ -1129,8 +1165,14 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
-    @pytest.mark.parametrize("shadow_line", [b"import math as run\n", b"from math import sqrt as run\n"])
-    def test_scan_model_honors_import_alias_shadowing_before_late_priority_call(self, shadow_line: bytes) -> None:
+    @pytest.mark.parametrize(
+        "shadow_import",
+        [
+            b"import math as run\n",
+            b"from math import sqrt as run\n",
+        ],
+    )
+    def test_scan_model_honors_import_alias_shadowing_before_late_priority_call(self, shadow_import: bytes) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
             f"def benign_{index}():\n    return {index}\n}}\x00".encode()
@@ -1145,9 +1187,9 @@ class TestJITScriptDetector:
             + leading_blocks
             + b"import runpy\nrun = runpy.run_path\n"
             + padding
-            + shadow_line
+            + shadow_import
             + padding
-            + b"run([])\n"
+            + b"run(1)\n"
         )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
@@ -1176,6 +1218,39 @@ class TestJITScriptDetector:
         assert len(usage_lines) <= jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES
         assert any(
             f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "clause_source",
+        [
+            (b"def payload(flag):\n    if flag:\n        return None\n    else:\n        # pad\n"),
+            (b"def payload():\n    try:\n        return None\n    except Exception:\n        # pad\n"),
+            (b"def payload():\n    try:\n        value = 1\n    finally:\n        # pad\n"),
+        ],
+    )
+    def test_scan_model_detects_deep_priority_import_inside_compound_clauses(self, clause_source: bytes) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"        # pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + clause_source
+            + padding
+            + b"        import runpy as rp\n"
+            + b"        return rp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
     def test_scan_model_preserves_multiple_shadowed_aliases_before_late_safe_call(self) -> None:
