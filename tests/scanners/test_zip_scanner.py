@@ -632,9 +632,15 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "library_name = 'variablegetattr'\n"
         "getattr(ctypes.cdll, library_name)\n"
         "ctypes.cdll.__getattr__(library_name)\n"
+        "ctypes.cdll.__getattr__(name='keywordgetattr')\n"
+        "loader_unpack = ctypes.LibraryLoader(*(ctypes.CDLL,))\n"
+        "loader_unpack.unpacklib.printf(b'x')\n"
+        "loader_unpack_kw = ctypes.LibraryLoader(**{'dlltype': ctypes.CDLL})\n"
+        "loader_unpack_kw.unpackkwlib.printf(b'x')\n"
         "loader_getattr = ctypes.LibraryLoader(ctypes.CDLL)\n"
         "loader_getattr.__getattr__('localizedgetattr')\n"
         "loader_getattr.__getattr__(library_name)\n"
+        "loader_getattr.__getattr__(name='localizedkeywordgetattr')\n"
         "hasattr(ctypes.cdll, 'hasattrlib')\n"
         "hasattr(ctypes.LibraryLoader(ctypes.CDLL), 'hasattrpayload')\n"
         "class LocalAliasCDLL(ctypes.CDLL):\n"
@@ -642,6 +648,13 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "        init = ctypes.CDLL.__init__\n"
         "        init(self, name)\n"
         "ctypes.LibraryLoader(LocalAliasCDLL).localaliaslib\n"
+        "class SafeBase:\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        self.name = name\n"
+        "class ExplicitSuperCDLL(SafeBase, ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super(SafeBase, self).__init__(name)\n"
+        "ctypes.LibraryLoader(ExplicitSuperCDLL).superlib\n"
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
@@ -682,13 +695,18 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.LibraryLoader.classaliaslib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.attrlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.cdll.<dynamic>" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.keywordgetattr" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.unpacklib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.unpackkwlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.localizedgetattr" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.<dynamic>" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.localizedkeywordgetattr" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.user32" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.advapi32" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.cdll.hasattrlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.hasattrpayload" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.localaliaslib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.superlib" in checks_by_rule["S110"].details["reason"]
 
 
 def test_scan_zip_flags_webbrowser_controller_getattribute_launch(tmp_path: Path) -> None:
@@ -1212,6 +1230,20 @@ def test_scan_zip_preserves_safe_runpy_overwrite_before_conditional(tmp_path: Pa
             "        def later() -> None:\n"
             "            ctypes.CDLL.__init__(self, name)\n"
             "ctypes.LibraryLoader(SafeNestedCDLL).payload\nSafeNestedCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass SafeShadowCDLL(ctypes.CDLL):\n"
+            "    init = ctypes.CDLL.__init__\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        self.init = lambda name: None\n"
+            "        self.init(name)\n"
+            "ctypes.LibraryLoader(SafeShadowCDLL).payload\nSafeShadowCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass SafeNewCDLL(ctypes.CDLL):\n"
+            "    def __new__(cls, name: str):\n"
+            "        return object()\n"
+            "ctypes.LibraryLoader(SafeNewCDLL).payload\nSafeNewCDLL('/missing')\n"
         ),
         (
             "import ctypes\nimport webbrowser\n"

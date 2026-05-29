@@ -525,16 +525,38 @@ def _line_calls_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> b
 
 
 def _line_shadows_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
-    assignment_operators = rb"\+=|-=|\*=|//=|/=|%=|\*\*=|@=|&=|\|=|\^=|>>=|<<=|=(?!=)"
+    assignment_operators = rb"\*\*=|//=|>>=|<<=|\+=|-=|\*=|/=|%=|@=|&=|\|=|\^=|(?<![=!<>])=(?!=)"
     return any(
         re.search(
             rb"(?:^|[;:])\s*" + re.escape(alias) + rb"\s*(?::[^=\n]+)?\s*(?:" + assignment_operators + rb")",
             code_line,
         )
+        or _line_assignment_targets_include_alias(code_line, alias, assignment_operators)
         or re.search(rb"^\s*(?:async\s+)?def\s+" + re.escape(alias) + rb"\b", code_line)
         or re.search(rb"^\s*class\s+" + re.escape(alias) + rb"\b", code_line)
         for alias in aliases
     )
+
+
+def _line_assignment_targets_include_alias(code_line: bytes, alias: bytes, assignment_operators: bytes) -> bool:
+    for match in re.finditer(assignment_operators, code_line):
+        if _line_nesting_depth(code_line[: match.start()]) != 0:
+            continue
+        lhs_start = max(code_line.rfind(b";", 0, match.start()), code_line.rfind(b":", 0, match.start())) + 1
+        lhs = code_line[lhs_start : match.start()]
+        if re.search(rb"(?<![A-Za-z0-9_.])" + re.escape(alias) + rb"(?![A-Za-z0-9_.\[])", lhs):
+            return True
+    return False
+
+
+def _line_nesting_depth(segment: bytes) -> int:
+    depth = 0
+    for char in segment:
+        if char in b"([{":
+            depth += 1
+        elif char in b")]}" and depth:
+            depth -= 1
+    return depth
 
 
 def _line_indent_width(line: bytes) -> int:
