@@ -154,7 +154,7 @@ _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN = re.compile(
     rb"from\s+(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s]|\\\r?\n|$)"
     rb")"
 )
-_EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN = rb"[A-Za-z_]\w*(?:\s*:[^=\n]+)?"
+_EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN = rb"[A-Za-z_]\w*(?:\s*:[^=\n#]+)?"
 _EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+")
 _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])"
@@ -342,7 +342,7 @@ def _priority_alias_usage_line(
         else:
             line_end += 1
         line = candidate[line_start:line_end]
-        code_line = _python_code_without_comments_or_strings(line)
+        code_line = _python_structural_line_bytes(line)
         if any(re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\()", code_line) for alias in aliases):
             return line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
         line_start = line_end
@@ -401,109 +401,92 @@ def _embedded_python_scan_windows(data: bytes) -> list[bytes]:
     return [data[:_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES], data[-_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:]]
 
 
-def _strip_python_comment_bytes(line: bytes) -> bytes:
-    quote: int | None = None
+def _python_structural_line_bytes(line: bytes) -> bytes:
+    structural = bytearray()
+    quote_marker: bytes | None = None
     escaped = False
-    for index, byte in enumerate(line):
-        if escaped:
-            escaped = False
-            continue
-        if byte == ord("\\") and quote is not None:
-            escaped = True
-            continue
-        if byte in {ord("'"), ord('"')}:
-            if quote is None:
-                quote = byte
-            elif quote == byte:
-                quote = None
-            continue
-        if byte == ord("#") and quote is None:
-            return line[:index]
-    return line
-
-
-def _python_code_without_comments_or_strings(line: bytes) -> bytes:
-    code = bytearray(line)
-    quote: int | None = None
-    quote_size = 1
     index = 0
     while index < len(line):
-        byte = line[index]
-        if quote is not None:
-            code[index] = ord(" ")
-            if quote_size == 1 and byte == ord("\\"):
-                if index + 1 < len(line):
-                    code[index + 1] = ord(" ")
-                index += 2
+        if quote_marker is not None:
+            if escaped:
+                escaped = False
+                index += 1
                 continue
-            marker = bytes((quote,)) * quote_size
-            if line.startswith(marker, index):
-                code[index : index + quote_size] = b" " * quote_size
-                index += quote_size
-                quote = None
-                quote_size = 1
+            if len(quote_marker) == 1 and line[index] == ord("\\"):
+                escaped = True
+                index += 1
                 continue
-            if quote_size == 1 and byte == quote:
-                quote = None
+            if line.startswith(quote_marker, index):
+                index += len(quote_marker)
+                quote_marker = None
+                continue
             index += 1
             continue
+
+        byte = line[index]
         if byte == ord("#"):
-            return bytes(code[:index])
+            break
+        if line.startswith(b'"""', index) or line.startswith(b"'''", index):
+            quote_marker = line[index : index + 3]
+            index += 3
+            continue
         if byte in {ord("'"), ord('"')}:
-            marker = bytes((byte,)) * 3
-            if line.startswith(marker, index):
-                code[index : index + 3] = b"   "
-                quote = byte
-                quote_size = 3
-                index += 3
-                continue
-            code[index] = ord(" ")
-            quote = byte
-            quote_size = 1
+            quote_marker = bytes([byte])
+            index += 1
+            continue
+        structural.append(byte)
         index += 1
-    return bytes(code)
+    return bytes(structural)
+
+
+def _triple_quote_state_after_line(line: bytes, quote: bytes | None) -> bytes | None:
+    index = 0
+    while index < len(line):
+        if quote is not None:
+            end = line.find(quote, index)
+            if end == -1:
+                return quote
+            index = end + len(quote)
+            quote = None
+            continue
+
+        byte = line[index]
+        if byte == ord("#"):
+            return None
+        if line.startswith(b'"""', index) or line.startswith(b"'''", index):
+            quote = line[index : index + 3]
+            index += 3
+            continue
+        if byte in {ord("'"), ord('"')}:
+            single_quote = byte
+            index += 1
+            escaped = False
+            while index < len(line):
+                current = line[index]
+                if escaped:
+                    escaped = False
+                elif current == ord("\\"):
+                    escaped = True
+                elif current == single_quote:
+                    index += 1
+                    break
+                index += 1
+            continue
+        index += 1
+    return quote
 
 
 def _line_has_explicit_continuation(line: bytes) -> bool:
-    return _python_code_without_comments_or_strings(line).rstrip().endswith(b"\\")
+    return _python_structural_line_bytes(line).rstrip().endswith(b"\\")
 
 
 def _line_parenthesis_delta(line: bytes) -> int:
-    line = _python_code_without_comments_or_strings(line)
-    return line.count(b"(") - line.count(b")")
+    structural = _python_structural_line_bytes(line)
+    return structural.count(b"(") - structural.count(b")")
 
 
 def _multiline_string_state_after_line(line: bytes, quote: bytes | None) -> bytes | None:
-    code = line if quote is not None else _strip_python_comment_bytes(line)
-    if quote is not None:
-        return None if quote in code else quote
-    single_quote: int | None = None
-    escaped = False
-    index = 0
-    while index < len(code):
-        byte = code[index]
-        if escaped:
-            escaped = False
-            index += 1
-            continue
-        if single_quote is not None:
-            if byte == ord("\\"):
-                escaped = True
-            elif byte == single_quote:
-                single_quote = None
-            index += 1
-            continue
-        if byte in {ord("'"), ord('"')}:
-            marker = bytes((byte,)) * 3
-            if code.startswith(marker, index):
-                closing_offset = code.find(marker, index + len(marker))
-                if closing_offset == -1:
-                    return marker
-                index = closing_offset + len(marker)
-                continue
-            single_quote = byte
-        index += 1
-    return None
+    return _triple_quote_state_after_line(line, quote)
 
 
 def _is_embedded_top_level_prefix(prefix: bytes) -> bool:
