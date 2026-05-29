@@ -358,6 +358,11 @@ def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite
         ("import webbrowser\nwebbrowser.open('https://evil.example')\n", "webbrowser.open"),
         ("from webbrowser import open_new as launch\nlaunch('https://evil.example')\n", "webbrowser.open_new"),
         ("import webbrowser\nwebbrowser.open_new_tab('https://evil.example')\n", "webbrowser.open_new_tab"),
+        ("import webbrowser\nwebbrowser.get().open('https://evil.example')\n", "webbrowser.open"),
+        (
+            "import webbrowser\ncontroller = webbrowser.get()\ncontroller.open_new_tab('https://evil.example')\n",
+            "webbrowser.open_new_tab",
+        ),
     ],
 )
 def test_scan_zip_flags_webbrowser_launch_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
@@ -374,6 +379,7 @@ def test_scan_zip_flags_webbrowser_launch_python_member(tmp_path: Path, source: 
     ]
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S109"
+    assert python_checks[0].severity == IssueSeverity.CRITICAL
     assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
 
 
@@ -412,6 +418,9 @@ def test_scan_zip_preserves_possible_webbrowser_launch_after_conditional_overwri
             "ctypes.LibraryLoader.LoadLibrary",
         ),
         ("import ctypes\nctypes.cdll.msvcrt.printf(b'hi')\n", "ctypes.cdll.msvcrt"),
+        ("import ctypes\ngetattr(ctypes, 'cdll').msvcrt.printf(b'hi')\n", "ctypes.cdll.msvcrt"),
+        ("import ctypes\nctypes.cdll.__getattr__('msvcrt').printf(b'hi')\n", "ctypes.cdll.msvcrt"),
+        ("import ctypes\nctypes.cdll.msvcrt.foo = 1\n", "ctypes.cdll.msvcrt"),
         ("import _ctypes\n_ctypes.dlopen('libc.so.6')\n", "_ctypes.dlopen"),
     ],
 )

@@ -137,6 +137,7 @@ def pytest_runtest_setup(item):
             "test_rule_code_registry_consistency.py",  # Scanner literal rule-code registry consistency
             "test_keras_h5_scanner.py",  # Keras H5 scanner CVE-2025-9905 tests
             "test_cve_detection.py",  # CVE detection tests
+            "test_jit_script_detector.py",  # JIT embedded Python execution detector tests
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
             "test_paddle_scanner.py",  # PaddlePaddle scanner tests
             "test_cve_2025_10155_bin_pickle.py",  # CVE-2025-10155 .bin pickle detection tests

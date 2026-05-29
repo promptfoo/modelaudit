@@ -1278,6 +1278,7 @@ def test_pytorch_zip_scans_unmarked_runpy_execution_in_archive_data(tmp_path: Pa
         and "Dynamic module execution detected" in check.message
     ]
     assert len(matching_failures) == 1
+    assert matching_failures[0].rule_code == "S108"
 
 
 def test_pytorch_zip_ignores_certain_replaced_runpy_execution_in_archive_data(tmp_path: Path) -> None:
@@ -1302,6 +1303,12 @@ def test_pytorch_zip_ignores_certain_replaced_runpy_execution_in_archive_data(tm
         b"def payload():\n    return webbrowser.open('https://evil.example')\n",
         b"def payload():\n    from webbrowser import open_new as launch\n    return launch('https://evil.example')\n",
         b"def payload():\n    return webbrowser.open_new_tab('https://evil.example')\n",
+        b"def payload():\n    return webbrowser.get().open('https://evil.example')\n",
+        (
+            b"def payload():\n"
+            b"    controller = webbrowser.get()\n"
+            b"    return controller.open_new_tab('https://evil.example')\n"
+        ),
     ],
 )
 def test_pytorch_zip_scans_unmarked_webbrowser_launch_in_archive_data(tmp_path: Path, payload: bytes) -> None:
@@ -1324,6 +1331,7 @@ def test_pytorch_zip_scans_unmarked_webbrowser_launch_in_archive_data(tmp_path: 
         if check.location == f"{zip_path}:archive/data/payload.bin" and "Web browser launch detected" in check.message
     ]
     assert len(matching_failures) == 1
+    assert matching_failures[0].rule_code == "S109"
 
 
 def test_pytorch_zip_ignores_certain_replaced_webbrowser_launch_in_archive_data(tmp_path: Path) -> None:
@@ -1350,6 +1358,9 @@ def test_pytorch_zip_ignores_certain_replaced_webbrowser_launch_in_archive_data(
         b"def payload():\n    return ctypes.windll.LoadLibrary('payload.dll')\n",
         b"def payload():\n    return ctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('./payload.so')\n",
         b"def payload():\n    return ctypes.cdll.msvcrt.printf(b'hi')\n",
+        b"def payload():\n    return getattr(ctypes, 'cdll').msvcrt.printf(b'hi')\n",
+        b"def payload():\n    return ctypes.cdll.__getattr__('msvcrt').printf(b'hi')\n",
+        b"def payload():\n    ctypes.cdll.msvcrt.foo = 1\n",
         b"def payload():\n    import _ctypes\n    return _ctypes.dlopen('libc.so.6')\n",
     ],
 )
@@ -1374,6 +1385,7 @@ def test_pytorch_zip_scans_unmarked_ctypes_native_loading_in_archive_data(tmp_pa
         and "Native library loading detected" in check.message
     ]
     assert len(matching_failures) == 1
+    assert matching_failures[0].rule_code == "S110"
 
 
 @pytest.mark.parametrize(

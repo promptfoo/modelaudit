@@ -476,6 +476,26 @@ class TestJITScriptDetector:
 
         assert findings == []
 
+    def test_scan_model_detects_binary_prefixed_aliased_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xff" + b"def payload():\n    from runpy import run_path as run\n    return run('payload.py')\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_binary_prefixed_replaced_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xff" + b"def payload():\n    import runpy\n    runpy.run_path = len\n    return runpy.run_path([])\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
     def test_scan_model_preserves_possible_runpy_execution_after_conditional_replacement(self) -> None:
         detector = JITScriptDetector()
         source = (
@@ -494,10 +514,28 @@ class TestJITScriptDetector:
             b"def payload():\n    return webbrowser.open('https://evil.example')\n",
             b"def payload():\n    from webbrowser import open_new as launch\n    return launch('https://evil.example')\n",
             b"def payload():\n    return webbrowser.open_new_tab('https://evil.example')\n",
+            b"def payload():\n    return webbrowser.get().open('https://evil.example')\n",
+            (
+                b"def payload():\n"
+                b"    controller = webbrowser.get()\n"
+                b"    return controller.open_new_tab('https://evil.example')\n"
+            ),
         ],
     )
     def test_scan_model_detects_unmarked_webbrowser_launch(self, source: bytes) -> None:
         detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(f.type == "code_execution_pattern" and f.pattern == "Web browser launch detected" for f in findings)
+
+    def test_scan_model_detects_binary_prefixed_aliased_webbrowser_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xff" + b"def payload():\n"
+            b"    from webbrowser import open_new_tab as launch\n"
+            b"    return launch('https://evil.example')\n"
+        )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
@@ -538,6 +576,9 @@ class TestJITScriptDetector:
             b"def payload():\n    from ctypes import CDLL as load\n    return load('./payload.so')\n",
             b"def payload():\n    return ctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('./payload.so')\n",
             b"def payload():\n    return ctypes.cdll.msvcrt.printf(b'hi')\n",
+            b"def payload():\n    return getattr(ctypes, 'cdll').msvcrt.printf(b'hi')\n",
+            b"def payload():\n    return ctypes.cdll.__getattr__('msvcrt').printf(b'hi')\n",
+            b"def payload():\n    ctypes.cdll.msvcrt.foo = 1\n",
             b"def payload():\n    import _ctypes\n    return _ctypes.dlopen('libc.so.6')\n",
         ],
     )
@@ -548,6 +589,36 @@ class TestJITScriptDetector:
 
         assert any(
             f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
+        )
+
+    def test_scan_model_detects_binary_prefixed_aliased_ctypes_native_loading(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xff" + b"def payload():\n    from ctypes import CDLL as load\n    return load('./payload.so')\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"def payload():\n    return webbrowser.opened('https://example.test')\n",
+            b"def payload():\n    return webbrowser.open_newspaper('https://example.test')\n",
+            b"def payload():\n    return ctypes.CDLLibrary('./payload.so')\n",
+            b"def payload():\n    return ctypes.CDLLibrary\n",
+        ],
+    )
+    def test_scan_model_ignores_webbrowser_and_ctypes_near_matches(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern"
+            and f.pattern in {"Web browser launch detected", "Native library loading detected"}
+            for f in findings
         )
 
     @pytest.mark.parametrize(

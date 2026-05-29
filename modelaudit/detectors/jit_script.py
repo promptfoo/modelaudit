@@ -192,11 +192,11 @@ CODE_EXECUTION_PATTERNS = [
     (rb"os\.(system|popen|exec\w*|spawn\w*|posix_spawnp?|startfile)", _OS_CODE_EXECUTION_DESCRIPTION),
     (rb"pty\.spawn", _PTY_CODE_EXECUTION_DESCRIPTION),
     (rb"runpy\.(?:run_module|run_path)", _RUNPY_CODE_EXECUTION_DESCRIPTION),
-    (rb"webbrowser\.open(?:_new(?:_tab)?)?", _WEBBROWSER_LAUNCH_DESCRIPTION),
+    (rb"webbrowser\.open(?:_new(?:_tab)?)?\s*\(", _WEBBROWSER_LAUNCH_DESCRIPTION),
     (
-        rb"(?:_ctypes\.dlopen|ctypes\.(?:(?:CDLL|OleDLL|PyDLL|WinDLL)|"
-        rb"LibraryLoader\s*\([^)]*\)\.LoadLibrary|"
-        rb"(?:cdll|oledll|pydll|windll)\.(?:LoadLibrary|[A-Za-z_]\w*)))",
+        rb"(?:_ctypes\.dlopen\s*\(|ctypes\.(?:(?:CDLL|OleDLL|PyDLL|WinDLL)\s*\(|"
+        rb"LibraryLoader\s*\([^)]*\)\.LoadLibrary\s*\(|"
+        rb"(?:cdll|oledll|pydll|windll)\.(?:LoadLibrary\s*\(|(?!LoadLibrary\b)[A-Za-z_]\w*\b)))",
         _CTYPES_NATIVE_LOADING_DESCRIPTION,
     ),
     # Network patterns
@@ -611,6 +611,13 @@ class JITScriptDetector:
         bounded_runpy_execution_calls: set[str] | None = None
         bounded_webbrowser_launch_calls: set[str] | None = None
         bounded_ctypes_native_loading_calls: set[str] | None = None
+        snippet_os_process_calls: set[str] = set()
+        snippet_subprocess_calls: set[str] = set()
+        snippet_pty_process_calls: set[str] = set()
+        snippet_runpy_execution_calls: set[str] = set()
+        snippet_webbrowser_launch_calls: set[str] = set()
+        snippet_ctypes_native_loading_calls: set[str] = set()
+        saw_snippet_ast = False
         try:
             bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
             bounded_dangerous_builtins = _resolve_alias_aware_dangerous_builtins(bounded_tree)
@@ -678,12 +685,41 @@ class JITScriptDetector:
 
                 # Try to parse as AST for deeper analysis
                 if tree is not None:
+                    saw_snippet_ast = True
+                    (
+                        snippet_os_calls,
+                        snippet_subprocess,
+                        snippet_pty_calls,
+                        snippet_runpy_calls,
+                        snippet_webbrowser_calls,
+                        snippet_ctypes_calls,
+                    ) = _resolve_alias_aware_execution_calls(tree)
+                    snippet_os_process_calls.update(snippet_os_calls)
+                    snippet_subprocess_calls.update(snippet_subprocess)
+                    snippet_pty_process_calls.update(snippet_pty_calls)
+                    snippet_runpy_execution_calls.update(snippet_runpy_calls)
+                    snippet_webbrowser_launch_calls.update(snippet_webbrowser_calls)
+                    snippet_ctypes_native_loading_calls.update(snippet_ctypes_calls)
                     ast_findings = self._analyze_ast(tree, framework, context)
                     findings.extend(ast_findings)
 
             except Exception:
                 # Failed to process this code snippet
                 continue
+
+        if saw_snippet_ast:
+            if bounded_os_process_calls is None:
+                bounded_os_process_calls = snippet_os_process_calls
+            if bounded_subprocess_calls is None:
+                bounded_subprocess_calls = snippet_subprocess_calls
+            if bounded_pty_process_calls is None:
+                bounded_pty_process_calls = snippet_pty_process_calls
+            if bounded_runpy_execution_calls is None:
+                bounded_runpy_execution_calls = snippet_runpy_execution_calls
+            if bounded_webbrowser_launch_calls is None:
+                bounded_webbrowser_launch_calls = snippet_webbrowser_launch_calls
+            if bounded_ctypes_native_loading_calls is None:
+                bounded_ctypes_native_loading_calls = snippet_ctypes_native_loading_calls
 
         def add_code_execution_pattern_finding(description: str) -> None:
             findings.append(

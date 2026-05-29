@@ -102,6 +102,8 @@ _WEBBROWSER_LAUNCH_CALLS = frozenset(
         "webbrowser.open_new_tab",
     }
 )
+_WEBBROWSER_CONTROLLER_FACTORIES = frozenset({"webbrowser.get"})
+_WEBBROWSER_CONTROLLER_LAUNCH_METHODS = frozenset({"open", "open_new", "open_new_tab"})
 _CTYPES_NATIVE_LIBRARY_LOADING_CALLS = frozenset(
     {
         "_ctypes.dlopen",
@@ -208,11 +210,22 @@ def _ctypes_loader_attribute_load_name(reference_name: str) -> str | None:
     return f"{loader_root}.{library_name}"
 
 
+def _webbrowser_controller_launch_call_name(reference_name: str) -> str | None:
+    root_name, separator, method_name = reference_name.rpartition(".")
+    if not separator or root_name not in _WEBBROWSER_CONTROLLER_FACTORIES:
+        return None
+    if method_name not in _WEBBROWSER_CONTROLLER_LAUNCH_METHODS:
+        return None
+    return f"webbrowser.{method_name}"
+
+
 def _rule_code_for_high_risk_call(call_name: str) -> str:
     """Return the rule code that most accurately describes ``call_name``."""
     direct = _HIGH_RISK_PYTHON_CALL_RULE_CODES.get(call_name)
     if direct is not None:
         return direct
+    if _webbrowser_controller_launch_call_name(call_name) is not None:
+        return "S109"
     if _ctypes_loader_attribute_load_name(call_name) is not None:
         return "S110"
     for prefix, code in _HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES:
@@ -373,6 +386,21 @@ def _resolve_ctypes_library_loader_instance_roots(node: ast.AST, alias_scopes: _
 
     loader_roots = resolved_constructor_names & _CTYPES_LIBRARY_LOADER_CONSTRUCTORS
     return frozenset(loader_roots) if loader_roots else None
+
+
+def _resolve_webbrowser_controller_factory_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    if not isinstance(node, ast.Call):
+        return None
+
+    factory_name = _resolve_call_name(node.func)
+    if factory_name is None:
+        return None
+    resolved_factory_names = _apply_aliases(factory_name, alias_scopes)
+    if resolved_factory_names is None:
+        return None
+
+    controller_roots = resolved_factory_names & _WEBBROWSER_CONTROLLER_FACTORIES
+    return frozenset(controller_roots) if controller_roots else None
 
 
 _MAX_STATIC_STRING_LENGTH = 1024
@@ -584,6 +612,12 @@ def _resolve_static_attribute_names(
     if resolved_target_roots is None:
         resolved_target_roots = _resolve_ctypes_library_loader_instance_roots(target_root_node, alias_scopes)
         if resolved_target_roots is None:
+            resolved_target_roots = _resolve_webbrowser_controller_factory_roots(target_root_node, alias_scopes)
+        if resolved_target_roots is None:
+            resolved_target_roots = _resolve_getattr_call_names(target_root_node, alias_scopes)
+        if resolved_target_roots is None:
+            resolved_target_roots = _resolve_ctypes_loader_dunder_getattr_call_names(target_root_node, alias_scopes)
+        if resolved_target_roots is None:
             target_root = _resolve_call_name(target_root_node)
             if target_root is None:
                 return None
@@ -622,6 +656,40 @@ def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> fr
         return None
 
     return _resolve_static_attribute_names(target_root_node, attr_name_node, alias_scopes)
+
+
+def _resolve_ctypes_loader_dunder_getattr_call_names(
+    node: ast.AST, alias_scopes: _AliasScopes
+) -> frozenset[str] | None:
+    if isinstance(node, ast.Attribute) and node.attr == "__call__":
+        return _resolve_ctypes_loader_dunder_getattr_call_names(node.value, alias_scopes)
+
+    if not isinstance(node, ast.Call) or len(node.args) != 1 or node.keywords:
+        return None
+
+    attr_name = _resolve_static_string(node.args[0])
+    if attr_name is None:
+        return None
+
+    if isinstance(node.func, ast.Attribute) and node.func.attr == "__getattr__":
+        loader_roots = _resolve_static_reference_names(node.func.value, alias_scopes)
+    else:
+        helper_name = _resolve_call_name(node.func)
+        resolved_helper_names = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
+        if resolved_helper_names is None:
+            return None
+        loader_roots = frozenset(
+            helper_name.removesuffix(".__getattr__")
+            for helper_name in resolved_helper_names
+            if helper_name.endswith(".__getattr__")
+        )
+
+    if loader_roots is None:
+        return None
+    ctypes_loader_roots = loader_roots & _CTYPES_LIBRARY_LOADER_OBJECTS
+    if not ctypes_loader_roots:
+        return None
+    return frozenset(f"{loader_root}.{attr_name}" for loader_root in ctypes_loader_roots)
 
 
 def _resolve_dunder_getattribute_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
@@ -778,6 +846,9 @@ def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -
     getattr_names = _resolve_getattr_call_names(node, alias_scopes)
     if getattr_names is not None:
         return getattr_names
+    ctypes_getattr_names = _resolve_ctypes_loader_dunder_getattr_call_names(node, alias_scopes)
+    if ctypes_getattr_names is not None:
+        return ctypes_getattr_names
     getattribute_names = _resolve_dunder_getattribute_call_names(node, alias_scopes)
     if getattribute_names is not None:
         return getattribute_names
@@ -787,7 +858,10 @@ def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -
     namespace_roots = _resolve_namespace_dict_roots(node, alias_scopes)
     if namespace_roots:
         return frozenset(f"{namespace_root}.__dict__" for namespace_root in namespace_roots)
-    return _resolve_ctypes_library_loader_instance_roots(node, alias_scopes)
+    ctypes_loader_roots = _resolve_ctypes_library_loader_instance_roots(node, alias_scopes)
+    if ctypes_loader_roots is not None:
+        return ctypes_loader_roots
+    return _resolve_webbrowser_controller_factory_roots(node, alias_scopes)
 
 
 def _resolve_static_assignment_target_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
@@ -803,6 +877,7 @@ def _is_high_risk_python_call_name(name: str) -> bool:
     return (
         name in _HIGH_RISK_PYTHON_CALLS
         or (name.startswith("subprocess.") and name not in _KNOWN_NON_EXECUTING_SUBPROCESS_CALLS)
+        or (_webbrowser_controller_launch_call_name(name) is not None)
         or (_ctypes_loader_attribute_load_name(name) is not None)
     )
 
@@ -1102,11 +1177,24 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self._bind_name(name, None)
 
     def _visit_assignment_target(self, target: ast.AST) -> None:
+        self._record_assignment_target_attribute_loads(target)
         self._suppress_attribute_load_detection_depth += 1
         try:
             self.visit(target)
         finally:
             self._suppress_attribute_load_detection_depth -= 1
+
+    def _record_assignment_target_attribute_loads(self, target: ast.AST) -> None:
+        if not isinstance(target, ast.Attribute):
+            return
+        resolved_names = _resolve_static_reference_names(target.value, self.alias_scopes)
+        effective_names = self._effective_reference_names(resolved_names) if resolved_names is not None else None
+        if effective_names is None:
+            return
+        for resolved_name in effective_names:
+            load_name = _ctypes_loader_attribute_load_name(resolved_name)
+            if load_name is not None and self._is_tracked_call_name(load_name):
+                self.risky_calls.add(load_name)
 
     def _bind_arguments(self, arguments: ast.arguments) -> None:
         positional_args = [*arguments.posonlyargs, *arguments.args]
@@ -1448,7 +1536,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         resolved_names = self._resolve_invoked_reference_names(node.func)
         if resolved_names is not None and self._resolve_certain_static_mapping_mutator_names(node.func) is None:
             for resolved_name in resolved_names:
-                risk_name = _ctypes_loader_attribute_load_name(resolved_name) or resolved_name
+                risk_name = (
+                    _webbrowser_controller_launch_call_name(resolved_name)
+                    or _ctypes_loader_attribute_load_name(resolved_name)
+                    or resolved_name
+                )
                 if self._is_tracked_call_name(risk_name):
                     self.risky_calls.add(risk_name)
         self.generic_visit(node)
@@ -1578,7 +1670,7 @@ def scan_archive_member_for_known_risks(
                 name=_PYTHON_MEMBER_CHECK_NAME,
                 passed=False,
                 message=f"High-risk Python code found in {archive_kind} member {member_name}: {reason}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.CRITICAL if rule_code == "S109" else IssueSeverity.WARNING,
                 location=location,
                 details={"entry": member_name, "reason": reason},
                 rule_code=rule_code,
