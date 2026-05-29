@@ -149,6 +149,7 @@ _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES = (
     | _WEBBROWSER_CONTROLLER_FACTORIES
     | _CTYPES_NATIVE_LIBRARY_LOADING_CALLS
     | _CTYPES_LIBRARY_LOADER_OBJECTS
+    | _CTYPES_LIBRARY_LOADER_CONSTRUCTORS
 )
 
 # Map each high-risk call name to the rule code that best describes its risk
@@ -682,9 +683,9 @@ def _resolve_getattr_call_names(
         return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
 
     accessor_names = frozenset(
-        normalized_helper_name.removesuffix(".__getattribute__")
+        normalized_helper_name.rsplit(".", maxsplit=1)[0]
         for normalized_helper_name in normalized_helper_names
-        if normalized_helper_name.endswith(".__getattribute__")
+        if normalized_helper_name.endswith((".__getattribute__", ".__getattr__"))
     )
     if accessor_names:
         if len(node.args) != 1 or node.keywords:
@@ -1995,6 +1996,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         call_result_names = self._resolve_reference_names(node)
         if call_result_names is not None:
             self._call_result_aliases[id(node)] = call_result_names
+            for call_result_name in call_result_names:
+                normalized_result_name = _ctypes_loader_attribute_load_name(call_result_name)
+                if normalized_result_name is not None:
+                    self.risky_calls.add(normalized_result_name)
 
         direct_call_name = _resolve_call_name(node.func)
         if direct_call_name is not None:

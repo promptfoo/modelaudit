@@ -665,9 +665,15 @@ class TestJITScriptDetector:
             b"    loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
             b"    loader_kw = ctypes.LibraryLoader(dlltype=ctypes.CDLL)\n"
             b"    loader_alias = ctypes.LibraryLoader(ctypes.cdll._dlltype)\n"
+            b"    loader_method = ctypes.LibraryLoader(ctypes.CDLL)\n"
             b"    loader.msvcrt.printf(b'x')\n"
             b"    loader_kw.payload.printf(b'x')\n"
-            b"    return loader_alias.aliaslib.printf(b'x')\n"
+            b"    loader_alias.aliaslib.printf(b'x')\n"
+            b"    loader_method.LoadLibrary('methodlib')\n"
+            b"    loader_method.__getitem__('getitemlib')\n"
+            b"    getattr(ctypes.windll, 'user32')\n"
+            b"    ctypes.windll.__getattr__('advapi32')\n"
+            b"    return getattr(ctypes.LibraryLoader(ctypes.CDLL), 'attrlib')\n"
             b"\x00MODEL-FRAMING"
         )
 
@@ -728,6 +734,8 @@ class TestJITScriptDetector:
             b"    loader.payload.printf(b'x')\n"
             b"    load = ctypes.cdll.LoadLibrary\n"
             b"    class_attr = ctypes.LibraryLoader.payload\n"
+            b"    ctypes.LibraryLoader = len\n"
+            b"    ctypes.LibraryLoader(ctypes.CDLL).payload\n"
             b"    return load.__name__\n"
             b"\x00MODEL-FRAMING"
         )
