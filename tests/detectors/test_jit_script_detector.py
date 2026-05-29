@@ -556,6 +556,30 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
+    def test_scan_model_detects_tail_window_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00" * (jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES + 16)
+            + b"\x00\xfffrom runpy import run_path as run\nrun('payload.py')\n\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_late_priority_runpy_snippet_after_harmless_imports(self) -> None:
+        detector = JITScriptDetector()
+        leading_imports = b"".join(f"import harmless_{index}\n\x00".encode() for index in range(12))
+        source = b"\x00\xff" + leading_imports + b"from runpy import run_path as run\nrun('payload.py')\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
     def test_scan_model_ignores_binary_framed_top_level_replaced_runpy_execution(self) -> None:
         detector = JITScriptDetector()
         source = b"\x00\xffimport runpy\nrunpy.run_path = len\nrunpy.run_path([])\n\x00MODEL-FRAMING"

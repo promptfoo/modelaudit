@@ -1422,7 +1422,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     allow_module_locals_mapping=self._non_module_scope_depth == 0,
                 )
             elif name in _RUNPY_CODE_EXECUTION_CALLS:
-                base_value = frozenset({name})
+                base_value = current_scope[name] if name in current_scope else frozenset({name})
             else:
                 base_value = current_scope.get(name, frozenset({name}) if implicit_builtins else None)
             values = [scope.get(name, base_value) for scope in branch_scopes]
