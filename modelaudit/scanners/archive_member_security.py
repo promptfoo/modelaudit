@@ -2573,12 +2573,25 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         )
 
     @staticmethod
-    def _initializer_alias_call_is_bound(call: ast.Call) -> bool:
-        return (
+    def _initializer_alias_call_is_bound(
+        call: ast.Call,
+        class_scope: _AliasScope,
+        initializer_scope: _AliasScope,
+        class_name: str,
+    ) -> bool:
+        if not (
             isinstance(call.func, ast.Attribute)
             and isinstance(call.func.value, ast.Name)
             and call.func.value.id in {"self", "cls"}
+        ):
+            return False
+        _local_aliases, local_found = _lookup_bound_alias(
+            f"{call.func.value.id}.{call.func.attr}",
+            [initializer_scope],
         )
+        if local_found:
+            return False
+        return bool(_HighRiskPythonCallVisitor._class_local_method_aliases(call.func, class_scope, class_name))
 
     def _initializer_call_preserves_ctypes_loader_init(
         self,
@@ -2611,7 +2624,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         )
         if not self._is_ctypes_loader_init_alias(resolved_func_names):
             return False
-        bound_method = self._initializer_alias_call_is_bound(call)
+        bound_method = self._initializer_alias_call_is_bound(call, class_scope, initializer_scope, class_name)
         if not bound_method and not self._call_has_initializer_self_argument(call, initializer_self_names):
             return False
         return self._call_has_loader_name_argument(call, bound_method=bound_method)
@@ -2687,6 +2700,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for statement in statements:
             if self._initializer_statement_forwards_super_init(statement, class_name, initializer_self_names):
                 return True
+            if self._initializer_statement_definitely_terminates(statement):
+                return False
         return False
 
     def _initializer_statement_forwards_super_init(
@@ -2738,13 +2753,56 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def _merge_initializer_branch_scopes(
         self,
         initializer_scope: _AliasScope,
+        class_scope: _AliasScope,
         branch_scopes: list[_AliasScope],
     ) -> None:
         base_scope = dict(initializer_scope)
         for name in {name for scope in branch_scopes for name in scope}:
-            initializer_scope[name] = self._merge_alias_values(
-                *(scope.get(name, base_scope.get(name)) for scope in branch_scopes)
-            )
+            fallback_value = base_scope.get(name)
+            missing_branch_can_fall_back_to_class = False
+            if name not in base_scope:
+                fallback_value = self._initializer_class_fallback_alias(name, class_scope)
+            branch_values: list[_AliasValue] = []
+            for scope in branch_scopes:
+                if name in scope:
+                    branch_values.append(scope[name])
+                    continue
+                class_fallback = self._initializer_class_fallback_alias(name, class_scope)
+                if class_fallback is not None:
+                    missing_branch_can_fall_back_to_class = True
+                    branch_values.append(class_fallback)
+                else:
+                    branch_values.append(fallback_value)
+            if missing_branch_can_fall_back_to_class:
+                initializer_scope.pop(name, None)
+                continue
+            initializer_scope[name] = self._merge_alias_values(*branch_values)
+
+    @staticmethod
+    def _initializer_class_fallback_alias(name: str, class_scope: _AliasScope) -> _AliasValue:
+        self_prefixes = ("self.", "cls.")
+        if not name.startswith(self_prefixes):
+            return None
+        _receiver, _separator, attr_name = name.partition(".")
+        aliases = class_scope.get(attr_name)
+        return aliases if isinstance(aliases, frozenset) else None
+
+    def _initializer_statement_definitely_terminates(self, statement: ast.stmt) -> bool:
+        if isinstance(statement, (ast.Return, ast.Raise)):
+            return True
+        if isinstance(statement, ast.If):
+            constant_bool = self._constant_bool(statement.test)
+            if constant_bool is True:
+                return self._initializer_statements_definitely_terminate(statement.body)
+            if constant_bool is False:
+                return self._initializer_statements_definitely_terminate(statement.orelse)
+            return self._initializer_statements_definitely_terminate(
+                statement.body
+            ) and self._initializer_statements_definitely_terminate(statement.orelse)
+        return False
+
+    def _initializer_statements_definitely_terminate(self, statements: list[ast.stmt]) -> bool:
+        return any(self._initializer_statement_definitely_terminates(statement) for statement in statements)
 
     def _initializer_statements_preserve_ctypes_loader_init(
         self,
@@ -2767,6 +2825,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 loader_base_indices,
             ):
                 return True
+            if self._initializer_statement_definitely_terminates(statement):
+                return False
         return False
 
     def _initializer_statement_preserves_ctypes_loader_init(
@@ -2831,7 +2891,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 loader_base_indices,
             ):
                 return True
-            self._merge_initializer_branch_scopes(initializer_scope, branch_scopes)
+            self._merge_initializer_branch_scopes(initializer_scope, class_scope, branch_scopes)
             return False
         if isinstance(statement, ast.While):
             constant_bool = self._constant_bool(statement.test)
@@ -2856,7 +2916,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 loader_base_indices,
             ):
                 return True
-            self._merge_initializer_branch_scopes(initializer_scope, [branch_scope, dict(initializer_scope)])
+            self._merge_initializer_branch_scopes(
+                initializer_scope, class_scope, [branch_scope, dict(initializer_scope)]
+            )
             return False
         if isinstance(statement, ast.Assign):
             if self._initializer_node_preserves_ctypes_loader_init(
@@ -2915,14 +2977,22 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     @staticmethod
     def _class_method(node: ast.ClassDef, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
-        return next(
-            (
-                statement
-                for statement in node.body
-                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) and statement.name == name
-            ),
-            None,
-        )
+        for statement in reversed(node.body):
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) and statement.name == name:
+                return statement
+            if _HighRiskPythonCallVisitor._class_statement_binds_name(statement, name):
+                return None
+        return None
+
+    @staticmethod
+    def _class_statement_binds_name(statement: ast.stmt, name: str) -> bool:
+        if isinstance(statement, ast.Assign):
+            return any(bound_name == name for target in statement.targets for bound_name in _binding_names(target))
+        if isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+            return any(bound_name == name for bound_name in _binding_names(statement.target))
+        if isinstance(statement, ast.Delete):
+            return any(bound_name == name for target in statement.targets for bound_name in _binding_names(target))
+        return False
 
     @staticmethod
     def _class_method_has_decorator(

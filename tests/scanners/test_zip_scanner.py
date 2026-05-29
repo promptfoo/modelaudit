@@ -1083,6 +1083,21 @@ def test_scan_zip_ignores_unreachable_new_returns_async_init_and_hasattr_alias(t
         "    def __init__(self, name: str) -> None:\n"
         "        super().__init__(name)\n"
         "ctypes.LibraryLoader(SafeAliasSuperCDLL).payload\n"
+        "class ReturnBeforeDelegateCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        return\n"
+        "        ctypes.CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(ReturnBeforeDelegateCDLL).payload\n"
+        "class RaiseBeforeDelegateCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        raise RuntimeError(name)\n"
+        "        ctypes.CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(RaiseBeforeDelegateCDLL).payload\n"
+        "class InstanceStoredAliasCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        self.init = ctypes.CDLL.__init__\n"
+        "        self.init(name)\n"
+        "ctypes.LibraryLoader(InstanceStoredAliasCDLL).payload\n"
         "ctypes.LibraryLoader(**{'dlltype': ctypes.CDLL, 'bad': 1}).payload\n"
         "getattr(ctypes.cdll, 123)\n"
         "hasattr(ctypes.cdll, 123)\n"
@@ -1125,6 +1140,24 @@ def test_scan_zip_resolves_static_ctypes_initializer_call_forms(tmp_path: Path) 
         "    def __init__(self, name: str) -> None:\n"
         "        super().__init__(name)\n"
         "ctypes.LibraryLoader(ForwardingBaseCDLL).forwardingbaselib\n"
+        "class BranchFallbackCDLL(ctypes.CDLL):\n"
+        "    init = ctypes.CDLL.__init__\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        if name == 'skip':\n"
+        "            self.init = len\n"
+        "        self.init(name)\n"
+        "ctypes.LibraryLoader(BranchFallbackCDLL).branchfallbacklib\n"
+        "class RedefinedInitCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        pass\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(RedefinedInitCDLL).redefinedinitlib\n"
+        "class AssignedInitCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        pass\n"
+        "    __init__ = ctypes.CDLL.__init__\n"
+        "ctypes.LibraryLoader(AssignedInitCDLL).assignedinitlib\n"
         "class PartialNewCDLL(ctypes.CDLL):\n"
         "    def __new__(cls, name: str):\n"
         "        if name == 'skip':\n"
@@ -1149,6 +1182,9 @@ def test_scan_zip_resolves_static_ctypes_initializer_call_forms(tmp_path: Path) 
     assert "ctypes.LibraryLoader.kwnameinitlib" in s110_reason
     assert "ctypes.LibraryLoader.starargsinitlib" in s110_reason
     assert "ctypes.LibraryLoader.forwardingbaselib" in s110_reason
+    assert "ctypes.LibraryLoader.branchfallbacklib" in s110_reason
+    assert "ctypes.LibraryLoader.redefinedinitlib" in s110_reason
+    assert "ctypes.LibraryLoader.assignedinitlib" in s110_reason
     assert "ctypes.LibraryLoader.partialnewlib" in s110_reason
 
 
