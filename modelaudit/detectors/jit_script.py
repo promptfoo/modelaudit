@@ -154,14 +154,24 @@ _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN = re.compile(
     rb"from\s+(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s]|\\\r?\n|$)"
     rb")"
 )
+_EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN = rb"[A-Za-z_]\w*(?:\s*:[^=\n]+)?"
+_PRIORITY_EMBEDDED_PYTHON_ASSIGNMENT_LHS_PATTERN = rb"[a-z_]\w*(?:\s*:[^=\n]+)?"
 _EMBEDDED_PYTHON_CONTEXT_STATEMENT_START_PATTERN = re.compile(
-    rb"(?<![A-Za-z0-9_'\".])(?:(?:import|from)\s+|[A-Za-z_]\w*\s*=)"
+    rb"(?<![A-Za-z0-9_'\".])(?:(?:import|from)\s+|" + _EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN + rb"\s*=)"
 )
-_PRIORITY_EMBEDDED_PYTHON_ALIAS_ASSIGNMENT_PATTERN = re.compile(rb"(?m)^\s*[a-z_]\w*\s*=\s*[a-z_]\w*(?:\.[a-z_]\w*)+")
+_PRIORITY_EMBEDDED_PYTHON_ALIAS_ASSIGNMENT_PATTERN = re.compile(
+    rb"(?m)^\s*" + _PRIORITY_EMBEDDED_PYTHON_ASSIGNMENT_LHS_PATTERN + rb"\s*=\s*[a-z_]\w*(?:\.[a-z_]\w*)+"
+)
 _DIRECT_PRIORITY_EMBEDDED_PYTHON_ALIAS_ASSIGNMENT_PATTERN = re.compile(
-    rb"(?m)^\s*[a-z_]\w*\s*=\s*(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")\."
+    rb"(?m)^\s*"
+    + _PRIORITY_EMBEDDED_PYTHON_ASSIGNMENT_LHS_PATTERN
+    + rb"\s*=\s*(?:"
+    + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN
+    + rb")\."
 )
-_PRIORITY_EMBEDDED_PYTHON_SIMPLE_ALIAS_ASSIGNMENT_PATTERN = re.compile(rb"(?m)^\s*[a-z_]\w*\s*=\s*[a-z_]\w*")
+_PRIORITY_EMBEDDED_PYTHON_SIMPLE_ALIAS_ASSIGNMENT_PATTERN = re.compile(
+    rb"(?m)^\s*" + _PRIORITY_EMBEDDED_PYTHON_ASSIGNMENT_LHS_PATTERN + rb"\s*=\s*[a-z_]\w*"
+)
 _EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+")
 _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])"
@@ -364,24 +374,88 @@ def _strip_python_comment_bytes(line: bytes) -> bytes:
     return line
 
 
+def _python_code_without_comments_or_strings(line: bytes) -> bytes:
+    code = bytearray(line)
+    quote: int | None = None
+    quote_size = 1
+    index = 0
+    while index < len(line):
+        byte = line[index]
+        if quote is not None:
+            code[index] = ord(" ")
+            if quote_size == 1 and byte == ord("\\"):
+                if index + 1 < len(line):
+                    code[index + 1] = ord(" ")
+                index += 2
+                continue
+            marker = bytes((quote,)) * quote_size
+            if line.startswith(marker, index):
+                code[index : index + quote_size] = b" " * quote_size
+                index += quote_size
+                quote = None
+                quote_size = 1
+                continue
+            if quote_size == 1 and byte == quote:
+                quote = None
+            index += 1
+            continue
+        if byte == ord("#"):
+            return bytes(code[:index])
+        if byte in {ord("'"), ord('"')}:
+            marker = bytes((byte,)) * 3
+            if line.startswith(marker, index):
+                code[index : index + 3] = b"   "
+                quote = byte
+                quote_size = 3
+                index += 3
+                continue
+            code[index] = ord(" ")
+            quote = byte
+            quote_size = 1
+        index += 1
+    return bytes(code)
+
+
 def _line_has_explicit_continuation(line: bytes) -> bool:
-    return _strip_python_comment_bytes(line).rstrip().endswith(b"\\")
+    return _python_code_without_comments_or_strings(line).rstrip().endswith(b"\\")
 
 
 def _line_parenthesis_delta(line: bytes) -> int:
-    line = _strip_python_comment_bytes(line)
+    line = _python_code_without_comments_or_strings(line)
     return line.count(b"(") - line.count(b")")
 
 
 def _multiline_string_state_after_line(line: bytes, quote: bytes | None) -> bytes | None:
-    code = _strip_python_comment_bytes(line)
+    code = line if quote is not None else _strip_python_comment_bytes(line)
     if quote is not None:
         return None if quote in code else quote
-    triple_quotes = [(offset, marker) for marker in (b'"""', b"'''") if (offset := code.find(marker)) != -1]
-    if not triple_quotes:
-        return None
-    quote_offset, marker = min(triple_quotes, key=lambda item: item[0])
-    return None if marker in code[quote_offset + len(marker) :] else marker
+    single_quote: int | None = None
+    escaped = False
+    index = 0
+    while index < len(code):
+        byte = code[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if single_quote is not None:
+            if byte == ord("\\"):
+                escaped = True
+            elif byte == single_quote:
+                single_quote = None
+            index += 1
+            continue
+        if byte in {ord("'"), ord('"')}:
+            marker = bytes((byte,)) * 3
+            if code.startswith(marker, index):
+                closing_offset = code.find(marker, index + len(marker))
+                if closing_offset == -1:
+                    return marker
+                index = closing_offset + len(marker)
+                continue
+            single_quote = byte
+        index += 1
+    return None
 
 
 def _embedded_python_context_statement_start(line: bytes) -> int | None:

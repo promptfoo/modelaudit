@@ -1325,14 +1325,29 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
         local_name = alias.asname or alias.name
-        self.alias_scopes[-1][local_name] = frozenset({import_name})
+        self._bind_name(local_name, frozenset({import_name}))
         self._refresh_imported_static_members(local_name, import_name)
 
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
+        if "." not in name:
+            self._shadow_static_member_aliases(name)
         self.alias_scopes[-1][name] = resolved_names
 
     def _bind_name_in_scope(self, scope_index: int, name: str, resolved_names: _AliasValue) -> None:
+        if "." not in name:
+            self._shadow_static_member_aliases_in_scope(scope_index, name)
         self.alias_scopes[scope_index][name] = resolved_names
+
+    def _shadow_static_member_aliases(self, local_name: str) -> None:
+        self._shadow_static_member_aliases_in_scope(len(self.alias_scopes) - 1, local_name)
+
+    def _shadow_static_member_aliases_in_scope(self, scope_index: int, local_name: str) -> None:
+        prefix = f"{local_name}."
+        current_scope = self.alias_scopes[scope_index]
+        for scope in self.alias_scopes:
+            for key in scope:
+                if key.startswith(prefix):
+                    current_scope[key] = None
 
     def _refresh_imported_static_members(self, local_name: str, import_name: str) -> None:
         for reference_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:

@@ -698,6 +698,19 @@ def test_scan_zip_clears_static_member_overwrite_after_module_import(tmp_path: P
     assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
 
 
+def test_scan_zip_clears_imported_static_members_after_alias_rebind(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import runpy as rp\nrp = object()\nrp.run_path('safe.py')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_scan_zip_preserves_safe_runpy_overwrite_before_conditional(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = "import runpy\nrunpy.run_path = len\nif replace:\n    runpy.run_path = str\nrunpy.run_path([])\n"
