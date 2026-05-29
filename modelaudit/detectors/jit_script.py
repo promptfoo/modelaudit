@@ -161,7 +161,8 @@ _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"from\s+[A-Za-z_][\w.]*(?:\s|\\\r?\n)+import)"
 )
 _EMBEDDED_PYTHON_CONTEXT_START_PATTERN = re.compile(
-    rb"(?<![A-Za-z0-9_'\".])(?:import\s+[A-Za-z_][\w.]*|from\s+[A-Za-z_][\w.]*|[A-Za-z_]\w*\s*=)"
+    rb"(?<![A-Za-z0-9_'\".])"
+    rb"(?:import\s+[A-Za-z_][\w.]*|from\s+[A-Za-z_][\w.]*|[A-Za-z_]\w*(?:\s*:[^=\n#]+)?\s*=)"
 )
 
 
@@ -338,45 +339,92 @@ def _embedded_python_scan_windows(data: bytes) -> list[bytes]:
     return [data[:_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES], data[-_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:]]
 
 
-def _strip_python_comment_bytes(line: bytes) -> bytes:
-    quote: int | None = None
+def _python_structural_line_bytes(line: bytes) -> bytes:
+    structural = bytearray()
+    quote_marker: bytes | None = None
     escaped = False
-    for index, byte in enumerate(line):
-        if escaped:
-            escaped = False
+    index = 0
+    while index < len(line):
+        if quote_marker is not None:
+            if escaped:
+                escaped = False
+                index += 1
+                continue
+            if len(quote_marker) == 1 and line[index] == ord("\\"):
+                escaped = True
+                index += 1
+                continue
+            if line.startswith(quote_marker, index):
+                index += len(quote_marker)
+                quote_marker = None
+                continue
+            index += 1
             continue
-        if byte == ord("\\") and quote is not None:
-            escaped = True
+
+        byte = line[index]
+        if byte == ord("#"):
+            break
+        if line.startswith(b'"""', index) or line.startswith(b"'''", index):
+            quote_marker = line[index : index + 3]
+            index += 3
             continue
         if byte in {ord("'"), ord('"')}:
-            if quote is None:
-                quote = byte
-            elif quote == byte:
-                quote = None
+            quote_marker = bytes([byte])
+            index += 1
             continue
-        if byte == ord("#") and quote is None:
-            return line[:index]
-    return line
+        structural.append(byte)
+        index += 1
+    return bytes(structural)
+
+
+def _triple_quote_state_after_line(line: bytes, quote: bytes | None) -> bytes | None:
+    index = 0
+    while index < len(line):
+        if quote is not None:
+            end = line.find(quote, index)
+            if end == -1:
+                return quote
+            index = end + len(quote)
+            quote = None
+            continue
+
+        byte = line[index]
+        if byte == ord("#"):
+            return None
+        if line.startswith(b'"""', index) or line.startswith(b"'''", index):
+            quote = line[index : index + 3]
+            index += 3
+            continue
+        if byte in {ord("'"), ord('"')}:
+            single_quote = byte
+            index += 1
+            escaped = False
+            while index < len(line):
+                current = line[index]
+                if escaped:
+                    escaped = False
+                elif current == ord("\\"):
+                    escaped = True
+                elif current == single_quote:
+                    index += 1
+                    break
+                index += 1
+            continue
+        index += 1
+    return quote
 
 
 def _line_has_explicit_continuation(line: bytes) -> bool:
-    return _strip_python_comment_bytes(line).rstrip().endswith(b"\\")
+    return _python_structural_line_bytes(line).rstrip().endswith(b"\\")
 
 
 def _line_parenthesis_delta(line: bytes) -> int:
-    line = _strip_python_comment_bytes(line)
-    return line.count(b"(") - line.count(b")")
+    structural = _python_structural_line_bytes(line)
+    return structural.count(b"(") - structural.count(b")")
 
 
 def _multiline_string_state_after_line(line: bytes, quote: bytes | None) -> bytes | None:
-    code = _strip_python_comment_bytes(line)
-    if quote is not None:
-        return None if quote in code else quote
-    triple_quotes = [(offset, marker) for marker in (b'"""', b"'''") if (offset := code.find(marker)) != -1]
-    if not triple_quotes:
-        return None
-    quote_offset, marker = min(triple_quotes, key=lambda item: item[0])
-    return None if marker in code[quote_offset + len(marker) :] else marker
+    return _triple_quote_state_after_line(line, quote)
 
 
 def _is_embedded_top_level_prefix(prefix: bytes) -> bool:
@@ -398,11 +446,12 @@ def _context_statement_start(line: bytes) -> int | None:
 def _assignment_targets(tree: ast.AST) -> list[str]:
     targets: list[str] = []
     for statement in getattr(tree, "body", []):
-        if not isinstance(statement, ast.Assign):
-            continue
-        for target in statement.targets:
-            if isinstance(target, ast.Name):
-                targets.append(target.id)
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                if isinstance(target, ast.Name):
+                    targets.append(target.id)
+        elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+            targets.append(statement.target.id)
     return targets
 
 

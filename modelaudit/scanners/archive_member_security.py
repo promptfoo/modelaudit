@@ -1330,15 +1330,25 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 continue
             self.alias_scopes[-1][f"{local_name}{reference.removeprefix(import_name)}"] = frozenset({reference})
 
+    def _clear_member_bindings(self, scope_index: int, local_name: str) -> None:
+        if "." in local_name or local_name.startswith(_MODULE_NAMESPACE_WRITE_PREFIX):
+            return
+        prefix = f"{local_name}."
+        scope = self.alias_scopes[scope_index]
+        for name in [name for name in scope if name.startswith(prefix)]:
+            scope.pop(name, None)
+
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
         local_name = alias.asname or alias.name
-        self.alias_scopes[-1][local_name] = frozenset({import_name})
+        self._bind_name(local_name, frozenset({import_name}))
         self._bind_imported_static_members(local_name, import_name)
 
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
+        self._clear_member_bindings(-1, name)
         self.alias_scopes[-1][name] = resolved_names
 
     def _bind_name_in_scope(self, scope_index: int, name: str, resolved_names: _AliasValue) -> None:
+        self._clear_member_bindings(scope_index, name)
         self.alias_scopes[scope_index][name] = resolved_names
 
     def _bind_module_namespace_key(self, key: str, resolved_names: _AliasValue) -> None:
