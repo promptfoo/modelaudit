@@ -12,6 +12,7 @@ Part of ModelAudit's critical security validation suite.
 import ast
 import re
 import textwrap
+from bisect import bisect_left, bisect_right
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -129,13 +130,55 @@ _DANGEROUS_IMPORT_PATTERNS = {
     dangerous_import: _compile_dangerous_import_patterns(dangerous_import) for dangerous_import in DANGEROUS_IMPORTS
 }
 _MAX_SNIPPET_PARSE_TRIM_ATTEMPTS = 8
+_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS = 10
+_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS = 16
+_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES = 16_384
+_MAX_PRIORITY_ALIAS_USAGE_LINES = 8
 _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES = 1_000_000
+_MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES = 16_384
 _EMBEDDED_PYTHON_START_MARKERS = (b"def ", b"async def ", b"class ", b"import ", b"from ")
-_EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+")
+_PRIORITY_EMBEDDED_PYTHON_MODULES = tuple(
+    sorted(
+        {marker.lower() for marker in (*DANGEROUS_IMPORTS, "asyncio", "ctypes", "runpy", "subprocess", "webbrowser")},
+        key=len,
+        reverse=True,
+    )
+)
+_PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN = b"|".join(
+    re.escape(marker.encode("utf-8")) for marker in _PRIORITY_EMBEDDED_PYTHON_MODULES
+)
+_PRIORITY_WILDCARD_IMPORT_ALIASES = {
+    "asyncio": ("create_subprocess_exec", "create_subprocess_shell"),
+    "ctypes": ("CDLL", "LoadLibrary", "LibraryLoader", "cdll", "pydll", "windll"),
+    "os": ("popen", "spawnl", "spawnle", "spawnv", "spawnve", "system"),
+    "runpy": ("_run_module_as_main", "run_module", "run_path"),
+    "subprocess": ("Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput", "run"),
+    "webbrowser": ("get", "open", "open_new", "open_new_tab"),
+}
+_PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN = re.compile(
+    rb"(?m)^\s*(?:"
+    rb"import\s+(?:[a-z_][\w.]*(?:\s+as\s+[a-z_]\w*)?\s*,(?:\s|\\\r?\n)*)*(?:"
+    + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN
+    + rb")(?:[.\s,]|$)|"
+    rb"from\s+(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s]|\\\r?\n|$)"
+    rb")"
+)
+_EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN = rb"(?:[A-Za-z_]\w*(?:\s*:[^=\n#]+)?|[\(\[][A-Za-z_][^=\n#]*[\)\]])"
+_EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}\x00]+|class\s+\w+[^}\x00]+")
 _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])"
-    rb"(?:(?:async\s+)?def\s+\w+|class\s+\w+|import\s+[A-Za-z_][\w.]*|from\s+[A-Za-z_][\w.]*\s+import)"
+    rb"(?:(?:async\s+)?def\s+\w+|class\s+\w+|import\s+[A-Za-z_][\w.]*|"
+    rb"from\s+[A-Za-z_][\w.]*(?:\s|\\\r?\n)+import)"
 )
+_EMBEDDED_PYTHON_CONTEXT_START_PATTERN = re.compile(
+    rb"(?<![A-Za-z0-9_'\".])(?:if\s+True\s*:|import\s+[A-Za-z_][\w.]*|from\s+[A-Za-z_][\w.]*|"
+    + _EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN
+    + rb"\s*=)"
+)
+_EMBEDDED_PYTHON_COMPOUND_CONTEXT_START_PATTERN = re.compile(
+    rb"(?<![A-Za-z0-9_'\".])if\s+(?:True|1)\s*:\s*(?:import|from)\s+"
+)
+_EmbeddedPythonCandidate = tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]
 
 
 def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
@@ -185,28 +228,345 @@ def _candidate_embedded_python_snippets(
     bounded: bytes,
     *,
     include_full_source: bool = False,
-) -> list[tuple[bytes, tuple[int, int]]]:
-    candidates: list[tuple[bytes, tuple[int, int]]] = []
+) -> list[_EmbeddedPythonCandidate]:
+    candidates: list[_EmbeddedPythonCandidate] = []
     block_spans: list[tuple[int, int]] = []
+    start_offsets = [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(bounded)]
+    priority_starts: set[int] = set()
+    for priority_offset in _priority_import_offsets(bounded):
+        insertion_index = bisect_right(start_offsets, priority_offset)
+        if insertion_index == 0:
+            continue
+        priority_starts.add(start_offsets[insertion_index - 1])
+        if insertion_index >= 2:
+            priority_starts.add(start_offsets[insertion_index - 2])
+
     if include_full_source:
-        candidates.append((bounded, (0, len(bounded))))
+        span = (0, len(bounded))
+        candidates.append((bounded, span, (span,)))
 
     for match in _EMBEDDED_PYTHON_BLOCK_PATTERN.finditer(bounded):
         span = match.span()
         if include_full_source and span[0] == 0:
             continue
         block_spans.append(span)
-        candidates.append((match.group(0), span))
+        candidates.append((match.group(0), span, (span,)))
 
-    for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(bounded):
-        start = match.start()
+    for start in start_offsets:
         if include_full_source and start == 0:
             continue
-        if any(block_start <= start < block_end for block_start, block_end in block_spans):
+        if any(block_start < start < block_end for block_start, block_end in block_spans):
             continue
-        candidates.append((bounded[start:], (start, len(bounded))))
+        if any(block_start == start for block_start, _block_end in block_spans) and start not in priority_starts:
+            continue
+        span = (start, len(bounded))
+        candidates.append((bounded[start:], span, (span,)))
 
     return candidates
+
+
+def _priority_import_offsets(bounded: bytes) -> list[int]:
+    lowered = bounded.lower()
+    return [
+        match.start()
+        for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(lowered)
+        if _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.match(lowered[match.start() :]) is not None
+    ]
+
+
+def _span_contains_priority_offset(span: tuple[int, int], priority_offsets: list[int]) -> bool:
+    index = bisect_left(priority_offsets, span[0])
+    return index < len(priority_offsets) and priority_offsets[index] < span[1]
+
+
+def _bounded_priority_embedded_python_candidate(
+    candidate: bytes,
+    span: tuple[int, int],
+    priority_offsets: list[int],
+) -> _EmbeddedPythonCandidate:
+    index = bisect_left(priority_offsets, span[0])
+    if index >= len(priority_offsets) or priority_offsets[index] >= span[1]:
+        return candidate, span, (span,)
+    fallback_candidate: _EmbeddedPythonCandidate | None = None
+    for priority_offset in priority_offsets[index:]:
+        if priority_offset >= span[1]:
+            break
+        (
+            compact_candidate,
+            compact_span,
+            compact_real_ranges,
+            has_usage_lines,
+        ) = _bounded_priority_embedded_python_candidate_at_offset(candidate, span, priority_offset - span[0])
+        if has_usage_lines:
+            return compact_candidate, compact_span, compact_real_ranges
+        if fallback_candidate is None:
+            fallback_candidate = (compact_candidate, compact_span, compact_real_ranges)
+    return fallback_candidate or (candidate, span, (span,))
+
+
+def _bounded_priority_embedded_python_candidate_at_offset(
+    candidate: bytes,
+    span: tuple[int, int],
+    priority_relative_offset: int,
+) -> tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...], bool]:
+    if priority_relative_offset >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
+        line_start = candidate.rfind(b"\n", 0, priority_relative_offset) + 1
+    else:
+        line_start = 0
+    bounded_end = min(len(candidate), line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
+    segment_ranges: list[tuple[int, int]] = []
+
+    def add_segment(start: int, end: int) -> None:
+        if end > start:
+            segment_ranges.append((start, end))
+
+    block_header_end = candidate.find(b"\n")
+    if (
+        block_header_end != -1
+        and line_start > block_header_end
+        and candidate[:block_header_end].lstrip().startswith((b"def ", b"async def ", b"class "))
+    ):
+        add_segment(0, block_header_end + 1)
+    add_segment(line_start, bounded_end)
+
+    aliases = _priority_import_aliases(_compact_candidate_segments(candidate, segment_ranges))
+    usage_lines = _priority_alias_usage_lines(candidate, aliases, bounded_end) if aliases else []
+    for usage_line in usage_lines:
+        add_segment(*usage_line)
+
+    tail_start = max(bounded_end, len(candidate) - _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
+    tail_start = candidate.rfind(b"\n", 0, tail_start) + 1
+    if bounded_end < tail_start < len(candidate):
+        add_segment(tail_start, len(candidate))
+
+    merged_ranges = _merge_candidate_segment_ranges(segment_ranges)
+    compact_candidate = _compact_candidate_segments(candidate, merged_ranges)
+    if not merged_ranges:
+        return compact_candidate, span, (span,), bool(usage_lines)
+
+    span_start = span[0] + merged_ranges[0][0]
+    span_end = span[0] + max(end for _start, end in merged_ranges)
+    real_ranges = tuple((span[0] + start, span[0] + end) for start, end in merged_ranges)
+    return compact_candidate, (span_start, span_end), real_ranges, bool(usage_lines)
+
+
+def _is_priority_module_name(module_name: str) -> bool:
+    module_name = module_name.lower()
+    return any(
+        module_name == priority_module or module_name.startswith(f"{priority_module}.")
+        for priority_module in _PRIORITY_EMBEDDED_PYTHON_MODULES
+    )
+
+
+def _priority_import_aliases(candidate: bytes) -> frozenset[bytes]:
+    try:
+        source, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
+        tree = ast.parse(textwrap.dedent(source))
+    except (SyntaxError, ValueError):
+        return frozenset()
+
+    aliases: set[bytes] = set()
+    for statement in ast.walk(tree):
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                if _is_priority_module_name(alias.name):
+                    root_name = alias.name.split(".", maxsplit=1)[0]
+                    aliases.add((alias.asname or root_name).encode("utf-8"))
+        elif isinstance(statement, ast.ImportFrom) and statement.module is not None:
+            root_name = statement.module.split(".", maxsplit=1)[0]
+            if _is_priority_module_name(statement.module):
+                for alias in statement.names:
+                    if alias.name == "*":
+                        aliases.update(
+                            name.encode("utf-8") for name in _PRIORITY_WILDCARD_IMPORT_ALIASES.get(root_name, ())
+                        )
+                    else:
+                        aliases.add((alias.asname or alias.name).encode("utf-8"))
+    aliases.update(_priority_assignment_aliases(source, tree, {alias.decode("utf-8") for alias in aliases}))
+    return frozenset(aliases)
+
+
+def _priority_assignment_aliases(source: str, tree: ast.AST, priority_aliases: set[str]) -> set[bytes]:
+    aliases: set[bytes] = set()
+    discovered_aliases = set(priority_aliases)
+    for target, value in _assignment_targets_and_values_in_tree(tree):
+        if _expression_is_priority_alias_reference(value, discovered_aliases):
+            aliases.add(target.encode("utf-8"))
+            discovered_aliases.add(target)
+            continue
+        probe = f"{source}\n" + "\n".join(_priority_assignment_probe_calls(target))
+        try:
+            probe_tree = ast.parse(probe)
+        except (SyntaxError, ValueError):
+            continue
+        if _resolve_alias_aware_high_risk_calls(probe_tree):
+            aliases.add(target.encode("utf-8"))
+            discovered_aliases.add(target)
+    return aliases
+
+
+def _assignment_targets_and_values_in_tree(tree: ast.AST) -> list[tuple[str, ast.AST]]:
+    targets_and_values: list[tuple[str, ast.AST]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                targets_and_values.extend((name, node.value) for name in _assignment_target_names(target))
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+            targets_and_values.extend((name, node.value) for name in _assignment_target_names(node.target))
+    return targets_and_values
+
+
+def _expression_is_priority_alias_reference(node: ast.AST, aliases: set[str]) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in aliases
+    if isinstance(node, ast.Attribute):
+        return _expression_is_priority_alias_reference(node.value, aliases)
+    if isinstance(node, ast.Subscript):
+        return _expression_is_priority_alias_reference(node.value, aliases)
+    if isinstance(node, ast.Call):
+        call_name = _simple_reference_name(node.func)
+        if call_name in {"getattr", "builtins.getattr"} and len(node.args) >= 2 and not node.keywords:
+            return _expression_is_priority_alias_reference(node.args[0], aliases)
+    return False
+
+
+def _simple_reference_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _simple_reference_name(node.value)
+        if parent is None:
+            return None
+        return f"{parent}.{node.attr}"
+    return None
+
+
+def _priority_assignment_probe_calls(target: str) -> list[str]:
+    return [
+        f"{target}()",
+        f"{target}.run_path('payload.py')",
+        f"{target}.run_module('payload')",
+        f"{target}._run_module_as_main('payload')",
+        f"{target}.system('id')",
+        f"{target}.popen('id')",
+        f"{target}.run(['id'])",
+        f"{target}.Popen(['id'])",
+        f"{target}.call(['id'])",
+        f"{target}.check_call(['id'])",
+        f"{target}.check_output(['id'])",
+        f"{target}.getoutput('id')",
+        f"{target}.getstatusoutput('id')",
+        f"{target}.open('https://example.invalid')",
+        f"{target}.open_new('https://example.invalid')",
+        f"{target}.open_new_tab('https://example.invalid')",
+        f"{target}.CDLL('payload')",
+        f"{target}.LoadLibrary('payload')",
+        f"{target}.__getitem__('payload')",
+    ]
+
+
+def _priority_alias_usage_lines(
+    candidate: bytes, aliases: frozenset[bytes], search_start: int
+) -> list[tuple[int, int]]:
+    usage_lines: list[tuple[int, int]] = []
+    line_start = search_start
+    multiline_quote: bytes | None = _multiline_string_state_after_line(candidate[:search_start], None)
+    while line_start < len(candidate):
+        line_end = candidate.find(b"\n", line_start)
+        if line_end == -1:
+            line_end = len(candidate)
+        else:
+            line_end += 1
+        line = candidate[line_start:line_end]
+        if multiline_quote is not None:
+            multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+            line_start = line_end
+            continue
+        code_line = _python_structural_line_bytes(line)
+        if _line_uses_priority_alias(code_line, aliases):
+            usage_lines.append((line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)))
+            if _line_calls_priority_alias(code_line, aliases) or len(usage_lines) >= _MAX_PRIORITY_ALIAS_USAGE_LINES:
+                return usage_lines
+        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+        line_start = line_end
+    return usage_lines
+
+
+def _line_uses_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
+    return any(
+        re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\()", code_line)
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?getattr\s*\(\s*" + re.escape(alias) + rb"\s*,",
+            code_line,
+        )
+        for alias in aliases
+    )
+
+
+def _line_calls_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
+    return any(
+        re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\(|\.[A-Za-z_]\w*\s*\()", code_line)
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?getattr\s*\(\s*"
+            + re.escape(alias)
+            + rb"\s*,\s*['\"][A-Za-z_]\w*['\"]\s*\)\s*\(",
+            code_line,
+        )
+        for alias in aliases
+    )
+
+
+def _merge_candidate_segment_ranges(segment_ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(segment_ranges):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (previous_start, max(previous_end, end))
+    return merged
+
+
+def _compact_candidate_segments(candidate: bytes, segment_ranges: list[tuple[int, int]]) -> bytes:
+    if len(segment_ranges) == 1:
+        start, end = segment_ranges[0]
+        return candidate[start:end]
+    return b"\n".join(candidate[start:end].rstrip(b"\n") for start, end in segment_ranges)
+
+
+def _prioritized_embedded_python_snippets(
+    candidates: list[_EmbeddedPythonCandidate],
+    bounded: bytes | None = None,
+) -> list[_EmbeddedPythonCandidate]:
+    selected: list[_EmbeddedPythonCandidate] = []
+    selected_spans: set[tuple[int, int]] = set()
+    priority_offsets = _priority_import_offsets(bounded) if bounded is not None else []
+    selected_priority_candidates = 0
+    for index, (candidate, span, real_ranges) in enumerate(candidates):
+        has_priority_marker = (
+            _span_contains_priority_offset(span, priority_offsets)
+            if bounded is not None
+            else _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(candidate.lower()) is not None
+        )
+        if index >= _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:
+            if not has_priority_marker:
+                continue
+            if selected_priority_candidates >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
+                continue
+            if bounded is not None:
+                candidate, span, real_ranges = _bounded_priority_embedded_python_candidate(
+                    candidate, span, priority_offsets
+                )
+            else:
+                candidate = candidate[:_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES]
+                span = (span[0], span[0] + len(candidate))
+                real_ranges = (span,)
+            selected_priority_candidates += 1
+        if span in selected_spans:
+            continue
+        selected_spans.add(span)
+        selected.append((candidate, span, real_ranges))
+    return selected
 
 
 def _complete_brace_truncated_line_candidate(
@@ -229,12 +589,396 @@ def _embedded_python_scan_windows(data: bytes) -> list[bytes]:
     return [data[:_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES], data[-_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:]]
 
 
+def _python_structural_line_bytes(line: bytes) -> bytes:
+    structural = bytearray()
+    quote_marker: bytes | None = None
+    escaped = False
+    index = 0
+    while index < len(line):
+        if quote_marker is not None:
+            if escaped:
+                escaped = False
+                index += 1
+                continue
+            if len(quote_marker) == 1 and line[index] == ord("\\"):
+                escaped = True
+                index += 1
+                continue
+            if line.startswith(quote_marker, index):
+                index += len(quote_marker)
+                quote_marker = None
+                continue
+            index += 1
+            continue
+
+        byte = line[index]
+        if byte == ord("#"):
+            break
+        if line.startswith(b'"""', index) or line.startswith(b"'''", index):
+            quote_marker = line[index : index + 3]
+            index += 3
+            continue
+        if byte in {ord("'"), ord('"')}:
+            quote_marker = bytes([byte])
+            index += 1
+            continue
+        structural.append(byte)
+        index += 1
+    return bytes(structural)
+
+
+def _triple_quote_state_after_line(line: bytes, quote: bytes | None) -> bytes | None:
+    index = 0
+    while index < len(line):
+        if quote is not None:
+            end = _find_unescaped_marker(line, quote, index)
+            if end == -1:
+                return quote
+            index = end + len(quote)
+            quote = None
+            continue
+
+        byte = line[index]
+        if byte == ord("#"):
+            return None
+        if (line.startswith(b'"""', index) or line.startswith(b"'''", index)) and not _is_escaped_marker(line, index):
+            quote = line[index : index + 3]
+            index += 3
+            continue
+        if byte in {ord("'"), ord('"')}:
+            single_quote = byte
+            index += 1
+            escaped = False
+            while index < len(line):
+                current = line[index]
+                if escaped:
+                    escaped = False
+                elif current == ord("\\"):
+                    escaped = True
+                elif current == single_quote:
+                    index += 1
+                    break
+                index += 1
+            continue
+        index += 1
+    return quote
+
+
+def _find_unescaped_marker(line: bytes, marker: bytes, start: int) -> int:
+    index = line.find(marker, start)
+    while index != -1:
+        if not _is_escaped_marker(line, index):
+            return index
+        index = line.find(marker, index + 1)
+    return -1
+
+
+def _is_escaped_marker(line: bytes, index: int) -> bool:
+    backslashes = 0
+    position = index - 1
+    while position >= 0 and line[position] == ord("\\"):
+        backslashes += 1
+        position -= 1
+    return backslashes % 2 == 1
+
+
+def _line_has_explicit_continuation(line: bytes) -> bool:
+    return _python_structural_line_bytes(line).rstrip().endswith(b"\\")
+
+
+def _line_parenthesis_delta(line: bytes) -> int:
+    structural = _python_structural_line_bytes(line)
+    return structural.count(b"(") - structural.count(b")")
+
+
+def _multiline_string_state_after_line(line: bytes, quote: bytes | None) -> bytes | None:
+    return _triple_quote_state_after_line(line, quote)
+
+
+def _is_embedded_top_level_prefix(prefix: bytes) -> bool:
+    if not prefix:
+        return True
+    stripped_prefix = prefix.strip()
+    if stripped_prefix == b"":
+        return False
+    return not any(0x20 <= byte < 0x7F for byte in stripped_prefix)
+
+
+def _context_statement_start(line: bytes) -> int | None:
+    for match in _EMBEDDED_PYTHON_CONTEXT_START_PATTERN.finditer(line):
+        if _is_embedded_top_level_prefix(line[: match.start()]):
+            return match.start()
+    structural_line = _python_structural_line_bytes(line)
+    for match in _EMBEDDED_PYTHON_COMPOUND_CONTEXT_START_PATTERN.finditer(structural_line):
+        if _is_embedded_top_level_prefix(structural_line[: match.start()]):
+            return match.start()
+    return None
+
+
+def _assignment_targets(tree: ast.AST) -> list[str]:
+    targets: list[str] = []
+    for statement in getattr(tree, "body", []):
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                targets.extend(_assignment_target_names(target))
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            targets.extend(_assignment_target_names(statement.target))
+    return targets
+
+
+def _assignment_target_names(target: ast.AST) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Starred):
+        return _assignment_target_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for element in target.elts for name in _assignment_target_names(element)]
+    return []
+
+
+def _is_priority_assignment_context(context: bytes, statement: bytes) -> bool:
+    code_str, _byte_offsets = _decode_utf8_with_byte_offsets(context + statement)
+    statement_str, _statement_byte_offsets = _decode_utf8_with_byte_offsets(statement)
+    try:
+        statement_tree = ast.parse(statement_str)
+    except (SyntaxError, ValueError):
+        return False
+
+    targets = _assignment_targets(statement_tree)
+    if not targets:
+        return False
+
+    probe = code_str + "\n" + "\n".join(call for target in targets for call in _priority_assignment_probe_calls(target))
+    try:
+        probe_tree = ast.parse(probe)
+    except (SyntaxError, ValueError):
+        return False
+    return bool(_resolve_alias_aware_high_risk_calls(probe_tree))
+
+
+def _tree_imports_priority_module(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(_is_priority_module_name(alias.name) for alias in node.names):
+            return True
+        if isinstance(node, ast.ImportFrom) and node.module is not None and _is_priority_module_name(node.module):
+            return True
+    return False
+
+
+def _is_priority_prefix_context_statement(context: bytes, statement: bytes) -> bool:
+    code_str, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
+    try:
+        tree = ast.parse(code_str)
+    except (SyntaxError, ValueError):
+        return False
+    if _tree_imports_priority_module(tree):
+        return True
+    return _is_priority_assignment_context(context, statement)
+
+
+def _is_prefix_context_shadow_statement(context: bytes, statement: bytes) -> bool:
+    if not context:
+        return False
+    context_names = _prefix_context_binding_names(context)
+    if not context_names:
+        return False
+    return not _statement_defined_names(statement).isdisjoint(context_names)
+
+
+def _statement_defined_names(statement: bytes) -> set[str]:
+    statement_str, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
+    try:
+        tree = ast.parse(statement_str)
+    except (SyntaxError, ValueError):
+        return set()
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.asname or alias.name.split(".", maxsplit=1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(alias.asname or alias.name for alias in node.names)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                names.update(_assignment_target_names(target))
+    return names
+
+
+def _statement_referenced_names(statement: bytes) -> set[str]:
+    statement_str, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
+    try:
+        tree = ast.parse(statement_str)
+    except (SyntaxError, ValueError):
+        return set()
+    return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+
+
+def _drop_context_statement_index(context: list[bytes]) -> int:
+    later_references: set[str] = set()
+    for index in range(len(context) - 1, -1, -1):
+        defined_names = _statement_defined_names(context[index])
+        if defined_names.isdisjoint(later_references):
+            return index
+        later_references.difference_update(defined_names)
+        later_references.update(_statement_referenced_names(context[index]))
+    return 0
+
+
+def _prefix_context_binding_names(context: bytes) -> set[str]:
+    code_str, _byte_offsets = _decode_utf8_with_byte_offsets(context)
+    try:
+        tree = ast.parse(code_str)
+    except (SyntaxError, ValueError):
+        return set()
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.asname or alias.name.split(".", maxsplit=1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(alias.asname or alias.name for alias in node.names)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                names.update(_assignment_target_names(target))
+    return names
+
+
+def _extract_priority_prefix_context(data: bytes) -> bytes:
+    """Return bounded top-level dangerous imports and aliases from a prefix window."""
+    context: list[bytes] = []
+    context_size = 0
+    lines = data.splitlines(keepends=True)
+    index = 0
+    multiline_quote: bytes | None = None
+    while index < len(lines):
+        start = _context_statement_start(lines[index])
+        if start is None:
+            multiline_quote = _multiline_string_state_after_line(lines[index], multiline_quote)
+            index += 1
+            continue
+        if multiline_quote is not None:
+            multiline_quote = _multiline_string_state_after_line(lines[index], multiline_quote)
+            index += 1
+            continue
+
+        statement_line_quote = _multiline_string_state_after_line(lines[index], None)
+        statement_lines = [lines[index][start:]]
+        paren_depth = _line_parenthesis_delta(statement_lines[0])
+        while (_line_has_explicit_continuation(statement_lines[-1]) or paren_depth > 0) and index + 1 < len(lines):
+            index += 1
+            continuation = lines[index]
+            statement_lines.append(continuation)
+            paren_depth += _line_parenthesis_delta(continuation)
+
+        statement = b"".join(statement_lines).rstrip() + b"\n"
+        current_context = b"".join(context)
+        if not _is_priority_prefix_context_statement(
+            current_context, statement
+        ) and not _is_prefix_context_shadow_statement(current_context, statement):
+            multiline_quote = statement_line_quote
+            index += 1
+            continue
+        if len(statement) > _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES:
+            index += 1
+            continue
+        while context and context_size + len(statement) > _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES:
+            drop_index = _drop_context_statement_index([*context, statement])
+            if drop_index >= len(context):
+                break
+            context_size -= len(context.pop(drop_index))
+        context.append(statement)
+        context_size += len(statement)
+        index += 1
+
+    return b"".join(context)
+
+
+def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]:
+    windows = _embedded_python_scan_windows(data)
+    if len(windows) == 1:
+        return [(windows[0], False)]
+
+    prefix, tail = windows
+    extraction_windows = [(prefix, False), (tail, False)]
+    import_context = _extract_priority_prefix_context(prefix)
+    if import_context:
+        extraction_windows.append((import_context + b"\n" + tail, True))
+        tail_starts = [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(tail) if match.start() > 0]
+        context_aliases = _priority_import_aliases(import_context)
+        priority_tail_starts = set(_tail_starts_for_priority_alias_uses(tail, tail_starts, context_aliases))
+        for priority_offset in _priority_import_offsets(tail):
+            insertion_index = bisect_right(tail_starts, priority_offset)
+            if insertion_index:
+                priority_tail_starts.add(tail_starts[insertion_index - 1])
+        priority_tail_start_list = _bounded_priority_tail_starts(sorted(priority_tail_starts))
+        selected_starts = [
+            *tail_starts[:_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS],
+            *priority_tail_start_list,
+            *tail_starts[-_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:],
+        ]
+        for start in dict.fromkeys(selected_starts):
+            extraction_windows.append((import_context + b"\n" + tail[start:], True))
+    return extraction_windows
+
+
+def _bounded_priority_tail_starts(tail_starts: list[int]) -> list[int]:
+    if len(tail_starts) <= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
+        return tail_starts
+    head_count = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS // 2
+    tail_count = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS - head_count
+    return [*tail_starts[:head_count], *tail_starts[-tail_count:]]
+
+
+def _tail_starts_for_priority_alias_uses(
+    tail: bytes,
+    tail_starts: list[int],
+    aliases: frozenset[bytes],
+) -> list[int]:
+    selected_starts: list[int] = []
+    if not tail_starts or not aliases:
+        return selected_starts
+    for usage_start, _usage_end in _priority_alias_usage_lines(tail, aliases, 0):
+        start_index = bisect_right(tail_starts, usage_start) - 1
+        if start_index >= 0:
+            selected_starts.append(tail_starts[start_index])
+    return selected_starts
+
+
 def _has_raw_match_outside_parsed_spans(raw_spans: list[tuple[int, int]], parsed_spans: list[tuple[int, int]]) -> bool:
     """Return whether any raw regex hit sits outside AST-validated source."""
     for raw_start, raw_end in raw_spans:
         if not any(parsed_start <= raw_start and raw_end <= parsed_end for parsed_start, parsed_end in parsed_spans):
             return True
     return False
+
+
+def _parsed_real_spans(
+    real_ranges: tuple[tuple[int, int], ...],
+    parsed_byte_length: int,
+    compact_length: int,
+) -> list[tuple[int, int]]:
+    if parsed_byte_length >= compact_length:
+        return list(real_ranges)
+
+    remaining = parsed_byte_length
+    parsed_spans: list[tuple[int, int]] = []
+    for start, end in real_ranges:
+        if remaining <= 0:
+            break
+        segment_length = end - start
+        consumed = min(segment_length, remaining)
+        if consumed > 0:
+            parsed_spans.append((start, start + consumed))
+            remaining -= consumed
+        if remaining > 0:
+            remaining -= 1
+    return parsed_spans
+
+
+def _is_span_inside_parsed_spans(span: tuple[int, int], parsed_spans: list[tuple[int, int]]) -> bool:
+    return any(parsed_start <= span[0] and span[1] <= parsed_end for parsed_start, parsed_end in parsed_spans)
 
 
 def _decode_utf8_with_byte_offsets(data: bytes) -> tuple[str, list[int]]:
@@ -357,8 +1101,10 @@ class JITScriptDetector:
         """Return whether a bounded binary blob has parseable dangerous Python framing."""
         if not any(marker in data for marker in _EMBEDDED_PYTHON_START_MARKERS):
             return False
-        for window in _embedded_python_scan_windows(data):
-            for candidate, _span in _candidate_embedded_python_snippets(window):
+        for window, include_full_source in _embedded_python_extraction_windows(data):
+            for candidate, _span, _real_ranges in _candidate_embedded_python_snippets(
+                window, include_full_source=include_full_source
+            ):
                 code_str, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
                 parsed_snippet = _parse_embedded_python_snippet(code_str)
                 if parsed_snippet is None:
@@ -425,6 +1171,23 @@ class JITScriptDetector:
         patterns = _DANGEROUS_IMPORT_PATTERNS.get(dangerous_import)
         import_pattern, from_pattern = patterns or _compile_dangerous_import_patterns(dangerous_import)
         return import_pattern.search(source) is not None or from_pattern.search(source) is not None
+
+    @staticmethod
+    def _dangerous_imports_in_tree(tree: ast.AST) -> set[str]:
+        dangerous_imports: set[str] = set()
+        for node in ast.walk(tree):
+            imported_modules: list[str] = []
+            if isinstance(node, ast.Import):
+                imported_modules.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imported_modules.append(node.module)
+            for module_name in imported_modules:
+                dangerous_imports.update(
+                    dangerous_import
+                    for dangerous_import in DANGEROUS_IMPORTS
+                    if module_name == dangerous_import or module_name.startswith(f"{dangerous_import}.")
+                )
+        return dangerous_imports
 
     def scan_torchscript(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Scan TorchScript model data for dangerous operations.
@@ -709,8 +1472,10 @@ class JITScriptDetector:
             # raw pattern detection active and fall back to extracted snippets.
             bounded_high_risk_calls = None
 
-        for match, span in matches[:10]:  # Analyze first 10 code snippets
+        for match, span, real_ranges in _prioritized_embedded_python_snippets(matches, bounded=bounded):
             try:
+                if _is_span_inside_parsed_spans(span, parsed_snippet_spans):
+                    continue
                 code_str, byte_offsets = _decode_utf8_with_byte_offsets(match)
                 parsed_snippet = _parse_embedded_python_snippet(code_str)
                 if parsed_snippet is None or parsed_snippet[1] < len(code_str):
@@ -724,10 +1489,16 @@ class JITScriptDetector:
                             byte_offsets = completed_byte_offsets
                             parsed_snippet = completed_parsed_snippet
                             span = completed_span
+                            real_ranges = (completed_span,)
 
+                parsed_imports = (
+                    self._dangerous_imports_in_tree(parsed_snippet[0]) if parsed_snippet is not None else None
+                )
                 # Check for dangerous imports
                 for dangerous_import in DANGEROUS_IMPORTS:
-                    if self._contains_dangerous_import(code_str, dangerous_import):
+                    if self._contains_dangerous_import(code_str, dangerous_import) and (
+                        parsed_imports is None or dangerous_import in parsed_imports
+                    ):
                         findings.append(
                             create_jit_finding(
                                 message=f"Dangerous import '{dangerous_import}' in embedded code",
@@ -769,7 +1540,7 @@ class JITScriptDetector:
                 if parsed_snippet is not None:
                     tree, parsed_chars = parsed_snippet
                     parsed_byte_length = byte_offsets[parsed_chars]
-                    parsed_snippet_spans.append((span[0], min(span[1], span[0] + parsed_byte_length)))
+                    parsed_snippet_spans.extend(_parsed_real_spans(real_ranges, parsed_byte_length, len(match)))
                     snippet_high_risk_calls.update(_resolve_alias_aware_high_risk_calls(tree))
                     ast_findings = self._analyze_ast(tree, framework, context)
                     findings.extend(ast_findings)
@@ -1210,7 +1981,15 @@ class JITScriptDetector:
                 )
             )
         elif self._looks_like_framed_dangerous_python_source(data):
-            findings.extend(self._extract_and_check_python_code(data, "Generic Python", context))
+            for window, include_full_source in _embedded_python_extraction_windows(data):
+                findings.extend(
+                    self._extract_and_check_python_code(
+                        window,
+                        "Generic Python",
+                        context,
+                        include_full_source=include_full_source,
+                    )
+                )
 
         return findings
 

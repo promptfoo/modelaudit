@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect embedded Python `os.exec*`, `os.spawn*`, `os.posix_spawn*`, and `os.startfile` process-launch calls in archives and JIT-scanned content
 - detect embedded Python `asyncio.create_subprocess_*` calls and resolved JIT `subprocess` launch aliases
 - detect embedded Python `runpy.run_module`, `runpy.run_path`, and `runpy._run_module_as_main` dynamic-module execution calls
+- preserve embedded Python runpy, webbrowser, and ctypes findings across continued imports, late aliases, and bounded tail-window extraction gaps
 - detect embedded Python `webbrowser` launches and `ctypes` native-library loads in archives and JIT-scanned content
 - scan dangerous RKNN safe-key metadata values instead of suppressing the whole key-value string
 - scan ONNX external data initializers in nested graphs, functions, and training graphs
@@ -106,6 +107,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - honor descriptor-owned header aliases during helper scanner selection for renamed HDF5, GGML, and compressed payloads
 - detect signature-valid Torch7 payloads even when renamed with misleading suffixes
 - detect acquired executable Llamafile payloads with misleading suffixes, retain archive-polyglot coverage, and classify unavailable runtime previews as inconclusive
+- preserve Torch7 Lua findings in executable Llamafile/Torch7 polyglot payloads
 
 ### Performance Improvements
 
