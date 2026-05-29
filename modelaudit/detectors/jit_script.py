@@ -494,7 +494,13 @@ def _priority_alias_usage_lines(
         code_line = _python_structural_line_bytes(line)
         shadowed_aliases = _line_shadowed_priority_aliases(code_line, aliases)
         if shadowed_aliases:
-            shadow_line = (line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES))
+            shadow_line = (
+                line_start,
+                min(
+                    _priority_alias_shadow_segment_end(candidate, line, line_end),
+                    line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES,
+                ),
+            )
             for alias in shadowed_aliases:
                 pending_shadow_lines[alias] = shadow_line
         if used_aliases := _line_used_priority_aliases(code_line, aliases):
@@ -518,6 +524,33 @@ def _priority_alias_usage_lines(
         multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
         line_start = line_end
     return usage_lines
+
+
+def _priority_alias_shadow_segment_end(candidate: bytes, line: bytes, line_end: int) -> int:
+    structural_line = _python_structural_line_bytes(line)
+    if not structural_line.rstrip().endswith(b":"):
+        return line_end
+    header_indent = _line_indent_width(line)
+    segment_end = line_end
+    body_seen = False
+    next_line_start = line_end
+    while next_line_start < len(candidate):
+        next_line_end = candidate.find(b"\n", next_line_start)
+        if next_line_end == -1:
+            next_line_end = len(candidate)
+        else:
+            next_line_end += 1
+        next_line = candidate[next_line_start:next_line_end]
+        next_structural_line = _python_structural_line_bytes(next_line)
+        next_stripped = next_structural_line.strip()
+        next_indent = _line_indent_width(next_line)
+        if next_stripped and next_indent <= header_indent:
+            break
+        segment_end = next_line_end
+        if next_stripped:
+            body_seen = True
+        next_line_start = next_line_end
+    return segment_end if body_seen else line_end
 
 
 def _line_uses_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
@@ -698,6 +731,10 @@ def _statement_bound_priority_aliases(statement: ast.stmt, aliases: frozenset[by
         return frozenset(
             name for alias in statement.names for name in ((alias.asname or alias.name).encode(),) if name in aliases
         )
+    if isinstance(statement, ast.Delete):
+        return frozenset(
+            alias for target in statement.targets for alias in _target_bound_priority_aliases(target, aliases)
+        )
     return frozenset()
 
 
@@ -706,9 +743,17 @@ def _statement_binds_priority_alias(statement: ast.stmt, aliases: frozenset[byte
 
 
 def _line_assigns_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
+    decoded_line = textwrap.dedent(code_line.decode("utf-8", errors="ignore"))
     try:
-        tree = ast.parse(textwrap.dedent(code_line.decode("utf-8", errors="ignore")))
+        tree = ast.parse(decoded_line)
     except SyntaxError:
+        if not decoded_line.rstrip().endswith(":"):
+            return False
+        try:
+            tree = ast.parse(f"{decoded_line.rstrip()}\n    pass\n")
+        except (SyntaxError, ValueError):
+            return False
+    except ValueError:
         return False
 
     pending = list(reversed(tree.body))
@@ -740,9 +785,17 @@ def _line_shadowed_priority_aliases(code_line: bytes, aliases: frozenset[bytes])
 
 
 def _line_assigned_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    decoded_line = textwrap.dedent(code_line.decode("utf-8", errors="ignore"))
     try:
-        tree = ast.parse(textwrap.dedent(code_line.decode("utf-8", errors="ignore")))
+        tree = ast.parse(decoded_line)
     except SyntaxError:
+        if not decoded_line.rstrip().endswith(":"):
+            return frozenset()
+        try:
+            tree = ast.parse(f"{decoded_line.rstrip()}\n    pass\n")
+        except (SyntaxError, ValueError):
+            return frozenset()
+    except ValueError:
         return frozenset()
 
     pending = list(reversed(tree.body))

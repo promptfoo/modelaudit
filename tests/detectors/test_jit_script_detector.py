@@ -997,6 +997,41 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
+    @pytest.mark.parametrize(
+        "shadow_block",
+        [
+            b"del c\n",
+            b"for c in [len]:\n    pass\n",
+            b"with contextlib.suppress(Exception) as c:\n    pass\n",
+        ],
+    )
+    def test_scan_model_honors_late_ctypes_alias_shadowing_after_priority_window(self, shadow_block: bytes) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import ctypes as c\nimport contextlib\n"
+            + padding
+            + shadow_block
+            + padding
+            + b"c.CDLL('libpayload.so')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
     def test_scan_model_ignores_dead_branch_priority_import_after_default_cap(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
