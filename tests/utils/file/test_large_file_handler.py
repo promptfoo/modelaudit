@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import struct
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.scanners import safetensors_scanner
 from modelaudit.scanners.base import ScanResult
+from modelaudit.scanners.safetensors_scanner import MAX_HEADER_BYTES, SafeTensorsScanner
 from modelaudit.utils.file import handlers as advanced_handlers
 from modelaudit.utils.file import large_file_handler
+from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
 
 
 class DummyScanner:
@@ -52,6 +58,55 @@ class DummyMmapScanner:
         result.bytes_scanned = Path(file_path).stat().st_size
         result.finish(success=True)
         return result
+
+
+def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
+    header_len = MAX_HEADER_BYTES + 1
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.write(b"{")
+        handle.truncate(8 + header_len + 1)
+
+
+@pytest.mark.parametrize("scan_func", [large_file_handler.scan_large_file, advanced_handlers.scan_advanced_large_file])
+def test_large_handler_cache_bypasses_oversized_safetensors_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scan_func: Callable[..., ScanResult],
+) -> None:
+    payload = tmp_path / "weights.jpg"
+    _write_sparse_oversized_safetensors_candidate(payload)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    scanner = SafeTensorsScanner(config=config)
+    hash_attempts = 0
+
+    monkeypatch.setattr(advanced_handlers, "EXTREME_MODEL_THRESHOLD", 1)
+    monkeypatch.setattr(advanced_handlers, "LARGE_MODEL_THRESHOLD_200GB", payload.stat().st_size + 1)
+
+    def record_hash_attempt(_self: SecureFileHasher, _path: str) -> str:
+        nonlocal hash_attempts
+        hash_attempts += 1
+        return "unexpected-full-file-hash"
+
+    monkeypatch.setattr(SecureFileHasher, "hash_file", record_hash_attempt)
+    monkeypatch.setattr(
+        safetensors_scanner.SafeTensorsScanner,
+        "calculate_file_hashes",
+        lambda _self, _path: pytest.fail("bounded SafeTensors failure must not hash inside the scanner"),
+    )
+
+    reset_cache_manager()
+    try:
+        result = scan_func(str(payload), scanner)
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert any(check.name == "Header Size Limit" for check in result.checks)
+        assert hash_attempts == 0
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_chunked_scan_populates_end_time_and_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

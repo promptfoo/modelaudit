@@ -137,6 +137,25 @@ def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
     return {(call.name, call.rule_code) for call in high_risk_python_calls_in_tree(tree)}
 
 
+def _parse_embedded_python_snippet(code_str: str) -> ast.AST | None:
+    """Parse an extracted Python snippet, trimming trailing binary framing when needed."""
+    try:
+        return ast.parse(code_str)
+    except (SyntaxError, ValueError):
+        pass
+
+    lines = code_str.splitlines()
+    for end in range(len(lines) - 1, 0, -1):
+        candidate = "\n".join(lines[:end])
+        if candidate.strip() == "":
+            continue
+        try:
+            return ast.parse(f"{candidate}\n")
+        except (SyntaxError, ValueError):
+            continue
+    return None
+
+
 # Patterns that indicate code execution attempts
 _SUBPROCESS_CODE_EXECUTION_DESCRIPTION = "Subprocess execution detected"
 _OS_CODE_EXECUTION_DESCRIPTION = "OS command execution detected"
@@ -536,11 +555,14 @@ class JITScriptDetector:
         python_code_pattern = rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+"
         matches = [bounded] if include_full_source else re.findall(python_code_pattern, bounded)
         bounded_high_risk_calls: set[tuple[str, str]] | None = None
+        snippet_high_risk_calls: set[tuple[str, str]] = set()
         try:
             bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
             bounded_high_risk_calls = _resolve_alias_aware_high_risk_calls(bounded_tree)
         except (SyntaxError, UnicodeDecodeError, ValueError):
-            pass
+            # Binary model blobs commonly contain non-Python framing bytes; keep
+            # raw pattern detection active and fall back to extracted snippets.
+            bounded_high_risk_calls = None
 
         for match in matches[:10]:  # Analyze first 10 code snippets
             try:
@@ -586,34 +608,33 @@ class JITScriptDetector:
                             )
                         )
 
-                # Try to parse as AST for deeper analysis
-                try:
-                    tree = ast.parse(code_str)
+                # Try to parse as AST for deeper analysis.
+                tree = _parse_embedded_python_snippet(code_str)
+                if tree is not None:
+                    snippet_high_risk_calls.update(_resolve_alias_aware_high_risk_calls(tree))
                     ast_findings = self._analyze_ast(tree, framework, context)
                     findings.extend(ast_findings)
-                except SyntaxError:
-                    # Not valid Python, might be partial or corrupted
-                    pass
 
             except Exception:
                 # Failed to process this code snippet
                 continue
 
         # Check for common code execution patterns in binary
+        resolved_high_risk_calls = (bounded_high_risk_calls or set()) | snippet_high_risk_calls
         for pattern, description in CODE_EXECUTION_PATTERNS:
             pattern_match = re.search(pattern, bounded) is not None
-            if description == _SUBPROCESS_CODE_EXECUTION_DESCRIPTION and bounded_high_risk_calls is not None:
-                resolved_subprocess_call = any(code == "S103" for _, code in bounded_high_risk_calls)
-                rebound_to_high_risk_call = pattern_match and bool(bounded_high_risk_calls)
-                if not resolved_subprocess_call and not rebound_to_high_risk_call:
+            if description == _SUBPROCESS_CODE_EXECUTION_DESCRIPTION:
+                resolved_subprocess_call = any(code == "S103" for _, code in resolved_high_risk_calls)
+                if resolved_subprocess_call:
+                    pattern_match = True
+                elif bounded_high_risk_calls is not None:
                     continue
-                pattern_match = True
-            if description == _OS_CODE_EXECUTION_DESCRIPTION and bounded_high_risk_calls is not None:
-                resolved_os_process_call = any(code == "S101" for _, code in bounded_high_risk_calls)
-                rebound_to_high_risk_call = pattern_match and bool(bounded_high_risk_calls)
-                if not resolved_os_process_call and not rebound_to_high_risk_call:
+            if description == _OS_CODE_EXECUTION_DESCRIPTION:
+                resolved_os_process_call = any(code == "S101" for _, code in resolved_high_risk_calls)
+                if resolved_os_process_call:
+                    pattern_match = True
+                elif bounded_high_risk_calls is not None:
                     continue
-                pattern_match = True
             if pattern_match:  # Limit search size
                 findings.append(
                     create_jit_finding(

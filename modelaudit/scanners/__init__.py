@@ -13,6 +13,40 @@ from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanRes
 
 logger = logging.getLogger(__name__)
 
+_READ_FAILURE_AWARE_EXTENSION_SCANNERS = frozenset(
+    {
+        "cntk",
+        "coreml",
+        "lightgbm",
+        "manifest",
+        "metadata",
+        "numpy",
+        "paddle",
+        "pytorch_binary",
+        "r_serialized",
+        "safetensors",
+        "tensorrt",
+        "text",
+        "tf_metagraph",
+        "tf_savedmodel",
+        "zip",
+    }
+)
+_READ_FAILURE_AWARE_UNREADABLE_EXTENSION_OWNERS = {
+    "cntk": frozenset({".cmf", ".dnn"}),
+    "coreml": frozenset({".mlmodel"}),
+    "lightgbm": frozenset({".lgb", ".lightgbm"}),
+    "numpy": frozenset({".npy"}),
+    "paddle": frozenset({".pdiparams", ".pdmodel"}),
+    "pytorch_binary": frozenset({".bin"}),
+    "r_serialized": frozenset({".rda", ".rdata", ".rds"}),
+    "safetensors": frozenset({".safetensors"}),
+    "tensorrt": frozenset({".engine", ".plan", ".trt"}),
+    "tf_metagraph": frozenset({".meta"}),
+    "tf_savedmodel": frozenset({".pb"}),
+    "zip": frozenset({".npz", ".zip"}),
+}
+
 
 def _check_numpy_compatibility() -> tuple[bool, str]:
     """Check NumPy version compatibility and return status with message"""
@@ -254,15 +288,24 @@ class ScannerRegistry:
         if not candidate_extensions:
             candidate_extensions.append("")
 
+        try:
+            read_probe_failed = os.path.isfile(path) and not os.access(path, os.R_OK)
+        except OSError:
+            read_probe_failed = True
         is_zip_file = False
+        zip_probe_failed = False
         try:
             is_zip_file = os.path.isfile(path) and zipfile.is_zipfile(path)
         except OSError:
-            return None
+            # Continue only into scanners that explicitly translate unreadable
+            # owned inputs into an operationally incomplete outcome.
+            zip_probe_failed = True
 
         for candidate_extension in candidate_extensions:
             for scanner_id, scanner_info in sorted_scanners:
                 if scanner_selection is not None and not scanner_selection.allows(scanner_id):
+                    continue
+                if (read_probe_failed or zip_probe_failed) and scanner_id not in _READ_FAILURE_AWARE_EXTENSION_SCANNERS:
                     continue
                 extensions = scanner_info.get("extensions", [])
                 content_routed_extensions = scanner_info.get("content_routed_extensions", [])
@@ -270,7 +313,11 @@ class ScannerRegistry:
                     continue
 
                 scanner_class = self._load_scanner(scanner_id)
-                if scanner_class and scanner_class.can_handle(path):
+                unreadable_extension_owner = (
+                    read_probe_failed
+                    and candidate_extension in _READ_FAILURE_AWARE_UNREADABLE_EXTENSION_OWNERS.get(scanner_id, ())
+                )
+                if scanner_class and (scanner_class.can_handle(path) or unreadable_extension_owner):
                     if scanner_id != "llamafile" and (
                         scanner_selection is None or scanner_selection.allows("llamafile")
                     ):
@@ -288,6 +335,22 @@ class ScannerRegistry:
                             if torch7_class and torch7_class.can_handle(path):
                                 return torch7_class
                     return scanner_class
+
+        # Filename-owned scanners still need to retain ownership when an
+        # unreadable file prevents later content-routing fallback.
+        if read_probe_failed or zip_probe_failed:
+            for scanner_id, scanner_info in sorted_scanners:
+                if scanner_selection is not None and not scanner_selection.allows(scanner_id):
+                    continue
+                if scanner_id not in _READ_FAILURE_AWARE_EXTENSION_SCANNERS:
+                    continue
+                if not self._is_content_routed_filename(filename, scanner_info):
+                    continue
+
+                scanner_class = self._load_scanner(scanner_id)
+                if scanner_class and scanner_class.can_handle(path):
+                    return scanner_class
+            return None
 
         # Some ZIP-backed artifacts intentionally use pickle/checkpoint suffixes.
         # If stricter extension-specific scanners all decline, fall back to the

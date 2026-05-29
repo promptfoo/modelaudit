@@ -279,12 +279,82 @@ class TestJITScriptDetector:
 
         assert findings == []
 
+    def test_scan_model_ignores_string_literal_os_process_launch_with_unrelated_risk(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"import pickle\n\n"
+            b"def payload(data):\n"
+            b"    pickle.loads(data)\n"
+            b"    return \"os.posix_spawn('/bin/sh', ['sh'], {})\"\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
     @pytest.mark.parametrize(
         "source",
         [
-            b"def payload():\n    return subprocess.check_call(['id'])\n",
-            b"from subprocess import getoutput as launch\ndef payload():\n    return launch('id')\n",
-            b"def payload():\n    subprocess.run = len\n    return subprocess.run([])\n",
+            (
+                b"import os\n"
+                b"import subprocess\n\n"
+                b"def payload(args):\n"
+                b"    marker = os.posix_spawn\n"
+                b"    return subprocess.list2cmdline(args)\n"
+            ),
+            (
+                b"import os\n"
+                b"import subprocess\n\n"
+                b"def payload():\n"
+                b"    marker = os.posix_spawn\n"
+                b"    return subprocess.run(['echo', 'ok'], check=False)\n"
+            ),
+        ],
+    )
+    def test_scan_model_ignores_uninvoked_os_process_reference_with_unrelated_risk(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_embedded_snippet_alias_aware_os_process_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import os\n"
+            b"    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], dict())\n"
+            b"}"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_embedded_snippet_alias_aware_os_process_launch_before_binary_tail(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import os\n"
+            b"    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], dict())\n"
+            b"\x00\xffMODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
             b"async def payload():\n    return await asyncio.create_subprocess_shell('id')\n",
             b"async def payload():\n    return await asyncio.subprocess.create_subprocess_exec('id')\n",
             (
@@ -292,16 +362,18 @@ class TestJITScriptDetector:
                 b"async def payload():\n    return await launch('id')\n"
             ),
             (
-                b"async def payload():\n    asyncio.create_subprocess_shell = len\n"
+                b"async def payload():\n"
+                b"    asyncio.create_subprocess_shell = len\n"
                 b"    return asyncio.create_subprocess_shell([])\n"
             ),
             (
-                b"async def payload(data):\n    asyncio.create_subprocess_exec = pickle.loads\n"
+                b"async def payload(data):\n"
+                b"    asyncio.create_subprocess_exec = pickle.loads\n"
                 b"    return asyncio.create_subprocess_exec(data)\n"
             ),
         ],
     )
-    def test_scan_model_detects_subprocess_launch_source_conservatively(self, source: bytes) -> None:
+    def test_scan_model_detects_asyncio_subprocess_launch_source_conservatively(self, source: bytes) -> None:
         detector = JITScriptDetector()
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
@@ -310,19 +382,35 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
         )
 
-    @pytest.mark.parametrize(
-        "source",
-        [
-            b"def payload():\n    return \"subprocess.check_call(['id'])\"\n",
-            b"def payload():\n    return \"asyncio.create_subprocess_shell('id')\"\n",
-        ],
-    )
-    def test_scan_model_ignores_string_literal_subprocess_launch(self, source: bytes) -> None:
+    def test_scan_model_ignores_string_literal_asyncio_subprocess_launch_with_unrelated_risk(self) -> None:
         detector = JITScriptDetector()
+        source = (
+            b"import pickle\n\n"
+            b"def payload(data):\n"
+            b"    pickle.loads(data)\n"
+            b"    return \"asyncio.create_subprocess_shell('id')\"\n"
+        )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
-        assert findings == []
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_embedded_snippet_alias_aware_asyncio_subprocess_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    from asyncio import create_subprocess_shell as launch\n"
+            b"    return launch('id')\n"
+            b"}"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
 
     def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""

@@ -146,7 +146,7 @@ _MODEL_ARCHIVE_SIGNAL_BASENAMES: frozenset[str] = frozenset(
         "flax_model.msgpack",
     }
 )
-_MODEL_ARCHIVE_BINARY_SIGNAL_EXTENSIONS: frozenset[str] = frozenset({".bin"})
+_MODEL_ARCHIVE_BINARY_SIGNAL_EXTENSIONS: frozenset[str] = frozenset({".bin", ".jpg", ".jpeg", ".png", ".gif", ".bmp"})
 
 
 def _get_scannable_extensions() -> set[str]:
@@ -184,6 +184,7 @@ def _zip_member_has_scannable_binary_signal(archive: zipfile.ZipFile, member: zi
         from .detection import (
             PROTO0_1_MAX_PROBE_BYTES,
             _looks_like_binary_pickle_protocol,
+            _looks_like_coreml_model_proto_prefix,
             _looks_like_proto0_or_1_pickle,
         )
 
@@ -194,6 +195,9 @@ def _zip_member_has_scannable_binary_signal(archive: zipfile.ZipFile, member: zi
         return None
 
     if sample.startswith(_ZIP_LOCAL_FILE_SIGNATURES):
+        return True
+    coreml_status = _looks_like_coreml_model_proto_prefix(sample, sample_is_prefix=member.file_size > len(sample))
+    if coreml_status is True or coreml_status is None:
         return True
     if _looks_like_binary_pickle_protocol(sample[:4]):
         return True

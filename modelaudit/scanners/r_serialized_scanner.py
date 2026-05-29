@@ -1,4 +1,4 @@
-"""Scanner for R serialized model artifacts (.rds, .rda, .rdata)."""
+"""Scanner for R serialized model artifacts."""
 
 from __future__ import annotations
 
@@ -12,8 +12,13 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
+from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
+
+_DECODE_INCONCLUSIVE_REASON = "r_serialized_decode_incomplete"
+_READ_INCONCLUSIVE_REASON = "r_serialized_read_failed"
+_STRING_EXTRACTION_INCONCLUSIVE_REASON = "r_serialized_string_extraction_incomplete"
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -111,18 +116,24 @@ class RSerializedScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        if os.path.splitext(path)[1].lower() not in cls.supported_extensions:
-            return False
+        known_extension = os.path.splitext(path)[1].lower() in cls.supported_extensions
 
         try:
             with open(path, "rb") as file_obj:
                 header = file_obj.read(16)
         except OSError:
-            return False
+            # Preserve declared ownership so scan() can report unavailable
+            # coverage; readable suffix-only near matches are still rejected.
+            return True
 
         compression = cls._detect_compression(header)
         if compression is None:
-            return cls._looks_like_r_serialization(header)
+            if known_extension:
+                return cls._looks_like_r_serialization(header)
+            return cls._looks_like_renamed_r_serialization(header)
+
+        if not known_extension:
+            return False
 
         try:
             prefix = cls._read_decompressed_prefix(path, compression, cls._CAN_HANDLE_DECOMPRESSED_LIMIT)
@@ -131,6 +142,14 @@ class RSerializedScanner(BaseScanner):
             return True
 
         return cls._looks_like_r_serialization(prefix)
+
+    @classmethod
+    def _looks_like_renamed_r_serialization(cls, data: bytes) -> bool:
+        return any(
+            data.startswith(workspace_header + marker)
+            for workspace_header in cls._WORKSPACE_HEADERS
+            for marker in cls._SERIALIZATION_MARKERS
+        )
 
     @classmethod
     def _detect_compression(cls, header: bytes) -> str | None:
@@ -349,21 +368,52 @@ class RSerializedScanner(BaseScanner):
         truncated = False
         total_printable_bytes = 0
         longest_string = 0
+        current_parts: list[str] = []
+        current_offset = 0
+        previous_match_end: int | None = None
+
+        def append_current_run() -> bool:
+            nonlocal total_printable_bytes, longest_string
+            if not current_parts:
+                return True
+            text = "".join(current_parts).strip()
+            if not text:
+                return True
+            longest_string = max(longest_string, len(text))
+            if len(strings) >= self.max_extracted_strings:
+                return False
+            strings.append(_ExtractedString(text=text, offset=current_offset))
+            total_printable_bytes += len(text)
+            return True
+
+        def append_printable_tail(start: int, end: int) -> None:
+            if not current_parts or start >= end:
+                return
+            tail_end = start
+            while tail_end < end and 0x20 <= payload[tail_end] <= 0x7E:
+                tail_end += 1
+            if tail_end == start:
+                return
+            tail = payload[start:tail_end]
+            current_parts.append(tail.decode("utf-8", errors="ignore"))
 
         for match in self._PRINTABLE_RE.finditer(payload):
-            if len(strings) >= self.max_extracted_strings:
+            if previous_match_end != match.start():
+                if previous_match_end is not None:
+                    append_printable_tail(previous_match_end, match.start())
+                if not append_current_run():
+                    truncated = True
+                    break
+                current_parts = []
+                current_offset = match.start()
+
+            current_parts.append(match.group().decode("utf-8", errors="ignore"))
+            previous_match_end = match.end()
+        else:
+            if previous_match_end is not None:
+                append_printable_tail(previous_match_end, len(payload))
+            if not append_current_run():
                 truncated = True
-                break
-
-            text = match.group().decode("utf-8", errors="ignore").strip()
-            if not text:
-                continue
-
-            strings.append(_ExtractedString(text=text, offset=match.start()))
-            text_length = len(text)
-            total_printable_bytes += text_length
-            if text_length > longest_string:
-                longest_string = text_length
 
         return strings, truncated, total_printable_bytes, longest_string
 
@@ -561,12 +611,7 @@ class RSerializedScanner(BaseScanner):
         strings_truncated: bool,
     ) -> None:
         printable_ratio = total_printable_bytes / payload_size if payload_size > 0 else 0.0
-        looks_stuffed = (
-            strings_truncated
-            or string_count >= self.max_extracted_strings
-            or longest_string > 8_192
-            or (payload_size >= 1_000_000 and printable_ratio > 0.80)
-        )
+        looks_stuffed = longest_string > 8_192 or (payload_size >= 1_000_000 and printable_ratio > 0.80)
 
         if looks_stuffed:
             result.add_check(
@@ -606,6 +651,14 @@ class RSerializedScanner(BaseScanner):
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
+            if any(
+                check.name == "Path Readable" and check.status == CheckStatus.FAILED
+                for check in path_check_result.checks
+            ):
+                result = self._create_result()
+                self._mark_read_failure(result, path, PermissionError(f"Path is not readable: {path}"))
+                result.finish(success=False)
+                return result
             return path_check_result
 
         size_check = self._check_size_limit(path)
@@ -618,19 +671,19 @@ class RSerializedScanner(BaseScanner):
 
         try:
             payload, compression, truncated, decompressed_bytes = self._read_payload_for_analysis(path, file_size)
-        except (EOFError, OSError, ValueError, MemoryError, gzip.BadGzipFile, lzma.LZMAError) as exc:
-            result.add_check(
-                name="R Serialized Decompression",
-                passed=False,
-                message=f"Failed to safely read R serialized payload: {exc}",
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={"exception": str(exc), "exception_type": type(exc).__name__},
-                why=(
-                    "Malformed or unsafe compressed streams are treated as scan failures to avoid "
-                    "unsafe parsing behavior."
-                ),
-            )
+        except gzip.BadGzipFile as exc:
+            self._mark_decode_failure(result, path, exc)
+            result.finish(success=False)
+            return result
+        except OSError as exc:
+            if exc.errno is not None:
+                self._mark_read_failure(result, path, exc)
+            else:
+                self._mark_decode_failure(result, path, exc)
+            result.finish(success=False)
+            return result
+        except (EOFError, ValueError, MemoryError, lzma.LZMAError) as exc:
+            self._mark_decode_failure(result, path, exc)
             result.finish(success=False)
             return result
 
@@ -703,6 +756,27 @@ class RSerializedScanner(BaseScanner):
         result.metadata["extracted_string_count"] = len(extracted_strings)
         result.bytes_scanned = len(payload)
 
+        if strings_truncated:
+            mark_inconclusive_scan_result(result, _STRING_EXTRACTION_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="String Extraction Ceiling",
+                passed=False,
+                message=(
+                    f"Analysis reached configured extracted-string ceiling ({self.max_extracted_strings} strings)"
+                ),
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "max_extracted_strings": self.max_extracted_strings,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": _STRING_EXTRACTION_INCONCLUSIVE_REASON,
+                },
+                why=(
+                    "An extracted-string ceiling limits resource usage. Review with higher limits if deeper "
+                    "inspection is needed."
+                ),
+            )
+
         self._add_symbol_and_payload_checks(result, extracted_strings, path)
         self._add_payload_stuffing_check(
             result=result,
@@ -718,3 +792,44 @@ class RSerializedScanner(BaseScanner):
             success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
         )
         return result
+
+    @staticmethod
+    def _mark_read_failure(result: ScanResult, path: str, error: OSError) -> None:
+        """Record file-access coverage loss separately from malformed serialized data."""
+        mark_inconclusive_scan_result(result, _READ_INCONCLUSIVE_REASON)
+        mark_operational_scan_error(result, _READ_INCONCLUSIVE_REASON)
+        result.add_check(
+            name="R Serialized Read",
+            passed=False,
+            message=f"Unable to read R serialized payload for analysis: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": _READ_INCONCLUSIVE_REASON,
+            },
+            why="The artifact could not be read, so R serialized security analysis did not complete.",
+        )
+
+    @staticmethod
+    def _mark_decode_failure(result: ScanResult, path: str, error: Exception) -> None:
+        """Record bounded decode or decompression coverage loss."""
+        mark_inconclusive_scan_result(result, _DECODE_INCONCLUSIVE_REASON)
+        result.add_check(
+            name="R Serialized Decompression",
+            passed=False,
+            message=f"Failed to safely read R serialized payload: {error}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": _DECODE_INCONCLUSIVE_REASON,
+            },
+            why=(
+                "Malformed or unsafe compressed streams are treated as scan failures to avoid unsafe parsing behavior."
+            ),
+        )

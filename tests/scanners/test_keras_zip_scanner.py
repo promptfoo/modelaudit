@@ -78,6 +78,36 @@ def _assert_inconclusive_keras_zip_scan(model_path: Path, reason: str, expected_
     assert determine_exit_code(audit_result) == 2
 
 
+def _assert_inconclusive_keras_zip_scan_not_cached(model_path: Path, reason: str, cache_dir: Path) -> None:
+    reset_cache_manager()
+    try:
+        first_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for audit_result in (first_result, second_result):
+            metadata = audit_result.file_metadata[str(model_path)]
+            assert determine_exit_code(audit_result) == 2
+            assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            assert reason in metadata.get("scan_outcome_reasons")
+            assert not any(
+                issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in audit_result.issues
+            )
+
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def create_external_link_weights_h5(tmp_path: Path) -> Path:
     """Create a weights H5 file containing an ExternalLink to a local fixture."""
     if h5py is None:
@@ -157,6 +187,50 @@ class TestKerasZipScanner:
             check.name == "HDF5 External Weight Reference Version Check" and check.status == CheckStatus.PASSED
             for check in result.checks
         )
+
+    @pytest.mark.parametrize(
+        "keras_version",
+        ["3.12.1rc1", "3.12.1a0", "3.12.1.dev0", "3.13.2rc1", "3.13.2dev0"],
+    )
+    def test_embedded_hdf5_external_references_prerelease_fixes_are_vulnerable(
+        self, tmp_path: Path, keras_version: str
+    ) -> None:
+        """Prereleases of the fixed CVE-2026-1669 versions are still vulnerable."""
+        scanner = KerasZipScanner()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version=keras_version,
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["keras_version"] == keras_version
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+
+    @pytest.mark.parametrize(
+        "keras_version",
+        ["3.12.1", "3.12.1+cpu", "3.12.1+rc1", "3.13.2", "3.13.2.post1", "3.13.2+dev0"],
+    )
+    def test_embedded_hdf5_external_references_stable_fixed_versions_pass(
+        self, tmp_path: Path, keras_version: str
+    ) -> None:
+        """Stable fixed CVE-2026-1669 versions should not emit warning noise."""
+        scanner = KerasZipScanner()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version=keras_version,
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
     def test_benign_embedded_weights_do_not_emit_warning_noise(self, tmp_path: Path) -> None:
         """Benign embedded weights should not produce warning or critical noise."""
@@ -317,6 +391,148 @@ class TestKerasZipScanner:
         assert "keras_zip_config_missing" in result.metadata["scan_outcome_reasons"]
         assert any(
             check.name == "Keras ZIP Format Check" and check.status == CheckStatus.FAILED for check in result.checks
+        )
+
+    def test_read_failure_returns_inconclusive_exit2(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Unavailable Keras ZIP content is incomplete analysis, not a security finding."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            file_name="unavailable_content.keras",
+        )
+
+        def raise_os_error(
+            _self: KerasZipScanner,
+            _archive: zipfile.ZipFile,
+            _member_name: str,
+        ) -> None:
+            raise OSError("simulated Keras ZIP member read failure")
+
+        monkeypatch.setattr(KerasZipScanner, "_get_archive_member_info", raise_os_error)
+
+        _assert_inconclusive_keras_zip_scan(keras_path, "keras_zip_read_failed", "Keras ZIP File Read")
+        result = KerasZipScanner().scan(str(keras_path))
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+        _assert_inconclusive_keras_zip_scan_not_cached(
+            keras_path,
+            "keras_zip_read_failed",
+            tmp_path / "read-failure-cache",
+        )
+
+    @pytest.mark.parametrize(
+        ("failure_kind", "expected_reason"),
+        [("read", "keras_zip_read_failed"), ("scan", "keras_zip_scan_failed")],
+    )
+    def test_primary_failure_still_recurses_detectable_payload(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure_kind: str,
+        expected_reason: str,
+    ) -> None:
+        """Unavailable Keras analysis must not hide independently detectable ZIP payloads."""
+        keras_path = tmp_path / "unavailable_config_with_payload.keras"
+        with zipfile.ZipFile(keras_path, "w") as archive:
+            archive.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+        if failure_kind == "read":
+
+            def raise_os_error(
+                _self: KerasZipScanner,
+                _archive: zipfile.ZipFile,
+                _member_name: str,
+            ) -> None:
+                raise OSError("simulated Keras ZIP member read failure")
+
+            monkeypatch.setattr(KerasZipScanner, "_get_archive_member_info", raise_os_error)
+        else:
+
+            def raise_runtime_error(_self: KerasZipScanner, _model_config: dict[str, Any], _result: Any) -> None:
+                raise RuntimeError("simulated unexpected Keras ZIP scan failure")
+
+            monkeypatch.setattr(KerasZipScanner, "_scan_model_config", raise_runtime_error)
+
+        result = scan_model_directory_or_file(str(keras_path), cache_enabled=False)
+        metadata = result.file_metadata[str(keras_path)]
+
+        assert expected_reason in metadata["scan_outcome_reasons"]
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("zip_entry") == "payload.pkl"
+            and any(symbol in issue.message.lower() for symbol in ("os.system", "posix.system"))
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
+
+    @pytest.mark.parametrize(
+        ("failure_kind", "expected_reason"),
+        [("read", "keras_zip_read_failed"), ("scan", "keras_zip_scan_failed")],
+    )
+    def test_primary_failure_does_not_cache_temporary_recursive_member(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure_kind: str,
+        expected_reason: str,
+    ) -> None:
+        """Fallback recursion must not cache extracted members that are immediately deleted."""
+        keras_path = tmp_path / f"{failure_kind}_failure_with_benign_payload.keras"
+        with zipfile.ZipFile(keras_path, "w") as archive:
+            archive.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            archive.writestr("payload.pkl", b"\x80\x04N.")
+
+        if failure_kind == "read":
+
+            def raise_os_error(
+                _self: KerasZipScanner,
+                _archive: zipfile.ZipFile,
+                _member_name: str,
+            ) -> None:
+                raise OSError("simulated Keras ZIP member read failure")
+
+            monkeypatch.setattr(KerasZipScanner, "_get_archive_member_info", raise_os_error)
+        else:
+
+            def raise_runtime_error(_self: KerasZipScanner, _model_config: dict[str, Any], _result: Any) -> None:
+                raise RuntimeError("simulated unexpected Keras ZIP scan failure")
+
+            monkeypatch.setattr(KerasZipScanner, "_scan_model_config", raise_runtime_error)
+
+        _assert_inconclusive_keras_zip_scan_not_cached(
+            keras_path,
+            expected_reason,
+            tmp_path / f"{failure_kind}-recursive-member-cache",
+        )
+
+    def test_unexpected_scan_failure_returns_inconclusive_exit2_without_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Unexpected unavailable ZIP analysis is incomplete, not a critical model finding."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            file_name="unexpected_scan_failure.keras",
+        )
+
+        def fail_config_scan(_self: KerasZipScanner, _model_config: dict[str, Any], _result: Any) -> None:
+            raise RuntimeError("simulated unexpected Keras ZIP scan failure")
+
+        monkeypatch.setattr(KerasZipScanner, "_scan_model_config", fail_config_scan)
+
+        _assert_inconclusive_keras_zip_scan(keras_path, "keras_zip_scan_failed", "Keras ZIP File Scan")
+        result = KerasZipScanner().scan(str(keras_path))
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+        _assert_inconclusive_keras_zip_scan_not_cached(
+            keras_path,
+            "keras_zip_scan_failed",
+            tmp_path / "scan-failure-cache",
         )
 
     def test_malformed_config_json_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
@@ -785,8 +1001,13 @@ class TestKerasZipScanner:
         assert len(recursive_size_checks) == 1
         assert recursive_size_checks[0].status == CheckStatus.FAILED
         assert "exceeds maximum size of 1024 bytes" in recursive_size_checks[0].message
+        assert recursive_size_checks[0].severity == IssueSeverity.INFO
+        assert "zip_entry_scan_incomplete" in result.metadata["scan_outcome_reasons"]
         assert result.success is False
-        assert result.has_warnings is True
+        assert result.has_warnings is False
+
+        aggregate_result = scan_model_directory_or_file(str(keras_path), max_embedded_weights_bytes=1024)
+        assert determine_exit_code(aggregate_result) == 2
 
     def test_scan_fails_closed_on_oversized_config_json_and_recurses_payloads(self, tmp_path: Path) -> None:
         """Oversized config.json members should be bounded before parsing and still recurse other entries."""
