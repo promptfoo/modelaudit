@@ -1562,6 +1562,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self._class_scope_ids: set[int] = set()
         self._comprehension_outer_scope_indices: list[int] = []
         self._call_result_aliases: dict[int, _AliasValue] = {}
+        self._instance_binding_generations: dict[str, int] = {}
         self._non_module_scope_depth = 0
         self.risky_calls: set[str] = set()
 
@@ -1638,7 +1639,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         localized_names = set(resolved_names)
         if _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT in localized_names:
             localized_names.remove(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT)
-            localized_names.add(_localized_instance_root(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT, local_name))
+            localized_names.add(
+                self._localized_instance_root_for_binding(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT, local_name)
+            )
         webbrowser_controller_roots = _resolve_webbrowser_controller_factory_roots(
             value,
             self.alias_scopes,
@@ -1648,8 +1651,13 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for controller_root in webbrowser_controller_roots or frozenset():
             if controller_root in localized_names:
                 localized_names.remove(controller_root)
-                localized_names.add(_localized_instance_root(controller_root, local_name))
+                localized_names.add(self._localized_instance_root_for_binding(controller_root, local_name))
         return frozenset(localized_names)
+
+    def _localized_instance_root_for_binding(self, root_name: str, local_name: str) -> str:
+        generation = self._instance_binding_generations.get(local_name, 0) + 1
+        self._instance_binding_generations[local_name] = generation
+        return _localized_instance_root(root_name, f"{local_name}#{generation}")
 
     def _bind_module_namespace_key(self, key: str, resolved_names: _AliasValue) -> None:
         self._bind_name(f"{_MODULE_NAMESPACE_WRITE_PREFIX}{key}", resolved_names)
@@ -1704,8 +1712,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if isinstance(target, ast.Name):
             resolved_names = self._resolve_binding_value_names(value)
             localized_names = self._localize_instance_binding_value(target.id, value, resolved_names)
-            self._restore_reassigned_instance_member_defaults(target.id, localized_names)
             self._bind_name(target.id, localized_names)
+            self._restore_reassigned_instance_member_defaults(target.id, localized_names)
         elif isinstance(target, ast.Subscript):
             key = _resolve_static_string(target.slice)
             roots = _resolve_namespace_mapping_roots(
@@ -2251,6 +2259,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 return any(loader_index > index for loader_index in loader_base_indices)
         return False
 
+    @staticmethod
+    def _ctypes_loader_init_call_has_name_argument(call: ast.Call) -> bool:
+        return bool(call.args) or any(keyword.arg == "name" for keyword in call.keywords)
+
     def _initializer_call_preserves_ctypes_loader_init(
         self,
         call: ast.Call,
@@ -2269,9 +2281,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 base_identity_names,
                 loader_base_indices,
             )
+            and self._ctypes_loader_init_call_has_name_argument(call)
         ):
             return True
-        return self._is_ctypes_loader_init_alias(
+        return self._ctypes_loader_init_call_has_name_argument(call) and self._is_ctypes_loader_init_alias(
             self._resolve_initializer_reference_names(call.func, class_scope, initializer_scope)
         )
 
@@ -2470,6 +2483,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         )
         init_method = self._class_method(node, "__init__")
         if init_method is None:
+            class_init_alias = class_scope.get("__init__")
+            if self._is_ctypes_loader_init_alias(class_init_alias):
+                return True
             if not node.bases or self._class_new_may_skip_init(node):
                 return False
             return 0 in loader_base_indices

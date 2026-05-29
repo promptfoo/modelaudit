@@ -1037,6 +1037,28 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
+    @pytest.mark.parametrize(
+        "compound_payload",
+        [
+            b"if flag:\n    pass\nelse:\n    import runpy\n    runpy.run_path('payload.py')\n",
+            b"try:\n    pass\nexcept Exception:\n    import runpy\n    runpy.run_path('payload.py')\n",
+            b"try:\n    pass\nfinally:\n    import runpy\n    runpy.run_path('payload.py')\n",
+        ],
+    )
+    def test_scan_model_detects_clause_priority_import_after_default_cap(self, compound_payload: bytes) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        source = b"\x00\xff" + leading_blocks + compound_payload
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
     def test_scan_model_ignores_alias_comparisons_before_late_priority_attribute_load(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
@@ -1936,6 +1958,9 @@ class TestJITScriptDetector:
             b"        def __init__(self, name: str) -> None:\n"
             b"            super(Safe, self).__init__(name)\n"
             b"    ctypes.LibraryLoader(SkipSafeCDLL).superskiplib\n"
+            b"    class ClassBodyInitCDLL(Safe, ctypes.CDLL):\n"
+            b"        __init__ = ctypes.CDLL.__init__\n"
+            b"    ctypes.LibraryLoader(ClassBodyInitCDLL).classbodyinitlib\n"
             b"\x00MODEL-FRAMING"
         )
 
@@ -2076,6 +2101,11 @@ class TestJITScriptDetector:
             b"        pass\n"
             b"    ctypes.LibraryLoader(NoLoad).payload\n"
             b"    NoLoad('/missing')\n"
+            b"    class MissingNameSuperCDLL(ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            super().__init__()\n"
+            b"    ctypes.LibraryLoader(MissingNameSuperCDLL).payload\n"
+            b"    MissingNameSuperCDLL('/missing')\n"
             b"    class DeadDelegateCDLL(ctypes.CDLL):\n"
             b"        def __init__(self, name: str) -> None:\n"
             b"            if False:\n"
@@ -2127,9 +2157,11 @@ class TestJITScriptDetector:
             b"    builtins.__getattr__('eval')('1')\n"
             b"    other = browser\n"
             b"    browser.open = len\n"
+            b"    browser = webbrowser.get()\n"
             b"    other.open([])\n"
             b"    other_loader = loader\n"
             b"    loader.payload = len\n"
+            b"    loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
             b"    other_loader.payload([])\n"
             b"    ctypes.LibraryLoader = len\n"
             b"    ctypes.LibraryLoader(ctypes.CDLL).payload\n"
