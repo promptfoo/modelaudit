@@ -1448,6 +1448,7 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
         b"def payload():\n    return os.posix_spawnp('sh', ['sh'], {})\n",
         b"def payload():\n    return os.startfile('payload.exe')\n",
         b"def payload():\n    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], {})\n",
+        (b"\x00\xffimport os\ndef payload():\n    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], {})\n}"),
         b"def payload():\n    os.posix_spawn = len\n    return os.posix_spawn([])\n",
         b"def payload(data):\n    os.posix_spawn = pickle.loads\n    return os.posix_spawn(data)\n",
     ],
@@ -1469,6 +1470,42 @@ def test_pytorch_zip_scans_os_process_launch_source_conservatively(tmp_path: Pat
     assert any(
         check.location == f"{zip_path}:archive/data/payload.bin" and "OS command execution detected" in check.message
         for check in jit_failures
+    )
+
+
+def test_pytorch_zip_allows_framed_benign_dict_literal_os_accessor(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    payload = b"\x00\xffdef payload():\n    import os\n    return {'cwd': getattr(os, 'getcwd')()}\n}"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and "OS command execution detected" in check.message
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_ignores_binary_framed_string_literal_os_process_launch(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    payload = b"\x00\xffdef payload():\n    return \"os.posix_spawn('/bin/sh', ['sh'], {})\"\n}"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and "OS command execution detected" in check.message
+        for check in result.checks
     )
 
 
