@@ -125,6 +125,10 @@ def get_embedded_code_rule_code(code_type: str) -> str | None:
 
     if "dynamic module execution" in code_lower or "runpy" in code_lower:
         return _rule("S108")
+    elif "web browser launch" in code_lower or "webbrowser" in code_lower:
+        return _rule("S109")
+    elif "native library loading" in code_lower or "ctypes" in code_lower:
+        return _rule("S110")
     elif "torchscript" in code_lower or "jit" in code_lower:
         return _rule("S510")
     elif (

@@ -332,6 +332,8 @@ def _decode_utf8_with_byte_offsets(data: bytes) -> tuple[str, list[int]]:
 _SUBPROCESS_CODE_EXECUTION_DESCRIPTION = "Subprocess execution detected"
 _OS_CODE_EXECUTION_DESCRIPTION = "OS command execution detected"
 _RUNPY_CODE_EXECUTION_DESCRIPTION = "Dynamic module execution detected"
+_WEBBROWSER_LAUNCH_DESCRIPTION = "Web browser launch detected"
+_CTYPES_NATIVE_LOADING_DESCRIPTION = "Native library loading detected"
 CODE_EXECUTION_PATTERNS = [
     # Direct execution patterns
     (rb"exec\s*\(", "exec() call detected"),
@@ -346,6 +348,11 @@ CODE_EXECUTION_PATTERNS = [
     ),
     (rb"os\.(system|popen|exec\w*|spawn\w*|posix_spawnp?|startfile)", _OS_CODE_EXECUTION_DESCRIPTION),
     (rb"runpy\.(?:_run_module_as_main|run_module|run_path)", _RUNPY_CODE_EXECUTION_DESCRIPTION),
+    (rb"webbrowser\.(?:get|open|open_new|open_new_tab)", _WEBBROWSER_LAUNCH_DESCRIPTION),
+    (
+        rb"ctypes\.(?:CDLL|OleDLL|PyDLL|WinDLL|LibraryLoader|cdll|oledll|pydll|windll)",
+        _CTYPES_NATIVE_LOADING_DESCRIPTION,
+    ),
     # Network patterns
     (rb"socket\.(socket|create_connection)", "Socket creation detected"),
     (rb"urllib\.(request|urlopen)", "URL request detected"),
@@ -849,6 +856,18 @@ class JITScriptDetector:
             if description == _RUNPY_CODE_EXECUTION_DESCRIPTION:
                 resolved_runpy_call = any(code == "S108" for _, code in resolved_high_risk_calls)
                 if resolved_runpy_call:
+                    pattern_match = True
+                elif bounded_high_risk_calls is not None or raw_match_only_in_parsed_snippets:
+                    continue
+            if description == _WEBBROWSER_LAUNCH_DESCRIPTION:
+                resolved_webbrowser_call = any(code == "S109" for _, code in resolved_high_risk_calls)
+                if resolved_webbrowser_call:
+                    pattern_match = True
+                elif bounded_high_risk_calls is not None or raw_match_only_in_parsed_snippets:
+                    continue
+            if description == _CTYPES_NATIVE_LOADING_DESCRIPTION:
+                resolved_ctypes_call = any(code == "S110" for _, code in resolved_high_risk_calls)
+                if resolved_ctypes_call:
                     pattern_match = True
                 elif bounded_high_risk_calls is not None or raw_match_only_in_parsed_snippets:
                     continue

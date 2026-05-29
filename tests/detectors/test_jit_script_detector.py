@@ -745,6 +745,43 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
+    def test_scan_model_detects_binary_framed_webbrowser_and_ctypes_calls(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    import webbrowser\n"
+            b"    webbrowser.get().open.__call__('https://example.invalid')\n"
+            b"    ctypes.cdll['msvcrt'].printf(b'x')\n"
+            b"    ctypes.cdll.__getitem__('msvcrt')\n"
+            b"    loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    return loader.msvcrt.printf(b'x')\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        patterns = {finding.pattern for finding in findings if finding.type == "code_execution_pattern"}
+        assert "Web browser launch detected" in patterns
+        assert "Native library loading detected" in patterns
+
+    def test_scan_model_ignores_safe_webbrowser_get_overwrite(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import webbrowser\n"
+            b"    webbrowser.get = len\n"
+            b"    return webbrowser.get([]).open('https://example.invalid')\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
     def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""
         detector_normal = JITScriptDetector({"strict_mode": False})
