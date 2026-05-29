@@ -186,7 +186,11 @@ def _ctypes_loader_attribute_load_name(reference_name: str) -> str | None:
     library_name = parts[2]
     if loader_root not in _CTYPES_LIBRARY_LOADER_OBJECTS:
         return None
-    if library_name.startswith("_") or library_name in _CTYPES_LIBRARY_LOADER_NON_LOADING_ATTRIBUTES:
+    if (
+        library_name.startswith("_")
+        or library_name in _CTYPES_LIBRARY_LOADER_NON_LOADING_ATTRIBUTES
+        or library_name in {"LoadLibrary", "__getitem__"}
+    ):
         return None
     return f"{loader_root}.{library_name}"
 
@@ -218,6 +222,14 @@ def _has_static_overwritable_reference_prefix(name: str) -> bool:
     return any(
         name == reference_name or name.startswith(f"{reference_name}.")
         for reference_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
+    )
+
+
+def _is_overwritable_high_risk_reference(name: str) -> bool:
+    return (
+        name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
+        or _webbrowser_controller_launch_call_name(name) is not None
+        or _ctypes_loader_attribute_load_name(name) is not None
     )
 
 
@@ -1151,10 +1163,14 @@ def _resolve_ctypes_library_loader_instance_roots(
     loader_roots: set[str] = set()
     constructor_roots = resolved_func_names & _CTYPES_LIBRARY_LOADER_CONSTRUCTORS
     if constructor_roots:
-        if len(node.args) != 1 or node.keywords:
+        if len(node.args) == 1 and not node.keywords:
+            loader_type_node = node.args[0]
+        elif not node.args and len(node.keywords) == 1 and node.keywords[0].arg == "dlltype":
+            loader_type_node = node.keywords[0].value
+        else:
             return None
         resolved_loader_types = _resolve_static_reference_names(
-            node.args[0],
+            loader_type_node,
             alias_scopes,
             allow_module_locals_mapping=allow_module_locals_mapping,
             allow_local_namespace_mapping=allow_local_namespace_mapping,
@@ -1409,11 +1425,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             resolved_value = self._resolve_binding_value_names(value)
             syntactic_name = _resolve_call_name(target)
             for target_name in resolved_target_names:
-                if (
-                    target_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
-                    or _webbrowser_controller_launch_call_name(target_name) is not None
-                    or _ctypes_loader_attribute_load_name(target_name) is not None
-                ):
+                if _is_overwritable_high_risk_reference(target_name):
                     self._bind_name(target_name, resolved_value)
                     if syntactic_name is not None:
                         self._bind_name(syntactic_name, resolved_value)
@@ -1672,16 +1684,35 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     self.alias_scopes,
                     allow_module_locals_mapping=self._non_module_scope_depth == 0,
                 )
-            elif name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
-                base_value = current_scope.get(name, frozenset({name}))
             else:
-                base_value = current_scope.get(name, frozenset({name}) if implicit_builtins else None)
+                high_risk_default = self._conditionally_overwritable_high_risk_reference_default(name)
+                if high_risk_default is not None:
+                    base_value = current_scope.get(name, high_risk_default)
+                else:
+                    base_value = current_scope.get(name, frozenset({name}) if implicit_builtins else None)
             values = [scope.get(name, base_value) for scope in branch_scopes]
             concrete_aliases = frozenset(alias for value in values if isinstance(value, frozenset) for alias in value)
             if concrete_aliases:
                 current_scope[name] = concrete_aliases
             elif any(value is None for value in values):
                 current_scope[name] = None
+
+    def _conditionally_overwritable_high_risk_reference_default(self, name: str) -> _AliasValue:
+        if _is_overwritable_high_risk_reference(name):
+            return frozenset({name})
+        root, separator, suffix = name.partition(".")
+        if not separator:
+            return None
+        aliases = _resolve_aliases(root, self.alias_scopes)
+        if aliases is None:
+            return None
+        resolved_high_risk_names = frozenset(
+            resolved_name
+            for alias in aliases
+            for resolved_name in (f"{alias}.{suffix}",)
+            if _is_overwritable_high_risk_reference(resolved_name)
+        )
+        return resolved_high_risk_names or None
 
     def _visit_child_scope_without_class_locals(self, body: list[ast.stmt]) -> None:
         original_scopes = self.alias_scopes

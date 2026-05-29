@@ -589,6 +589,8 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "ctypes.cdll.__getitem__('msvcrt')\n"
         "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
         "loader.msvcrt.printf(b'x')\n"
+        "loader_kw = ctypes.LibraryLoader(dlltype=ctypes.CDLL)\n"
+        "loader_kw.payload.printf(b'x')\n"
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
@@ -608,6 +610,7 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.cdll.msvcrt" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.kernel32" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.msvcrt" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.payload" in checks_by_rule["S110"].details["reason"]
 
 
 def test_scan_zip_flags_webbrowser_controller_getattribute_launch(tmp_path: Path) -> None:
@@ -675,6 +678,33 @@ def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite
     assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
 
 
+def test_scan_zip_preserves_dynamic_member_risk_after_conditional_overwrite(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import webbrowser\n"
+        "browser = webbrowser.get()\n"
+        "if replace:\n"
+        "    browser.open = len\n"
+        "    ctypes.windll.kernel32 = len\n"
+        "browser.open('https://example.invalid')\n"
+        "ctypes.windll.kernel32\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
+    assert checks_by_rule["S110"].details["reason"] == "high-risk calls: ctypes.windll.kernel32"
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -720,6 +750,7 @@ def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite
         "import ctypes\nloader = ctypes.LibraryLoader(len)\nloader.payload.printf(b'x')\n",
         "import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL, object)\nloader.payload.printf(b'x')\n",
         "import ctypes\nloader = ctypes.LibraryLoader(loader=ctypes.CDLL)\nloader.payload.printf(b'x')\n",
+        "import ctypes\nload = ctypes.cdll.LoadLibrary\nname = load.__name__\n",
     ],
 )
 def test_scan_zip_ignores_benign_namespace_mapping_call(tmp_path: Path, source: str) -> None:

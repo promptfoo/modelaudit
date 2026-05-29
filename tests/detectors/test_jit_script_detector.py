@@ -663,7 +663,30 @@ class TestJITScriptDetector:
             b"    ctypes.cdll['msvcrt'].printf(b'x')\n"
             b"    ctypes.cdll.__getitem__('msvcrt')\n"
             b"    loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
-            b"    return loader.msvcrt.printf(b'x')\n"
+            b"    loader_kw = ctypes.LibraryLoader(dlltype=ctypes.CDLL)\n"
+            b"    loader.msvcrt.printf(b'x')\n"
+            b"    return loader_kw.payload.printf(b'x')\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        patterns = {finding.pattern for finding in findings if finding.type == "code_execution_pattern"}
+        assert "Web browser launch detected" in patterns
+        assert "Native library loading detected" in patterns
+
+    def test_scan_model_preserves_dynamic_member_risk_after_conditional_overwrite(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    import webbrowser\n"
+            b"    browser = webbrowser.get()\n"
+            b"    if replace:\n"
+            b"        browser.open = len\n"
+            b"        ctypes.windll.kernel32 = len\n"
+            b"    browser.open('https://example.invalid')\n"
+            b"    return ctypes.windll.kernel32\n"
             b"\x00MODEL-FRAMING"
         )
 
@@ -700,7 +723,9 @@ class TestJITScriptDetector:
             b"    browser.open = len\n"
             b"    browser.open([])\n"
             b"    loader = ctypes.LibraryLoader(len)\n"
-            b"    return loader.payload.printf(b'x')\n"
+            b"    loader.payload.printf(b'x')\n"
+            b"    load = ctypes.cdll.LoadLibrary\n"
+            b"    return load.__name__\n"
             b"\x00MODEL-FRAMING"
         )
 
