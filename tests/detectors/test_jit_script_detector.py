@@ -441,6 +441,17 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
         )
 
+    def test_scan_model_detects_binary_framed_long_tail_alias_aware_os_process_launch(self) -> None:
+        detector = JITScriptDetector()
+        tail = b"\n".join(b"tail" for _ in range(jit_script_module._MAX_SNIPPET_PARSE_TRIM_ATTEMPTS + 20))
+        source = b"\x00\xffdef payload():\n    import os as o\n    return getattr(o, 'system')('id')\n\x00" + tail
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
     def test_scan_model_preserves_raw_asyncio_match_in_unparsed_snippet_after_benign_parse(self) -> None:
         detector = JITScriptDetector()
         source = (
