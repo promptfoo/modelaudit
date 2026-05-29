@@ -52,7 +52,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - classify unavailable manifest cloud-reference inspection as inconclusive rather than reporting complete coverage
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
-- report incomplete R serialized coverage without treating extraction ceilings alone as suspicious payloads
 - route renamed R workspace artifacts only from complete workspace serialization headers without promoting text near-matches
 - report incomplete R serialized coverage without treating extraction ceilings alone as suspicious payloads, and preserve detection across printable-chunk boundaries
 - mark compressed-wrapper partial-analysis outcomes explicitly inconclusive

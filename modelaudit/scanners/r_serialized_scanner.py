@@ -370,7 +370,6 @@ class RSerializedScanner(BaseScanner):
         longest_string = 0
         current_parts: list[str] = []
         current_offset = 0
-        current_printable_bytes = 0
         previous_match_end: int | None = None
 
         def append_current_run() -> bool:
@@ -380,7 +379,7 @@ class RSerializedScanner(BaseScanner):
             text = "".join(current_parts).strip()
             if not text:
                 return True
-            longest_string = max(longest_string, current_printable_bytes)
+            longest_string = max(longest_string, len(text))
             if len(strings) >= self.max_extracted_strings:
                 return False
             strings.append(_ExtractedString(text=text, offset=current_offset))
@@ -388,7 +387,6 @@ class RSerializedScanner(BaseScanner):
             return True
 
         def append_printable_tail(start: int, end: int) -> None:
-            nonlocal current_printable_bytes
             if not current_parts or start >= end:
                 return
             tail_end = start
@@ -398,7 +396,6 @@ class RSerializedScanner(BaseScanner):
                 return
             tail = payload[start:tail_end]
             current_parts.append(tail.decode("utf-8", errors="ignore"))
-            current_printable_bytes += len(tail)
 
         for match in self._PRINTABLE_RE.finditer(payload):
             if previous_match_end != match.start():
@@ -409,10 +406,8 @@ class RSerializedScanner(BaseScanner):
                     break
                 current_parts = []
                 current_offset = match.start()
-                current_printable_bytes = 0
 
             current_parts.append(match.group().decode("utf-8", errors="ignore"))
-            current_printable_bytes += len(match.group())
             previous_match_end = match.end()
         else:
             if previous_match_end is not None:

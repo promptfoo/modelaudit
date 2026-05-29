@@ -360,6 +360,27 @@ def test_scan_whitespace_padding_does_not_report_payload_stuffing(tmp_path: Path
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
+def test_scan_short_text_with_trailing_padding_does_not_report_payload_stuffing(tmp_path: Path) -> None:
+    payload = "model" + (" " * 9_000)
+    direct_path = tmp_path / "padding.rds"
+    renamed_workspace = tmp_path / "padding.jpg"
+    _write_raw_r_serialized(direct_path, payload)
+    _write_raw_r_serialized(renamed_workspace, payload, workspace_header=True)
+
+    direct = RSerializedScanner().scan(str(direct_path))
+    renamed = core.scan_file(str(renamed_workspace), config={"cache_enabled": False})
+    aggregate = core.scan_model_directory_or_file(str(renamed_workspace), cache_enabled=False)
+
+    for result in (direct, renamed):
+        stuffing_checks = _check_by_name(result, "Serialized Payload Stuffing Detection")
+        assert len(stuffing_checks) == 1
+        assert stuffing_checks[0].status == CheckStatus.PASSED
+        assert stuffing_checks[0].details["longest_string"] == len("model")
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert renamed.scanner_name == "r_serialized"
+    assert core.determine_exit_code(aggregate) == 0
+
+
 def test_scan_detects_executable_call_split_at_printable_chunk_boundary(tmp_path: Path) -> None:
     path = tmp_path / "split-system-call.rds"
     _write_raw_r_serialized(path, "A" * 503 + "base::system('id')")
