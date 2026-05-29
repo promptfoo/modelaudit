@@ -1323,14 +1323,62 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
         )
 
+    def _bind_imported_static_members(self, local_name: str, import_name: str, *, preserve_existing: bool) -> None:
+        prefix = f"{import_name}."
+        for reference in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
+            if not reference.startswith(prefix):
+                continue
+            local_reference = f"{local_name}{reference.removeprefix(import_name)}"
+            if preserve_existing and local_reference in self.alias_scopes[-1]:
+                continue
+            self.alias_scopes[-1][local_reference] = _resolve_aliases(
+                reference,
+                self.alias_scopes,
+            )
+
+    def _shadow_member_bindings(self, scope_index: int, local_name: str) -> None:
+        if "." in local_name or local_name.startswith(_MODULE_NAMESPACE_WRITE_PREFIX):
+            return
+        prefix = f"{local_name}."
+        current_scope = self.alias_scopes[scope_index]
+        for scope in self.alias_scopes:
+            for name in tuple(scope):
+                if name.startswith(prefix):
+                    current_scope[name] = None
+
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
-        self.alias_scopes[-1][alias.asname or alias.name] = frozenset({import_name})
+        local_name = alias.asname or alias.name
+        previous_names, _found = _lookup_bound_alias(local_name, self.alias_scopes)
+        preserve_existing = isinstance(previous_names, frozenset) and import_name in previous_names
+        self._bind_name(local_name, frozenset({import_name}))
+        self._bind_imported_static_members(local_name, import_name, preserve_existing=preserve_existing)
 
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
+        previous_names, _found = _lookup_bound_alias(name, self.alias_scopes)
+        preserves_module_binding = (
+            isinstance(previous_names, frozenset)
+            and isinstance(resolved_names, frozenset)
+            and bool(previous_names & resolved_names)
+        )
+        if not preserves_module_binding:
+            self._shadow_member_bindings(-1, name)
         self.alias_scopes[-1][name] = resolved_names
 
     def _bind_name_in_scope(self, scope_index: int, name: str, resolved_names: _AliasValue) -> None:
+        previous_names, _found = _lookup_bound_alias(name, self.alias_scopes[: scope_index + 1])
+        preserves_module_binding = (
+            isinstance(previous_names, frozenset)
+            and isinstance(resolved_names, frozenset)
+            and bool(previous_names & resolved_names)
+        )
+        if not preserves_module_binding:
+            self._shadow_member_bindings(scope_index, name)
         self.alias_scopes[scope_index][name] = resolved_names
+
+    def _should_track_syntactic_static_reference(self, syntactic_name: str) -> bool:
+        root_name = syntactic_name.split(".", maxsplit=1)[0]
+        root_aliases, found = _lookup_bound_alias(root_name, self.alias_scopes)
+        return not found or root_aliases is not None
 
     def _bind_module_namespace_key(self, key: str, resolved_names: _AliasValue) -> None:
         self._bind_name(f"{_MODULE_NAMESPACE_WRITE_PREFIX}{key}", resolved_names)
@@ -1375,12 +1423,18 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                         continue
                     self._bind_name(f"{root}.{key}", resolved_value)
         elif isinstance(target, ast.Attribute):
+            syntactic_name = _resolve_call_name(target)
             resolved_target_names = self._resolve_reference_names(target)
-            if resolved_target_names is None:
+            target_names = set(resolved_target_names or frozenset())
+            if (
+                syntactic_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
+                and self._should_track_syntactic_static_reference(syntactic_name)
+            ):
+                target_names.add(syntactic_name)
+            if not target_names:
                 return
             resolved_value = self._resolve_binding_value_names(value)
-            syntactic_name = _resolve_call_name(target)
-            for target_name in resolved_target_names:
+            for target_name in target_names:
                 if target_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
                     self._bind_name(target_name, resolved_value)
                     if syntactic_name is not None:

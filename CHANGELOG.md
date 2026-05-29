@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect embedded Python `os.exec*`, `os.spawn*`, `os.posix_spawn*`, and `os.startfile` process-launch calls in archives and JIT-scanned content
 - detect embedded Python `asyncio.create_subprocess_*` calls and resolved JIT `subprocess` launch aliases
 - detect embedded Python `runpy.run_module`, `runpy.run_path`, and `runpy._run_module_as_main` dynamic-module execution calls
+- preserve embedded Python runpy, webbrowser, and ctypes findings across continued imports, late aliases, and bounded tail-window extraction gaps
 - detect embedded Python `webbrowser` launches and `ctypes` native-library loads in archives and JIT-scanned content
 - scan dangerous RKNN safe-key metadata values instead of suppressing the whole key-value string
 - scan ONNX external data initializers in nested graphs, functions, and training graphs
