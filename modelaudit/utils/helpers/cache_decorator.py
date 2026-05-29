@@ -58,12 +58,12 @@ def _is_read_failure_aware_scanner_path(file_path: str) -> bool:
 
 def _is_read_failure_aware_content_route(file_path: str) -> bool:
     try:
-        from ..file.detection import detect_file_format
+        from ..file.detection import _looks_like_renamed_r_serialized_header, read_magic_bytes
     except Exception:
         return False
 
     try:
-        return detect_file_format(file_path) == "r_serialized"
+        return _looks_like_renamed_r_serialized_header(read_magic_bytes(file_path, 16))
     except Exception:
         return False
 
