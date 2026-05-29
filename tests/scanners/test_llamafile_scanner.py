@@ -241,6 +241,37 @@ def test_llamafile_bounds_torch7_scan_attempts_after_marker_decoys(
     )
 
 
+def test_llamafile_reuses_torch7_offset_pass_while_skipping_marker_decoys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "many-torch7-marker-decoys-single-pass.llamafile"
+    valid_gguf = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    decoys = b"".join(b"T7\x00\x00" + (b"A" * 32) for _ in range(128))
+    torch7_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id')\n"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=valid_gguf + decoys + torch7_payload))
+
+    find_start_offsets: list[int] = []
+    original_find_offset = LlamafileScanner._find_embedded_torch7_offset
+
+    def counting_find_offset(path: Path, max_scan_bytes: int, *, start_offset: int = 0) -> int | None:
+        find_start_offsets.append(start_offset)
+        return original_find_offset(path, max_scan_bytes, start_offset=start_offset)
+
+    monkeypatch.setattr(LlamafileScanner, "_find_embedded_torch7_offset", staticmethod(counting_find_offset))
+
+    result = LlamafileScanner(config={"torch7_max_scan_bytes": 128}).scan(str(binary))
+
+    assert find_start_offsets == [binary.read_bytes().index(valid_gguf) + len(b"GGUF")]
+    assert result.metadata["embedded_torch7_offset"] == binary.read_bytes().index(torch7_payload)
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+
+
 def test_llamafile_continues_after_structural_torch7_decoy(tmp_path: Path) -> None:
     binary = tmp_path / "torch7-structural-decoy-then-payload.llamafile"
     valid_gguf = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)

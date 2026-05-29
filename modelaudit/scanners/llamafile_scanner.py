@@ -6,6 +6,7 @@ import ipaddress
 import os
 import re
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -30,6 +31,7 @@ LLAMAFILE_RUNTIME_PREVIEW_READ_REASON = "llamafile_runtime_preview_read_failed"
 LLAMAFILE_TORCH7_CARVE_FAILURE_REASON = "llamafile_torch7_payload_carve_failed"
 LLAMAFILE_TORCH7_ANALYSIS_INCOMPLETE_REASON = "llamafile_torch7_analysis_incomplete"
 TORCH7_SIGNATURE_WINDOW_BYTES = 4096
+TORCH7_BINARY_MARKER = b"T7\x00\x00"
 TORCH7_ACTIONABLE_SIGNAL_CHUNK_BYTES = 64 * 1024
 TORCH7_ACTIONABLE_SIGNAL_CARRY_BYTES = 128
 LLAMAFILE_TORCH7_MAX_CANDIDATE_SCANS = 16
@@ -507,13 +509,12 @@ class LlamafileScanner(BaseScanner):
         actionable_keys: set[tuple[str, str, str, str, str]] = set()
         best_actionable_rank = 0
         deferred_incomplete: tuple[ScanResult, int, int] | None = None
-        next_offset: int | None = offset
         non_actionable_scans = 0
         actionable_scans = 0
         best_scanned_signal_rank = 0
         actionable_scan_limited = False
 
-        while next_offset is not None:
+        for next_offset in self._iter_embedded_torch7_offsets(path, self.max_payload_scan_bytes, start_offset=offset):
             structurally_credible = self._embedded_torch7_candidate_is_structural(path, next_offset)
             has_binary_payload = self._embedded_torch7_candidate_has_binary_payload_bytes(path, next_offset)
             actionable_signal_rank = self._embedded_torch7_candidate_actionable_signal_rank(
@@ -521,18 +522,8 @@ class LlamafileScanner(BaseScanner):
             )
             has_actionable_signal = actionable_signal_rank > 0
             if not (structurally_credible or has_binary_payload or has_actionable_signal):
-                next_offset = self._find_embedded_torch7_offset(
-                    path,
-                    self.max_payload_scan_bytes,
-                    start_offset=next_offset + 1,
-                )
                 continue
             if non_actionable_scans >= self.max_torch7_candidate_scans and not has_actionable_signal:
-                next_offset = self._find_embedded_torch7_offset(
-                    path,
-                    self.max_payload_scan_bytes,
-                    start_offset=next_offset + 1,
-                )
                 continue
             if (
                 has_actionable_signal
@@ -540,11 +531,6 @@ class LlamafileScanner(BaseScanner):
                 and actionable_signal_rank <= best_scanned_signal_rank
             ):
                 actionable_scan_limited = True
-                next_offset = self._find_embedded_torch7_offset(
-                    path,
-                    self.max_payload_scan_bytes,
-                    start_offset=next_offset + 1,
-                )
                 continue
 
             if has_actionable_signal:
@@ -573,12 +559,6 @@ class LlamafileScanner(BaseScanner):
                     and self._torch7_result_is_incomplete(embedded_result)
                 ):
                     deferred_incomplete = (embedded_result, next_offset, carve_size)
-
-            next_offset = self._find_embedded_torch7_offset(
-                path,
-                self.max_payload_scan_bytes,
-                start_offset=next_offset + 1,
-            )
 
         if actionable_results:
             _, actionable_offset, carve_size, _ = actionable_results[0]
@@ -627,9 +607,9 @@ class LlamafileScanner(BaseScanner):
             return False
         if len(prefix) < 8 or not prefix.startswith(b"T7\x00\x00"):
             return False
-        next_marker = prefix.find(b"T7\x00\x00", len(b"T7\x00\x00"))
+        next_marker = prefix.find(TORCH7_BINARY_MARKER, len(TORCH7_BINARY_MARKER))
         window_end = 256 if next_marker == -1 else next_marker
-        window = prefix[len(b"T7\x00\x00") : window_end]
+        window = prefix[len(TORCH7_BINARY_MARKER) : window_end]
         return any(byte not in b"\t\n\r" + bytes(range(0x20, 0x7F)) for byte in window)
 
     @staticmethod
@@ -656,8 +636,8 @@ class LlamafileScanner(BaseScanner):
                         return best_rank
 
                     haystack = carry + chunk
-                    marker_search_start = len(carry) + (len(b"T7\x00\x00") if first_chunk else 0)
-                    next_marker = haystack.find(b"T7\x00\x00", marker_search_start)
+                    marker_search_start = len(carry) + (len(TORCH7_BINARY_MARKER) if first_chunk else 0)
+                    next_marker = haystack.find(TORCH7_BINARY_MARKER, marker_search_start)
                     signal_window = haystack if next_marker == -1 else haystack[:next_marker]
                     best_rank = max(best_rank, cls._torch7_actionable_signal_rank(signal_window))
                     if best_rank == 2:
@@ -857,17 +837,18 @@ class LlamafileScanner(BaseScanner):
 
         return gguf_offset, torch7_offset
 
-    @staticmethod
-    def _find_embedded_torch7_offset(path: Path, max_scan_bytes: int, *, start_offset: int = 0) -> int | None:
-        """Find a Torch7 payload signature after a known payload boundary."""
+    @classmethod
+    def _iter_embedded_torch7_offsets(cls, path: Path, max_scan_bytes: int, *, start_offset: int = 0) -> Iterator[int]:
+        """Yield Torch7 candidate offsets in one bounded pass."""
         file_size = path.stat().st_size
         search_limit = min(file_size, max_scan_bytes)
         if start_offset >= search_limit:
-            return None
+            return
 
         overlap = TORCH7_SIGNATURE_WINDOW_BYTES - 1
         scanned = start_offset
         carry = b""
+        last_yielded = start_offset - 1
 
         with path.open("rb") as handle:
             handle.seek(start_offset)
@@ -879,14 +860,40 @@ class LlamafileScanner(BaseScanner):
 
                 haystack = carry + chunk
                 window_offset = scanned - len(carry)
-                torch7_relative_index = find_torch7_candidate_offset(haystack)
-                if torch7_relative_index is not None:
-                    return window_offset + torch7_relative_index
+                relative_offsets: set[int] = set()
+
+                marker_search_offset = 0
+                while True:
+                    marker_offset = haystack.find(TORCH7_BINARY_MARKER, marker_search_offset)
+                    if marker_offset == -1:
+                        break
+                    absolute_offset = window_offset + marker_offset
+                    if absolute_offset > last_yielded and file_size - absolute_offset >= 8:
+                        relative_offsets.add(marker_offset)
+                    marker_search_offset = marker_offset + 1
+
+                for match in re.finditer(rb"4(?:\r\n|[\r\n])", haystack):
+                    absolute_offset = window_offset + match.start()
+                    if absolute_offset <= last_yielded:
+                        continue
+                    candidate_window = haystack[match.start() : match.start() + TORCH7_SIGNATURE_WINDOW_BYTES]
+                    if find_structural_torch7_offset(candidate_window) == 0:
+                        relative_offsets.add(match.start())
+
+                for relative_offset in sorted(relative_offsets):
+                    absolute_offset = window_offset + relative_offset
+                    if absolute_offset <= last_yielded:
+                        continue
+                    yield absolute_offset
+                    last_yielded = absolute_offset
 
                 carry = haystack[-overlap:] if overlap > 0 else b""
                 scanned += len(chunk)
 
-        return None
+    @classmethod
+    def _find_embedded_torch7_offset(cls, path: Path, max_scan_bytes: int, *, start_offset: int = 0) -> int | None:
+        """Find a Torch7 payload signature after a known payload boundary."""
+        return next(cls._iter_embedded_torch7_offsets(path, max_scan_bytes, start_offset=start_offset), None)
 
     @staticmethod
     def _find_casefolded_marker_offset(
