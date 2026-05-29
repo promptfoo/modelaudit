@@ -591,6 +591,8 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "loader.msvcrt.printf(b'x')\n"
         "loader_kw = ctypes.LibraryLoader(dlltype=ctypes.CDLL)\n"
         "loader_kw.payload.printf(b'x')\n"
+        "loader_alias = ctypes.LibraryLoader(ctypes.cdll._dlltype)\n"
+        "loader_alias.aliaslib.printf(b'x')\n"
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
@@ -611,6 +613,7 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.windll.kernel32" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.msvcrt" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.payload" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.aliaslib" in checks_by_rule["S110"].details["reason"]
 
 
 def test_scan_zip_flags_webbrowser_controller_getattribute_launch(tmp_path: Path) -> None:
@@ -751,6 +754,7 @@ def test_scan_zip_preserves_dynamic_member_risk_after_conditional_overwrite(tmp_
         "import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL, object)\nloader.payload.printf(b'x')\n",
         "import ctypes\nloader = ctypes.LibraryLoader(loader=ctypes.CDLL)\nloader.payload.printf(b'x')\n",
         "import ctypes\nload = ctypes.cdll.LoadLibrary\nname = load.__name__\n",
+        "import ctypes\nname = ctypes.LibraryLoader.payload\n",
     ],
 )
 def test_scan_zip_ignores_benign_namespace_mapping_call(tmp_path: Path, source: str) -> None:

@@ -101,15 +101,17 @@ _WEBBROWSER_LAUNCH_CALLS = frozenset(
 )
 _WEBBROWSER_CONTROLLER_FACTORIES = frozenset({"webbrowser.get"})
 _WEBBROWSER_CONTROLLER_LAUNCH_METHODS = frozenset({"open", "open_new", "open_new_tab"})
+_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT = "ctypes.LibraryLoader.__instance__"
 _CTYPES_LIBRARY_LOADER_OBJECTS = frozenset(
     {
-        "ctypes.LibraryLoader",
+        _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT,
         "ctypes.cdll",
         "ctypes.oledll",
         "ctypes.pydll",
         "ctypes.windll",
     }
 )
+_CTYPES_LIBRARY_LOADER_DISPLAY_ROOTS = {_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT: "ctypes.LibraryLoader"}
 _CTYPES_LIBRARY_LOADER_NON_LOADING_ATTRIBUTES = frozenset({"_FuncPtr", "_dlltype", "_handle", "_name"})
 _CTYPES_LIBRARY_LOADER_CONSTRUCTORS = frozenset({"ctypes.LibraryLoader"})
 _CTYPES_LIBRARY_LOADER_TYPES = frozenset(
@@ -119,6 +121,11 @@ _CTYPES_LIBRARY_LOADER_TYPES = frozenset(
         "ctypes.PyDLL",
         "ctypes.WinDLL",
     }
+)
+_CTYPES_LIBRARY_LOADER_TYPE_ALIASES = frozenset(
+    f"{loader_root}._dlltype"
+    for loader_root in _CTYPES_LIBRARY_LOADER_OBJECTS
+    if loader_root != _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT
 )
 _CTYPES_NATIVE_LIBRARY_LOADING_CALLS = frozenset(
     {
@@ -165,7 +172,10 @@ _HIGH_RISK_PYTHON_CALL_RULE_CODES: dict[str, str] = {
     **dict.fromkeys(_WEBBROWSER_LAUNCH_CALLS, "S109"),
     **dict.fromkeys(_CTYPES_NATIVE_LIBRARY_LOADING_CALLS, "S110"),
 }
-_HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES: tuple[tuple[str, str], ...] = (("subprocess.", "S103"),)
+_HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES: tuple[tuple[str, str], ...] = (
+    ("subprocess.", "S103"),
+    ("ctypes.LibraryLoader.", "S110"),
+)
 _FALLBACK_HIGH_RISK_RULE_CODE = "S104"
 _HIGH_RISK_PYTHON_CALLS = frozenset(_HIGH_RISK_PYTHON_CALL_RULE_CODES)
 
@@ -178,21 +188,24 @@ def _strip_dunder_call_suffixes(reference_name: str) -> str:
 
 def _ctypes_loader_attribute_load_name(reference_name: str) -> str | None:
     reference_name = _strip_dunder_call_suffixes(reference_name)
-    parts = reference_name.split(".")
-    if len(parts) < 3:
+    loader_root = None
+    suffix = ""
+    for candidate_root in sorted(_CTYPES_LIBRARY_LOADER_OBJECTS, key=len, reverse=True):
+        if reference_name.startswith(f"{candidate_root}."):
+            loader_root = candidate_root
+            suffix = reference_name[len(candidate_root) + 1 :]
+            break
+    if loader_root is None or not suffix:
         return None
-
-    loader_root = ".".join(parts[:2])
-    library_name = parts[2]
-    if loader_root not in _CTYPES_LIBRARY_LOADER_OBJECTS:
-        return None
+    library_name = suffix.split(".", maxsplit=1)[0]
     if (
         library_name.startswith("_")
         or library_name in _CTYPES_LIBRARY_LOADER_NON_LOADING_ATTRIBUTES
         or library_name in {"LoadLibrary", "__getitem__"}
     ):
         return None
-    return f"{loader_root}.{library_name}"
+    display_root = _CTYPES_LIBRARY_LOADER_DISPLAY_ROOTS.get(loader_root, loader_root)
+    return f"{display_root}.{library_name}"
 
 
 def _webbrowser_controller_launch_call_name(reference_name: str) -> str | None:
@@ -1175,9 +1188,11 @@ def _resolve_ctypes_library_loader_instance_roots(
             allow_module_locals_mapping=allow_module_locals_mapping,
             allow_local_namespace_mapping=allow_local_namespace_mapping,
         )
-        if resolved_loader_types is None or not (resolved_loader_types & _CTYPES_LIBRARY_LOADER_TYPES):
+        if resolved_loader_types is None or not (
+            resolved_loader_types & (_CTYPES_LIBRARY_LOADER_TYPES | _CTYPES_LIBRARY_LOADER_TYPE_ALIASES)
+        ):
             return None
-        loader_roots.update(constructor_roots)
+        loader_roots.add(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT)
     if len(node.args) == 1 and not node.keywords:
         library_name = _resolve_static_string(node.args[0])
         for resolved_func_name in resolved_func_names:
