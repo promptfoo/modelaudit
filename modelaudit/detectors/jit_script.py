@@ -10,7 +10,6 @@ Part of ModelAudit's critical security validation suite.
 """
 
 import ast
-import contextlib
 import re
 import textwrap
 from typing import TYPE_CHECKING, Any
@@ -90,10 +89,6 @@ DANGEROUS_BUILTINS = [
     "reload",
     "file",
 ]
-_BUILTIN_NAMESPACE_PREFIXES = ("__builtin__.", "__builtins__.", "builtins.")
-_JIT_DANGEROUS_BUILTIN_CALL_NAMES = frozenset(DANGEROUS_BUILTINS).union(
-    f"{prefix}{builtin}" for prefix in _BUILTIN_NAMESPACE_PREFIXES for builtin in DANGEROUS_BUILTINS
-)
 
 # Dangerous module imports
 DANGEROUS_IMPORTS = [
@@ -135,33 +130,30 @@ _DANGEROUS_IMPORT_PATTERNS = {
 }
 
 
-def _resolve_alias_aware_dangerous_builtins(tree: ast.AST) -> set[str]:
-    """Return dangerous builtins reached through shared bounded source resolution."""
-    from modelaudit.scanners.archive_member_security import statically_resolved_python_call_names_in_tree
-
-    dangerous_builtins: set[str] = set()
-    for call_name in statically_resolved_python_call_names_in_tree(tree, _JIT_DANGEROUS_BUILTIN_CALL_NAMES):
-        if call_name in DANGEROUS_BUILTINS:
-            dangerous_builtins.add(call_name)
-            continue
-        for prefix in _BUILTIN_NAMESPACE_PREFIXES:
-            if call_name.startswith(prefix):
-                builtin_name = call_name.removeprefix(prefix)
-                if builtin_name in DANGEROUS_BUILTINS:
-                    dangerous_builtins.add(builtin_name)
-                break
-    return dangerous_builtins
-
-
-def _resolve_alias_aware_process_calls(tree: ast.AST) -> tuple[set[str], set[str]]:
-    """Return OS and subprocess process launches reached through static resolution."""
+def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
+    """Return high-risk calls reached through shared static resolution."""
     from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_tree
 
-    calls = high_risk_python_calls_in_tree(tree)
-    return (
-        {call.name for call in calls if call.rule_code == "S101"},
-        {call.name for call in calls if call.rule_code == "S103"},
-    )
+    return {(call.name, call.rule_code) for call in high_risk_python_calls_in_tree(tree)}
+
+
+def _parse_embedded_python_snippet(code_str: str) -> ast.AST | None:
+    """Parse an extracted Python snippet, trimming trailing binary framing when needed."""
+    try:
+        return ast.parse(code_str)
+    except (SyntaxError, ValueError):
+        pass
+
+    lines = code_str.splitlines()
+    for end in range(len(lines) - 1, 0, -1):
+        candidate = "\n".join(lines[:end])
+        if candidate.strip() == "":
+            continue
+        try:
+            return ast.parse(f"{candidate}\n")
+        except (SyntaxError, ValueError):
+            continue
+    return None
 
 
 # Patterns that indicate code execution attempts
@@ -175,10 +167,10 @@ CODE_EXECUTION_PATTERNS = [
     (rb"__import__\s*\(", "__import__() call detected"),
     # Subprocess patterns
     (
-        rb"subprocess\.(call|run|Popen|check_call|check_output|getoutput|getstatusoutput)",
+        rb"(?:subprocess\.(?:call|run|Popen|check_call|check_output|getoutput|getstatusoutput)"
+        rb"|asyncio\.(?:subprocess\.)?create_subprocess_(?:exec|shell))",
         _SUBPROCESS_CODE_EXECUTION_DESCRIPTION,
     ),
-    (rb"asyncio\.create_subprocess_(?:exec|shell)", _SUBPROCESS_CODE_EXECUTION_DESCRIPTION),
     (rb"os\.(system|popen|exec\w*|spawn\w*|posix_spawnp?|startfile)", _OS_CODE_EXECUTION_DESCRIPTION),
     # Network patterns
     (rb"socket\.(socket|create_connection)", "Socket creation detected"),
@@ -191,13 +183,6 @@ CODE_EXECUTION_PATTERNS = [
     (rb"lambda\s+.*:\s*exec", "Lambda with exec detected"),
     (rb"type\s*\(\s*['\"].*['\"],.*exec", "Dynamic type creation with exec"),
 ]
-_BUILTIN_CODE_EXECUTION_PATTERN_NAMES = {
-    "exec() call detected": "exec",
-    "eval() call detected": "eval",
-    "compile() call detected": "compile",
-    "__import__() call detected": "__import__",
-    "File write operation detected": "open",
-}
 
 
 class JITScriptDetector:
@@ -241,10 +226,7 @@ class JITScriptDetector:
     @staticmethod
     def _ast_contains_dangerous_python(tree: ast.AST) -> bool:
         """Return whether parsed Python contains modeled dangerous operations."""
-        if _resolve_alias_aware_dangerous_builtins(tree):
-            return True
-        os_process_calls, subprocess_calls = _resolve_alias_aware_process_calls(tree)
-        if os_process_calls or subprocess_calls:
+        if _resolve_alias_aware_high_risk_calls(tree):
             return True
 
         def is_dangerous_import(module_name: str) -> bool:
@@ -269,6 +251,9 @@ class JITScriptDetector:
                 if node.module and is_dangerous_import(node.module):
                     return True
             elif isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id in DANGEROUS_BUILTINS:
+                    return True
+
                 operation = dotted_name(node.func)
                 if operation is None:
                     continue
@@ -281,6 +266,10 @@ class JITScriptDetector:
                     "requests.post",
                     "requests.put",
                     "requests.delete",
+                    "subprocess.call",
+                    "subprocess.run",
+                    "subprocess.Popen",
+                    "subprocess.check_output",
                 }:
                     return True
         return False
@@ -565,22 +554,19 @@ class JITScriptDetector:
         bounded = data if include_full_source else data[:1000000]
         python_code_pattern = rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+"
         matches = [bounded] if include_full_source else re.findall(python_code_pattern, bounded)
-        bounded_dangerous_builtins: set[str] | None = None
-        bounded_os_process_calls: set[str] | None = None
-        bounded_subprocess_calls: set[str] | None = None
+        bounded_high_risk_calls: set[tuple[str, str]] | None = None
+        snippet_high_risk_calls: set[tuple[str, str]] = set()
         try:
             bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
-            bounded_dangerous_builtins = _resolve_alias_aware_dangerous_builtins(bounded_tree)
-            bounded_os_process_calls, bounded_subprocess_calls = _resolve_alias_aware_process_calls(bounded_tree)
+            bounded_high_risk_calls = _resolve_alias_aware_high_risk_calls(bounded_tree)
         except (SyntaxError, UnicodeDecodeError, ValueError):
-            pass
+            # Binary model blobs commonly contain non-Python framing bytes; keep
+            # raw pattern detection active and fall back to extracted snippets.
+            bounded_high_risk_calls = None
 
         for match in matches[:10]:  # Analyze first 10 code snippets
             try:
-                code_str = textwrap.dedent(match.decode("utf-8", errors="ignore"))
-                tree: ast.AST | None = None
-                with contextlib.suppress(SyntaxError):
-                    tree = ast.parse(code_str)
+                code_str = match.decode("utf-8", errors="ignore")
 
                 # Check for dangerous imports
                 for dangerous_import in DANGEROUS_IMPORTS:
@@ -603,31 +589,29 @@ class JITScriptDetector:
                         )
 
                 # Check for dangerous builtins
-                dangerous_builtins = (
-                    _resolve_alias_aware_dangerous_builtins(tree)
-                    if tree is not None
-                    else {builtin for builtin in DANGEROUS_BUILTINS if builtin in code_str}
-                )
-                for builtin in sorted(dangerous_builtins):
-                    findings.append(
-                        create_jit_finding(
-                            message=f"Dangerous builtin '{builtin}' used in embedded code",
-                            severity="CRITICAL",
-                            context=context,
-                            pattern=None,
-                            recommendation=f"Remove {builtin} usage - it can execute arbitrary code",
-                            confidence=0.9,
-                            framework=framework,
-                            code_snippet=code_str[:200],
-                            type="dangerous_builtin",
-                            operation=None,
-                            builtin=builtin,
-                            import_=None,
+                for builtin in DANGEROUS_BUILTINS:
+                    if builtin in code_str:
+                        findings.append(
+                            create_jit_finding(
+                                message=f"Dangerous builtin '{builtin}' used in embedded code",
+                                severity="CRITICAL",
+                                context=context,
+                                pattern=None,
+                                recommendation=f"Remove {builtin} usage - it can execute arbitrary code",
+                                confidence=0.9,
+                                framework=framework,
+                                code_snippet=code_str[:200],
+                                type="dangerous_builtin",
+                                operation=None,
+                                builtin=builtin,
+                                import_=None,
+                            )
                         )
-                    )
 
-                # Try to parse as AST for deeper analysis
+                # Try to parse as AST for deeper analysis.
+                tree = _parse_embedded_python_snippet(code_str)
                 if tree is not None:
+                    snippet_high_risk_calls.update(_resolve_alias_aware_high_risk_calls(tree))
                     ast_findings = self._analyze_ast(tree, framework, context)
                     findings.extend(ast_findings)
 
@@ -636,27 +620,22 @@ class JITScriptDetector:
                 continue
 
         # Check for common code execution patterns in binary
+        resolved_high_risk_calls = (bounded_high_risk_calls or set()) | snippet_high_risk_calls
         for pattern, description in CODE_EXECUTION_PATTERNS:
-            builtin_name = _BUILTIN_CODE_EXECUTION_PATTERN_NAMES.get(description)
-            if (
-                builtin_name is not None
-                and bounded_dangerous_builtins is not None
-                and builtin_name not in bounded_dangerous_builtins
-            ):
-                continue
-            if (
-                description == _SUBPROCESS_CODE_EXECUTION_DESCRIPTION
-                and bounded_subprocess_calls is not None
-                and not bounded_subprocess_calls
-            ):
-                continue
-            if (
-                description == _OS_CODE_EXECUTION_DESCRIPTION
-                and bounded_os_process_calls is not None
-                and not bounded_os_process_calls
-            ):
-                continue
-            if re.search(pattern, bounded):  # Limit search size
+            pattern_match = re.search(pattern, bounded) is not None
+            if description == _SUBPROCESS_CODE_EXECUTION_DESCRIPTION:
+                resolved_subprocess_call = any(code == "S103" for _, code in resolved_high_risk_calls)
+                if resolved_subprocess_call:
+                    pattern_match = True
+                elif bounded_high_risk_calls is not None:
+                    continue
+            if description == _OS_CODE_EXECUTION_DESCRIPTION:
+                resolved_os_process_call = any(code == "S101" for _, code in resolved_high_risk_calls)
+                if resolved_os_process_call:
+                    pattern_match = True
+                elif bounded_high_risk_calls is not None:
+                    continue
+            if pattern_match:  # Limit search size
                 findings.append(
                     create_jit_finding(
                         message=description,
@@ -737,34 +716,29 @@ class JITScriptDetector:
                 self.generic_visit(node)
 
             def visit_Call(self, node: ast.Call) -> None:
+                # Check for dangerous function calls
+                if isinstance(node.func, ast.Name) and node.func.id in DANGEROUS_BUILTINS:
+                    self.findings.append(
+                        create_jit_finding(
+                            message=f"AST analysis: Dangerous function call '{node.func.id}'",
+                            severity="CRITICAL",
+                            context=context,
+                            pattern=None,
+                            recommendation="Remove dangerous function calls to prevent code execution",
+                            confidence=0.9,
+                            framework=framework,
+                            code_snippet=None,
+                            type="ast_dangerous_call",
+                            operation=None,
+                            builtin=node.func.id,
+                            import_=None,
+                        )
+                    )
                 self.generic_visit(node)
 
         visitor = DangerousNodeVisitor()
         visitor.visit(tree)
         findings.extend(visitor.findings)
-
-        reported_builtins = {
-            finding.builtin
-            for finding in findings
-            if finding.type == "ast_dangerous_call" and finding.builtin is not None
-        }
-        for dangerous_builtin in sorted(_resolve_alias_aware_dangerous_builtins(tree) - reported_builtins):
-            findings.append(
-                create_jit_finding(
-                    message=f"AST analysis: Dangerous function call '{dangerous_builtin}'",
-                    severity="CRITICAL",
-                    context=context,
-                    pattern=None,
-                    recommendation="Remove dangerous function calls to prevent code execution",
-                    confidence=0.9,
-                    framework=framework,
-                    code_snippet=None,
-                    type="ast_dangerous_call",
-                    operation=None,
-                    builtin=dangerous_builtin,
-                    import_=None,
-                )
-            )
 
         return findings
 

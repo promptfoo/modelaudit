@@ -9,11 +9,12 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from modelaudit.config.explanations import get_tf_op_explanation
+from modelaudit.core_results import mark_operational_scan_error
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
+from modelaudit.scanner_results import mark_inconclusive_scan_result
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 
-from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 # Discovery assumptions for `.meta` support:
 # 1) TensorFlow MetaGraph artifacts are protobuf-encoded `MetaGraphDef` payloads
@@ -35,7 +36,6 @@ _MAX_FUNCTION_NODES = 100_000
 _MAX_ATTR_VALUE_BYTES = 32 * 1024
 _MAX_COLLECTION_VALUE_BYTES = 256 * 1024
 _MAX_SIGNAL_EXAMPLES = 8
-METAGRAPH_PARSE_INCONCLUSIVE_REASON = "metagraph_protobuf_parse_failed"
 
 # Align dangerous operation severity with SavedModel scanner behavior.
 # Save/Restore ops are common in benign checkpoints and are not direct
@@ -92,14 +92,6 @@ def _read_bounded(path: str, max_bytes: int) -> tuple[bytes, bool]:
 
 
 def _parse_metagraph(data: bytes) -> Any:
-    metagraph, parse_error = _parse_metagraph_preserving_partial(data)
-    if parse_error is not None:
-        raise parse_error
-    return metagraph
-
-
-def _parse_metagraph_preserving_partial(data: bytes) -> tuple[Any, Exception | None]:
-    """Return any decoded MetaGraph fields together with a trailing parse error."""
     # Import vendored protos module (sets up sys.path for tensorflow.* imports)
     # Order matters: modelaudit.protos must be imported first to set up sys.path
     import modelaudit.protos  # noqa: F401, I001
@@ -107,11 +99,8 @@ def _parse_metagraph_preserving_partial(data: bytes) -> tuple[Any, Exception | N
     from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
 
     metagraph = MetaGraphDef()
-    try:
-        metagraph.ParseFromString(data)
-    except Exception as exc:
-        return metagraph, exc
-    return metagraph, None
+    metagraph.ParseFromString(data)
+    return metagraph
 
 
 @dataclass(frozen=True)
@@ -146,7 +135,7 @@ def _collect_structure(metagraph: Any) -> _MetaGraphStructure:
     function_node_count = sum(len(function.node_def) for function in metagraph.graph_def.library.function)
     collection_count = len(metagraph.collection_def)
 
-    if not has_graph:
+    if not has_graph and collection_count == 0:
         return _MetaGraphStructure(
             valid=False,
             reason="missing_graph_def",
@@ -265,26 +254,59 @@ class TensorFlowMetaGraphScanner(BaseScanner):
         if not has_tensorflow_protobuf_stubs():
             return False
 
-        file_size = os.path.getsize(path)
-        if file_size < _MIN_PARSE_BYTES:
-            return False
-        if file_size > _MAX_PARSE_BYTES:
-            return True
-
         try:
+            file_size = os.path.getsize(path)
+            if file_size < _MIN_PARSE_BYTES:
+                return False
+            if file_size > _MAX_PARSE_BYTES:
+                return True
+
             content, truncated = _read_bounded(path, _MAX_PARSE_BYTES)
             if truncated:
                 return False
             metagraph = _parse_metagraph(content)
+        except OSError:
+            return True
         except Exception:
             return False
 
         structure = _collect_structure(metagraph)
         return structure.valid
 
+    @staticmethod
+    def _is_unreadable_path_result(result: ScanResult) -> bool:
+        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    @staticmethod
+    def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
+        mark_inconclusive_scan_result(result, "metagraph_read_failed")
+        mark_operational_scan_error(result, "metagraph_read_failed")
+        result.add_check(
+            name="MetaGraph File Read",
+            passed=False,
+            message=f"Unable to read .meta file: {error}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "metagraph_read_failed",
+                "operational_error_reason": "metagraph_read_failed",
+            },
+        )
+        result.finish(success=False)
+        return result
+
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
+            if self._is_unreadable_path_result(path_check_result):
+                return self._finish_read_failure(
+                    self._create_result(),
+                    path,
+                    PermissionError(f"Path is not readable: {path}"),
+                )
             return path_check_result
 
         size_check = self._check_size_limit(path)
@@ -313,16 +335,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
         try:
             content, truncated = _read_bounded(path, _MAX_PARSE_BYTES)
         except OSError as e:
-            result.add_check(
-                name="MetaGraph File Read",
-                passed=False,
-                message=f"Unable to read .meta file: {e}",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
-            )
-            result.finish(success=False)
-            return result
+            return self._finish_read_failure(result, path, e)
 
         result.bytes_scanned = len(content)
         result.metadata["scan_truncated"] = truncated
@@ -341,22 +354,19 @@ class TensorFlowMetaGraphScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        metagraph, parse_error = _parse_metagraph_preserving_partial(content)
-        if parse_error is not None:
-            mark_inconclusive_scan_result(result, METAGRAPH_PARSE_INCONCLUSIVE_REASON)
+        try:
+            metagraph = _parse_metagraph(content)
+        except Exception as e:
             result.add_check(
                 name="MetaGraph Protobuf Parsing",
                 passed=False,
-                message=f"Invalid or corrupt TensorFlow MetaGraph protobuf: {parse_error}",
-                severity=IssueSeverity.INFO,
+                message=f"Invalid or corrupt TensorFlow MetaGraph protobuf: {e}",
+                severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={
-                    "exception": str(parse_error),
-                    "exception_type": type(parse_error).__name__,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": METAGRAPH_PARSE_INCONCLUSIVE_REASON,
-                },
+                details={"exception": str(e), "exception_type": type(e).__name__},
             )
+            result.finish(success=False)
+            return result
 
         structure = _collect_structure(metagraph)
         result.metadata["graph_node_count"] = structure.graph_node_count
@@ -532,7 +542,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                         )
 
                     if any(hint in key_lower for hint in _COLLECTION_EXEC_HINTS):
-                        decoded = value[:_MAX_ATTR_VALUE_BYTES].decode("utf-8", errors="ignore")
+                        decoded = value[:_MAX_COLLECTION_VALUE_BYTES].decode("utf-8", errors="ignore")
                         if _COMMAND_RE.search(decoded) and _NETWORK_RE.search(decoded):
                             result.add_check(
                                 name="MetaGraph Collection Executable Pattern",
@@ -574,7 +584,5 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                 },
             )
 
-        result.finish(
-            success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
-        )
+        result.finish(success=not result.has_errors)
         return result

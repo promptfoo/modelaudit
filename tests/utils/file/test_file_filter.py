@@ -3,26 +3,47 @@
 import importlib
 import json
 import pickle
+import struct
 import zipfile
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file import filtering
-from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT, detect_file_format_for_skip_filter
+from modelaudit.utils.file.detection import (
+    EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+    FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+    LLAMAFILE_ROUTE_SCAN_BYTES,
+    LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+    PROTOBUF_MODEL_CANDIDATE_FORMAT,
+    SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
+    TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+    detect_file_format_for_skip_filter,
+)
 from modelaudit.utils.file.filtering import (
     _ZIP_MEMBER_SNIFF_LIMIT,
     should_skip_file,
 )
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers.file_creators import (
+    create_mock_mxnet_symbol,
     create_mock_onnx,
     create_v7_tar_archive,
     prefix_mock_onnx_with_unknown_field,
 )
 
 
+def _require_tf_protos() -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+
 def _build_tf_metagraph_bytes() -> bytes:
+    _require_tf_protos()
     import modelaudit.protos  # noqa: F401
 
     meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
@@ -34,6 +55,7 @@ def _build_tf_metagraph_bytes() -> bytes:
 
 
 def _build_tf_savedmodel_bytes() -> bytes:
+    _require_tf_protos()
     import modelaudit.protos  # noqa: F401
 
     saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
@@ -44,6 +66,19 @@ def _build_tf_savedmodel_bytes() -> bytes:
     node.name = "const_node"
     node.op = "Const"
     return cast(bytes, saved_model.SerializeToString())
+
+
+def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
+    header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.write(b"{")
+        handle.truncate(8 + header_len + 1)
+
+
+def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
+    field = b"z " + (b"x" * 32)
+    return field * ((min_bytes // len(field)) + 1)
 
 
 def _build_lightgbm_text() -> str:
@@ -61,6 +96,12 @@ def _build_lightgbm_text() -> str:
             "leaf_value=0.1 0.2",
         ]
     )
+
+
+def _write_cntkv2(path: Path, include_structure: bool = True) -> None:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    structure = b" CompositeFunction primitive_functions " if include_structure else b""
+    path.write_bytes(prefix + structure + b" inputs outputs ")
 
 
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
@@ -257,14 +298,145 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_legacy_tar))
         assert should_skip_file(str(real_image))
 
+    def test_disguised_jax_json_checkpoint_bypasses_skip_without_routing_ajax_near_match(self, tmp_path: Path) -> None:
+        checkpoint_path = tmp_path / "checkpoint.jpg"
+        near_match_path = tmp_path / "ajax.jpg"
+        checkpoint_path.write_text(
+            (" " * 1024) + json.dumps({"framework": "jax", "orbax_version": "0.1.0"}),
+            encoding="utf-8",
+        )
+        near_match_path.write_text(json.dumps({"framework": "ajax", "format": "checkpoint"}), encoding="utf-8")
+
+        assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+        assert not should_skip_file(str(checkpoint_path))
+        assert detect_file_format_for_skip_filter(str(near_match_path)) == "unknown"
+        assert should_skip_file(str(near_match_path))
+
+    def test_oversized_disguised_jax_json_checkpoint_bypasses_skip_after_late_identity(self, tmp_path: Path) -> None:
+        checkpoint_path = tmp_path / "large-checkpoint.jpg"
+        near_match_path = tmp_path / "large-ajax.jpg"
+        padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
+        checkpoint_path.write_text(json.dumps({"padding": padding, "framework": "jax"}), encoding="utf-8")
+        near_match_path.write_text(json.dumps({"padding": padding, "framework": "ajax"}), encoding="utf-8")
+
+        assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+        assert not should_skip_file(str(checkpoint_path))
+        assert detect_file_format_for_skip_filter(str(near_match_path)) == "unknown"
+        assert should_skip_file(str(near_match_path))
+
+    def test_large_disguised_flax_checkpoint_bypasses_skip_without_promoting_generic_msgpack_map(
+        self, tmp_path: Path
+    ) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_checkpoint = tmp_path / "checkpoint.jpg"
+        generic_map = tmp_path / "metadata.jpg"
+        large_metadata = "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+        disguised_checkpoint.write_bytes(
+            msgpack.packb({"metadata": large_metadata, "params": {"w": [1, 2, 3]}}, use_bin_type=True)
+        )
+        generic_map.write_bytes(
+            msgpack.packb(
+                {"metadata": large_metadata, "state": {"selected": True}, "__reduce__": "os.system"},
+                use_bin_type=True,
+            )
+        )
+
+        assert detect_file_format_for_skip_filter(str(disguised_checkpoint)) == "flax_msgpack"
+        assert not should_skip_file(str(disguised_checkpoint))
+        assert detect_file_format_for_skip_filter(str(generic_map)) == "unknown"
+        assert should_skip_file(str(generic_map))
+
+    @pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"])
+    def test_flax_checkpoint_under_default_skipped_suffix_bypasses_skip(
+        self,
+        tmp_path: Path,
+        suffix: str,
+    ) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        checkpoint = tmp_path / f"checkpoint{suffix}"
+        generic_map = tmp_path / f"metadata{suffix}"
+        checkpoint.write_bytes(
+            msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+        generic_map.write_bytes(
+            msgpack.packb({"state": {"selected": True}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        assert detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+        assert not should_skip_file(str(checkpoint))
+        assert detect_file_format_for_skip_filter(str(generic_map)) == "unknown"
+        if suffix in {".txt", ".rst"}:
+            assert should_skip_file(str(generic_map))
+
+    def test_oversized_ambiguous_text_suffix_fails_closed_as_flax(self, tmp_path: Path) -> None:
+        document = tmp_path / "notes.txt"
+        document.write_bytes(b" " * (2 * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1) + 2))
+
+        assert detect_file_format_for_skip_filter(str(document)) == "flax_msgpack"
+        assert not should_skip_file(str(document))
+
+    def test_small_plain_text_document_stays_skipped_instead_of_routing_as_flax(self, tmp_path: Path) -> None:
+        document = tmp_path / "notes.txt"
+        document.write_text("ordinary project documentation\n", encoding="utf-8")
+
+        assert detect_file_format_for_skip_filter(str(document)) == "unknown"
+        assert should_skip_file(str(document))
+
+    def test_xml_looking_scalar_flax_checkpoint_bypasses_skip(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        checkpoint = tmp_path / "xml-looking-scalar.txt"
+        checkpoint.write_bytes(
+            msgpack.packb(60, use_bin_type=True)
+            + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        assert detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+        assert not should_skip_file(str(checkpoint))
+
+    def test_inconclusive_document_suffix_flax_candidate_bypasses_skip(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        checkpoint = tmp_path / "delayed-root.txt"
+        checkpoint.write_bytes(
+            msgpack.packb(None, use_bin_type=True) * 4097
+            + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        assert detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+        assert not should_skip_file(str(checkpoint))
+
+    def test_large_json_array_under_skipped_suffix_is_preserved_fail_closed(self, tmp_path: Path) -> None:
+        json_array = tmp_path / "metadata.jpg"
+        json_array.write_bytes(b"[" + b"0," * ((MXNET_SYMBOL_SIGNATURE_READ_BYTES // 2) + 100) + b"0]")
+
+        assert detect_file_format_for_skip_filter(str(json_array)) == "flax_msgpack"
+        assert not should_skip_file(str(json_array))
+
+    def test_incomplete_disguised_flax_probe_bypasses_skip_filter(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        checkpoint = tmp_path / "unavailable.jpg"
+        checkpoint.write_bytes(b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03")
+        monkeypatch.setattr(
+            "modelaudit.utils.file.detection._probe_flax_msgpack_checkpoint_file",
+            lambda _path: None,
+        )
+
+        assert detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+        assert not should_skip_file(str(checkpoint))
+
     def test_pk_prefix_near_match_stays_skipped(self, tmp_path: Path) -> None:
         near_match = tmp_path / "pknope.jpg"
         near_match.write_bytes(b"PKNO harmless text")
 
         assert should_skip_file(str(near_match))
 
-    def test_disguised_tf_metagraph_bypasses_skip_without_promoting_generic_protobuf(self, tmp_path: Path) -> None:
-        disguised_metagraph = tmp_path / "graph.jpg"
+    @pytest.mark.parametrize("filename", ["graph.jpg", "graph.py", "graph.pyw"])
+    def test_disguised_tf_metagraph_bypasses_skip_without_promoting_generic_protobuf(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        disguised_metagraph = tmp_path / filename
         generic_protobuf = tmp_path / "generic.jpg"
         disguised_metagraph.write_bytes(b"\xa2\x06\x80\x08" + (b"x" * 1024) + _build_tf_metagraph_bytes())
         generic_protobuf.write_bytes(b"\x12\x02\x08\x01")
@@ -274,16 +446,66 @@ class TestFileFilter:
         assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
         assert should_skip_file(str(generic_protobuf))
 
-    def test_disguised_tf_savedmodel_bypasses_skip_without_promoting_generic_protobuf(self, tmp_path: Path) -> None:
-        disguised_savedmodel = tmp_path / "saved.jpg"
+    def test_disguised_tf_metagraph_after_printable_unknown_prefix_bypasses_skip(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES", 64)
+        disguised_metagraph = tmp_path / "prefixed-graph.jpg"
+        disguised_metagraph.write_bytes(_printable_unknown_proto_prefix(65) + _build_tf_metagraph_bytes())
+
+        assert detect_file_format_for_skip_filter(str(disguised_metagraph)) == "tf_metagraph"
+        assert not should_skip_file(str(disguised_metagraph))
+
+    @pytest.mark.parametrize("filename", ["saved.jpg", "saved.py", "saved.pyw"])
+    def test_disguised_tf_savedmodel_bypasses_skip_without_promoting_generic_protobuf(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        filename: str,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES", 64)
+        disguised_savedmodel = tmp_path / filename
         generic_protobuf = tmp_path / "generic.jpg"
-        disguised_savedmodel.write_bytes(_build_tf_savedmodel_bytes())
+        disguised_savedmodel.write_bytes(_printable_unknown_proto_prefix(65) + _build_tf_savedmodel_bytes())
         generic_protobuf.write_bytes(b"\x12\x02\x08\x01")
 
         assert detect_file_format_for_skip_filter(str(disguised_savedmodel)) == "tf_savedmodel"
         assert not should_skip_file(str(disguised_savedmodel))
         assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
         assert should_skip_file(str(generic_protobuf))
+
+    @pytest.mark.parametrize("comment", ["#" * 31, "# cafe\u00e9" + ("#" * 24)])
+    def test_large_python_source_shaped_like_unknown_protobuf_stays_skipped(self, tmp_path: Path, comment: str) -> None:
+        source = tmp_path / "large_source.py"
+        source_line = f"z {comment}\n"
+        source.write_text(source_line * ((2 * 1024 * 1024 // len(source_line.encode())) + 2), encoding="utf-8")
+
+        compile(source.read_text(encoding="utf-8"), str(source), "exec")
+        assert detect_file_format_for_skip_filter(str(source)) == "unknown"
+        assert should_skip_file(str(source))
+
+    def test_binary_python_suffix_with_oversized_tensorflow_candidate_is_preserved(self, tmp_path: Path) -> None:
+        payload = tmp_path / "oversized-candidate.py"
+        payload.write_bytes(b"\x08\x01" + b"\x12\x81\x80\x80\x0a" + (b"x" * (20 * 1024 * 1024 + 1)))
+
+        assert detect_file_format_for_skip_filter(str(payload)) == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+        assert not should_skip_file(str(payload))
+
+    def test_bounded_unknown_prefix_before_tf_graph_is_not_skipped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_FIELDS", 2)
+        disguised_metagraph = tmp_path / "budget-prefixed.jpg"
+        disguised_metagraph.write_bytes(
+            b"{" + (b"\x18\x00" * 3) + b"|" + b"z\x09\x81\xa6params\x80" + _build_tf_metagraph_bytes()
+        )
+
+        assert detect_file_format_for_skip_filter(str(disguised_metagraph)) == "tf_metagraph"
+        assert not should_skip_file(str(disguised_metagraph))
 
     def test_prefixed_disguised_onnx_bypasses_skip_without_promoting_generic_protobuf(self, tmp_path: Path) -> None:
         pytest.importorskip("onnx")
@@ -297,12 +519,78 @@ class TestFileFilter:
         assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
         assert should_skip_file(str(generic_protobuf))
 
-    def test_budget_exhausted_protobuf_near_match_survives_filter_for_tentative_scan(self, tmp_path: Path) -> None:
-        near_match = tmp_path / "ambiguous.jpg"
-        near_match.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
+    def test_disguised_torch7_bypasses_default_skip(self, tmp_path: Path) -> None:
+        disguised_torch7 = tmp_path / "payload.jpg"
+        disguised_torch7.write_bytes(b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n")
+        near_match = tmp_path / "source.jpg"
+        near_match.write_text("import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n")
 
-        assert detect_file_format_for_skip_filter(str(near_match)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
-        assert not should_skip_file(str(near_match))
+        assert detect_file_format_for_skip_filter(str(disguised_torch7)) == "torch7"
+        assert not should_skip_file(str(disguised_torch7))
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+        assert should_skip_file(str(near_match))
+
+    @pytest.mark.parametrize("embedded_format", ["cntk", "lightgbm"])
+    def test_disguised_torch7_outranks_embedded_content_signatures(
+        self,
+        tmp_path: Path,
+        embedded_format: str,
+    ) -> None:
+        disguised_torch7 = tmp_path / f"payload-{embedded_format}.jpg"
+        payload = b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+        if embedded_format == "cntk":
+            embedded_payload = tmp_path / "embedded.cmf"
+            _write_cntkv2(embedded_payload)
+            payload += embedded_payload.read_bytes()
+        else:
+            payload += b"\x00" + _build_lightgbm_text().encode("utf-8")
+        disguised_torch7.write_bytes(payload)
+
+        assert detect_file_format_for_skip_filter(str(disguised_torch7)) == "torch7"
+        assert not should_skip_file(str(disguised_torch7))
+
+    def test_disguised_llamafile_bypasses_default_skip(self, tmp_path: Path) -> None:
+        disguised_llamafile = tmp_path / "payload.jpg"
+        disguised_llamafile.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile runtime")
+        near_match = tmp_path / "tool.jpg"
+        near_match.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llama-file runtime")
+
+        assert detect_file_format_for_skip_filter(str(disguised_llamafile)) == "llamafile"
+        assert not should_skip_file(str(disguised_llamafile))
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+        assert should_skip_file(str(near_match))
+
+    def test_disguised_llamafile_probe_failure_is_preserved_for_full_scan(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        payload = tmp_path / "payload.jpg"
+        payload.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile runtime")
+
+        def raise_os_error(_path: Path, _marker: bytes, _limit: int) -> bool:
+            raise OSError("synthetic marker probe failure")
+
+        monkeypatch.setattr("modelaudit.utils.file.detection._contains_casefolded_marker_in_prefix", raise_os_error)
+
+        assert detect_file_format_for_skip_filter(str(payload)) == "llamafile_routing_inconclusive"
+        assert not should_skip_file(str(payload))
+
+    def test_executable_zip_with_out_of_window_llamafile_marker_stays_scannable(self, tmp_path: Path) -> None:
+        payload = tmp_path / "payload.jpg"
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("payload.pkl", pickle.dumps({"safe": True}))
+        payload.write_bytes(
+            b"\x7fELF"
+            + b"\x00" * 60
+            + b"A" * LLAMAFILE_ROUTE_SCAN_BYTES
+            + b"llamafile runtime"
+            + b"B" * LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
+            + payload.read_bytes()
+        )
+
+        assert detect_file_format_for_skip_filter(str(payload)) == EXECUTABLE_ZIP_POLYGLOT_FORMAT
+        assert not should_skip_file(str(payload))
 
     def test_prefixed_zip_with_central_directory_stub_stays_scannable(self, tmp_path: Path) -> None:
         disguised_zip = tmp_path / "archive.jpg"
@@ -326,11 +614,77 @@ class TestFileFilter:
 
     def test_disguised_lightgbm_text_model_bypasses_default_skip(self, tmp_path: Path) -> None:
         """Default skip filtering must preserve supported text models under skipped suffixes."""
-        disguised_lightgbm = tmp_path / "model.txt"
+        disguised_lightgbm = tmp_path / "model.jpg"
         disguised_lightgbm.write_text(("# preface\n" * 64) + _build_lightgbm_text(), encoding="utf-8")
+        near_match = tmp_path / "near_match.jpg"
+        near_match.write_text("tree=0\nversion=v4\nnum_class=1\n", encoding="utf-8")
 
         assert detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
         assert not should_skip_file(str(disguised_lightgbm))
+        assert should_skip_file(str(near_match))
+
+    def test_disguised_lightgbm_binary_prelude_bypasses_default_skip(self, tmp_path: Path) -> None:
+        disguised_lightgbm = tmp_path / "binary-model.jpg"
+        disguised_lightgbm.write_bytes(b"\x01opaque tree prelude\x00" + _build_lightgbm_text().encode("utf-8"))
+        prose_prefixed = tmp_path / "notes.jpg"
+        prose_prefixed.write_text("notes about a model\n" + _build_lightgbm_text(), encoding="utf-8")
+        tree_prefixed_prose = tmp_path / "tree-notes.jpg"
+        tree_prefixed_prose.write_text("tree model notes\n" + _build_lightgbm_text(), encoding="utf-8")
+        tree_equals_prose = tmp_path / "tree-equals-notes.jpg"
+        tree_equals_prose.write_text("tree=implementation notes\n" + _build_lightgbm_text(), encoding="utf-8")
+
+        assert detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
+        assert detect_file_format_for_skip_filter(str(prose_prefixed)) == "unknown"
+        assert detect_file_format_for_skip_filter(str(tree_prefixed_prose)) == "unknown"
+        assert detect_file_format_for_skip_filter(str(tree_equals_prose)) == "unknown"
+        assert not should_skip_file(str(disguised_lightgbm))
+        assert should_skip_file(str(prose_prefixed))
+        assert should_skip_file(str(tree_prefixed_prose))
+        assert should_skip_file(str(tree_equals_prose))
+
+    def test_disguised_cntk_model_bypasses_default_skip(self, tmp_path: Path) -> None:
+        """Default skip filtering must preserve strict CNTK signatures under skipped suffixes."""
+        disguised_cntk = tmp_path / "model.jpg"
+        _write_cntkv2(disguised_cntk)
+        near_match = tmp_path / "near_match.jpg"
+        _write_cntkv2(near_match, include_structure=False)
+
+        assert detect_file_format_for_skip_filter(str(disguised_cntk)) == "cntk"
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+        assert not should_skip_file(str(disguised_cntk))
+        assert should_skip_file(str(near_match))
+
+    def test_disguised_mxnet_symbol_bypasses_default_skip_without_promoting_json_near_match(
+        self, tmp_path: Path
+    ) -> None:
+        """Structurally valid MXNet symbol JSON should survive skipped media suffixes."""
+        disguised_symbol = create_mock_mxnet_symbol(tmp_path / "model.jpg")
+        near_match = tmp_path / "graph.jpg"
+        near_match.write_text(
+            '{"nodes":[{"op":"Custom"}],"arg_nodes":[],"heads":[[0,0,0]]}',
+            encoding="utf-8",
+        )
+
+        assert detect_file_format_for_skip_filter(str(disguised_symbol)) == "mxnet"
+        assert not should_skip_file(str(disguised_symbol))
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+        assert should_skip_file(str(near_match))
+
+    def test_strong_r_workspace_bypasses_skip_without_promoting_weak_near_match(self, tmp_path: Path) -> None:
+        disguised_workspace = tmp_path / "workspace.jpg"
+        disguised_workspace.write_bytes(b"RDX3\nX\nworkspace\nmodel")
+        ambiguous_text = tmp_path / "notes.jpg"
+        ambiguous_text.write_bytes(b"X\nordinary exported table\n")
+        incomplete_workspace = tmp_path / "header-notes.jpg"
+        incomplete_workspace.write_bytes(b"RDX3\nQ\nordinary exported table\n")
+
+        assert detect_file_format_for_skip_filter(str(disguised_workspace)) == "r_serialized"
+        assert not should_skip_file(str(disguised_workspace))
+        assert detect_file_format_for_skip_filter(str(ambiguous_text)) == "unknown"
+        assert should_skip_file(str(ambiguous_text))
+        assert detect_file_format_for_skip_filter(str(incomplete_workspace)) == "unknown"
+        assert should_skip_file(str(incomplete_workspace))
 
     def test_disguised_xml_models_with_long_prologs_bypass_default_skip(self, tmp_path: Path) -> None:
         """Skipped suffixes must not hide XML model roots after long benign prologs."""
@@ -356,6 +710,23 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_openvino))
         assert not should_skip_file(str(disguised_pmml))
         assert should_skip_file(str(benign_xml))
+
+    def test_oversized_disguised_safetensors_candidate_bypasses_default_skip(self, tmp_path: Path) -> None:
+        """Oversized framing must survive filtering for scanner-level bounded handling."""
+        disguised_safetensors = tmp_path / "weights.jpg"
+        malformed_near_match = tmp_path / "framing-only.jpg"
+        _write_sparse_oversized_safetensors_candidate(disguised_safetensors)
+        # Keep the negative fixture outside the unrelated MessagePack route.
+        header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 0xC1
+        with malformed_near_match.open("wb") as handle:
+            handle.write(struct.pack("<Q", header_len))
+            handle.write(b"\x00")
+            handle.truncate(8 + header_len + 1)
+
+        assert detect_file_format_for_skip_filter(str(disguised_safetensors)) == "safetensors"
+        assert not should_skip_file(str(disguised_safetensors))
+        assert detect_file_format_for_skip_filter(str(malformed_near_match)) == "unknown"
+        assert should_skip_file(str(malformed_near_match))
 
     def test_disguised_pmml_with_oversized_doctype_subset_fails_closed(self, tmp_path: Path) -> None:
         """Incomplete oversized XML prologs should survive filtering for fail-closed handling."""

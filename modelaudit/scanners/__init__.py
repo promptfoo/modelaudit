@@ -10,9 +10,42 @@ from typing import Any
 from ..scanner_registry_metadata import get_scanner_registry_metadata
 from ..scanner_selection import ScannerSelectionPolicy, policy_from_config
 from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
-from .routing import routed_scanner_can_handle, select_routed_scanner_id
 
 logger = logging.getLogger(__name__)
+
+_READ_FAILURE_AWARE_EXTENSION_SCANNERS = frozenset(
+    {
+        "cntk",
+        "coreml",
+        "lightgbm",
+        "manifest",
+        "metadata",
+        "numpy",
+        "paddle",
+        "pytorch_binary",
+        "r_serialized",
+        "safetensors",
+        "tensorrt",
+        "text",
+        "tf_metagraph",
+        "tf_savedmodel",
+        "zip",
+    }
+)
+_READ_FAILURE_AWARE_UNREADABLE_EXTENSION_OWNERS = {
+    "cntk": frozenset({".cmf", ".dnn"}),
+    "coreml": frozenset({".mlmodel"}),
+    "lightgbm": frozenset({".lgb", ".lightgbm"}),
+    "numpy": frozenset({".npy"}),
+    "paddle": frozenset({".pdiparams", ".pdmodel"}),
+    "pytorch_binary": frozenset({".bin"}),
+    "r_serialized": frozenset({".rda", ".rdata", ".rds"}),
+    "safetensors": frozenset({".safetensors"}),
+    "tensorrt": frozenset({".engine", ".plan", ".trt"}),
+    "tf_metagraph": frozenset({".meta"}),
+    "tf_savedmodel": frozenset({".pb"}),
+    "zip": frozenset({".npz", ".zip"}),
+}
 
 
 def _check_numpy_compatibility() -> tuple[bool, str]:
@@ -112,7 +145,7 @@ class ScannerRegistry:
                     scanner_class = getattr(module, scanner_info["class"])
 
                 self._loaded_scanners[scanner_id] = scanner_class
-                logger.debug(f"Loaded scanner: {scanner_id}")
+                logger.debug("Scanner loaded successfully")
                 return scanner_class
 
             except ImportError as e:
@@ -132,9 +165,9 @@ class ScannerRegistry:
 
                 # For expected dependency issues, use debug level
                 if scanner_deps or (is_numpy_sensitive and _is_numpy_compatibility_error(e)):
-                    logger.debug(error_msg)
+                    logger.debug("Scanner unavailable due to an optional dependency or compatibility issue")
                 else:
-                    logger.debug(error_msg)
+                    logger.debug("Scanner unavailable during lazy loading")
 
                 return None
 
@@ -149,16 +182,16 @@ class ScannerRegistry:
                             f"Scanner {scanner_id} failed due to NumPy compatibility issue. "
                             f"{self._numpy_status} Consider using 'pip install numpy<2.0' if needed."
                         )
-                        logger.debug(error_msg)  # Debug level - expected NumPy compatibility issues
+                        logger.debug("Scanner unavailable due to a NumPy compatibility issue")
                     else:
                         error_msg = f"Scanner {scanner_id} failed with NumPy compatibility error: {e}"
-                        logger.warning(error_msg)  # Warning - unexpected NumPy issue
+                        logger.warning("Scanner failed with an unexpected NumPy compatibility issue")
                 elif isinstance(e, AttributeError):
                     error_msg = f"Scanner class {scanner_info['class']} not found in {scanner_info['module']}: {e}"
-                    logger.warning(error_msg)  # Warning - code structure issue
+                    logger.warning("Scanner class could not be loaded")
                 else:
                     error_msg = f"Scanner {scanner_id} failed to load: {e}"
-                    logger.warning(error_msg)  # Warning - unexpected error
+                    logger.warning("Scanner failed to load unexpectedly")
 
                 self._failed_scanners[scanner_id] = error_msg
                 return None
@@ -255,15 +288,24 @@ class ScannerRegistry:
         if not candidate_extensions:
             candidate_extensions.append("")
 
+        try:
+            read_probe_failed = os.path.isfile(path) and not os.access(path, os.R_OK)
+        except OSError:
+            read_probe_failed = True
         is_zip_file = False
+        zip_probe_failed = False
         try:
             is_zip_file = os.path.isfile(path) and zipfile.is_zipfile(path)
         except OSError:
-            return None
+            # Continue only into scanners that explicitly translate unreadable
+            # owned inputs into an operationally incomplete outcome.
+            zip_probe_failed = True
 
         for candidate_extension in candidate_extensions:
             for scanner_id, scanner_info in sorted_scanners:
                 if scanner_selection is not None and not scanner_selection.allows(scanner_id):
+                    continue
+                if (read_probe_failed or zip_probe_failed) and scanner_id not in _READ_FAILURE_AWARE_EXTENSION_SCANNERS:
                     continue
                 extensions = scanner_info.get("extensions", [])
                 content_routed_extensions = scanner_info.get("content_routed_extensions", [])
@@ -271,32 +313,78 @@ class ScannerRegistry:
                     continue
 
                 scanner_class = self._load_scanner(scanner_id)
-                if scanner_class and scanner_class.can_handle(path):
+                unreadable_extension_owner = (
+                    read_probe_failed
+                    and candidate_extension in _READ_FAILURE_AWARE_UNREADABLE_EXTENSION_OWNERS.get(scanner_id, ())
+                )
+                if scanner_class and (scanner_class.can_handle(path) or unreadable_extension_owner):
+                    if scanner_id != "llamafile" and (
+                        scanner_selection is None or scanner_selection.allows("llamafile")
+                    ):
+                        from modelaudit.utils.file.detection import is_llamafile_executable
+
+                        if is_llamafile_executable(path):
+                            llamafile_class = self._load_scanner("llamafile")
+                            if llamafile_class:
+                                return llamafile_class
+                    if scanner_id != "torch7" and (scanner_selection is None or scanner_selection.allows("torch7")):
+                        from modelaudit.utils.file.detection import is_torch7_suffix_override_candidate
+
+                        if is_torch7_suffix_override_candidate(path):
+                            torch7_class = self._load_scanner("torch7")
+                            if torch7_class and torch7_class.can_handle(path):
+                                return torch7_class
                     return scanner_class
 
-        try:
-            from modelaudit.utils.file.detection import detect_file_format
+        # Filename-owned scanners still need to retain ownership when an
+        # unreadable file prevents later content-routing fallback.
+        if read_probe_failed or zip_probe_failed:
+            for scanner_id, scanner_info in sorted_scanners:
+                if scanner_selection is not None and not scanner_selection.allows(scanner_id):
+                    continue
+                if scanner_id not in _READ_FAILURE_AWARE_EXTENSION_SCANNERS:
+                    continue
+                if not self._is_content_routed_filename(filename, scanner_info):
+                    continue
 
-            header_format = detect_file_format(path)
-        except Exception:
-            header_format = "unknown"
+                scanner_class = self._load_scanner(scanner_id)
+                if scanner_class and scanner_class.can_handle(path):
+                    return scanner_class
+            return None
 
-        header_scanner_id = select_routed_scanner_id(path, header_format, extension=file_ext)
-        header_scanner_info = self._scanners.get(header_scanner_id or "")
-        if (
-            header_scanner_id
-            and header_scanner_info
-            and (scanner_selection is None or scanner_selection.allows(header_scanner_id))
-        ):
-            scanner_class = self._load_scanner(header_scanner_id)
-            if scanner_class and routed_scanner_can_handle(scanner_class, header_scanner_id, header_format, path):
-                return scanner_class
-
-        # If structure-specific scanners decline a ZIP, preserve generic ZIP
-        # recursion so nested payload analysis is never dropped.
+        # Some ZIP-backed artifacts intentionally use pickle/checkpoint suffixes.
+        # If stricter extension-specific scanners all decline, fall back to the
+        # generic ZIP scanner so helper-level routing does not drop coverage.
         if is_zip_file and (scanner_selection is None or scanner_selection.allows("zip")):
             scanner_class = self._load_scanner("zip")
             if scanner_class and scanner_class.can_handle(path):
+                return scanner_class
+
+        try:
+            from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
+
+            header_format = detect_file_format(path)
+            extension_format = detect_format_from_extension(path)
+        except Exception:
+            header_format = "unknown"
+            extension_format = "unknown"
+
+        header_scanner_id = self.get_scanner_id_for_header_format(header_format)
+        header_scanner_info = self._scanners.get(header_scanner_id or "")
+        extension_scanner_id = self.get_scanner_id_for_header_format(extension_format)
+        compatible_header_route = (
+            header_format == header_scanner_id
+            or extension_format == "unknown"
+            or extension_scanner_id == header_scanner_id
+        )
+        if (
+            header_scanner_id
+            and header_scanner_info
+            and compatible_header_route
+            and (scanner_selection is None or scanner_selection.allows(header_scanner_id))
+        ):
+            scanner_class = self._load_scanner(header_scanner_id)
+            if scanner_class and (scanner_class.can_handle(path) or os.path.exists(path)):
                 return scanner_class
 
         # Manifest-like config files sometimes intentionally use generic or

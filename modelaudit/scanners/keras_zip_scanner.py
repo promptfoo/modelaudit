@@ -31,7 +31,8 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
-from .archive_member_security import executable_archive_member_rule_code, is_executable_archive_member_name
+from .archive_dispatch import SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY
+from .archive_member_security import is_executable_archive_member_name
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
@@ -41,6 +42,7 @@ from .keras_utils import (
     find_case_insensitive_substrings,
     is_known_safe_keras_layer_class,
 )
+from .zip_scanner import ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY
 
 # CVE-2025-1550: Keras safe_mode bypass via arbitrary module references in config.json
 # Allowlist of top-level module names that are safe in Keras model configs.
@@ -114,6 +116,8 @@ def _has_get_file_reference(values: list[str]) -> bool:
 _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
+_KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+_-]*)\s*$")
+_KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(r"(?i)^(?:a|alpha|b|beta|c|rc|pre|preview|dev)")
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -356,17 +360,28 @@ class KerasZipScanner(BaseScanner):
             skip_entry_values = [entry for entry in skip_entries if isinstance(entry, str)]
         else:
             skip_entry_values = []
-        owned_entries = [_KERAS_CONFIG_ENTRY, _KERAS_METADATA_ENTRY]
+        raw_security_only_entries = recursive_config.get(ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY, ())
+        if isinstance(raw_security_only_entries, str):
+            security_only_entries: list[str] = [raw_security_only_entries]
+        elif isinstance(raw_security_only_entries, (list, tuple, set, frozenset)):
+            security_only_entries = [entry for entry in raw_security_only_entries if isinstance(entry, str)]
+        else:
+            security_only_entries = []
+        owned_entries = [_KERAS_CONFIG_ENTRY]
         if skip_weights_entry:
             owned_entries.append(_KERAS_WEIGHTS_ENTRY)
         for owned_entry in owned_entries:
-            if owned_entry not in skip_entry_values:
-                skip_entry_values.append(owned_entry)
+            if owned_entry not in security_only_entries:
+                security_only_entries.append(owned_entry)
         recursive_config["skip_archive_entries"] = skip_entry_values
+        recursive_config[ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY] = security_only_entries
         return recursive_config
 
     def _merge_recursive_archive_scan(self, path: str, result: ScanResult) -> None:
         """Recursively scan every ZIP member through the generic archive scanner."""
+        if self.config.get(SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY):
+            return
+
         from .zip_scanner import ZipScanner
 
         has_embedded_weights_limit = self._has_embedded_weights_limit_reason(result)
@@ -384,6 +399,15 @@ class KerasZipScanner(BaseScanner):
         if nested_contents is not None:
             result.metadata["contents"] = nested_contents
         result.success = result.success and nested_result.success
+
+    def _merge_recursive_archive_scan_after_primary_failure(self, path: str, result: ScanResult) -> None:
+        """Preserve independently detectable archive findings when Keras analysis is unavailable."""
+        try:
+            self._merge_recursive_archive_scan(path, result)
+        except Exception:
+            # The primary failure already makes this scan inconclusive; a
+            # failing fallback must not replace that explicit outcome.
+            return
 
     def scan(self, path: str) -> ScanResult:
         """Scan a ZIP-based Keras model file for suspicious configurations"""
@@ -508,28 +532,41 @@ class KerasZipScanner(BaseScanner):
             self._merge_recursive_archive_scan(path, result)
             result.finish(success=False)
             return result
-        except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as e:
-            self._mark_inconclusive_scan_result(result, "keras_zip_archive_read_failed")
+        except OSError as e:
+            self._mark_inconclusive_scan_result(result, "keras_zip_read_failed")
             result.add_check(
-                name="Keras ZIP Archive Read",
+                name="Keras ZIP File Read",
                 passed=False,
-                message=f"Unable to complete Keras ZIP scan due to archive read failure: {e!s}",
+                message=f"Unable to read Keras ZIP content: {e!s}",
                 severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "keras_zip_read_failed",
+                },
             )
+            self._merge_recursive_archive_scan_after_primary_failure(path, result)
             self._finish_scan_result(result)
             return result
         except Exception as e:
+            self._mark_inconclusive_scan_result(result, "keras_zip_scan_failed")
             result.add_check(
                 name="Keras ZIP File Scan",
                 passed=False,
                 message=f"Error scanning Keras ZIP file: {e!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "keras_zip_scan_failed",
+                },
             )
-            result.finish(success=False)
+            self._merge_recursive_archive_scan_after_primary_failure(path, result)
+            self._finish_scan_result(result)
             return result
 
         self._finish_scan_result(result)
@@ -576,7 +613,6 @@ class KerasZipScanner(BaseScanner):
                     severity=IssueSeverity.WARNING,
                     location=f"{archive_path}/{filename}",
                     details={"filename": filename},
-                    rule_code="S507",
                 )
             elif is_executable_archive_member_name(normalized_name):
                 result.add_check(
@@ -586,7 +622,6 @@ class KerasZipScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     location=f"{archive_path}/{filename}",
                     details={"filename": filename},
-                    rule_code=executable_archive_member_rule_code(filename),
                 )
 
     @staticmethod
@@ -1979,20 +2014,21 @@ class KerasZipScanner(BaseScanner):
     @staticmethod
     def _is_vulnerable_to_cve_2026_1669(version: str) -> bool:
         """Return True for Keras versions in the known CVE-2026-1669 affected ranges."""
-        parts = version.split(".", 2)
-        if len(parts) < 2:
+        version_match = _KERAS_RELEASE_VERSION_PATTERN.match(version)
+        if not version_match:
             return False
 
         try:
-            major = int(parts[0])
-            minor = int(parts[1])
-            patch = 0
-            if len(parts) == 3:
-                patch_digits = "".join(ch for ch in parts[2] if ch.isdigit())
-                if patch_digits:
-                    patch = int(patch_digits)
+            major = int(version_match.group(1))
+            minor = int(version_match.group(2))
+            patch = int(version_match.group(3) or 0)
         except ValueError:
             return False
 
+        suffix = (version_match.group(4) or "").strip().lower()
+        public_suffix = suffix.lstrip("._-")
+        is_prerelease = not suffix.startswith("+") and bool(_KERAS_PRERELEASE_SUFFIX_PATTERN.match(public_suffix))
         parsed = (major, minor, patch)
-        return (3, 0, 0) <= parsed < (3, 12, 1) or (3, 13, 0) <= parsed < (3, 13, 2)
+        if (3, 0, 0) <= parsed < (3, 12, 1) or (3, 13, 0) <= parsed < (3, 13, 2):
+            return True
+        return parsed in {(3, 12, 1), (3, 13, 2)} and is_prerelease

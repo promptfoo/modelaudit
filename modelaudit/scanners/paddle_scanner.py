@@ -6,8 +6,9 @@ from typing import ClassVar
 
 from modelaudit.detectors.suspicious_symbols import BINARY_CODE_PATTERNS, SUSPICIOUS_STRING_PATTERNS
 
+from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 HAS_PADDLE = True
 
@@ -77,9 +78,39 @@ class PaddleScanner(BaseScanner):
             return False
         return os.path.splitext(path)[1].lower() in cls.supported_extensions
 
+    @staticmethod
+    def _is_unreadable_path_result(result: ScanResult) -> bool:
+        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    @staticmethod
+    def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
+        mark_inconclusive_scan_result(result, "paddle_read_failed")
+        mark_operational_scan_error(result, "paddle_read_failed")
+        result.add_check(
+            name="Paddle File Read",
+            passed=False,
+            message=f"Error reading file: {error}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "paddle_read_failed",
+            },
+        )
+        result.finish(success=False)
+        return result
+
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
+            if self._is_unreadable_path_result(path_check_result):
+                return self._finish_read_failure(
+                    self._create_result(),
+                    path,
+                    PermissionError(f"Path is not readable: {path}"),
+                )
             return path_check_result
 
         size_check = self._check_size_limit(path)
@@ -144,6 +175,8 @@ class PaddleScanner(BaseScanner):
                         )
                     previous_chunk_tail = chunk[-chunk_overlap:] if chunk_overlap else b""
             result.bytes_scanned = bytes_scanned
+        except OSError as e:
+            return self._finish_read_failure(result, path, e)
         except Exception as e:  # pragma: no cover - unexpected I/O errors
             result.add_check(
                 name="Paddle File Read",

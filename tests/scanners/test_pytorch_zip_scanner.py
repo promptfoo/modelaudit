@@ -5,7 +5,7 @@ import time
 import warnings
 import zipfile
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 import pytest
 
@@ -73,6 +73,30 @@ def _pytorch_storage_persistent_id_payload(key: str | bytes) -> bytes:
         b"\x8c\x07storage\x94"
         b"\x8c\x05torch\x94"
         b"\x8c\x0cFloatStorage\x94\x93" + key_opcode + b"\x8c\x03cpu\x94K\x01tQ."
+    )
+
+
+def _pytorch_storage_persistent_id_payload_with_popped_key(key: str, popped_key: str) -> bytes:
+    payload = _pytorch_storage_persistent_id_payload(key)
+    popped_key_bytes = popped_key.encode("utf-8")
+    assert len(popped_key_bytes) < 256
+    assert payload.endswith(b"Q.")
+    return payload[:-2] + b"\x8c" + bytes([len(popped_key_bytes)]) + popped_key_bytes + b"\x940" + payload[-2:]
+
+
+def _short_binbytes(value: bytes) -> bytes:
+    assert len(value) < 256
+    return b"C" + bytes([len(value)]) + value + b"\x94"
+
+
+def _fake_byte_storage_persistent_id_payload(key: str) -> bytes:
+    return (
+        b"\x80\x04("
+        + _short_binbytes(b"storage")
+        + _short_binbytes(b"FakeStorage")
+        + _short_binbytes(key.encode("utf-8"))
+        + _short_binbytes(b"cpu")
+        + b"K\x01tQ."
     )
 
 
@@ -343,6 +367,277 @@ def test_pytorch_zip_scanner_native_library_near_match_extension_stays_clean(tmp
     )
 
 
+def test_pytorch_zip_scanner_detects_disguised_executable_sidecar_by_content(tmp_path: Path) -> None:
+    """Strong executable bytes must not disappear behind an ordinary sidecar suffix."""
+    model_path = create_mock_pytorch_zip(tmp_path / "disguised_executable.pt", prefix="archive")
+    distant_pe_header = bytearray(b"\x00" * 2052)
+    distant_pe_header[:2] = b"MZ"
+    distant_pe_header[0x3C:0x40] = (2048).to_bytes(4, "little")
+    distant_pe_header[2048:2052] = b"PE\x00\x00"
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/weights/payload.bin", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+        zip_file.writestr("archive/weights/loader.dat", bytes(distant_pe_header))
+
+    direct_result = PyTorchZipScanner().scan(str(model_path))
+    assert direct_result.success is False
+    executable_checks = {
+        check.details.get("file"): check
+        for check in direct_result.checks
+        if check.name == "Executable File Detection" and check.status == CheckStatus.FAILED
+    }
+    assert {"archive/weights/payload.bin", "archive/weights/loader.dat"}.issubset(executable_checks)
+    assert executable_checks["archive/weights/payload.bin"].rule_code == "S502"
+    assert executable_checks["archive/weights/loader.dat"].rule_code == "S501"
+    assert all(check.severity == IssueSeverity.CRITICAL for check in executable_checks.values())
+
+    aggregate_result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    assert determine_exit_code(aggregate_result) == 1
+    finding_messages = {issue.message for issue in aggregate_result.issues}
+    assert "Executable file found in PyTorch model: archive/weights/payload.bin" in finding_messages
+    assert "Executable file found in PyTorch model: archive/weights/loader.dat" in finding_messages
+
+
+def test_pytorch_zip_scanner_detects_executable_bytes_hidden_behind_python_name(tmp_path: Path) -> None:
+    """A Python suffix must not reduce a native payload to a warning-only finding."""
+    model_path = create_mock_pytorch_zip(tmp_path / "python_named_executable.pt", prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/code/payload.py", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("file") == "archive/code/payload.py"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_detects_executable_sidecar_under_untrusted_data_path(tmp_path: Path) -> None:
+    """Only validated tensor storage blobs should skip executable-content probing."""
+    model_path = create_mock_pytorch_zip(tmp_path / "untrusted_data_path.pt", prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/weights/data/0", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("file") == "archive/weights/data/0"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_marks_over_budget_pe_header_offset_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unconfirmed PE pointer must not become a fabricated executable finding."""
+    model_path = create_mock_pytorch_zip(tmp_path / "oversized_pe_offset.pt", prefix="archive")
+    sidecar = bytearray(b"\x00" * 64)
+    sidecar[:2] = b"MZ"
+    sidecar[0x3C:0x40] = ((1024 * 1024) + 1).to_bytes(4, "little")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/weights/loader.dat", bytes(sidecar))
+
+    original = PyTorchZipScanner._read_member_prefix
+    content_probe_limits: list[int] = []
+
+    def record_content_probe(
+        self: PyTorchZipScanner,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        limit: int,
+        *,
+        phase: str,
+        result: ScanResult,
+    ) -> bytes:
+        if phase == "executable member content probe" and entry.filename.endswith("loader.dat"):
+            content_probe_limits.append(limit)
+        return original(self, zip_file, entry, limit, phase=phase, result=result)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_read_member_prefix", record_content_probe)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert content_probe_limits == [1024]
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_executable_member_probe_failed" in result.metadata["scan_outcome_reasons"]
+    assert not any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("file") == "archive/weights/loader.dat"
+        for check in result.checks
+    )
+    probe_checks = [check for check in result.checks if check.name == "Executable Content Probe"]
+    assert len(probe_checks) == 1
+    assert probe_checks[0].details["entries"][0]["exception_type"] == "BoundedProbeIncomplete"
+
+
+def test_pytorch_zip_scanner_does_not_treat_tensor_storage_bytes_as_executable_sidecar(tmp_path: Path) -> None:
+    """Arbitrary tensor storage bytes are not evidence of an executable archive member."""
+    model_path = create_mock_pytorch_zip(tmp_path / "tensor_bytes.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
+    assert not any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("file") == "archive/data/0"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_keeps_tensor_storage_trust_when_pickle_scanner_is_disabled(tmp_path: Path) -> None:
+    """Scanner-only PyTorch ZIP scans still need trusted storage IDs to avoid tensor-byte false positives."""
+    model_path = create_mock_pytorch_zip(tmp_path / "scanner_only_tensor_bytes.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner(config={"scanners": ["pytorch_zip"]}).scan(str(model_path))
+
+    assert result.success is True
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pickle"
+        for check in result.checks
+    )
+    assert any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
+    assert not any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("file") == "archive/data/0"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_probes_unreferenced_numeric_storage_lookalike(tmp_path: Path) -> None:
+    """An unreferenced canonical-looking data member remains an executable sidecar."""
+    model_path = create_mock_pytorch_zip(tmp_path / "unreferenced_tensor_bytes.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", b"\x00" * 8)
+        zip_file.writestr("archive/data/999", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("file") == "archive/data/999"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_only_probes_popped_storage_key_decoys(tmp_path: Path) -> None:
+    """Scanner-only fallback trust must follow the actual BINPERSID operand."""
+    model_path = create_mock_pytorch_zip(tmp_path / "popped_storage_decoy.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload_with_popped_key("0", "999"))
+        zip_file.writestr("archive/data/0", b"\x00" * 8)
+        zip_file.writestr("archive/data/999", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner(config={"scanners": ["pytorch_zip"]}).scan(str(model_path))
+
+    assert result.success is False
+    trusted_keys = {
+        check.details.get("pytorch_storage_key")
+        for check in result.checks
+        if check.details.get("trusted_pytorch_archive_context") is True
+    }
+    assert trusted_keys == {"0"}
+    assert any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("file") == "archive/data/999"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_only_rejects_fake_byte_storage_descriptors(tmp_path: Path) -> None:
+    """Scanner-only fallback trust must require a real torch storage GLOBAL descriptor."""
+    model_path = create_mock_pytorch_zip(tmp_path / "fake_byte_storage.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", _fake_byte_storage_persistent_id_payload("999"))
+        zip_file.writestr("archive/data/999", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner(config={"scanners": ["pytorch_zip"]}).scan(str(model_path))
+
+    assert result.success is False
+    assert not any(
+        check.details.get("trusted_pytorch_archive_context") is True
+        and check.details.get("pytorch_storage_key") == "999"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("file") == "archive/data/999"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_fails_closed_when_executable_content_probe_cannot_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unreadable ordinary sidecars leave executable-content coverage incomplete."""
+    model_path = create_mock_pytorch_zip(tmp_path / "unreadable_sidecar.pt", prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/weights/sidecar.bin", b"ordinary metadata")
+
+    original = PyTorchZipScanner._read_member_prefix
+
+    def fail_content_probe(
+        self: PyTorchZipScanner,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        limit: int,
+        *,
+        phase: str,
+        result: ScanResult,
+    ) -> bytes:
+        if phase == "executable member content probe" and entry.filename.endswith("sidecar.bin"):
+            raise OSError("simulated executable probe read failure")
+        return original(self, zip_file, entry, limit, phase=phase, result=result)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_read_member_prefix", fail_content_probe)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_executable_member_probe_failed" in result.metadata["scan_outcome_reasons"]
+    probe_checks = [check for check in result.checks if check.name == "Executable Content Probe"]
+    assert len(probe_checks) == 1
+    assert probe_checks[0].severity == IssueSeverity.INFO
+    assert probe_checks[0].details["entries"][0]["zip_entry"] == "archive/weights/sidecar.bin"
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Executable File Detection" and check.status == CheckStatus.PASSED
+    ]
+    _assert_pytorch_zip_inconclusive_not_cached(
+        model_path,
+        tmp_path / "cache",
+        "pytorch_zip_executable_member_probe_failed",
+        expected_success=False,
+        expected_exit_code=2,
+    )
+
+
 def test_pytorch_zip_scanner_relaxes_crc_for_pickle_scan(tmp_path: Path) -> None:
     """CRC-mismatched pickle entries should still be scanned with an explicit warning."""
     model_path = create_mock_pytorch_zip(tmp_path / "crc_mismatch.pt", malicious=True)
@@ -352,7 +647,7 @@ def test_pytorch_zip_scanner_relaxes_crc_for_pickle_scan(tmp_path: Path) -> None
 
     crc_checks = [check for check in result.checks if check.name == "PyTorch ZIP CRC Handling"]
 
-    assert result.success is True
+    assert result.success is False
     assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
     assert len(crc_checks) == 1
     assert crc_checks[0].status == CheckStatus.FAILED
@@ -372,43 +667,6 @@ def test_pytorch_zip_scanner_normal_archive_skips_relaxed_crc_signal(tmp_path: P
     assert result.success is True
     assert "relaxed_crc_members" not in result.metadata
     assert not [check for check in result.checks if check.name == "PyTorch ZIP CRC Handling"]
-
-
-def test_pytorch_zip_scanner_path_traversal_named_pickle_keeps_archive_rule(tmp_path: Path) -> None:
-    model_path = tmp_path / "traversal.pt"
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("version", "3")
-        zip_file.writestr("../../pickle_payload.bin", b"not a pickle")
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    traversal_checks = [
-        check
-        for check in result.checks
-        if check.name == "Path Traversal Protection" and check.status == CheckStatus.FAILED
-    ]
-    assert len(traversal_checks) == 1
-    assert traversal_checks[0].severity == IssueSeverity.CRITICAL
-    assert traversal_checks[0].rule_code == "S405"
-    assert not [check for check in result.checks if check.rule_code == "S213"]
-
-
-def test_pytorch_zip_scanner_executable_named_pickle_keeps_executable_rule(tmp_path: Path) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "executable.pt")
-    with zipfile.ZipFile(model_path, "a") as zip_file:
-        zip_file.writestr("archive/data/pickle_payload.exe", b"not executed")
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    executable_checks = [
-        check
-        for check in result.checks
-        if check.name == "Executable File Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert len(executable_checks) == 1
-    assert executable_checks[0].severity == IssueSeverity.CRITICAL
-    assert executable_checks[0].rule_code == "S501"
-    assert not [check for check in result.checks if check.rule_code == "S213"]
 
 
 def test_pytorch_zip_scanner_scans_shadowed_duplicate_data_pkl(tmp_path: Path) -> None:
@@ -466,8 +724,8 @@ def test_pytorch_zip_scanner_conflicting_duplicate_data_pkl_is_info_only(tmp_pat
     assert result.metadata["pickle_files"] == ["data.pkl", "data.pkl"]
 
 
-def test_pytorch_zip_scanner_invalid_zip(tmp_path: Path) -> None:
-    """Invalid ZIP structure is incomplete coverage, not a detected hazard."""
+def test_pytorch_zip_scanner_invalid_zip(tmp_path):
+    """Test scanning an invalid ZIP file."""
     # Create an invalid ZIP file
     invalid_path = tmp_path / "invalid.pt"
     invalid_path.write_bytes(b"This is not a valid ZIP file")
@@ -475,10 +733,8 @@ def test_pytorch_zip_scanner_invalid_zip(tmp_path: Path) -> None:
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(invalid_path))
 
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "pytorch_zip_format_unrecognized" in result.metadata["scan_outcome_reasons"]
-    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+    # Should have an error about invalid ZIP
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
         "invalid" in issue.message.lower() or "corrupt" in issue.message.lower() or "error" in issue.message.lower()
         for issue in result.issues
@@ -521,6 +777,177 @@ def test_pytorch_zip_scanner_with_blacklist(tmp_path):
     # Should detect our blacklisted pattern
     blacklist_issues = [issue for issue in result.issues if "suspicious_function" in issue.message.lower()]
     assert len(blacklist_issues) > 0
+
+
+def _assert_blacklist_inconclusive_not_cached(
+    path: Path,
+    cache_dir: Path,
+    reason: str,
+    **scan_kwargs: Any,
+) -> None:
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert reason in metadata["scan_outcome_reasons"]
+            assert not [
+                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_pytorch_zip_oversized_blacklist_member_is_inconclusive(tmp_path: Path) -> None:
+    """Configured blacklist coverage must not pass when a matching member is skipped."""
+    zip_path = create_mock_pytorch_zip(tmp_path / "blocked_oversized.pt", data={})
+    with zipfile.ZipFile(zip_path, "a") as zip_file:
+        zip_file.writestr("notes.txt", b"A" * 48 + b"BLOCKED_PATTERN")
+
+    config = {"blacklist_patterns": ["BLOCKED_PATTERN"], "max_blacklist_scan_size": 32}
+    result = PyTorchZipScanner(config=config).scan(str(zip_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == [
+        PyTorchZipScanner.BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON,
+    ]
+    limit_checks = [
+        check
+        for check in result.checks
+        if check.name == "Blacklist Pattern Check" and check.details.get("zip_entry") == "notes.txt"
+    ]
+    assert len(limit_checks) == 1
+    assert limit_checks[0].status == CheckStatus.FAILED
+    assert limit_checks[0].severity == IssueSeverity.INFO
+    assert limit_checks[0].details["analysis_incomplete"] is True
+    assert not any("BLOCKED_PATTERN" in issue.message for issue in result.issues)
+
+    _assert_blacklist_inconclusive_not_cached(
+        zip_path,
+        tmp_path / "oversized-hidden-cache",
+        PyTorchZipScanner.BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON,
+        blacklist_patterns=["BLOCKED_PATTERN"],
+        max_blacklist_scan_size=32,
+    )
+
+
+def test_pytorch_zip_oversized_benign_blacklist_member_is_inconclusive_without_finding(tmp_path: Path) -> None:
+    """A benign skipped member is incomplete coverage, not a claimed blacklist match."""
+    zip_path = create_mock_pytorch_zip(tmp_path / "benign_oversized.pt", data={})
+    with zipfile.ZipFile(zip_path, "a") as zip_file:
+        zip_file.writestr("notes.txt", b"A" * 48 + b"ordinary")
+
+    result = PyTorchZipScanner(
+        config={"blacklist_patterns": ["BLOCKED_PATTERN"], "max_blacklist_scan_size": 32},
+    ).scan(str(zip_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == [
+        PyTorchZipScanner.BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON,
+    ]
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    _assert_blacklist_inconclusive_not_cached(
+        zip_path,
+        tmp_path / "oversized-benign-cache",
+        PyTorchZipScanner.BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON,
+        blacklist_patterns=["BLOCKED_PATTERN"],
+        max_blacklist_scan_size=32,
+    )
+
+
+def test_pytorch_zip_blacklist_member_read_failure_is_inconclusive_and_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_path = create_mock_pytorch_zip(tmp_path / "unreadable_blacklist.pt", data={})
+    with zipfile.ZipFile(zip_path, "a") as zip_file:
+        zip_file.writestr("notes.txt", b"ordinary")
+
+    original_read_member_bytes = PyTorchZipScanner._read_member_bytes
+
+    def fail_blacklist_member_read(
+        self: PyTorchZipScanner,
+        zip_file: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        *,
+        phase: str,
+        result: ScanResult,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        if phase == "blacklist_check" and self._get_zip_member_name(name) == "notes.txt":
+            raise OSError("member read failed")
+        return original_read_member_bytes(self, zip_file, name, phase=phase, result=result, max_bytes=max_bytes)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_read_member_bytes", fail_blacklist_member_read)
+
+    result = PyTorchZipScanner(config={"blacklist_patterns": ["BLOCKED_PATTERN"]}).scan(str(zip_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == [
+        PyTorchZipScanner.BLACKLIST_READ_INCONCLUSIVE_REASON,
+    ]
+    read_checks = [
+        check
+        for check in result.checks
+        if check.name == "ZIP Entry Read" and check.details.get("zip_entry") == "notes.txt"
+    ]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == PyTorchZipScanner.BLACKLIST_READ_INCONCLUSIVE_REASON
+
+    _assert_blacklist_inconclusive_not_cached(
+        zip_path,
+        tmp_path / "blacklist-read-failure-cache",
+        PyTorchZipScanner.BLACKLIST_READ_INCONCLUSIVE_REASON,
+        blacklist_patterns=["BLOCKED_PATTERN"],
+    )
+
+
+def test_pytorch_zip_blacklist_pattern_at_size_limit_is_detected(tmp_path: Path) -> None:
+    """A member within the configured blacklist window must remain actively inspected."""
+    zip_path = create_mock_pytorch_zip(tmp_path / "bounded_pattern.pt", data={})
+    payload = b"A" * 48 + b"BLOCKED_PATTERN"
+    with zipfile.ZipFile(zip_path, "a") as zip_file:
+        zip_file.writestr("notes.txt", payload)
+
+    result = PyTorchZipScanner(
+        config={"blacklist_patterns": ["BLOCKED_PATTERN"], "max_blacklist_scan_size": len(payload)},
+    ).scan(str(zip_path))
+
+    assert "scan_outcome" not in result.metadata
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "BLOCKED_PATTERN" in issue.message for issue in result.issues
+    )
+
+    aggregate = scan_model_directory_or_file(
+        str(zip_path),
+        blacklist_patterns=["BLOCKED_PATTERN"],
+        max_blacklist_scan_size=len(payload),
+        cache_enabled=False,
+    )
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_pytorch_pickle_file_unsupported(tmp_path):
@@ -626,7 +1053,7 @@ def test_pytorch_zip_scanner_handles_zip_metadata_oserror(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Non-BadZipFile metadata failures should fail closed without inventing a finding."""
+    """Non-BadZipFile metadata failures are incomplete coverage, not findings."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
 
     def fail_namelist(self: zipfile.ZipFile) -> list[str]:
@@ -639,30 +1066,17 @@ def test_pytorch_zip_scanner_handles_zip_metadata_oserror(
 
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "pytorch_zip_scan_failed" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["scan_outcome_reasons"] == [PyTorchZipScanner.SCAN_INCONCLUSIVE_REASON]
     assert any("zip metadata unavailable" in check.message for check in result.checks)
-    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+    assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
 
 
-def test_pytorch_zip_corrupt_format_is_inconclusive(tmp_path: Path) -> None:
-    model_path = tmp_path / "corrupt.pt"
-    model_path.write_bytes(b"PK\x03\x04truncated")
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "pytorch_zip_parse_failed" in result.metadata["scan_outcome_reasons"]
-    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
-
-
-def test_pytorch_zip_preserves_path_traversal_when_late_scan_fails(
+def test_pytorch_zip_scan_failure_is_inconclusive_and_not_cached(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "traversal_then_failure.pt")
-    with zipfile.ZipFile(model_path, "a") as zip_file:
-        zip_file.writestr("../escape.py", b"value = 1\n")
+    zip_path = create_mock_pytorch_zip(tmp_path / "interrupted.pt", data={})
+    cache_dir = tmp_path / "scan-failure-cache"
 
     def fail_discovery(
         self: PyTorchZipScanner,
@@ -670,65 +1084,58 @@ def test_pytorch_zip_preserves_path_traversal_when_late_scan_fails(
         safe_entries: list[zipfile.ZipInfo],
         result: ScanResult,
     ) -> list[zipfile.ZipInfo]:
-        raise OSError("late metadata failure")
-
-    monkeypatch.setattr(PyTorchZipScanner, "_discover_pickle_files", fail_discovery)
-
-    direct_result = PyTorchZipScanner().scan(str(model_path))
-    assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "pytorch_zip_scan_failed" in direct_result.metadata["scan_outcome_reasons"]
-    assert any(issue.rule_code == "S405" and issue.severity == IssueSeverity.CRITICAL for issue in direct_result.issues)
-
-    aggregate_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
-    metadata = aggregate_result.file_metadata[str(model_path)]
-    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "pytorch_zip_scan_failed" in metadata["scan_outcome_reasons"]
-    assert determine_exit_code(aggregate_result) == 1
-    assert any(issue.rule_code == "S405" for issue in aggregate_result.issues)
-
-
-def test_pytorch_zip_incomplete_scan_without_findings_is_not_cached(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "incomplete.pt")
-    cache_dir = tmp_path / "cache"
-
-    def fail_discovery(
-        self: PyTorchZipScanner,
-        zip_file: zipfile.ZipFile,
-        safe_entries: list[zipfile.ZipInfo],
-        result: ScanResult,
-    ) -> list[zipfile.ZipInfo]:
-        raise OSError("late metadata failure")
+        raise OSError("pickle discovery unavailable")
 
     monkeypatch.setattr(PyTorchZipScanner, "_discover_pickle_files", fail_discovery)
 
     reset_cache_manager()
     try:
-        first_result = scan_model_directory_or_file(
-            str(model_path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        second_result = scan_model_directory_or_file(
-            str(model_path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        for aggregate_result in (first_result, second_result):
-            metadata = aggregate_result.file_metadata[str(model_path)]
-            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-            assert "pytorch_zip_scan_failed" in metadata["scan_outcome_reasons"]
-            assert determine_exit_code(aggregate_result) == 2
-            assert not any(
-                issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in aggregate_result.issues
+        for _ in range(2):
+            aggregate = scan_model_directory_or_file(
+                str(zip_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
             )
+            metadata = aggregate.file_metadata[str(zip_path)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert PyTorchZipScanner.SCAN_INCONCLUSIVE_REASON in metadata["scan_outcome_reasons"]
+            assert determine_exit_code(aggregate) == 2
+            assert not [
+                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+def test_pytorch_zip_scan_failure_preserves_prior_malicious_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_path = create_mock_pytorch_zip(tmp_path / "malicious_interrupted.pt", malicious=True)
+
+    def fail_jit_scan(
+        self: PyTorchZipScanner,
+        zip_file: zipfile.ZipFile,
+        safe_entries: list[zipfile.ZipInfo],
+        result: ScanResult,
+        path: str,
+    ) -> int:
+        raise OSError("jit scan unavailable")
+
+    monkeypatch.setattr(PyTorchZipScanner, "_scan_for_jit_patterns", fail_jit_scan)
+
+    direct = PyTorchZipScanner().scan(str(zip_path))
+    aggregate = scan_model_directory_or_file(str(zip_path), cache_enabled=False)
+
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in direct.issues)
+    assert any(check.name == "PyTorch ZIP Scan" and check.severity == IssueSeverity.INFO for check in direct.checks)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in aggregate.issues
+    )
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_pytorch_zip_timeout_marks_inconclusive(tmp_path: Path) -> None:
@@ -1040,9 +1447,12 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
         b"def payload():\n    return os.posix_spawn('/bin/sh', ['sh'], {})\n",
         b"def payload():\n    return os.posix_spawnp('sh', ['sh'], {})\n",
         b"def payload():\n    return os.startfile('payload.exe')\n",
+        b"def payload():\n    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], {})\n",
+        b"def payload():\n    os.posix_spawn = len\n    return os.posix_spawn([])\n",
+        b"def payload(data):\n    os.posix_spawn = pickle.loads\n    return os.posix_spawn(data)\n",
     ],
 )
-def test_pytorch_zip_scans_unmarked_os_process_launch_in_archive_data(tmp_path: Path, payload: bytes) -> None:
+def test_pytorch_zip_scans_os_process_launch_source_conservatively(tmp_path: Path, payload: bytes) -> None:
     zip_path = tmp_path / "model.pt"
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("archive/version", "3")
@@ -1065,89 +1475,21 @@ def test_pytorch_zip_scans_unmarked_os_process_launch_in_archive_data(tmp_path: 
 @pytest.mark.parametrize(
     "payload",
     [
-        b"def payload():\n    os.system = len\n    return os.system([])\n",
-        b"def payload():\n    os.posix_spawn = len\n    return os.posix_spawn([])\n",
-        b"def payload():\n    os.startfile = len\n    return os.startfile([])\n",
-    ],
-)
-def test_pytorch_zip_ignores_certain_replaced_os_process_launch_in_archive_data(tmp_path: Path, payload: bytes) -> None:
-    zip_path = tmp_path / "model.pt"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    assert not any(
-        check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    )
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        b"def payload():\n    return subprocess.check_call(['id'])\n",
-        b"def payload():\n    return subprocess.getoutput('id')\n",
-        b"def payload():\n    return subprocess.getstatusoutput('id')\n",
-    ],
-)
-def test_pytorch_zip_scans_unmarked_subprocess_launch_in_archive_data(tmp_path: Path, payload: bytes) -> None:
-    zip_path = tmp_path / "model.pt"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    jit_failures = [
-        check
-        for check in result.checks
-        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert any(
-        check.location == f"{zip_path}:archive/data/payload.bin" and "Subprocess execution detected" in check.message
-        for check in jit_failures
-    )
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        b"def payload():\n    subprocess.run = len\n    return subprocess.run([])\n",
-        b"def payload():\n    subprocess.check_call = len\n    return subprocess.check_call([])\n",
-        b"def payload():\n    subprocess.getoutput = len\n    return subprocess.getoutput([])\n",
-        b"def payload():\n    return subprocess.CompletedProcess([], 0)\n",
-        b"def payload():\n    return subprocess.list2cmdline(['input'])\n",
-    ],
-)
-def test_pytorch_zip_ignores_nonexecuting_or_replaced_subprocess_launch_in_archive_data(
-    tmp_path: Path, payload: bytes
-) -> None:
-    zip_path = tmp_path / "model.pt"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    assert not any(
-        check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    )
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        b"async def payload():\n    return await asyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
         b"async def payload():\n    return await asyncio.create_subprocess_shell('id')\n",
+        b"async def payload():\n    return await asyncio.subprocess.create_subprocess_exec('id')\n",
+        (
+            b"from asyncio import create_subprocess_exec as launch\n"
+            b"async def payload():\n    return await launch('id')\n"
+        ),
+        (
+            b"\x00\xffdef payload():\n"
+            b"    from asyncio import create_subprocess_shell as launch\n"
+            b"    return launch('id')\n"
+            b"}"
+        ),
     ],
 )
-def test_pytorch_zip_scans_unmarked_asyncio_process_launch_in_archive_data(tmp_path: Path, payload: bytes) -> None:
+def test_pytorch_zip_scans_asyncio_subprocess_launch_source_conservatively(tmp_path: Path, payload: bytes) -> None:
     zip_path = tmp_path / "model.pt"
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("archive/version", "3")
@@ -1167,116 +1509,16 @@ def test_pytorch_zip_scans_unmarked_asyncio_process_launch_in_archive_data(tmp_p
     )
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        (
-            b"async def payload():\n"
-            b"    asyncio.create_subprocess_exec = len\n"
-            b"    return asyncio.create_subprocess_exec([])\n"
-        ),
-        (
-            b"async def payload():\n"
-            b"    asyncio.create_subprocess_shell = len\n"
-            b"    return asyncio.create_subprocess_shell([])\n"
-        ),
-    ],
-)
-def test_pytorch_zip_ignores_certain_replaced_asyncio_process_launch_in_archive_data(
-    tmp_path: Path, payload: bytes
-) -> None:
-    zip_path = tmp_path / "model.pt"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    assert not any(
-        check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    )
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        b"getattr(__builtins__, 'eval')('1 + 1')\n",
-        b"__builtins__['ev' + 'al']('1 + 1')\n",
-        b"__builtins__.__dict__.get('eval')('1 + 1')\n",
-        b"import builtins as bi\nbi.eval('1 + 1')\n",
-        b"from builtins import eval as run\nrun('1 + 1')\n",
-        b"globals()['__builtins__']['ev' + 'al']('1 + 1')\n",
-        b"globals().get('__builtins__').get('eval')('1 + 1')\n",
-        b"getattr(globals()['__builtins__'], 'eval')('1 + 1')\n",
-        b"namespace = globals()\nnamespace['__builtins__']['ev' + 'al']('1 + 1')\n",
-        b"namespace = globals()\nnamespace.get('__builtins__').get('eval')('1 + 1')\n",
-        b"namespace = globals()\ngetattr(namespace['__builtins__'], 'eval')('1 + 1')\n",
-        b"lookup = globals().get\nlookup('__builtins__').get('ev' + 'al')('1 + 1')\n",
-        b"namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n",
-        b"lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
-        b"lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
-        (b"run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun.__call__('1 + 1')\n"),
-        (b"run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun('1 + 1')\n"),
-        (
-            b"run = globals()['__builtins__']['eval']\n"
-            b"globals()['__builtins__'].__setitem__('eval', len)\n"
-            b"run('1 + 1')\n"
-        ),
-        (
-            b"run = globals()['__builtins__']['eval']\n"
-            b"replace = globals()['__builtins__'].__setitem__\n"
-            b"replace('eval', len)\n"
-            b"run('1 + 1')\n"
-        ),
-        (
-            b"run = globals()['__builtins__']['eval']\n"
-            b"globals()['__builtins__']['eval'] = __builtins__['exec']\n"
-            b"run('1 + 1')\n"
-        ),
-        b"import builtins\nbuiltins.__dict__.pop('eval')('pass')\n",
-        b"import builtins\nrun = builtins.__dict__.pop('eval')\nrun('pass')\n",
-        b"import builtins\nif remove:\n    del builtins.__dict__['eval']\nbuiltins.eval('pass')\n",
-        b"import builtins\nrun = builtins.eval\nbuiltins.__dict__.clear()\nrun('pass')\n",
-        b"import builtins\nif remove:\n    builtins.__dict__.clear()\nbuiltins.eval('pass')\n",
-    ],
-)
-def test_pytorch_zip_scans_static_builtin_indirection_in_archive_data(tmp_path: Path, payload: bytes) -> None:
-    """A disguised source member using the builtin namespace still receives JIT analysis."""
-    zip_path = tmp_path / "model.pt"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    jit_failures = [
-        check
-        for check in result.checks
-        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert any(
-        check.location == f"{zip_path}:archive/data/payload.bin" and "Dangerous function call 'eval'" in check.message
-        for check in jit_failures
-    )
-
-
-@pytest.mark.parametrize(
-    ("payload", "builtin"),
-    [
-        (b"import builtins as bi\nbi.open('result.txt', 'w')\n", "open"),
-        (b"import builtins as bi\ngetattr(bi, 'op' + 'en')('result.txt', 'w')\n", "open"),
-        (b"from builtins import compile as build\nbuild('x = 1', '<x>', 'exec')\n", "compile"),
-    ],
-)
-def test_pytorch_zip_scans_aliased_modeled_builtins_in_archive_data(
+def test_pytorch_zip_ignores_string_literal_asyncio_subprocess_launch_with_unrelated_risk(
     tmp_path: Path,
-    payload: bytes,
-    builtin: str,
 ) -> None:
     zip_path = tmp_path / "model.pt"
+    payload = (
+        b"import pickle\n\n"
+        b"def payload(data):\n"
+        b"    pickle.loads(data)\n"
+        b"    return \"asyncio.create_subprocess_shell('id')\"\n"
+    )
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("archive/version", "3")
         zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
@@ -1284,77 +1526,34 @@ def test_pytorch_zip_scans_aliased_modeled_builtins_in_archive_data(
 
     result = PyTorchZipScanner().scan(str(zip_path))
 
-    jit_failures = [
-        check
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and "Subprocess execution detected" in check.message
         for check in result.checks
-        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert any(
-        check.location == f"{zip_path}:archive/data/payload.bin"
-        and f"Dangerous function call '{builtin}'" in check.message
-        for check in jit_failures
     )
 
 
 @pytest.mark.parametrize(
     "payload",
     [
-        b"callbacks = {'eval': len}\ncallbacks['eval']([])\n",
-        b"import builtins as bi\nbi.len([1])\n",
-        b"globals()['__builtins__']['len']([1])\n",
-        b"globals = lambda: {'__builtins__': {'eval': len}}\nglobals()['__builtins__']['eval']([])\n",
-        b"namespace = globals()\nnamespace['__builtins__']['len']([1])\n",
         (
-            b"namespace = globals()\n"
-            b"namespace = {'__builtins__': {'eval': len}}\n"
-            b"namespace['__builtins__']['eval']([])\n"
-        ),
-        (b"namespace = globals()\nnamespace['__builtins__']['eval'] = len\nnamespace['__builtins__']['eval']([])\n"),
-        b"lookup = globals().get\nlookup('__builtins__').get('len')([1])\n",
-        b"mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
-        b"globals()['__builtins__'].__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
-        b"globals()['__builtins__'].update({'eval': len})\nglobals()['__builtins__']['eval']([])\n",
-        b"import builtins\nbuiltins.__dict__.update({'eval': len})\nbuiltins.eval([])\n",
-        b"import builtins\ngetattr(builtins, '__dict__').update({'eval': len})\nbuiltins.eval([])\n",
-        b"import builtins\ndict.update(builtins.__dict__, {'eval': len})\nbuiltins.eval([])\n",
-        b"import builtins\nbuiltins.__dict__.pop('eval')\nbuiltins.eval([])\n",
-        b"import builtins\ndict.pop(builtins.__dict__, 'eval')\nbuiltins.eval([])\n",
-        b"import builtins\ndel builtins.__dict__['eval']\nbuiltins.eval([])\n",
-        b"import builtins\nbuiltins.__dict__.__delitem__('eval')\nbuiltins.eval([])\n",
-        b"import builtins\nimport operator\noperator.delitem(builtins.__dict__, 'eval')\nbuiltins.eval([])\n",
-        b"import builtins\nbuiltins.__dict__.clear()\nbuiltins.eval([])\n",
-        b"import builtins\ndict.clear(builtins.__dict__)\nbuiltins.eval([])\n",
-        (
-            b"replace = globals()['__builtins__'].__setitem__\n"
-            b"replace('eval', len)\n"
-            b"globals()['__builtins__']['eval']([])\n"
+            b"import os\n"
+            b"import subprocess\n\n"
+            b"def payload(args):\n"
+            b"    marker = os.posix_spawn\n"
+            b"    return subprocess.list2cmdline(args)\n"
         ),
         (
-            b"replace = globals()['__builtins__'].update\n"
-            b"replace({'eval': len})\n"
-            b"globals()['__builtins__']['eval']([])\n"
-        ),
-        b"setattr(globals()['__builtins__'], 'eval', len)\nglobals()['__builtins__']['eval']([])\n",
-        (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
-        (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun.__call__([])\n"),
-        (b"globals()['__builtins__'].__setitem__('eval', len)\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
-        (
-            b"replace = globals()['__builtins__'].__setitem__\n"
-            b"replace('eval', len)\n"
-            b"run = globals()['__builtins__']['eval']\n"
-            b"run([])\n"
-        ),
-        b"def payload():\n    eval = len\n    return eval([])\n",
-        (
+            b"import os\n"
+            b"import subprocess\n\n"
             b"def payload():\n"
-            b"    namespace = globals()\n"
-            b"    namespace['__builtins__']['eval'] = len\n"
-            b"    return namespace['__builtins__']['eval']([])\n"
+            b"    marker = os.posix_spawn\n"
+            b"    return subprocess.run(['echo', 'ok'], check=False)\n"
         ),
     ],
 )
-def test_pytorch_zip_ignores_benign_builtin_shaped_access_in_archive_data(tmp_path: Path, payload: bytes) -> None:
-    """Ordinary mappings and harmless builtin use must remain benign."""
+def test_pytorch_zip_ignores_uninvoked_os_process_reference_with_unrelated_risk(tmp_path: Path, payload: bytes) -> None:
     zip_path = tmp_path / "model.pt"
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("archive/version", "3")
@@ -1364,65 +1563,11 @@ def test_pytorch_zip_ignores_benign_builtin_shaped_access_in_archive_data(tmp_pa
     result = PyTorchZipScanner().scan(str(zip_path))
 
     assert not any(
-        check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and "OS command execution detected" in check.message
         for check in result.checks
     )
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        (
-            b"namespace = globals()\n"
-            b"namespace['__builtins__']['eval'] = __builtins__['exec']\n"
-            b"namespace['__builtins__']['eval']('pass')\n"
-        ),
-        (
-            b"globals()['__builtins__'].__setitem__('eval', __builtins__['exec'])\n"
-            b"globals()['__builtins__']['eval']('pass')\n"
-        ),
-        (
-            b"globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
-            b"globals()['__builtins__']['eval']('pass')\n"
-        ),
-        (
-            b"replace = globals()['__builtins__'].__setitem__\n"
-            b"replace('eval', __builtins__['exec'])\n"
-            b"globals()['__builtins__']['eval']('pass')\n"
-        ),
-        (
-            b"replace = globals()['__builtins__'].update\n"
-            b"replace({'eval': __builtins__['exec']})\n"
-            b"globals()['__builtins__']['eval']('pass')\n"
-        ),
-        (
-            b"setattr(globals()['__builtins__'], 'eval', __builtins__['exec'])\n"
-            b"globals()['__builtins__']['eval']('pass')\n"
-        ),
-        b"import builtins\nbuiltins.__dict__.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
-        b"import builtins\ngetattr(builtins, '__dict__').update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
-        b"import builtins\ndict.update(builtins.__dict__, {'eval': builtins.exec})\nbuiltins.eval('pass')\n",
-        (
-            b"import builtins\nrun = builtins.exec\nbuiltins.__dict__.clear()\n"
-            b"builtins.__dict__.update({'eval': run})\nbuiltins.eval('pass')\n"
-        ),
-    ],
-)
-def test_pytorch_zip_detects_dangerous_builtin_reassignment_in_archive_data(tmp_path: Path, payload: bytes) -> None:
-    zip_path = tmp_path / "model.pt"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    jit_failures = [
-        check
-        for check in result.checks
-        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert any("Dangerous function call 'exec'" in check.message for check in jit_failures)
 
 
 def test_pytorch_zip_ignores_non_source_eval_text_in_archive_data(tmp_path: Path) -> None:
@@ -3038,7 +3183,7 @@ def test_pytorch_zip_tensor_metadata_large_auxiliary_pickle_stays_clean(tmp_path
     )
 
 
-def _assert_tensor_metadata_inconclusive_not_cached(
+def _assert_pytorch_zip_inconclusive_not_cached(
     path: Path,
     cache_dir: Path,
     reason: str,
@@ -3079,7 +3224,7 @@ def test_pytorch_zip_tensor_metadata_parse_failure_is_exit1_and_not_cached(tmp_p
         zipf.writestr("archive/data.pkl", b"\x80\x02B")
         zipf.writestr("archive/data/0", b"\x00" * 24)
 
-    _assert_tensor_metadata_inconclusive_not_cached(
+    _assert_pytorch_zip_inconclusive_not_cached(
         zip_path,
         tmp_path / "parse-failure-cache",
         "pytorch_zip_tensor_metadata_validation_failed",
@@ -3105,7 +3250,7 @@ def test_pytorch_zip_tensor_metadata_truncation_is_exit2_and_not_cached(tmp_path
         )
         zipf.writestr("archive/data/0", b"\x00" * 24)
 
-    _assert_tensor_metadata_inconclusive_not_cached(
+    _assert_pytorch_zip_inconclusive_not_cached(
         zip_path,
         tmp_path / "truncation-cache",
         "pytorch_zip_tensor_metadata_validation_truncated",

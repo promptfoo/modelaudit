@@ -4,6 +4,7 @@ import os
 import re
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 try:
@@ -79,6 +80,9 @@ class PmmlScanner(BaseScanner):
     description = "Scans PMML files for XML security issues and suspicious content"
     supported_extensions: ClassVar[list[str]] = [".pmml"]
     MAX_EXTENSION_TEXT_NODES: ClassVar[int] = 20000
+    FILE_READ_INCOMPLETE_REASON: ClassVar[str] = "pmml_file_read_failed"
+    EXTENSION_TRAVERSAL_INCOMPLETE_REASON: ClassVar[str] = "pmml_extension_traversal_limit_exceeded"
+    XML_PARSE_INCOMPLETE_REASON: ClassVar[str] = "pmml_xml_parse_failed"
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         pmml_config = dict(config or {})
@@ -121,14 +125,20 @@ class PmmlScanner(BaseScanner):
             with open(path, "rb") as f:
                 data = f.read()
             result.bytes_scanned = len(data)
-        except Exception as e:  # pragma: no cover - unexpected read errors
+        except Exception as e:
+            mark_inconclusive_scan_result(result, self.FILE_READ_INCOMPLETE_REASON)
             result.add_check(
                 name="PMML File Read",
                 passed=False,
                 message=f"Error reading file: {e}",
                 severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self.FILE_READ_INCOMPLETE_REASON,
+                },
             )
             result.finish(success=False)
             return result
@@ -181,13 +191,19 @@ class PmmlScanner(BaseScanner):
                 )
                 root = UnsafeET.fromstring(text)
         except Exception as e:
+            mark_inconclusive_scan_result(result, self.XML_PARSE_INCOMPLETE_REASON)
             result.add_check(
                 name="XML Parse Validation",
                 passed=False,
                 message=f"Malformed XML: {e}",
                 severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self.XML_PARSE_INCOMPLETE_REASON,
+                },
                 why=(
                     "The file contains malformed XML that cannot be parsed. This may indicate corruption "
                     "or malicious content."
@@ -202,7 +218,9 @@ class PmmlScanner(BaseScanner):
         # Check for suspicious content in the parsed XML
         self._check_suspicious_content(root, result, path)
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=not result.has_errors and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        )
         return result
 
     def _check_dangerous_xml_constructs(
@@ -287,22 +305,24 @@ class PmmlScanner(BaseScanner):
             if tag_name == "extension":
                 all_text, truncated = self._get_all_text_content(elem)
                 if truncated:
+                    mark_inconclusive_scan_result(result, self.EXTENSION_TRAVERSAL_INCOMPLETE_REASON)
                     result.add_check(
                         name="Extension Element Completeness Check",
                         passed=False,
                         message=("PMML <Extension> content exceeds the safe inspection node limit; scan is incomplete"),
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={
                             "tag": elem.tag,
                             "max_extension_text_nodes": self.MAX_EXTENSION_TEXT_NODES,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": self.EXTENSION_TRAVERSAL_INCOMPLETE_REASON,
                         },
                         why=(
                             "Attackers can pad nested Extension trees to move malicious code beyond "
-                            "a bounded traversal window. Treating truncated inspection as a hard "
-                            "failure prevents a false sense of safety."
+                            "a bounded traversal window. Reporting incomplete coverage prevents a "
+                            "false sense of safety without claiming observed malicious content."
                         ),
-                        rule_code="S902",
                     )
                 combined = f"{elem_text} {attr_text} {all_text}".lower()
             else:
@@ -492,7 +512,7 @@ class PmmlScanner(BaseScanner):
         return cls._xml_namespace(tag) == root_namespace
 
     def _get_all_text_content(self, element: Any) -> tuple[str, bool]:
-        """Collect Extension text/attribute values and report bounded traversal truncation."""
+        """Collect Extension text and report whether traversal hit the node budget."""
         text_parts: list[str] = []
         stack = [element]
         nodes_seen = 0
@@ -514,7 +534,6 @@ class PmmlScanner(BaseScanner):
                 text_parts.append(current.text.strip())
             if current.tail:
                 text_parts.append(current.tail.strip())
-            text_parts.extend(str(value).strip() for value in current.attrib.values() if str(value).strip())
 
             try:
                 child_count = len(current)

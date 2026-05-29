@@ -1,14 +1,19 @@
 """Tests for metadata scanner."""
 
+import os
 import tempfile
 from pathlib import Path
 from urllib.parse import ParseResult
 
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners import metadata_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.metadata_scanner import MetadataScanner
+from modelaudit.utils.helpers import cache_decorator
 
 
 class TestMetadataScanner:
@@ -68,6 +73,149 @@ class TestMetadataScanner:
 
         assert result.scanner_name == "metadata"
         assert len(result.issues) == 0  # Clean README should have no issues
+
+    def test_metadata_read_failure_is_inconclusive_not_security_finding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Unreadable routed metadata should fail closed without a fabricated security issue."""
+        readme_path = tmp_path / "README.md"
+        readme_path.write_text("# Model Card\n\nThis README is benign.\n")
+        cache_dir = tmp_path / "cache"
+
+        def fail_read(*_args: object, **_kwargs: object) -> object:
+            raise OSError("simulated metadata read failure")
+
+        monkeypatch.setattr(metadata_scanner, "open", fail_read, raising=False)
+
+        result = MetadataScanner().scan(str(readme_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["scan_outcome_reasons"] == ["metadata_read_failed"]
+        assert result.metadata["operational_error"] is True
+        assert result.metadata["operational_error_reason"] == "metadata_read_failed"
+        read_checks = [check for check in result.checks if check.name == "Metadata File Read"]
+        assert len(read_checks) == 1
+        assert read_checks[0].severity == IssueSeverity.INFO
+        assert read_checks[0].rule_code is None
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+        reset_cache_manager()
+        try:
+            aggregates = [
+                scan_model_directory_or_file(
+                    str(readme_path),
+                    cache_enabled=True,
+                    cache_dir=str(cache_dir),
+                    min_cache_file_size=0,
+                )
+                for _ in range(2)
+            ]
+
+            for aggregate in aggregates:
+                assert aggregate.success is False
+                assert not any(
+                    issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues
+                )
+                assert determine_exit_code(aggregate) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_metadata_invalid_utf8_is_operational_not_security_finding(self, tmp_path: Path) -> None:
+        readme_path = tmp_path / "README.md"
+        readme_path.write_bytes(b"# Model Card\n\ninvalid text: \xff\n")
+
+        direct = MetadataScanner().scan(str(readme_path))
+        aggregate = scan_model_directory_or_file(str(readme_path), cache_scan_results=False)
+
+        assert direct.success is False
+        assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert direct.metadata["operational_error_reason"] == "metadata_read_failed"
+        read_check = next(check for check in direct.checks if check.name == "Metadata File Read")
+        assert read_check.details["exception_type"] == "UnicodeDecodeError"
+        assert read_check.severity == IssueSeverity.INFO
+        assert read_check.rule_code is None
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+        assert determine_exit_code(aggregate) == 2
+
+    def test_metadata_permission_failure_is_operational_after_preflight(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        readme_path = tmp_path / "README.md"
+        readme_path.write_text("# Model Card\n", encoding="utf-8")
+        real_access = os.access
+
+        def inaccessible_owned_path(path: str, mode: int) -> bool:
+            return False if path == str(readme_path) else real_access(path, mode)
+
+        monkeypatch.setattr("modelaudit.scanners.base.os.access", inaccessible_owned_path)
+
+        direct = MetadataScanner().scan(str(readme_path))
+        aggregate = scan_model_directory_or_file(str(readme_path), cache_scan_results=False)
+
+        assert direct.success is False
+        assert direct.metadata["operational_error_reason"] == "metadata_read_failed"
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in direct.issues)
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+        assert determine_exit_code(aggregate) == 2
+
+    def test_metadata_read_failure_bypasses_stale_clean_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        metadata_path = tmp_path / "model-index.yml"
+        metadata_path.write_text("model-index:\n- name: clean-model\n" + "x" * 11_000, encoding="utf-8")
+        cache_dir = tmp_path / "cache"
+
+        reset_cache_manager()
+        try:
+            with monkeypatch.context() as warm_cache:
+                warm_cache.setattr(
+                    cache_decorator,
+                    "should_bypass_cache_for_read_failure_aware_file",
+                    lambda _path: False,
+                )
+                warm_result = scan_file(
+                    str(metadata_path),
+                    config={
+                        "cache_enabled": True,
+                        "cache_dir": str(cache_dir),
+                        "min_cache_file_size": 0,
+                    },
+                )
+
+            assert warm_result.success is True
+            cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+            assert cached_entries > 0
+
+            def fail_read(*_args: object, **_kwargs: object) -> object:
+                raise OSError("simulated metadata read failure after cache warm")
+
+            monkeypatch.setattr(metadata_scanner, "open", fail_read, raising=False)
+
+            aggregate = scan_model_directory_or_file(
+                str(metadata_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert aggregate.success is False
+            assert aggregate.file_metadata[str(metadata_path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert aggregate.file_metadata[str(metadata_path)]["operational_error_reason"] == "metadata_read_failed"
+            assert not any(
+                issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues
+            )
+            assert determine_exit_code(aggregate) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
+        finally:
+            reset_cache_manager()
 
     def test_scan_suspicious_urls_in_readme(self) -> None:
         """Test detection of suspicious URLs in README."""
@@ -288,11 +436,12 @@ class TestMetadataScanner:
 
         result = scanner.scan(str(readme_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["operational_error_reason"] == "scan_timeout"
         timeout_checks = [check for check in result.checks if check.name == "Metadata Scan Timeout"]
         assert len(timeout_checks) == 1
         assert timeout_checks[0].status == CheckStatus.FAILED
-        assert timeout_checks[0].severity == IssueSeverity.WARNING
+        assert timeout_checks[0].severity == IssueSeverity.INFO
         assert not any(check.name == "Metadata Scan Error" for check in result.checks)
         assert not any(issue.type == "file_error" for issue in result.issues)
 
@@ -323,7 +472,8 @@ class TestMetadataScanner:
         timeout_checks = [check for check in result.checks if check.name == "Metadata Scan Timeout"]
         suspicious_issues = [issue for issue in result.issues if issue.details.get("suspicious_domain") == "bit.ly"]
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["operational_error_reason"] == "scan_timeout"
         assert len(timeout_checks) == 1
         assert len(suspicious_issues) == 1
         assert not any(check.name == "Metadata Scan Error" for check in result.checks)
@@ -359,7 +509,8 @@ class TestMetadataScanner:
             issue.details["suspicious_domain"] for issue in result.issues if "suspicious_domain" in issue.details
         }
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["operational_error_reason"] == "scan_timeout"
         assert len(timeout_checks) == 1
         assert detected_domains == {"bit.ly"}
         assert not any(check.name == "Metadata Scan Error" for check in result.checks)

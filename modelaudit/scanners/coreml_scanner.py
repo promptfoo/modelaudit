@@ -11,9 +11,10 @@ from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import ClassVar, NamedTuple
 
+from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
-from .base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner, IssueSeverity, ScanResult
+from .base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 _MAX_VARINT_BYTES = 10
 
@@ -348,6 +349,7 @@ class CoreMLScanner(BaseScanner):
             2004,
             2005,
             2006,
+            3000,
         }
     )
     NEURAL_NETWORK_FIELDS: ClassVar[frozenset[int]] = frozenset({303, 403, 500})
@@ -391,6 +393,15 @@ class CoreMLScanner(BaseScanner):
         )
 
     @staticmethod
+    def _is_inconclusive_result(result: ScanResult) -> bool:
+        return result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+
+    @staticmethod
+    def _preserve_tentative_inconclusive(result: ScanResult) -> None:
+        result.scanner_name = "unknown"
+        result.metadata["tentative_protobuf_candidate_unresolved"] = "coreml_analysis_incomplete"
+
+    @staticmethod
     def _reject_tentative_candidate(result: ScanResult) -> ScanResult:
         result.scanner_name = "unknown"
         result.metadata["tentative_protobuf_candidate_rejected"] = True
@@ -406,34 +417,6 @@ class CoreMLScanner(BaseScanner):
         result.finish(success=True)
         return result
 
-    @staticmethod
-    def _add_incomplete_coverage_check(
-        result: ScanResult,
-        *,
-        name: str,
-        message: str,
-        location: str,
-        details: dict[str, object],
-        reason: str = "coreml_analysis_incomplete",
-        why: str | None = None,
-    ) -> None:
-        """Report unavailable CoreML coverage without misclassifying it as risk."""
-        mark_inconclusive_scan_result(result, reason)
-        result.add_check(
-            name=name,
-            passed=False,
-            message=message,
-            severity=IssueSeverity.INFO,
-            location=location,
-            details={
-                **details,
-                "analysis_incomplete": True,
-                "scan_outcome_reason": reason,
-            },
-            rule_code="S902",
-            why=why,
-        )
-
     @classmethod
     def can_handle(cls, path: str) -> bool:
         if not os.path.isfile(path):
@@ -441,11 +424,11 @@ class CoreMLScanner(BaseScanner):
         if os.path.splitext(path)[1].lower() not in cls.supported_extensions:
             return False
 
-        file_size = os.path.getsize(path)
-        if file_size < 8:
-            return False
-
         try:
+            file_size = os.path.getsize(path)
+            if file_size < 8:
+                return False
+
             read_size = min(file_size, cls.CAN_HANDLE_READ_BYTES)
             with open(path, "rb") as handle:
                 prefix = handle.read(read_size)
@@ -459,8 +442,34 @@ class CoreMLScanner(BaseScanner):
                 return False
 
             return cls._has_coreml_structure(top_fields)
+        except OSError:
+            return True
         except Exception:
             return False
+
+    @staticmethod
+    def _is_unreadable_path_result(result: ScanResult) -> bool:
+        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    @staticmethod
+    def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
+        mark_inconclusive_scan_result(result, "coreml_read_failed")
+        mark_operational_scan_error(result, "coreml_read_failed")
+        result.add_check(
+            name="CoreML File Read",
+            passed=False,
+            message=f"Failed to read CoreML file: {error}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "coreml_read_failed",
+            },
+        )
+        result.finish(success=False)
+        return result
 
     @classmethod
     def _has_coreml_structure(cls, fields: list[_ProtoField]) -> bool:
@@ -472,7 +481,13 @@ class CoreMLScanner(BaseScanner):
         if not description_fields:
             return False
 
-        has_model_type = any(field.field_number in cls.MODEL_TYPE_FIELDS and field.wire_type == 2 for field in fields)
+        has_model_type = any(
+            field.field_number in cls.MODEL_TYPE_FIELDS
+            and field.wire_type == 2
+            and isinstance(field.value, bytes)
+            and len(field.value) > 0
+            for field in fields
+        )
         if not has_model_type:
             return False
 
@@ -490,6 +505,12 @@ class CoreMLScanner(BaseScanner):
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
+            if self._is_unreadable_path_result(path_check_result):
+                return self._finish_read_failure(
+                    self._create_result(),
+                    path,
+                    PermissionError(f"Path is not readable: {path}"),
+                )
             return path_check_result
 
         size_check = self._check_size_limit(path)
@@ -510,14 +531,16 @@ class CoreMLScanner(BaseScanner):
             with open(path, "rb") as handle:
                 data = handle.read(read_limit)
             result.bytes_scanned = len(data)
+        except OSError as exc:
+            return self._finish_read_failure(result, path, exc)
         except Exception as exc:
-            self._add_incomplete_coverage_check(
-                result,
+            result.add_check(
                 name="CoreML File Read",
+                passed=False,
                 message=f"Failed to read CoreML file: {exc}",
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception": str(exc), "exception_type": type(exc).__name__},
-                reason="coreml_file_read_failed",
             )
             result.finish(success=False)
             return result
@@ -547,13 +570,9 @@ class CoreMLScanner(BaseScanner):
         )
         if parse_error:
             if parse_error.startswith("field count exceeded limit"):
-                if self._is_tentative_protobuf_route():
-                    return self._reject_tentative_candidate(result)
                 mark_inconclusive_scan_result(result, "coreml_top_level_field_limit")
-            elif self._is_tentative_protobuf_route():
+            elif self._is_tentative_protobuf_route() and not self._is_inconclusive_result(result):
                 return self._reject_tentative_candidate(result)
-            else:
-                mark_inconclusive_scan_result(result, "coreml_protobuf_parse_failed")
             result.add_check(
                 name="CoreML Protobuf Parse",
                 passed=False,
@@ -562,11 +581,13 @@ class CoreMLScanner(BaseScanner):
                 location=path,
                 details={"parse_error": parse_error},
             )
+            if self._is_tentative_protobuf_route() and self._is_inconclusive_result(result):
+                self._preserve_tentative_inconclusive(result)
             result.finish(success=False)
             return result
 
         if not self._has_coreml_structure(top_fields):
-            if self._is_tentative_protobuf_route():
+            if self._is_tentative_protobuf_route() and not self._is_inconclusive_result(result):
                 return self._reject_tentative_candidate(result)
             result.add_check(
                 name="CoreML Structural Validation",
@@ -575,6 +596,8 @@ class CoreMLScanner(BaseScanner):
                 severity=IssueSeverity.INFO,
                 location=path,
             )
+            if self._is_tentative_protobuf_route() and self._is_inconclusive_result(result):
+                self._preserve_tentative_inconclusive(result)
             result.finish(success=False)
             return result
 
@@ -617,8 +640,7 @@ class CoreMLScanner(BaseScanner):
         if scan_truncated:
             mark_inconclusive_scan_result(result, "coreml_analysis_incomplete")
 
-        scan_incomplete = result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-        if metadata_findings == 0 and not scan_incomplete:
+        if metadata_findings == 0 and not scan_truncated:
             result.add_check(
                 name="CoreML Metadata Security Check",
                 passed=True,
@@ -626,7 +648,7 @@ class CoreMLScanner(BaseScanner):
                 location=path,
             )
 
-        if custom_findings == 0 and not scan_incomplete:
+        if custom_findings == 0 and not scan_truncated:
             result.add_check(
                 name="CoreML Custom Code Path Check",
                 passed=True,
@@ -634,7 +656,7 @@ class CoreMLScanner(BaseScanner):
                 location=path,
             )
 
-        if linked_path_findings == 0 and not scan_incomplete:
+        if linked_path_findings == 0 and not scan_truncated:
             result.add_check(
                 name="CoreML Linked Model Path Check",
                 passed=True,
@@ -744,10 +766,11 @@ class CoreMLScanner(BaseScanner):
             return
 
         result.metadata["coreml_traversal_truncated"] = True
-        self._add_incomplete_coverage_check(
-            result,
+        result.add_check(
             name="CoreML Recursive Traversal Limit",
+            passed=False,
             message="CoreML nested-message traversal reached the safe depth limit; scan is incomplete",
+            severity=IssueSeverity.CRITICAL,
             location=path,
             details={
                 "field_path": message_path,
@@ -823,14 +846,15 @@ class CoreMLScanner(BaseScanner):
             max_fields=self.MAX_NESTED_FIELDS,
         )
         if desc_error:
-            self._add_incomplete_coverage_check(
-                result,
+            result.add_check(
                 name="CoreML Description Parse",
+                passed=False,
                 message=f"Unable to parse CoreML model description: {desc_error}",
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"field_path": description_path, "parse_error": desc_error},
             )
-            return findings
+            return findings + 1
 
         metadata_messages = _len_fields(desc_fields, 100)
         if not metadata_messages:
@@ -841,14 +865,15 @@ class CoreMLScanner(BaseScanner):
             max_fields=self.MAX_NESTED_FIELDS,
         )
         if metadata_error:
-            self._add_incomplete_coverage_check(
-                result,
+            result.add_check(
                 name="CoreML Metadata Parse",
+                passed=False,
                 message=f"Unable to parse CoreML metadata section: {metadata_error}",
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"field_path": f"{description_path}.metadata", "parse_error": metadata_error},
             )
-            return findings
+            return findings + 1
 
         builtin_metadata_fields = {
             1: "shortDescription",
@@ -887,16 +912,18 @@ class CoreMLScanner(BaseScanner):
         for index, entry_field in enumerate(user_defined_fields):
             entry_fields, entry_error = self._parse_field_message(entry_field, max_fields=32)
             if entry_error:
-                self._add_incomplete_coverage_check(
-                    result,
+                result.add_check(
                     name="CoreML User Metadata Entry Parse",
+                    passed=False,
                     message=f"Malformed user-defined metadata entry at index {index}: {entry_error}",
+                    severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={
                         "field_path": f"{description_path}.metadata.userDefined[{index}]",
                         "parse_error": entry_error,
                     },
                 )
+                findings += 1
                 continue
 
             key_field = _len_fields(entry_fields, 1)
@@ -1052,16 +1079,18 @@ class CoreMLScanner(BaseScanner):
                 max_fields=self.MAX_NESTED_FIELDS,
             )
             if network_error:
-                self._add_incomplete_coverage_check(
-                    result,
+                result.add_check(
                     name="CoreML Neural Network Parse",
+                    passed=False,
                     message=f"Unable to parse CoreML neural network block: {network_error}",
+                    severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={
                         "field_path": f"{model_path}[{model_field.field_number}]",
                         "parse_error": network_error,
                     },
                 )
+                findings += 1
                 continue
 
             layer_fields = _len_fields(network_fields, 1)
@@ -1072,16 +1101,18 @@ class CoreMLScanner(BaseScanner):
                     max_fields=self.MAX_NESTED_FIELDS,
                 )
                 if layer_error:
-                    self._add_incomplete_coverage_check(
-                        result,
+                    result.add_check(
                         name="CoreML Layer Parse",
+                        passed=False,
                         message=f"Unable to parse CoreML layer definition: {layer_error}",
+                        severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={
                             "field_path": f"{model_path}[{model_field.field_number}].layers[{layer_index}]",
                             "parse_error": layer_error,
                         },
                     )
+                    findings += 1
                     continue
 
                 layer_name = ""
@@ -1099,16 +1130,18 @@ class CoreMLScanner(BaseScanner):
                         max_fields=self.MAX_NESTED_FIELDS,
                     )
                     if custom_error:
-                        self._add_incomplete_coverage_check(
-                            result,
+                        result.add_check(
                             name="CoreML Custom Layer Parse",
+                            passed=False,
                             message=f"Unable to parse CoreML custom layer block: {custom_error}",
+                            severity=IssueSeverity.CRITICAL,
                             location=path,
                             details={
                                 "field_path": f"{model_path}[{model_field.field_number}].layers[{layer_index}].custom",
                                 "parse_error": custom_error,
                             },
                         )
+                        findings += 1
                         continue
 
                     class_name = ""
@@ -1154,16 +1187,18 @@ class CoreMLScanner(BaseScanner):
                 max_fields=self.MAX_NESTED_FIELDS,
             )
             if custom_model_error:
-                self._add_incomplete_coverage_check(
-                    result,
+                result.add_check(
                     name="CoreML Custom Model Parse",
+                    passed=False,
                     message=f"Unable to parse CoreML custom model block: {custom_model_error}",
+                    severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={
                         "field_path": f"{model_path}[555]",
                         "parse_error": custom_model_error,
                     },
                 )
+                findings += 1
                 continue
 
             class_name = ""
@@ -1220,16 +1255,18 @@ class CoreMLScanner(BaseScanner):
         for entry_index, parameter_entry in enumerate(parameter_entries):
             entry_fields, entry_error = self._parse_field_message(parameter_entry, max_fields=32)
             if entry_error:
-                self._add_incomplete_coverage_check(
-                    result,
+                result.add_check(
                     name="CoreML Custom Parameter Entry Parse",
+                    passed=False,
                     message=f"Unable to parse CoreML custom parameter entry: {entry_error}",
+                    severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={
                         "field_path": f"{field_path}[{entry_index}]",
                         "parse_error": entry_error,
                     },
                 )
+                findings += 1
                 continue
 
             key_fields = _len_fields(entry_fields, 1)
@@ -1244,10 +1281,11 @@ class CoreMLScanner(BaseScanner):
             param_key = _decode_string(raw_key, max_length=256)
             value_message_fields, value_error = self._parse_field_message(value_fields[0], max_fields=32)
             if value_error:
-                self._add_incomplete_coverage_check(
-                    result,
+                result.add_check(
                     name="CoreML Custom Parameter Value Parse",
+                    passed=False,
                     message=f"Unable to parse CoreML custom parameter value: {value_error}",
+                    severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={
                         "field_path": f"{field_path}[{entry_index}].{param_key or '<unnamed>'}",
@@ -1255,6 +1293,7 @@ class CoreMLScanner(BaseScanner):
                         "parse_error": value_error,
                     },
                 )
+                findings += 1
                 continue
 
             string_values = _len_fields(value_message_fields, 20)
@@ -1309,16 +1348,18 @@ class CoreMLScanner(BaseScanner):
         for linked_model_field in linked_model_fields:
             linked_model_message, parse_error = self._parse_field_message(linked_model_field, max_fields=64)
             if parse_error:
-                self._add_incomplete_coverage_check(
-                    result,
+                result.add_check(
                     name="CoreML Linked Model Parse",
+                    passed=False,
                     message=f"Unable to parse CoreML linked-model block: {parse_error}",
+                    severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={
                         "field_path": f"{model_path}[556]",
                         "parse_error": parse_error,
                     },
                 )
+                findings += 1
                 continue
 
             linked_model_file_fields = _len_fields(linked_model_message, 1)
@@ -1328,16 +1369,18 @@ class CoreMLScanner(BaseScanner):
                     max_fields=64,
                 )
                 if file_error:
-                    self._add_incomplete_coverage_check(
-                        result,
+                    result.add_check(
                         name="CoreML Linked Model File Parse",
+                        passed=False,
                         message=f"Unable to parse CoreML linked-model file entry: {file_error}",
+                        severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={
                             "field_path": f"{model_path}[556].linkedModelFile",
                             "parse_error": file_error,
                         },
                     )
+                    findings += 1
                     continue
 
                 file_name = self._extract_string_parameter(linked_model_file, field_number=1)
