@@ -23,7 +23,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner, mxnet_scanner, safetensors_scanner
-from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
 from modelaudit.utils.file import detection as file_detection
@@ -2308,6 +2308,69 @@ def test_scan_file_preserves_zip_findings_in_llamafile_polyglot(tmp_path: Path, 
 
     assert result.scanner_name == "llamafile"
     _assert_system_pickle_detected(result, "payload.pkl")
+
+
+@pytest.mark.parametrize(
+    ("runtime_padding", "torch7_payload"),
+    [
+        (
+            b"",
+            b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\ncmd = os.execute('id')\n",
+        ),
+        (b"", b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id')\n"),
+        (
+            b"A" * (64 * 1024),
+            b"4\n1\n3\nV 1\n17\ntorch.FloatTensor\ncmd = os.execute('id')\n",
+        ),
+        (b"GGUFnot-a-valid-model", b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id')\n"),
+    ],
+    ids=["ascii", "binary", "late-ascii-no-boundary", "decoy-gguf-before-binary"],
+)
+def test_scan_file_preserves_torch7_findings_in_llamafile_polyglot(
+    tmp_path: Path,
+    runtime_padding: bytes,
+    torch7_payload: bytes,
+) -> None:
+    polyglot = tmp_path / "payload.jpg"
+    polyglot.write_bytes(
+        b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime\n" + runtime_padding + torch7_payload
+    )
+
+    result = scan_file(str(polyglot), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "llamafile"
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+
+
+def test_scan_file_does_not_merge_torch7_for_llamafile_text_near_match(tmp_path: Path) -> None:
+    executable = tmp_path / "payload.jpg"
+    executable.write_bytes(
+        b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime includes torch tensor metadata\n"
+    )
+
+    result = scan_file(str(executable), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "llamafile"
+    assert not any(check.name.startswith("Torch7 ") for check in result.checks)
+
+
+def test_scan_file_does_not_merge_torch7_for_llamafile_magic_only_marker(tmp_path: Path) -> None:
+    executable = tmp_path / "payload.jpg"
+    executable.write_bytes(
+        b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime\n" + b"T7\x00\x00" + (b"A" * 8192)
+    )
+
+    result = scan_file(str(executable), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "llamafile"
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert "embedded_torch7_offset" not in result.metadata
+    assert not any(check.name.startswith("Torch7 ") for check in result.checks)
 
 
 @pytest.mark.parametrize("container_kind", ["pytorch", "executorch", "skops"])

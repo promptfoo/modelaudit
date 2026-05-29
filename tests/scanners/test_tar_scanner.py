@@ -464,6 +464,19 @@ class TestTarScanner:
 
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
 
+    def test_scan_tar_ignores_runpy_member_after_module_alias_rebind(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"class Safe:\n    run_path = len\nimport runpy as rp\nrp = Safe()\nrp.run_path([])\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+
     def test_scan_tar_ignores_safe_namespace_slot_rebinding(self, tmp_path: Path) -> None:
         """A safe final callable bound through a module dictionary should remain clean."""
         archive_path = tmp_path / "model_bundle.tar"
