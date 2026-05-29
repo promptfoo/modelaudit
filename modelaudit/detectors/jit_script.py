@@ -135,6 +135,13 @@ _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS = 10
 _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS = 16
 _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES = 16_384
 _MAX_PRIORITY_ALIAS_USAGE_LINES = 8
+# Each indirect-alias probe re-parses and re-resolves the whole (<=16 KiB) snippet,
+# so an unbounded loop is quadratic in the assignment count. Cap the expensive
+# probes; the cheap direct-reference fast path still runs for every assignment.
+_MAX_PRIORITY_ASSIGNMENT_PROBES = 48
+# Bound nested ``:``-header recursion when extracting an embedded statement so a
+# crafted deeply-indented blob cannot exhaust the interpreter stack.
+_MAX_BODY_STATEMENT_NESTING = 100
 _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES = 1_000_000
 _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES = 16_384
 _EMBEDDED_PYTHON_START_MARKERS = (b"def ", b"async def ", b"class ", b"import ", b"from ")
@@ -397,11 +404,15 @@ def _priority_import_aliases(candidate: bytes) -> frozenset[bytes]:
 def _priority_assignment_aliases(source: str, tree: ast.AST, priority_aliases: set[str]) -> set[bytes]:
     aliases: set[bytes] = set()
     discovered_aliases = set(priority_aliases)
+    expensive_probes = 0
     for target, value in _assignment_targets_and_values_in_tree(tree):
         if _expression_is_priority_alias_reference(value, discovered_aliases):
             aliases.add(target.encode("utf-8"))
             discovered_aliases.add(target)
             continue
+        if expensive_probes >= _MAX_PRIORITY_ASSIGNMENT_PROBES:
+            continue
+        expensive_probes += 1
         probe = f"{source}\n" + "\n".join(_priority_assignment_probe_calls(target))
         try:
             probe_tree = ast.parse(probe)
@@ -553,10 +564,6 @@ def _priority_alias_shadow_segment_end(candidate: bytes, line: bytes, line_end: 
     return segment_end if body_seen else line_end
 
 
-def _line_uses_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
-    return bool(_line_used_priority_aliases(code_line, aliases))
-
-
 def _line_used_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
     return frozenset(
         alias
@@ -567,10 +574,6 @@ def _line_used_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> 
             code_line,
         )
     )
-
-
-def _line_calls_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
-    return bool(_line_called_priority_aliases(code_line, aliases))
 
 
 def _line_called_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
@@ -700,10 +703,6 @@ def _target_bound_priority_aliases(target: ast.AST, aliases: frozenset[bytes]) -
     return frozenset()
 
 
-def _target_binds_priority_alias(target: ast.AST, aliases: frozenset[bytes]) -> bool:
-    return bool(_target_bound_priority_aliases(target, aliases))
-
-
 def _statement_bound_priority_aliases(statement: ast.stmt, aliases: frozenset[bytes]) -> frozenset[bytes]:
     if isinstance(statement, ast.Assign):
         return frozenset(
@@ -736,41 +735,6 @@ def _statement_bound_priority_aliases(statement: ast.stmt, aliases: frozenset[by
             alias for target in statement.targets for alias in _target_bound_priority_aliases(target, aliases)
         )
     return frozenset()
-
-
-def _statement_binds_priority_alias(statement: ast.stmt, aliases: frozenset[bytes]) -> bool:
-    return bool(_statement_bound_priority_aliases(statement, aliases))
-
-
-def _line_assigns_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
-    decoded_line = textwrap.dedent(code_line.decode("utf-8", errors="ignore"))
-    try:
-        tree = ast.parse(decoded_line)
-    except SyntaxError:
-        if not decoded_line.rstrip().endswith(":"):
-            return False
-        try:
-            tree = ast.parse(f"{decoded_line.rstrip()}\n    pass\n")
-        except (SyntaxError, ValueError):
-            return False
-    except ValueError:
-        return False
-
-    pending = list(reversed(tree.body))
-    while pending:
-        statement = pending.pop()
-        if _statement_binds_priority_alias(statement, aliases):
-            return True
-        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue
-        pending.extend(
-            child for child in reversed(list(ast.iter_child_nodes(statement))) if isinstance(child, ast.stmt)
-        )
-    return False
-
-
-def _line_shadows_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
-    return bool(_line_shadowed_priority_aliases(code_line, aliases))
 
 
 def _line_shadowed_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
@@ -852,7 +816,9 @@ def _compound_header_start(line_start: int, structural_line: bytes) -> int:
     return line_start
 
 
-def _first_body_statement_segment(candidate: bytes, header_line_end: int, header_indent: int) -> tuple[int, int] | None:
+def _first_body_statement_segment(
+    candidate: bytes, header_line_end: int, header_indent: int, _depth: int = 0
+) -> tuple[int, int] | None:
     line_start = header_line_end
     while line_start < len(candidate):
         line_end = _line_end_offset(candidate, line_start)
@@ -873,8 +839,10 @@ def _first_body_statement_segment(candidate: bytes, header_line_end: int, header
             statement_end = _line_end_offset(candidate, continuation_start)
             paren_depth += _line_parenthesis_delta(candidate[continuation_start:statement_end])
 
-        if structural_line.endswith(b":"):
-            nested_segment = _first_body_statement_segment(candidate, statement_end, _line_indent_width(line))
+        if structural_line.endswith(b":") and _depth < _MAX_BODY_STATEMENT_NESTING:
+            nested_segment = _first_body_statement_segment(
+                candidate, statement_end, _line_indent_width(line), _depth + 1
+            )
             if nested_segment is not None:
                 statement_end = nested_segment[1]
         return line_start, statement_end
