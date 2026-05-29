@@ -16,6 +16,7 @@ from modelaudit.scanners.llamafile_scanner import (
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
     LLAMAFILE_RUNTIME_PREVIEW_READ_REASON,
     LlamafileScanner,
+    find_structural_torch7_offset,
 )
 
 
@@ -263,14 +264,21 @@ def test_llamafile_finds_torch7_in_initial_payload_pass_while_skipping_marker_de
     signal_probe_offsets: list[int] = []
     original_signal_rank = LlamafileScanner._embedded_torch7_candidate_actionable_signal_rank
 
-    def counting_signal_rank(path: Path, offset: int, max_scan_bytes: int) -> int:
+    def counting_signal_rank(path: Path, offset: int, max_scan_bytes: int, *, stop_at_any_marker: bool = False) -> int:
         signal_probe_offsets.append(offset)
-        return original_signal_rank(path, offset, max_scan_bytes)
+        return original_signal_rank(path, offset, max_scan_bytes, stop_at_any_marker=stop_at_any_marker)
 
     monkeypatch.setattr(
         LlamafileScanner,
         "_embedded_torch7_candidate_actionable_signal_rank",
-        classmethod(lambda cls, path, offset, max_scan_bytes: counting_signal_rank(path, offset, max_scan_bytes)),
+        classmethod(
+            lambda cls, path, offset, max_scan_bytes, *, stop_at_any_marker=False: counting_signal_rank(
+                path,
+                offset,
+                max_scan_bytes,
+                stop_at_any_marker=stop_at_any_marker,
+            )
+        ),
     )
 
     result = LlamafileScanner(config={"torch7_max_scan_bytes": 128}).scan(str(binary))
@@ -440,6 +448,58 @@ def test_llamafile_ranks_split_critical_signal_before_actionable_cap(tmp_path: P
     )
 
 
+def test_llamafile_does_not_rank_unrelated_shell_string_as_critical_cap_signal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "torch7-unrelated-shell-decoys-then-critical.llamafile"
+    warning_candidates = [
+        (
+            f"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id-{index}')\n".encode()
+            + b"\x00".join(f"benign-{filler}".encode() for filler in range(8))
+            + b"\x00bash -c\n"
+            + b"\x00"
+            + (b"P" * 512)
+        )
+        for index in range(4)
+    ]
+    critical_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('bash -c id')\n"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=b"".join(warning_candidates) + critical_payload))
+
+    scanned_offsets: list[int] = []
+    original_scan_candidate = LlamafileScanner._scan_embedded_torch7_candidate
+
+    def counting_scan_candidate(
+        self: LlamafileScanner,
+        path: Path,
+        scanner: Any,
+        result: ScanResult,
+        offset: int,
+    ) -> tuple[ScanResult | None, int]:
+        scanned_offsets.append(offset)
+        return original_scan_candidate(self, path, scanner, result, offset)
+
+    monkeypatch.setattr(LlamafileScanner, "_scan_embedded_torch7_candidate", counting_scan_candidate)
+
+    result = LlamafileScanner(config={"llamafile_torch7_max_candidate_scans": 2, "torch7_max_scan_bytes": 512}).scan(
+        str(binary)
+    )
+
+    critical_offset = binary.read_bytes().index(critical_payload)
+    assert scanned_offsets == [
+        binary.read_bytes().index(warning_candidates[0]),
+        binary.read_bytes().index(warning_candidates[1]),
+        critical_offset,
+    ]
+    assert result.metadata["embedded_torch7_offset"] == critical_offset
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
 def test_llamafile_keeps_searching_after_non_actionable_candidate_cap(tmp_path: Path) -> None:
     binary = tmp_path / "torch7-many-benign-candidates-then-payload.llamafile"
     benign_candidates = b"".join(b"T7\x00\x00" + (b"A" * 64) for _ in range(32))
@@ -587,7 +647,7 @@ def test_llamafile_preserves_magic_only_binary_torch7_payload_with_late_lua_sign
 
 def test_llamafile_preserves_printable_magic_only_torch7_payload_with_late_lua_signal(tmp_path: Path) -> None:
     binary = tmp_path / "late-printable-magic-only-torch7.llamafile"
-    torch7_payload = b"T7\x00\x00" + (b"A" * (80 * 1024)) + b"cmd = os.execute('id')\n"
+    torch7_payload = b"T7\x00\x00" + (b"A" * (2 * 1024 * 1024)) + b"cmd = os.execute('id')\n"
     binary.write_bytes(_build_llamafile_blob(embedded_payload=torch7_payload))
 
     result = LlamafileScanner().scan(str(binary))
@@ -627,7 +687,9 @@ def test_llamafile_ignores_many_invalid_ascii_torch7_header_decoys(
     binary.write_bytes(_build_llamafile_blob(embedded_payload=invalid_ascii_decoys + torch7_payload))
 
     scanned_offsets: list[int] = []
+    structural_probes = 0
     original_scan_candidate = LlamafileScanner._scan_embedded_torch7_candidate
+    original_structural_probe = find_structural_torch7_offset
 
     def counting_scan_candidate(
         self: LlamafileScanner,
@@ -639,11 +701,20 @@ def test_llamafile_ignores_many_invalid_ascii_torch7_header_decoys(
         scanned_offsets.append(offset)
         return original_scan_candidate(self, path, scanner, result, offset)
 
+    def counting_structural_probe(payload: bytes) -> int | None:
+        nonlocal structural_probes
+        structural_probes += 1
+        return original_structural_probe(payload)
+
     monkeypatch.setattr(LlamafileScanner, "_scan_embedded_torch7_candidate", counting_scan_candidate)
+    monkeypatch.setattr(
+        "modelaudit.scanners.llamafile_scanner.find_structural_torch7_offset", counting_structural_probe
+    )
 
     result = LlamafileScanner(config={"torch7_max_scan_bytes": 256}).scan(str(binary))
 
     assert scanned_offsets == [binary.read_bytes().index(torch7_payload)]
+    assert structural_probes <= 4
     assert any(
         check.name == "Torch7 Lua Execution Primitive Analysis"
         and check.status == CheckStatus.FAILED

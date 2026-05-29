@@ -33,7 +33,7 @@ LLAMAFILE_TORCH7_ANALYSIS_INCOMPLETE_REASON = "llamafile_torch7_analysis_incompl
 TORCH7_SIGNATURE_WINDOW_BYTES = 4096
 TORCH7_BINARY_MARKER = b"T7\x00\x00"
 TORCH7_ACTIONABLE_SIGNAL_CHUNK_BYTES = 64 * 1024
-TORCH7_ACTIONABLE_SIGNAL_CARRY_BYTES = 128
+TORCH7_ACTIONABLE_SIGNAL_CARRY_BYTES = 1024
 LLAMAFILE_TORCH7_MAX_CANDIDATE_SCANS = 16
 
 ELF_MAGIC = b"\x7fELF"
@@ -48,6 +48,7 @@ MACHO_MAGICS = {
 }
 
 PRINTABLE_TEXT_RE = re.compile(rb"[ -~]{8,}")
+TORCH7_PRINTABLE_TEXT_RE = re.compile(rb"[\t\n\r -~]{6,512}")
 TORCH7_EXEC_PRIMITIVE_BYTES_RE = re.compile(
     rb"(?i)\b(?:os\.execute|io\.popen|loadstring|dofile|loadfile|setfenv|getfenv)\s*\("
 )
@@ -534,7 +535,12 @@ class LlamafileScanner(BaseScanner):
         best_scanned_signal_rank = 0
         actionable_scan_limited = False
 
-        for next_offset in self._iter_embedded_torch7_offsets(path, self.max_payload_scan_bytes, start_offset=offset):
+        for next_offset in self._iter_embedded_torch7_offsets(
+            path,
+            self.max_payload_scan_bytes,
+            start_offset=offset,
+            signal_scan_bytes=scanner.max_scan_bytes,
+        ):
             structurally_credible = self._embedded_torch7_candidate_is_structural(path, next_offset)
             has_binary_payload = self._embedded_torch7_candidate_has_binary_payload_bytes(path, next_offset)
             actionable_signal_rank = self._embedded_torch7_candidate_actionable_signal_rank(
@@ -649,22 +655,31 @@ class LlamafileScanner(BaseScanner):
 
     @classmethod
     def _torch7_actionable_signal_rank(cls, window: bytes) -> int:
-        has_exec = TORCH7_EXEC_PRIMITIVE_BYTES_RE.search(window) is not None
-        if has_exec and TORCH7_NETWORK_OR_SHELL_BYTES_RE.search(window) is not None:
-            return 2
-        if (
-            has_exec
-            or TORCH7_DYNAMIC_LOAD_BYTES_RE.search(window) is not None
-            or cls._torch7_has_suspicious_require(window)
-        ):
-            return 1
-        return 0
+        rank = 0
+        strings = TORCH7_PRINTABLE_TEXT_RE.findall(window)
+        for index, text in enumerate(strings):
+            if TORCH7_EXEC_PRIMITIVE_BYTES_RE.search(text) is None:
+                continue
+            rank = 1
+            window_start = max(0, index - 1)
+            window_end = min(len(strings), index + 2)
+            context_window = b" ".join(strings[window_start:window_end])
+            if TORCH7_NETWORK_OR_SHELL_BYTES_RE.search(context_window) is not None:
+                return 2
+        if TORCH7_DYNAMIC_LOAD_BYTES_RE.search(window) is not None or cls._torch7_has_suspicious_require(window):
+            rank = max(rank, 1)
+        return rank
 
     @classmethod
-    def _embedded_torch7_candidate_actionable_signal_rank(cls, path: Path, offset: int, max_scan_bytes: int) -> int:
+    def _embedded_torch7_candidate_actionable_signal_rank(
+        cls,
+        path: Path,
+        offset: int,
+        max_scan_bytes: int,
+        *,
+        stop_at_any_marker: bool = False,
+    ) -> int:
         best_rank = 0
-        seen_exec = False
-        seen_network_or_shell = False
         try:
             with path.open("rb") as handle:
                 handle.seek(offset)
@@ -678,18 +693,14 @@ class LlamafileScanner(BaseScanner):
 
                     haystack = carry + chunk
                     marker_search_start = len(carry) + (len(TORCH7_BINARY_MARKER) if first_chunk else 0)
-                    next_marker = cls._find_structural_torch7_boundary(haystack, marker_search_start)
+                    next_marker = (
+                        haystack.find(TORCH7_BINARY_MARKER, marker_search_start)
+                        if stop_at_any_marker
+                        else cls._find_structural_torch7_boundary(haystack, marker_search_start)
+                    )
                     signal_window = haystack if next_marker == -1 else haystack[:next_marker]
-                    if TORCH7_EXEC_PRIMITIVE_BYTES_RE.search(signal_window) is not None:
-                        seen_exec = True
-                        best_rank = max(best_rank, 1)
-                    if TORCH7_NETWORK_OR_SHELL_BYTES_RE.search(signal_window) is not None:
-                        seen_network_or_shell = True
-                    if TORCH7_DYNAMIC_LOAD_BYTES_RE.search(
-                        signal_window
-                    ) is not None or cls._torch7_has_suspicious_require(signal_window):
-                        best_rank = max(best_rank, 1)
-                    if seen_exec and seen_network_or_shell:
+                    best_rank = max(best_rank, cls._torch7_actionable_signal_rank(signal_window))
+                    if best_rank == 2:
                         return 2
                     if next_marker != -1:
                         return best_rank
@@ -700,6 +711,44 @@ class LlamafileScanner(BaseScanner):
         except OSError:
             return 0
         return best_rank
+
+    @staticmethod
+    def _torch7_ascii_candidate_is_structural(candidate_window: bytes) -> bool:
+        fields: list[bytes] = []
+        position = 0
+        while len(fields) < 6 and position < len(candidate_window):
+            line_limit = min(len(candidate_window), position + TORCH7_SIGNATURE_WINDOW_BYTES + 1)
+            newline = candidate_window.find(b"\n", position, line_limit)
+            carriage_return = candidate_window.find(b"\r", position, line_limit)
+            line_end_candidates = [index for index in (newline, carriage_return) if index != -1]
+            if not line_end_candidates:
+                if line_limit < len(candidate_window):
+                    return False
+                fields.append(candidate_window[position:line_limit])
+                break
+
+            line_end = min(line_end_candidates)
+            fields.append(candidate_window[position:line_end])
+            position = line_end + 2 if candidate_window[line_end : line_end + 2] == b"\r\n" else line_end + 1
+
+        if len(fields) < 6:
+            return False
+        try:
+            object_index = int(fields[1])
+            version_length = int(fields[2])
+            class_name_length = int(fields[4])
+        except ValueError:
+            return False
+
+        version = fields[3]
+        class_name = fields[5]
+        return (
+            object_index > 0
+            and version_length == len(version)
+            and class_name_length == len(class_name)
+            and re.fullmatch(rb"V [+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", version) is not None
+            and class_name.startswith((b"torch.", b"nn.", b"cunn.", b"cutorch."))
+        )
 
     @classmethod
     def _find_structural_torch7_boundary(cls, haystack: bytes, search_start: int) -> int:
@@ -714,7 +763,7 @@ class LlamafileScanner(BaseScanner):
         for match in re.finditer(rb"4(?:\r\n|[\r\n])", ascii_window):
             candidate_offset = search_start + match.start()
             candidate_window = haystack[candidate_offset : candidate_offset + TORCH7_SIGNATURE_WINDOW_BYTES]
-            if find_structural_torch7_offset(candidate_window) == 0:
+            if cls._torch7_ascii_candidate_is_structural(candidate_window):
                 return candidate_offset
 
         return -1
@@ -902,7 +951,14 @@ class LlamafileScanner(BaseScanner):
         return gguf_offset, torch7_offset
 
     @classmethod
-    def _iter_embedded_torch7_offsets(cls, path: Path, max_scan_bytes: int, *, start_offset: int = 0) -> Iterator[int]:
+    def _iter_embedded_torch7_offsets(
+        cls,
+        path: Path,
+        max_scan_bytes: int,
+        *,
+        start_offset: int = 0,
+        signal_scan_bytes: int | None = None,
+    ) -> Iterator[int]:
         """Yield Torch7 candidate offsets in one bounded pass."""
         file_size = path.stat().st_size
         search_limit = min(file_size, max_scan_bytes)
@@ -936,7 +992,14 @@ class LlamafileScanner(BaseScanner):
                     if (
                         absolute_offset > last_yielded
                         and file_size - absolute_offset >= 8
-                        and cls._torch7_marker_candidate_is_promising(haystack, marker_offset, candidate_window)
+                        and cls._torch7_marker_candidate_is_promising(
+                            path,
+                            absolute_offset,
+                            haystack,
+                            marker_offset,
+                            candidate_window,
+                            min(signal_scan_bytes or max_scan_bytes, max_scan_bytes - absolute_offset),
+                        )
                     ):
                         relative_offsets.add(marker_offset)
                     marker_search_offset = marker_offset + 1
@@ -946,7 +1009,7 @@ class LlamafileScanner(BaseScanner):
                     if absolute_offset <= last_yielded:
                         continue
                     candidate_window = haystack[match.start() : match.start() + TORCH7_SIGNATURE_WINDOW_BYTES]
-                    if find_structural_torch7_offset(candidate_window) == 0:
+                    if cls._torch7_ascii_candidate_is_structural(candidate_window):
                         relative_offsets.add(match.start())
 
                 for relative_offset in sorted(relative_offsets):
@@ -962,9 +1025,12 @@ class LlamafileScanner(BaseScanner):
     @classmethod
     def _torch7_marker_candidate_is_promising(
         cls,
+        path: Path,
+        absolute_offset: int,
         haystack: bytes,
         marker_offset: int,
         candidate_window: bytes,
+        max_signal_scan_bytes: int,
     ) -> bool:
         if find_structural_torch7_offset(candidate_window) == 0:
             return True
@@ -973,7 +1039,17 @@ class LlamafileScanner(BaseScanner):
 
         next_marker = haystack.find(TORCH7_BINARY_MARKER, marker_offset + len(TORCH7_BINARY_MARKER))
         signal_window = haystack[marker_offset:] if next_marker == -1 else haystack[marker_offset:next_marker]
-        return cls._torch7_actionable_signal_rank(signal_window) > 0
+        if cls._torch7_actionable_signal_rank(signal_window) > 0:
+            return True
+        return (
+            cls._embedded_torch7_candidate_actionable_signal_rank(
+                path,
+                absolute_offset,
+                max_signal_scan_bytes,
+                stop_at_any_marker=True,
+            )
+            > 0
+        )
 
     @classmethod
     def _find_embedded_torch7_offset(cls, path: Path, max_scan_bytes: int, *, start_offset: int = 0) -> int | None:
