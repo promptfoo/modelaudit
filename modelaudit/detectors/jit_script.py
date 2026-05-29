@@ -287,7 +287,28 @@ def _bounded_priority_embedded_python_candidate(
     index = bisect_left(priority_offsets, span[0])
     if index >= len(priority_offsets) or priority_offsets[index] >= span[1]:
         return candidate, span, (span,)
-    priority_relative_offset = priority_offsets[index] - span[0]
+    fallback_candidate: _EmbeddedPythonCandidate | None = None
+    for priority_offset in priority_offsets[index:]:
+        if priority_offset >= span[1]:
+            break
+        (
+            compact_candidate,
+            compact_span,
+            compact_real_ranges,
+            has_usage_lines,
+        ) = _bounded_priority_embedded_python_candidate_at_offset(candidate, span, priority_offset - span[0])
+        if has_usage_lines:
+            return compact_candidate, compact_span, compact_real_ranges
+        if fallback_candidate is None:
+            fallback_candidate = (compact_candidate, compact_span, compact_real_ranges)
+    return fallback_candidate or (candidate, span, (span,))
+
+
+def _bounded_priority_embedded_python_candidate_at_offset(
+    candidate: bytes,
+    span: tuple[int, int],
+    priority_relative_offset: int,
+) -> tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...], bool]:
     if priority_relative_offset >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
         line_start = candidate.rfind(b"\n", 0, priority_relative_offset) + 1
     else:
@@ -321,12 +342,12 @@ def _bounded_priority_embedded_python_candidate(
     merged_ranges = _merge_candidate_segment_ranges(segment_ranges)
     compact_candidate = _compact_candidate_segments(candidate, merged_ranges)
     if not merged_ranges:
-        return compact_candidate, span, (span,)
+        return compact_candidate, span, (span,), bool(usage_lines)
 
     span_start = span[0] + merged_ranges[0][0]
     span_end = span[0] + max(end for _start, end in merged_ranges)
     real_ranges = tuple((span[0] + start, span[0] + end) for start, end in merged_ranges)
-    return compact_candidate, (span_start, span_end), real_ranges
+    return compact_candidate, (span_start, span_end), real_ranges, bool(usage_lines)
 
 
 def _is_priority_module_name(module_name: str) -> bool:
@@ -367,8 +388,9 @@ def _priority_import_aliases(candidate: bytes) -> frozenset[bytes]:
 
 def _priority_assignment_aliases(source: str, tree: ast.AST) -> set[bytes]:
     aliases: set[bytes] = set()
-    targets = _assignment_targets(tree)
+    targets = _assignment_targets_in_tree(tree)
     for target in targets:
+        aliases.add(target.encode("utf-8"))
         probe = f"{source}\n" + "\n".join(_priority_assignment_probe_calls(target))
         try:
             probe_tree = ast.parse(probe)
@@ -377,6 +399,17 @@ def _priority_assignment_aliases(source: str, tree: ast.AST) -> set[bytes]:
         if _resolve_alias_aware_high_risk_calls(probe_tree):
             aliases.add(target.encode("utf-8"))
     return aliases
+
+
+def _assignment_targets_in_tree(tree: ast.AST) -> list[str]:
+    targets: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                targets.extend(_assignment_target_names(target))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets.extend(_assignment_target_names(node.target))
+    return targets
 
 
 def _priority_assignment_probe_calls(target: str) -> list[str]:
