@@ -580,6 +580,25 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
+    def test_priority_snippets_require_import_boundaries_after_cap(self) -> None:
+        leading_candidates = [
+            (f"import harmless_{index}\n".encode(), (index, index + 1))
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
+        ]
+        host_candidate = (b"import host_123\n", (100, 101))
+        system_candidate = (b"class System:\n    pass\n", (200, 201))
+        os_candidate = (b"import os\n", (300, 301))
+        runpy_candidate = (b"from runpy import run_path\n", (400, 401))
+
+        selected = jit_script_module._prioritized_embedded_python_snippets(
+            [*leading_candidates, host_candidate, system_candidate, os_candidate, runpy_candidate]
+        )
+
+        assert host_candidate not in selected
+        assert system_candidate not in selected
+        assert os_candidate in selected
+        assert runpy_candidate in selected
+
     def test_scan_model_ignores_binary_framed_top_level_replaced_runpy_execution(self) -> None:
         detector = JITScriptDetector()
         source = b"\x00\xffimport runpy\nrunpy.run_path = len\nrunpy.run_path([])\n\x00MODEL-FRAMING"

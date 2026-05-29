@@ -132,14 +132,21 @@ _MAX_SNIPPET_PARSE_TRIM_ATTEMPTS = 8
 _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS = 10
 _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES = 1_000_000
 _EMBEDDED_PYTHON_START_MARKERS = (b"def ", b"async def ", b"class ", b"import ", b"from ")
-_PRIORITY_EMBEDDED_PYTHON_MARKERS = tuple(
-    marker.encode("utf-8")
-    for marker in (
-        *DANGEROUS_IMPORTS,
-        "asyncio",
-        "runpy",
-        "subprocess",
+_PRIORITY_EMBEDDED_PYTHON_MODULES = tuple(
+    sorted(
+        {marker.lower() for marker in (*DANGEROUS_IMPORTS, "asyncio", "runpy", "subprocess")},
+        key=len,
+        reverse=True,
     )
+)
+_PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN = b"|".join(
+    re.escape(marker.encode("utf-8")) for marker in _PRIORITY_EMBEDDED_PYTHON_MODULES
+)
+_PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN = re.compile(
+    rb"(?m)^\s*(?:"
+    rb"import\s+(?:[a-z_][\w.]*\s*,\s*)*(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s,]|$)|"
+    rb"from\s+(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s]|$)"
+    rb")"
 )
 _EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+")
 _EMBEDDED_PYTHON_START_PATTERN = re.compile(
@@ -226,7 +233,7 @@ def _prioritized_embedded_python_snippets(
     selected_spans: set[tuple[int, int]] = set()
     for index, (candidate, span) in enumerate(candidates):
         candidate_prefix = candidate[:4096].lower()
-        has_priority_marker = any(marker in candidate_prefix for marker in _PRIORITY_EMBEDDED_PYTHON_MARKERS)
+        has_priority_marker = _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(candidate_prefix) is not None
         if index >= _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS and not has_priority_marker:
             continue
         if span in selected_spans:
