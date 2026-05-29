@@ -971,6 +971,520 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
+    def test_scan_model_ignores_shadowed_late_assignment_alias_call_after_priority_window(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy\nrun = runpy.run_path\n"
+            + padding
+            + b"run = len\n"
+            + padding
+            + b"run([])\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "shadow_block",
+        [
+            b"del c\n",
+            b"(c := len)\n",
+            b"for c in [len]:\n    pass\n",
+            b"with contextlib.suppress(Exception) as c:\n    pass\n",
+        ],
+    )
+    def test_scan_model_honors_late_ctypes_alias_shadowing_after_priority_window(self, shadow_block: bytes) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import ctypes as c\nimport contextlib\n"
+            + padding
+            + shadow_block
+            + padding
+            + b"c.CDLL('libpayload.so')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_dead_branch_priority_import_after_default_cap(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"if False:\n    import runpy as rp\n"
+            + padding
+            + b"rp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_indented_priority_import_after_default_cap(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        source = (
+            b"\x00\xff" + leading_blocks + b"if True:\n" + b"    import runpy\n" + b"    runpy.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "compound_payload",
+        [
+            b"if flag:\n    pass\nelse:\n    import runpy\n    runpy.run_path('payload.py')\n",
+            b"try:\n    pass\nexcept Exception:\n    import runpy\n    runpy.run_path('payload.py')\n",
+            b"try:\n    pass\nfinally:\n    import runpy\n    runpy.run_path('payload.py')\n",
+        ],
+    )
+    def test_scan_model_detects_clause_priority_import_after_default_cap(self, compound_payload: bytes) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        source = b"\x00\xff" + leading_blocks + compound_payload
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_alias_comparisons_before_late_priority_attribute_load(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        comparisons = b"".join(
+            b"c == None\n" for _index in range(jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES + 2)
+        )
+        source = b"\x00\xff" + leading_blocks + b"import ctypes as c\n" + padding + comparisons + b"c.cdll.msvcrt\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
+        )
+
+    @pytest.mark.parametrize("filler_line", [b"foo(c=1)\n", b"obj.c = 1\n"])
+    def test_scan_model_ignores_nonbinding_alias_syntax_before_late_priority_attribute_load(
+        self, filler_line: bytes
+    ) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        filler = filler_line * jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES
+        source = b"\x00\xff" + leading_blocks + b"import ctypes as c\n" + padding + filler + b"c.cdll.msvcrt\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
+        )
+
+    def test_scan_model_bounds_shadow_only_priority_lines_before_late_call(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        shadows = b"c = len\n" * jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import ctypes as c\n"
+            + padding
+            + shadows
+            + b"import ctypes as c\n"
+            + b"c.cdll.msvcrt\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "shadow_line",
+        [
+            b"run, other = len, 1\n",
+            b"(run) = len\n",
+            b"[run] = [len]\n",
+            b"other, (run, final) = 1, (len, 2)\n",
+            b"*run, other = [len], 1\n",
+        ],
+    )
+    def test_scan_model_honors_destructured_alias_shadowing_before_late_priority_call(self, shadow_line: bytes) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy\nrun = runpy.run_path\n"
+            + padding
+            + shadow_line
+            + padding
+            + b"run([])\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "shadow_import",
+        [
+            b"import math as run\n",
+            b"from math import sqrt as run\n",
+        ],
+    )
+    def test_scan_model_honors_import_alias_shadowing_before_late_priority_call(self, shadow_import: bytes) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy\nrun = runpy.run_path\n"
+            + padding
+            + shadow_import
+            + padding
+            + b"run(1)\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_keeps_scanning_after_shadow_only_priority_lines(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        shadows = b"c = len\n" * 512
+        shadow_candidate = shadows + b"import ctypes as c\nc.cdll.msvcrt\n"
+        usage_lines = jit_script_module._priority_alias_usage_lines(shadow_candidate, frozenset({b"c"}), 0)
+        source = b"\x00\xff" + leading_blocks + b"import ctypes as c\n" + padding + shadow_candidate
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert len(usage_lines) <= jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "clause_source",
+        [
+            (b"def payload(flag):\n    if flag:\n        return None\n    else:\n        # pad\n"),
+            (b"def payload():\n    try:\n        return None\n    except Exception:\n        # pad\n"),
+            (b"def payload():\n    try:\n        value = 1\n    finally:\n        # pad\n"),
+        ],
+    )
+    def test_scan_model_detects_deep_priority_import_inside_compound_clauses(self, clause_source: bytes) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"        # pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + clause_source
+            + padding
+            + b"        import runpy as rp\n"
+            + b"        return rp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_preserves_multiple_shadowed_aliases_before_late_safe_call(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy\n"
+            + b"a = runpy.run_path\n"
+            + b"b = runpy.run_module\n"
+            + b"c = runpy._run_module_as_main\n"
+            + padding
+            + b"a = len\n"
+            + b"b = len\n"
+            + b"c = len\n"
+            + b"a([])\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_live_alias_call_on_shadow_line(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy\n"
+            + b"a = runpy.run_path\n"
+            + b"b = runpy.run_module\n"
+            + padding
+            + b"a = len; b('payload')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_keeps_scanning_after_same_line_safe_shadow_call(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy\n"
+            + b"a = runpy.run_path\n"
+            + b"b = runpy.run_module\n"
+            + padding
+            + b"a = len; a([])\n"
+            + padding
+            + b"b('payload')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_safe_same_line_shadow_calls_do_not_exhaust_priority_budget(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        safe_shadow_calls = b"".join(
+            b"a = len; a([])\n" + padding for _index in range(jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES + 2)
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy\n"
+            + b"a = runpy.run_path\n"
+            + b"b = runpy.run_module\n"
+            + padding
+            + safe_shadow_calls
+            + b"b('payload')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_indented_safe_same_line_shadow_calls_do_not_exhaust_priority_budget(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"    # pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        safe_shadow_calls = b"".join(
+            b"    a = len; a([])\n" + padding for _index in range(jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES + 2)
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"def payload():\n"
+            + b"    import runpy\n"
+            + b"    a = runpy.run_path\n"
+            + b"    b = runpy.run_module\n"
+            + padding
+            + safe_shadow_calls
+            + b"    return b('payload')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_same_line_call_before_shadow(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy\n"
+            + b"a = runpy.run_path\n"
+            + padding
+            + b"a('payload.py'); a = len\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_same_line_alias_capture_before_shadow(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy as a\n"
+            + padding
+            + b"b = a.run_path; a = len\n"
+            + padding
+            + b"b('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
     def test_scan_model_ignores_unrelated_assignment_alias_before_delayed_priority_call(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
@@ -1665,13 +2179,61 @@ class TestJITScriptDetector:
         detector = JITScriptDetector()
         source = (
             b"\x00\xffdef payload():\n"
+            b"    import builtins\n"
             b"    import ctypes\n"
+            b"    import os\n"
             b"    import webbrowser\n"
             b"    webbrowser.get().open.__call__('https://example.invalid')\n"
+            b"    webbrowser.get().__getattribute__('open')('https://example.invalid')\n"
+            b"    ctypes.windll.kernel32\n"
             b"    ctypes.cdll['msvcrt'].printf(b'x')\n"
             b"    ctypes.cdll.__getitem__('msvcrt')\n"
             b"    loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
-            b"    return loader.msvcrt.printf(b'x')\n"
+            b"    loader_kw = ctypes.LibraryLoader(dlltype=ctypes.CDLL)\n"
+            b"    loader_alias = ctypes.LibraryLoader(ctypes.cdll._dlltype)\n"
+            b"    loader_method = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    loader.msvcrt.printf(b'x')\n"
+            b"    loader_kw.payload.printf(b'x')\n"
+            b"    loader_alias.aliaslib.printf(b'x')\n"
+            b"    loader_method.LoadLibrary('methodlib')\n"
+            b"    loader_method.__getitem__('getitemlib')\n"
+            b"    loader_method.LoadLibrary(name='keywordlib')\n"
+            b"    loader_method.__getitem__(name='keywordgetitem')\n"
+            b"    loader_variable = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    library_name = 'variablelib'\n"
+            b"    loader_variable.LoadLibrary(library_name)\n"
+            b"    loader_variable.__getitem__(library_name)\n"
+            b"    ctypes.LibraryLoader.LoadLibrary(ctypes.cdll, 'unboundlib')\n"
+            b"    ctypes.LibraryLoader.__getitem__(ctypes.cdll, 'unboundgetitem')\n"
+            b"    ctypes.LibraryLoader.LoadLibrary(self=ctypes.cdll, name='selfkeywordlib')\n"
+            b"    ctypes.LibraryLoader.__getitem__(self=ctypes.cdll, name='selfkeywordgetitem')\n"
+            b"    object.__getattribute__(ctypes.cdll, 'LoadLibrary')('objectmethodlib')\n"
+            b"    object.__getattribute__(ctypes.cdll, '__getitem__')('objectgetitem')\n"
+            b"    ctypes.windll.kernel32 = len\n"
+            b"    ctypes.windll.__getattr__('kernel32')\n"
+            b"    loader_conditional = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    conditional_load = loader_conditional.LoadLibrary\n"
+            b"    if flag:\n"
+            b"        conditional_load = ctypes.LibraryLoader\n"
+            b"    conditional_load('conditionalmethod')\n"
+            b"    ctypes.cdll.augmented += 1\n"
+            b"    loader_augmented = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    loader_augmented.augmented += 1\n"
+            b"    class MyCDLL(ctypes.CDLL):\n"
+            b"        pass\n"
+            b"    ctypes.LibraryLoader(MyCDLL).subclasslib\n"
+            b"    getattr(ctypes.windll, 'user32')\n"
+            b"    ctypes.windll.__getattr__('advapi32')\n"
+            b"    ctypes.cdll.__getattr__(name='keywordgetattr')\n"
+            b"    ctypes.LibraryLoader(*(ctypes.CDLL,)).unpacklib\n"
+            b"    class SafeBase:\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            self.name = name\n"
+            b"    class ExplicitSuperCDLL(SafeBase, ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            super(SafeBase, self).__init__(name)\n"
+            b"    ctypes.LibraryLoader(ExplicitSuperCDLL).superlib\n"
+            b"    return getattr(ctypes.LibraryLoader(ctypes.CDLL), 'attrlib')\n"
             b"\x00MODEL-FRAMING"
         )
 
@@ -1680,6 +2242,173 @@ class TestJITScriptDetector:
         patterns = {finding.pattern for finding in findings if finding.type == "code_execution_pattern"}
         assert "Web browser launch detected" in patterns
         assert "Native library loading detected" in patterns
+
+    def test_scan_model_preserves_dynamic_member_risk_after_conditional_overwrite(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    import webbrowser\n"
+            b"    browser = webbrowser.get()\n"
+            b"    if replace:\n"
+            b"        browser.open = len\n"
+            b"        ctypes.windll.kernel32 = len\n"
+            b"    browser.open('https://example.invalid')\n"
+            b"    return ctypes.windll.kernel32\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        patterns = {finding.pattern for finding in findings if finding.type == "code_execution_pattern"}
+        assert "Web browser launch detected" in patterns
+        assert "Native library loading detected" in patterns
+
+    def test_scan_model_keeps_webbrowser_member_overwrites_controller_local(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import webbrowser\n"
+            b"    safe_browser = webbrowser.get('safe')\n"
+            b"    safe_browser.open = len\n"
+            b"    other_browser = webbrowser.get('other')\n"
+            b"    return other_browser.open('https://example.invalid')\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_keeps_library_loader_member_overwrites_instance_local(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    safe_loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    safe_loader.payload = len\n"
+            b"    other_loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    return other_loader.payload\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_detects_hasattr_ctypes_load_and_local_init_alias(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    hasattr(ctypes.cdll, 'hasattrlib')\n"
+            b"    hasattr(ctypes.LibraryLoader(ctypes.CDLL), 'hasattrpayload')\n"
+            b"    ctypes.cdll.__getattr__(name='keywordgetattr')\n"
+            b"    ctypes.LibraryLoader(*(ctypes.CDLL,)).starredlib\n"
+            b"    class LocalAliasCDLL(ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            init = ctypes.CDLL.__init__\n"
+            b"            init(self, name)\n"
+            b"    ctypes.LibraryLoader(LocalAliasCDLL).localaliaslib\n"
+            b"    class Safe:\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            self.name = name\n"
+            b"    class SkipSafeCDLL(Safe, ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            super(Safe, self).__init__(name)\n"
+            b"    ctypes.LibraryLoader(SkipSafeCDLL).superskiplib\n"
+            b"    class ClassBodyInitCDLL(Safe, ctypes.CDLL):\n"
+            b"        __init__ = ctypes.CDLL.__init__\n"
+            b"    ctypes.LibraryLoader(ClassBodyInitCDLL).classbodyinitlib\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_preserves_dynamic_member_risk_after_reassignment_and_delete(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    import webbrowser\n"
+            b"    browser = webbrowser.get('safe')\n"
+            b"    browser.open = len\n"
+            b"    browser = webbrowser.get('other')\n"
+            b"    browser.open('https://example.invalid')\n"
+            b"    other = webbrowser.get()\n"
+            b"    other.open = len\n"
+            b"    del other.open\n"
+            b"    other.open('https://example.invalid')\n"
+            b"    loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    loader.payload = len\n"
+            b"    loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    loader.payload\n"
+            b"    other_loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    other_loader.payload = len\n"
+            b"    del other_loader.payload\n"
+            b"    other_loader.payload\n"
+            b"    ctypes.windll.payload = len\n"
+            b"    del ctypes.windll.payload\n"
+            b"    return ctypes.windll.payload\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        patterns = {finding.pattern for finding in findings if finding.type == "code_execution_pattern"}
+        assert "Web browser launch detected" in patterns
+        assert "Native library loading detected" in patterns
+
+    def test_scan_model_detects_ctypes_cdll_subclass_class_local_initializer_alias(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    class MyCDLL(ctypes.CDLL):\n"
+            b"        init = ctypes.CDLL.__init__\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            self.init(name)\n"
+            b"    return ctypes.LibraryLoader(MyCDLL).payload\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_unreachable_ctypes_cdll_subclass_initializer(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    class SafeCDLL(ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            if False:\n"
+            b"                super().__init__(name)\n"
+            b"    return ctypes.LibraryLoader(SafeCDLL).payload\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
 
     @pytest.mark.parametrize(
         ("payload", "expected_pattern"),
@@ -1722,6 +2451,141 @@ class TestJITScriptDetector:
 
         assert not any(
             finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_non_loading_ctypes_subclass_initializers(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    class Safe:\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            self.name = name\n"
+            b"    class NoLoad(Safe, ctypes.CDLL):\n"
+            b"        pass\n"
+            b"    ctypes.LibraryLoader(NoLoad).payload\n"
+            b"    NoLoad('/missing')\n"
+            b"    class MissingNameSuperCDLL(ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            super().__init__()\n"
+            b"    ctypes.LibraryLoader(MissingNameSuperCDLL).payload\n"
+            b"    MissingNameSuperCDLL('/missing')\n"
+            b"    class DeadDelegateCDLL(ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            if False:\n"
+            b"                ctypes.CDLL.__init__(self, name)\n"
+            b"    ctypes.LibraryLoader(DeadDelegateCDLL).payload\n"
+            b"    DeadDelegateCDLL('/missing')\n"
+            b"    class InstanceShadowCDLL(ctypes.CDLL):\n"
+            b"        init = ctypes.CDLL.__init__\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            self.init = lambda name: None\n"
+            b"            self.init(name)\n"
+            b"    ctypes.LibraryLoader(InstanceShadowCDLL).payload\n"
+            b"    InstanceShadowCDLL('/missing')\n"
+            b"    class NewSkipsInitCDLL(ctypes.CDLL):\n"
+            b"        def __new__(cls, name: str):\n"
+            b"            return object()\n"
+            b"    ctypes.LibraryLoader(NewSkipsInitCDLL).payload\n"
+            b"    NewSkipsInitCDLL('/missing')\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_safe_webbrowser_method_overwrite_and_invalid_libraryloader(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    import ctypes\n"
+            b"    import webbrowser\n"
+            b"    browser = webbrowser.get()\n"
+            b"    browser.open = len\n"
+            b"    browser.open([])\n"
+            b"    loader = ctypes.LibraryLoader(len)\n"
+            b"    loader.payload.printf(b'x')\n"
+            b"    load = ctypes.cdll.LoadLibrary\n"
+            b"    class_attr = ctypes.LibraryLoader.payload\n"
+            b"    ctypes.windll.kernel32 = len\n"
+            b"    getattr(ctypes.windll, 'kernel32')\n"
+            b"    getattr(object=ctypes.cdll, name='msvcrt')\n"
+            b"    ctypes.windll.kernel32\n"
+            b"    ctypes.cdll.__getattribute__('msvcrt')\n"
+            b"    object.__getattribute__(ctypes.cdll, 'msvcrt')\n"
+            b"    os.__getattr__('system')('id')\n"
+            b"    builtins.__getattr__('eval')('1')\n"
+            b"    other = browser\n"
+            b"    browser.open = len\n"
+            b"    browser = webbrowser.get()\n"
+            b"    other.open([])\n"
+            b"    other_loader = loader\n"
+            b"    loader.payload = len\n"
+            b"    loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    other_loader.payload([])\n"
+            b"    ctypes.LibraryLoader = len\n"
+            b"    ctypes.LibraryLoader(ctypes.CDLL).payload\n"
+            b"    class SafeCDLL(ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            pass\n"
+            b"    ctypes.LibraryLoader(SafeCDLL).payload\n"
+            b"    SafeCDLL('/missing')\n"
+            b"    class Safe:\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            self.name = name\n"
+            b"    class NoLoad(Safe, ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            super().__init__(name)\n"
+            b"    ctypes.LibraryLoader(NoLoad).payload\n"
+            b"    NoLoad('/missing')\n"
+            b"    class OverwrittenInitCDLL(ctypes.CDLL):\n"
+            b"        init = ctypes.CDLL.__init__\n"
+            b"        def init(self, name: str) -> None:\n"
+            b"            pass\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            self.init(name)\n"
+            b"    ctypes.LibraryLoader(OverwrittenInitCDLL).payload\n"
+            b"    OverwrittenInitCDLL('/missing')\n"
+            b"    class SafeNestedCDLL(ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            def later() -> None:\n"
+            b"                ctypes.CDLL.__init__(self, name)\n"
+            b"    ctypes.LibraryLoader(SafeNestedCDLL).payload\n"
+            b"    SafeNestedCDLL('/missing')\n"
+            b"    class SafeShadowCDLL(ctypes.CDLL):\n"
+            b"        init = ctypes.CDLL.__init__\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            self.init = lambda name: None\n"
+            b"            self.init(name)\n"
+            b"    ctypes.LibraryLoader(SafeShadowCDLL).payload\n"
+            b"    SafeShadowCDLL('/missing')\n"
+            b"    class SafeNewCDLL(ctypes.CDLL):\n"
+            b"        def __new__(cls, name: str):\n"
+            b"            return object()\n"
+            b"    ctypes.LibraryLoader(SafeNewCDLL).payload\n"
+            b"    SafeNewCDLL('/missing')\n"
+            b"    setattr(ctypes.windll, 'kernel32', len)\n"
+            b"    ctypes.windll.kernel32\n"
+            b"    safe_loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            b"    setattr(safe_loader, 'payload', len)\n"
+            b"    safe_loader.payload([])\n"
+            b"    safe_browser = webbrowser.get()\n"
+            b"    setattr(safe_browser, 'open', len)\n"
+            b"    safe_browser.open([])\n"
+            b"    return load.__name__\n"
+            b"\x00MODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern"
+            and finding.pattern in {"Web browser launch detected", "Native library loading detected"}
             for finding in findings
         )
 

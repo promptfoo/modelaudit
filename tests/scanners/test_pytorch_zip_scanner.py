@@ -1587,6 +1587,8 @@ def test_pytorch_zip_scans_webbrowser_and_ctypes_execution_in_archive_data(tmp_p
         b"    import ctypes\n"
         b"    import webbrowser\n"
         b"    webbrowser.get().open.__call__('https://example.invalid')\n"
+        b"    webbrowser.get().__getattribute__('open')('https://example.invalid')\n"
+        b"    ctypes.windll.kernel32\n"
         b"    ctypes.cdll['msvcrt'].printf(b'x')\n"
         b"    ctypes.cdll.__getitem__('msvcrt')\n"
         b"    loader = ctypes.LibraryLoader(ctypes.CDLL)\n"

@@ -325,9 +325,9 @@ def test_scan_zip_preserves_subprocess_after_asyncio_wildcard_import(tmp_path: P
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 
-def test_scan_zip_flags_builtins_getattr_keyword_call_dangerous_python_member(tmp_path: Path) -> None:
+def test_scan_zip_flags_builtins_getattr_call_dangerous_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
-    source = "import builtins as bi\nimport os\nbi.getattr(object=os, name='system').__call__('echo hidden')\n"
+    source = "import builtins as bi\nimport os\nbi.getattr(os, 'system').__call__('echo hidden')\n"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
 
@@ -349,7 +349,7 @@ def test_scan_zip_flags_aliased_getattr_helper_dangerous_python_member(tmp_path:
     source = (
         "from builtins import getattr as resolve\n"
         "import os as operating_system\n"
-        "resolve(object=operating_system, name='system')('echo hidden')\n"
+        "resolve(operating_system, 'system')('echo hidden')\n"
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
@@ -583,10 +583,85 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "import ctypes\n"
         "import webbrowser\n"
         "webbrowser.get().open.__call__('https://example.invalid')\n"
+        "webbrowser.get().__getattribute__('open')('https://example.invalid')\n"
+        "ctypes.windll.kernel32\n"
         "ctypes.cdll['msvcrt'].printf(b'x')\n"
         "ctypes.cdll.__getitem__('msvcrt')\n"
         "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
         "loader.msvcrt.printf(b'x')\n"
+        "loader_kw = ctypes.LibraryLoader(dlltype=ctypes.CDLL)\n"
+        "loader_kw.payload.printf(b'x')\n"
+        "loader_alias = ctypes.LibraryLoader(ctypes.cdll._dlltype)\n"
+        "loader_alias.aliaslib.printf(b'x')\n"
+        "loader_method = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader_method.LoadLibrary('methodlib')\n"
+        "loader_method.__getitem__('getitemlib')\n"
+        "loader_method.LoadLibrary(name='keywordlib')\n"
+        "loader_method.__getitem__(name='keywordgetitem')\n"
+        "loader_variable = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "library_name = 'variablelib'\n"
+        "loader_variable.LoadLibrary(library_name)\n"
+        "loader_variable.__getitem__(library_name)\n"
+        "ctypes.LibraryLoader.LoadLibrary(ctypes.cdll, 'unboundlib')\n"
+        "ctypes.LibraryLoader.__getitem__(ctypes.cdll, 'unboundgetitem')\n"
+        "ctypes.LibraryLoader.LoadLibrary(self=ctypes.cdll, name='selfkeywordlib')\n"
+        "ctypes.LibraryLoader.__getitem__(self=ctypes.cdll, name='selfkeywordgetitem')\n"
+        "object.__getattribute__(ctypes.cdll, 'LoadLibrary')('objectmethodlib')\n"
+        "object.__getattribute__(ctypes.cdll, '__getitem__')('objectgetitem')\n"
+        "object.__getattribute__(ctypes.cdll, '__getattr__')('objectgetattr')\n"
+        "ctypes.windll.kernel32 = len\n"
+        "ctypes.windll.__getattr__('kernel32')\n"
+        "loader_conditional = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "conditional_load = loader_conditional.LoadLibrary\n"
+        "if flag:\n"
+        "    conditional_load = ctypes.LibraryLoader\n"
+        "conditional_load('conditionalmethod')\n"
+        "ctypes.cdll.augmented += 1\n"
+        "loader_augmented = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader_augmented.augmented += 1\n"
+        "class MyCDLL(ctypes.CDLL):\n"
+        "    pass\n"
+        "ctypes.LibraryLoader(MyCDLL).subclasslib\n"
+        "class MyAliasedCDLL(ctypes.CDLL):\n"
+        "    init = ctypes.CDLL.__init__\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        self.init(name)\n"
+        "ctypes.LibraryLoader(MyAliasedCDLL).classaliaslib\n"
+        "getattr(ctypes.windll, 'user32')\n"
+        "ctypes.windll.__getattr__('advapi32')\n"
+        "getattr(ctypes.LibraryLoader(ctypes.CDLL), 'attrlib')\n"
+        "library_name = 'variablegetattr'\n"
+        "getattr(ctypes.cdll, library_name)\n"
+        "ctypes.cdll.__getattr__(library_name)\n"
+        "ctypes.cdll.__getattr__(name='keywordgetattr')\n"
+        "loader_unpack = ctypes.LibraryLoader(*(ctypes.CDLL,))\n"
+        "loader_unpack.unpacklib.printf(b'x')\n"
+        "loader_unpack_kw = ctypes.LibraryLoader(**{'dlltype': ctypes.CDLL})\n"
+        "loader_unpack_kw.unpackkwlib.printf(b'x')\n"
+        "loader_empty_star = ctypes.LibraryLoader(*(), dlltype=ctypes.CDLL)\n"
+        "loader_empty_star.emptystarlib.printf(b'x')\n"
+        "loader_getattr = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader_getattr.__getattr__('localizedgetattr')\n"
+        "loader_getattr.__getattr__(library_name)\n"
+        "loader_getattr.__getattr__(name='localizedkeywordgetattr')\n"
+        "hasattr(ctypes.cdll, 'hasattrlib')\n"
+        "hasattr(ctypes.LibraryLoader(ctypes.CDLL), 'hasattrpayload')\n"
+        "ctypes.LibraryLoader(*(ctypes.CDLL,)).starredlib\n"
+        "class LocalAliasCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        init = ctypes.CDLL.__init__\n"
+        "        init(self, name)\n"
+        "ctypes.LibraryLoader(LocalAliasCDLL).localaliaslib\n"
+        "class Safe:\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        self.name = name\n"
+        "class SkipSafeCDLL(Safe, ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super(Safe, self).__init__(name)\n"
+        "ctypes.LibraryLoader(SkipSafeCDLL).superskiplib\n"
+        "class ClassBodyInitCDLL(Safe, ctypes.CDLL):\n"
+        "    __init__ = ctypes.CDLL.__init__\n"
+        "ctypes.LibraryLoader(ClassBodyInitCDLL).classbodyinitlib\n"
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
@@ -604,7 +679,527 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
     assert checks_by_rule["S110"].severity == IssueSeverity.CRITICAL
     assert "ctypes.cdll.msvcrt" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.windll.kernel32" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.msvcrt" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.payload" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.aliaslib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.methodlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.getitemlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.keywordlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.keywordgetitem" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.<dynamic>" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.subclasslib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.unboundlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.unboundgetitem" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.selfkeywordlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.selfkeywordgetitem" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.objectmethodlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.objectgetitem" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.objectgetattr" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.windll.kernel32" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.conditionalmethod" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.augmented" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.augmented" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.classaliaslib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.attrlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.<dynamic>" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.keywordgetattr" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.unpacklib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.unpackkwlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.emptystarlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.localizedgetattr" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.<dynamic>" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.localizedkeywordgetattr" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.windll.user32" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.windll.advapi32" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.hasattrlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.hasattrpayload" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.localaliaslib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.starredlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.superskiplib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.classbodyinitlib" in checks_by_rule["S110"].details["reason"]
+
+
+def test_scan_zip_flags_webbrowser_controller_getattribute_launch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import webbrowser\nwebbrowser.get().__getattribute__('open')('https://example.invalid')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S109"
+    assert python_checks[0].details["reason"] == "high-risk calls: webbrowser.open"
+
+
+def test_scan_zip_handles_final_dynamic_accessor_edges(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import webbrowser\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.payload = len\n"
+        "delattr(loader, 'payload')\n"
+        "loader.payload\n"
+        "browser = webbrowser.get()\n"
+        "browser.open = len\n"
+        "delattr(browser, 'open')\n"
+        "browser.open('https://example.invalid')\n"
+        "getattr(*(ctypes.cdll, 'msvcrt'))\n"
+        "hasattr(*(ctypes.LibraryLoader(ctypes.CDLL), 'hasattrpayload'))\n"
+        "getattr(ctypes.cdll, 'emptykwargs', **{})\n"
+        "hasattr(ctypes.LibraryLoader(ctypes.CDLL), 'hasattremptykwargs', **{})\n"
+        "ctypes.LibraryLoader.__getattr__(ctypes.cdll, 'unboundgetattr')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S109", "S110"}
+    assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
+    s110_reason = checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.payload" in s110_reason
+    assert "ctypes.cdll.msvcrt" in s110_reason
+    assert "ctypes.cdll.emptykwargs" in s110_reason
+    assert "ctypes.LibraryLoader.hasattrpayload" in s110_reason
+    assert "ctypes.LibraryLoader.hasattremptykwargs" in s110_reason
+    assert "ctypes.cdll.unboundgetattr" in s110_reason
+
+
+def test_scan_zip_honors_safe_dynamic_member_aliases_and_method_overwrites(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import webbrowser\n"
+        "browser = webbrowser.get()\n"
+        "other_browser = browser\n"
+        "browser.open = len\n"
+        "browser = webbrowser.get()\n"
+        "other_browser.open([])\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "other_loader = loader\n"
+        "loader.payload = len\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "other_loader.payload\n"
+        "method_loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "method_loader.LoadLibrary = len\n"
+        "method_loader.LoadLibrary([])\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_zip_resolves_final_ctypes_initializer_edges(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "class Safe:\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        self.name = name\n"
+        "class ClassBodyCDLL(Safe, ctypes.CDLL):\n"
+        "    __init__ = ctypes.CDLL.__init__\n"
+        "ctypes.LibraryLoader(ClassBodyCDLL).classbodylib\n"
+        "class ClassQualifiedCDLL(ctypes.CDLL):\n"
+        "    init = ctypes.CDLL.__init__\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ClassQualifiedCDLL.init(self, name)\n"
+        "ctypes.LibraryLoader(ClassQualifiedCDLL).qualifiedlib\n"
+        "class SuperSkipCDLL(Safe, ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super(Safe, self).__init__(name)\n"
+        "ctypes.LibraryLoader(SuperSkipCDLL).superskiplib\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S110"}
+    s110_reason = checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.classbodylib" in s110_reason
+    assert "ctypes.LibraryLoader.qualifiedlib" in s110_reason
+    assert "ctypes.LibraryLoader.superskiplib" in s110_reason
+
+
+def test_scan_zip_ignores_invalid_ctypes_initializer_delegates(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "class MissingNameCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super().__init__()\n"
+        "ctypes.LibraryLoader(MissingNameCDLL).payload\n"
+        "class DirectMissingNameCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(self)\n"
+        "ctypes.LibraryLoader(DirectMissingNameCDLL).payload\n"
+        "class WrongSelfCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(object(), name)\n"
+        "ctypes.LibraryLoader(WrongSelfCDLL).payload\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S110"
+        for check in result.checks
+    )
+
+
+def test_scan_zip_restores_dynamic_member_defaults_after_namespace_rebinds(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import webbrowser\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.payload = len\n"
+        "globals()['loader'] = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.payload\n"
+        "browser = webbrowser.get()\n"
+        "browser.open = len\n"
+        "globals().update(browser=webbrowser.get())\n"
+        "browser.open('https://example.invalid')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S109", "S110"}
+    assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
+    assert "ctypes.LibraryLoader.payload" in checks_by_rule["S110"].details["reason"]
+
+
+def test_scan_zip_keeps_dynamic_member_deletes_child_scope_local(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import webbrowser\n"
+        "ctypes.windll.payload = len\n"
+        "browser = webbrowser.get()\n"
+        "browser.open = len\n"
+        "def child():\n"
+        "    del ctypes.windll.payload\n"
+        "    del browser.open\n"
+        "ctypes.windll.payload\n"
+        "browser.open([])\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_zip_flags_empty_kwargs_loader_constructor_and_current_super(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "ctypes.LibraryLoader(ctypes.CDLL, **{}).emptykwargs\n"
+        "class Empty:\n"
+        "    pass\n"
+        "class EmptyLeadingCDLL(Empty, ctypes.CDLL):\n"
+        "    pass\n"
+        "ctypes.LibraryLoader(EmptyLeadingCDLL).emptyleadinglib\n"
+        "class EmptyBaseSuperCDLL(Empty, ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super().__init__(name)\n"
+        "ctypes.LibraryLoader(EmptyBaseSuperCDLL).emptybasesuperlib\n"
+        "class CurrentSuperCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super(CurrentSuperCDLL, self).__init__(name)\n"
+        "ctypes.LibraryLoader(CurrentSuperCDLL).currentsuperlib\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S110"}
+    s110_reason = checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.emptykwargs" in s110_reason
+    assert "ctypes.LibraryLoader.emptyleadinglib" in s110_reason
+    assert "ctypes.LibraryLoader.emptybasesuperlib" in s110_reason
+    assert "ctypes.LibraryLoader.currentsuperlib" in s110_reason
+
+
+def test_scan_zip_resolves_initializer_delete_before_class_alias_fallback(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "class DeletedShadowCDLL(ctypes.CDLL):\n"
+        "    init = ctypes.CDLL.__init__\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        self.init = len\n"
+        "        del self.init\n"
+        "        self.init(name)\n"
+        "ctypes.LibraryLoader(DeletedShadowCDLL).deletedshadowlib\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S110"}
+    assert "ctypes.LibraryLoader.deletedshadowlib" in checks_by_rule["S110"].details["reason"]
+
+
+def test_scan_zip_resolves_imports_inside_ctypes_subclass_initializers(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "class ImportAliasCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        import ctypes as ct\n"
+        "        ct.CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(ImportAliasCDLL).importaliaslib\n"
+        "class FromImportCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        from ctypes import CDLL\n"
+        "        CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(FromImportCDLL).fromimportlib\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S110"}
+    s110_reason = checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.importaliaslib" in s110_reason
+    assert "ctypes.LibraryLoader.fromimportlib" in s110_reason
+
+
+def test_scan_zip_ignores_unreachable_new_returns_async_init_and_hasattr_alias(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import os\n"
+        "class ReachableInstanceCDLL(ctypes.CDLL):\n"
+        "    def __new__(cls, name: str):\n"
+        "        return super().__new__(cls)\n"
+        "        return object()\n"
+        "ctypes.LibraryLoader(ReachableInstanceCDLL).reachablelib\n"
+        "class AsyncInitCDLL(ctypes.CDLL):\n"
+        "    async def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(AsyncInitCDLL).payload\n"
+        "class StaticInitCDLL(ctypes.CDLL):\n"
+        "    @staticmethod\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(StaticInitCDLL).payload\n"
+        "class SafeBase:\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        self.name = name\n"
+        "class SafeSuperCDLL(SafeBase, ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super().__init__(name)\n"
+        "ctypes.LibraryLoader(SafeSuperCDLL).payload\n"
+        "class SafeCurrentSuperCDLL(SafeBase, ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super(SafeCurrentSuperCDLL, self).__init__(name)\n"
+        "ctypes.LibraryLoader(SafeCurrentSuperCDLL).payload\n"
+        "class InvalidSuperSelfCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super(InvalidSuperSelfCDLL, object()).__init__(name)\n"
+        "ctypes.LibraryLoader(InvalidSuperSelfCDLL).payload\n"
+        "class AsyncNewCDLL(ctypes.CDLL):\n"
+        "    async def __new__(cls, name: str):\n"
+        "        return super().__new__(cls)\n"
+        "ctypes.LibraryLoader(AsyncNewCDLL).payload\n"
+        "class NumericDeadDelegateCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        if 0:\n"
+        "            ctypes.CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(NumericDeadDelegateCDLL).payload\n"
+        "class BadKwInitCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(self, **{'name': name, 'bad': 1})\n"
+        "ctypes.LibraryLoader(BadKwInitCDLL).payload\n"
+        "class BadDirectKwInitCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(self, name=name, bad=1)\n"
+        "ctypes.LibraryLoader(BadDirectKwInitCDLL).payload\n"
+        "class BadSurplusArgsCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(self, name, 0, None, False, False, None, 'extra')\n"
+        "ctypes.LibraryLoader(BadSurplusArgsCDLL).payload\n"
+        "class BadBoundSurplusArgsCDLL(ctypes.CDLL):\n"
+        "    init = ctypes.CDLL.__init__\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        self.init(name, 0, None, False, False, None, 'extra')\n"
+        "ctypes.LibraryLoader(BadBoundSurplusArgsCDLL).payload\n"
+        "class ClassMethodInitCDLL(ctypes.CDLL):\n"
+        "    @classmethod\n"
+        "    def __init__(cls, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(cls, name)\n"
+        "ctypes.LibraryLoader(ClassMethodInitCDLL).payload\n"
+        "AliasSafeBase = SafeBase\n"
+        "class SafeAliasSuperCDLL(AliasSafeBase, ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super().__init__(name)\n"
+        "ctypes.LibraryLoader(SafeAliasSuperCDLL).payload\n"
+        "class ReturnBeforeDelegateCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        return\n"
+        "        ctypes.CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(ReturnBeforeDelegateCDLL).payload\n"
+        "class RaiseBeforeDelegateCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        raise RuntimeError(name)\n"
+        "        ctypes.CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(RaiseBeforeDelegateCDLL).payload\n"
+        "class InstanceStoredAliasCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        self.init = ctypes.CDLL.__init__\n"
+        "        self.init(name)\n"
+        "ctypes.LibraryLoader(InstanceStoredAliasCDLL).payload\n"
+        "ctypes.LibraryLoader(**{'dlltype': ctypes.CDLL, 'bad': 1}).payload\n"
+        "getattr(ctypes.cdll, 123)\n"
+        "hasattr(ctypes.cdll, 123)\n"
+        "ctypes.LibraryLoader.__getattr__(ctypes.cdll, 123)\n"
+        "f = hasattr(os, 'system')\n"
+        "f('id')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S110"}
+    assert checks_by_rule["S110"].details["reason"] == "high-risk calls: ctypes.LibraryLoader.reachablelib"
+
+
+def test_scan_zip_resolves_static_ctypes_initializer_call_forms(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "ctypes.LibraryLoader(**{'dlltype': len, 'dlltype': ctypes.CDLL}).duplicatekwlib\n"
+        "class KwNameCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(self, **{'name': name})\n"
+        "ctypes.LibraryLoader(KwNameCDLL).kwnameinitlib\n"
+        "class StarArgsCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(*(self, name))\n"
+        "ctypes.LibraryLoader(StarArgsCDLL).starargsinitlib\n"
+        "class DelegatingBase:\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super().__init__(name)\n"
+        "class ForwardingBaseCDLL(DelegatingBase, ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super().__init__(name)\n"
+        "ctypes.LibraryLoader(ForwardingBaseCDLL).forwardingbaselib\n"
+        "class BranchFallbackCDLL(ctypes.CDLL):\n"
+        "    init = ctypes.CDLL.__init__\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        if name == 'skip':\n"
+        "            self.init = len\n"
+        "        self.init(name)\n"
+        "ctypes.LibraryLoader(BranchFallbackCDLL).branchfallbacklib\n"
+        "class RedefinedInitCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        pass\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(RedefinedInitCDLL).redefinedinitlib\n"
+        "class AssignedInitCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        pass\n"
+        "    __init__ = ctypes.CDLL.__init__\n"
+        "ctypes.LibraryLoader(AssignedInitCDLL).assignedinitlib\n"
+        "class PartialNewCDLL(ctypes.CDLL):\n"
+        "    def __new__(cls, name: str):\n"
+        "        if name == 'skip':\n"
+        "            return object()\n"
+        "        return super().__new__(cls)\n"
+        "ctypes.LibraryLoader(PartialNewCDLL).partialnewlib\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S110"}
+    s110_reason = checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.duplicatekwlib" in s110_reason
+    assert "ctypes.LibraryLoader.kwnameinitlib" in s110_reason
+    assert "ctypes.LibraryLoader.starargsinitlib" in s110_reason
+    assert "ctypes.LibraryLoader.forwardingbaselib" in s110_reason
+    assert "ctypes.LibraryLoader.branchfallbacklib" in s110_reason
+    assert "ctypes.LibraryLoader.redefinedinitlib" in s110_reason
+    assert "ctypes.LibraryLoader.assignedinitlib" in s110_reason
+    assert "ctypes.LibraryLoader.partialnewlib" in s110_reason
 
 
 def test_scan_zip_flags_extensionless_runpy_python_member(tmp_path: Path) -> None:
@@ -652,6 +1247,426 @@ def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S108"
     assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
+
+
+def test_scan_zip_preserves_dynamic_member_risk_after_conditional_overwrite(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import webbrowser\n"
+        "browser = webbrowser.get()\n"
+        "if replace:\n"
+        "    browser.open = len\n"
+        "    ctypes.windll.kernel32 = len\n"
+        "browser.open('https://example.invalid')\n"
+        "ctypes.windll.kernel32\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
+    assert checks_by_rule["S110"].details["reason"] == "high-risk calls: ctypes.windll.kernel32"
+
+
+def test_scan_zip_flags_ctypes_getattr_dynamic_library_name(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "name = 'payload'\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "getattr(ctypes.cdll, name)\n"
+        "ctypes.windll.__getattr__(name)\n"
+        "loader.__getattr__(name)\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S110"
+    assert "ctypes.cdll.<dynamic>" in python_checks[0].details["reason"]
+    assert "ctypes.windll.<dynamic>" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.<dynamic>" in python_checks[0].details["reason"]
+
+
+def test_scan_zip_flags_unpacked_getattr_and_unbound_loader_getattr(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "getattr(*(ctypes.cdll, 'msvcrt'))\n"
+        "getattr(*(ctypes.cdll,), 'ucrtbase')\n"
+        "getattr(ctypes.cdll, *('vcruntime', None))\n"
+        "hasattr(*(loader, 'payload'))\n"
+        "hasattr(*(loader,), 'mixedpayload')\n"
+        "ctypes.LibraryLoader.__getattr__(ctypes.cdll, 'advapi32')\n"
+        "ctypes.LibraryLoader.__getattr__(*(ctypes.windll, 'kernel32'))\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S110"
+    assert "ctypes.cdll.msvcrt" in python_checks[0].details["reason"]
+    assert "ctypes.cdll.ucrtbase" in python_checks[0].details["reason"]
+    assert "ctypes.cdll.vcruntime" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.payload" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.mixedpayload" in python_checks[0].details["reason"]
+    assert "ctypes.cdll.advapi32" in python_checks[0].details["reason"]
+    assert "ctypes.windll.kernel32" in python_checks[0].details["reason"]
+
+
+def test_scan_zip_preserves_library_loader_member_risk_after_other_instance_overwrite(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "safe_loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "safe_loader.payload = len\n"
+        "live_loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "live_loader.payload\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S110"
+    assert python_checks[0].details["reason"] == "high-risk calls: ctypes.LibraryLoader.payload"
+
+
+def test_scan_zip_preserves_webbrowser_controller_member_risk_after_other_instance_overwrite(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import webbrowser\n"
+        "safe = webbrowser.get('safe')\n"
+        "safe.open = len\n"
+        "other = webbrowser.get('other')\n"
+        "other.open('https://example.invalid')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S109"
+    assert python_checks[0].details["reason"] == "high-risk calls: webbrowser.open"
+
+
+def test_scan_zip_preserves_webbrowser_member_risk_after_other_controller_overwrite(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import webbrowser\n"
+        "safe_browser = webbrowser.get('safe')\n"
+        "safe_browser.open = len\n"
+        "webbrowser.get('other').open('https://example.invalid')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S109"
+    assert python_checks[0].details["reason"] == "high-risk calls: webbrowser.open"
+
+
+def test_scan_zip_preserves_dynamic_member_risk_after_same_name_reassignment(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import webbrowser\n"
+        "browser = webbrowser.get('safe')\n"
+        "browser.open = len\n"
+        "browser = webbrowser.get('other')\n"
+        "browser.open('https://example.invalid')\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.payload = len\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.payload\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
+    assert checks_by_rule["S110"].details["reason"] == "high-risk calls: ctypes.LibraryLoader.payload"
+
+
+def test_scan_zip_restores_dynamic_member_risk_after_delete(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import webbrowser\n"
+        "browser = webbrowser.get()\n"
+        "browser.open = len\n"
+        "del browser.open\n"
+        "browser.open('https://example.invalid')\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.payload = len\n"
+        "del loader.payload\n"
+        "loader.payload\n"
+        "ctypes.windll.payload = len\n"
+        "del ctypes.windll.payload\n"
+        "ctypes.windll.payload\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
+    assert "ctypes.LibraryLoader.payload" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.windll.payload" in checks_by_rule["S110"].details["reason"]
+
+
+def test_scan_zip_restores_dynamic_member_risk_after_delattr_and_namespace_rebind(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import webbrowser\n"
+        "browser = webbrowser.get()\n"
+        "browser.open = len\n"
+        "delattr(browser, 'open')\n"
+        "browser.open('https://example.invalid')\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.payload = len\n"
+        "delattr(loader, 'payload')\n"
+        "loader.payload\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.payload = len\n"
+        "globals()['loader'] = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.payload\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
+    assert "ctypes.LibraryLoader.payload" in checks_by_rule["S110"].details["reason"]
+
+
+def test_scan_zip_restores_loader_method_risk_after_delete(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.LoadLibrary = len\n"
+        "del loader.LoadLibrary\n"
+        "loader.LoadLibrary('loadlibrarypayload')\n"
+        "loader.__getitem__ = len\n"
+        "del loader.__getitem__\n"
+        "loader.__getitem__('getitempayload')\n"
+        "loader.__getattr__ = len\n"
+        "delattr(*(loader, '__getattr__'))\n"
+        "loader.__getattr__('getattrpayload')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S110"
+    assert "ctypes.LibraryLoader.loadlibrarypayload" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.getitempayload" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.getattrpayload" in python_checks[0].details["reason"]
+
+
+def test_scan_zip_preserves_ctypes_subclass_with_class_local_init_alias(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "class MyCDLL(ctypes.CDLL):\n"
+        "    init = ctypes.CDLL.__init__\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        self.init(name)\n"
+        "MyCDLL('/tmp/payload.so')\n"
+        "ctypes.LibraryLoader(MyCDLL).payload\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S110"
+    assert python_checks[0].details["reason"] == "high-risk calls: ctypes.CDLL, ctypes.LibraryLoader.payload"
+
+
+def test_scan_zip_preserves_ctypes_subclass_class_body_and_qualified_init_aliases(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "class Safe:\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        self.name = name\n"
+        "class BodyAliasCDLL(Safe, ctypes.CDLL):\n"
+        "    __init__ = ctypes.CDLL.__init__\n"
+        "ctypes.LibraryLoader(BodyAliasCDLL).bodyalias\n"
+        "class QualifiedAliasCDLL(ctypes.CDLL):\n"
+        "    init = ctypes.CDLL.__init__\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        QualifiedAliasCDLL.init(self, name)\n"
+        "ctypes.LibraryLoader(QualifiedAliasCDLL).qualifiedalias\n"
+        "class CustomReceiverCDLL(ctypes.CDLL):\n"
+        "    def __init__(this, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(this, name)\n"
+        "ctypes.LibraryLoader(CustomReceiverCDLL).customreceiver\n"
+        "class StarredInitCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(*(self, name))\n"
+        "ctypes.LibraryLoader(StarredInitCDLL).starredinit\n"
+        "class ReceiverAliasCDLL(ctypes.CDLL):\n"
+        "    def __init__(this, name: str) -> None:\n"
+        "        target = this\n"
+        "        ctypes.CDLL.__init__(target, name)\n"
+        "ctypes.LibraryLoader(ReceiverAliasCDLL).receiveralias\n"
+        "class CustomQualifiedAliasCDLL(ctypes.CDLL):\n"
+        "    init = ctypes.CDLL.__init__\n"
+        "    def __init__(this, name: str) -> None:\n"
+        "        CustomQualifiedAliasCDLL.init(this, name)\n"
+        "ctypes.LibraryLoader(CustomQualifiedAliasCDLL).customqualified\n"
+        "class LocalClassAliasDangerousCDLL(ctypes.CDLL):\n"
+        "    init = lambda self, name: None\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        cls = LocalClassAliasDangerousCDLL\n"
+        "        cls.init = ctypes.CDLL.__init__\n"
+        "        cls.init(self, name)\n"
+        "ctypes.LibraryLoader(LocalClassAliasDangerousCDLL).localclassdangerous\n"
+        "class DangerousQualifiedRebindCDLL(ctypes.CDLL):\n"
+        "    init = lambda self, name: None\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        DangerousQualifiedRebindCDLL.init = ctypes.CDLL.__init__\n"
+        "        DangerousQualifiedRebindCDLL.init(self, name)\n"
+        "ctypes.LibraryLoader(DangerousQualifiedRebindCDLL).dangerousqualified\n"
+        "class DefaultAliasCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str, init=ctypes.CDLL.__init__) -> None:\n"
+        "        init(self, name)\n"
+        "ctypes.LibraryLoader(DefaultAliasCDLL).defaultalias\n"
+        "class DeletedInitCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        pass\n"
+        "    del __init__\n"
+        "ctypes.LibraryLoader(DeletedInitCDLL).deletedinit\n"
+        "class ReachableNewCDLL(ctypes.CDLL):\n"
+        "    def __new__(cls, name: str):\n"
+        "        return super().__new__(cls)\n"
+        "        return object()\n"
+        "ctypes.LibraryLoader(ReachableNewCDLL).reachable\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S110"
+    assert "ctypes.LibraryLoader.bodyalias" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.qualifiedalias" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.customreceiver" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.starredinit" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.receiveralias" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.customqualified" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.localclassdangerous" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.dangerousqualified" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.defaultalias" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.deletedinit" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.reachable" in python_checks[0].details["reason"]
+
+
+def test_scan_zip_ignores_unreachable_ctypes_cdll_subclass_initializer(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "class SafeCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        if False:\n"
+        "            super().__init__(name)\n"
+        "ctypes.LibraryLoader(SafeCDLL).payload\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
 
 
 def test_scan_zip_preserves_restored_runpy_execution_after_static_overwrite(tmp_path: Path) -> None:
@@ -816,7 +1831,189 @@ def test_scan_zip_preserves_safe_runpy_overwrite_before_conditional(tmp_path: Pa
         ("import os\nrunner = os.system\nif True:\n    globals()['runner'] = print\nglobals()['runner']('safe')\n"),
         "import runpy\nrunpy.run_path = len\nrunpy.run_path([])\n",
         "import webbrowser\nwebbrowser.get = len\nwebbrowser.get([]).open('https://example.invalid')\n",
+        "import webbrowser\nbrowser = webbrowser.get()\nbrowser.open = len\nbrowser.open([])\n",
         "import ctypes\nctypes.cdll = len\nctypes.cdll['msvcrt'].printf(b'x')\n",
+        "import ctypes\nloader = ctypes.LibraryLoader(len)\nloader.payload.printf(b'x')\n",
+        "import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL, object)\nloader.payload.printf(b'x')\n",
+        "import ctypes\nloader = ctypes.LibraryLoader(loader=ctypes.CDLL)\nloader.payload.printf(b'x')\n",
+        "import ctypes\nload = ctypes.cdll.LoadLibrary\nname = load.__name__\n",
+        "import ctypes\nname = ctypes.LibraryLoader.payload\n",
+        "import ctypes\nctypes.LibraryLoader = len\nctypes.LibraryLoader(ctypes.CDLL).payload\n",
+        "import ctypes\nctypes.windll.kernel32 = len\ngetattr(ctypes.windll, 'kernel32')\n",
+        "import ctypes\ngetattr(object=ctypes.cdll, name='msvcrt')\n",
+        "import ctypes\nctypes.cdll.__getattribute__('msvcrt')\n",
+        "import ctypes\nobject.__getattribute__(ctypes.cdll, 'msvcrt')\n",
+        "import ctypes\nctypes.windll.kernel32 = len\nctypes.windll.kernel32\n",
+        "import safe as runpy\nrunpy.run_path = runpy.run_module\nrunpy.run_path('payload')\n",
+        "import ctypes\nsetattr(ctypes.windll, 'kernel32', len)\nctypes.windll.kernel32\n",
+        (
+            "import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            "setattr(loader, 'payload', len)\nloader.payload([])\n"
+        ),
+        ("import webbrowser\nbrowser = webbrowser.get()\nsetattr(browser, 'open', len)\nbrowser.open([])\n"),
+        (
+            "import ctypes\nclass SafeNestedCDLL(ctypes.CDLL):\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        def later() -> None:\n"
+            "            ctypes.CDLL.__init__(self, name)\n"
+            "ctypes.LibraryLoader(SafeNestedCDLL).payload\nSafeNestedCDLL('/missing')\n"
+        ),
+        "import os\nos.__getattr__('system')('id')\n",
+        "import builtins\nbuiltins.__getattr__('eval')('1')\n",
+        "import webbrowser\nbrowser = webbrowser.get()\nother = browser\nbrowser.open = len\nother.open([])\n",
+        (
+            "import webbrowser\nbrowser = webbrowser.get()\nother = browser\n"
+            "browser.open = len\nbrowser = webbrowser.get()\nother.open([])\n"
+        ),
+        (
+            "import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            "other = loader\nloader.payload = len\nother.payload([])\n"
+        ),
+        (
+            "import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            "other = loader\nloader.payload = len\nloader = ctypes.LibraryLoader(ctypes.CDLL)\nother.payload([])\n"
+        ),
+        (
+            "import ctypes\nclass SafeCDLL(ctypes.CDLL):\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        pass\n"
+            "ctypes.LibraryLoader(SafeCDLL).payload\nSafeCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass Safe:\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        self.name = name\n"
+            "class NoLoad(Safe, ctypes.CDLL):\n"
+            "    pass\n"
+            "ctypes.LibraryLoader(NoLoad).payload\nNoLoad('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass Safe:\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        self.name = name\n"
+            "class NoLoad(Safe, ctypes.CDLL):\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        super().__init__(name)\n"
+            "ctypes.LibraryLoader(NoLoad).payload\nNoLoad('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass MissingNameSuperCDLL(ctypes.CDLL):\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        super().__init__()\n"
+            "ctypes.LibraryLoader(MissingNameSuperCDLL).payload\nMissingNameSuperCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass DeadDelegateCDLL(ctypes.CDLL):\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        if False:\n"
+            "            ctypes.CDLL.__init__(self, name)\n"
+            "ctypes.LibraryLoader(DeadDelegateCDLL).payload\nDeadDelegateCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass InstanceShadowCDLL(ctypes.CDLL):\n"
+            "    init = ctypes.CDLL.__init__\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        self.init = lambda name: None\n"
+            "        self.init(name)\n"
+            "ctypes.LibraryLoader(InstanceShadowCDLL).payload\nInstanceShadowCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass NewSkipsInitCDLL(ctypes.CDLL):\n"
+            "    def __new__(cls, name: str):\n"
+            "        return object()\n"
+            "ctypes.LibraryLoader(NewSkipsInitCDLL).payload\nNewSkipsInitCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass InvalidDirectCDLL(ctypes.CDLL):\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        ctypes.CDLL.__init__(object(), name)\n"
+            "ctypes.LibraryLoader(InvalidDirectCDLL).payload\nInvalidDirectCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass AsyncInitCDLL(ctypes.CDLL):\n"
+            "    async def __init__(self, name: str) -> None:\n"
+            "        ctypes.CDLL.__init__(self, name)\n"
+            "ctypes.LibraryLoader(AsyncInitCDLL).payload\nAsyncInitCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass SafeQualifiedRebindCDLL(ctypes.CDLL):\n"
+            "    init = ctypes.CDLL.__init__\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        SafeQualifiedRebindCDLL.init = lambda self, name: None\n"
+            "        SafeQualifiedRebindCDLL.init(self, name)\n"
+            "ctypes.LibraryLoader(SafeQualifiedRebindCDLL).payload\nSafeQualifiedRebindCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass SafeLocalClassAliasRebindCDLL(ctypes.CDLL):\n"
+            "    init = ctypes.CDLL.__init__\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        cls = SafeLocalClassAliasRebindCDLL\n"
+            "        cls.init = lambda self, name: None\n"
+            "        cls.init(self, name)\n"
+            "ctypes.LibraryLoader(SafeLocalClassAliasRebindCDLL).payload\n"
+            "SafeLocalClassAliasRebindCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            "loader.LoadLibrary = len\nloader.LoadLibrary([])\n"
+            "loader.__getitem__ = len\nloader.__getitem__([])\n"
+            "loader.__getattr__ = len\nloader.__getattr__('payload')\n"
+        ),
+        ("import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL)\ndel loader.payload\nloader.payload\n"),
+        (
+            "import ctypes\nfrom builtins import staticmethod as sm\n"
+            "class StaticAliasCDLL(ctypes.CDLL):\n"
+            "    @sm\n"
+            "    def __init__(name: str) -> None:\n"
+            "        ctypes.CDLL.__init__(name)\n"
+            "ctypes.LibraryLoader(StaticAliasCDLL).payload\nStaticAliasCDLL('/missing')\n"
+        ),
+        (
+            "import builtins as b\nimport ctypes\n"
+            "class ClassAliasCDLL(ctypes.CDLL):\n"
+            "    @b.classmethod\n"
+            "    def __init__(cls, name: str) -> None:\n"
+            "        ctypes.CDLL.__init__(cls, name)\n"
+            "ctypes.LibraryLoader(ClassAliasCDLL).payload\nClassAliasCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass SafeCDLL(ctypes.CDLL):\n"
+            "    init = ctypes.CDLL.__init__\n"
+            "    def init(self, name: str) -> None:\n"
+            "        pass\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        self.init(name)\n"
+            "ctypes.LibraryLoader(SafeCDLL).payload\nSafeCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass SafeNestedCDLL(ctypes.CDLL):\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        def later() -> None:\n"
+            "            ctypes.CDLL.__init__(self, name)\n"
+            "ctypes.LibraryLoader(SafeNestedCDLL).payload\nSafeNestedCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass SafeShadowCDLL(ctypes.CDLL):\n"
+            "    init = ctypes.CDLL.__init__\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        self.init = lambda name: None\n"
+            "        self.init(name)\n"
+            "ctypes.LibraryLoader(SafeShadowCDLL).payload\nSafeShadowCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass SafeNewCDLL(ctypes.CDLL):\n"
+            "    def __new__(cls, name: str):\n"
+            "        return object()\n"
+            "ctypes.LibraryLoader(SafeNewCDLL).payload\nSafeNewCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nimport webbrowser\n"
+            "setattr(ctypes.windll, 'kernel32', len)\nctypes.windll.kernel32\n"
+            "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            "setattr(loader, 'payload', len)\nloader.payload([])\n"
+            "browser = webbrowser.get()\n"
+            "setattr(browser, 'open', len)\nbrowser.open([])\n"
+        ),
     ],
 )
 def test_scan_zip_ignores_benign_namespace_mapping_call(tmp_path: Path, source: str) -> None:

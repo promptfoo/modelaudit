@@ -13,6 +13,7 @@ import ast
 import re
 import textwrap
 from bisect import bisect_left, bisect_right
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -178,6 +179,9 @@ _EMBEDDED_PYTHON_CONTEXT_START_PATTERN = re.compile(
 _EMBEDDED_PYTHON_COMPOUND_CONTEXT_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])if\s+(?:True|1)\s*:\s*(?:import|from)\s+"
 )
+_COMPOUND_HEADER_MATCH_PATTERN = re.compile(
+    rb"\b(?:async\s+def|if|elif|else|for|while|try|except|finally|with|class|def)\b"
+)
 _EmbeddedPythonCandidate = tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]
 
 
@@ -259,8 +263,9 @@ def _candidate_embedded_python_snippets(
             continue
         if any(block_start == start for block_start, _block_end in block_spans) and start not in priority_starts:
             continue
-        span = (start, len(bounded))
-        candidates.append((bounded[start:], span, (span,)))
+        candidate_start = _candidate_start_with_enclosing_header(bounded, start)
+        span = (candidate_start, len(bounded))
+        candidates.append((bounded[candidate_start:], span, (span,)))
 
     return candidates
 
@@ -317,8 +322,9 @@ def _bounded_priority_embedded_python_candidate_at_offset(
     segment_ranges: list[tuple[int, int]] = []
 
     def add_segment(start: int, end: int) -> None:
-        if end > start:
-            segment_ranges.append((start, end))
+        segment = (start, end)
+        if end > start and segment not in segment_ranges:
+            segment_ranges.append(segment)
 
     block_header_end = candidate.find(b"\n")
     if (
@@ -327,6 +333,8 @@ def _bounded_priority_embedded_python_candidate_at_offset(
         and candidate[:block_header_end].lstrip().startswith((b"def ", b"async def ", b"class "))
     ):
         add_segment(0, block_header_end + 1)
+    for header_start, header_end in _enclosing_compound_header_segments(candidate, line_start):
+        add_segment(header_start, header_end)
     add_segment(line_start, bounded_end)
 
     aliases = _priority_import_aliases(_compact_candidate_segments(candidate, segment_ranges))
@@ -469,6 +477,7 @@ def _priority_alias_usage_lines(
     candidate: bytes, aliases: frozenset[bytes], search_start: int
 ) -> list[tuple[int, int]]:
     usage_lines: list[tuple[int, int]] = []
+    pending_shadow_lines: dict[bytes, tuple[int, int]] = {}
     line_start = search_start
     multiline_quote: bytes | None = _multiline_string_state_after_line(candidate[:search_start], None)
     while line_start < len(candidate):
@@ -483,37 +492,495 @@ def _priority_alias_usage_lines(
             line_start = line_end
             continue
         code_line = _python_structural_line_bytes(line)
-        if _line_uses_priority_alias(code_line, aliases):
-            usage_lines.append((line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)))
-            if _line_calls_priority_alias(code_line, aliases) or len(usage_lines) >= _MAX_PRIORITY_ALIAS_USAGE_LINES:
+        shadowed_aliases = _line_shadowed_priority_aliases(code_line, aliases)
+        if shadowed_aliases:
+            shadow_line = (
+                line_start,
+                min(
+                    _priority_alias_shadow_segment_end(candidate, line, line_end),
+                    line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES,
+                ),
+            )
+            for alias in shadowed_aliases:
+                pending_shadow_lines[alias] = shadow_line
+        if used_aliases := _line_used_priority_aliases(code_line, aliases):
+            live_aliases = _line_live_priority_aliases(code_line, aliases)
+            active_used_aliases = (used_aliases - shadowed_aliases) | live_aliases
+            if not active_used_aliases:
+                multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                line_start = line_end
+                continue
+            for shadow_line in sorted(
+                {shadow_line for alias, shadow_line in pending_shadow_lines.items() if alias in used_aliases}
+            ):
+                if shadow_line not in usage_lines:
+                    usage_lines.append(shadow_line)
+            usage_line = (line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES))
+            if usage_line not in usage_lines:
+                usage_lines.append(usage_line)
+            called_aliases = _line_called_priority_aliases(code_line, aliases)
+            if (called_aliases & active_used_aliases) or len(usage_lines) >= _MAX_PRIORITY_ALIAS_USAGE_LINES:
                 return usage_lines
         multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
         line_start = line_end
     return usage_lines
 
 
+def _priority_alias_shadow_segment_end(candidate: bytes, line: bytes, line_end: int) -> int:
+    structural_line = _python_structural_line_bytes(line)
+    if not structural_line.rstrip().endswith(b":"):
+        return line_end
+    header_indent = _line_indent_width(line)
+    segment_end = line_end
+    body_seen = False
+    next_line_start = line_end
+    while next_line_start < len(candidate):
+        next_line_end = candidate.find(b"\n", next_line_start)
+        if next_line_end == -1:
+            next_line_end = len(candidate)
+        else:
+            next_line_end += 1
+        next_line = candidate[next_line_start:next_line_end]
+        next_structural_line = _python_structural_line_bytes(next_line)
+        next_stripped = next_structural_line.strip()
+        next_indent = _line_indent_width(next_line)
+        if next_stripped and next_indent <= header_indent:
+            break
+        segment_end = next_line_end
+        if next_stripped:
+            body_seen = True
+        next_line_start = next_line_end
+    return segment_end if body_seen else line_end
+
+
 def _line_uses_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
-    return any(
-        re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\()", code_line)
+    return bool(_line_used_priority_aliases(code_line, aliases))
+
+
+def _line_used_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    return frozenset(
+        alias
+        for alias in aliases
+        if re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\()", code_line)
         or re.search(
             rb"(?<![A-Za-z0-9_.])(?:builtins\.)?getattr\s*\(\s*" + re.escape(alias) + rb"\s*,",
             code_line,
         )
-        for alias in aliases
     )
 
 
 def _line_calls_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
-    return any(
-        re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\(|\.[A-Za-z_]\w*\s*\()", code_line)
+    return bool(_line_called_priority_aliases(code_line, aliases))
+
+
+def _line_called_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    return frozenset(
+        alias
+        for alias in aliases
+        if re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\(|\.[A-Za-z_]\w*\s*\()", code_line)
         or re.search(
             rb"(?<![A-Za-z0-9_.])(?:builtins\.)?getattr\s*\(\s*"
             + re.escape(alias)
             + rb"\s*,\s*['\"][A-Za-z_]\w*['\"]\s*\)\s*\(",
             code_line,
         )
-        for alias in aliases
     )
+
+
+def _line_live_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    try:
+        tree = ast.parse(textwrap.dedent(code_line.decode("utf-8", errors="ignore")))
+    except SyntaxError:
+        return frozenset()
+
+    live_aliases: set[bytes] = set()
+    shadowed_aliases: set[bytes] = set()
+    for statement in tree.body:
+        for event, event_aliases in _statement_priority_alias_runtime_events(statement, aliases):
+            if event == "use":
+                live_aliases.update(event_aliases - shadowed_aliases)
+            else:
+                shadowed_aliases.update(event_aliases)
+    return frozenset(live_aliases)
+
+
+def _statement_priority_alias_runtime_events(
+    statement: ast.stmt,
+    aliases: frozenset[bytes],
+) -> Iterator[tuple[str, frozenset[bytes]]]:
+    if isinstance(statement, ast.Assign):
+        yield from _node_priority_alias_use_events(statement.value, aliases)
+        yield (
+            "bind",
+            frozenset(
+                alias for target in statement.targets for alias in _target_bound_priority_aliases(target, aliases)
+            ),
+        )
+        return
+    if isinstance(statement, ast.AnnAssign):
+        if statement.value is not None:
+            yield from _node_priority_alias_use_events(statement.value, aliases)
+        yield "bind", _target_bound_priority_aliases(statement.target, aliases)
+        return
+    if isinstance(statement, ast.AugAssign):
+        yield from _node_priority_alias_use_events(statement.target, aliases)
+        yield from _node_priority_alias_use_events(statement.value, aliases)
+        yield "bind", _target_bound_priority_aliases(statement.target, aliases)
+        return
+    if isinstance(statement, (ast.Import, ast.ImportFrom)):
+        yield "bind", _statement_bound_priority_aliases(statement, aliases)
+        return
+    if isinstance(statement, ast.If):
+        yield from _node_priority_alias_use_events(statement.test, aliases)
+        for child_statement in [*statement.body, *statement.orelse]:
+            yield from _statement_priority_alias_runtime_events(child_statement, aliases)
+        return
+    yield from _node_priority_alias_use_events(statement, aliases)
+    if bound_aliases := _statement_bound_priority_aliases(statement, aliases):
+        yield "bind", bound_aliases
+
+
+def _node_priority_alias_use_events(node: ast.AST, aliases: frozenset[bytes]) -> Iterator[tuple[str, frozenset[bytes]]]:
+    alias_names = {alias.decode("utf-8", errors="ignore"): alias for alias in aliases}
+    pending = [node]
+    while pending:
+        child = pending.pop()
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(child, ast.Call):
+            called_aliases = _call_priority_aliases(child, alias_names)
+            if called_aliases:
+                yield "use", called_aliases
+                continue
+        expression_aliases = _expression_priority_aliases(child, alias_names)
+        if expression_aliases:
+            yield "use", expression_aliases
+            continue
+        pending.extend(reversed(list(ast.iter_child_nodes(child))))
+
+
+def _call_priority_aliases(call: ast.Call, alias_names: dict[str, bytes]) -> frozenset[bytes]:
+    if isinstance(call.func, ast.Name):
+        alias = alias_names.get(call.func.id)
+        return frozenset({alias}) if alias is not None else frozenset()
+    if isinstance(call.func, ast.Attribute):
+        return _expression_priority_aliases(call.func.value, alias_names)
+    if (
+        isinstance(call.func, ast.Call)
+        and _simple_reference_name(call.func.func) in {"getattr", "builtins.getattr"}
+        and call.func.args
+    ):
+        return _expression_priority_aliases(call.func.args[0], alias_names)
+    return frozenset()
+
+
+def _expression_priority_aliases(node: ast.AST, alias_names: dict[str, bytes]) -> frozenset[bytes]:
+    if isinstance(node, ast.Name):
+        alias = alias_names.get(node.id)
+        return frozenset({alias}) if alias is not None else frozenset()
+    if isinstance(node, (ast.Attribute, ast.Subscript)):
+        return _expression_priority_aliases(node.value, alias_names)
+    if (
+        isinstance(node, ast.Call)
+        and _simple_reference_name(node.func) in {"getattr", "builtins.getattr"}
+        and node.args
+    ):
+        return _expression_priority_aliases(node.args[0], alias_names)
+    return frozenset()
+
+
+def _target_bound_priority_aliases(target: ast.AST, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    if isinstance(target, ast.Name):
+        name = target.id.encode()
+        return frozenset({name}) if name in aliases else frozenset()
+    if isinstance(target, ast.Starred):
+        return _target_bound_priority_aliases(target.value, aliases)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return frozenset(alias for element in target.elts for alias in _target_bound_priority_aliases(element, aliases))
+    return frozenset()
+
+
+def _target_binds_priority_alias(target: ast.AST, aliases: frozenset[bytes]) -> bool:
+    return bool(_target_bound_priority_aliases(target, aliases))
+
+
+def _statement_bound_priority_aliases(statement: ast.stmt, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    if isinstance(statement, ast.Assign):
+        return frozenset(
+            alias for target in statement.targets for alias in _target_bound_priority_aliases(target, aliases)
+        )
+    if isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+        return _target_bound_priority_aliases(statement.target, aliases)
+    if isinstance(statement, (ast.For, ast.AsyncFor)):
+        return _target_bound_priority_aliases(statement.target, aliases)
+    if isinstance(statement, (ast.With, ast.AsyncWith)):
+        return frozenset(
+            alias
+            for item in statement.items
+            if item.optional_vars is not None
+            for alias in _target_bound_priority_aliases(item.optional_vars, aliases)
+        )
+    if isinstance(statement, ast.Import):
+        return frozenset(
+            name
+            for alias in statement.names
+            for name in ((alias.asname or alias.name.split(".", maxsplit=1)[0]).encode(),)
+            if name in aliases
+        )
+    if isinstance(statement, ast.ImportFrom):
+        return frozenset(
+            name for alias in statement.names for name in ((alias.asname or alias.name).encode(),) if name in aliases
+        )
+    if isinstance(statement, ast.Delete):
+        return frozenset(
+            alias for target in statement.targets for alias in _target_bound_priority_aliases(target, aliases)
+        )
+    return frozenset()
+
+
+def _statement_binds_priority_alias(statement: ast.stmt, aliases: frozenset[bytes]) -> bool:
+    return bool(_statement_bound_priority_aliases(statement, aliases))
+
+
+def _line_assigns_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
+    decoded_line = textwrap.dedent(code_line.decode("utf-8", errors="ignore"))
+    try:
+        tree = ast.parse(decoded_line)
+    except SyntaxError:
+        if not decoded_line.rstrip().endswith(":"):
+            return False
+        try:
+            tree = ast.parse(f"{decoded_line.rstrip()}\n    pass\n")
+        except (SyntaxError, ValueError):
+            return False
+    except ValueError:
+        return False
+
+    pending = list(reversed(tree.body))
+    while pending:
+        statement = pending.pop()
+        if _statement_binds_priority_alias(statement, aliases):
+            return True
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        pending.extend(
+            child for child in reversed(list(ast.iter_child_nodes(statement))) if isinstance(child, ast.stmt)
+        )
+    return False
+
+
+def _line_shadows_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
+    return bool(_line_shadowed_priority_aliases(code_line, aliases))
+
+
+def _line_shadowed_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    shadowed_aliases = set(_line_assigned_priority_aliases(code_line, aliases))
+    shadowed_aliases.update(
+        alias
+        for alias in aliases
+        if re.search(rb"^\s*(?:async\s+)?def\s+" + re.escape(alias) + rb"\b", code_line)
+        or re.search(rb"^\s*class\s+" + re.escape(alias) + rb"\b", code_line)
+    )
+    return frozenset(shadowed_aliases)
+
+
+def _line_assigned_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    decoded_line = textwrap.dedent(code_line.decode("utf-8", errors="ignore"))
+    try:
+        tree = ast.parse(decoded_line)
+    except SyntaxError:
+        if not decoded_line.rstrip().endswith(":"):
+            return frozenset()
+        try:
+            tree = ast.parse(f"{decoded_line.rstrip()}\n    pass\n")
+        except (SyntaxError, ValueError):
+            return frozenset()
+    except ValueError:
+        return frozenset()
+
+    pending = list(reversed(tree.body))
+    assigned_aliases: set[bytes] = set()
+    while pending:
+        statement = pending.pop()
+        assigned_aliases.update(_statement_bound_priority_aliases(statement, aliases))
+        assigned_aliases.update(_named_expression_bound_priority_aliases(statement, aliases))
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        pending.extend(
+            child for child in reversed(list(ast.iter_child_nodes(statement))) if isinstance(child, ast.stmt)
+        )
+    return frozenset(assigned_aliases)
+
+
+def _named_expression_bound_priority_aliases(node: ast.AST, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    assigned_aliases: set[bytes] = set()
+    pending = [node]
+    while pending:
+        child = pending.pop()
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(child, ast.NamedExpr):
+            assigned_aliases.update(_target_bound_priority_aliases(child.target, aliases))
+        pending.extend(reversed(list(ast.iter_child_nodes(child))))
+    return frozenset(assigned_aliases)
+
+
+def _line_indent_width(line: bytes) -> int:
+    return len(line) - len(line.lstrip(b" \t"))
+
+
+def _compound_header_keyword(structural_line: bytes) -> bytes | None:
+    stripped = structural_line.lstrip()
+    for keyword in (b"async def", b"elif", b"else", b"except", b"finally", b"if", b"for", b"while", b"try"):
+        if stripped == keyword + b":" or stripped.startswith(keyword + b" ") or stripped.startswith(keyword + b":"):
+            return keyword
+    return None
+
+
+def _line_end_offset(candidate: bytes, line_start: int) -> int:
+    line_end = candidate.find(b"\n", line_start)
+    return len(candidate) if line_end == -1 else line_end + 1
+
+
+def _compound_header_start(line_start: int, structural_line: bytes) -> int:
+    header_match = _COMPOUND_HEADER_MATCH_PATTERN.search(structural_line)
+    if header_match is None:
+        return line_start
+    prefix = structural_line[: header_match.start()]
+    if _is_embedded_top_level_prefix(prefix):
+        return line_start + header_match.start()
+    return line_start
+
+
+def _first_body_statement_segment(candidate: bytes, header_line_end: int, header_indent: int) -> tuple[int, int] | None:
+    line_start = header_line_end
+    while line_start < len(candidate):
+        line_end = _line_end_offset(candidate, line_start)
+        line = candidate[line_start:line_end]
+        structural_line = _python_structural_line_bytes(line).rstrip()
+        if not structural_line:
+            line_start = line_end
+            continue
+        if _line_indent_width(line) <= header_indent:
+            return None
+
+        statement_end = line_end
+        paren_depth = _line_parenthesis_delta(line)
+        while (
+            _line_has_explicit_continuation(candidate[line_start:statement_end]) or paren_depth > 0
+        ) and statement_end < len(candidate):
+            continuation_start = statement_end
+            statement_end = _line_end_offset(candidate, continuation_start)
+            paren_depth += _line_parenthesis_delta(candidate[continuation_start:statement_end])
+
+        if structural_line.endswith(b":"):
+            nested_segment = _first_body_statement_segment(candidate, statement_end, _line_indent_width(line))
+            if nested_segment is not None:
+                statement_end = nested_segment[1]
+        return line_start, statement_end
+    return None
+
+
+def _previous_header_context_segments(
+    candidate: bytes,
+    before_line_start: int,
+    indent: int,
+    keywords: set[bytes],
+) -> list[tuple[int, int]]:
+    search_end = before_line_start
+    while search_end > 0:
+        previous_line_end = search_end - 1
+        previous_line_start = candidate.rfind(b"\n", 0, previous_line_end) + 1
+        previous_line = candidate[previous_line_start:search_end]
+        search_end = previous_line_start
+        structural_line = _python_structural_line_bytes(previous_line).rstrip()
+        if not structural_line:
+            continue
+        previous_indent = _line_indent_width(previous_line)
+        if previous_indent < indent:
+            return []
+        if previous_indent != indent:
+            continue
+        keyword = _compound_header_keyword(structural_line)
+        if keyword not in keywords or not structural_line.endswith(b":"):
+            continue
+        header_start = _compound_header_start(previous_line_start, structural_line)
+        header_segment = (header_start, previous_line_start + len(previous_line))
+        body_segment = _first_body_statement_segment(candidate, previous_line_start + len(previous_line), indent)
+        if body_segment is None:
+            return [header_segment]
+        return [header_segment, body_segment]
+    return []
+
+
+def _try_else_context_segments(candidate: bytes, clause_line_start: int, indent: int) -> list[tuple[int, int]]:
+    except_context = _previous_header_context_segments(candidate, clause_line_start, indent, {b"except"})
+    try_context = _previous_header_context_segments(candidate, clause_line_start, indent, {b"try"})
+    if try_context and except_context:
+        return [*try_context, *except_context]
+    return []
+
+
+def _matching_clause_context_segments(
+    candidate: bytes,
+    clause_line_start: int,
+    indent: int,
+    clause_keyword: bytes | None,
+) -> list[tuple[int, int]]:
+    if clause_keyword in {b"else", b"elif"}:
+        context = _previous_header_context_segments(candidate, clause_line_start, indent, {b"if", b"for", b"while"})
+        if context:
+            return context
+        if clause_keyword == b"else":
+            return _try_else_context_segments(candidate, clause_line_start, indent)
+    if clause_keyword in {b"except", b"finally"}:
+        return _previous_header_context_segments(candidate, clause_line_start, indent, {b"try"})
+    return []
+
+
+def _enclosing_compound_header_segments(candidate: bytes, line_start: int) -> list[tuple[int, int]]:
+    line_end = candidate.find(b"\n", line_start)
+    if line_end == -1:
+        line_end = len(candidate)
+    current_indent = _line_indent_width(candidate[line_start:line_end])
+    if current_indent == 0:
+        return []
+
+    segments: list[tuple[int, int]] = []
+    search_end = line_start
+    while current_indent > 0 and search_end > 0:
+        previous_line_end = search_end - 1
+        previous_line_start = candidate.rfind(b"\n", 0, previous_line_end) + 1
+        previous_line = candidate[previous_line_start:search_end]
+        search_end = previous_line_start
+        structural_line = _python_structural_line_bytes(previous_line).rstrip()
+        if not structural_line:
+            continue
+        previous_indent = _line_indent_width(previous_line)
+        if previous_indent < current_indent and structural_line.endswith(b":"):
+            header_start = _compound_header_start(previous_line_start, structural_line)
+            header_segment = (header_start, previous_line_start + len(previous_line))
+            clause_context = _matching_clause_context_segments(
+                candidate,
+                previous_line_start,
+                previous_indent,
+                _compound_header_keyword(structural_line),
+            )
+            segments.append(header_segment)
+            segments.extend(reversed(clause_context))
+            current_indent = previous_indent
+    return list(reversed(segments))
+
+
+def _candidate_start_with_enclosing_header(candidate: bytes, start: int) -> int:
+    line_start = candidate.rfind(b"\n", 0, start) + 1
+    line_end = candidate.find(b"\n", start)
+    if line_end == -1:
+        line_end = len(candidate)
+    if _line_indent_width(candidate[line_start:line_end]) == 0:
+        return start
+    header_segments = _enclosing_compound_header_segments(candidate, line_start)
+    return header_segments[0][0] if header_segments else start
 
 
 def _merge_candidate_segment_ranges(segment_ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:

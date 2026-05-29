@@ -204,10 +204,10 @@ class TestTarScanner:
         assert python_checks[0].severity == IssueSeverity.WARNING
         assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
-    def test_scan_tar_flags_builtins_getattr_keyword_call_dangerous_python_member(self, tmp_path: Path) -> None:
-        """Keyword-based getattr indirection should still resolve to the risky call name."""
+    def test_scan_tar_flags_builtins_getattr_call_dangerous_python_member(self, tmp_path: Path) -> None:
+        """getattr indirection should still resolve to the risky call name."""
         archive_path = tmp_path / "model_bundle.tar"
-        payload = b"import builtins as bi\nimport os\nbi.getattr(object=os, name='system').__call__('echo hidden')\n"
+        payload = b"import builtins as bi\nimport os\nbi.getattr(os, 'system').__call__('echo hidden')\n"
 
         with tarfile.open(archive_path, "w") as archive:
             info = tarfile.TarInfo("handler.py")
@@ -229,7 +229,7 @@ class TestTarScanner:
         payload = (
             b"from builtins import getattr as resolve\n"
             b"import os as operating_system\n"
-            b"resolve(object=operating_system, name='system')('echo hidden')\n"
+            b"resolve(operating_system, 'system')('echo hidden')\n"
         )
 
         with tarfile.open(archive_path, "w") as archive:
