@@ -147,6 +147,14 @@ _PRIORITY_EMBEDDED_PYTHON_MODULES = tuple(
 _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN = b"|".join(
     re.escape(marker.encode("utf-8")) for marker in _PRIORITY_EMBEDDED_PYTHON_MODULES
 )
+_PRIORITY_WILDCARD_IMPORT_ALIASES = {
+    "asyncio": ("create_subprocess_exec", "create_subprocess_shell"),
+    "ctypes": ("CDLL", "LoadLibrary", "LibraryLoader", "cdll", "pydll", "windll"),
+    "os": ("popen", "spawnl", "spawnle", "spawnv", "spawnve", "system"),
+    "runpy": ("_run_module_as_main", "run_module", "run_path"),
+    "subprocess": ("Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput", "run"),
+    "webbrowser": ("get", "open", "open_new", "open_new_tab"),
+}
 _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN = re.compile(
     rb"(?m)^\s*(?:"
     rb"import\s+(?:[a-z_][\w.]*(?:\s+as\s+[a-z_]\w*)?\s*,(?:\s|\\\r?\n)*)*(?:"
@@ -335,7 +343,13 @@ def _priority_import_aliases(candidate: bytes) -> frozenset[bytes]:
         elif isinstance(statement, ast.ImportFrom) and statement.module is not None:
             root_name = statement.module.split(".", maxsplit=1)[0]
             if root_name in priority_modules:
-                aliases.update((alias.asname or alias.name).encode("utf-8") for alias in statement.names)
+                for alias in statement.names:
+                    if alias.name == "*":
+                        aliases.update(
+                            name.encode("utf-8") for name in _PRIORITY_WILDCARD_IMPORT_ALIASES.get(root_name, ())
+                        )
+                    else:
+                        aliases.add((alias.asname or alias.name).encode("utf-8"))
     aliases.update(_priority_assignment_aliases(source, tree))
     return frozenset(aliases)
 

@@ -1354,11 +1354,25 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self._bind_imported_static_members(local_name, import_name, preserve_existing=preserve_existing)
 
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
-        self._shadow_member_bindings(-1, name)
+        previous_names, _found = _lookup_bound_alias(name, self.alias_scopes)
+        preserves_module_binding = (
+            isinstance(previous_names, frozenset)
+            and isinstance(resolved_names, frozenset)
+            and bool(previous_names & resolved_names)
+        )
+        if not preserves_module_binding:
+            self._shadow_member_bindings(-1, name)
         self.alias_scopes[-1][name] = resolved_names
 
     def _bind_name_in_scope(self, scope_index: int, name: str, resolved_names: _AliasValue) -> None:
-        self._shadow_member_bindings(scope_index, name)
+        previous_names, _found = _lookup_bound_alias(name, self.alias_scopes[: scope_index + 1])
+        preserves_module_binding = (
+            isinstance(previous_names, frozenset)
+            and isinstance(resolved_names, frozenset)
+            and bool(previous_names & resolved_names)
+        )
+        if not preserves_module_binding:
+            self._shadow_member_bindings(scope_index, name)
         self.alias_scopes[scope_index][name] = resolved_names
 
     def _should_track_syntactic_static_reference(self, syntactic_name: str) -> bool:

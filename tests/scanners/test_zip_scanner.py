@@ -724,6 +724,45 @@ def test_scan_zip_preserves_safe_module_member_overwrite_after_reimport(tmp_path
     )
 
 
+def test_scan_zip_preserves_runpy_member_after_harmless_reimport(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import runpy as rp\nimport runpy as rp\nrp.run_path('payload.py')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S108"
+    assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
+
+
+@pytest.mark.parametrize("rebinding", ["rp = rp", "rp = runpy"])
+def test_scan_zip_preserves_runpy_member_after_module_preserving_alias_assignment(
+    tmp_path: Path, rebinding: str
+) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = f"import runpy\nimport runpy as rp\n{rebinding}\nrp.run_path('payload.py')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S108"
+    assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
+
+
 def test_scan_zip_preserves_safe_runpy_overwrite_before_conditional(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = "import runpy\nrunpy.run_path = len\nif replace:\n    runpy.run_path = str\nrunpy.run_path([])\n"
