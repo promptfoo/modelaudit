@@ -754,10 +754,14 @@ def _resolve_getattr_call_names(
         attr_name = _resolve_static_string(node.args[0])
         if attr_name is None:
             return None
-        return _apply_aliases_to_names(
-            frozenset(f"{target_root}.{attr_name}" for target_root in accessor_names),
+        resolved_names: set[str] = {f"{target_root}.{attr_name}" for target_root in getattr_accessor_names}
+        getattribute_names = _apply_aliases_to_names(
+            frozenset(f"{target_root}.{attr_name}" for target_root in getattribute_accessor_names),
             alias_scopes,
         )
+        if getattribute_names is not None:
+            resolved_names.update(getattribute_names)
+        return frozenset(resolved_names) or None
 
     if not (normalized_helper_names & {"getattr", "builtins.getattr"}):
         return None
@@ -1249,16 +1253,16 @@ def _resolve_ctypes_library_loader_instance_roots(
         elif not node.args and len(node.keywords) == 1 and node.keywords[0].arg == "dlltype":
             loader_type_node = node.keywords[0].value
         else:
-            return None
-        resolved_loader_types = _resolve_static_reference_names(
-            loader_type_node,
-            alias_scopes,
-            allow_module_locals_mapping=allow_module_locals_mapping,
-            allow_local_namespace_mapping=allow_local_namespace_mapping,
-        )
-        if not _canonical_ctypes_loader_type_aliases(resolved_loader_types):
-            return None
-        loader_roots.add(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT)
+            loader_type_node = None
+        if loader_type_node is not None:
+            resolved_loader_types = _resolve_static_reference_names(
+                loader_type_node,
+                alias_scopes,
+                allow_module_locals_mapping=allow_module_locals_mapping,
+                allow_local_namespace_mapping=allow_local_namespace_mapping,
+            )
+            if _canonical_ctypes_loader_type_aliases(resolved_loader_types):
+                loader_roots.add(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT)
     library_name_node: ast.AST | None = None
     if len(node.args) == 1 and not node.keywords:
         library_name_node = node.args[0]
@@ -1977,6 +1981,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.visit(node.value)
+        resolved_names = self._resolve_reference_names(node.target)
+        if resolved_names is not None:
+            for resolved_name in resolved_names:
+                normalized_name = _ctypes_loader_attribute_load_name(resolved_name)
+                if normalized_name is not None:
+                    self.risky_calls.add(normalized_name)
         self._shadow_binding_target(node.target)
         self.visit(node.target)
 

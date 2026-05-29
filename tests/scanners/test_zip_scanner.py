@@ -606,6 +606,16 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "ctypes.LibraryLoader.__getitem__(ctypes.cdll, 'unboundgetitem')\n"
         "object.__getattribute__(ctypes.cdll, 'LoadLibrary')('objectmethodlib')\n"
         "object.__getattribute__(ctypes.cdll, '__getitem__')('objectgetitem')\n"
+        "ctypes.windll.kernel32 = len\n"
+        "ctypes.windll.__getattr__('kernel32')\n"
+        "loader_conditional = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "conditional_load = loader_conditional.LoadLibrary\n"
+        "if flag:\n"
+        "    conditional_load = ctypes.LibraryLoader\n"
+        "conditional_load('conditionalmethod')\n"
+        "ctypes.cdll.augmented += 1\n"
+        "loader_augmented = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader_augmented.augmented += 1\n"
         "class MyCDLL(ctypes.CDLL):\n"
         "    pass\n"
         "ctypes.LibraryLoader(MyCDLL).subclasslib\n"
@@ -643,6 +653,10 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.cdll.unboundgetitem" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.cdll.objectmethodlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.cdll.objectgetitem" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.windll.kernel32" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.conditionalmethod" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.augmented" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.augmented" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.attrlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.user32" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.advapi32" in checks_by_rule["S110"].details["reason"]
@@ -789,7 +803,6 @@ def test_scan_zip_preserves_dynamic_member_risk_after_conditional_overwrite(tmp_
         "import ctypes\nname = ctypes.LibraryLoader.payload\n",
         "import ctypes\nctypes.LibraryLoader = len\nctypes.LibraryLoader(ctypes.CDLL).payload\n",
         "import ctypes\nctypes.windll.kernel32 = len\ngetattr(ctypes.windll, 'kernel32')\n",
-        "import ctypes\nctypes.windll.kernel32 = len\nctypes.windll.__getattr__('kernel32')\n",
         "import ctypes\nctypes.cdll.__getattribute__('msvcrt')\n",
         "import ctypes\nobject.__getattribute__(ctypes.cdll, 'msvcrt')\n",
         "import ctypes\nctypes.windll.kernel32 = len\nctypes.windll.kernel32\n",
