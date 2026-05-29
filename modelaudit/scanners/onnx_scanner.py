@@ -166,6 +166,42 @@ def _iter_model_initializer_graphs(model: Any) -> Any:
         yield from _iter_graph_and_subgraphs(training_info.algorithm)
 
 
+def _iter_attribute_external_data_tensors(attribute: Any) -> Any:
+    """Yield tensor values declared by an ONNX attribute."""
+    yield from getattr(attribute, "tensors", [])
+    for sparse_tensor in getattr(attribute, "sparse_tensors", []):
+        yield sparse_tensor.values
+        yield sparse_tensor.indices
+    try:
+        if attribute.HasField("t"):
+            yield attribute.t
+        if attribute.HasField("sparse_tensor"):
+            yield attribute.sparse_tensor.values
+            yield attribute.sparse_tensor.indices
+    except (ValueError, AttributeError):  # pragma: no cover - proto edge case
+        pass
+
+
+def _iter_graph_external_data_tensors(graph: Any) -> Any:
+    """Yield graph-owned tensors that can carry external_data references."""
+    yield from getattr(graph, "initializer", [])
+    for sparse_tensor in getattr(graph, "sparse_initializer", []):
+        yield sparse_tensor.values
+        yield sparse_tensor.indices
+    for node in getattr(graph, "node", []):
+        for attribute in getattr(node, "attribute", []):
+            yield from _iter_attribute_external_data_tensors(attribute)
+
+
+def _iter_model_external_data_tensor_groups(model: Any) -> Any:
+    """Yield model tensor groups that can declare external_data."""
+    for graph in _iter_model_initializer_graphs(model):
+        yield _iter_graph_external_data_tensors(graph)
+    for function in getattr(model, "functions", []):
+        for attribute in getattr(function, "attribute_proto", []):
+            yield _iter_attribute_external_data_tensors(attribute)
+
+
 def _model_declares_python_operator(model: Any) -> bool:
     """Return True when the parsed ONNX model actually declares a Python operator.
 
@@ -645,8 +681,8 @@ class OnnxScanner(BaseScanner):
         traversal_files: dict[str, list[str]] = {}  # file -> [tensor_names]
         safe_files: set[str] = set()
 
-        for graph in _iter_model_initializer_graphs(model):
-            for tensor in getattr(graph, "initializer", []):
+        for tensors in _iter_model_external_data_tensor_groups(model):
+            for tensor in tensors:
                 self.check_interrupted()
 
                 if tensor.data_location != onnx.TensorProto.EXTERNAL:
