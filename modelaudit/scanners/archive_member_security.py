@@ -763,7 +763,7 @@ def _resolve_getattr_call_names(
             allow_local_namespace_mapping=allow_local_namespace_mapping,
         )
         attr_name = _resolve_static_string(node.args[1])
-        if resolved_target_roots is None or attr_name is None:
+        if resolved_target_roots is None:
             return None
         if attr_name in {"__getitem__", "LoadLibrary"}:
             loader_method_roots = frozenset(
@@ -776,6 +776,8 @@ def _resolve_getattr_call_names(
                     frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in loader_method_roots),
                     alias_scopes,
                 )
+        if attr_name is None:
+            return None
         resolved_target_roots = frozenset(
             root for root in resolved_target_roots if not _is_ctypes_library_loader_object_root(root)
         )
@@ -1870,19 +1872,21 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self._bind_name(f"{root}.{key}", resolved_value)
 
     def _record_setattr_call(self, node: ast.Call) -> None:
-        if len(node.args) != 3 or node.keywords:
+        helper_name = _resolve_call_name(node.func)
+        resolved_helper_names = _apply_aliases(helper_name, self.alias_scopes) if helper_name is not None else None
+        if not resolved_helper_names or not (resolved_helper_names & {"setattr", "builtins.setattr"}):
             return
-        resolved_func_names = self._resolve_reference_names(node.func)
-        if not resolved_func_names or not (resolved_func_names & {"setattr", "builtins.setattr"}):
+        if len(node.args) != 3 or node.keywords:
             return
         attr_name = _resolve_static_string(node.args[1])
         if attr_name is None:
             return
-        resolved_target_roots = self._resolve_reference_names(node.args[0])
-        if resolved_target_roots is None:
+        target_roots = self._resolve_reference_names(node.args[0])
+        if target_roots is None:
             return
         resolved_value = self._resolve_binding_value_names(node.args[2])
-        for target_name in (f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots):
+        for target_root in target_roots:
+            target_name = f"{target_root}.{attr_name}"
             if _is_overwritable_high_risk_reference(target_name):
                 self._bind_name(target_name, resolved_value)
 
@@ -2135,14 +2139,14 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         return aliases if isinstance(aliases, frozenset) else frozenset()
 
     @staticmethod
-    def _direct_scope_calls(body: list[ast.stmt]) -> Iterator[ast.Call]:
-        pending: list[ast.AST] = list(reversed(body))
+    def _initializer_calls(init_method: ast.FunctionDef | ast.AsyncFunctionDef) -> Iterator[ast.Call]:
+        pending: list[ast.AST] = list(reversed(init_method.body))
         while pending:
             node = pending.pop()
-            if isinstance(node, ast.Call):
-                yield node
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
                 continue
+            if isinstance(node, ast.Call):
+                yield node
             pending.extend(reversed(list(ast.iter_child_nodes(node))))
 
     def _class_preserves_ctypes_loader_init(self, node: ast.ClassDef, class_scope: _AliasScope) -> bool:
@@ -2161,7 +2165,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if node.bases
             else frozenset()
         )
-        for child in self._direct_scope_calls(init_method.body):
+        for child in self._initializer_calls(init_method):
             if (
                 first_base_loader_types
                 and isinstance(child.func, ast.Attribute)

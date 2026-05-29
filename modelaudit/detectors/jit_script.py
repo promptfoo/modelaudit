@@ -259,9 +259,7 @@ def _candidate_embedded_python_snippets(
             continue
         if any(block_start == start for block_start, _block_end in block_spans) and start not in priority_starts:
             continue
-        line_start = bounded.rfind(b"\n", 0, start) + 1
-        header_segments = _enclosing_compound_header_segments(bounded, line_start)
-        candidate_start = header_segments[0][0] if header_segments else start
+        candidate_start = _candidate_start_with_enclosing_header(bounded, start)
         span = (candidate_start, len(bounded))
         candidates.append((bounded[candidate_start:], span, (span,)))
 
@@ -527,7 +525,7 @@ def _line_calls_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> b
 
 
 def _line_shadows_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
-    assignment_operators = rb"\+=|-=|\*=|/=|//=|%=|\*\*=|@=|&=|\|=|\^=|>>=|<<=|=(?!=)"
+    assignment_operators = rb"\+=|-=|\*=|//=|/=|%=|\*\*=|@=|&=|\|=|\^=|>>=|<<=|=(?!=)"
     return any(
         re.search(
             rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?::[^=\n]+)?\s*(?:" + assignment_operators + rb")",
@@ -563,19 +561,22 @@ def _enclosing_compound_header_segments(candidate: bytes, line_start: int) -> li
             continue
         previous_indent = _line_indent_width(previous_line)
         if previous_indent < current_indent and structural_line.endswith(b":"):
-            segments.append((previous_line_start, previous_line_start + len(previous_line)))
+            header_match = re.search(rb"\b(?:if|for|while|try|with|class|def|async\s+def)\b", structural_line)
+            header_start = previous_line_start + (header_match.start() if header_match is not None else 0)
+            segments.append((header_start, previous_line_start + len(previous_line)))
             current_indent = previous_indent
     return list(reversed(segments))
 
 
-def _is_indented_start_with_enclosing_header(candidate: bytes, start: int) -> bool:
+def _candidate_start_with_enclosing_header(candidate: bytes, start: int) -> int:
     line_start = candidate.rfind(b"\n", 0, start) + 1
     line_end = candidate.find(b"\n", start)
     if line_end == -1:
         line_end = len(candidate)
     if _line_indent_width(candidate[line_start:line_end]) == 0:
-        return False
-    return bool(_enclosing_compound_header_segments(candidate, line_start))
+        return start
+    header_segments = _enclosing_compound_header_segments(candidate, line_start)
+    return header_segments[0][0] if header_segments else start
 
 
 def _merge_candidate_segment_ranges(segment_ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:

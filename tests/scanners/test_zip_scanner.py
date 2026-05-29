@@ -629,6 +629,12 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "getattr(ctypes.windll, 'user32')\n"
         "ctypes.windll.__getattr__('advapi32')\n"
         "getattr(ctypes.LibraryLoader(ctypes.CDLL), 'attrlib')\n"
+        "library_name = 'variablegetattr'\n"
+        "getattr(ctypes.cdll, library_name)\n"
+        "ctypes.cdll.__getattr__(library_name)\n"
+        "loader_getattr = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader_getattr.__getattr__('localizedgetattr')\n"
+        "loader_getattr.__getattr__(library_name)\n"
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
@@ -668,6 +674,9 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.LibraryLoader.augmented" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.classaliaslib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.attrlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.<dynamic>" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.localizedgetattr" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.<dynamic>" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.user32" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.advapi32" in checks_by_rule["S110"].details["reason"]
 
@@ -1128,6 +1137,19 @@ def test_scan_zip_preserves_safe_runpy_overwrite_before_conditional(tmp_path: Pa
         "import ctypes\nobject.__getattribute__(ctypes.cdll, 'msvcrt')\n",
         "import ctypes\nctypes.windll.kernel32 = len\nctypes.windll.kernel32\n",
         "import safe as runpy\nrunpy.run_path = runpy.run_module\nrunpy.run_path('payload')\n",
+        "import ctypes\nsetattr(ctypes.windll, 'kernel32', len)\nctypes.windll.kernel32\n",
+        (
+            "import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            "setattr(loader, 'payload', len)\nloader.payload([])\n"
+        ),
+        ("import webbrowser\nbrowser = webbrowser.get()\nsetattr(browser, 'open', len)\nbrowser.open([])\n"),
+        (
+            "import ctypes\nclass SafeNestedCDLL(ctypes.CDLL):\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        def later() -> None:\n"
+            "            ctypes.CDLL.__init__(self, name)\n"
+            "ctypes.LibraryLoader(SafeNestedCDLL).payload\nSafeNestedCDLL('/missing')\n"
+        ),
         "import os\nos.__getattr__('system')('id')\n",
         "import builtins\nbuiltins.__getattr__('eval')('1')\n",
         "import webbrowser\nbrowser = webbrowser.get()\nother = browser\nbrowser.open = len\nother.open([])\n",

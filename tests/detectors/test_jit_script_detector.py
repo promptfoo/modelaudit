@@ -1027,7 +1027,9 @@ class TestJITScriptDetector:
             f"def benign_{index}():\n    return {index}\n}}\x00".encode()
             for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
         )
-        source = b"\x00\xff" + leading_blocks + b"if True:\n    import runpy\n    runpy.run_path('payload.py')\n"
+        source = (
+            b"\x00\xff" + leading_blocks + b"if True:\n" + b"    import runpy\n" + b"    runpy.run_path('payload.py')\n"
+        )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
@@ -1035,14 +1037,19 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
-    def test_scan_model_does_not_count_comparisons_as_priority_alias_shadowing(self) -> None:
+    def test_scan_model_ignores_alias_comparisons_before_late_priority_attribute_load(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
             f"def benign_{index}():\n    return {index}\n}}\x00".encode()
             for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
         )
-        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
-        comparisons = b"".join(b"c == None\n" for _ in range(jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES + 2))
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        comparisons = b"".join(
+            b"c == None\n" for _index in range(jit_script_module._MAX_PRIORITY_ALIAS_USAGE_LINES + 2)
+        )
         source = b"\x00\xff" + leading_blocks + b"import ctypes as c\n" + padding + comparisons + b"c.cdll.msvcrt\n"
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
