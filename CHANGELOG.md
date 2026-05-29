@@ -59,7 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect executable PyTorch ZIP sidecars hidden behind ordinary filenames while excluding raw tensor-storage bytes
 - scan 7-Zip Python members and content-disguised executable sidecars through shared archive security checks
 - skip non-numeric weight metadata and report incomplete weight-distribution analysis accurately
-- report incomplete R serialized coverage without treating extraction ceilings alone as suspicious payloads, and preserve detection across printable-chunk boundaries
 - classify unavailable Paddle, NumPy, PyTorch binary, and SavedModel reads as inconclusive rather than security findings
 - classify unavailable CoreML, SafeTensors, and TensorRT reads as inconclusive rather than security findings
 - classify unavailable TensorFlow MetaGraph reads as operational errors rather than security findings, including stale cache transitions

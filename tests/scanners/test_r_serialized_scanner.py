@@ -234,6 +234,55 @@ def test_scan_read_failure_bypasses_stale_clean_cache(tmp_path: Path) -> None:
         reset_cache_manager()
 
 
+def test_scan_renamed_read_failure_bypasses_stale_clean_cache(tmp_path: Path) -> None:
+    path = tmp_path / "read-failure-after-cache.jpg"
+    _write_raw_r_serialized(path, "safe\nmodel\nweights", workspace_header=True)
+    cache_dir = tmp_path / "cache"
+    cache_config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        with patch(
+            "modelaudit.utils.helpers.cache_decorator.should_bypass_cache_for_read_failure_aware_file",
+            return_value=False,
+        ):
+            warm_result = core.scan_file(str(path), config=cache_config)
+
+        assert warm_result.success is True
+        cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
+        assert cached_entries > 0
+
+        with patch.object(
+            RSerializedScanner,
+            "_read_payload_for_analysis",
+            side_effect=PermissionError(13, "simulated renamed R payload read failure after cache warm"),
+        ):
+            direct = core.scan_file(str(path), config=cache_config)
+            aggregate = core.scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+        assert direct.success is False
+        assert direct.metadata["scan_outcome_reasons"] == ["r_serialized_read_failed"]
+        assert direct.metadata["operational_error_reason"] == "r_serialized_read_failed"
+        metadata = aggregate.file_metadata[str(path)]
+        assert aggregate.success is False
+        assert metadata["scan_outcome_reasons"] == ["r_serialized_read_failed"]
+        assert metadata["operational_error_reason"] == "r_serialized_read_failed"
+        assert core.determine_exit_code(aggregate) == 2
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
+    finally:
+        reset_cache_manager()
+
+
 def test_scan_unreadable_path_is_operationally_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

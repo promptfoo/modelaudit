@@ -1634,6 +1634,8 @@ def detect_pytorch_binary_supplemental_format(path: str) -> str | None:
     magic8 = prefix[:8]
     if magic4 == b"RKNN":
         return "rknn"
+    if _looks_like_renamed_r_serialized_header(prefix):
+        return "r_serialized"
     if _is_torch7_signature(prefix):
         return "torch7"
     if _detect_executorch_content_route(file_path, magic8) == "executorch":
@@ -4068,6 +4070,8 @@ def detect_file_format(path: str) -> str:
     magic4 = header[:4]
     magic8 = header[:8]
     magic16 = header[:16]
+    ext = file_path.suffix.lower()
+    filename_lower = file_path.name.lower()
 
     if magic8.startswith(b"\x93NUMPY"):
         return "numpy"
@@ -4090,14 +4094,11 @@ def detect_file_format(path: str) -> str:
         return "gguf"
     if magic4 in GGML_MAGIC_VARIANTS:
         return "ggml"
-    if _looks_like_renamed_r_serialized_header(magic16):
+    if ext != ".bin" and _looks_like_renamed_r_serialized_header(magic16):
         return "r_serialized"
     llamafile_format = _detect_llamafile_route_format(file_path, magic4)
     if llamafile_format is not None:
         return llamafile_format
-
-    ext = file_path.suffix.lower()
-    filename_lower = file_path.name.lower()
 
     # Compound tar wrappers should route to TAR scanner semantics.
     if filename_lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
@@ -4443,6 +4444,7 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
         if ext_format == "pytorch_binary" and header_format in {
             "pytorch_binary",
             "pickle",
+            "r_serialized",
             "zip",
             "unknown",  # .bin files can contain arbitrary binary data
         }:
