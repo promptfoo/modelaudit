@@ -279,6 +279,49 @@ class TestJITScriptDetector:
 
         assert findings == []
 
+    def test_scan_model_ignores_string_literal_os_process_launch_with_unrelated_risk(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"import pickle\n\n"
+            b"def payload(data):\n"
+            b"    pickle.loads(data)\n"
+            b"    return \"os.posix_spawn('/bin/sh', ['sh'], {})\"\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            (
+                b"import os\n"
+                b"import subprocess\n\n"
+                b"def payload(args):\n"
+                b"    marker = os.posix_spawn\n"
+                b"    return subprocess.list2cmdline(args)\n"
+            ),
+            (
+                b"import os\n"
+                b"import subprocess\n\n"
+                b"def payload():\n"
+                b"    marker = os.posix_spawn\n"
+                b"    return subprocess.run(['echo', 'ok'], check=False)\n"
+            ),
+        ],
+    )
+    def test_scan_model_ignores_uninvoked_os_process_reference_with_unrelated_risk(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
     def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""
         detector_normal = JITScriptDetector({"strict_mode": False})

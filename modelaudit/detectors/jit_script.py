@@ -599,8 +599,7 @@ class JITScriptDetector:
             pattern_match = re.search(pattern, bounded) is not None
             if description == _OS_CODE_EXECUTION_DESCRIPTION and bounded_high_risk_calls is not None:
                 resolved_os_process_call = any(code == "S101" for _, code in bounded_high_risk_calls)
-                rebound_to_high_risk_call = pattern_match and bool(bounded_high_risk_calls)
-                if not resolved_os_process_call and not rebound_to_high_risk_call:
+                if not resolved_os_process_call:
                     continue
                 pattern_match = True
             if pattern_match:  # Limit search size

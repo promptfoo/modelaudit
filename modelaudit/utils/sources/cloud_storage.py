@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Callable, Collection, Coroutine, Iterator
+from collections.abc import Callable, Collection, Coroutine, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -101,6 +101,17 @@ def _cloud_url_basename(url: str) -> str:
     except Exception:
         path = url
     return Path(path).name
+
+
+def _metadata_etag(metadata: Mapping[str, Any] | None) -> str | None:
+    """Extract a stable object validator from fsspec-style metadata."""
+    if not metadata:
+        return None
+    for key in ("etag", "ETag", "Etag", "e_tag", "version_id", "VersionId", "generation"):
+        value = metadata.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
 
 
 def _cloud_url_without_query(url: str) -> str:
@@ -309,13 +320,17 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
 
         # Check if it's a file or directory
         if info.get("type") == "file" or (info.get("type") != "directory" and "size" in info):
-            return {
+            file_metadata: dict[str, Any] = {
                 "type": "file",
                 "size": info.get("size", 0),
                 "name": _cloud_url_basename(url),
                 "estimated_time": estimate_download_time(info.get("size", 0)),
                 "human_size": format_size(info.get("size", 0)),
             }
+            etag = _metadata_etag(info)
+            if etag is not None:
+                file_metadata["etag"] = etag
+            return file_metadata
 
         # It's a directory, list contents
         files = []
@@ -329,14 +344,21 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
                 item_info = fs.info(item)
                 if item_info.get("type") == "file" or "size" in item_info:
                     size = item_info.get("size", 0)
-                    files.append(
-                        {"path": item, "name": _cloud_url_basename(item), "size": size, "human_size": format_size(size)}
-                    )
+                    file_metadata = {
+                        "path": item,
+                        "name": _cloud_url_basename(item),
+                        "size": size,
+                        "human_size": format_size(size),
+                    }
+                    etag = _metadata_etag(item_info)
+                    if etag is not None:
+                        file_metadata["etag"] = etag
+                    files.append(file_metadata)
                     total_size += size
             except Exception:
                 continue
 
-        return {
+        directory_metadata: dict[str, Any] = {
             "type": "directory",
             "file_count": len(files),
             "total_size": total_size,
@@ -344,6 +366,10 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
             "files": files,
             "estimated_time": estimate_download_time(total_size),
         }
+        etag = _metadata_etag(info)
+        if etag is not None:
+            directory_metadata["etag"] = etag
+        return directory_metadata
     except Exception as e:
         # If we can't get info, assume it's a file
         return {"type": "unknown", "error": redact_cloud_error_for_display(e, url)}
@@ -467,8 +493,12 @@ class GCSCache:
                 self._save_metadata()
                 return None
 
-            # Check if etag matches (if provided)
-            if etag and cached.get("etag") != etag:
+            cached_etag = cached.get("etag")
+            if etag is None or not cached_etag:
+                self._save_metadata()
+                return None
+
+            if cached_etag != etag:
                 return None
 
             # Update last accessed time
@@ -600,6 +630,17 @@ def _build_safe_local_path(base_url: str, file_url: str, download_path: Path) ->
     return local_path
 
 
+def _clear_directory_contents(path: Path) -> None:
+    """Remove stale cache directory contents without deleting the directory itself."""
+    if not path.exists():
+        return
+    for child in path.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
 def download_from_cloud(
     url: str,
     cache_dir: Path | None = None,
@@ -628,14 +669,6 @@ def download_from_cloud(
     # Initialize cache
     cache = GCSCache(cache_dir) if use_cache else None
 
-    # Check cache first
-    if cache:
-        cached_path = cache.get_cached_path(url)
-        if cached_path:
-            if show_progress:
-                click.echo(f"✓ Using cached version from {cached_path}")
-            return cached_path
-
     # Analyze target
     metadata = _run_coroutine_sync(lambda: analyze_cloud_target(url))
 
@@ -643,6 +676,14 @@ def download_from_cloud(
     if "error" in metadata or metadata.get("type") == "unknown":
         error_msg = redact_cloud_error_for_display(metadata.get("error", "Unknown cloud target type"), url)
         raise ValueError(f"Failed to analyze cloud target {redact_url_for_display(url)}: {error_msg}")
+
+    etag = _metadata_etag(metadata)
+    if cache:
+        cached_path = cache.get_cached_path(url, etag=etag)
+        if cached_path:
+            if show_progress:
+                click.echo(f"✓ Using cached version from {cached_path}")
+            return cached_path
 
     # Check if we can use streaming analysis
     if stream_analyze and metadata.get("type") == "file":
@@ -715,6 +756,9 @@ def download_from_cloud(
 
         # Download based on type
         if metadata["type"] == "directory":
+            if cache:
+                _clear_directory_contents(download_path)
+
             # Handle directory download
             raw_files = metadata.get("files")
             if raw_files is None:
@@ -777,13 +821,13 @@ def download_from_cloud(
 
             # Cache the download
             if cache:
-                cache.cache_file(url, local_file)  # Cache the actual file, not the directory
+                cache.cache_file(url, local_file, etag=etag)  # Cache the actual file, not the directory
 
             return local_file  # Return the actual file path for single files
 
         # Cache the download (for directories)
         if cache:
-            cache.cache_file(url, download_path)
+            cache.cache_file(url, download_path, etag=etag)
 
         return download_path
     except Exception:

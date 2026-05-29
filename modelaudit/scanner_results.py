@@ -322,14 +322,16 @@ class ScanResult:
         self._merged_children_success = self._merged_children_success and other.success
         self.success = self.success and other.success
         # Merge metadata dictionaries
+        list_union_metadata_keys = {SCAN_OUTCOME_REASONS_METADATA_KEY, "skipped_scanner_ids"}
         for key, value in other.metadata.items():
+            if key in list_union_metadata_keys and isinstance(self.metadata.get(key), list) and isinstance(value, list):
+                existing_values = self.metadata[key]
+                for item in value:
+                    if item not in existing_values:
+                        existing_values.append(item)
+                continue
             if key in self.metadata and isinstance(self.metadata[key], dict) and isinstance(value, dict):
                 self.metadata[key].update(value)
-            elif key == "skipped_scanner_ids" and isinstance(self.metadata.get(key), list) and isinstance(value, list):
-                existing_ids = self.metadata[key]
-                for scanner_id in value:
-                    if scanner_id not in existing_ids:
-                        existing_ids.append(scanner_id)
             else:
                 self.metadata[key] = value
 

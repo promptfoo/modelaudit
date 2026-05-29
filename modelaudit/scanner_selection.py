@@ -22,6 +22,8 @@ ScannerSelectionSkipKind = Literal["preferred", "embedded"]
 
 SCANNER_SELECTION_CONFIG_KEY = "scanner_selection"
 _GENERIC_CONTAINER_SCANNER_IDS = frozenset({"compressed", "rar", "sevenzip", "tar", "zip"})
+_PROTOBUF_MODEL_CANDIDATE_SCANNER_ID = "protobuf_model_candidate"
+_PROTOBUF_MODEL_CANDIDATE_ANALYZER_IDS = frozenset({"onnx", "coreml"})
 
 
 def scanner_catalog() -> list[dict[str, Any]]:
@@ -166,6 +168,24 @@ class ScannerSelectionPolicy:
             "enabled_scanner_ids": sorted(self.enabled_scanner_ids),
             "excluded_scanner_ids": sorted(self.exclude_scanner_ids),
         }
+
+
+def allows_protobuf_model_candidate_analysis(policy: ScannerSelectionPolicy) -> bool:
+    """Return whether a bounded protobuf candidate may receive concrete analysis."""
+    if _PROTOBUF_MODEL_CANDIDATE_SCANNER_ID in policy.exclude_scanner_ids:
+        return False
+    return policy.allows(_PROTOBUF_MODEL_CANDIDATE_SCANNER_ID) or any(
+        policy.allows(scanner_id) for scanner_id in _PROTOBUF_MODEL_CANDIDATE_ANALYZER_IDS
+    )
+
+
+def allows_protobuf_model_candidate_analyzer(policy: ScannerSelectionPolicy, scanner_id: str) -> bool:
+    """Keep internal candidate delegation within the user's scanner policy."""
+    if scanner_id not in _PROTOBUF_MODEL_CANDIDATE_ANALYZER_IDS:
+        return False
+    if not allows_protobuf_model_candidate_analysis(policy) or scanner_id in policy.exclude_scanner_ids:
+        return False
+    return policy.allows(_PROTOBUF_MODEL_CANDIDATE_SCANNER_ID) or policy.allows(scanner_id)
 
 
 def resolve_scanner_selection_policy(
