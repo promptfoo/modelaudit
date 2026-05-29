@@ -335,6 +335,7 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         # It's a directory, list contents
         files = []
         total_size = 0
+        metadata_errors: list[dict[str, str]] = []
 
         # List all files recursively
         # Ensure URL ends with / for proper globbing
@@ -355,8 +356,29 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
                         file_metadata["etag"] = etag
                     files.append(file_metadata)
                     total_size += size
-            except Exception:
-                continue
+            except Exception as exc:
+                metadata_errors.append(
+                    {
+                        "path": redact_url_for_display(item),
+                        "error": redact_cloud_error_for_display(exc, item),
+                    }
+                )
+
+        if metadata_errors:
+            sample_errors = "; ".join(f"{entry['path']}: {entry['error']}" for entry in metadata_errors[:3])
+            if len(metadata_errors) > 3:
+                sample_errors = f"{sample_errors}; ..."
+            return {
+                "type": "unknown",
+                "analysis_incomplete": True,
+                "metadata_error_count": len(metadata_errors),
+                "metadata_errors": metadata_errors,
+                "error": (
+                    "Cloud directory analysis incomplete: metadata lookup failed for "
+                    f"{len(metadata_errors)} object(s) under {redact_url_for_display(url)}: "
+                    f"{sample_errors}"
+                ),
+            }
 
         directory_metadata: dict[str, Any] = {
             "type": "directory",

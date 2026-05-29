@@ -35,6 +35,24 @@ def make_fs_mock() -> MagicMock:
     return fs
 
 
+def configure_partial_metadata_failure(fs: MagicMock, url: str) -> tuple[str, str]:
+    model_url = f"{url.rstrip('/')}/model.bin"
+    hidden_url = f"{url.rstrip('/')}/evil.pkl?X-Amz-Signature=secret"
+
+    def info_side_effect(path: str) -> dict[str, object]:
+        if path == url:
+            return {"type": "directory", "name": "bucket/path/"}
+        if path == model_url:
+            return {"type": "file", "size": 2048}
+        if path == hidden_url:
+            raise PermissionError(f"metadata denied for {hidden_url}")
+        raise FileNotFoundError(path)
+
+    fs.info.side_effect = info_side_effect
+    fs.glob.return_value = [model_url, hidden_url]
+    return model_url, hidden_url
+
+
 def test_run_coroutine_sync_without_running_loop() -> None:
     """_run_coroutine_sync should use asyncio.run() when no loop is active."""
 
@@ -149,10 +167,69 @@ def test_analyze_cloud_target_directory_success(mock_fs: MagicMock) -> None:
     fs.glob.assert_called_once_with("s3://bucket/path/**")
 
 
+@patch("fsspec.filesystem")
+def test_analyze_cloud_target_directory_fails_on_partial_metadata_error(
+    mock_fs: MagicMock,
+) -> None:
+    url = "s3://bucket/path/"
+    fs = make_fs_mock()
+    _model_url, hidden_url = configure_partial_metadata_failure(fs, url)
+    mock_fs.return_value = fs
+
+    result = asyncio.run(analyze_cloud_target(url))
+    serialized = json.dumps(result)
+
+    assert result["type"] == "unknown"
+    assert result["analysis_incomplete"] is True
+    assert result["metadata_error_count"] == 1
+    assert "metadata lookup failed for 1 object" in result["error"]
+    assert "evil.pkl" in result["error"]
+    assert "X-Amz-Signature" not in serialized
+    assert "secret" not in serialized
+    assert hidden_url not in serialized
+
+
 def test_filter_scannable_files_handles_signed_cloud_urls() -> None:
     files = [{"path": "s3://bucket/model.pkl?X-Amz-Signature=secret"}]
 
     assert filter_scannable_files(files) == files
+
+
+@patch("fsspec.filesystem")
+def test_download_from_cloud_fails_closed_on_partial_directory_metadata_error(
+    mock_fs_class: MagicMock,
+    tmp_path: Path,
+) -> None:
+    url = "s3://bucket/path/"
+    fs = make_fs_mock()
+    configure_partial_metadata_failure(fs, url)
+    mock_fs_class.return_value = fs
+
+    with pytest.raises(ValueError, match="Cloud directory analysis incomplete"):
+        download_from_cloud(
+            url,
+            cache_dir=tmp_path,
+            use_cache=False,
+            selective=False,
+            show_progress=False,
+        )
+
+    fs.get.assert_not_called()
+
+
+@patch("fsspec.filesystem")
+def test_download_from_cloud_streaming_fails_closed_on_partial_directory_metadata_error(
+    mock_fs_class: MagicMock,
+) -> None:
+    url = "s3://bucket/path/"
+    fs = make_fs_mock()
+    configure_partial_metadata_failure(fs, url)
+    mock_fs_class.return_value = fs
+
+    with pytest.raises(ValueError, match="Cloud directory analysis incomplete"):
+        list(download_from_cloud_streaming(url, selective=False, show_progress=False))
+
+    fs.get.assert_not_called()
 
 
 @patch("fsspec.filesystem")
