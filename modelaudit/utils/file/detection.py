@@ -58,6 +58,8 @@ _TensorFlowProtoRoute = Literal[
 _TensorFlowOuterHint = Literal["unknown", "tf_metagraph", "tf_savedmodel"]
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _TORCH7_ACTIONABLE_LUA_READ_BYTES = 64 * 1024
+_TORCH7_ASCII_HEADER_MAX_LINE_BYTES = 4096
+_TORCH7_BINARY_PAYLOAD_PROBE_BYTES = 256
 _TORCH7_ACTIONABLE_LUA_PATTERN = re.compile(
     rb"(?i)\b(?:os\.execute|io\.popen|loadstring|dofile|loadfile|setfenv|getfenv|package\.loadlib|ffi\.load|loadlib)\b"
 )
@@ -2913,11 +2915,33 @@ def _resolve_inconclusive_tensorflow_flax_overlap(file_path: Path, file_size: in
     return "flax_msgpack"
 
 
+def _read_torch7_ascii_header_fields(prefix: bytes, offset: int) -> list[bytes] | None:
+    """Read the first six Torch7 ASCII header fields without splitting the suffix."""
+    fields: list[bytes] = []
+    position = offset
+    while len(fields) < 6 and position < len(prefix):
+        line_limit = min(len(prefix), position + _TORCH7_ASCII_HEADER_MAX_LINE_BYTES + 1)
+        newline = prefix.find(b"\n", position, line_limit)
+        carriage_return = prefix.find(b"\r", position, line_limit)
+        line_end_candidates = [index for index in (newline, carriage_return) if index != -1]
+        if not line_end_candidates:
+            if line_limit < len(prefix):
+                return None
+            fields.append(prefix[position:line_limit])
+            break
+
+        line_end = min(line_end_candidates)
+        fields.append(prefix[position:line_end])
+        position = line_end + 2 if prefix[line_end : line_end + 2] == b"\r\n" else line_end + 1
+
+    return fields if len(fields) >= 6 else None
+
+
 def _find_torch7_ascii_object_signature_offset(prefix: bytes) -> int | None:
     """Return the offset of a Torch7 ASCII serialized Torch object header."""
     for match in re.finditer(rb"4(?:\r\n|[\r\n])", prefix):
-        fields = prefix[match.start() :].splitlines()
-        if len(fields) < 6:
+        fields = _read_torch7_ascii_header_fields(prefix, match.start())
+        if fields is None:
             continue
         try:
             object_index = int(fields[1])
@@ -2977,6 +3001,16 @@ def _has_torch7_binary_magic_with_actionable_lua(prefix: bytes, offset: int = 0)
     return _TORCH7_ACTIONABLE_LUA_PATTERN.search(window) is not None
 
 
+def _has_torch7_binary_payload_bytes(prefix: bytes, offset: int = 0) -> bool:
+    """Return whether a binary Torch7 marker is followed by non-text record bytes."""
+    if len(prefix) - offset < 8 or not prefix.startswith(b"T7\x00\x00", offset):
+        return False
+    next_marker = prefix.find(b"T7\x00\x00", offset + len(b"T7\x00\x00"))
+    window_end = offset + _TORCH7_BINARY_PAYLOAD_PROBE_BYTES if next_marker == -1 else next_marker
+    window = prefix[offset + len(b"T7\x00\x00") : window_end]
+    return any(byte in _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES for byte in window)
+
+
 def _find_torch7_binary_candidate_offset(prefix: bytes) -> int | None:
     """Return the offset of a binary Torch7 candidate worth secondary analysis."""
     search_offset = 0
@@ -2984,8 +3018,10 @@ def _find_torch7_binary_candidate_offset(prefix: bytes) -> int | None:
         match_offset = prefix.find(b"T7\x00\x00", search_offset)
         if match_offset == -1:
             return None
-        if _has_torch7_binary_object_structure(prefix, match_offset) or _has_torch7_binary_magic_with_actionable_lua(
-            prefix, match_offset
+        if (
+            _has_torch7_binary_object_structure(prefix, match_offset)
+            or _has_torch7_binary_magic_with_actionable_lua(prefix, match_offset)
+            or _has_torch7_binary_payload_bytes(prefix, match_offset)
         ):
             return match_offset
         search_offset = match_offset + 1

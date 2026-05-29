@@ -14,6 +14,7 @@ from ..utils.file.detection import (
     LLAMAFILE_MARKER,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    find_structural_torch7_offset,
     find_torch7_candidate_offset,
     is_llamafile_executable,
 )
@@ -501,6 +502,7 @@ class LlamafileScanner(BaseScanner):
 
         while next_offset is not None and candidate_scans < self.max_torch7_candidate_scans:
             candidate_scans += 1
+            structurally_credible = self._embedded_torch7_candidate_is_structural(path, next_offset)
             embedded_result, carve_size = self._scan_embedded_torch7_candidate(path, scanner, result, next_offset)
             if embedded_result is not None:
                 actionable_severity = self._torch7_result_actionable_severity(embedded_result)
@@ -515,7 +517,11 @@ class LlamafileScanner(BaseScanner):
                         if not candidate_keys or not candidate_keys.issubset(actionable_keys):
                             actionable_results.append((embedded_result, next_offset, carve_size, actionable_severity))
                             actionable_keys.update(candidate_keys)
-                if deferred_incomplete is None and self._torch7_result_is_incomplete(embedded_result):
+                if (
+                    deferred_incomplete is None
+                    and structurally_credible
+                    and self._torch7_result_is_incomplete(embedded_result)
+                ):
                     deferred_incomplete = (embedded_result, next_offset, carve_size)
 
             next_offset = self._find_embedded_torch7_offset(
@@ -541,6 +547,16 @@ class LlamafileScanner(BaseScanner):
             result.metadata["embedded_torch7_offset"] = incomplete_offset
             result.metadata["embedded_torch7_size"] = carve_size
             self._append_torch7_findings(result, embedded_result, incomplete_offset)
+
+    @staticmethod
+    def _embedded_torch7_candidate_is_structural(path: Path, offset: int) -> bool:
+        try:
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                prefix = handle.read(TORCH7_SIGNATURE_WINDOW_BYTES)
+        except OSError:
+            return False
+        return find_structural_torch7_offset(prefix) == 0
 
     def _scan_embedded_torch7_candidate(
         self,
