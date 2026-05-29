@@ -185,6 +185,24 @@ def test_llamafile_detects_appended_torch7_after_valid_gguf_payload(tmp_path: Pa
     )
 
 
+def test_llamafile_skips_bare_torch7_decoy_before_appended_payload(tmp_path: Path) -> None:
+    binary = tmp_path / "torch7-decoy-then-payload.llamafile"
+    valid_gguf = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    torch7_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id')\n"
+    embedded_payload = valid_gguf + b"T7\x00\x00" + (b"A" * 8192) + torch7_payload
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=embedded_payload))
+
+    result = LlamafileScanner(config={"torch7_max_scan_bytes": 128}).scan(str(binary))
+
+    assert result.metadata["embedded_torch7_offset"] == binary.read_bytes().index(torch7_payload)
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+
+
 def test_llamafile_ignores_truncated_embedded_torch7_marker(tmp_path: Path) -> None:
     binary = tmp_path / "truncated-torch7-marker.llamafile"
     binary.write_bytes(_build_llamafile_blob(embedded_payload=b"T7\x00\x00"))
