@@ -43,6 +43,31 @@ _VERSIONED_SHARED_OBJECT_SUFFIX_RE = re.compile(r"\.so(?:\.[0-9]+)+$")
 _PYTHON_ARCHIVE_MEMBER_SUFFIXES = (".py", ".pyw")
 _PYTHON_SHEBANG_COMMAND_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?w?|pypy(?:\d+(?:\.\d+)*)?)$")
 _ENV_SHEBANG_OPTIONS_WITH_ARGUMENT = frozenset({"-u", "--unset", "-C", "--chdir"})
+_OS_PROCESS_EXECUTION_CALLS = frozenset(
+    {
+        "os.execl",
+        "os.execle",
+        "os.execlp",
+        "os.execlpe",
+        "os.execv",
+        "os.execve",
+        "os.execvp",
+        "os.execvpe",
+        "os.popen",
+        "os.posix_spawn",
+        "os.posix_spawnp",
+        "os.spawnl",
+        "os.spawnle",
+        "os.spawnlp",
+        "os.spawnlpe",
+        "os.spawnv",
+        "os.spawnve",
+        "os.spawnvp",
+        "os.spawnvpe",
+        "os.startfile",
+        "os.system",
+    }
+)
 _HIGH_RISK_PYTHON_CALLS = {
     "__import__",
     "builtins.__import__",
@@ -51,8 +76,6 @@ _HIGH_RISK_PYTHON_CALLS = {
     "eval",
     "exec",
     "importlib.import_module",
-    "os.popen",
-    "os.system",
     "pickle.load",
     "pickle.loads",
     "subprocess.call",
@@ -60,6 +83,7 @@ _HIGH_RISK_PYTHON_CALLS = {
     "subprocess.check_output",
     "subprocess.Popen",
     "subprocess.run",
+    *_OS_PROCESS_EXECUTION_CALLS,
 }
 
 
@@ -85,10 +109,9 @@ _HIGH_RISK_PYTHON_CALL_RULE_CODES: dict[str, str] = {
     "eval": "S104",
     "exec": "S104",
     "importlib.import_module": "S107",
-    "os.popen": "S101",
-    "os.system": "S101",
     "pickle.load": "S213",
     "pickle.loads": "S213",
+    **dict.fromkeys(_OS_PROCESS_EXECUTION_CALLS, "S101"),
 }
 _HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES: tuple[tuple[str, str], ...] = (("subprocess.", "S103"),)
 _FALLBACK_HIGH_RISK_RULE_CODE = "S104"
@@ -1671,6 +1694,15 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+def high_risk_python_calls_in_tree(tree: ast.AST) -> set[HighRiskPythonCall]:
+    """Return high-risk calls resolvable from an already parsed Python tree."""
+    visitor = _HighRiskPythonCallVisitor()
+    visitor.visit(tree)
+    return {
+        HighRiskPythonCall(name=name, rule_code=_rule_code_for_high_risk_call(name)) for name in visitor.risky_calls
+    }
+
+
 def high_risk_python_calls_in_source(source_bytes: bytes) -> set[HighRiskPythonCall]:
     """Return the set of high-risk Python calls resolvable from ``source_bytes``.
 
@@ -1686,11 +1718,7 @@ def high_risk_python_calls_in_source(source_bytes: bytes) -> set[HighRiskPythonC
     except (SyntaxError, ValueError) as exc:
         raise PythonArchiveMemberParseError(str(exc)) from exc
 
-    visitor = _HighRiskPythonCallVisitor()
-    visitor.visit(tree)
-    return {
-        HighRiskPythonCall(name=name, rule_code=_rule_code_for_high_risk_call(name)) for name in visitor.risky_calls
-    }
+    return high_risk_python_calls_in_tree(tree)
 
 
 _PYTHON_MEMBER_CHECK_NAME = "Python Archive Member Security"

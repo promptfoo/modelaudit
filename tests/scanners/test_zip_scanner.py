@@ -473,6 +473,29 @@ def test_scan_zip_reports_rebound_namespace_callable_target(tmp_path: Path) -> N
     assert python_checks[0].details["reason"] == "high-risk calls: os.popen"
 
 
+def test_scan_zip_flags_namespace_bound_os_process_launch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import os\n"
+        "namespace = os.__dict__\n"
+        "namespace['launch'] = os.posix_spawn\n"
+        "namespace['launch']('/bin/sh', ['sh'], {})\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S101"
+    assert python_checks[0].details["reason"] == "high-risk calls: os.posix_spawn"
+
+
 @pytest.mark.parametrize(
     "source",
     [
