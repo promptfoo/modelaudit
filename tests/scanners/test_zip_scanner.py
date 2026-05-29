@@ -602,6 +602,10 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "library_name = 'variablelib'\n"
         "loader_variable.LoadLibrary(library_name)\n"
         "loader_variable.__getitem__(library_name)\n"
+        "ctypes.LibraryLoader.LoadLibrary(ctypes.cdll, 'unboundlib')\n"
+        "ctypes.LibraryLoader.__getitem__(ctypes.cdll, 'unboundgetitem')\n"
+        "object.__getattribute__(ctypes.cdll, 'LoadLibrary')('objectmethodlib')\n"
+        "object.__getattribute__(ctypes.cdll, '__getitem__')('objectgetitem')\n"
         "class MyCDLL(ctypes.CDLL):\n"
         "    pass\n"
         "ctypes.LibraryLoader(MyCDLL).subclasslib\n"
@@ -635,6 +639,10 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.LibraryLoader.keywordgetitem" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.<dynamic>" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.subclasslib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.unboundlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.unboundgetitem" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.objectmethodlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.objectgetitem" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.attrlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.user32" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.advapi32" in checks_by_rule["S110"].details["reason"]
@@ -784,6 +792,7 @@ def test_scan_zip_preserves_dynamic_member_risk_after_conditional_overwrite(tmp_
         "import ctypes\nctypes.windll.kernel32 = len\nctypes.windll.__getattr__('kernel32')\n",
         "import ctypes\nctypes.cdll.__getattribute__('msvcrt')\n",
         "import ctypes\nobject.__getattribute__(ctypes.cdll, 'msvcrt')\n",
+        "import ctypes\nctypes.windll.kernel32 = len\nctypes.windll.kernel32\n",
         "import os\nos.__getattr__('system')('id')\n",
         "import builtins\nbuiltins.__getattr__('eval')('1')\n",
         "import webbrowser\nbrowser = webbrowser.get()\nother = browser\nbrowser.open = len\nother.open([])\n",

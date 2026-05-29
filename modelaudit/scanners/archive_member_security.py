@@ -714,6 +714,13 @@ def _resolve_getattr_call_names(
         attr_name = _resolve_static_string(node.args[1])
         if resolved_target_roots is None or attr_name is None:
             return None
+        if attr_name in {"__getitem__", "LoadLibrary"}:
+            loader_method_roots = resolved_target_roots & _CTYPES_LIBRARY_LOADER_OBJECTS
+            if loader_method_roots:
+                return _apply_aliases_to_names(
+                    frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in loader_method_roots),
+                    alias_scopes,
+                )
         resolved_target_roots = frozenset(
             root for root in resolved_target_roots if root not in _CTYPES_LIBRARY_LOADER_OBJECTS
         )
@@ -1266,6 +1273,34 @@ def _resolve_ctypes_library_loader_instance_roots(
                 continue
             if method_name in {"__getitem__", "LoadLibrary"}:
                 loader_roots.add(f"{root_name}.{library_name or _CTYPES_DYNAMIC_LIBRARY_NAME}")
+    for resolved_func_name in resolved_func_names:
+        stripped_func_name = _strip_dunder_call_suffixes(resolved_func_name)
+        root_name, separator, method_name = stripped_func_name.rpartition(".")
+        if not separator or root_name not in _CTYPES_LIBRARY_LOADER_CONSTRUCTORS:
+            continue
+        if method_name not in {"__getitem__", "LoadLibrary"}:
+            continue
+        self_node: ast.AST | None = None
+        unbound_library_name_node: ast.AST | None = None
+        if len(node.args) == 2 and not node.keywords:
+            self_node = node.args[0]
+            unbound_library_name_node = node.args[1]
+        elif len(node.args) == 1 and len(node.keywords) == 1 and node.keywords[0].arg == "name":
+            self_node = node.args[0]
+            unbound_library_name_node = node.keywords[0].value
+        if self_node is None or unbound_library_name_node is None:
+            continue
+        resolved_self_names = _resolve_static_reference_names(
+            self_node,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        self_loader_roots = (resolved_self_names or frozenset()) & _CTYPES_LIBRARY_LOADER_OBJECTS
+        library_name = _resolve_static_string(unbound_library_name_node)
+        loader_roots.update(
+            f"{loader_root}.{library_name or _CTYPES_DYNAMIC_LIBRARY_NAME}" for loader_root in self_loader_roots
+        )
     return frozenset(loader_roots) or None
 
 
@@ -1337,7 +1372,9 @@ def _resolve_static_reference_names(
             allow_local_namespace_mapping=allow_local_namespace_mapping,
         )
         if ctypes_loader_roots is not None:
-            return frozenset(f"{root}.{node.attr}" for root in ctypes_loader_roots)
+            return _apply_aliases_to_names(
+                frozenset(f"{root}.{node.attr}" for root in ctypes_loader_roots), alias_scopes
+            )
         webbrowser_controller_roots = _resolve_webbrowser_controller_factory_roots(
             node.value,
             alias_scopes,
