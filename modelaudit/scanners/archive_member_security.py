@@ -726,6 +726,39 @@ def _resolve_static_string(node: ast.AST) -> str | None:
     return "".join(parts)
 
 
+def _single_static_call_argument(
+    args: list[ast.expr],
+    keywords: list[ast.keyword],
+    *,
+    keyword_name: str,
+) -> ast.AST | None:
+    if len(args) == 1 and not keywords:
+        argument = args[0]
+        if isinstance(argument, ast.Starred):
+            value = argument.value
+            if isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == 1:
+                return value.elts[0]
+            return None
+        return argument
+    if args or len(keywords) != 1:
+        return None
+
+    keyword = keywords[0]
+    if keyword.arg == keyword_name:
+        return keyword.value
+    if keyword.arg is not None:
+        return None
+    mapping = keyword.value
+    if not isinstance(mapping, ast.Dict):
+        return None
+    for key_node, value_node in zip(mapping.keys, mapping.values, strict=True):
+        if key_node is None:
+            continue
+        if _resolve_static_string(key_node) == keyword_name:
+            return value_node
+    return None
+
+
 def _resolve_getattr_call_names(
     node: ast.AST,
     alias_scopes: _AliasScopes,
@@ -824,14 +857,12 @@ def _resolve_getattr_call_names(
     )
     accessor_names = getattr_accessor_names | getattribute_accessor_names
     if accessor_names:
-        if node.keywords:
-            if node.args or len(node.keywords) != 1 or node.keywords[0].arg != "name" or not getattr_accessor_names:
-                return None
-            attr_name = _resolve_static_string(node.keywords[0].value)
-        else:
-            if expanded_args is None or len(expanded_args) != 1:
-                return None
-            attr_name = _resolve_static_string(expanded_args[0])
+        if node.keywords and not getattr_accessor_names:
+            return None
+        attr_node = _single_static_call_argument(node.args, node.keywords, keyword_name="name")
+        if attr_node is None:
+            return None
+        attr_name = _resolve_static_string(attr_node)
         if attr_name is None and not getattr_accessor_names:
             return None
         resolved_names: set[str] = set(_ctypes_loader_member_load_names(getattr_accessor_names, attr_name))
@@ -1342,14 +1373,7 @@ def _resolve_ctypes_library_loader_instance_roots(
     loader_roots: set[str] = set()
     constructor_roots = resolved_func_names & _CTYPES_LIBRARY_LOADER_CONSTRUCTORS
     if constructor_roots:
-        loader_type_node: ast.AST | None
-        expanded_args = _expanded_static_call_args(node) if not node.keywords else None
-        if expanded_args is not None and len(expanded_args) == 1:
-            loader_type_node = expanded_args[0]
-        elif not node.args and len(node.keywords) == 1 and node.keywords[0].arg == "dlltype":
-            loader_type_node = node.keywords[0].value
-        else:
-            loader_type_node = None
+        loader_type_node = _single_static_call_argument(node.args, node.keywords, keyword_name="dlltype")
         if loader_type_node is not None:
             resolved_loader_types = _resolve_static_reference_names(
                 loader_type_node,
@@ -1359,11 +1383,7 @@ def _resolve_ctypes_library_loader_instance_roots(
             )
             if _canonical_ctypes_loader_type_aliases(resolved_loader_types):
                 loader_roots.add(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT)
-    library_name_node: ast.AST | None = None
-    if len(node.args) == 1 and not node.keywords:
-        library_name_node = node.args[0]
-    elif not node.args and len(node.keywords) == 1 and node.keywords[0].arg == "name":
-        library_name_node = node.keywords[0].value
+    library_name_node = _single_static_call_argument(node.args, node.keywords, keyword_name="name")
     if library_name_node is not None:
         library_name = _resolve_static_string(library_name_node)
         for resolved_func_name in resolved_func_names:
@@ -1582,7 +1602,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self._class_scope_ids: set[int] = set()
         self._comprehension_outer_scope_indices: list[int] = []
         self._call_result_aliases: dict[int, _AliasValue] = {}
-        self._localized_instance_counter = 0
+        self._instance_binding_generations: dict[str, int] = {}
         self._non_module_scope_depth = 0
         self.risky_calls: set[str] = set()
 
@@ -1659,7 +1679,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         localized_names = set(resolved_names)
         if _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT in localized_names:
             localized_names.remove(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT)
-            localized_names.add(self._new_localized_instance_root(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT, local_name))
+            localized_names.add(
+                self._localized_instance_root_for_binding(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT, local_name)
+            )
         webbrowser_controller_roots = _resolve_webbrowser_controller_factory_roots(
             value,
             self.alias_scopes,
@@ -1669,12 +1691,13 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for controller_root in webbrowser_controller_roots or frozenset():
             if controller_root in localized_names:
                 localized_names.remove(controller_root)
-                localized_names.add(self._new_localized_instance_root(controller_root, local_name))
+                localized_names.add(self._localized_instance_root_for_binding(controller_root, local_name))
         return frozenset(localized_names)
 
-    def _new_localized_instance_root(self, root_name: str, local_name: str) -> str:
-        self._localized_instance_counter += 1
-        return _localized_instance_root(root_name, f"{local_name}${self._localized_instance_counter}")
+    def _localized_instance_root_for_binding(self, root_name: str, local_name: str) -> str:
+        generation = self._instance_binding_generations.get(local_name, 0) + 1
+        self._instance_binding_generations[local_name] = generation
+        return _localized_instance_root(root_name, f"{local_name}#{generation}")
 
     def _bind_module_namespace_key(self, key: str, resolved_names: _AliasValue) -> None:
         self._bind_name(f"{_MODULE_NAMESPACE_WRITE_PREFIX}{key}", resolved_names)
@@ -2281,6 +2304,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             local_aliases, local_found = _lookup_bound_alias(f"{node.value.id}.{node.attr}", [initializer_scope])
             if local_found:
                 return local_aliases if isinstance(local_aliases, frozenset) else None
+        reference_name = _resolve_call_name(node)
+        if reference_name is not None:
+            initializer_names, initializer_found = _lookup_bound_alias(reference_name, [initializer_scope])
+            if initializer_found:
+                return initializer_names
         class_local_names = self._class_local_method_aliases(node, class_scope, class_name)
         if class_local_names:
             return class_local_names
@@ -2304,7 +2332,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         base_identity_names: list[frozenset[str]],
         loader_base_indices: frozenset[int],
     ) -> bool:
-        if not loader_base_indices or super_call.keywords:
+        if _resolve_call_name(super_call.func) != "super" or not loader_base_indices or super_call.keywords:
             return False
         if not super_call.args:
             return 0 in loader_base_indices
@@ -2341,7 +2369,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         )
 
     @staticmethod
-    def _initializer_alias_call_is_bound(call: ast.Call, class_name: str) -> bool:
+    def _initializer_alias_call_is_bound(call: ast.Call) -> bool:
         return (
             isinstance(call.func, ast.Attribute)
             and isinstance(call.func.value, ast.Name)
@@ -2362,7 +2390,6 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             isinstance(call.func, ast.Attribute)
             and call.func.attr == "__init__"
             and isinstance(call.func.value, ast.Call)
-            and _resolve_call_name(call.func.value.func) == "super"
             and self._super_call_preserves_ctypes_loader_init(
                 call.func.value,
                 base_identity_names,
@@ -2378,7 +2405,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         )
         if not self._is_ctypes_loader_init_alias(resolved_func_names):
             return False
-        bound_method = self._initializer_alias_call_is_bound(call, class_name)
+        bound_method = self._initializer_alias_call_is_bound(call)
         if not bound_method and not self._call_has_initializer_self_argument(call, initializer_self_names):
             return False
         return self._call_has_loader_name_argument(call, bound_method=bound_method)
@@ -2618,7 +2645,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if self._class_new_may_skip_init(node):
             return False
         if init_method is None:
-            if self._is_ctypes_loader_init_alias(class_scope.get("__init__")):
+            class_init_alias = class_scope.get("__init__")
+            if self._is_ctypes_loader_init_alias(class_init_alias):
                 return True
             if not node.bases:
                 return False
