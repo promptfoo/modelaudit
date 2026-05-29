@@ -144,7 +144,7 @@ _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN = b"|".join(
 )
 _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN = re.compile(
     rb"(?m)^\s*(?:"
-    rb"import\s+(?:[a-z_][\w.]*(?:\s+as\s+[a-z_]\w*)?\s*,\s*)*(?:"
+    rb"import\s+(?:[a-z_][\w.]*(?:\s+as\s+[a-z_]\w*)?\s*,(?:\s|\\\r?\n)*)*(?:"
     + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN
     + rb")(?:[.\s,]|$)|"
     rb"from\s+(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s]|$)"
@@ -265,12 +265,29 @@ def _embedded_python_scan_windows(data: bytes) -> list[bytes]:
     return [data[:_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES], data[-_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:]]
 
 
+def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]:
+    windows = _embedded_python_scan_windows(data)
+    if len(windows) == 1:
+        return [(windows[0], False)]
+
+    # Keep top-of-source alias overwrites visible when checking bounded tail code.
+    prefix = windows[0]
+    first_python_start = _EMBEDDED_PYTHON_START_PATTERN.search(prefix)
+    if first_python_start is not None:
+        prefix = prefix[first_python_start.start() :]
+    return [(prefix + b"\n" + windows[1], True)]
+
+
 def _has_raw_match_outside_parsed_spans(raw_spans: list[tuple[int, int]], parsed_spans: list[tuple[int, int]]) -> bool:
     """Return whether any raw regex hit sits outside AST-validated source."""
     for raw_start, raw_end in raw_spans:
         if not any(parsed_start <= raw_start and raw_end <= parsed_end for parsed_start, parsed_end in parsed_spans):
             return True
     return False
+
+
+def _is_span_inside_parsed_spans(span: tuple[int, int], parsed_spans: list[tuple[int, int]]) -> bool:
+    return any(parsed_start <= span[0] and span[1] <= parsed_end for parsed_start, parsed_end in parsed_spans)
 
 
 def _decode_utf8_with_byte_offsets(data: bytes) -> tuple[str, list[int]]:
@@ -740,6 +757,8 @@ class JITScriptDetector:
 
         for match, span in _prioritized_embedded_python_snippets(matches):
             try:
+                if _is_span_inside_parsed_spans(span, parsed_snippet_spans):
+                    continue
                 code_str, byte_offsets = _decode_utf8_with_byte_offsets(match)
                 parsed_snippet = _parse_embedded_python_snippet(code_str)
                 if parsed_snippet is None or parsed_snippet[1] < len(code_str):
@@ -1227,8 +1246,15 @@ class JITScriptDetector:
                 )
             )
         elif self._looks_like_framed_dangerous_python_source(data):
-            for window in _embedded_python_scan_windows(data):
-                findings.extend(self._extract_and_check_python_code(window, "Generic Python", context))
+            for window, include_full_source in _embedded_python_extraction_windows(data):
+                findings.extend(
+                    self._extract_and_check_python_code(
+                        window,
+                        "Generic Python",
+                        context,
+                        include_full_source=include_full_source,
+                    )
+                )
 
         return findings
 
