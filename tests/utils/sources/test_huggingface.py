@@ -376,6 +376,131 @@ class TestModelDownload:
 
         assert "allow_patterns" not in mock_snapshot_download.call_args.kwargs
 
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin", ".safetensors"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "model.safetensors"], None),
+    )
+    @patch("huggingface_hub.HfApi.repo_info")
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_max_size_rejects_oversized_selected_files(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        mock_repo_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+    ) -> None:
+        """Repository downloads should enforce max-size before snapshot transfer."""
+        mock_repo_info.return_value = SimpleNamespace(sha="abc123")
+        mock_get_paths_info.return_value = [
+            SimpleNamespace(path="pytorch_model.bin", size=700),
+            SimpleNamespace(path="model.safetensors", size=500),
+        ]
+
+        with pytest.raises(Exception, match="selected Hugging Face files total 1200 bytes exceeds max size 1000 bytes"):
+            download_model("https://huggingface.co/test/model", max_size=1000)
+
+        mock_snapshot_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin", ".safetensors"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin"], None),
+    )
+    @patch("huggingface_hub.HfApi.repo_info")
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_max_size_rejects_unknown_selected_file_size(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        mock_repo_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+    ) -> None:
+        """Unknown selected file sizes should fail closed before download."""
+        mock_repo_info.return_value = SimpleNamespace(sha="abc123")
+        mock_get_paths_info.return_value = [SimpleNamespace(path="pytorch_model.bin", size=None)]
+
+        with pytest.raises(Exception, match=r"unknown size for selected file pytorch_model\.bin"):
+            download_model("https://huggingface.co/test/model", max_size=1000)
+
+        mock_snapshot_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin"], None),
+    )
+    @patch("huggingface_hub.HfApi.repo_info")
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_max_size_rejects_missing_selected_file_metadata(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        mock_repo_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+    ) -> None:
+        """Missing metadata for a selected file should fail closed under a cap."""
+        mock_repo_info.return_value = SimpleNamespace(sha="abc123")
+        mock_get_paths_info.return_value = []
+
+        with pytest.raises(Exception, match=r"unknown size for selected file pytorch_model\.bin"):
+            download_model("https://huggingface.co/test/model", max_size=1000)
+
+        mock_snapshot_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin"], None),
+    )
+    @patch("huggingface_hub.HfApi.repo_info")
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_max_size_allows_under_limit_selected_files(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        mock_repo_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Under-limit repository downloads should still use selective allow patterns."""
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "pytorch_model.bin").write_bytes(b"weights")
+        mock_snapshot_download.return_value = str(download_path)
+        mock_repo_info.return_value = SimpleNamespace(sha="abc123")
+        mock_get_paths_info.return_value = [SimpleNamespace(path="pytorch_model.bin", size=700)]
+
+        download_model("https://huggingface.co/test/model", max_size=1000)
+
+        mock_get_paths_info.assert_called_once_with("test/model", ["pytorch_model.bin"], revision="abc123")
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin"]
+        assert mock_snapshot_download.call_args.kwargs["revision"] == "abc123"
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(None, "repository listing unavailable"),
+    )
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_max_size_rejects_listing_failure_before_extension_allowlist(
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+    ) -> None:
+        """When max-size is set, listing failures cannot fall back to broad extension globs."""
+        with pytest.raises(Exception, match="Cannot enforce max-size for test/model: repository listing failed"):
+            download_model("https://huggingface.co/test/model", max_size=1000)
+
+        mock_snapshot_download.assert_not_called()
+
     @patch("huggingface_hub.snapshot_download")
     @patch("shutil.rmtree")
     def test_download_model_cleanup_on_failure(self, mock_rmtree, mock_snapshot_download):
@@ -438,6 +563,92 @@ class TestModelDownloadStreaming:
             filename="pytorch_model.bin",
             cache_dir=str(tmp_path / "huggingface"),
             local_dir=str(tmp_path / "huggingface" / "test" / "model"),
+        )
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin", ".safetensors"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "model.safetensors"], None),
+    )
+    @patch("huggingface_hub.HfApi.repo_info")
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_max_size_rejects_oversized_selected_files(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        mock_repo_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+    ) -> None:
+        """Streaming mode should enforce max-size before downloading selected files."""
+        mock_repo_info.return_value = SimpleNamespace(sha="abc123")
+        mock_get_paths_info.return_value = [
+            SimpleNamespace(path="pytorch_model.bin", size=700),
+            SimpleNamespace(path="model.safetensors", size=500),
+        ]
+
+        with pytest.raises(Exception, match="selected Hugging Face files total 1200 bytes exceeds max size 1000 bytes"):
+            list(download_model_streaming("https://huggingface.co/test/model", max_size=1000))
+
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin"], None),
+    )
+    @patch("huggingface_hub.HfApi.repo_info")
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_max_size_rejects_unknown_selected_file_size(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        mock_repo_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+    ) -> None:
+        """Streaming mode should fail closed on unknown selected file size."""
+        mock_repo_info.return_value = SimpleNamespace(sha="abc123")
+        mock_get_paths_info.return_value = [SimpleNamespace(path="pytorch_model.bin", size=None)]
+
+        with pytest.raises(Exception, match=r"unknown size for selected file pytorch_model\.bin"):
+            list(download_model_streaming("https://huggingface.co/test/model", max_size=1000))
+
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin"], None),
+    )
+    @patch("huggingface_hub.HfApi.repo_info")
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_max_size_allows_under_limit_selected_files(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        mock_repo_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Under-limit streaming mode should still download selected files."""
+        downloaded_file = tmp_path / "pytorch_model.bin"
+        mock_repo_info.return_value = SimpleNamespace(sha="abc123")
+        mock_get_paths_info.return_value = [SimpleNamespace(path="pytorch_model.bin", size=700)]
+        mock_hf_hub_download.return_value = str(downloaded_file)
+
+        results = list(download_model_streaming("https://huggingface.co/test/model", max_size=1000))
+
+        assert results == [(downloaded_file, True)]
+        mock_get_paths_info.assert_called_once_with("test/model", ["pytorch_model.bin"], revision="abc123")
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="pytorch_model.bin",
+            revision="abc123",
         )
 
     @patch(

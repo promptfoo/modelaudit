@@ -118,6 +118,54 @@ def _list_repo_files_with_timeout(repo_id: str, timeout_seconds: float = 30) -> 
     return files, None
 
 
+def _get_huggingface_path_sizes(repo_id: str, filenames: list[str]) -> tuple[dict[str, int | None], str]:
+    """Return exact Hugging Face sizes for selected files and the checked revision."""
+    if not filenames:
+        return {}, ""
+
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    repo_info = api.repo_info(repo_id, files_metadata=False)
+    raw_revision = getattr(repo_info, "sha", None)
+    if not isinstance(raw_revision, str) or not raw_revision:
+        raise Exception(f"Cannot enforce max-size for {repo_id}: repository revision unavailable")
+
+    path_info = api.get_paths_info(repo_id, filenames, revision=raw_revision)
+    sizes: dict[str, int | None] = {}
+    for item in path_info:
+        path = getattr(item, "path", None)
+        if not isinstance(path, str):
+            continue
+        raw_size = getattr(item, "size", None)
+        sizes[path] = raw_size if isinstance(raw_size, int) and raw_size >= 0 else None
+    return sizes, raw_revision
+
+
+def _ensure_huggingface_selection_within_max_size(
+    repo_id: str,
+    filenames: list[str],
+    max_size: int | None,
+) -> str | None:
+    """Fail before transfer when selected Hugging Face files exceed the download budget."""
+    if max_size is None or not filenames:
+        return None
+
+    sizes, revision = _get_huggingface_path_sizes(repo_id, filenames)
+    total_size = 0
+    for filename in filenames:
+        size = sizes.get(filename)
+        if size is None:
+            raise Exception(f"Cannot download {repo_id}: unknown size for selected file {filename}")
+        total_size += size
+        if total_size > max_size:
+            raise Exception(
+                f"Cannot download {repo_id}: selected Hugging Face files total {total_size} bytes "
+                f"exceeds max size {max_size} bytes"
+            )
+    return revision
+
+
 def get_model_info(url: str) -> dict:
     """Get information about a HuggingFace model without downloading it.
 
@@ -206,13 +254,19 @@ def get_model_size(repo_id: str) -> int | None:
         return None
 
 
-def download_model(url: str, cache_dir: Path | None = None, show_progress: bool = True) -> Path:
+def download_model(
+    url: str,
+    cache_dir: Path | None = None,
+    show_progress: bool = True,
+    max_size: int | None = None,
+) -> Path:
     """Download a model from HuggingFace.
 
     Args:
         url: HuggingFace model URL
         cache_dir: Optional cache directory for downloads
         show_progress: Whether to show download progress
+        max_size: Optional maximum total selected download size in bytes
 
     Returns:
         Path to the downloaded model directory
@@ -301,14 +355,25 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
 
         # If we found specific model files, download them
         if model_files:
+            revision = _ensure_huggingface_selection_within_max_size(repo_id, model_files, max_size)
             download_kwargs["allow_patterns"] = model_files
+            if revision is not None:
+                download_kwargs["revision"] = revision
         elif repo_listing_failed:
+            if max_size is not None:
+                raise Exception(
+                    f"Cannot enforce max-size for {repo_id}: repository listing failed: {repo_listing_error}"
+                )
             extension_allow_patterns = _build_extension_allow_patterns()
             if not extension_allow_patterns:
                 raise Exception(
                     f"Refusing to download full snapshot for {repo_id}: no selective allowlist patterns available"
                 )
             download_kwargs["allow_patterns"] = extension_allow_patterns
+        else:
+            revision = _ensure_huggingface_selection_within_max_size(repo_id, repo_files, max_size)
+            if revision is not None:
+                download_kwargs["revision"] = revision
 
         if "allow_patterns" in download_kwargs:
             local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
@@ -352,7 +417,10 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
 
 
 def download_model_streaming(
-    url: str, cache_dir: Path | None = None, show_progress: bool = True
+    url: str,
+    cache_dir: Path | None = None,
+    show_progress: bool = True,
+    max_size: int | None = None,
 ) -> Iterator[tuple[Path, bool]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
 
@@ -363,6 +431,7 @@ def download_model_streaming(
         url: HuggingFace model URL
         cache_dir: Optional cache directory for downloads
         show_progress: Whether to show download progress
+        max_size: Optional maximum total selected download size in bytes
 
     Yields:
         Tuple of (Path, bool) - (downloaded file path, is_last_file flag)
@@ -411,6 +480,7 @@ def download_model_streaming(
             # Fallback: download all files if no recognized extensions found
             # This maintains parity with download_model() behavior
             model_files = repo_files
+        revision = _ensure_huggingface_selection_within_max_size(repo_id, model_files, max_size)
 
         # Setup cache directory
         download_path = None
@@ -424,20 +494,20 @@ def download_model_streaming(
             is_last = idx == total_files - 1
 
             # Download single file
+            download_kwargs: dict[str, Any] = {
+                "repo_id": repo_id,
+                "filename": filename,
+            }
+            if revision is not None:
+                download_kwargs["revision"] = revision
             if cache_dir is not None and download_path is not None:
                 # Use specific cache dir for local placement
-                local_path = hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
-                    cache_dir=str(cache_dir / "huggingface"),
-                    local_dir=str(download_path),
-                )
+                download_kwargs["cache_dir"] = str(cache_dir / "huggingface")
+                download_kwargs["local_dir"] = str(download_path)
+                local_path = hf_hub_download(**download_kwargs)
             else:
                 # Use HF default cache
-                local_path = hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
-                )
+                local_path = hf_hub_download(**download_kwargs)
 
             yield (Path(local_path), is_last)
 
