@@ -757,6 +757,10 @@ def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
             b"    return await launch('id')\n",
             "asyncio.create_subprocess_exec",
         ),
+        (
+            b"import runpy\ndef handle(data, context):\n    return runpy._run_module_as_main('payload')\n",
+            "runpy._run_module_as_main",
+        ),
         (b"import runpy\ndef handle(data, context):\n    return runpy.run_module('payload')\n", "runpy.run_module"),
         (
             b"from runpy import run_path as run\ndef handle(data, context):\n    return run('payload.py')\n",

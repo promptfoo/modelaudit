@@ -555,6 +555,7 @@ def test_scan_zip_flags_asyncio_subprocess_python_member(tmp_path: Path, source:
 @pytest.mark.parametrize(
     ("source", "dangerous_name"),
     [
+        ("import runpy\nrunpy._run_module_as_main('payload')\n", "runpy._run_module_as_main"),
         ("import runpy\nrunpy.run_module('payload')\n", "runpy.run_module"),
         ("from runpy import run_path as run\nrun('payload.py')\n", "runpy.run_path"),
     ],
@@ -574,6 +575,35 @@ def test_scan_zip_flags_runpy_execution_python_member(tmp_path: Path, source: st
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S108"
     assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
+def test_scan_zip_flags_extensionless_runpy_python_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler", "import runpy\nrunpy.run_module('payload')\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S108"
+    assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_module"
+
+
+def test_scan_zip_ignores_extensionless_runpy_near_match(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("notes", "documentation mentions runpy.run_module('payload')\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
 
 
 def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite(tmp_path: Path) -> None:

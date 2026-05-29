@@ -30,6 +30,11 @@ def test_generic_rule_prefers_network_codes_for_urls() -> None:
     assert get_generic_rule_code("Network communication pattern: https://evil.example") == "S309"
 
 
+def test_embedded_code_rule_maps_dynamic_module_execution_before_executable_text() -> None:
+    """Dynamic module execution contains an "exe" prefix but belongs to runpy."""
+    assert get_embedded_code_rule_code("Dynamic module execution detected") == "S108"
+
+
 @pytest.mark.parametrize(
     ("message", "expected_rule_code"),
     [

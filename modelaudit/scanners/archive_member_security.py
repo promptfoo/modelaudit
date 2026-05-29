@@ -76,42 +76,22 @@ _ASYNCIO_PROCESS_EXECUTION_CALLS = frozenset(
         "asyncio.subprocess.create_subprocess_shell",
     }
 )
+_SUBPROCESS_PROCESS_EXECUTION_CALLS = frozenset(
+    {
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.Popen",
+        "subprocess.run",
+    }
+)
 _RUNPY_CODE_EXECUTION_CALLS = frozenset(
     {
+        "runpy._run_module_as_main",
         "runpy.run_module",
         "runpy.run_path",
     }
 )
-_HIGH_RISK_PYTHON_CALLS = {
-    "__import__",
-    "builtins.__import__",
-    "builtins.eval",
-    "builtins.exec",
-    "eval",
-    "exec",
-    "importlib.import_module",
-    "pickle.load",
-    "pickle.loads",
-    "subprocess.call",
-    "subprocess.check_call",
-    "subprocess.check_output",
-    "subprocess.Popen",
-    "subprocess.run",
-    *_OS_PROCESS_EXECUTION_CALLS,
-    *_ASYNCIO_PROCESS_EXECUTION_CALLS,
-    *_RUNPY_CODE_EXECUTION_CALLS,
-}
-
-
-def _split_env_shebang_command(value: str) -> str | None:
-    try:
-        split_parts = shlex.split(value)
-    except ValueError:
-        split_parts = value.split()
-    if not split_parts:
-        return None
-    return split_parts[0].rsplit("/", 1)[-1].lower()
-
 
 # Map each high-risk call name to the rule code that best describes its risk
 # category. SARIF consumers, dashboards, and per-rule severity overrides rely
@@ -127,12 +107,24 @@ _HIGH_RISK_PYTHON_CALL_RULE_CODES: dict[str, str] = {
     "importlib.import_module": "S107",
     "pickle.load": "S213",
     "pickle.loads": "S213",
+    **dict.fromkeys(_SUBPROCESS_PROCESS_EXECUTION_CALLS, "S103"),
     **dict.fromkeys(_OS_PROCESS_EXECUTION_CALLS, "S101"),
     **dict.fromkeys(_ASYNCIO_PROCESS_EXECUTION_CALLS, "S103"),
     **dict.fromkeys(_RUNPY_CODE_EXECUTION_CALLS, "S108"),
 }
 _HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES: tuple[tuple[str, str], ...] = (("subprocess.", "S103"),)
 _FALLBACK_HIGH_RISK_RULE_CODE = "S104"
+_HIGH_RISK_PYTHON_CALLS = frozenset(_HIGH_RISK_PYTHON_CALL_RULE_CODES)
+
+
+def _split_env_shebang_command(value: str) -> str | None:
+    try:
+        split_parts = shlex.split(value)
+    except ValueError:
+        split_parts = value.split()
+    if not split_parts:
+        return None
+    return split_parts[0].rsplit("/", 1)[-1].lower()
 
 
 def _rule_code_for_high_risk_call(call_name: str) -> str:
@@ -1078,6 +1070,8 @@ def _wildcard_import_aliases(module: str) -> Iterator[tuple[str, str]]:
         if not call_name.startswith(prefix):
             continue
         exported_name = call_name.removeprefix(prefix).split(".", maxsplit=1)[0]
+        if exported_name.startswith("_"):
+            continue
         if module == "asyncio" and exported_name == "subprocess":
             continue
         yield exported_name, f"{module}.{exported_name}"
@@ -1764,6 +1758,39 @@ _PYTHON_MEMBER_CHECK_NAME = "Python Archive Member Security"
 _EXECUTABLE_MEMBER_CHECK_NAME = "Executable Archive Member Detection"
 
 
+def _add_python_archive_member_call_checks(
+    *,
+    archive_kind: str,
+    archive_path: str,
+    member_name: str,
+    result: ScanResult,
+    calls: set[HighRiskPythonCall],
+) -> bool:
+    if not calls:
+        return False
+
+    # Emit one finding per rule code so SARIF consumers, dashboards, and
+    # per-rule severity overrides see accurate attribution (``os.system``
+    # as S101, ``subprocess.run`` as S103, etc.) instead of one S104
+    # catch-all that aggregates unrelated risk categories.
+    calls_by_rule: dict[str, list[str]] = {}
+    for call in calls:
+        calls_by_rule.setdefault(call.rule_code, []).append(call.name)
+    for rule_code in sorted(calls_by_rule):
+        names = sorted(calls_by_rule[rule_code])
+        reason = f"high-risk calls: {', '.join(names)}"
+        result.add_check(
+            name=_PYTHON_MEMBER_CHECK_NAME,
+            passed=False,
+            message=f"High-risk Python code found in {archive_kind} member {member_name}: {reason}",
+            severity=IssueSeverity.WARNING,
+            location=f"{archive_path}:{member_name}",
+            details={"entry": member_name, "reason": reason},
+            rule_code=rule_code,
+        )
+    return True
+
+
 def _add_executable_archive_member_check(
     *,
     archive_kind: str,
@@ -1922,26 +1949,34 @@ def scan_archive_member_for_known_risks(
             )
             return
 
-        # Emit one finding per rule code so SARIF consumers, dashboards, and
-        # per-rule severity overrides see accurate attribution (``os.system``
-        # as S101, ``subprocess.run`` as S103, etc.) instead of one S104
-        # catch-all that aggregates unrelated risk categories.
-        calls_by_rule: dict[str, list[str]] = {}
-        for call in calls:
-            calls_by_rule.setdefault(call.rule_code, []).append(call.name)
-        for rule_code in sorted(calls_by_rule):
-            names = sorted(calls_by_rule[rule_code])
-            reason = f"high-risk calls: {', '.join(names)}"
-            result.add_check(
-                name=_PYTHON_MEMBER_CHECK_NAME,
-                passed=False,
-                message=f"High-risk Python code found in {archive_kind} member {member_name}: {reason}",
-                severity=IssueSeverity.WARNING,
-                location=location,
-                details={"entry": member_name, "reason": reason},
-                rule_code=rule_code,
-            )
+        _add_python_archive_member_call_checks(
+            archive_kind=archive_kind,
+            archive_path=archive_path,
+            member_name=member_name,
+            result=result,
+            calls=calls,
+        )
         return
+
+    if (
+        analyze_python_source
+        and "." not in normalized_lower.rsplit("/", maxsplit=1)[-1]
+        and total_size <= max_python_analysis_bytes
+        and tmp_path is not None
+    ):
+        try:
+            with open(tmp_path, "rb") as member_file:
+                calls = high_risk_python_calls_in_source(member_file.read())
+        except (OSError, PythonArchiveMemberParseError):
+            calls = set()
+        if _add_python_archive_member_call_checks(
+            archive_kind=archive_kind,
+            archive_path=archive_path,
+            member_name=member_name,
+            result=result,
+            calls=calls,
+        ):
+            return
 
     if is_executable_archive_member_name(normalized_lower):
         _add_executable_archive_member_check(

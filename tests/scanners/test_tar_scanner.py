@@ -398,6 +398,7 @@ class TestTarScanner:
     @pytest.mark.parametrize(
         ("payload", "dangerous_name"),
         [
+            (b"import runpy\nrunpy._run_module_as_main('payload')\n", "runpy._run_module_as_main"),
             (b"import runpy\nrunpy.run_module('payload')\n", "runpy.run_module"),
             (b"from runpy import run_path as run\nrun('payload.py')\n", "runpy.run_path"),
         ],
@@ -419,6 +420,36 @@ class TestTarScanner:
         assert python_checks[0].status == CheckStatus.FAILED
         assert python_checks[0].rule_code == "S108"
         assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+    def test_scan_tar_flags_extensionless_runpy_python_member(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"import runpy\nrunpy.run_module('payload')\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].rule_code == "S108"
+        assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_module"
+
+    def test_scan_tar_ignores_extensionless_runpy_near_match(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"documentation mentions runpy.run_module('payload')\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("notes")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
 
     def test_scan_tar_allows_replaced_runpy_execution(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "model_bundle.tar"

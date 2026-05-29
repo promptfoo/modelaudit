@@ -1512,9 +1512,11 @@ def test_pytorch_zip_scans_asyncio_subprocess_launch_source_conservatively(tmp_p
 @pytest.mark.parametrize(
     "payload",
     [
+        b"def payload():\n    return runpy._run_module_as_main('payload')\n",
         b"def payload():\n    return runpy.run_module('payload')\n",
         b"def payload():\n    from runpy import run_path as run\n    return run('payload.py')\n",
         (b"\x00\xffdef payload():\n    from runpy import run_path as run\n    return run('payload.py')\n}"),
+        b"\x00\xfffrom runpy import _run_module_as_main as run\nrun('payload')\n\x00MODEL-FRAMING",
     ],
 )
 def test_pytorch_zip_scans_unmarked_runpy_execution_in_archive_data(tmp_path: Path, payload: bytes) -> None:
@@ -1543,7 +1545,7 @@ def test_pytorch_zip_scans_unmarked_runpy_execution_in_archive_data(tmp_path: Pa
 
 def test_pytorch_zip_ignores_certain_replaced_runpy_execution_in_archive_data(tmp_path: Path) -> None:
     zip_path = tmp_path / "model.pt"
-    payload = b"\x00\xffdef payload():\n    import runpy\n    runpy.run_path = len\n    return runpy.run_path([])\n"
+    payload = b"\x00\xffimport runpy\nrunpy.run_path = len\nrunpy.run_path([])\n\x00MODEL-FRAMING"
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("archive/version", "3")
         zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))

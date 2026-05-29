@@ -129,6 +129,13 @@ _DANGEROUS_IMPORT_PATTERNS = {
     dangerous_import: _compile_dangerous_import_patterns(dangerous_import) for dangerous_import in DANGEROUS_IMPORTS
 }
 _MAX_SNIPPET_PARSE_TRIM_ATTEMPTS = 8
+_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES = 1_000_000
+_EMBEDDED_PYTHON_START_MARKERS = (b"def ", b"async def ", b"class ", b"import ", b"from ")
+_EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+")
+_EMBEDDED_PYTHON_START_PATTERN = re.compile(
+    rb"(?<![A-Za-z0-9_'\".])"
+    rb"(?:(?:async\s+)?def\s+\w+|class\s+\w+|import\s+[A-Za-z_][\w.]*|from\s+[A-Za-z_][\w.]*\s+import)"
+)
 
 
 def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
@@ -172,6 +179,40 @@ def _parse_embedded_python_snippet(code_str: str) -> tuple[ast.AST, int] | None:
         except (SyntaxError, ValueError):
             continue
     return None
+
+
+def _candidate_embedded_python_snippets(
+    bounded: bytes,
+    *,
+    include_full_source: bool = False,
+) -> list[tuple[bytes, tuple[int, int]]]:
+    candidates: list[tuple[bytes, tuple[int, int]]] = []
+    block_spans: list[tuple[int, int]] = []
+    if include_full_source:
+        candidates.append((bounded, (0, len(bounded))))
+
+    for match in _EMBEDDED_PYTHON_BLOCK_PATTERN.finditer(bounded):
+        span = match.span()
+        if include_full_source and span[0] == 0:
+            continue
+        block_spans.append(span)
+        candidates.append((match.group(0), span))
+
+    for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(bounded):
+        start = match.start()
+        if include_full_source and start == 0:
+            continue
+        if any(block_start <= start < block_end for block_start, block_end in block_spans):
+            continue
+        candidates.append((bounded[start:], (start, len(bounded))))
+
+    return candidates
+
+
+def _embedded_python_scan_windows(data: bytes) -> list[bytes]:
+    if len(data) <= _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:
+        return [data]
+    return [data[:_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES], data[-_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:]]
 
 
 def _has_raw_match_outside_parsed_spans(raw_spans: list[tuple[int, int]], parsed_spans: list[tuple[int, int]]) -> bool:
@@ -237,7 +278,7 @@ CODE_EXECUTION_PATTERNS = [
         _SUBPROCESS_CODE_EXECUTION_DESCRIPTION,
     ),
     (rb"os\.(system|popen|exec\w*|spawn\w*|posix_spawnp?|startfile)", _OS_CODE_EXECUTION_DESCRIPTION),
-    (rb"runpy\.(?:run_module|run_path)", _RUNPY_CODE_EXECUTION_DESCRIPTION),
+    (rb"runpy\.(?:_run_module_as_main|run_module|run_path)", _RUNPY_CODE_EXECUTION_DESCRIPTION),
     # Network patterns
     (rb"socket\.(socket|create_connection)", "Socket creation detected"),
     (rb"urllib\.(request|urlopen)", "URL request detected"),
@@ -281,13 +322,30 @@ class JITScriptDetector:
     @staticmethod
     def _looks_like_dangerous_python_source(data: bytes) -> bool:
         """Return whether marker-free bytes look like dangerous embedded Python source."""
+        bounded = data
         try:
-            source = textwrap.dedent(data.decode("utf-8"))
-            tree = ast.parse(source)
+            source = textwrap.dedent(bounded.decode("utf-8"))
+            full_tree = ast.parse(source)
         except (SyntaxError, UnicodeDecodeError, ValueError):
             return False
 
-        return JITScriptDetector._ast_contains_dangerous_python(tree)
+        return JITScriptDetector._ast_contains_dangerous_python(full_tree)
+
+    @staticmethod
+    def _looks_like_framed_dangerous_python_source(data: bytes) -> bool:
+        """Return whether a bounded binary blob has parseable dangerous Python framing."""
+        if not any(marker in data for marker in _EMBEDDED_PYTHON_START_MARKERS):
+            return False
+        for window in _embedded_python_scan_windows(data):
+            for candidate, _span in _candidate_embedded_python_snippets(window):
+                code_str, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
+                parsed_snippet = _parse_embedded_python_snippet(code_str)
+                if parsed_snippet is None:
+                    continue
+                snippet_tree, _parsed_chars = parsed_snippet
+                if JITScriptDetector._ast_contains_dangerous_python(snippet_tree):
+                    return True
+        return False
 
     @staticmethod
     def _ast_contains_dangerous_python(tree: ast.AST) -> bool:
@@ -618,12 +676,7 @@ class JITScriptDetector:
             return findings
 
         bounded = data if include_full_source else data[:1000000]
-        python_code_pattern = rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+"
-        matches = (
-            [(bounded, (0, len(bounded)))]
-            if include_full_source
-            else [(match.group(0), match.span()) for match in re.finditer(python_code_pattern, bounded)]
-        )
+        matches = _candidate_embedded_python_snippets(bounded, include_full_source=include_full_source)
         bounded_high_risk_calls: set[tuple[str, str]] | None = None
         snippet_high_risk_calls: set[tuple[str, str]] = set()
         parsed_snippet_spans: list[tuple[int, int]] = []
@@ -1115,6 +1168,8 @@ class JITScriptDetector:
                     include_full_source=True,
                 )
             )
+        elif self._looks_like_framed_dangerous_python_source(data):
+            findings.extend(self._extract_and_check_python_code(data, "Generic Python", context))
 
         return findings
 
