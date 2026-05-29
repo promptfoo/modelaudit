@@ -39,7 +39,7 @@ from .keras_utils import (
     check_custom_metric_config,
     check_lambda_dict_function,
     check_subclassed_model,
-    find_case_insensitive_substrings,
+    find_lambda_dangerous_patterns,
     is_known_safe_keras_layer_class,
 )
 from .zip_scanner import ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY
@@ -1849,7 +1849,7 @@ class KerasZipScanner(BaseScanner):
                         "webbrowser",
                     ]
 
-                    found_patterns = find_case_insensitive_substrings(decoded_str, dangerous_patterns)
+                    found_patterns = find_lambda_dangerous_patterns(decoded_str, dangerous_patterns)
 
                     if found_patterns:
                         result.add_check(

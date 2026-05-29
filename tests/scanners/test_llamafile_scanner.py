@@ -260,9 +260,23 @@ def test_llamafile_reuses_torch7_offset_pass_while_skipping_marker_decoys(
 
     monkeypatch.setattr(LlamafileScanner, "_find_embedded_torch7_offset", staticmethod(counting_find_offset))
 
+    signal_probe_offsets: list[int] = []
+    original_signal_rank = LlamafileScanner._embedded_torch7_candidate_actionable_signal_rank
+
+    def counting_signal_rank(path: Path, offset: int, max_scan_bytes: int) -> int:
+        signal_probe_offsets.append(offset)
+        return original_signal_rank(path, offset, max_scan_bytes)
+
+    monkeypatch.setattr(
+        LlamafileScanner,
+        "_embedded_torch7_candidate_actionable_signal_rank",
+        classmethod(lambda cls, path, offset, max_scan_bytes: counting_signal_rank(path, offset, max_scan_bytes)),
+    )
+
     result = LlamafileScanner(config={"torch7_max_scan_bytes": 128}).scan(str(binary))
 
     assert find_start_offsets == [binary.read_bytes().index(valid_gguf) + len(b"GGUF")]
+    assert signal_probe_offsets == [binary.read_bytes().index(torch7_payload)]
     assert result.metadata["embedded_torch7_offset"] == binary.read_bytes().index(torch7_payload)
     assert any(
         check.name == "Torch7 Lua Execution Primitive Analysis"
@@ -430,6 +444,50 @@ def test_llamafile_keeps_searching_after_cap_for_require_only_torch7_payload(tmp
     )
 
     assert result.metadata["embedded_torch7_offset"] == binary.read_bytes().index(torch7_payload)
+    assert any(
+        check.name == "Torch7 Dynamic Module Load Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+
+
+def test_llamafile_safe_require_decoys_do_not_exhaust_actionable_candidate_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "torch7-safe-require-decoys-then-evil-require.llamafile"
+    safe_decoys = [b"T7\x00\x00\x01\x02\x03\x04require('torch')\n" + (b"A" * 256) for _ in range(4)]
+    torch7_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\nrequire('evil.module')\n"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=b"".join(safe_decoys) + torch7_payload))
+
+    scanned_offsets: list[int] = []
+    original_scan_candidate = LlamafileScanner._scan_embedded_torch7_candidate
+
+    def counting_scan_candidate(
+        self: LlamafileScanner,
+        path: Path,
+        scanner: Any,
+        result: ScanResult,
+        offset: int,
+    ) -> tuple[ScanResult | None, int]:
+        scanned_offsets.append(offset)
+        return original_scan_candidate(self, path, scanner, result, offset)
+
+    monkeypatch.setattr(LlamafileScanner, "_scan_embedded_torch7_candidate", counting_scan_candidate)
+
+    result = LlamafileScanner(config={"llamafile_torch7_max_candidate_scans": 2, "torch7_max_scan_bytes": 128}).scan(
+        str(binary)
+    )
+
+    payload_offset = binary.read_bytes().index(torch7_payload)
+    first_decoy_offset = binary.read_bytes().index(safe_decoys[0])
+    assert scanned_offsets == [
+        first_decoy_offset,
+        first_decoy_offset + len(safe_decoys[0]),
+        payload_offset,
+    ]
+    assert result.metadata["embedded_torch7_offset"] == payload_offset
     assert any(
         check.name == "Torch7 Dynamic Module Load Analysis"
         and check.status == CheckStatus.FAILED

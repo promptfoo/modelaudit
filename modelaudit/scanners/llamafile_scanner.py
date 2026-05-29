@@ -51,7 +51,27 @@ PRINTABLE_TEXT_RE = re.compile(rb"[ -~]{8,}")
 TORCH7_EXEC_PRIMITIVE_BYTES_RE = re.compile(
     rb"(?i)\b(?:os\.execute|io\.popen|loadstring|dofile|loadfile|setfenv|getfenv)\s*\("
 )
-TORCH7_DYNAMIC_LOAD_BYTES_RE = re.compile(rb"(?i)\b(?:package\.loadlib|ffi\.load|loadlib|require)\b")
+TORCH7_DYNAMIC_LOAD_BYTES_RE = re.compile(rb"(?i)\b(?:package\.loadlib|ffi\.load|loadlib)\b")
+TORCH7_REQUIRE_BYTES_RE = re.compile(
+    rb"(?is)\brequire(?:\s|--[^\r\n]*(?:\r?\n|$))*"
+    rb"(?:\((?:\s|--[^\r\n]*(?:\r?\n|$))*(?:['\"]([^'\"]+)['\"]|\[(=*)\[(.*?)\]\2\])"
+    rb"(?:\s|--[^\r\n]*(?:\r?\n|$))*\)|['\"]([^'\"]+)['\"]|\[(=*)\[(.*?)\]\5\])"
+)
+TORCH7_SAFE_REQUIRE_MODULES = frozenset(
+    {
+        b"torch",
+        b"nn",
+        b"nngraph",
+        b"image",
+        b"paths",
+        b"math",
+        b"string",
+        b"table",
+        b"cunn",
+        b"cutorch",
+        b"optim",
+    }
+)
 TORCH7_NETWORK_OR_SHELL_BYTES_RE = re.compile(
     rb"(?i)\b(?:https?://|ftp://|socket\.|luasocket|curl|wget|powershell(?:\.exe)?|"
     rb"cmd(?:\.exe)?\s+/c|/bin/sh|/bin/bash|bash\s+-c|sh\s+-c|netcat|nc\s+)"
@@ -598,13 +618,7 @@ class LlamafileScanner(BaseScanner):
         return find_structural_torch7_offset(prefix) == 0
 
     @staticmethod
-    def _embedded_torch7_candidate_has_binary_payload_bytes(path: Path, offset: int) -> bool:
-        try:
-            with path.open("rb") as handle:
-                handle.seek(offset)
-                prefix = handle.read(TORCH7_SIGNATURE_WINDOW_BYTES)
-        except OSError:
-            return False
+    def _torch7_candidate_prefix_has_binary_payload_bytes(prefix: bytes) -> bool:
         if len(prefix) < 8 or not prefix.startswith(b"T7\x00\x00"):
             return False
         next_marker = prefix.find(TORCH7_BINARY_MARKER, len(TORCH7_BINARY_MARKER))
@@ -612,12 +626,37 @@ class LlamafileScanner(BaseScanner):
         window = prefix[len(TORCH7_BINARY_MARKER) : window_end]
         return any(byte not in b"\t\n\r" + bytes(range(0x20, 0x7F)) for byte in window)
 
+    @classmethod
+    def _embedded_torch7_candidate_has_binary_payload_bytes(cls, path: Path, offset: int) -> bool:
+        try:
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                prefix = handle.read(TORCH7_SIGNATURE_WINDOW_BYTES)
+        except OSError:
+            return False
+        return cls._torch7_candidate_prefix_has_binary_payload_bytes(prefix)
+
+    @staticmethod
+    def _torch7_has_suspicious_require(window: bytes) -> bool:
+        for quoted_paren, _, long_paren, quoted_bare, _, long_bare in TORCH7_REQUIRE_BYTES_RE.findall(window):
+            module = next(
+                (candidate.lower() for candidate in (quoted_paren, long_paren, quoted_bare, long_bare) if candidate),
+                b"",
+            )
+            if module and module not in TORCH7_SAFE_REQUIRE_MODULES and not module.startswith(b"torch."):
+                return True
+        return False
+
     @staticmethod
     def _torch7_actionable_signal_rank(window: bytes) -> int:
         has_exec = TORCH7_EXEC_PRIMITIVE_BYTES_RE.search(window) is not None
         if has_exec and TORCH7_NETWORK_OR_SHELL_BYTES_RE.search(window) is not None:
             return 2
-        if has_exec or TORCH7_DYNAMIC_LOAD_BYTES_RE.search(window) is not None:
+        if (
+            has_exec
+            or TORCH7_DYNAMIC_LOAD_BYTES_RE.search(window) is not None
+            or LlamafileScanner._torch7_has_suspicious_require(window)
+        ):
             return 1
         return 0
 
@@ -868,7 +907,11 @@ class LlamafileScanner(BaseScanner):
                     if marker_offset == -1:
                         break
                     absolute_offset = window_offset + marker_offset
-                    if absolute_offset > last_yielded and file_size - absolute_offset >= 8:
+                    if (
+                        absolute_offset > last_yielded
+                        and file_size - absolute_offset >= 8
+                        and cls._torch7_marker_candidate_is_promising(haystack, marker_offset)
+                    ):
                         relative_offsets.add(marker_offset)
                     marker_search_offset = marker_offset + 1
 
@@ -889,6 +932,19 @@ class LlamafileScanner(BaseScanner):
 
                 carry = haystack[-overlap:] if overlap > 0 else b""
                 scanned += len(chunk)
+
+    @classmethod
+    def _torch7_marker_candidate_is_promising(cls, haystack: bytes, offset: int) -> bool:
+        candidate_window = haystack[offset : offset + TORCH7_SIGNATURE_WINDOW_BYTES]
+        if find_structural_torch7_offset(candidate_window) == 0:
+            return True
+        if cls._torch7_candidate_prefix_has_binary_payload_bytes(candidate_window):
+            return True
+
+        next_marker = haystack.find(TORCH7_BINARY_MARKER, offset + len(TORCH7_BINARY_MARKER))
+        if next_marker == -1:
+            return True
+        return cls._torch7_actionable_signal_rank(haystack[offset:next_marker]) > 0
 
     @classmethod
     def _find_embedded_torch7_offset(cls, path: Path, max_scan_bytes: int, *, start_offset: int = 0) -> int | None:
