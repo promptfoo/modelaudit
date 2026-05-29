@@ -61,6 +61,15 @@ enum FormatFieldNumbering {
     Manual,
 }
 
+#[derive(Clone, Copy)]
+enum TrackedDictMutationKind {
+    SetItem,
+    SetDefault,
+    Update,
+}
+
+type TrackedDictSnapshot = (Vec<(String, StackValue)>, Vec<StackValue>, bool);
+
 enum StrFormatRootItemLookup {
     Invalid,
     Path(Vec<Option<String>>),
@@ -1753,7 +1762,10 @@ impl<'a> ScanState<'a> {
         !reference.malformed
             && matches!(
                 (reference.module.as_str(), reference.name.as_str()),
-                ("builtins" | "__builtin__" | "__builtins__", "type")
+                (
+                    "builtins" | "__builtin__" | "__builtins__",
+                    "type" | "type.__class__"
+                )
             )
     }
 
@@ -1816,33 +1828,60 @@ impl<'a> ScanState<'a> {
         callable_value: Option<&StackValue>,
         arguments: Option<&[StackValue]>,
     ) {
-        if !Self::is_tracked_dict_setitem_callable(callable_value) {
+        let Some(kind) = Self::tracked_dict_mutation_kind(callable_value) else {
             return;
-        }
+        };
         let Some(arguments) = arguments else {
             return;
         };
-        let [target, key, value] = arguments else {
-            return;
-        };
-        self.record_tracked_dict_mutation(target, key, value);
+        match kind {
+            TrackedDictMutationKind::SetItem => {
+                let [target, key, value] = arguments else {
+                    return;
+                };
+                self.record_tracked_dict_mutation(target, key, value);
+            }
+            TrackedDictMutationKind::SetDefault => {
+                let [target, key] = arguments else {
+                    if let [target, key, value] = arguments {
+                        self.record_tracked_dict_setdefault_mutation(target, key, Some(value));
+                    }
+                    return;
+                };
+                self.record_tracked_dict_setdefault_mutation(target, key, None);
+            }
+            TrackedDictMutationKind::Update => {
+                let [target, source] = arguments else {
+                    return;
+                };
+                self.record_tracked_dict_update_mutation(target, source);
+            }
+        }
     }
 
-    fn is_tracked_dict_setitem_callable(callable_value: Option<&StackValue>) -> bool {
+    fn tracked_dict_mutation_kind(
+        callable_value: Option<&StackValue>,
+    ) -> Option<TrackedDictMutationKind> {
         let Some(StackValue::Global(reference)) = callable_value else {
-            return false;
+            return None;
         };
         if reference.malformed {
-            return false;
+            return None;
         }
-        matches!(
-            (reference.module.as_str(), reference.name.as_str()),
-            ("operator" | "_operator", "setitem")
-                | (
-                    "builtins" | "__builtin__" | "__builtins__",
-                    "dict.__setitem__"
-                )
-        )
+        match (reference.module.as_str(), reference.name.as_str()) {
+            ("operator" | "_operator", "setitem") => Some(TrackedDictMutationKind::SetItem),
+            ("operator" | "_operator", "ior") => Some(TrackedDictMutationKind::Update),
+            ("builtins" | "__builtin__" | "__builtins__", "dict.__setitem__") => {
+                Some(TrackedDictMutationKind::SetItem)
+            }
+            ("builtins" | "__builtin__" | "__builtins__", "dict.setdefault") => {
+                Some(TrackedDictMutationKind::SetDefault)
+            }
+            ("builtins" | "__builtin__" | "__builtins__", "dict.update" | "dict.__ior__") => {
+                Some(TrackedDictMutationKind::Update)
+            }
+            _ => None,
+        }
     }
 
     fn record_tracked_dict_mutation(
@@ -1874,6 +1913,122 @@ impl<'a> ScanState<'a> {
                     value.clone(),
                 );
             }
+        }
+    }
+
+    fn record_tracked_dict_setdefault_mutation(
+        &mut self,
+        target: &StackValue,
+        key: &StackValue,
+        value: Option<&StackValue>,
+    ) {
+        let StackValue::TrackedDict {
+            memo_index,
+            entries,
+            ..
+        } = target
+        else {
+            return;
+        };
+        let Some(memo_index) = *memo_index else {
+            return;
+        };
+        let key = stack_value_string(key, self.payload);
+        if key.as_ref().is_some_and(|key| {
+            self.current_tracked_dict_entries(entries, Some(memo_index))
+                .iter()
+                .any(|(candidate, _)| candidate == key)
+        }) {
+            return;
+        }
+        let value = value.cloned().unwrap_or(StackValue::Primitive {
+            type_name: "NoneType",
+            repr: "None".to_string(),
+        });
+        if let Some(StackValue::TrackedDict {
+            entries,
+            unknown_key_values,
+            unknown_key_values_overflowed,
+            ..
+        }) = self.memo.get_mut(&memo_index)
+        {
+            if let Some(key) = key {
+                Self::insert_tracked_dict_entry(entries, key, value);
+            } else {
+                Self::insert_tracked_dict_unknown_key_value(
+                    unknown_key_values,
+                    unknown_key_values_overflowed,
+                    value,
+                );
+            }
+        }
+    }
+
+    fn record_tracked_dict_update_mutation(&mut self, target: &StackValue, source: &StackValue) {
+        let StackValue::TrackedDict { memo_index, .. } = target else {
+            return;
+        };
+        let Some(memo_index) = *memo_index else {
+            return;
+        };
+        let Some((source_entries, source_unknown_key_values, source_overflowed)) =
+            self.tracked_dict_snapshot(source)
+        else {
+            self.mark_tracked_dict_unknown_key_values_overflowed(memo_index);
+            return;
+        };
+        if let Some(StackValue::TrackedDict {
+            entries,
+            unknown_key_values,
+            unknown_key_values_overflowed,
+            ..
+        }) = self.memo.get_mut(&memo_index)
+        {
+            for (key, value) in source_entries {
+                Self::insert_tracked_dict_entry(entries, key, value);
+            }
+            for value in source_unknown_key_values {
+                Self::insert_tracked_dict_unknown_key_value(
+                    unknown_key_values,
+                    unknown_key_values_overflowed,
+                    value,
+                );
+            }
+            if source_overflowed {
+                *unknown_key_values_overflowed = true;
+            }
+        }
+    }
+
+    fn tracked_dict_snapshot(&self, value: &StackValue) -> Option<TrackedDictSnapshot> {
+        let StackValue::TrackedDict {
+            entries,
+            unknown_key_values,
+            unknown_key_values_overflowed,
+            memo_index,
+        } = value
+        else {
+            return None;
+        };
+        Some((
+            self.current_tracked_dict_entries(entries, *memo_index)
+                .to_vec(),
+            self.current_tracked_dict_unknown_key_values(unknown_key_values, *memo_index)
+                .to_vec(),
+            self.current_tracked_dict_unknown_key_values_overflowed(
+                *unknown_key_values_overflowed,
+                *memo_index,
+            ),
+        ))
+    }
+
+    fn mark_tracked_dict_unknown_key_values_overflowed(&mut self, memo_index: i64) {
+        if let Some(StackValue::TrackedDict {
+            unknown_key_values_overflowed,
+            ..
+        }) = self.memo.get_mut(&memo_index)
+        {
+            *unknown_key_values_overflowed = true;
         }
     }
 
