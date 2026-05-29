@@ -678,7 +678,7 @@ def test_scan_zip_preserves_restored_runpy_execution_after_static_overwrite(tmp_
     assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
 
 
-def test_scan_zip_clears_static_member_overwrite_after_module_import(tmp_path: Path) -> None:
+def test_scan_zip_preserves_runpy_execution_after_import_rebinds_module(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = (
         "class Dummy:\n    pass\nrunpy = Dummy()\nrunpy.run_path = len\nimport runpy\nrunpy.run_path('payload.py')\n"
