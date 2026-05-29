@@ -13,6 +13,7 @@ import ast
 import re
 import textwrap
 from bisect import bisect_left, bisect_right
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -473,6 +474,7 @@ def _priority_alias_usage_lines(
     candidate: bytes, aliases: frozenset[bytes], search_start: int
 ) -> list[tuple[int, int]]:
     usage_lines: list[tuple[int, int]] = []
+    pending_shadow_lines: dict[bytes, tuple[int, int]] = {}
     line_start = search_start
     multiline_quote: bytes | None = _multiline_string_state_after_line(candidate[:search_start], None)
     while line_start < len(candidate):
@@ -487,13 +489,28 @@ def _priority_alias_usage_lines(
             line_start = line_end
             continue
         code_line = _python_structural_line_bytes(line)
-        if _line_shadows_priority_alias(code_line, aliases):
-            usage_lines.append((line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)))
-            if len(usage_lines) >= _MAX_PRIORITY_ALIAS_USAGE_LINES:
-                return usage_lines
-        elif _line_uses_priority_alias(code_line, aliases):
-            usage_lines.append((line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)))
-            if _line_calls_priority_alias(code_line, aliases) or len(usage_lines) >= _MAX_PRIORITY_ALIAS_USAGE_LINES:
+        shadowed_aliases = _line_shadowed_priority_aliases(code_line, aliases)
+        if shadowed_aliases:
+            shadow_line = (line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES))
+            for alias in shadowed_aliases:
+                pending_shadow_lines[alias] = shadow_line
+        if used_aliases := _line_used_priority_aliases(code_line, aliases):
+            live_aliases = _line_live_priority_aliases(code_line, aliases)
+            active_used_aliases = (used_aliases - shadowed_aliases) | live_aliases
+            if not active_used_aliases:
+                multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                line_start = line_end
+                continue
+            for shadow_line in sorted(
+                {shadow_line for alias, shadow_line in pending_shadow_lines.items() if alias in used_aliases}
+            ):
+                if shadow_line not in usage_lines:
+                    usage_lines.append(shadow_line)
+            usage_line = (line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES))
+            if usage_line not in usage_lines:
+                usage_lines.append(usage_line)
+            called_aliases = _line_called_priority_aliases(code_line, aliases)
+            if (called_aliases & active_used_aliases) or len(usage_lines) >= _MAX_PRIORITY_ALIAS_USAGE_LINES:
                 return usage_lines
         multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
         line_start = line_end
@@ -501,57 +518,193 @@ def _priority_alias_usage_lines(
 
 
 def _line_uses_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
-    return any(
-        re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\()", code_line)
+    return bool(_line_used_priority_aliases(code_line, aliases))
+
+
+def _line_used_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    return frozenset(
+        alias
+        for alias in aliases
+        if re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\()", code_line)
         or re.search(
             rb"(?<![A-Za-z0-9_.])(?:builtins\.)?getattr\s*\(\s*" + re.escape(alias) + rb"\s*,",
             code_line,
         )
-        for alias in aliases
     )
 
 
 def _line_calls_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
-    return any(
-        re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\(|\.[A-Za-z_]\w*\s*\()", code_line)
+    return bool(_line_called_priority_aliases(code_line, aliases))
+
+
+def _line_called_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    return frozenset(
+        alias
+        for alias in aliases
+        if re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\(|\.[A-Za-z_]\w*\s*\()", code_line)
         or re.search(
             rb"(?<![A-Za-z0-9_.])(?:builtins\.)?getattr\s*\(\s*"
             + re.escape(alias)
             + rb"\s*,\s*['\"][A-Za-z_]\w*['\"]\s*\)\s*\(",
             code_line,
         )
-        for alias in aliases
     )
 
 
-def _target_binds_priority_alias(target: ast.AST, aliases: frozenset[bytes]) -> bool:
+def _line_live_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    try:
+        tree = ast.parse(textwrap.dedent(code_line.decode("utf-8", errors="ignore")))
+    except SyntaxError:
+        return frozenset()
+
+    live_aliases: set[bytes] = set()
+    shadowed_aliases: set[bytes] = set()
+    for statement in tree.body:
+        for event, event_aliases in _statement_priority_alias_runtime_events(statement, aliases):
+            if event == "use":
+                live_aliases.update(event_aliases - shadowed_aliases)
+            else:
+                shadowed_aliases.update(event_aliases)
+    return frozenset(live_aliases)
+
+
+def _statement_priority_alias_runtime_events(
+    statement: ast.stmt,
+    aliases: frozenset[bytes],
+) -> Iterator[tuple[str, frozenset[bytes]]]:
+    if isinstance(statement, ast.Assign):
+        yield from _node_priority_alias_use_events(statement.value, aliases)
+        yield (
+            "bind",
+            frozenset(
+                alias for target in statement.targets for alias in _target_bound_priority_aliases(target, aliases)
+            ),
+        )
+        return
+    if isinstance(statement, ast.AnnAssign):
+        if statement.value is not None:
+            yield from _node_priority_alias_use_events(statement.value, aliases)
+        yield "bind", _target_bound_priority_aliases(statement.target, aliases)
+        return
+    if isinstance(statement, ast.AugAssign):
+        yield from _node_priority_alias_use_events(statement.target, aliases)
+        yield from _node_priority_alias_use_events(statement.value, aliases)
+        yield "bind", _target_bound_priority_aliases(statement.target, aliases)
+        return
+    if isinstance(statement, (ast.Import, ast.ImportFrom)):
+        yield "bind", _statement_bound_priority_aliases(statement, aliases)
+        return
+    if isinstance(statement, ast.If):
+        yield from _node_priority_alias_use_events(statement.test, aliases)
+        for child_statement in [*statement.body, *statement.orelse]:
+            yield from _statement_priority_alias_runtime_events(child_statement, aliases)
+        return
+    yield from _node_priority_alias_use_events(statement, aliases)
+    if bound_aliases := _statement_bound_priority_aliases(statement, aliases):
+        yield "bind", bound_aliases
+
+
+def _node_priority_alias_use_events(node: ast.AST, aliases: frozenset[bytes]) -> Iterator[tuple[str, frozenset[bytes]]]:
+    alias_names = {alias.decode("utf-8", errors="ignore"): alias for alias in aliases}
+    pending = [node]
+    while pending:
+        child = pending.pop()
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(child, ast.Call):
+            called_aliases = _call_priority_aliases(child, alias_names)
+            if called_aliases:
+                yield "use", called_aliases
+                continue
+        expression_aliases = _expression_priority_aliases(child, alias_names)
+        if expression_aliases:
+            yield "use", expression_aliases
+            continue
+        pending.extend(reversed(list(ast.iter_child_nodes(child))))
+
+
+def _call_priority_aliases(call: ast.Call, alias_names: dict[str, bytes]) -> frozenset[bytes]:
+    if isinstance(call.func, ast.Name):
+        alias = alias_names.get(call.func.id)
+        return frozenset({alias}) if alias is not None else frozenset()
+    if isinstance(call.func, ast.Attribute):
+        return _expression_priority_aliases(call.func.value, alias_names)
+    if (
+        isinstance(call.func, ast.Call)
+        and _simple_reference_name(call.func.func) in {"getattr", "builtins.getattr"}
+        and call.func.args
+    ):
+        return _expression_priority_aliases(call.func.args[0], alias_names)
+    return frozenset()
+
+
+def _expression_priority_aliases(node: ast.AST, alias_names: dict[str, bytes]) -> frozenset[bytes]:
+    if isinstance(node, ast.Name):
+        alias = alias_names.get(node.id)
+        return frozenset({alias}) if alias is not None else frozenset()
+    if isinstance(node, (ast.Attribute, ast.Subscript)):
+        return _expression_priority_aliases(node.value, alias_names)
+    if (
+        isinstance(node, ast.Call)
+        and _simple_reference_name(node.func) in {"getattr", "builtins.getattr"}
+        and node.args
+    ):
+        return _expression_priority_aliases(node.args[0], alias_names)
+    return frozenset()
+
+
+def _target_bound_priority_aliases(target: ast.AST, aliases: frozenset[bytes]) -> frozenset[bytes]:
     if isinstance(target, ast.Name):
-        return target.id.encode() in aliases
+        name = target.id.encode()
+        return frozenset({name}) if name in aliases else frozenset()
     if isinstance(target, ast.Starred):
-        return _target_binds_priority_alias(target.value, aliases)
+        return _target_bound_priority_aliases(target.value, aliases)
     if isinstance(target, (ast.Tuple, ast.List)):
-        return any(_target_binds_priority_alias(element, aliases) for element in target.elts)
-    return False
+        return frozenset(alias for element in target.elts for alias in _target_bound_priority_aliases(element, aliases))
+    return frozenset()
+
+
+def _target_binds_priority_alias(target: ast.AST, aliases: frozenset[bytes]) -> bool:
+    return bool(_target_bound_priority_aliases(target, aliases))
+
+
+def _statement_bound_priority_aliases(statement: ast.stmt, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    if isinstance(statement, ast.Assign):
+        return frozenset(
+            alias for target in statement.targets for alias in _target_bound_priority_aliases(target, aliases)
+        )
+    if isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+        return _target_bound_priority_aliases(statement.target, aliases)
+    if isinstance(statement, (ast.For, ast.AsyncFor)):
+        return _target_bound_priority_aliases(statement.target, aliases)
+    if isinstance(statement, (ast.With, ast.AsyncWith)):
+        return frozenset(
+            alias
+            for item in statement.items
+            if item.optional_vars is not None
+            for alias in _target_bound_priority_aliases(item.optional_vars, aliases)
+        )
+    if isinstance(statement, ast.Import):
+        return frozenset(
+            name
+            for alias in statement.names
+            for name in ((alias.asname or alias.name.split(".", maxsplit=1)[0]).encode(),)
+            if name in aliases
+        )
+    if isinstance(statement, ast.ImportFrom):
+        return frozenset(
+            name for alias in statement.names for name in ((alias.asname or alias.name).encode(),) if name in aliases
+        )
+    return frozenset()
 
 
 def _statement_binds_priority_alias(statement: ast.stmt, aliases: frozenset[bytes]) -> bool:
-    if isinstance(statement, ast.Assign):
-        return any(_target_binds_priority_alias(target, aliases) for target in statement.targets)
-    if isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
-        return _target_binds_priority_alias(statement.target, aliases)
-    if isinstance(statement, (ast.For, ast.AsyncFor)):
-        return _target_binds_priority_alias(statement.target, aliases)
-    if isinstance(statement, (ast.With, ast.AsyncWith)):
-        return any(
-            item.optional_vars is not None and _target_binds_priority_alias(item.optional_vars, aliases)
-            for item in statement.items
-        )
-    return False
+    return bool(_statement_bound_priority_aliases(statement, aliases))
 
 
 def _line_assigns_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
     try:
-        tree = ast.parse(code_line.decode("utf-8", errors="ignore"))
+        tree = ast.parse(textwrap.dedent(code_line.decode("utf-8", errors="ignore")))
     except SyntaxError:
         return False
 
@@ -569,11 +722,37 @@ def _line_assigns_priority_alias(code_line: bytes, aliases: frozenset[bytes]) ->
 
 
 def _line_shadows_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
-    return _line_assigns_priority_alias(code_line, aliases) or any(
-        re.search(rb"^\s*(?:async\s+)?def\s+" + re.escape(alias) + rb"\b", code_line)
-        or re.search(rb"^\s*class\s+" + re.escape(alias) + rb"\b", code_line)
+    return bool(_line_shadowed_priority_aliases(code_line, aliases))
+
+
+def _line_shadowed_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    shadowed_aliases = set(_line_assigned_priority_aliases(code_line, aliases))
+    shadowed_aliases.update(
+        alias
         for alias in aliases
+        if re.search(rb"^\s*(?:async\s+)?def\s+" + re.escape(alias) + rb"\b", code_line)
+        or re.search(rb"^\s*class\s+" + re.escape(alias) + rb"\b", code_line)
     )
+    return frozenset(shadowed_aliases)
+
+
+def _line_assigned_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    try:
+        tree = ast.parse(textwrap.dedent(code_line.decode("utf-8", errors="ignore")))
+    except SyntaxError:
+        return frozenset()
+
+    pending = list(reversed(tree.body))
+    assigned_aliases: set[bytes] = set()
+    while pending:
+        statement = pending.pop()
+        assigned_aliases.update(_statement_bound_priority_aliases(statement, aliases))
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        pending.extend(
+            child for child in reversed(list(ast.iter_child_nodes(statement))) if isinstance(child, ast.stmt)
+        )
+    return frozenset(assigned_aliases)
 
 
 def _line_indent_width(line: bytes) -> int:
