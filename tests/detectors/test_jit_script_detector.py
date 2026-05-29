@@ -730,7 +730,7 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
-    def test_scan_model_detects_tail_alias_call_with_binary_framed_prefix_import(self) -> None:
+    def test_scan_model_detects_tail_runpy_alias_from_framed_prefix_import_context(self) -> None:
         detector = JITScriptDetector()
         filler_line = b"# filler\n"
         filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
@@ -797,7 +797,7 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
-    def test_scan_model_detects_tail_alias_call_from_prefix_assignment_context(self) -> None:
+    def test_scan_model_detects_tail_runpy_alias_from_framed_prefix_assignment_context(self) -> None:
         detector = JITScriptDetector()
         filler_line = b"# filler\n"
         filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
@@ -865,8 +865,22 @@ class TestJITScriptDetector:
         filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
         source = (
             b"\x00\xffdef helper():\n"
-            b"    import runpy as rp\n" + filler + b"def payload():\n    return rp.run_path('payload.py')\n"
+            b"    import runpy as rp\n" + filler + b"def payload():\n"
+            b"    import os\n"
+            b"    return rp.run_path('payload.py')\n"
         )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_does_not_use_commented_prefix_import_as_tail_context(self) -> None:
+        detector = JITScriptDetector()
+        filler_line = b"# filler\n"
+        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        source = b"\x00\xff# import runpy as rp\n" + filler + b"def payload():\n    return rp.run_path('payload.py')\n"
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 

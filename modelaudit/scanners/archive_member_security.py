@@ -1323,10 +1323,17 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
         )
 
+    def _bind_imported_static_members(self, local_name: str, import_name: str) -> None:
+        prefix = f"{import_name}."
+        for reference in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
+            if not reference.startswith(prefix):
+                continue
+            self.alias_scopes[-1][f"{local_name}{reference.removeprefix(import_name)}"] = frozenset({reference})
+
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
         local_name = alias.asname or alias.name
         self._bind_name(local_name, frozenset({import_name}))
-        self._refresh_imported_static_members(local_name, import_name)
+        self._bind_imported_static_members(local_name, import_name)
 
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
         if "." not in name:
@@ -1345,16 +1352,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         prefix = f"{local_name}."
         current_scope = self.alias_scopes[scope_index]
         for scope in self.alias_scopes:
-            for key in scope:
+            for key in tuple(scope):
                 if key.startswith(prefix):
                     current_scope[key] = None
-
-    def _refresh_imported_static_members(self, local_name: str, import_name: str) -> None:
-        for reference_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
-            if reference_name != import_name and not reference_name.startswith(f"{import_name}."):
-                continue
-            suffix = reference_name.removeprefix(import_name)
-            self._bind_name(f"{local_name}{suffix}", frozenset({reference_name}))
 
     def _bind_module_namespace_key(self, key: str, resolved_names: _AliasValue) -> None:
         self._bind_name(f"{_MODULE_NAMESPACE_WRITE_PREFIX}{key}", resolved_names)
