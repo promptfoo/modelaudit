@@ -1001,6 +1001,7 @@ class TestJITScriptDetector:
         "shadow_block",
         [
             b"del c\n",
+            b"(c := len)\n",
             b"for c in [len]:\n    pass\n",
             b"with contextlib.suppress(Exception) as c:\n    pass\n",
         ],

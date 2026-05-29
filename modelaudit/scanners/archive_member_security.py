@@ -784,15 +784,18 @@ def _single_static_call_argument(
     keyword_name: str,
 ) -> ast.AST | None:
     meaningful_keywords = [keyword for keyword in keywords if not _keyword_is_empty_static_kwargs(keyword)]
-    if len(args) == 1 and not meaningful_keywords:
-        argument = args[0]
+    expanded_args: list[ast.AST] = []
+    for argument in args:
         if isinstance(argument, ast.Starred):
             value = argument.value
-            if isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == 1:
-                return value.elts[0]
-            return None
-        return argument
-    if args or len(meaningful_keywords) != 1:
+            if not isinstance(value, (ast.Tuple, ast.List)):
+                return None
+            expanded_args.extend(value.elts)
+            continue
+        expanded_args.append(argument)
+    if len(expanded_args) == 1 and not meaningful_keywords:
+        return expanded_args[0]
+    if expanded_args or len(meaningful_keywords) != 1:
         return None
 
     keyword_values = _static_keyword_arguments(meaningful_keywords)
@@ -863,7 +866,7 @@ def _resolve_getattr_call_names(
         attr_name = _resolve_static_string(expanded_args[1])
         if resolved_target_roots is None:
             return None
-        if attr_name in {"__getitem__", "LoadLibrary"}:
+        if attr_name in {"__getitem__", "__getattr__", "LoadLibrary"}:
             loader_method_roots = frozenset(
                 resolved_root
                 for resolved_root in resolved_target_roots
@@ -1443,7 +1446,7 @@ def _resolve_ctypes_library_loader_instance_roots(
             if split_reference is None:
                 continue
             root_name, suffix = split_reference
-            if suffix in {"__getitem__", "LoadLibrary"}:
+            if suffix in {"__getitem__", "__getattr__", "LoadLibrary"}:
                 loader_roots.add(f"{root_name}.{library_name or _CTYPES_DYNAMIC_LIBRARY_NAME}")
     for resolved_func_name in resolved_func_names:
         stripped_func_name = _strip_dunder_call_suffixes(resolved_func_name)
@@ -1778,7 +1781,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self, target_names: frozenset[str] | set[str], syntactic_name: str | None
     ) -> bool:
         dynamic_target_names = frozenset(
-            target_name for target_name in target_names if _is_dynamic_overwritable_high_risk_reference(target_name)
+            target_name
+            for target_name in target_names
+            if _is_dynamic_overwritable_high_risk_reference(target_name)
+            and any(target_name in scope for scope in self.alias_scopes)
         )
         if not dynamic_target_names:
             return False
@@ -1908,6 +1914,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _delete_target_binding(self, target: ast.AST) -> None:
         if isinstance(target, ast.Name):
+            if id(self.alias_scopes[-1]) in self._class_scope_ids:
+                self.alias_scopes[-1].pop(target.id, None)
+                return
             self._bind_name(target.id, None)
         elif isinstance(target, ast.Subscript):
             key = _resolve_static_string(target.slice)
@@ -2394,17 +2403,19 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 yield node
             pending.extend(reversed(list(ast.iter_child_nodes(node))))
 
-    @staticmethod
-    def _argument_alias_scope(arguments: ast.arguments) -> _AliasScope:
-        argument_names = [
-            *arguments.posonlyargs,
-            *arguments.args,
-            *arguments.kwonlyargs,
-        ]
-        scope: _AliasScope = {argument.arg: None for argument in argument_names}
+    def _argument_alias_scope(self, arguments: ast.arguments) -> _AliasScope:
         positional_args = [*arguments.posonlyargs, *arguments.args]
+        positional_default_start = len(positional_args) - len(arguments.defaults)
+        scope: _AliasScope = {}
+        for index, argument in enumerate(positional_args):
+            default = (
+                arguments.defaults[index - positional_default_start] if index >= positional_default_start else None
+            )
+            scope[argument.arg] = self._resolve_binding_value_names(default) if default is not None else None
         if positional_args:
             scope[positional_args[0].arg] = frozenset({positional_args[0].arg})
+        for argument, default in zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True):
+            scope[argument.arg] = self._resolve_binding_value_names(default) if default is not None else None
         if arguments.vararg is not None:
             scope[arguments.vararg.arg] = None
         if arguments.kwarg is not None:
@@ -3116,12 +3127,18 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             return any(bound_name == name for target in statement.targets for bound_name in _binding_names(target))
         return False
 
-    @staticmethod
     def _class_method_has_decorator(
+        self,
         method: ast.FunctionDef | ast.AsyncFunctionDef,
         decorator_names: frozenset[str],
     ) -> bool:
-        return any(_resolve_call_name(decorator) in decorator_names for decorator in method.decorator_list)
+        for decorator in method.decorator_list:
+            if _resolve_call_name(decorator) in decorator_names:
+                return True
+            resolved_names = self._resolve_reference_names(decorator)
+            if resolved_names is not None and resolved_names & decorator_names:
+                return True
+        return False
 
     def _class_has_local_initializer(
         self,

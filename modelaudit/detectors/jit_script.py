@@ -803,11 +803,25 @@ def _line_assigned_priority_aliases(code_line: bytes, aliases: frozenset[bytes])
     while pending:
         statement = pending.pop()
         assigned_aliases.update(_statement_bound_priority_aliases(statement, aliases))
+        assigned_aliases.update(_named_expression_bound_priority_aliases(statement, aliases))
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
         pending.extend(
             child for child in reversed(list(ast.iter_child_nodes(statement))) if isinstance(child, ast.stmt)
         )
+    return frozenset(assigned_aliases)
+
+
+def _named_expression_bound_priority_aliases(node: ast.AST, aliases: frozenset[bytes]) -> frozenset[bytes]:
+    assigned_aliases: set[bytes] = set()
+    pending = [node]
+    while pending:
+        child = pending.pop()
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(child, ast.NamedExpr):
+            assigned_aliases.update(_target_bound_priority_aliases(child.target, aliases))
+        pending.extend(reversed(list(ast.iter_child_nodes(child))))
     return frozenset(assigned_aliases)
 
 

@@ -608,6 +608,7 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "ctypes.LibraryLoader.__getitem__(self=ctypes.cdll, name='selfkeywordgetitem')\n"
         "object.__getattribute__(ctypes.cdll, 'LoadLibrary')('objectmethodlib')\n"
         "object.__getattribute__(ctypes.cdll, '__getitem__')('objectgetitem')\n"
+        "object.__getattribute__(ctypes.cdll, '__getattr__')('objectgetattr')\n"
         "ctypes.windll.kernel32 = len\n"
         "ctypes.windll.__getattr__('kernel32')\n"
         "loader_conditional = ctypes.LibraryLoader(ctypes.CDLL)\n"
@@ -637,6 +638,8 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "loader_unpack.unpacklib.printf(b'x')\n"
         "loader_unpack_kw = ctypes.LibraryLoader(**{'dlltype': ctypes.CDLL})\n"
         "loader_unpack_kw.unpackkwlib.printf(b'x')\n"
+        "loader_empty_star = ctypes.LibraryLoader(*(), dlltype=ctypes.CDLL)\n"
+        "loader_empty_star.emptystarlib.printf(b'x')\n"
         "loader_getattr = ctypes.LibraryLoader(ctypes.CDLL)\n"
         "loader_getattr.__getattr__('localizedgetattr')\n"
         "loader_getattr.__getattr__(library_name)\n"
@@ -692,6 +695,7 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.cdll.selfkeywordgetitem" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.cdll.objectmethodlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.cdll.objectgetitem" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.objectgetattr" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.kernel32" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.conditionalmethod" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.cdll.augmented" in checks_by_rule["S110"].details["reason"]
@@ -702,6 +706,7 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.cdll.keywordgetattr" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.unpacklib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.unpackkwlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.emptystarlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.localizedgetattr" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.<dynamic>" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.localizedkeywordgetattr" in checks_by_rule["S110"].details["reason"]
@@ -1604,6 +1609,15 @@ def test_scan_zip_preserves_ctypes_subclass_class_body_and_qualified_init_aliase
         "        DangerousQualifiedRebindCDLL.init = ctypes.CDLL.__init__\n"
         "        DangerousQualifiedRebindCDLL.init(self, name)\n"
         "ctypes.LibraryLoader(DangerousQualifiedRebindCDLL).dangerousqualified\n"
+        "class DefaultAliasCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str, init=ctypes.CDLL.__init__) -> None:\n"
+        "        init(self, name)\n"
+        "ctypes.LibraryLoader(DefaultAliasCDLL).defaultalias\n"
+        "class DeletedInitCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        pass\n"
+        "    del __init__\n"
+        "ctypes.LibraryLoader(DeletedInitCDLL).deletedinit\n"
         "class ReachableNewCDLL(ctypes.CDLL):\n"
         "    def __new__(cls, name: str):\n"
         "        return super().__new__(cls)\n"
@@ -1630,6 +1644,8 @@ def test_scan_zip_preserves_ctypes_subclass_class_body_and_qualified_init_aliase
     assert "ctypes.LibraryLoader.customqualified" in python_checks[0].details["reason"]
     assert "ctypes.LibraryLoader.localclassdangerous" in python_checks[0].details["reason"]
     assert "ctypes.LibraryLoader.dangerousqualified" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.defaultalias" in python_checks[0].details["reason"]
+    assert "ctypes.LibraryLoader.deletedinit" in python_checks[0].details["reason"]
     assert "ctypes.LibraryLoader.reachable" in python_checks[0].details["reason"]
 
 
@@ -1942,6 +1958,23 @@ def test_scan_zip_preserves_safe_runpy_overwrite_before_conditional(tmp_path: Pa
             "loader.LoadLibrary = len\nloader.LoadLibrary([])\n"
             "loader.__getitem__ = len\nloader.__getitem__([])\n"
             "loader.__getattr__ = len\nloader.__getattr__('payload')\n"
+        ),
+        ("import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL)\ndel loader.payload\nloader.payload\n"),
+        (
+            "import ctypes\nfrom builtins import staticmethod as sm\n"
+            "class StaticAliasCDLL(ctypes.CDLL):\n"
+            "    @sm\n"
+            "    def __init__(name: str) -> None:\n"
+            "        ctypes.CDLL.__init__(name)\n"
+            "ctypes.LibraryLoader(StaticAliasCDLL).payload\nStaticAliasCDLL('/missing')\n"
+        ),
+        (
+            "import builtins as b\nimport ctypes\n"
+            "class ClassAliasCDLL(ctypes.CDLL):\n"
+            "    @b.classmethod\n"
+            "    def __init__(cls, name: str) -> None:\n"
+            "        ctypes.CDLL.__init__(cls, name)\n"
+            "ctypes.LibraryLoader(ClassAliasCDLL).payload\nClassAliasCDLL('/missing')\n"
         ),
         (
             "import ctypes\nclass SafeCDLL(ctypes.CDLL):\n"
