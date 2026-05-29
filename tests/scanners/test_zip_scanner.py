@@ -325,9 +325,9 @@ def test_scan_zip_preserves_subprocess_after_asyncio_wildcard_import(tmp_path: P
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 
-def test_scan_zip_flags_builtins_getattr_keyword_call_dangerous_python_member(tmp_path: Path) -> None:
+def test_scan_zip_flags_builtins_getattr_call_dangerous_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
-    source = "import builtins as bi\nimport os\nbi.getattr(object=os, name='system').__call__('echo hidden')\n"
+    source = "import builtins as bi\nimport os\nbi.getattr(os, 'system').__call__('echo hidden')\n"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
 
@@ -349,7 +349,7 @@ def test_scan_zip_flags_aliased_getattr_helper_dangerous_python_member(tmp_path:
     source = (
         "from builtins import getattr as resolve\n"
         "import os as operating_system\n"
-        "resolve(object=operating_system, name='system')('echo hidden')\n"
+        "resolve(operating_system, 'system')('echo hidden')\n"
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)

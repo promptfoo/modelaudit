@@ -697,11 +697,16 @@ def test_scan_detects_getattr_wrapped_handler_execution_primitive(tmp_path: Path
 @pytest.mark.parametrize(
     "handler_source",
     [
-        b"import os\n\ndef handle(data, context):\n    return getattr(os, name='system')('id')\n",
-        b"import os\n\ndef handle(data, context):\n    return getattr(object=os, name='system')('id')\n",
+        b"import builtins\nimport os\n\ndef handle(data, context):\n    return builtins.getattr(os, 'system')('id')\n",
+        (
+            b"from builtins import getattr as resolve\n"
+            b"import os\n\n"
+            b"def handle(data, context):\n"
+            b"    return resolve(os, 'system')('id')\n"
+        ),
     ],
 )
-def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
+def test_scan_detects_aliased_getattr_wrapped_handler_execution_primitive(
     tmp_path: Path,
     handler_source: bytes,
 ) -> None:
