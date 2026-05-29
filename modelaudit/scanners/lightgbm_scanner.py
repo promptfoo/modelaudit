@@ -8,8 +8,9 @@ import re
 from typing import Any, ClassVar
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
+from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 _LIGHTGBM_HEADER_MARKERS: tuple[str, ...] = (
     "version=",
@@ -88,6 +89,7 @@ _ABSOLUTE_PATH_PATTERN = re.compile(r"(?:\b[A-Za-z]:\\|^/|^~[/\\])")
 _TRAVERSAL_PATTERN = re.compile(r"(?:\.\./|\.\.\\)")
 _BASE64_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{100,}={0,2})")
 _HEX_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2}){8,}")
+_DEDICATED_LIGHTGBM_EXTENSIONS = {".lgb", ".lightgbm"}
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -153,17 +155,38 @@ class LightGBMScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        if os.path.splitext(path)[1].lower() not in cls.supported_extensions:
-            return False
-
         try:
             with open(path, "rb") as file_obj:
                 preview = file_obj.read(cls._SIGNATURE_READ_BYTES)
         except OSError:
-            return False
+            return os.path.splitext(path)[1].lower() in _DEDICATED_LIGHTGBM_EXTENSIONS
 
         signature = cls._evaluate_signature(cls._normalize_preview(preview))
         return bool(signature["looks_like"])
+
+    @staticmethod
+    def _is_unreadable_path_result(result: ScanResult) -> bool:
+        return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    @staticmethod
+    def _finish_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
+        mark_inconclusive_scan_result(result, "lightgbm_read_failed")
+        mark_operational_scan_error(result, "lightgbm_read_failed")
+        result.add_check(
+            name="LightGBM File Read",
+            passed=False,
+            message=f"Unable to read LightGBM file: {error}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "error": str(error),
+                "error_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "lightgbm_read_failed",
+            },
+        )
+        result.finish(success=False)
+        return result
 
     @staticmethod
     def _is_trusted_url(url: str) -> bool:
@@ -358,6 +381,12 @@ class LightGBMScanner(BaseScanner):
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
+            if self._is_unreadable_path_result(path_check_result):
+                return self._finish_read_failure(
+                    self._create_result(),
+                    path,
+                    PermissionError(f"Path is not readable: {path}"),
+                )
             return path_check_result
 
         size_check = self._check_size_limit(path)
@@ -374,16 +403,7 @@ class LightGBMScanner(BaseScanner):
             with open(path, "rb") as file_obj:
                 payload = file_obj.read(self.scan_budget + 1)
         except OSError as error:
-            result.add_check(
-                name="LightGBM File Read",
-                passed=False,
-                message=f"Unable to read LightGBM file: {error}",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={"error": str(error), "error_type": type(error).__name__},
-            )
-            result.finish(success=False)
-            return result
+            return self._finish_read_failure(result, path, error)
 
         truncated = len(payload) > self.scan_budget
         inspected_payload = payload[: self.scan_budget]

@@ -1,4 +1,6 @@
+import gc
 import json
+import logging
 import os
 import statistics
 import time
@@ -24,9 +26,11 @@ class TestPerformanceBenchmarks:
         """Define performance thresholds for different operations."""
         import os
 
-        # More lenient thresholds for CI environments
+        # More lenient thresholds for CI and xdist environments where this
+        # benchmark shares CPU with other scanner-heavy tests.
         is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
-        multiplier = 3.0 if is_ci else 1.0
+        is_xdist_worker = os.getenv("PYTEST_XDIST_WORKER") or os.getenv("PYTEST_XDIST_WORKER_COUNT")
+        multiplier = 3.0 if is_ci or is_xdist_worker else 1.0
 
         return {
             "single_file_scan_max_time": 5.0 * multiplier,  # seconds
@@ -35,6 +39,11 @@ class TestPerformanceBenchmarks:
             "files_per_second_min": 1.0 / multiplier,  # files/second minimum
             "bytes_per_second_min": 1024 / multiplier,  # bytes/second minimum
         }
+
+    @pytest.fixture(autouse=True)
+    def suppress_expected_scanner_findings(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Keep adversarial fixture findings out of benchmark timing."""
+        caplog.set_level(logging.CRITICAL + 1, logger="modelaudit.scanners")
 
     def measure_scan_performance(self, path: str, runs: int = 3) -> dict[str, Any]:
         """Measure scanning performance over multiple runs."""
@@ -111,7 +120,11 @@ class TestPerformanceBenchmarks:
                 cv_threshold = 2.0 if is_ci else 0.5
                 assert cv < cv_threshold, f"Performance too inconsistent (CV={cv:.2f}) for {filename}"
 
-    def test_directory_scanning_performance(self, assets_dir, performance_thresholds):
+    def test_directory_scanning_performance(
+        self,
+        assets_dir: Path,
+        performance_thresholds: dict[str, float],
+    ) -> None:
         """Benchmark directory scanning performance."""
         if not assets_dir.exists():
             pytest.skip("Assets directory does not exist")
@@ -182,8 +195,8 @@ class TestPerformanceBenchmarks:
             assert degradation_ratio < 5.0, f"Performance degrades too much with scale (ratio: {degradation_ratio:.2f})"
 
     @pytest.mark.performance
-    def test_memory_usage_stability(self, assets_dir):
-        """Test that memory usage remains stable during scanning."""
+    def test_memory_usage_stability(self, assets_dir: Path) -> None:
+        """Test that memory usage remains stable after scanner initialization."""
         if not assets_dir.exists():
             pytest.skip("Assets directory does not exist")
 
@@ -195,13 +208,17 @@ class TestPerformanceBenchmarks:
             pytest.skip("psutil not available for memory testing")
 
         process = psutil.Process(os.getpid())
+        warmup_results = scan_model_directory_or_file(str(assets_dir), cache_enabled=False)
+        assert warmup_results.success, "Warm-up scan should succeed"
+        gc.collect()
         initial_memory = process.memory_info().rss / 1024 / 1024  # MB
 
-        # Perform multiple scans
+        # Measure repeated scans after lazy scanner imports and caches are warm.
         for _ in range(5):
-            results = scan_model_directory_or_file(str(assets_dir))
+            results = scan_model_directory_or_file(str(assets_dir), cache_enabled=False)
             assert results.success, "Scan should succeed"
 
+        gc.collect()
         final_memory = process.memory_info().rss / 1024 / 1024  # MB
         memory_growth = final_memory - initial_memory
 

