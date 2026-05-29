@@ -1328,7 +1328,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for reference in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
             if not reference.startswith(prefix):
                 continue
-            self.alias_scopes[-1][f"{local_name}{reference.removeprefix(import_name)}"] = frozenset({reference})
+            self.alias_scopes[-1][f"{local_name}{reference.removeprefix(import_name)}"] = _resolve_aliases(
+                reference,
+                self.alias_scopes,
+            )
 
     def _shadow_member_bindings(self, scope_index: int, local_name: str) -> None:
         if "." in local_name or local_name.startswith(_MODULE_NAMESPACE_WRITE_PREFIX):
@@ -1352,6 +1355,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def _bind_name_in_scope(self, scope_index: int, name: str, resolved_names: _AliasValue) -> None:
         self._shadow_member_bindings(scope_index, name)
         self.alias_scopes[scope_index][name] = resolved_names
+
+    def _should_track_syntactic_static_reference(self, syntactic_name: str) -> bool:
+        root_name = syntactic_name.split(".", maxsplit=1)[0]
+        root_aliases, found = _lookup_bound_alias(root_name, self.alias_scopes)
+        return not found or root_aliases is not None
 
     def _bind_module_namespace_key(self, key: str, resolved_names: _AliasValue) -> None:
         self._bind_name(f"{_MODULE_NAMESPACE_WRITE_PREFIX}{key}", resolved_names)
@@ -1399,7 +1407,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             syntactic_name = _resolve_call_name(target)
             resolved_target_names = self._resolve_reference_names(target)
             target_names = set(resolved_target_names or frozenset())
-            if syntactic_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
+            if (
+                syntactic_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
+                and self._should_track_syntactic_static_reference(syntactic_name)
+            ):
                 target_names.add(syntactic_name)
             if not target_names:
                 return

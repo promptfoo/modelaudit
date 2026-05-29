@@ -282,11 +282,71 @@ def _bounded_priority_embedded_python_candidate(
         ):
             bounded_end = min(len(candidate), line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
             compact_candidate = candidate[: block_header_end + 1] + candidate[line_start:bounded_end]
-            return compact_candidate, (span[0], span[0] + len(compact_candidate))
+            return _append_late_priority_alias_usage(candidate, compact_candidate, bounded_end, span[0])
     else:
         line_start = 0
     bounded_end = min(len(candidate), line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
-    return candidate[line_start:bounded_end], (span[0] + line_start, span[0] + bounded_end)
+    bounded_candidate = candidate[line_start:bounded_end]
+    return _append_late_priority_alias_usage(candidate, bounded_candidate, bounded_end, span[0] + line_start)
+
+
+def _append_late_priority_alias_usage(
+    candidate: bytes,
+    bounded_candidate: bytes,
+    search_start: int,
+    span_start: int,
+) -> tuple[bytes, tuple[int, int]]:
+    aliases = _priority_import_aliases(bounded_candidate)
+    if not aliases:
+        return bounded_candidate, (span_start, span_start + len(bounded_candidate))
+
+    usage_line = _priority_alias_usage_line(candidate, aliases, search_start)
+    if usage_line is None:
+        return bounded_candidate, (span_start, span_start + len(bounded_candidate))
+
+    usage_start, usage_end = usage_line
+    compact_candidate = bounded_candidate.rstrip() + b"\n" + candidate[usage_start:usage_end]
+    return compact_candidate, (span_start, span_start + len(compact_candidate))
+
+
+def _priority_import_aliases(candidate: bytes) -> frozenset[bytes]:
+    try:
+        source, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
+        tree = ast.parse(textwrap.dedent(source))
+    except (SyntaxError, ValueError):
+        return frozenset()
+
+    aliases: set[bytes] = set()
+    priority_modules = set(_PRIORITY_EMBEDDED_PYTHON_MODULES)
+    for statement in ast.walk(tree):
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                root_name = alias.name.split(".", maxsplit=1)[0]
+                if root_name in priority_modules:
+                    aliases.add((alias.asname or root_name).encode("utf-8"))
+        elif isinstance(statement, ast.ImportFrom) and statement.module is not None:
+            root_name = statement.module.split(".", maxsplit=1)[0]
+            if root_name in priority_modules:
+                aliases.update((alias.asname or alias.name).encode("utf-8") for alias in statement.names)
+    return frozenset(aliases)
+
+
+def _priority_alias_usage_line(
+    candidate: bytes, aliases: frozenset[bytes], search_start: int
+) -> tuple[int, int] | None:
+    line_start = search_start
+    while line_start < len(candidate):
+        line_end = candidate.find(b"\n", line_start)
+        if line_end == -1:
+            line_end = len(candidate)
+        else:
+            line_end += 1
+        line = candidate[line_start:line_end]
+        code_line = _python_structural_line_bytes(line)
+        if any(re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\()", code_line) for alias in aliases):
+            return line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
+        line_start = line_end
+    return None
 
 
 def _prioritized_embedded_python_snippets(
@@ -544,7 +604,13 @@ def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]
     import_context = _extract_priority_prefix_context(prefix)
     if import_context:
         extraction_windows.append((import_context + b"\n" + tail, True))
+        for start in _embedded_python_start_offsets(tail)[:_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS]:
+            extraction_windows.append((import_context + b"\n" + tail[start:], False))
     return extraction_windows
+
+
+def _embedded_python_start_offsets(data: bytes) -> list[int]:
+    return [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(data)]
 
 
 def _has_raw_match_outside_parsed_spans(raw_spans: list[tuple[int, int]], parsed_spans: list[tuple[int, int]]) -> bool:
