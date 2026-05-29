@@ -32,6 +32,9 @@ _SENSITIVE_QUERY_PARAM_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
+_CLOUD_CONTENT_SNIFF_BYTES = 512
+_TFLITE_MAGIC_OFFSET = 4
+_TFLITE_MAGIC_BYTES = b"TFL3"
 
 
 def _run_coroutine_sync(coro_factory: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
@@ -602,6 +605,70 @@ def filter_scannable_files(
     return scannable
 
 
+def _detect_cloud_content_route_format(fs: Any, file_info: dict[str, Any]) -> str | None:
+    """Return a content-routed model format for a remote object, if cheaply identifiable."""
+    file_url = str(file_info["path"])
+    try:
+        size = _parse_size_value(file_info.get("size", _CLOUD_CONTENT_SNIFF_BYTES))
+    except (TypeError, ValueError):
+        size = _CLOUD_CONTENT_SNIFF_BYTES
+    if size <= 0:
+        return None
+
+    try:
+        with fs.open(file_url, "rb") as remote_file:
+            prefix = remote_file.read(min(size, _CLOUD_CONTENT_SNIFF_BYTES))
+    except Exception as exc:
+        raise ValueError(
+            "Cloud directory selective filtering incomplete: unable to inspect skipped object "
+            f"{redact_url_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+        ) from exc
+
+    if not prefix:
+        return None
+
+    from modelaudit.utils.file.detection import detect_format_from_magic_bytes
+
+    detected_format = detect_format_from_magic_bytes(
+        prefix[:4],
+        prefix[:8],
+        prefix[:16],
+        max(size, len(prefix)),
+        None,
+    )
+    if (
+        detected_format == "unknown"
+        and prefix[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + len(_TFLITE_MAGIC_BYTES)] == _TFLITE_MAGIC_BYTES
+    ):
+        return "tflite"
+    return None if detected_format == "unknown" else detected_format
+
+
+def _filter_scannable_cloud_files(
+    files: list[dict[str, Any]],
+    *,
+    fs: Any,
+    scannable_extensions: Collection[str] | None = None,
+) -> list[dict[str, Any]]:
+    scannable = filter_scannable_files(files, scannable_extensions=scannable_extensions)
+    if scannable_extensions is not None:
+        return scannable
+
+    scannable_paths = {str(file["path"]) for file in scannable}
+    for file_info in files:
+        file_path = str(file_info["path"])
+        if file_path in scannable_paths:
+            continue
+        detected_format = _detect_cloud_content_route_format(fs, file_info)
+        if detected_format is None:
+            continue
+        routed_file_info = dict(file_info)
+        routed_file_info["content_detected_format"] = detected_format
+        scannable.append(routed_file_info)
+        scannable_paths.add(file_path)
+    return scannable
+
+
 def _build_safe_local_path(base_url: str, file_url: str, download_path: Path) -> Path:
     """Build a local path for a cloud object and reject traversal attempts."""
     normalized_base = _cloud_url_without_query(base_url)
@@ -770,7 +837,7 @@ def download_from_cloud(
 
             if selective:
                 # Filter to only scannable files
-                files = filter_scannable_files(files, scannable_extensions=scannable_extensions)
+                files = _filter_scannable_cloud_files(files, fs=fs, scannable_extensions=scannable_extensions)
                 if show_progress:
                     total = metadata.get("file_count", 0)
                     if files:
@@ -895,7 +962,7 @@ def download_from_cloud_streaming(
             raise ValueError(f"Invalid metadata for 'files': expected list, got {type(raw_files).__name__}")
 
         if selective:
-            files = filter_scannable_files(files, scannable_extensions=scannable_extensions)
+            files = _filter_scannable_cloud_files(files, fs=fs, scannable_extensions=scannable_extensions)
             if show_progress and files:
                 click.echo(f"Found {len(files)} scannable files to stream")
 

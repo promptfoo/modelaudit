@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import logging
 import os
@@ -33,6 +34,15 @@ def make_fs_mock() -> MagicMock:
 
     fs.__exit__.side_effect = close_context
     return fs
+
+
+def configure_remote_open_payloads(fs: MagicMock, payloads: dict[str, bytes]) -> None:
+    def open_side_effect(path: str, _mode: str = "rb") -> io.BytesIO:
+        if path not in payloads:
+            raise FileNotFoundError(path)
+        return io.BytesIO(payloads[path])
+
+    fs.open.side_effect = open_side_effect
 
 
 def test_run_coroutine_sync_without_running_loop() -> None:
@@ -153,6 +163,153 @@ def test_filter_scannable_files_handles_signed_cloud_urls() -> None:
     files = [{"path": "s3://bucket/model.pkl?X-Amz-Signature=secret"}]
 
     assert filter_scannable_files(files) == files
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_download_from_cloud_selective_includes_content_routed_tflite(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
+    url = "s3://bucket/models/"
+    tflite_url = "s3://bucket/models/evil.payload"
+    tflite_payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "directory"}
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(tflite_payload)
+    configure_remote_open_payloads(fs, {tflite_url: tflite_payload})
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": len(tflite_payload),
+        "human_size": "24 B",
+        "estimated_time": "instant",
+        "files": [
+            {
+                "path": tflite_url,
+                "name": "evil.payload",
+                "size": len(tflite_payload),
+                "human_size": "24 B",
+            }
+        ],
+    }
+
+    result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
+
+    assert isinstance(result, Path)
+    fs.open.assert_called_once_with(tflite_url, "rb")
+    fs.get.assert_called_once()
+    assert fs.get.call_args.args[0] == tflite_url
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_download_from_cloud_selective_skips_benign_unsupported_content(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
+    url = "s3://bucket/models/"
+    preview_url = "s3://bucket/models/preview.png"
+    preview_payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "directory"}
+    configure_remote_open_payloads(fs, {preview_url: preview_payload})
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": len(preview_payload),
+        "human_size": "24 B",
+        "estimated_time": "instant",
+        "files": [
+            {
+                "path": preview_url,
+                "name": "preview.png",
+                "size": len(preview_payload),
+                "human_size": "24 B",
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="No scannable model files found"):
+        download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
+
+    fs.open.assert_called_once_with(preview_url, "rb")
+    fs.get.assert_not_called()
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_download_from_cloud_selective_fails_closed_when_skipped_content_cannot_be_inspected(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
+    url = "s3://bucket/models/"
+    hidden_url = "s3://bucket/models/evil.payload?X-Amz-Signature=secret"
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "directory"}
+    fs.open.side_effect = PermissionError(f"denied {hidden_url}")
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": 8,
+        "human_size": "8 B",
+        "estimated_time": "instant",
+        "files": [{"path": hidden_url, "name": "evil.payload", "size": 8, "human_size": "8 B"}],
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
+
+    error = str(excinfo.value)
+    assert "selective filtering incomplete" in error
+    assert "evil.payload" in error
+    assert "X-Amz-Signature" not in error
+    assert "secret" not in error
+    fs.get.assert_not_called()
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_download_from_cloud_streaming_selective_includes_content_routed_tflite(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+) -> None:
+    url = "s3://bucket/models/"
+    tflite_url = "s3://bucket/models/evil.payload"
+    tflite_payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
+    fs = make_fs_mock()
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(tflite_payload)
+    configure_remote_open_payloads(fs, {tflite_url: tflite_payload})
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": len(tflite_payload),
+        "human_size": "24 B",
+        "estimated_time": "instant",
+        "files": [
+            {
+                "path": tflite_url,
+                "name": "evil.payload",
+                "size": len(tflite_payload),
+                "human_size": "24 B",
+            }
+        ],
+    }
+
+    streamed = list(download_from_cloud_streaming(url, show_progress=False))
+
+    assert len(streamed) == 1
+    assert streamed[0][1] is True
+    fs.open.assert_called_once_with(tflite_url, "rb")
+    fs.get.assert_called_once()
+    assert fs.get.call_args.args[0] == tflite_url
 
 
 @patch("fsspec.filesystem")
