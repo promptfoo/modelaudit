@@ -128,6 +128,7 @@ _CTYPES_LIBRARY_LOADER_TYPE_ALIASES = frozenset(
     for loader_root in _CTYPES_LIBRARY_LOADER_OBJECTS
     if loader_root != _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT
 )
+_CTYPES_LOADER_INIT_KEYWORDS = frozenset({"self", "name", "mode", "handle", "use_errno", "use_last_error", "winmode"})
 _CTYPES_NATIVE_LIBRARY_LOADING_CALLS = frozenset(
     {
         "ctypes.CDLL",
@@ -726,22 +727,60 @@ def _resolve_static_string(node: ast.AST) -> str | None:
     return "".join(parts)
 
 
+def _is_static_non_string(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and not isinstance(node.value, str)
+
+
+def _keyword_is_empty_static_kwargs(keyword: ast.keyword) -> bool:
+    return (
+        keyword.arg is None
+        and isinstance(keyword.value, ast.Dict)
+        and not keyword.value.keys
+        and not keyword.value.values
+    )
+
+
+def _static_keyword_arguments(keywords: list[ast.keyword]) -> dict[str, ast.AST] | None:
+    values: dict[str, ast.AST] = {}
+    for keyword in keywords:
+        if _keyword_is_empty_static_kwargs(keyword):
+            continue
+        entry_values: dict[str, ast.AST] = {}
+        if keyword.arg is not None:
+            entry_values[keyword.arg] = keyword.value
+        elif isinstance(keyword.value, ast.Dict):
+            for key_node, value_node in zip(keyword.value.keys, keyword.value.values, strict=True):
+                if key_node is None:
+                    return None
+                key = _resolve_static_string(key_node)
+                if key is None:
+                    return None
+                entry_values[key] = value_node
+        else:
+            return None
+        if values.keys() & entry_values.keys():
+            return None
+        values.update(entry_values)
+    return values
+
+
+def _static_call_keyword_arguments(
+    keywords: list[ast.keyword],
+    allowed_keywords: frozenset[str],
+) -> dict[str, ast.AST] | None:
+    keyword_values = _static_keyword_arguments(keywords)
+    if keyword_values is None or not set(keyword_values) <= allowed_keywords:
+        return None
+    return keyword_values
+
+
 def _single_static_call_argument(
     args: list[ast.expr],
     keywords: list[ast.keyword],
     *,
     keyword_name: str,
 ) -> ast.AST | None:
-    meaningful_keywords = [
-        keyword
-        for keyword in keywords
-        if not (
-            keyword.arg is None
-            and isinstance(keyword.value, ast.Dict)
-            and not keyword.value.keys
-            and not keyword.value.values
-        )
-    ]
+    meaningful_keywords = [keyword for keyword in keywords if not _keyword_is_empty_static_kwargs(keyword)]
     if len(args) == 1 and not meaningful_keywords:
         argument = args[0]
         if isinstance(argument, ast.Starred):
@@ -753,25 +792,10 @@ def _single_static_call_argument(
     if args or len(meaningful_keywords) != 1:
         return None
 
-    keyword = meaningful_keywords[0]
-    if keyword.arg == keyword_name:
-        return keyword.value
-    if keyword.arg is not None:
+    keyword_values = _static_keyword_arguments(meaningful_keywords)
+    if keyword_values is None or set(keyword_values) != {keyword_name}:
         return None
-    mapping = keyword.value
-    if not isinstance(mapping, ast.Dict):
-        return None
-    static_items: list[tuple[str, ast.AST]] = []
-    for key_node, value_node in zip(mapping.keys, mapping.values, strict=True):
-        if key_node is None:
-            return None
-        key = _resolve_static_string(key_node)
-        if key is None:
-            return None
-        static_items.append((key, value_node))
-    if len(static_items) != 1 or static_items[0][0] != keyword_name:
-        return None
-    return static_items[0][1]
+    return keyword_values[keyword_name]
 
 
 def _resolve_getattr_call_names(
@@ -877,6 +901,8 @@ def _resolve_getattr_call_names(
         attr_node = _single_static_call_argument(node.args, node.keywords, keyword_name="name")
         if attr_node is None:
             return None
+        if _is_static_non_string(attr_node):
+            return None
         attr_name = _resolve_static_string(attr_node)
         if attr_name is None and not getattr_accessor_names:
             return None
@@ -902,6 +928,8 @@ def _resolve_getattr_call_names(
     target_root_node = expanded_args[0]
     attr_name_node = expanded_args[1]
 
+    if _is_static_non_string(attr_name_node):
+        return None
     attr_name = _resolve_static_string(attr_name_node)
     resolved_target_roots = _resolve_static_reference_names(
         target_root_node,
@@ -1404,7 +1432,7 @@ def _resolve_ctypes_library_loader_instance_roots(
             if _canonical_ctypes_loader_type_aliases(resolved_loader_types):
                 loader_roots.add(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT)
     library_name_node = _single_static_call_argument(node.args, node.keywords, keyword_name="name")
-    if library_name_node is not None:
+    if library_name_node is not None and not _is_static_non_string(library_name_node):
         library_name = _resolve_static_string(library_name_node)
         for resolved_func_name in resolved_func_names:
             split_reference = _split_ctypes_loader_reference(resolved_func_name)
@@ -1422,19 +1450,23 @@ def _resolve_ctypes_library_loader_instance_roots(
             continue
         self_node: ast.AST | None = None
         unbound_library_name_node: ast.AST | None = None
-        invalid_unbound_call = len(node.args) > 2
-        if len(node.args) >= 1:
-            self_node = node.args[0]
-        if len(node.args) >= 2:
-            unbound_library_name_node = node.args[1]
-        for keyword in node.keywords:
-            if keyword.arg == "self" and self_node is None:
-                self_node = keyword.value
-            elif keyword.arg == "name" and unbound_library_name_node is None:
-                unbound_library_name_node = keyword.value
-            else:
-                invalid_unbound_call = True
-        if invalid_unbound_call or self_node is None or unbound_library_name_node is None:
+        expanded_args = _expanded_static_call_args(node)
+        keyword_values = _static_call_keyword_arguments(node.keywords, frozenset({"self", "name"}))
+        if expanded_args is None or keyword_values is None or len(expanded_args) > 2:
+            continue
+        if len(expanded_args) >= 1:
+            self_node = expanded_args[0]
+        if len(expanded_args) >= 2:
+            unbound_library_name_node = expanded_args[1]
+        if "self" in keyword_values:
+            if self_node is not None:
+                continue
+            self_node = keyword_values["self"]
+        if "name" in keyword_values:
+            if unbound_library_name_node is not None:
+                continue
+            unbound_library_name_node = keyword_values["name"]
+        if self_node is None or unbound_library_name_node is None or _is_static_non_string(unbound_library_name_node):
             continue
         resolved_self_names = _resolve_static_reference_names(
             self_node,
@@ -2200,8 +2232,13 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     @staticmethod
     def _constant_bool(node: ast.AST) -> bool | None:
-        if isinstance(node, ast.Constant) and isinstance(node.value, bool):
-            return node.value
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool):
+                return node.value
+            if node.value is None:
+                return False
+            if isinstance(node.value, (int, float, complex, str, bytes)):
+                return bool(node.value)
         return None
 
     @staticmethod
@@ -2430,6 +2467,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self,
         super_call: ast.Call,
         class_name: str,
+        initializer_self_names: frozenset[str],
         base_identity_names: list[frozenset[str]],
         loader_base_indices: frozenset[int],
     ) -> bool:
@@ -2445,9 +2483,17 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             )
         if len(super_call.args) != 2:
             return False
+        if not self._node_is_initializer_self(super_call.args[1], initializer_self_names):
+            return False
         first_arg_names = self._reference_identity_names(super_call.args[0])
         if class_name in first_arg_names:
-            return bool(loader_base_indices)
+            return any(
+                not any(
+                    self._base_definitely_defines_initializer(base_names)
+                    for base_names in base_identity_names[:loader_index]
+                )
+                for loader_index in loader_base_indices
+            )
         for index, base_names in enumerate(base_identity_names):
             if first_arg_names & base_names:
                 return any(loader_index > index for loader_index in loader_base_indices)
@@ -2467,20 +2513,34 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         return frozenset({positional_args[0].arg})
 
     @staticmethod
+    def _node_is_initializer_self(node: ast.AST, initializer_self_names: frozenset[str]) -> bool:
+        return isinstance(node, ast.Name) and node.id in initializer_self_names
+
+    @staticmethod
     def _call_has_loader_name_argument(call: ast.Call, *, bound_method: bool) -> bool:
+        expanded_args = _expanded_static_call_args(call)
+        keyword_values = _static_call_keyword_arguments(
+            call.keywords,
+            _CTYPES_LOADER_INIT_KEYWORDS - frozenset({"self"}) if bound_method else _CTYPES_LOADER_INIT_KEYWORDS,
+        )
+        if expanded_args is None or keyword_values is None:
+            return False
         required_positional_count = 1 if bound_method else 2
-        if len(call.args) >= required_positional_count:
+        if len(expanded_args) >= required_positional_count:
             return True
-        return any(keyword.arg == "name" for keyword in call.keywords)
+        return "name" in keyword_values
 
     @staticmethod
     def _call_has_initializer_self_argument(call: ast.Call, initializer_self_names: frozenset[str]) -> bool:
-        if call.args:
-            first_arg = call.args[0]
-            return isinstance(first_arg, ast.Name) and first_arg.id in initializer_self_names
-        return any(
-            keyword.arg == "self" and isinstance(keyword.value, ast.Name) and keyword.value.id in initializer_self_names
-            for keyword in call.keywords
+        expanded_args = _expanded_static_call_args(call)
+        keyword_values = _static_call_keyword_arguments(call.keywords, _CTYPES_LOADER_INIT_KEYWORDS)
+        if expanded_args is None or keyword_values is None:
+            return False
+        if expanded_args:
+            return _HighRiskPythonCallVisitor._node_is_initializer_self(expanded_args[0], initializer_self_names)
+        self_node = keyword_values.get("self")
+        return self_node is not None and _HighRiskPythonCallVisitor._node_is_initializer_self(
+            self_node, initializer_self_names
         )
 
     @staticmethod
@@ -2508,6 +2568,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             and self._super_call_preserves_ctypes_loader_init(
                 call.func.value,
                 class_name,
+                initializer_self_names,
                 base_identity_names,
                 loader_base_indices,
             )
@@ -2756,56 +2817,45 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     @staticmethod
     def _return_value_is_obvious_non_instance(value: ast.AST | None) -> bool:
         if value is None:
-            return False
+            return True
         if isinstance(value, ast.Call) and _resolve_call_name(value.func) == "object":
             return True
-        if isinstance(value, ast.Constant) and value.value is not None:
+        if isinstance(value, ast.Constant):
             return True
         return isinstance(value, (ast.Tuple, ast.List, ast.Dict, ast.Set))
 
     def _class_new_may_skip_init(self, node: ast.ClassDef) -> bool:
         new_method = self._class_method(node, "__new__")
-        if new_method is None or isinstance(new_method, ast.AsyncFunctionDef):
+        if new_method is None:
             return False
-        return self._statements_may_reach_non_instance_return(new_method.body)
+        if isinstance(new_method, ast.AsyncFunctionDef):
+            return True
+        _may_continue, may_return_instance = self._new_statements_flow(new_method.body)
+        return not may_return_instance
 
-    def _statements_may_reach_non_instance_return(self, statements: list[ast.stmt]) -> bool:
+    def _new_statements_flow(self, statements: list[ast.stmt]) -> tuple[bool, bool]:
+        may_continue = True
+        may_return_instance = False
         for statement in statements:
+            if not may_continue:
+                break
             if isinstance(statement, ast.Return):
-                return self._return_value_is_obvious_non_instance(statement.value)
+                return False, may_return_instance or not self._return_value_is_obvious_non_instance(statement.value)
             if isinstance(statement, ast.If):
-                constant_bool = self._constant_bool(statement.test)
-                if constant_bool is True:
-                    return self._statements_may_reach_non_instance_return(statement.body)
-                if constant_bool is False:
-                    if self._statements_may_reach_non_instance_return(statement.orelse):
-                        return True
-                    if self._statements_always_return(statement.orelse):
-                        return False
-                    continue
-                if self._statements_may_reach_non_instance_return(
-                    statement.body
-                ) or self._statements_may_reach_non_instance_return(statement.orelse):
-                    return True
-                if self._statements_always_return(statement.body) and self._statements_always_return(statement.orelse):
-                    return False
-        return False
+                statement_may_continue, statement_may_return_instance = self._new_if_flow(statement)
+                may_continue = statement_may_continue
+                may_return_instance = may_return_instance or statement_may_return_instance
+        return may_continue, may_return_instance
 
-    @staticmethod
-    def _statements_always_return(statements: list[ast.stmt]) -> bool:
-        for statement in statements:
-            if isinstance(statement, ast.Return):
-                return True
-            if isinstance(statement, ast.If):
-                constant_bool = _HighRiskPythonCallVisitor._constant_bool(statement.test)
-                if constant_bool is True:
-                    return _HighRiskPythonCallVisitor._statements_always_return(statement.body)
-                if constant_bool is False:
-                    return _HighRiskPythonCallVisitor._statements_always_return(statement.orelse)
-                return _HighRiskPythonCallVisitor._statements_always_return(
-                    statement.body
-                ) and _HighRiskPythonCallVisitor._statements_always_return(statement.orelse)
-        return False
+    def _new_if_flow(self, statement: ast.If) -> tuple[bool, bool]:
+        constant_bool = self._constant_bool(statement.test)
+        if constant_bool is True:
+            return self._new_statements_flow(statement.body)
+        if constant_bool is False:
+            return self._new_statements_flow(statement.orelse)
+        body_may_continue, body_may_return_instance = self._new_statements_flow(statement.body)
+        orelse_may_continue, orelse_may_return_instance = self._new_statements_flow(statement.orelse)
+        return body_may_continue or orelse_may_continue, body_may_return_instance or orelse_may_return_instance
 
     def _class_preserves_ctypes_loader_init(self, node: ast.ClassDef, class_scope: _AliasScope) -> bool:
         base_identity_names = [self._reference_identity_names(base) for base in node.bases]

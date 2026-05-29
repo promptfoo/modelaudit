@@ -1040,7 +1040,31 @@ def test_scan_zip_ignores_unreachable_new_returns_async_init_and_hasattr_alias(t
         "    def __init__(self, name: str) -> None:\n"
         "        super().__init__(name)\n"
         "ctypes.LibraryLoader(SafeSuperCDLL).payload\n"
+        "class SafeCurrentSuperCDLL(SafeBase, ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super(SafeCurrentSuperCDLL, self).__init__(name)\n"
+        "ctypes.LibraryLoader(SafeCurrentSuperCDLL).payload\n"
+        "class InvalidSuperSelfCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super(InvalidSuperSelfCDLL, object()).__init__(name)\n"
+        "ctypes.LibraryLoader(InvalidSuperSelfCDLL).payload\n"
+        "class AsyncNewCDLL(ctypes.CDLL):\n"
+        "    async def __new__(cls, name: str):\n"
+        "        return super().__new__(cls)\n"
+        "ctypes.LibraryLoader(AsyncNewCDLL).payload\n"
+        "class NumericDeadDelegateCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        if 0:\n"
+        "            ctypes.CDLL.__init__(self, name)\n"
+        "ctypes.LibraryLoader(NumericDeadDelegateCDLL).payload\n"
+        "class BadKwInitCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(self, **{'name': name, 'bad': 1})\n"
+        "ctypes.LibraryLoader(BadKwInitCDLL).payload\n"
         "ctypes.LibraryLoader(**{'dlltype': ctypes.CDLL, 'bad': 1}).payload\n"
+        "getattr(ctypes.cdll, 123)\n"
+        "hasattr(ctypes.cdll, 123)\n"
+        "ctypes.LibraryLoader.__getattr__(ctypes.cdll, 123)\n"
         "f = hasattr(os, 'system')\n"
         "f('id')\n"
     )
@@ -1057,6 +1081,45 @@ def test_scan_zip_ignores_unreachable_new_returns_async_init_and_hasattr_alias(t
     checks_by_rule = {check.rule_code: check for check in python_checks}
     assert set(checks_by_rule) == {"S110"}
     assert checks_by_rule["S110"].details["reason"] == "high-risk calls: ctypes.LibraryLoader.reachablelib"
+
+
+def test_scan_zip_resolves_static_ctypes_initializer_call_forms(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "ctypes.LibraryLoader(**{'dlltype': len, 'dlltype': ctypes.CDLL}).duplicatekwlib\n"
+        "class KwNameCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(self, **{'name': name})\n"
+        "ctypes.LibraryLoader(KwNameCDLL).kwnameinitlib\n"
+        "class StarArgsCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(*(self, name))\n"
+        "ctypes.LibraryLoader(StarArgsCDLL).starargsinitlib\n"
+        "class PartialNewCDLL(ctypes.CDLL):\n"
+        "    def __new__(cls, name: str):\n"
+        "        if name == 'skip':\n"
+        "            return object()\n"
+        "        return super().__new__(cls)\n"
+        "ctypes.LibraryLoader(PartialNewCDLL).partialnewlib\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S110"}
+    s110_reason = checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.duplicatekwlib" in s110_reason
+    assert "ctypes.LibraryLoader.kwnameinitlib" in s110_reason
+    assert "ctypes.LibraryLoader.starargsinitlib" in s110_reason
+    assert "ctypes.LibraryLoader.partialnewlib" in s110_reason
 
 
 def test_scan_zip_flags_extensionless_runpy_python_member(tmp_path: Path) -> None:
