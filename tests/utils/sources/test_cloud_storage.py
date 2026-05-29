@@ -751,6 +751,64 @@ class TestCloudPathSecurity:
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
+    def test_download_with_max_size_fails_when_size_cannot_be_determined(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.side_effect = RuntimeError("permission denied")
+        mock_fs_class.return_value = fs
+
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 0,
+            "name": "model.bin",
+            "human_size": "0 B",
+            "estimated_time": "instant",
+        }
+
+        with pytest.raises(ValueError, match="Unable to enforce maximum cloud download size"):
+            download_from_cloud(
+                "s3://bucket/model.bin",
+                max_size=1024,
+                use_cache=False,
+                show_progress=False,
+            )
+
+        fs.get.assert_not_called()
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_with_max_size_rejects_late_object_size_over_limit(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 2048}
+        mock_fs_class.return_value = fs
+
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 0,
+            "name": "model.bin",
+            "human_size": "0 B",
+            "estimated_time": "instant",
+        }
+
+        with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+            download_from_cloud(
+                "s3://bucket/model.bin",
+                max_size=1024,
+                use_cache=False,
+                show_progress=False,
+            )
+
+        fs.get.assert_not_called()
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
     def test_streaming_download_rejects_path_traversal(
         self,
         mock_fs_class: MagicMock,

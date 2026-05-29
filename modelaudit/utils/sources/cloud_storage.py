@@ -700,7 +700,15 @@ def download_from_cloud(
         return f"stream://{url}"
 
     # Check size limits
-    size = metadata.get("total_size", metadata.get("size", 0))
+    try:
+        size = _parse_size_value(metadata.get("total_size", metadata.get("size", 0)))
+    except (TypeError, ValueError) as exc:
+        if max_size:
+            raise ValueError(
+                "Unable to enforce maximum cloud download size for "
+                f"{redact_url_for_display(url)}: invalid size metadata"
+            ) from exc
+        size = 0
     if max_size and size > max_size:
         raise ValueError(f"File size ({format_size(size)}) exceeds maximum allowed size ({format_size(max_size)})")
 
@@ -750,9 +758,18 @@ def download_from_cloud(
                     )
 
         if object_size is not None:
+            if max_size and object_size > max_size:
+                raise ValueError(
+                    f"File size ({format_size(object_size)}) exceeds maximum allowed size ({format_size(max_size)})"
+                )
             has_space, message = check_disk_space(download_path, object_size)
             if not has_space:
                 raise Exception(f"Cannot download from {redact_url_for_display(url)}: {message}")
+        elif max_size:
+            raise ValueError(
+                "Unable to enforce maximum cloud download size for "
+                f"{redact_url_for_display(url)} because the object size could not be determined"
+            )
 
         # Download based on type
         if metadata["type"] == "directory":
