@@ -1097,6 +1097,16 @@ class TestJITScriptDetector:
 
         assert findings == []
 
+    def test_scan_model_ignores_binary_framed_string_literal_os_process_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xffdef payload():\n    return \"os.posix_spawn('/bin/sh', ['sh'], {})\"\n}"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
     def test_scan_model_ignores_string_literal_os_process_launch_with_unrelated_risk(self) -> None:
         detector = JITScriptDetector()
         source = (
@@ -1145,7 +1155,7 @@ class TestJITScriptDetector:
         source = (
             b"\x00\xffdef payload():\n"
             b"    import os\n"
-            b"    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], dict())\n"
+            b"    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], {})\n"
             b"}"
         )
 
@@ -1167,6 +1177,28 @@ class TestJITScriptDetector:
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
         assert any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_framed_module_import_alias_aware_os_process_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffimport os\ndef payload():\n    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], {})\n}"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    def test_scan_model_allows_framed_benign_dict_literal_os_accessor(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xffdef payload():\n    import os\n    return {'cwd': getattr(os, 'getcwd')()}\n}"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
             f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
         )
 

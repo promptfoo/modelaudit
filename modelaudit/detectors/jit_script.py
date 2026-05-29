@@ -214,6 +214,20 @@ def _candidate_embedded_python_snippets(
     return candidates
 
 
+def _complete_brace_truncated_line_candidate(
+    bounded: bytes,
+    span: tuple[int, int],
+) -> tuple[bytes, tuple[int, int]] | None:
+    """Extend a failed block candidate through a same-line closing brace."""
+    if span[1] >= len(bounded) or bounded[span[1] : span[1] + 1] != b"}":
+        return None
+    line_end = bounded.find(b"\n", span[1])
+    end = len(bounded) if line_end < 0 else line_end + 1
+    if end <= span[1]:
+        return None
+    return bounded[span[0] : end], (span[0], end)
+
+
 def _embedded_python_scan_windows(data: bytes) -> list[bytes]:
     if len(data) <= _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:
         return [data]
@@ -702,6 +716,18 @@ class JITScriptDetector:
         for match, span in matches[:10]:  # Analyze first 10 code snippets
             try:
                 code_str, byte_offsets = _decode_utf8_with_byte_offsets(match)
+                parsed_snippet = _parse_embedded_python_snippet(code_str)
+                if parsed_snippet is None or parsed_snippet[1] < len(code_str):
+                    completed_candidate = _complete_brace_truncated_line_candidate(bounded, span)
+                    if completed_candidate is not None:
+                        completed_match, completed_span = completed_candidate
+                        completed_code_str, completed_byte_offsets = _decode_utf8_with_byte_offsets(completed_match)
+                        completed_parsed_snippet = _parse_embedded_python_snippet(completed_code_str)
+                        if completed_parsed_snippet is not None:
+                            code_str = completed_code_str
+                            byte_offsets = completed_byte_offsets
+                            parsed_snippet = completed_parsed_snippet
+                            span = completed_span
 
                 # Check for dangerous imports
                 for dangerous_import in DANGEROUS_IMPORTS:
@@ -747,8 +773,7 @@ class JITScriptDetector:
                         )
                     )
 
-                # Try to parse as AST for deeper analysis.
-                parsed_snippet = _parse_embedded_python_snippet(code_str)
+                # Use the parsed source, including a completed same-line candidate when applicable.
                 if parsed_snippet is not None:
                     tree, parsed_chars = parsed_snippet
                     parsed_byte_length = byte_offsets[parsed_chars]
@@ -798,11 +823,11 @@ class JITScriptDetector:
         for pattern, description in CODE_EXECUTION_PATTERNS:
             raw_pattern_spans = [match.span() for match in re.finditer(pattern, bounded)]
             pattern_match = len(raw_pattern_spans) > 0
+            raw_match_only_in_parsed_snippets = bool(parsed_snippet_spans) and not _has_raw_match_outside_parsed_spans(
+                raw_pattern_spans, parsed_snippet_spans
+            )
             if description == _SUBPROCESS_CODE_EXECUTION_DESCRIPTION:
                 resolved_subprocess_call = any(code == "S103" for _, code in resolved_high_risk_calls)
-                raw_match_only_in_parsed_snippets = bool(
-                    parsed_snippet_spans
-                ) and not _has_raw_match_outside_parsed_spans(raw_pattern_spans, parsed_snippet_spans)
                 if resolved_subprocess_call:
                     pattern_match = True
                 elif bounded_high_risk_calls is not None or raw_match_only_in_parsed_snippets:
@@ -811,13 +836,10 @@ class JITScriptDetector:
                 resolved_os_process_call = any(code == "S101" for _, code in resolved_high_risk_calls)
                 if resolved_os_process_call:
                     pattern_match = True
-                elif bounded_high_risk_calls is not None:
+                elif bounded_high_risk_calls is not None or raw_match_only_in_parsed_snippets:
                     continue
             if description == _RUNPY_CODE_EXECUTION_DESCRIPTION:
                 resolved_runpy_call = any(code == "S108" for _, code in resolved_high_risk_calls)
-                raw_match_only_in_parsed_snippets = bool(
-                    parsed_snippet_spans
-                ) and not _has_raw_match_outside_parsed_spans(raw_pattern_spans, parsed_snippet_spans)
                 if resolved_runpy_call:
                     pattern_match = True
                 elif bounded_high_risk_calls is not None or raw_match_only_in_parsed_snippets:
