@@ -724,6 +724,50 @@ def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
     assert "os.system" in handler_failures[0].message
 
 
+@pytest.mark.parametrize(
+    ("handler_source", "dangerous_name"),
+    [
+        (b"import os\ndef handle(data, context):\n    return os.execvpe('/bin/sh', ['sh'], {})\n", "os.execvpe"),
+        (
+            b"from os import spawnv as run\ndef handle(data, context):\n"
+            b"    return run(0, '/bin/sh', ['sh', '-c', 'id'])\n",
+            "os.spawnv",
+        ),
+        (
+            b"import os\ndef handle(data, context):\n    return os.posix_spawn('/bin/sh', ['sh', '-c', 'id'], {})\n",
+            "os.posix_spawn",
+        ),
+        (
+            b"import os\ndef handle(data, context):\n"
+            b"    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], {})\n",
+            "os.posix_spawn",
+        ),
+        (b"import os\ndef handle(data, context):\n    return os.startfile('payload.exe')\n", "os.startfile"),
+        (
+            b"import os\ndef handle(data, context):\n    os.posix_spawn = len\n    return os.posix_spawn([])\n",
+            "os.posix_spawn",
+        ),
+    ],
+)
+def test_scan_detects_os_process_launch_handler_execution_primitive(
+    tmp_path: Path, handler_source: bytes, dangerous_name: str
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="os_process_launch_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert dangerous_name in handler_failures[0].message
+
+
 def test_scan_detects_dunder_call_getattr_wrapped_handler_execution_primitive(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(

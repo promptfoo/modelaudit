@@ -333,6 +333,29 @@ class TestTarScanner:
         assert python_checks[0].rule_code == "S101"
         assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
+    def test_scan_tar_flags_namespace_bound_os_process_launch(self, tmp_path: Path) -> None:
+        """Namespace-write tracking must also preserve newly modeled OS launch APIs."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = (
+            b"import os\n"
+            b"namespace = os.__dict__\n"
+            b"namespace['launch'] = os.posix_spawn\n"
+            b"namespace['launch']('/bin/sh', ['sh'], {})\n"
+        )
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].rule_code == "S101"
+        assert python_checks[0].details["reason"] == "high-risk calls: os.posix_spawn"
+
     def test_scan_tar_ignores_safe_namespace_slot_rebinding(self, tmp_path: Path) -> None:
         """A safe final callable bound through a module dictionary should remain clean."""
         archive_path = tmp_path / "model_bundle.tar"

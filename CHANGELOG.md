@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - scan ONNX external data references in sparse initializers, tensor-valued attributes, and function defaults
+- detect dangerous Python calls retrieved through module namespace dictionaries in ZIP and TAR members
+- detect embedded Python `os.exec*`, `os.spawn*`, `os.posix_spawn*`, and `os.startfile` process-launch calls in archives and JIT-scanned content
 - scan dangerous RKNN safe-key metadata values instead of suppressing the whole key-value string
 - scan ONNX external data initializers in nested graphs, functions, and training graphs
 - route protocol-0 JAX checkpoint pickles through pickle opcode security checks
