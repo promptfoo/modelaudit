@@ -1323,12 +1323,15 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
         )
 
-    def _bind_imported_static_members(self, local_name: str, import_name: str) -> None:
+    def _bind_imported_static_members(self, local_name: str, import_name: str, *, preserve_existing: bool) -> None:
         prefix = f"{import_name}."
         for reference in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
             if not reference.startswith(prefix):
                 continue
-            self.alias_scopes[-1][f"{local_name}{reference.removeprefix(import_name)}"] = frozenset({reference})
+            local_reference = f"{local_name}{reference.removeprefix(import_name)}"
+            if preserve_existing and local_reference in self.alias_scopes[-1]:
+                continue
+            self.alias_scopes[-1][local_reference] = frozenset({reference})
 
     def _shadow_member_bindings(self, scope_index: int, local_name: str) -> None:
         if "." in local_name or local_name.startswith(_MODULE_NAMESPACE_WRITE_PREFIX):
@@ -1342,8 +1345,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
         local_name = alias.asname or alias.name
+        previous_names, _found = _lookup_bound_alias(local_name, self.alias_scopes)
+        preserve_existing = isinstance(previous_names, frozenset) and import_name in previous_names
         self._bind_name(local_name, frozenset({import_name}))
-        self._bind_imported_static_members(local_name, import_name)
+        self._bind_imported_static_members(local_name, import_name, preserve_existing=preserve_existing)
 
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
         self._shadow_member_bindings(-1, name)

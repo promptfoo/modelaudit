@@ -276,17 +276,28 @@ def _bounded_priority_embedded_python_candidate(
     priority_relative_offset = priority_offsets[index] - span[0]
     if priority_relative_offset >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
         line_start = candidate.rfind(b"\n", 0, priority_relative_offset) + 1
-        block_header_end = candidate.find(b"\n")
-        if block_header_end != -1 and candidate[:block_header_end].lstrip().startswith(
-            (b"def ", b"async def ", b"class ")
-        ):
-            bounded_end = min(len(candidate), line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
-            compact_candidate = candidate[: block_header_end + 1] + candidate[line_start:bounded_end]
-            return compact_candidate, (span[0], span[0] + len(compact_candidate))
     else:
         line_start = 0
     bounded_end = min(len(candidate), line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
-    return candidate[line_start:bounded_end], (span[0] + line_start, span[0] + bounded_end)
+    segments: list[bytes] = []
+    block_header_end = candidate.find(b"\n")
+    if (
+        block_header_end != -1
+        and line_start > block_header_end
+        and candidate[:block_header_end].lstrip().startswith((b"def ", b"async def ", b"class "))
+    ):
+        segments.append(candidate[: block_header_end + 1])
+    segments.append(candidate[line_start:bounded_end])
+
+    tail_start = max(bounded_end, len(candidate) - _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
+    tail_start = candidate.rfind(b"\n", 0, tail_start) + 1
+    if bounded_end < tail_start < len(candidate):
+        segments.append(candidate[tail_start:])
+
+    compact_candidate = b"\n".join(segment.rstrip(b"\n") for segment in segments if segment)
+    if len(segments) > 1:
+        return compact_candidate, (span[0], span[0] + len(compact_candidate))
+    return compact_candidate, (span[0] + line_start, span[0] + line_start + len(compact_candidate))
 
 
 def _prioritized_embedded_python_snippets(
@@ -544,6 +555,13 @@ def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]
     import_context = _extract_priority_prefix_context(prefix)
     if import_context:
         extraction_windows.append((import_context + b"\n" + tail, True))
+        tail_starts = [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(tail) if match.start() > 0]
+        selected_starts = [
+            *tail_starts[:_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS],
+            *tail_starts[-_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:],
+        ]
+        for start in dict.fromkeys(selected_starts):
+            extraction_windows.append((import_context + b"\n" + tail[start:], True))
     return extraction_windows
 
 
