@@ -129,8 +129,18 @@ _DANGEROUS_IMPORT_PATTERNS = {
     dangerous_import: _compile_dangerous_import_patterns(dangerous_import) for dangerous_import in DANGEROUS_IMPORTS
 }
 _MAX_SNIPPET_PARSE_TRIM_ATTEMPTS = 8
+_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS = 10
 _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES = 1_000_000
 _EMBEDDED_PYTHON_START_MARKERS = (b"def ", b"async def ", b"class ", b"import ", b"from ")
+_PRIORITY_EMBEDDED_PYTHON_MARKERS = tuple(
+    marker.encode("utf-8")
+    for marker in (
+        *DANGEROUS_IMPORTS,
+        "asyncio",
+        "runpy",
+        "subprocess",
+    )
+)
 _EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+")
 _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])"
@@ -207,6 +217,23 @@ def _candidate_embedded_python_snippets(
         candidates.append((bounded[start:], (start, len(bounded))))
 
     return candidates
+
+
+def _prioritized_embedded_python_snippets(
+    candidates: list[tuple[bytes, tuple[int, int]]],
+) -> list[tuple[bytes, tuple[int, int]]]:
+    selected: list[tuple[bytes, tuple[int, int]]] = []
+    selected_spans: set[tuple[int, int]] = set()
+    for index, (candidate, span) in enumerate(candidates):
+        candidate_prefix = candidate[:4096].lower()
+        has_priority_marker = any(marker in candidate_prefix for marker in _PRIORITY_EMBEDDED_PYTHON_MARKERS)
+        if index >= _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS and not has_priority_marker:
+            continue
+        if span in selected_spans:
+            continue
+        selected_spans.add(span)
+        selected.append((candidate, span))
+    return selected
 
 
 def _embedded_python_scan_windows(data: bytes) -> list[bytes]:
@@ -688,7 +715,7 @@ class JITScriptDetector:
             # raw pattern detection active and fall back to extracted snippets.
             bounded_high_risk_calls = None
 
-        for match, span in matches[:10]:  # Analyze first 10 code snippets
+        for match, span in _prioritized_embedded_python_snippets(matches):
             try:
                 code_str, byte_offsets = _decode_utf8_with_byte_offsets(match)
 
@@ -1169,7 +1196,8 @@ class JITScriptDetector:
                 )
             )
         elif self._looks_like_framed_dangerous_python_source(data):
-            findings.extend(self._extract_and_check_python_code(data, "Generic Python", context))
+            for window in _embedded_python_scan_windows(data):
+                findings.extend(self._extract_and_check_python_code(window, "Generic Python", context))
 
         return findings
 
