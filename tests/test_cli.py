@@ -1019,6 +1019,46 @@ def test_scan_huggingface_file_download_failure_redacts_url(mock_download_file):
     assert "https://huggingface.co/test/model/resolve/main/file.bin" in output
 
 
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_file_passes_max_size_to_download(
+    mock_scan: MagicMock,
+    mock_download_file: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Direct HuggingFace file downloads should receive the CLI download budget before fetch."""
+    downloaded_file = tmp_path / "model.bin"
+    downloaded_file.write_bytes(b"model")
+    mock_download_file.return_value = downloaded_file
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=4,
+        issues=[],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["test_scanner"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "--no-cache",
+            "--format",
+            "json",
+            "--max-size",
+            "2KB",
+            "https://huggingface.co/test/model/resolve/main/model.bin",
+        ],
+    )
+
+    assert result.exit_code == 0
+    mock_download_file.assert_called_once()
+    assert mock_download_file.call_args.kwargs["max_size"] == 2048
+    assert mock_scan.call_args.args[0] == str(downloaded_file)
+
+
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.cli.download_model")
 @patch("modelaudit.cli.scan_model_directory_or_file")

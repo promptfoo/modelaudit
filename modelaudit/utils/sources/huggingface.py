@@ -66,6 +66,16 @@ def _get_hf_cache_root() -> Path:
         return Path.home() / ".cache" / "huggingface" / "hub"
 
 
+def _format_size(size_bytes: int) -> str:
+    """Format a byte count for user-facing download budget errors."""
+    size = float(size_bytes)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024.0:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} PB"
+
+
 def _is_within_directory(base_dir: Path, target: Path) -> bool:
     """Return True when target resolves inside base_dir."""
     base_path = base_dir.resolve()
@@ -447,22 +457,24 @@ def download_model_streaming(
         ) from e
 
 
-def download_file_from_hf(url: str, cache_dir: Path | None = None) -> Path:
+def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int | None = None) -> Path:
     """Download a single file from HuggingFace using direct file URL.
 
     Args:
         url: Direct HuggingFace file URL (e.g., https://huggingface.co/user/repo/resolve/main/file.bin)
         cache_dir: Optional cache directory for downloads
+        max_size: Optional maximum file size to download
 
     Returns:
         Path to the downloaded file
 
     Raises:
         ValueError: If URL is invalid
+        ValueError: If max_size is set and file size is unknown or exceeds it
         Exception: If download fails
     """
     try:
-        from huggingface_hub import hf_hub_download
+        from huggingface_hub import HfApi, hf_hub_download
     except ImportError as e:
         raise ImportError(
             "huggingface-hub package is required for HuggingFace URL support. "
@@ -473,6 +485,17 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None) -> Path:
     display_url = redact_huggingface_url_for_display(url)
 
     try:
+        if max_size is not None:
+            path_info = HfApi().get_paths_info(repo_id, filename, revision=branch)
+            file_metadata = path_info[0] if path_info else None
+            file_size = getattr(file_metadata, "size", None)
+            if file_size is None:
+                raise ValueError(f"Unable to determine file size for {display_url}; refusing capped download")
+            if file_size > max_size:
+                raise ValueError(
+                    f"File size ({_format_size(file_size)}) exceeds maximum allowed size ({_format_size(max_size)})"
+                )
+
         # Use hf_hub_download for single file downloads
         local_path = hf_hub_download(
             repo_id=repo_id,

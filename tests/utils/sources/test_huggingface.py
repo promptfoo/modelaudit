@@ -802,6 +802,108 @@ class TestHuggingFaceFileURLs:
             cache_dir=str(cache_dir),
         )
 
+    @patch("huggingface_hub.HfApi")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_with_max_size_preflights_before_download(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_hf_api: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Direct file downloads should check size metadata before fetching capped files."""
+        mock_path = str(tmp_path / "downloaded_file.bin")
+        mock_hf_hub_download.return_value = mock_path
+        mock_hf_api.return_value.get_paths_info.return_value = [SimpleNamespace(size=1024)]
+
+        result = download_file_from_hf(
+            "https://huggingface.co/test/model/resolve/main/model.bin",
+            max_size=2048,
+        )
+
+        mock_hf_api.return_value.get_paths_info.assert_called_once_with("test/model", "model.bin", revision="main")
+        mock_hf_hub_download.assert_called_once()
+        assert result == Path(mock_path)
+
+    @patch("huggingface_hub.HfApi")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_with_max_size_rejects_oversized_before_download(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_hf_api: MagicMock,
+    ) -> None:
+        """Oversized direct files should not reach hf_hub_download."""
+        mock_hf_api.return_value.get_paths_info.return_value = [SimpleNamespace(size=11 * 1024 * 1024)]
+
+        with pytest.raises(Exception, match="exceeds maximum allowed size") as exc_info:
+            download_file_from_hf(
+                "https://huggingface.co/test/model/resolve/main/model.bin",
+                max_size=10 * 1024 * 1024,
+            )
+
+        assert "11.0 MB" in str(exc_info.value)
+        assert "10.0 MB" in str(exc_info.value)
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("huggingface_hub.HfApi")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_with_max_size_rejects_unknown_size_before_download(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_hf_api: MagicMock,
+    ) -> None:
+        """Capped direct files fail closed when HuggingFace metadata has no size."""
+        mock_hf_api.return_value.get_paths_info.return_value = [SimpleNamespace(size=None)]
+
+        with pytest.raises(Exception, match="Unable to determine file size"):
+            download_file_from_hf(
+                "https://huggingface.co/test/model/resolve/main/model.bin",
+                max_size=10 * 1024 * 1024,
+            )
+
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("huggingface_hub.HfApi")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_with_max_size_redacts_metadata_errors(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_hf_api: MagicMock,
+    ) -> None:
+        """Metadata preflight errors should not expose direct URL credentials."""
+        mock_hf_api.return_value.get_paths_info.side_effect = Exception(
+            "HEAD failed for https://huggingface.co/test/model/resolve/main/model.bin?token=hf_secret"
+        )
+
+        with pytest.raises(Exception, match="Failed to download file from") as exc_info:
+            download_file_from_hf(
+                "https://huggingface.co/test/model/resolve/main/model.bin?token=hf_secret",
+                max_size=10 * 1024 * 1024,
+            )
+
+        error = str(exc_info.value)
+        assert "hf_secret" not in error
+        assert "token=" not in error
+        assert "https://huggingface.co/test/model/resolve/main/model.bin" in error
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("huggingface_hub.HfApi")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_without_max_size_skips_metadata_preflight(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_hf_api: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Uncapped direct file downloads keep existing behavior and skip metadata lookup."""
+        mock_path = str(tmp_path / "downloaded_file.bin")
+        mock_hf_hub_download.return_value = mock_path
+
+        result = download_file_from_hf("https://huggingface.co/test/model/resolve/main/model.bin")
+
+        mock_hf_api.assert_not_called()
+        mock_hf_hub_download.assert_called_once()
+        assert result == Path(mock_path)
+
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_failure(self, mock_hf_hub_download):
         """Test that file download failures are handled properly."""
