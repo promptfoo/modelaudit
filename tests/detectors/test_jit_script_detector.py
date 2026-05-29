@@ -612,6 +612,17 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
+    def test_scan_model_detects_late_priority_runpy_import_list_alias(self) -> None:
+        detector = JITScriptDetector()
+        leading_imports = b"".join(f"import harmless_{index}\n\x00".encode() for index in range(12))
+        source = b"\x00\xff" + leading_imports + b"import harmless as h, runpy as rp\nrp.run_path('payload.py')\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
     def test_priority_snippets_require_import_boundaries_after_cap(self) -> None:
         leading_candidates = [
             (f"import harmless_{index}\n".encode(), (index, index + 1))
@@ -620,15 +631,24 @@ class TestJITScriptDetector:
         host_candidate = (b"import host_123\n", (100, 101))
         system_candidate = (b"class System:\n    pass\n", (200, 201))
         os_candidate = (b"import os\n", (300, 301))
+        aliased_runpy_candidate = (b"import harmless as h, runpy as rp\n", (350, 351))
         runpy_candidate = (b"from runpy import run_path\n", (400, 401))
 
         selected = jit_script_module._prioritized_embedded_python_snippets(
-            [*leading_candidates, host_candidate, system_candidate, os_candidate, runpy_candidate]
+            [
+                *leading_candidates,
+                host_candidate,
+                system_candidate,
+                os_candidate,
+                aliased_runpy_candidate,
+                runpy_candidate,
+            ]
         )
 
         assert host_candidate not in selected
         assert system_candidate not in selected
         assert os_candidate in selected
+        assert aliased_runpy_candidate in selected
         assert runpy_candidate in selected
 
     def test_scan_model_ignores_binary_framed_top_level_replaced_runpy_execution(self) -> None:

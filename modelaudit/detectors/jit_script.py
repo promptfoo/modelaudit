@@ -144,7 +144,9 @@ _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN = b"|".join(
 )
 _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN = re.compile(
     rb"(?m)^\s*(?:"
-    rb"import\s+(?:[a-z_][\w.]*\s*,\s*)*(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s,]|$)|"
+    rb"import\s+(?:[a-z_][\w.]*(?:\s+as\s+[a-z_]\w*)?\s*,\s*)*(?:"
+    + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN
+    + rb")(?:[.\s,]|$)|"
     rb"from\s+(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s]|$)"
     rb")"
 )
