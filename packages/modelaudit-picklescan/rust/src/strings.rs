@@ -360,7 +360,7 @@ fn is_common_dunder_metadata_literal(value: &str) -> bool {
     )
 }
 
-fn is_suspicious_magic_method(value: &str) -> bool {
+pub(crate) fn is_suspicious_magic_method(value: &str) -> bool {
     matches!(
         value,
         "__reduce__"
