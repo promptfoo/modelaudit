@@ -133,6 +133,7 @@ _MAX_SNIPPET_PARSE_TRIM_ATTEMPTS = 8
 _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS = 10
 _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS = 16
 _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES = 16_384
+_MAX_PRIORITY_ALIAS_USAGE_LINES = 8
 _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES = 1_000_000
 _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES = 16_384
 _EMBEDDED_PYTHON_START_MARKERS = (b"def ", b"async def ", b"class ", b"import ", b"from ")
@@ -165,6 +166,9 @@ _EMBEDDED_PYTHON_CONTEXT_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])(?:import\s+[A-Za-z_][\w.]*|from\s+[A-Za-z_][\w.]*|"
     + _EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN
     + rb"\s*=)"
+)
+_EMBEDDED_PYTHON_COMPOUND_CONTEXT_START_PATTERN = re.compile(
+    rb"(?<![A-Za-z0-9_'\".])if\s+(?:True|1)\s*:\s*(?:import|from)\s+"
 )
 
 
@@ -294,8 +298,8 @@ def _bounded_priority_embedded_python_candidate(
     add_segment(line_start, bounded_end)
 
     aliases = _priority_import_aliases(_compact_candidate_segments(candidate, segment_ranges))
-    usage_line = _priority_alias_usage_line(candidate, aliases, bounded_end) if aliases else None
-    if usage_line is not None:
+    usage_lines = _priority_alias_usage_lines(candidate, aliases, bounded_end) if aliases else []
+    for usage_line in usage_lines:
         add_segment(*usage_line)
 
     tail_start = max(bounded_end, len(candidate) - _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
@@ -332,13 +336,44 @@ def _priority_import_aliases(candidate: bytes) -> frozenset[bytes]:
             root_name = statement.module.split(".", maxsplit=1)[0]
             if root_name in priority_modules:
                 aliases.update((alias.asname or alias.name).encode("utf-8") for alias in statement.names)
+    aliases.update(_priority_assignment_aliases(source, tree))
     return frozenset(aliases)
 
 
-def _priority_alias_usage_line(
+def _priority_assignment_aliases(source: str, tree: ast.AST) -> set[bytes]:
+    aliases: set[bytes] = set()
+    targets = _assignment_targets(tree)
+    for target in targets:
+        probe = f"{source}\n" + "\n".join(_priority_assignment_probe_calls(target))
+        try:
+            probe_tree = ast.parse(probe)
+        except (SyntaxError, ValueError):
+            continue
+        if _resolve_alias_aware_high_risk_calls(probe_tree):
+            aliases.add(target.encode("utf-8"))
+    return aliases
+
+
+def _priority_assignment_probe_calls(target: str) -> list[str]:
+    return [
+        f"{target}()",
+        f"{target}.run_path('payload.py')",
+        f"{target}.run_module('payload')",
+        f"{target}.open('https://example.invalid')",
+        f"{target}.open_new('https://example.invalid')",
+        f"{target}.open_new_tab('https://example.invalid')",
+        f"{target}.CDLL('payload')",
+        f"{target}.LoadLibrary('payload')",
+        f"{target}.__getitem__('payload')",
+    ]
+
+
+def _priority_alias_usage_lines(
     candidate: bytes, aliases: frozenset[bytes], search_start: int
-) -> tuple[int, int] | None:
+) -> list[tuple[int, int]]:
+    usage_lines: list[tuple[int, int]] = []
     line_start = search_start
+    multiline_quote: bytes | None = _multiline_string_state_after_line(candidate[:search_start], None)
     while line_start < len(candidate):
         line_end = candidate.find(b"\n", line_start)
         if line_end == -1:
@@ -346,11 +381,29 @@ def _priority_alias_usage_line(
         else:
             line_end += 1
         line = candidate[line_start:line_end]
+        if multiline_quote is not None:
+            multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+            line_start = line_end
+            continue
         code_line = _python_structural_line_bytes(line)
-        if any(re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\()", code_line) for alias in aliases):
-            return line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
+        if _line_uses_priority_alias(code_line, aliases):
+            usage_lines.append((line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)))
+            if _line_calls_priority_alias(code_line, aliases) or len(usage_lines) >= _MAX_PRIORITY_ALIAS_USAGE_LINES:
+                return usage_lines
+        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
         line_start = line_end
-    return None
+    return usage_lines
+
+
+def _line_uses_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
+    return any(re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\()", code_line) for alias in aliases)
+
+
+def _line_calls_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
+    return any(
+        re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\(|\.[A-Za-z_]\w*\s*\()", code_line)
+        for alias in aliases
+    )
 
 
 def _merge_candidate_segment_ranges(segment_ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -465,7 +518,7 @@ def _triple_quote_state_after_line(line: bytes, quote: bytes | None) -> bytes | 
     index = 0
     while index < len(line):
         if quote is not None:
-            end = line.find(quote, index)
+            end = _find_unescaped_marker(line, quote, index)
             if end == -1:
                 return quote
             index = end + len(quote)
@@ -475,7 +528,7 @@ def _triple_quote_state_after_line(line: bytes, quote: bytes | None) -> bytes | 
         byte = line[index]
         if byte == ord("#"):
             return None
-        if line.startswith(b'"""', index) or line.startswith(b"'''", index):
+        if (line.startswith(b'"""', index) or line.startswith(b"'''", index)) and not _is_escaped_marker(line, index):
             quote = line[index : index + 3]
             index += 3
             continue
@@ -496,6 +549,24 @@ def _triple_quote_state_after_line(line: bytes, quote: bytes | None) -> bytes | 
             continue
         index += 1
     return quote
+
+
+def _find_unescaped_marker(line: bytes, marker: bytes, start: int) -> int:
+    index = line.find(marker, start)
+    while index != -1:
+        if not _is_escaped_marker(line, index):
+            return index
+        index = line.find(marker, index + 1)
+    return -1
+
+
+def _is_escaped_marker(line: bytes, index: int) -> bool:
+    backslashes = 0
+    position = index - 1
+    while position >= 0 and line[position] == ord("\\"):
+        backslashes += 1
+        position -= 1
+    return backslashes % 2 == 1
 
 
 def _line_has_explicit_continuation(line: bytes) -> bool:
@@ -523,6 +594,10 @@ def _is_embedded_top_level_prefix(prefix: bytes) -> bool:
 def _context_statement_start(line: bytes) -> int | None:
     for match in _EMBEDDED_PYTHON_CONTEXT_START_PATTERN.finditer(line):
         if _is_embedded_top_level_prefix(line[: match.start()]):
+            return match.start()
+    structural_line = _python_structural_line_bytes(line)
+    for match in _EMBEDDED_PYTHON_COMPOUND_CONTEXT_START_PATTERN.finditer(structural_line):
+        if _is_embedded_top_level_prefix(structural_line[: match.start()]):
             return match.start()
     return None
 
@@ -564,7 +639,7 @@ def _is_priority_assignment_context(context: bytes, statement: bytes) -> bool:
     if not targets:
         return False
 
-    probe = code_str + "\n" + "\n".join(f"{target}()" for target in targets)
+    probe = code_str + "\n" + "\n".join(call for target in targets for call in _priority_assignment_probe_calls(target))
     try:
         probe_tree = ast.parse(probe)
     except (SyntaxError, ValueError):
@@ -573,14 +648,29 @@ def _is_priority_assignment_context(context: bytes, statement: bytes) -> bool:
 
 
 def _is_priority_prefix_context_statement(context: bytes, statement: bytes) -> bool:
-    if _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(statement.lower()) is not None:
-        code_str, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
-        try:
-            ast.parse(code_str)
-        except (SyntaxError, ValueError):
-            return False
+    code_str, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
+    try:
+        tree = ast.parse(code_str)
+    except (SyntaxError, ValueError):
+        tree = None
+    if tree is not None and _tree_imports_priority_module(tree):
         return True
     return _is_priority_assignment_context(context, statement)
+
+
+def _tree_imports_priority_module(tree: ast.AST) -> bool:
+    priority_modules = set(_PRIORITY_EMBEDDED_PYTHON_MODULES)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name.split(".", maxsplit=1)[0].lower() in priority_modules for alias in node.names):
+                return True
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and node.module.split(".", maxsplit=1)[0].lower() in priority_modules
+        ):
+            return True
+    return False
 
 
 def _extract_priority_prefix_context(data: bytes) -> bytes:
@@ -639,13 +729,30 @@ def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]
     if import_context:
         extraction_windows.append((import_context + b"\n" + tail, True))
         tail_starts = [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(tail) if match.start() > 0]
+        context_aliases = _priority_import_aliases(import_context)
         selected_starts = [
             *tail_starts[:_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS],
+            *_tail_starts_for_priority_alias_uses(tail, tail_starts, context_aliases),
             *tail_starts[-_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:],
         ]
         for start in dict.fromkeys(selected_starts):
             extraction_windows.append((import_context + b"\n" + tail[start:], True))
     return extraction_windows
+
+
+def _tail_starts_for_priority_alias_uses(
+    tail: bytes,
+    tail_starts: list[int],
+    aliases: frozenset[bytes],
+) -> list[int]:
+    selected_starts: list[int] = []
+    if not tail_starts or not aliases:
+        return selected_starts
+    for usage_start, _usage_end in _priority_alias_usage_lines(tail, aliases, 0):
+        start_index = bisect_right(tail_starts, usage_start) - 1
+        if start_index >= 0:
+            selected_starts.append(tail_starts[start_index])
+    return selected_starts
 
 
 def _has_raw_match_outside_parsed_spans(raw_spans: list[tuple[int, int]], parsed_spans: list[tuple[int, int]]) -> bool:
