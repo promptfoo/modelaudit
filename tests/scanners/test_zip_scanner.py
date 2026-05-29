@@ -700,7 +700,7 @@ def test_scan_zip_preserves_runpy_execution_after_import_rebinds_module(tmp_path
 
 def test_scan_zip_clears_imported_static_members_after_alias_rebind(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
-    source = "import runpy as rp\nrp = object()\nrp.run_path('safe.py')\n"
+    source = "class Safe:\n    run_path = len\nimport runpy as rp\nrp = Safe()\nrp.run_path([])\n"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
 

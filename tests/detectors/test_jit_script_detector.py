@@ -556,6 +556,23 @@ class TestJITScriptDetector:
 
         assert findings == []
 
+    def test_scan_model_ignores_runpy_member_after_module_alias_rebind(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"class Safe:\n"
+            b"    run_path = len\n"
+            b"def payload():\n"
+            b"    import runpy as rp\n"
+            b"    rp = Safe()\n"
+            b"    return rp.run_path([])\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
     def test_scan_model_preserves_possible_runpy_execution_after_conditional_replacement(self) -> None:
         detector = JITScriptDetector()
         source = (
@@ -894,6 +911,22 @@ class TestJITScriptDetector:
         filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
         source = (
             b'\x00\xffmarker = \'"""\'\nimport runpy as rp\n'
+            + filler
+            + b"def payload():\n    return rp.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_tail_import_after_comment_line_closes_triple_quote(self) -> None:
+        detector = JITScriptDetector()
+        filler_line = b"# filler\n"
+        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        source = (
+            b'\x00\xfftext = """\n# closes """\nimport runpy as rp\n'
             + filler
             + b"def payload():\n    return rp.run_path('payload.py')\n"
         )
