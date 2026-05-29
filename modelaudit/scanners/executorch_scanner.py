@@ -133,8 +133,9 @@ class ExecuTorchScanner(BaseScanner):
         try:
             self.current_file_path = path
             with zipfile.ZipFile(path, "r") as z:
-                safe_entries: list[str] = []
-                for name in z.namelist():
+                safe_entries: list[zipfile.ZipInfo] = []
+                for entry in z.infolist():
+                    name = entry.filename
                     temp_base = os.path.join(tempfile.gettempdir(), "extract")
                     _, is_safe = sanitize_archive_path(name, temp_base)
                     if not is_safe:
@@ -148,14 +149,15 @@ class ExecuTorchScanner(BaseScanner):
                             rule_code="S405",
                         )
                         continue
-                    safe_entries.append(name)
+                    safe_entries.append(entry)
 
-                pickle_files = [n for n in safe_entries if n.endswith(".pkl")]
+                pickle_entries = [entry for entry in safe_entries if entry.filename.endswith(".pkl")]
+                pickle_files = [entry.filename for entry in pickle_entries]
                 result.metadata["pickle_files"] = pickle_files
                 bytes_scanned = 0
 
-                for name in pickle_files:
-                    member_info = z.getinfo(name)
+                for member_info in pickle_entries:
+                    name = member_info.filename
                     bytes_scanned += member_info.file_size
                     if self.pickle_scanner is None:
                         add_scanner_selection_skip_check(
@@ -167,7 +169,7 @@ class ExecuTorchScanner(BaseScanner):
                         )
                         continue
 
-                    with z.open(name, "r") as file_like:
+                    with z.open(member_info, "r") as file_like:
                         sub_result = self.pickle_scanner.scan_stream(
                             cast(BinaryIO, file_like),
                             member_info.file_size,
@@ -176,7 +178,8 @@ class ExecuTorchScanner(BaseScanner):
                     apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
                     result.merge(sub_result)
 
-                for name in safe_entries:
+                for entry in safe_entries:
+                    name = entry.filename
                     if name.endswith(".py"):
                         result.add_check(
                             name="Python File Detection",

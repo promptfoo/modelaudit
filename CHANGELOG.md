@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- scan every duplicate ExecuTorch pickle ZIP member instead of reopening by shadowable name
 - inspect every parsed GGUF chat template when duplicate or trailing malformed metadata could otherwise hide SSTI payloads
 - bound GGUF declared metadata and tensor collections, and cap reported tensor summaries, so oversized structures fail closed without exhausting scanner resources
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts

@@ -36,6 +36,14 @@ def create_executorch_archive(tmp_path: Path, *, malicious: bool = False) -> Pat
     return zip_path
 
 
+def _pickle_payload_with_eval(source: str) -> bytes:
+    class EvalPayload:
+        def __reduce__(self):
+            return (eval, (source,))
+
+    return pickle.dumps(EvalPayload())
+
+
 def test_executorch_scanner_can_handle(tmp_path: Path) -> None:
     path = create_executorch_archive(tmp_path)
     assert ExecuTorchScanner.can_handle(str(path))
@@ -295,3 +303,63 @@ def test_executorch_scanner_streams_pickle_members_without_zip_read(
     result = ExecuTorchScanner().scan(str(model_path))
 
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_executorch_duplicate_pickle_members_scan_malicious_first_entry(tmp_path: Path) -> None:
+    model_path = tmp_path / "duplicate-model.ptl"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("model.pkl", _pickle_payload_with_eval("print('evil')"))
+        zipf.writestr("model.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.metadata["pickle_files"] == ["model.pkl", "model.pkl"]
+    assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
+
+
+def test_renamed_executorch_archive_duplicate_pickle_routes_and_detects_shadowed_payload(tmp_path: Path) -> None:
+    model_path = tmp_path / "duplicate-model.jpg"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("bytecode.pkl", _pickle_payload_with_eval("print('evil')"))
+        zipf.writestr("bytecode.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+
+    file_result = core.scan_file(str(model_path), config={"cache_scan_results": False})
+    result = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert file_result.scanner_name == "executorch"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in file_result.issues
+    )
+    assert result.files_scanned == 1
+    assert "executorch" in result.scanner_names
+    assert core.determine_exit_code(result) == 1
+    assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
+
+
+def test_executorch_duplicate_pickle_members_scan_malicious_last_entry(tmp_path: Path) -> None:
+    model_path = tmp_path / "duplicate-model-reversed.ptl"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("model.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("model.pkl", _pickle_payload_with_eval("print('evil')"))
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.metadata["pickle_files"] == ["model.pkl", "model.pkl"]
+    assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
+
+
+def test_executorch_benign_duplicate_pickle_members_stay_clean(tmp_path: Path) -> None:
+    model_path = tmp_path / "duplicate-benign-model.ptl"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("model.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("model.pkl", pickle.dumps({"weights": [4, 5, 6]}))
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata["pickle_files"] == ["model.pkl", "model.pkl"]
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
