@@ -137,7 +137,27 @@ def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
     return {(call.name, call.rule_code) for call in high_risk_python_calls_in_tree(tree)}
 
 
+def _parse_embedded_python_snippet(code_str: str) -> ast.AST | None:
+    """Parse an extracted Python snippet, trimming trailing binary framing when needed."""
+    try:
+        return ast.parse(code_str)
+    except (SyntaxError, ValueError):
+        pass
+
+    lines = code_str.splitlines()
+    for end in range(len(lines) - 1, 0, -1):
+        candidate = "\n".join(lines[:end])
+        if candidate.strip() == "":
+            continue
+        try:
+            return ast.parse(f"{candidate}\n")
+        except (SyntaxError, ValueError):
+            continue
+    return None
+
+
 # Patterns that indicate code execution attempts
+_SUBPROCESS_CODE_EXECUTION_DESCRIPTION = "Subprocess execution detected"
 _OS_CODE_EXECUTION_DESCRIPTION = "OS command execution detected"
 CODE_EXECUTION_PATTERNS = [
     # Direct execution patterns
@@ -146,7 +166,11 @@ CODE_EXECUTION_PATTERNS = [
     (rb"compile\s*\(", "compile() call detected"),
     (rb"__import__\s*\(", "__import__() call detected"),
     # Subprocess patterns
-    (rb"subprocess\.(call|run|Popen|check_output)", "Subprocess execution detected"),
+    (
+        rb"(?:subprocess\.(?:call|run|Popen|check_call|check_output|getoutput|getstatusoutput)"
+        rb"|asyncio\.(?:subprocess\.)?create_subprocess_(?:exec|shell))",
+        _SUBPROCESS_CODE_EXECUTION_DESCRIPTION,
+    ),
     (rb"os\.(system|popen|exec\w*|spawn\w*|posix_spawnp?|startfile)", _OS_CODE_EXECUTION_DESCRIPTION),
     # Network patterns
     (rb"socket\.(socket|create_connection)", "Socket creation detected"),
@@ -584,15 +608,12 @@ class JITScriptDetector:
                             )
                         )
 
-                # Try to parse as AST for deeper analysis
-                try:
-                    tree = ast.parse(code_str)
+                # Try to parse as AST for deeper analysis.
+                tree = _parse_embedded_python_snippet(code_str)
+                if tree is not None:
                     snippet_high_risk_calls.update(_resolve_alias_aware_high_risk_calls(tree))
                     ast_findings = self._analyze_ast(tree, framework, context)
                     findings.extend(ast_findings)
-                except SyntaxError:
-                    # Not valid Python, might be partial or corrupted
-                    pass
 
             except Exception:
                 # Failed to process this code snippet
@@ -602,6 +623,12 @@ class JITScriptDetector:
         resolved_high_risk_calls = (bounded_high_risk_calls or set()) | snippet_high_risk_calls
         for pattern, description in CODE_EXECUTION_PATTERNS:
             pattern_match = re.search(pattern, bounded) is not None
+            if description == _SUBPROCESS_CODE_EXECUTION_DESCRIPTION:
+                resolved_subprocess_call = any(code == "S103" for _, code in resolved_high_risk_calls)
+                if resolved_subprocess_call:
+                    pattern_match = True
+                elif bounded_high_risk_calls is not None:
+                    continue
             if description == _OS_CODE_EXECUTION_DESCRIPTION:
                 resolved_os_process_call = any(code == "S101" for _, code in resolved_high_risk_calls)
                 if resolved_os_process_call:

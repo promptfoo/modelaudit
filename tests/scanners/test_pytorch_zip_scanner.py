@@ -1475,6 +1475,68 @@ def test_pytorch_zip_scans_os_process_launch_source_conservatively(tmp_path: Pat
 @pytest.mark.parametrize(
     "payload",
     [
+        b"async def payload():\n    return await asyncio.create_subprocess_shell('id')\n",
+        b"async def payload():\n    return await asyncio.subprocess.create_subprocess_exec('id')\n",
+        (
+            b"from asyncio import create_subprocess_exec as launch\n"
+            b"async def payload():\n    return await launch('id')\n"
+        ),
+        (
+            b"\x00\xffdef payload():\n"
+            b"    from asyncio import create_subprocess_shell as launch\n"
+            b"    return launch('id')\n"
+            b"}"
+        ),
+    ],
+)
+def test_pytorch_zip_scans_asyncio_subprocess_launch_source_conservatively(tmp_path: Path, payload: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    jit_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(
+        check.location == f"{zip_path}:archive/data/payload.bin" and "Subprocess execution detected" in check.message
+        for check in jit_failures
+    )
+
+
+def test_pytorch_zip_ignores_string_literal_asyncio_subprocess_launch_with_unrelated_risk(
+    tmp_path: Path,
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    payload = (
+        b"import pickle\n\n"
+        b"def payload(data):\n"
+        b"    pickle.loads(data)\n"
+        b"    return \"asyncio.create_subprocess_shell('id')\"\n"
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and "Subprocess execution detected" in check.message
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
         (
             b"import os\n"
             b"import subprocess\n\n"

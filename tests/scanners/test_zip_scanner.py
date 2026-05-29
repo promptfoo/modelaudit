@@ -497,6 +497,44 @@ def test_scan_zip_flags_namespace_bound_os_process_launch(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize(
+    ("source", "dangerous_name"),
+    [
+        (
+            "import asyncio\nasyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
+            "asyncio.create_subprocess_exec",
+        ),
+        (
+            "from asyncio import create_subprocess_shell as run\nrun('id')\n",
+            "asyncio.create_subprocess_shell",
+        ),
+        (
+            "import asyncio.subprocess\nasyncio.subprocess.create_subprocess_shell('id')\n",
+            "asyncio.subprocess.create_subprocess_shell",
+        ),
+        (
+            "import asyncio\nasyncio.create_subprocess_shell = len\nasyncio.create_subprocess_shell([])\n",
+            "asyncio.create_subprocess_shell",
+        ),
+    ],
+)
+def test_scan_zip_flags_asyncio_subprocess_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S103"
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "import os\nos.__dict__['getcwd']()\n",
