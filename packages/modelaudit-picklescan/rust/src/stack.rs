@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use crate::opcode::ArgValue;
 
 const MAX_TRACKED_TUPLE_ITEMS: usize = 16;
-const MAX_TRACKED_TUPLE_DEPTH: usize = 2;
+const MAX_TRACKED_TUPLE_DEPTH: usize = 4;
 const MAX_STACK_BYTES_PREVIEW: usize = 4096;
 
 #[derive(Clone)]
@@ -57,8 +57,14 @@ pub(crate) enum StackValue {
     DefaultDict {
         default_factory: GlobalRef,
     },
+    DynamicType {
+        type_name: Option<String>,
+        memo_index: Option<i64>,
+    },
     TrackedDict {
         entries: Vec<(String, StackValue)>,
+        unknown_key_values: Vec<StackValue>,
+        unknown_key_values_overflowed: bool,
         memo_index: Option<i64>,
     },
     MappingWrapper {
@@ -116,10 +122,37 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
         Some(StackValue::DefaultDict { default_factory }) => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
-        Some(StackValue::TrackedDict { entries, .. }) if entries.is_empty() => {
-            "dict:{}".to_string()
+        Some(StackValue::DynamicType {
+            type_name,
+            memo_index,
+        }) => format!(
+            "dynamic_type(name={}, memo={})",
+            type_name.as_deref().unwrap_or("unknown"),
+            memo_index.map_or_else(|| "none".to_string(), |index| index.to_string())
+        ),
+        Some(StackValue::TrackedDict {
+            entries,
+            unknown_key_values,
+            ..
+        }) if entries.is_empty() && unknown_key_values.is_empty() => "dict:{}".to_string(),
+        Some(StackValue::TrackedDict {
+            entries,
+            unknown_key_values,
+            unknown_key_values_overflowed,
+            ..
+        }) => {
+            let overflow = if *unknown_key_values_overflowed {
+                "+overflow"
+            } else {
+                ""
+            };
+            format!(
+                "dict(keys={}, dynamic_keys={}{})",
+                entries.len(),
+                unknown_key_values.len(),
+                overflow
+            )
         }
-        Some(StackValue::TrackedDict { entries, .. }) => format!("dict(keys={})", entries.len()),
         Some(StackValue::MappingWrapper {
             reference,
             mappings,
@@ -223,8 +256,37 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::DefaultDict { default_factory } => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
-        StackValue::TrackedDict { entries, .. } if entries.is_empty() => "dict:{}".to_string(),
-        StackValue::TrackedDict { entries, .. } => format!("dict(keys={})", entries.len()),
+        StackValue::DynamicType {
+            type_name,
+            memo_index,
+        } => format!(
+            "dynamic_type(name={}, memo={})",
+            type_name.as_deref().unwrap_or("unknown"),
+            memo_index.map_or_else(|| "none".to_string(), |index| index.to_string())
+        ),
+        StackValue::TrackedDict {
+            entries,
+            unknown_key_values,
+            ..
+        } if entries.is_empty() && unknown_key_values.is_empty() => "dict:{}".to_string(),
+        StackValue::TrackedDict {
+            entries,
+            unknown_key_values,
+            unknown_key_values_overflowed,
+            ..
+        } => {
+            let overflow = if *unknown_key_values_overflowed {
+                "+overflow"
+            } else {
+                ""
+            };
+            format!(
+                "dict(keys={}, dynamic_keys={}{})",
+                entries.len(),
+                unknown_key_values.len(),
+                overflow
+            )
+        }
         StackValue::MappingWrapper {
             reference,
             mappings,
