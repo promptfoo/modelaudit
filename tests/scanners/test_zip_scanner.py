@@ -748,6 +748,8 @@ def test_scan_zip_handles_final_dynamic_accessor_edges(tmp_path: Path) -> None:
         "browser.open('https://example.invalid')\n"
         "getattr(*(ctypes.cdll, 'msvcrt'))\n"
         "hasattr(*(ctypes.LibraryLoader(ctypes.CDLL), 'hasattrpayload'))\n"
+        "getattr(ctypes.cdll, 'emptykwargs', **{})\n"
+        "hasattr(ctypes.LibraryLoader(ctypes.CDLL), 'hasattremptykwargs', **{})\n"
         "ctypes.LibraryLoader.__getattr__(ctypes.cdll, 'unboundgetattr')\n"
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -766,7 +768,9 @@ def test_scan_zip_handles_final_dynamic_accessor_edges(tmp_path: Path) -> None:
     s110_reason = checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.payload" in s110_reason
     assert "ctypes.cdll.msvcrt" in s110_reason
+    assert "ctypes.cdll.emptykwargs" in s110_reason
     assert "ctypes.LibraryLoader.hasattrpayload" in s110_reason
+    assert "ctypes.LibraryLoader.hasattremptykwargs" in s110_reason
     assert "ctypes.cdll.unboundgetattr" in s110_reason
 
 
@@ -928,6 +932,9 @@ def test_scan_zip_flags_empty_kwargs_loader_constructor_and_current_super(tmp_pa
         "ctypes.LibraryLoader(ctypes.CDLL, **{}).emptykwargs\n"
         "class Empty:\n"
         "    pass\n"
+        "class EmptyLeadingCDLL(Empty, ctypes.CDLL):\n"
+        "    pass\n"
+        "ctypes.LibraryLoader(EmptyLeadingCDLL).emptyleadinglib\n"
         "class EmptyBaseSuperCDLL(Empty, ctypes.CDLL):\n"
         "    def __init__(self, name: str) -> None:\n"
         "        super().__init__(name)\n"
@@ -951,6 +958,7 @@ def test_scan_zip_flags_empty_kwargs_loader_constructor_and_current_super(tmp_pa
     assert set(checks_by_rule) == {"S110"}
     s110_reason = checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.emptykwargs" in s110_reason
+    assert "ctypes.LibraryLoader.emptyleadinglib" in s110_reason
     assert "ctypes.LibraryLoader.emptybasesuperlib" in s110_reason
     assert "ctypes.LibraryLoader.currentsuperlib" in s110_reason
 
@@ -1061,6 +1069,20 @@ def test_scan_zip_ignores_unreachable_new_returns_async_init_and_hasattr_alias(t
         "    def __init__(self, name: str) -> None:\n"
         "        ctypes.CDLL.__init__(self, **{'name': name, 'bad': 1})\n"
         "ctypes.LibraryLoader(BadKwInitCDLL).payload\n"
+        "class BadDirectKwInitCDLL(ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(self, name=name, bad=1)\n"
+        "ctypes.LibraryLoader(BadDirectKwInitCDLL).payload\n"
+        "class ClassMethodInitCDLL(ctypes.CDLL):\n"
+        "    @classmethod\n"
+        "    def __init__(cls, name: str) -> None:\n"
+        "        ctypes.CDLL.__init__(cls, name)\n"
+        "ctypes.LibraryLoader(ClassMethodInitCDLL).payload\n"
+        "AliasSafeBase = SafeBase\n"
+        "class SafeAliasSuperCDLL(AliasSafeBase, ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super().__init__(name)\n"
+        "ctypes.LibraryLoader(SafeAliasSuperCDLL).payload\n"
         "ctypes.LibraryLoader(**{'dlltype': ctypes.CDLL, 'bad': 1}).payload\n"
         "getattr(ctypes.cdll, 123)\n"
         "hasattr(ctypes.cdll, 123)\n"
@@ -1096,6 +1118,13 @@ def test_scan_zip_resolves_static_ctypes_initializer_call_forms(tmp_path: Path) 
         "    def __init__(self, name: str) -> None:\n"
         "        ctypes.CDLL.__init__(*(self, name))\n"
         "ctypes.LibraryLoader(StarArgsCDLL).starargsinitlib\n"
+        "class DelegatingBase:\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super().__init__(name)\n"
+        "class ForwardingBaseCDLL(DelegatingBase, ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super().__init__(name)\n"
+        "ctypes.LibraryLoader(ForwardingBaseCDLL).forwardingbaselib\n"
         "class PartialNewCDLL(ctypes.CDLL):\n"
         "    def __new__(cls, name: str):\n"
         "        if name == 'skip':\n"
@@ -1119,6 +1148,7 @@ def test_scan_zip_resolves_static_ctypes_initializer_call_forms(tmp_path: Path) 
     assert "ctypes.LibraryLoader.duplicatekwlib" in s110_reason
     assert "ctypes.LibraryLoader.kwnameinitlib" in s110_reason
     assert "ctypes.LibraryLoader.starargsinitlib" in s110_reason
+    assert "ctypes.LibraryLoader.forwardingbaselib" in s110_reason
     assert "ctypes.LibraryLoader.partialnewlib" in s110_reason
 
 

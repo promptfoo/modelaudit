@@ -845,7 +845,8 @@ def _resolve_getattr_call_names(
         while resolved_helper_name.endswith(".__call__"):
             resolved_helper_name = resolved_helper_name.removesuffix(".__call__")
         normalized_helper_names.add(resolved_helper_name)
-    expanded_args = _expanded_static_call_args(node) if not node.keywords else None
+    keyword_values = _static_keyword_arguments(node.keywords)
+    expanded_args = _expanded_static_call_args(node) if keyword_values == {} else None
 
     if normalized_helper_names & {"object.__getattribute__", "builtins.object.__getattribute__"}:
         if expanded_args is None or len(expanded_args) != 2:
@@ -1656,6 +1657,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self._call_result_aliases: dict[int, _AliasValue] = {}
         self._known_class_names: set[str] = set()
         self._classes_with_local_initializers: set[str] = set()
+        self._classes_with_forwarding_initializers: set[str] = set()
+        self._class_identity_aliases: dict[str, frozenset[str]] = {}
         self._instance_binding_generations: dict[str, int] = {}
         self._non_module_scope_depth = 0
         self.risky_calls: set[str] = set()
@@ -1827,6 +1830,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             localized_names = self._localize_instance_binding_value(target.id, value, resolved_names)
             self._bind_name(target.id, localized_names)
             self._restore_reassigned_instance_member_defaults(target.id, localized_names)
+            if self._non_module_scope_depth == 0:
+                class_identity_names = self._resolve_class_identity_names(value)
+                if class_identity_names:
+                    self._class_identity_aliases[target.id] = class_identity_names
+                else:
+                    self._class_identity_aliases.pop(target.id, None)
         elif isinstance(target, ast.Subscript):
             key = _resolve_static_string(target.slice)
             roots = _resolve_namespace_mapping_roots(
@@ -2461,7 +2470,23 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         syntactic_name = _resolve_call_name(node)
         if syntactic_name is not None:
             names.add(syntactic_name)
+            names.update(self._class_identity_aliases.get(syntactic_name, frozenset()))
         return frozenset(names)
+
+    def _resolve_class_identity_names(self, node: ast.AST) -> frozenset[str]:
+        reference_name = _resolve_call_name(node)
+        if reference_name is None:
+            return frozenset()
+        identity_names = set(self._class_identity_aliases.get(reference_name, frozenset()))
+        if reference_name in self._known_class_names:
+            identity_names.add(reference_name)
+        return frozenset(identity_names)
+
+    def _known_class_identity_names(self, names: frozenset[str]) -> frozenset[str]:
+        known_names = set(names & self._known_class_names)
+        for name in names:
+            known_names.update(self._class_identity_aliases.get(name, frozenset()))
+        return frozenset(known_names & self._known_class_names)
 
     def _super_call_preserves_ctypes_loader_init(
         self,
@@ -2476,7 +2501,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if not super_call.args:
             return any(
                 not any(
-                    self._base_definitely_defines_initializer(base_names)
+                    self._base_definitely_blocks_ctypes_initializer(base_names)
                     for base_names in base_identity_names[:loader_index]
                 )
                 for loader_index in loader_base_indices
@@ -2489,7 +2514,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if class_name in first_arg_names:
             return any(
                 not any(
-                    self._base_definitely_defines_initializer(base_names)
+                    self._base_definitely_blocks_ctypes_initializer(base_names)
                     for base_names in base_identity_names[:loader_index]
                 )
                 for loader_index in loader_base_indices
@@ -2499,11 +2524,15 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 return any(loader_index > index for loader_index in loader_base_indices)
         return False
 
-    def _base_definitely_defines_initializer(self, base_names: frozenset[str]) -> bool:
-        known_base_names = base_names & self._known_class_names
+    def _base_definitely_blocks_ctypes_initializer(self, base_names: frozenset[str]) -> bool:
+        known_base_names = self._known_class_identity_names(base_names)
         if not known_base_names:
             return False
-        return any(base_name in self._classes_with_local_initializers for base_name in known_base_names)
+        return any(
+            base_name in self._classes_with_local_initializers
+            and base_name not in self._classes_with_forwarding_initializers
+            for base_name in known_base_names
+        )
 
     @staticmethod
     def _initializer_self_names(arguments: ast.arguments) -> frozenset[str]:
@@ -2609,6 +2638,102 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             )
             for call in self._initializer_node_calls(node)
         )
+
+    def _super_call_forwards_initializer(
+        self,
+        super_call: ast.Call,
+        class_name: str,
+        initializer_self_names: frozenset[str],
+    ) -> bool:
+        if _resolve_call_name(super_call.func) != "super" or super_call.keywords:
+            return False
+        if not super_call.args:
+            return True
+        if len(super_call.args) != 2 or not self._node_is_initializer_self(super_call.args[1], initializer_self_names):
+            return False
+        return class_name in self._reference_identity_names(super_call.args[0])
+
+    def _initializer_call_forwards_super_init(
+        self,
+        call: ast.Call,
+        class_name: str,
+        initializer_self_names: frozenset[str],
+    ) -> bool:
+        return (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == "__init__"
+            and isinstance(call.func.value, ast.Call)
+            and self._super_call_forwards_initializer(call.func.value, class_name, initializer_self_names)
+            and self._call_has_loader_name_argument(call, bound_method=True)
+        )
+
+    def _initializer_node_forwards_super_init(
+        self,
+        node: ast.AST,
+        class_name: str,
+        initializer_self_names: frozenset[str],
+    ) -> bool:
+        return any(
+            self._initializer_call_forwards_super_init(call, class_name, initializer_self_names)
+            for call in self._initializer_node_calls(node)
+        )
+
+    def _initializer_statements_forward_super_init(
+        self,
+        statements: list[ast.stmt],
+        class_name: str,
+        initializer_self_names: frozenset[str],
+    ) -> bool:
+        for statement in statements:
+            if self._initializer_statement_forwards_super_init(statement, class_name, initializer_self_names):
+                return True
+        return False
+
+    def _initializer_statement_forwards_super_init(
+        self,
+        statement: ast.stmt,
+        class_name: str,
+        initializer_self_names: frozenset[str],
+    ) -> bool:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return False
+        if isinstance(statement, ast.If):
+            constant_bool = self._constant_bool(statement.test)
+            if constant_bool is True:
+                return self._initializer_statements_forward_super_init(
+                    statement.body,
+                    class_name,
+                    initializer_self_names,
+                )
+            if constant_bool is False:
+                return self._initializer_statements_forward_super_init(
+                    statement.orelse,
+                    class_name,
+                    initializer_self_names,
+                )
+            return self._initializer_statements_forward_super_init(
+                statement.body,
+                class_name,
+                initializer_self_names,
+            ) or self._initializer_statements_forward_super_init(
+                statement.orelse,
+                class_name,
+                initializer_self_names,
+            )
+        if isinstance(statement, ast.While):
+            constant_bool = self._constant_bool(statement.test)
+            if constant_bool is False:
+                return self._initializer_statements_forward_super_init(
+                    statement.orelse,
+                    class_name,
+                    initializer_self_names,
+                )
+            return self._initializer_statements_forward_super_init(
+                statement.body,
+                class_name,
+                initializer_self_names,
+            )
+        return self._initializer_node_forwards_super_init(statement, class_name, initializer_self_names)
 
     def _merge_initializer_branch_scopes(
         self,
@@ -2814,6 +2939,31 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     ) -> bool:
         return init_method is not None or "__init__" in class_scope
 
+    def _class_initializer_forwards_super_init(
+        self,
+        node: ast.ClassDef,
+        init_method: ast.FunctionDef | ast.AsyncFunctionDef | None,
+    ) -> bool:
+        if init_method is None or isinstance(init_method, ast.AsyncFunctionDef):
+            return False
+        if self._class_method_has_decorator(
+            init_method,
+            frozenset(
+                {
+                    "staticmethod",
+                    "builtins.staticmethod",
+                    "classmethod",
+                    "builtins.classmethod",
+                }
+            ),
+        ):
+            return False
+        return self._initializer_statements_forward_super_init(
+            init_method.body,
+            node.name,
+            self._initializer_self_names(init_method.args),
+        )
+
     @staticmethod
     def _return_value_is_obvious_non_instance(value: ast.AST | None) -> bool:
         if value is None:
@@ -2869,16 +3019,24 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             return False
         if isinstance(init_method, ast.AsyncFunctionDef) or (
             init_method is not None
-            and self._class_method_has_decorator(init_method, frozenset({"staticmethod", "builtins.staticmethod"}))
+            and self._class_method_has_decorator(
+                init_method,
+                frozenset({"staticmethod", "builtins.staticmethod", "classmethod", "builtins.classmethod"}),
+            )
         ):
             return False
         if init_method is None:
-            class_init_alias = class_scope.get("__init__")
-            if self._is_ctypes_loader_init_alias(class_init_alias):
-                return True
+            if "__init__" in class_scope:
+                return self._is_ctypes_loader_init_alias(class_scope.get("__init__"))
             if not node.bases:
                 return False
-            return 0 in loader_base_indices
+            return any(
+                not any(
+                    self._base_definitely_blocks_ctypes_initializer(base_names)
+                    for base_names in base_identity_names[:loader_index]
+                )
+                for loader_index in loader_base_indices
+            )
         initializer_scope = self._argument_alias_scope(init_method.args)
         initializer_self_names = self._initializer_self_names(init_method.args)
         return self._initializer_statements_preserve_ctypes_loader_init(
@@ -2905,8 +3063,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self.visit(keyword)
         class_scope = self._visit_class_scope(node.body)
         self._known_class_names.add(node.name)
-        if self._class_has_local_initializer(node, class_scope, self._class_method(node, "__init__")):
+        self._class_identity_aliases[node.name] = frozenset({node.name})
+        init_method = self._class_method(node, "__init__")
+        if self._class_has_local_initializer(node, class_scope, init_method):
             self._classes_with_local_initializers.add(node.name)
+        if self._class_initializer_forwards_super_init(node, init_method):
+            self._classes_with_forwarding_initializers.add(node.name)
         ctypes_loader_type_aliases = (
             base_ctypes_loader_aliases if self._class_preserves_ctypes_loader_init(node, class_scope) else frozenset()
         )
