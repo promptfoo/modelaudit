@@ -57,12 +57,7 @@ _TensorFlowProtoRoute = Literal[
 ]
 _TensorFlowOuterHint = Literal["unknown", "tf_metagraph", "tf_savedmodel"]
 _TORCH7_SIGNATURE_READ_BYTES = 4096
-_TORCH7_ACTIONABLE_LUA_READ_BYTES = 64 * 1024
 _TORCH7_ASCII_HEADER_MAX_LINE_BYTES = 4096
-_TORCH7_BINARY_PAYLOAD_PROBE_BYTES = 256
-_TORCH7_ACTIONABLE_LUA_PATTERN = re.compile(
-    rb"(?i)\b(?:os\.execute|io\.popen|loadstring|dofile|loadfile|setfenv|getfenv|package\.loadlib|ffi\.load|loadlib)\b"
-)
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
 _ONNX_MODEL_MAX_ROUTING_FIELDS = 4096
 _ONNX_GRAPH_MAX_ROUTING_FIELDS = 4096
@@ -2991,26 +2986,6 @@ def _find_torch7_binary_object_signature_offset(prefix: bytes) -> int | None:
         search_offset = match_offset + 1
 
 
-def _has_torch7_binary_magic_with_actionable_lua(prefix: bytes, offset: int = 0) -> bool:
-    """Return whether a bare binary Torch7 marker has nearby Lua risk signal."""
-    if len(prefix) - offset < 8 or not prefix.startswith(b"T7\x00\x00", offset):
-        return False
-    next_marker = prefix.find(b"T7\x00\x00", offset + len(b"T7\x00\x00"))
-    window_end = offset + _TORCH7_ACTIONABLE_LUA_READ_BYTES if next_marker == -1 else next_marker
-    window = prefix[offset:window_end]
-    return _TORCH7_ACTIONABLE_LUA_PATTERN.search(window) is not None
-
-
-def _has_torch7_binary_payload_bytes(prefix: bytes, offset: int = 0) -> bool:
-    """Return whether a binary Torch7 marker is followed by non-text record bytes."""
-    if len(prefix) - offset < 8 or not prefix.startswith(b"T7\x00\x00", offset):
-        return False
-    next_marker = prefix.find(b"T7\x00\x00", offset + len(b"T7\x00\x00"))
-    window_end = offset + _TORCH7_BINARY_PAYLOAD_PROBE_BYTES if next_marker == -1 else next_marker
-    window = prefix[offset + len(b"T7\x00\x00") : window_end]
-    return any(byte in _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES for byte in window)
-
-
 def _find_torch7_binary_candidate_offset(prefix: bytes) -> int | None:
     """Return the offset of a binary Torch7 candidate worth secondary analysis."""
     search_offset = 0
@@ -3018,11 +2993,7 @@ def _find_torch7_binary_candidate_offset(prefix: bytes) -> int | None:
         match_offset = prefix.find(b"T7\x00\x00", search_offset)
         if match_offset == -1:
             return None
-        if (
-            _has_torch7_binary_object_structure(prefix, match_offset)
-            or _has_torch7_binary_magic_with_actionable_lua(prefix, match_offset)
-            or _has_torch7_binary_payload_bytes(prefix, match_offset)
-        ):
+        if len(prefix) - match_offset >= 8:
             return match_offset
         search_offset = match_offset + 1
 

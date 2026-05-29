@@ -281,6 +281,28 @@ def test_llamafile_preserves_later_same_severity_distinct_torch7_findings(tmp_pa
     ]
 
 
+def test_llamafile_preserves_same_signal_torch7_candidates_with_distinct_evidence(tmp_path: Path) -> None:
+    binary = tmp_path / "torch7-two-exec-candidates.llamafile"
+    first_exec_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id')\n"
+    second_exec_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('whoami')\n"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=first_exec_payload + (b"A" * 8192) + second_exec_payload))
+
+    result = LlamafileScanner(config={"torch7_max_scan_bytes": 128}).scan(str(binary))
+
+    assert [candidate["offset"] for candidate in result.metadata["embedded_torch7_candidates"]] == [
+        binary.read_bytes().index(first_exec_payload),
+        binary.read_bytes().index(second_exec_payload),
+    ]
+    failed_examples = [
+        example
+        for check in result.checks
+        if check.name == "Torch7 Lua Execution Primitive Analysis" and check.status == CheckStatus.FAILED
+        for example in check.details["examples"]
+    ]
+    assert any("os.execute('id')" in example for example in failed_examples)
+    assert any("os.execute('whoami')" in example for example in failed_examples)
+
+
 def test_llamafile_prefers_later_critical_torch7_candidate_over_warning_decoy(tmp_path: Path) -> None:
     binary = tmp_path / "torch7-warning-decoy-then-critical.llamafile"
     warning_decoy = b"T7\x00\x00torch.FloatTensor nn.Sequential\npackage.loadlib('libx.so', 'luaopen_x')\n"
@@ -295,6 +317,25 @@ def test_llamafile_prefers_later_critical_torch7_candidate_over_warning_decoy(tm
         check.name == "Torch7 Lua Execution Primitive Analysis"
         and check.status == CheckStatus.FAILED
         and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_llamafile_keeps_searching_after_non_actionable_candidate_cap(tmp_path: Path) -> None:
+    binary = tmp_path / "torch7-many-benign-candidates-then-payload.llamafile"
+    benign_candidates = b"".join(b"T7\x00\x00" + (b"A" * 64) for _ in range(32))
+    torch7_payload = b"T7\x00\x00" + (b"A" * (80 * 1024)) + b"cmd = os.execute('id')\n"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=benign_candidates + torch7_payload))
+
+    result = LlamafileScanner(
+        config={"llamafile_torch7_max_candidate_scans": 4, "torch7_max_scan_bytes": 128 * 1024}
+    ).scan(str(binary))
+
+    assert result.metadata["embedded_torch7_offset"] == binary.read_bytes().index(torch7_payload)
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
         for check in result.checks
     )
 
@@ -341,6 +382,22 @@ def test_llamafile_preserves_magic_only_binary_torch7_payload_with_late_lua_sign
     binary = tmp_path / "late-magic-only-binary-torch7.llamafile"
     binary_records = b"\x01\x02\x03\x04" * (20 * 1024)
     torch7_payload = b"T7\x00\x00" + binary_records + b"cmd = os.execute('id')\n"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=torch7_payload))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["embedded_torch7_offset"] == binary.read_bytes().index(torch7_payload)
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+
+
+def test_llamafile_preserves_printable_magic_only_torch7_payload_with_late_lua_signal(tmp_path: Path) -> None:
+    binary = tmp_path / "late-printable-magic-only-torch7.llamafile"
+    torch7_payload = b"T7\x00\x00" + (b"A" * (80 * 1024)) + b"cmd = os.execute('id')\n"
     binary.write_bytes(_build_llamafile_blob(embedded_payload=torch7_payload))
 
     result = LlamafileScanner().scan(str(binary))

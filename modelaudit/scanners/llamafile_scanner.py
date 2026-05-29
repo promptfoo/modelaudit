@@ -44,6 +44,9 @@ MACHO_MAGICS = {
 }
 
 PRINTABLE_TEXT_RE = re.compile(rb"[ -~]{8,}")
+TORCH7_ACTIONABLE_BYTES_RE = re.compile(
+    rb"(?i)\b(?:os\.execute|io\.popen|loadstring|dofile|loadfile|setfenv|getfenv|package\.loadlib|ffi\.load|loadlib)\b"
+)
 SAFE_LOCALHOST_URL_RE = re.compile(
     r"https?://(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\]|::1)(?::\d+)?(?:/[^\s]*)?",
     re.IGNORECASE,
@@ -494,15 +497,33 @@ class LlamafileScanner(BaseScanner):
 
         scanner = Torch7Scanner(config=self.config)
         actionable_results: list[tuple[ScanResult, int, int, IssueSeverity]] = []
-        actionable_keys: set[tuple[str, str, str, str]] = set()
+        actionable_keys: set[tuple[str, str, str, str, str]] = set()
         best_actionable_rank = 0
         deferred_incomplete: tuple[ScanResult, int, int] | None = None
         next_offset: int | None = offset
-        candidate_scans = 0
+        non_actionable_scans = 0
 
-        while next_offset is not None and candidate_scans < self.max_torch7_candidate_scans:
-            candidate_scans += 1
+        while next_offset is not None:
             structurally_credible = self._embedded_torch7_candidate_is_structural(path, next_offset)
+            has_binary_payload = self._embedded_torch7_candidate_has_binary_payload_bytes(path, next_offset)
+            has_actionable_signal = self._embedded_torch7_candidate_has_actionable_signal(
+                path, next_offset, scanner.max_scan_bytes
+            )
+            if not (structurally_credible or has_binary_payload or has_actionable_signal):
+                next_offset = self._find_embedded_torch7_offset(
+                    path,
+                    self.max_payload_scan_bytes,
+                    start_offset=next_offset + 1,
+                )
+                continue
+            if non_actionable_scans >= self.max_torch7_candidate_scans and not has_actionable_signal:
+                next_offset = self._find_embedded_torch7_offset(
+                    path,
+                    self.max_payload_scan_bytes,
+                    start_offset=next_offset + 1,
+                )
+                continue
+
             embedded_result, carve_size = self._scan_embedded_torch7_candidate(path, scanner, result, next_offset)
             if embedded_result is not None:
                 actionable_severity = self._torch7_result_actionable_severity(embedded_result)
@@ -517,6 +538,8 @@ class LlamafileScanner(BaseScanner):
                         if not candidate_keys or not candidate_keys.issubset(actionable_keys):
                             actionable_results.append((embedded_result, next_offset, carve_size, actionable_severity))
                             actionable_keys.update(candidate_keys)
+                else:
+                    non_actionable_scans += 1
                 if (
                     deferred_incomplete is None
                     and structurally_credible
@@ -557,6 +580,34 @@ class LlamafileScanner(BaseScanner):
         except OSError:
             return False
         return find_structural_torch7_offset(prefix) == 0
+
+    @staticmethod
+    def _embedded_torch7_candidate_has_binary_payload_bytes(path: Path, offset: int) -> bool:
+        try:
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                prefix = handle.read(TORCH7_SIGNATURE_WINDOW_BYTES)
+        except OSError:
+            return False
+        if len(prefix) < 8 or not prefix.startswith(b"T7\x00\x00"):
+            return False
+        next_marker = prefix.find(b"T7\x00\x00", len(b"T7\x00\x00"))
+        window_end = 256 if next_marker == -1 else next_marker
+        window = prefix[len(b"T7\x00\x00") : window_end]
+        return any(byte not in b"\t\n\r" + bytes(range(0x20, 0x7F)) for byte in window)
+
+    @staticmethod
+    def _embedded_torch7_candidate_has_actionable_signal(path: Path, offset: int, max_scan_bytes: int) -> bool:
+        try:
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                payload = handle.read(max_scan_bytes)
+        except OSError:
+            return False
+        next_marker = payload.find(b"T7\x00\x00", len(b"T7\x00\x00"))
+        if next_marker != -1:
+            payload = payload[:next_marker]
+        return TORCH7_ACTIONABLE_BYTES_RE.search(payload) is not None
 
     def _scan_embedded_torch7_candidate(
         self,
@@ -612,24 +663,35 @@ class LlamafileScanner(BaseScanner):
         return 2 if severity == IssueSeverity.CRITICAL else 1
 
     @staticmethod
-    def _torch7_actionable_finding_keys(result: ScanResult) -> set[tuple[str, str, str, str]]:
-        keys: set[tuple[str, str, str, str]] = set()
+    def _torch7_actionable_finding_keys(result: ScanResult) -> set[tuple[str, str, str, str, str]]:
+        keys: set[tuple[str, str, str, str, str]] = set()
         for check in result.checks:
             if check.status == CheckStatus.FAILED and check.severity in {
                 IssueSeverity.WARNING,
                 IssueSeverity.CRITICAL,
             }:
+                examples = check.details.get("examples", "")
                 keys.add(
                     (
                         "check",
                         check.name,
                         check.severity.value,
                         str(check.details.get("signal", "")),
+                        repr(examples),
                     )
                 )
         for issue in result.issues:
             if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}:
-                keys.add(("issue", issue.message, issue.severity.value, str(issue.details.get("signal", ""))))
+                examples = issue.details.get("examples", "")
+                keys.add(
+                    (
+                        "issue",
+                        issue.message,
+                        issue.severity.value,
+                        str(issue.details.get("signal", "")),
+                        repr(examples),
+                    )
+                )
         return keys
 
     @staticmethod
