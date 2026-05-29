@@ -766,16 +766,10 @@ def _resolve_getattr_call_names(
     if not (normalized_helper_names & {"getattr", "builtins.getattr"}):
         return None
 
-    target_root_node: ast.AST | None = node.args[0] if node.args else None
-    attr_name_node: ast.AST | None = node.args[1] if len(node.args) >= 2 else None
-    for keyword in node.keywords:
-        if keyword.arg == "object" and target_root_node is None:
-            target_root_node = keyword.value
-        elif keyword.arg == "name" and attr_name_node is None:
-            attr_name_node = keyword.value
-
-    if target_root_node is None or attr_name_node is None:
+    if len(node.args) not in {2, 3} or node.keywords:
         return None
+    target_root_node = node.args[0]
+    attr_name_node = node.args[1]
 
     attr_name = _resolve_static_string(attr_name_node)
     if attr_name is None:
@@ -1286,13 +1280,19 @@ def _resolve_ctypes_library_loader_instance_roots(
             continue
         self_node: ast.AST | None = None
         unbound_library_name_node: ast.AST | None = None
-        if len(node.args) == 2 and not node.keywords:
+        invalid_unbound_call = len(node.args) > 2
+        if len(node.args) >= 1:
             self_node = node.args[0]
+        if len(node.args) >= 2:
             unbound_library_name_node = node.args[1]
-        elif len(node.args) == 1 and len(node.keywords) == 1 and node.keywords[0].arg == "name":
-            self_node = node.args[0]
-            unbound_library_name_node = node.keywords[0].value
-        if self_node is None or unbound_library_name_node is None:
+        for keyword in node.keywords:
+            if keyword.arg == "self" and self_node is None:
+                self_node = keyword.value
+            elif keyword.arg == "name" and unbound_library_name_node is None:
+                unbound_library_name_node = keyword.value
+            else:
+                invalid_unbound_call = True
+        if invalid_unbound_call or self_node is None or unbound_library_name_node is None:
             continue
         resolved_self_names = _resolve_static_reference_names(
             self_node,
@@ -1889,11 +1889,45 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self._visit_function_scope(node)
         self._bind_name(node.name, None)
 
+    def _class_preserves_ctypes_loader_init(self, node: ast.ClassDef) -> bool:
+        init_method = next(
+            (
+                statement
+                for statement in node.body
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) and statement.name == "__init__"
+            ),
+            None,
+        )
+        if init_method is None:
+            return True
+        for child in ast.walk(init_method):
+            if not isinstance(child, ast.Call):
+                continue
+            if (
+                isinstance(child.func, ast.Attribute)
+                and child.func.attr == "__init__"
+                and isinstance(child.func.value, ast.Call)
+                and _resolve_call_name(child.func.value.func) == "super"
+            ):
+                return True
+            resolved_names = self._resolve_reference_names(child.func)
+            if resolved_names is None:
+                continue
+            for resolved_name in resolved_names:
+                root_name = _strip_dunder_call_suffixes(resolved_name).removesuffix(".__init__")
+                if root_name in _CTYPES_LIBRARY_LOADER_TYPES:
+                    return True
+        return False
+
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        ctypes_loader_type_aliases = frozenset(
-            alias
-            for base in node.bases
-            for alias in _canonical_ctypes_loader_type_aliases(self._resolve_reference_names(base))
+        ctypes_loader_type_aliases = (
+            frozenset(
+                alias
+                for base in node.bases
+                for alias in _canonical_ctypes_loader_type_aliases(self._resolve_reference_names(base))
+            )
+            if self._class_preserves_ctypes_loader_init(node)
+            else frozenset()
         )
         for decorator in node.decorator_list:
             self.visit(decorator)

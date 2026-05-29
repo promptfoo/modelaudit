@@ -604,6 +604,8 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "loader_variable.__getitem__(library_name)\n"
         "ctypes.LibraryLoader.LoadLibrary(ctypes.cdll, 'unboundlib')\n"
         "ctypes.LibraryLoader.__getitem__(ctypes.cdll, 'unboundgetitem')\n"
+        "ctypes.LibraryLoader.LoadLibrary(self=ctypes.cdll, name='selfkeywordlib')\n"
+        "ctypes.LibraryLoader.__getitem__(self=ctypes.cdll, name='selfkeywordgetitem')\n"
         "object.__getattribute__(ctypes.cdll, 'LoadLibrary')('objectmethodlib')\n"
         "object.__getattribute__(ctypes.cdll, '__getitem__')('objectgetitem')\n"
         "ctypes.windll.kernel32 = len\n"
@@ -651,6 +653,8 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.LibraryLoader.subclasslib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.cdll.unboundlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.cdll.unboundgetitem" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.selfkeywordlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.selfkeywordgetitem" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.cdll.objectmethodlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.cdll.objectgetitem" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.kernel32" in checks_by_rule["S110"].details["reason"]
@@ -803,6 +807,7 @@ def test_scan_zip_preserves_dynamic_member_risk_after_conditional_overwrite(tmp_
         "import ctypes\nname = ctypes.LibraryLoader.payload\n",
         "import ctypes\nctypes.LibraryLoader = len\nctypes.LibraryLoader(ctypes.CDLL).payload\n",
         "import ctypes\nctypes.windll.kernel32 = len\ngetattr(ctypes.windll, 'kernel32')\n",
+        "import ctypes\ngetattr(object=ctypes.cdll, name='msvcrt')\n",
         "import ctypes\nctypes.cdll.__getattribute__('msvcrt')\n",
         "import ctypes\nobject.__getattribute__(ctypes.cdll, 'msvcrt')\n",
         "import ctypes\nctypes.windll.kernel32 = len\nctypes.windll.kernel32\n",
@@ -812,6 +817,12 @@ def test_scan_zip_preserves_dynamic_member_risk_after_conditional_overwrite(tmp_
         (
             "import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL)\n"
             "other = loader\nloader.payload = len\nother.payload([])\n"
+        ),
+        (
+            "import ctypes\nclass SafeCDLL(ctypes.CDLL):\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        pass\n"
+            "ctypes.LibraryLoader(SafeCDLL).payload\nSafeCDLL('/missing')\n"
         ),
     ],
 )
