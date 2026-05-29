@@ -76,6 +76,30 @@ def _pytorch_storage_persistent_id_payload(key: str | bytes) -> bytes:
     )
 
 
+def _pytorch_storage_persistent_id_payload_with_popped_key(key: str, popped_key: str) -> bytes:
+    payload = _pytorch_storage_persistent_id_payload(key)
+    popped_key_bytes = popped_key.encode("utf-8")
+    assert len(popped_key_bytes) < 256
+    assert payload.endswith(b"Q.")
+    return payload[:-2] + b"\x8c" + bytes([len(popped_key_bytes)]) + popped_key_bytes + b"\x940" + payload[-2:]
+
+
+def _short_binbytes(value: bytes) -> bytes:
+    assert len(value) < 256
+    return b"C" + bytes([len(value)]) + value + b"\x94"
+
+
+def _fake_byte_storage_persistent_id_payload(key: str) -> bytes:
+    return (
+        b"\x80\x04("
+        + _short_binbytes(b"storage")
+        + _short_binbytes(b"FakeStorage")
+        + _short_binbytes(key.encode("utf-8"))
+        + _short_binbytes(b"cpu")
+        + b"K\x01tQ."
+    )
+
+
 def _write_zip_with_duplicate_data_pkl(zip_path: Path, first_payload: bytes, second_payload: bytes) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
@@ -506,6 +530,56 @@ def test_pytorch_zip_scanner_probes_unreferenced_numeric_storage_lookalike(tmp_p
 
     result = PyTorchZipScanner().scan(str(model_path))
 
+    assert any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("file") == "archive/data/999"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_only_probes_popped_storage_key_decoys(tmp_path: Path) -> None:
+    """Scanner-only fallback trust must follow the actual BINPERSID operand."""
+    model_path = create_mock_pytorch_zip(tmp_path / "popped_storage_decoy.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload_with_popped_key("0", "999"))
+        zip_file.writestr("archive/data/0", b"\x00" * 8)
+        zip_file.writestr("archive/data/999", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner(config={"scanners": ["pytorch_zip"]}).scan(str(model_path))
+
+    assert result.success is False
+    trusted_keys = {
+        check.details.get("pytorch_storage_key")
+        for check in result.checks
+        if check.details.get("trusted_pytorch_archive_context") is True
+    }
+    assert trusted_keys == {"0"}
+    assert any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("file") == "archive/data/999"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_only_rejects_fake_byte_storage_descriptors(tmp_path: Path) -> None:
+    """Scanner-only fallback trust must require a real torch storage GLOBAL descriptor."""
+    model_path = create_mock_pytorch_zip(tmp_path / "fake_byte_storage.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", _fake_byte_storage_persistent_id_payload("999"))
+        zip_file.writestr("archive/data/999", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner(config={"scanners": ["pytorch_zip"]}).scan(str(model_path))
+
+    assert result.success is False
+    assert not any(
+        check.details.get("trusted_pytorch_archive_context") is True
+        and check.details.get("pytorch_storage_key") == "999"
+        for check in result.checks
+    )
     assert any(
         check.name == "Executable File Detection"
         and check.status == CheckStatus.FAILED

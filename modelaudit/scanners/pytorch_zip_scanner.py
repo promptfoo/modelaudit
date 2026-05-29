@@ -53,6 +53,14 @@ _PORTABLE_EXECUTABLE_MAX_PROBE_BYTES = (1024 * 1024) + 4
 _TORCHSCRIPT_FORBIDDEN_SOURCE_PATTERN = re.compile(
     r"(?im)(?:^\s*(?:import|from)\s+|\b(?:__import__|eval|exec|compile|open)\s*\(|\b(?:os|subprocess|socket|requests)\s*\.)"
 )
+
+
+@dataclass(frozen=True)
+class _PickleGlobalRef:
+    module: str
+    name: str
+
+
 _TORCHSCRIPT_FORBIDDEN_AST_NAMES: frozenset[str] = frozenset(
     {
         "__builtins__",
@@ -1522,27 +1530,127 @@ class PyTorchZipScanner(BaseScanner):
         except Exception:
             return set()
 
-        string_op_names = {"BINSTRING", "SHORT_BINSTRING", "BINUNICODE", "SHORT_BINUNICODE", "UNICODE"}
+        marker = object()
+        memo: dict[int, Any] = {}
+        stack: list[Any] = []
         referenced_keys: set[str] = set()
-        for index, (opcode, _arg, _pos) in enumerate(opcodes):
-            if opcode.name != "BINPERSID":
-                continue
 
-            window_strings: list[str] = []
-            for candidate_opcode, candidate_arg, _candidate_pos in opcodes[max(0, index - 20) : index]:
-                if candidate_opcode.name not in string_op_names:
+        def pop_marked_tuple() -> tuple[Any, ...] | None:
+            items: list[Any] = []
+            while stack:
+                item = stack.pop()
+                if item is marker:
+                    return tuple(reversed(items))
+                items.append(item)
+            return None
+
+        def memo_key(value: Any) -> int | None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        def storage_key_from_pid(pid: Any) -> str | None:
+            if not isinstance(pid, tuple) or len(pid) < 3:
+                return None
+            if pid[0] != "storage":
+                return None
+            storage_type = pid[1]
+            if not (
+                isinstance(storage_type, _PickleGlobalRef)
+                and storage_type.module == "torch"
+                and storage_type.name.endswith("Storage")
+            ):
+                return None
+            storage_key = cls._coerce_pickle_string_arg(pid[2])
+            if (
+                storage_key is not None
+                and cls._is_ascii_decimal_digits(storage_key)
+                and storage_key in trusted_storage_keys
+            ):
+                return storage_key
+            return None
+
+        for opcode, arg, _pos in opcodes:
+            opcode_name = opcode.name
+            if opcode_name in {"PROTO", "FRAME", "STOP"}:
+                continue
+            if opcode_name == "MARK":
+                stack.append(marker)
+            elif opcode_name in {
+                "BINSTRING",
+                "SHORT_BINSTRING",
+                "BINUNICODE",
+                "SHORT_BINUNICODE",
+                "UNICODE",
+                "BINBYTES",
+                "SHORT_BINBYTES",
+            }:
+                stack.append(cls._coerce_pickle_string_arg(arg))
+            elif opcode_name == "GLOBAL":
+                global_name = cls._coerce_pickle_string_arg(arg)
+                if global_name is None:
+                    stack.append(None)
                     continue
-                candidate = cls._coerce_pickle_string_arg(candidate_arg)
-                if candidate is not None:
-                    window_strings.append(candidate)
-
-            if "storage" not in window_strings or not any(value.endswith("Storage") for value in window_strings):
-                continue
-
-            for value in reversed(window_strings):
-                if cls._is_ascii_decimal_digits(value) and value in trusted_storage_keys:
-                    referenced_keys.add(value)
-                    break
+                parts = global_name.split()
+                stack.append(_PickleGlobalRef(parts[0], parts[1]) if len(parts) == 2 else None)
+            elif opcode_name == "STACK_GLOBAL":
+                if len(stack) < 2:
+                    stack.clear()
+                    continue
+                name = cls._coerce_pickle_string_arg(stack.pop())
+                module = cls._coerce_pickle_string_arg(stack.pop())
+                stack.append(_PickleGlobalRef(module, name) if module is not None and name is not None else None)
+            elif opcode_name == "EMPTY_TUPLE":
+                stack.append(())
+            elif opcode_name == "TUPLE":
+                tuple_value = pop_marked_tuple()
+                if tuple_value is None:
+                    stack.clear()
+                else:
+                    stack.append(tuple_value)
+            elif opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+                tuple_size = int(opcode_name[-1])
+                if len(stack) < tuple_size:
+                    stack.clear()
+                    continue
+                items = stack[-tuple_size:]
+                del stack[-tuple_size:]
+                stack.append(tuple(items))
+            elif opcode_name in {"BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "INT"}:
+                stack.append(arg)
+            elif opcode_name == "NONE":
+                stack.append(None)
+            elif opcode_name == "NEWTRUE":
+                stack.append(True)
+            elif opcode_name == "NEWFALSE":
+                stack.append(False)
+            elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
+                key = memo_key(arg)
+                if key is not None and stack:
+                    memo[key] = stack[-1]
+            elif opcode_name == "MEMOIZE":
+                if stack:
+                    memo[len(memo)] = stack[-1]
+            elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
+                key = memo_key(arg)
+                stack.append(memo.get(key) if key is not None else None)
+            elif opcode_name == "POP":
+                if stack:
+                    stack.pop()
+            elif opcode_name == "POP_MARK":
+                pop_marked_tuple()
+            elif opcode_name == "DUP":
+                if stack:
+                    stack.append(stack[-1])
+            elif opcode_name == "BINPERSID":
+                pid = stack.pop() if stack else None
+                storage_key = storage_key_from_pid(pid)
+                if storage_key is not None:
+                    referenced_keys.add(storage_key)
+                stack.append(None)
+            else:
+                stack.clear()
         return referenced_keys
 
     def _record_trusted_storage_persistent_ids_without_pickle_scanner(

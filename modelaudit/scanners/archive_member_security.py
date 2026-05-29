@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+import shlex
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -40,6 +41,8 @@ _MACHO_FAT_MAGICS = {
 }
 _VERSIONED_SHARED_OBJECT_SUFFIX_RE = re.compile(r"\.so(?:\.[0-9]+)+$")
 _PYTHON_ARCHIVE_MEMBER_SUFFIXES = (".py", ".pyw")
+_PYTHON_SHEBANG_COMMAND_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?w?|pypy(?:\d+(?:\.\d+)*)?)$")
+_ENV_SHEBANG_OPTIONS_WITH_ARGUMENT = frozenset({"-u", "--unset", "-C", "--chdir"})
 _HIGH_RISK_PYTHON_CALLS = {
     "__import__",
     "builtins.__import__",
@@ -58,6 +61,17 @@ _HIGH_RISK_PYTHON_CALLS = {
     "subprocess.Popen",
     "subprocess.run",
 }
+
+
+def _split_env_shebang_command(value: str) -> str | None:
+    try:
+        split_parts = shlex.split(value)
+    except ValueError:
+        split_parts = value.split()
+    if not split_parts:
+        return None
+    return split_parts[0].rsplit("/", 1)[-1].lower()
+
 
 # Map each high-risk call name to the rule code that best describes its risk
 # category. SARIF consumers, dashboards, and per-rule severity overrides rely
@@ -226,6 +240,76 @@ def probe_executable_archive_member_content(path: str) -> ExecutableArchiveMembe
 def is_executable_archive_member_content(path: str) -> bool:
     """Return True when a member begins with a confirmed executable signature."""
     return probe_executable_archive_member_content(path) == "detected"
+
+
+def _shebang_command_name(source_bytes: bytes) -> str | None:
+    if not source_bytes.startswith(b"#!"):
+        return None
+    first_line = source_bytes.splitlines()[0][2:].decode("utf-8", errors="ignore").strip()
+    if not first_line:
+        return None
+    try:
+        parts = shlex.split(first_line)
+    except ValueError:
+        parts = first_line.split()
+    if not parts:
+        return None
+
+    command = parts[0].rsplit("/", 1)[-1].lower()
+    if command != "env":
+        return command
+
+    index = 1
+    while index < len(parts):
+        token = parts[index]
+        if token in {"-S", "--split-string"}:
+            if index + 1 >= len(parts):
+                return None
+            return _split_env_shebang_command(parts[index + 1])
+        if token.startswith("--split-string="):
+            return _split_env_shebang_command(token.split("=", 1)[1])
+        if token.startswith("-S") and token != "-S":
+            return _split_env_shebang_command(token[2:])
+        if token in _ENV_SHEBANG_OPTIONS_WITH_ARGUMENT:
+            index += 2
+            continue
+        if token == "--" or token.startswith("--unset=") or token.startswith("--chdir="):
+            index += 1
+            continue
+        if token.startswith("-") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            index += 1
+            continue
+        return token.rsplit("/", 1)[-1].lower()
+    return None
+
+
+def _python_member_has_non_python_shebang(source_bytes: bytes) -> bool:
+    if not source_bytes.startswith(b"#!"):
+        return False
+    command = _shebang_command_name(source_bytes)
+    return command is None or _PYTHON_SHEBANG_COMMAND_RE.fullmatch(command) is None
+
+
+def _probe_python_archive_member_executable_content(path: str) -> ExecutableArchiveMemberProbeOutcome:
+    try:
+        with open(path, "rb") as member_file:
+            prefix_cache = member_file.read(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES)
+            if prefix_cache.startswith(b"#!"):
+                return "detected" if _python_member_has_non_python_shebang(prefix_cache) else "absent"
+
+            def read_prefix(limit: int) -> bytes:
+                nonlocal prefix_cache
+                if limit <= len(prefix_cache) or not prefix_cache.startswith(b"MZ"):
+                    return prefix_cache[:limit]
+                member_file.seek(0)
+                expanded_prefix = member_file.read(limit)
+                if len(expanded_prefix) > len(prefix_cache):
+                    prefix_cache = expanded_prefix
+                return prefix_cache[:limit]
+
+            return probe_executable_archive_member_signature(read_prefix)
+    except OSError:
+        return "absent"
 
 
 def executable_archive_member_content_rule_code(path: str) -> str | None:
@@ -1661,6 +1745,7 @@ def scan_archive_member_for_known_risks(
     python_analysis_incomplete_reason: str,
     executable_analysis_incomplete_reason: str,
     analyze_python_source: bool = True,
+    analyze_executable_content: bool = True,
 ) -> None:
     """Inspect generic archive members that nested dispatch would otherwise ignore.
 
@@ -1690,6 +1775,23 @@ def scan_archive_member_for_known_risks(
                     "analysis_incomplete": True,
                 },
             )
+            if analyze_executable_content and tmp_path is not None:
+                executable_probe_outcome = _probe_python_archive_member_executable_content(tmp_path)
+                if executable_probe_outcome == "detected":
+                    _add_executable_archive_member_check(
+                        archive_kind=archive_kind,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        result=result,
+                    )
+                elif executable_probe_outcome == "incomplete":
+                    _add_incomplete_executable_archive_member_check(
+                        archive_kind=archive_kind,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        result=result,
+                        incomplete_reason=executable_analysis_incomplete_reason,
+                    )
             return
 
         if tmp_path is None:
@@ -1706,10 +1808,8 @@ def scan_archive_member_for_known_risks(
 
         try:
             with open(tmp_path, "rb") as member_file:
-                calls = high_risk_python_calls_in_source(member_file.read())
-        except PythonArchiveMemberParseError as exc:
-            executable_probe_outcome = probe_executable_archive_member_content(tmp_path)
-            if executable_probe_outcome == "detected":
+                source_bytes = member_file.read()
+            if analyze_executable_content and _python_member_has_non_python_shebang(source_bytes):
                 _add_executable_archive_member_check(
                     archive_kind=archive_kind,
                     archive_path=archive_path,
@@ -1717,15 +1817,27 @@ def scan_archive_member_for_known_risks(
                     result=result,
                 )
                 return
-            if executable_probe_outcome == "incomplete":
-                _add_incomplete_executable_archive_member_check(
-                    archive_kind=archive_kind,
-                    archive_path=archive_path,
-                    member_name=member_name,
-                    result=result,
-                    incomplete_reason=executable_analysis_incomplete_reason,
-                )
-                return
+            calls = high_risk_python_calls_in_source(source_bytes)
+        except PythonArchiveMemberParseError as exc:
+            if analyze_executable_content:
+                executable_probe_outcome = _probe_python_archive_member_executable_content(tmp_path)
+                if executable_probe_outcome == "detected":
+                    _add_executable_archive_member_check(
+                        archive_kind=archive_kind,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        result=result,
+                    )
+                    return
+                if executable_probe_outcome == "incomplete":
+                    _add_incomplete_executable_archive_member_check(
+                        archive_kind=archive_kind,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        result=result,
+                        incomplete_reason=executable_analysis_incomplete_reason,
+                    )
+                    return
 
             mark_archive_scan_incomplete(result, python_analysis_incomplete_reason)
             result.add_check(
@@ -1773,7 +1885,7 @@ def scan_archive_member_for_known_risks(
         )
         return
 
-    if tmp_path is None:
+    if tmp_path is None or not analyze_executable_content:
         return
 
     executable_probe_outcome = probe_executable_archive_member_content(tmp_path)

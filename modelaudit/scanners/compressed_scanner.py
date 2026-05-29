@@ -17,6 +17,8 @@ from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_
 from ..utils.file._compression import is_zlib_header
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
+from ._archive_outcomes import member_scan_incomplete
+from .archive_member_security import scan_archive_member_for_known_risks
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 
@@ -102,11 +104,15 @@ class CompressedScanner(BaseScanner):
     DEFAULT_MAX_DEPTH: ClassVar[int] = 3
     DEFAULT_MAX_MEMBERS: ClassVar[int] = 1000
     DEFAULT_CHUNK_SIZE: ClassVar[int] = 64 * 1024
+    MAX_PYTHON_PAYLOAD_ANALYSIS_BYTES: ClassVar[int] = 10 * 1024 * 1024
     _DEPTH_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_depth_limit_exceeded"
     _MEMBER_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_member_limit_exceeded"
     _DECOMPRESSION_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_decompression_limit_exceeded"
     _OPTIONAL_DEPENDENCY_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_optional_dependency_unavailable"
     _STREAM_DECODE_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_stream_decode_failed"
+    _PYTHON_PAYLOAD_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_python_payload_analysis_incomplete"
+    _EXECUTABLE_PAYLOAD_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_executable_payload_analysis_incomplete"
+    _LOGICAL_WRAPPER_NAME_CONFIG: ClassVar[str] = "_compressed_logical_wrapper_name"
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -181,6 +187,13 @@ class CompressedScanner(BaseScanner):
         if wrapper_path.suffix and CompressedScanner._has_declared_wrapper_extension(path):
             return wrapper_path.name[: -len(wrapper_path.suffix)]
         return f"{wrapper_path.name}.inner"
+
+    @staticmethod
+    def _derive_inner_security_name(path: str) -> str:
+        wrapper_path = Path(path)
+        if wrapper_path.suffix and CompressedScanner._has_declared_wrapper_extension(path):
+            return wrapper_path.name[: -len(wrapper_path.suffix)]
+        return wrapper_path.name
 
     @staticmethod
     def _copy_stream_with_limits(
@@ -696,6 +709,91 @@ class CompressedScanner(BaseScanner):
             and not any(issue.severity == IssueSeverity.CRITICAL for issue in member_result.issues)
         )
 
+    @staticmethod
+    def _set_compressed_provenance(
+        result: ScanResult,
+        *,
+        first_issue: int,
+        first_check: int,
+        provenance: str,
+    ) -> None:
+        for issue in result.issues[first_issue:]:
+            issue.location = provenance
+            issue.details["compressed_wrapper"] = provenance
+        for check in result.checks[first_check:]:
+            check.location = provenance
+            check.details["compressed_wrapper"] = provenance
+
+    def _scan_decompressed_payload_security(
+        self,
+        *,
+        path: str,
+        security_name: str,
+        provenance: str,
+        temp_path: str,
+        member_temp_paths: list[str],
+        decompressed_bytes: int,
+        inner_owns_executable_content: bool,
+        result: ScanResult,
+    ) -> None:
+        first_issue = len(result.issues)
+        first_check = len(result.checks)
+        scan_archive_member_for_known_risks(
+            archive_kind="compressed",
+            archive_path=path,
+            member_name=security_name,
+            tmp_path=temp_path,
+            total_size=decompressed_bytes,
+            result=result,
+            max_python_analysis_bytes=self.MAX_PYTHON_PAYLOAD_ANALYSIS_BYTES,
+            python_analysis_incomplete_reason=self._PYTHON_PAYLOAD_INCONCLUSIVE_REASON,
+            executable_analysis_incomplete_reason=self._EXECUTABLE_PAYLOAD_INCONCLUSIVE_REASON,
+            analyze_executable_content=not inner_owns_executable_content,
+        )
+        self._set_compressed_provenance(
+            result,
+            first_issue=first_issue,
+            first_check=first_check,
+            provenance=provenance,
+        )
+
+        scan_outcome_reasons = result.metadata.get("scan_outcome_reasons")
+        aggregate_python_incomplete = (
+            isinstance(scan_outcome_reasons, list) and self._PYTHON_PAYLOAD_INCONCLUSIVE_REASON in scan_outcome_reasons
+        )
+        aggregate_executable_detected = any(
+            check.name == "Executable Archive Member Detection" for check in result.checks[first_check:]
+        )
+        if len(member_temp_paths) <= 1 or (aggregate_executable_detected and not aggregate_python_incomplete):
+            return
+
+        for member_index, member_temp_path in enumerate(member_temp_paths, start=1):
+            member_provenance = f"{provenance}#member-{member_index}"
+            member_first_issue = len(result.issues)
+            member_first_check = len(result.checks)
+            scan_archive_member_for_known_risks(
+                archive_kind="compressed",
+                archive_path=path,
+                member_name=security_name,
+                tmp_path=member_temp_path,
+                total_size=self.get_file_size(member_temp_path),
+                result=result,
+                max_python_analysis_bytes=self.MAX_PYTHON_PAYLOAD_ANALYSIS_BYTES,
+                python_analysis_incomplete_reason=self._PYTHON_PAYLOAD_INCONCLUSIVE_REASON,
+                executable_analysis_incomplete_reason=self._EXECUTABLE_PAYLOAD_INCONCLUSIVE_REASON,
+                analyze_python_source=aggregate_python_incomplete,
+            )
+            self._set_compressed_provenance(
+                result,
+                first_issue=member_first_issue,
+                first_check=member_first_check,
+                provenance=member_provenance,
+            )
+            if not aggregate_python_incomplete and any(
+                check.name == "Executable Archive Member Detection" for check in result.checks[member_first_check:]
+            ):
+                return
+
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
@@ -816,11 +914,30 @@ class CompressedScanner(BaseScanner):
             nested_config = dict(self.config)
             nested_config["_compressed_depth"] = depth + 1
             nested_config["_archive_depth"] = depth + 1
+            # Extracted temp paths are removed after this scan and cannot yield reusable cache entries.
+            nested_config["cache_enabled"] = False
+            logical_wrapper_name = self.config.get(self._LOGICAL_WRAPPER_NAME_CONFIG, path)
+            if not isinstance(logical_wrapper_name, str) or not logical_wrapper_name:
+                logical_wrapper_name = path
+            security_name = self._derive_inner_security_name(logical_wrapper_name)
+            nested_config[self._LOGICAL_WRAPPER_NAME_CONFIG] = security_name
             inner_result = core.scan_file(temp_path, nested_config)
 
             inner_display = self._derive_inner_display_name(path)
             provenance = f"{path} -> {inner_display}"
             self._rewrite_inner_locations(inner_result, temp_path, provenance)
+            self._scan_decompressed_payload_security(
+                path=path,
+                security_name=security_name,
+                provenance=provenance,
+                temp_path=temp_path,
+                member_temp_paths=member_temp_paths,
+                decompressed_bytes=decompressed_bytes,
+                inner_owns_executable_content=(
+                    len(member_temp_paths) == 1 and inner_result.scanner_name == "llamafile" and inner_result.success
+                ),
+                result=result,
+            )
 
             result.add_check(
                 name="Compressed Wrapper Inner Scanner Routing",
@@ -938,5 +1055,5 @@ class CompressedScanner(BaseScanner):
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
 
-        result.finish(success=not result.has_errors)
+        result.finish(success=not member_scan_incomplete(result) and not result.has_errors)
         return result
