@@ -291,6 +291,21 @@ def _is_dynamic_overwritable_high_risk_reference(name: str) -> bool:
     )
 
 
+def _ctypes_loader_member_load_names(resolved_roots: frozenset[str], attr_name: str | None) -> frozenset[str]:
+    library_name = attr_name or _CTYPES_DYNAMIC_LIBRARY_NAME
+    if attr_name is not None and (
+        attr_name.startswith("_")
+        or attr_name in _CTYPES_LIBRARY_LOADER_NON_LOADING_ATTRIBUTES
+        or attr_name in {"LoadLibrary", "__getitem__"}
+    ):
+        return frozenset()
+    return frozenset(
+        f"{resolved_root}.{library_name}"
+        for resolved_root in resolved_roots
+        if _is_ctypes_library_loader_object_root(resolved_root)
+    )
+
+
 def _split_env_shebang_command(value: str) -> str | None:
     try:
         split_parts = shlex.split(value)
@@ -759,7 +774,9 @@ def _resolve_getattr_call_names(
             return None
         if attr_name in {"__getitem__", "LoadLibrary"}:
             loader_method_roots = frozenset(
-                root for root in resolved_target_roots if _is_ctypes_library_loader_object_root(root)
+                resolved_root
+                for resolved_root in resolved_target_roots
+                if _is_ctypes_library_loader_object_root(resolved_root)
             )
             if loader_method_roots:
                 return _apply_aliases_to_names(
@@ -779,29 +796,32 @@ def _resolve_getattr_call_names(
         )
 
     getattr_accessor_names = frozenset(
-        accessor_root
+        root
         for normalized_helper_name in normalized_helper_names
-        if normalized_helper_name.endswith(".__getattr__")
-        for accessor_root in (normalized_helper_name.rsplit(".", maxsplit=1)[0],)
-        if _is_ctypes_library_loader_object_root(accessor_root)
+        for root in (normalized_helper_name.rsplit(".", maxsplit=1)[0],)
+        if normalized_helper_name.endswith(".__getattr__") and _is_ctypes_library_loader_object_root(root)
     )
     getattribute_accessor_names = frozenset(
-        accessor_root
+        root
         for normalized_helper_name in normalized_helper_names
-        if normalized_helper_name.endswith(".__getattribute__")
-        for accessor_root in (normalized_helper_name.rsplit(".", maxsplit=1)[0],)
-        if not _is_ctypes_library_loader_object_root(accessor_root)
+        for root in (normalized_helper_name.rsplit(".", maxsplit=1)[0],)
+        if normalized_helper_name.endswith(".__getattribute__") and not _is_ctypes_library_loader_object_root(root)
     )
     accessor_names = getattr_accessor_names | getattribute_accessor_names
     if accessor_names:
-        if len(node.args) != 1 or node.keywords:
+        if node.keywords:
+            if node.args or len(node.keywords) != 1 or node.keywords[0].arg != "name" or not getattr_accessor_names:
+                return None
+            attr_name = _resolve_static_string(node.keywords[0].value)
+        else:
+            if len(node.args) != 1:
+                return None
+            attr_name = _resolve_static_string(node.args[0])
+        if attr_name is None and not getattr_accessor_names:
             return None
-        attr_name = _resolve_static_string(node.args[0])
-        if attr_name is None and getattr_accessor_names:
-            return frozenset(f"{target_root}.{_CTYPES_DYNAMIC_LIBRARY_NAME}" for target_root in getattr_accessor_names)
+        resolved_names: set[str] = set(_ctypes_loader_member_load_names(getattr_accessor_names, attr_name))
         if attr_name is None:
-            return None
-        resolved_names: set[str] = {f"{target_root}.{attr_name}" for target_root in getattr_accessor_names}
+            return frozenset(resolved_names) or None
         getattribute_names = _apply_aliases_to_names(
             frozenset(f"{target_root}.{attr_name}" for target_root in getattribute_accessor_names),
             alias_scopes,
@@ -821,6 +841,7 @@ def _resolve_getattr_call_names(
     target_root_node = node.args[0]
     attr_name_node = node.args[1]
 
+    attr_name = _resolve_static_string(attr_name_node)
     resolved_target_roots = _resolve_static_reference_names(
         target_root_node,
         alias_scopes,
@@ -829,15 +850,8 @@ def _resolve_getattr_call_names(
     )
     if resolved_target_roots is None:
         return None
-    attr_name = _resolve_static_string(attr_name_node)
     if attr_name is None:
-        loader_roots = frozenset(
-            target_root for target_root in resolved_target_roots if _is_ctypes_library_loader_object_root(target_root)
-        )
-        return (
-            frozenset(f"{resolved_target_root}.{_CTYPES_DYNAMIC_LIBRARY_NAME}" for resolved_target_root in loader_roots)
-            or None
-        )
+        return _ctypes_loader_member_load_names(resolved_target_roots, attr_name) or None
     return _apply_aliases_to_names(
         frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots),
         alias_scopes,
@@ -1260,6 +1274,12 @@ def _resolve_webbrowser_controller_factory_roots(
     return controller_factories or None
 
 
+def _single_static_unpack_element(node: ast.AST) -> ast.AST | None:
+    if isinstance(node, (ast.Tuple, ast.List)) and len(node.elts) == 1:
+        return node.elts[0]
+    return None
+
+
 def _resolve_ctypes_library_loader_instance_roots(
     node: ast.AST,
     alias_scopes: _AliasScopes,
@@ -1301,8 +1321,11 @@ def _resolve_ctypes_library_loader_instance_roots(
     loader_roots: set[str] = set()
     constructor_roots = resolved_func_names & _CTYPES_LIBRARY_LOADER_CONSTRUCTORS
     if constructor_roots:
+        loader_type_node: ast.AST | None
         if len(node.args) == 1 and not node.keywords:
             loader_type_node = node.args[0]
+            if isinstance(loader_type_node, ast.Starred):
+                loader_type_node = _single_static_unpack_element(loader_type_node.value)
         elif not node.args and len(node.keywords) == 1 and node.keywords[0].arg == "dlltype":
             loader_type_node = node.keywords[0].value
         else:
@@ -2173,12 +2196,26 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             scope[arguments.kwarg.arg] = None
         return scope
 
+    @staticmethod
+    def _initializer_binding_names(target: ast.AST) -> Iterator[str]:
+        yield from _binding_names(target)
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id in {"self", "cls"}
+        ):
+            yield f"{target.value.id}.{target.attr}"
+
     def _resolve_initializer_reference_names(
         self,
         node: ast.AST,
         class_scope: _AliasScope,
         initializer_scope: _AliasScope,
     ) -> frozenset[str] | None:
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in {"self", "cls"}:
+            local_aliases, local_found = _lookup_bound_alias(f"{node.value.id}.{node.attr}", [initializer_scope])
+            if local_found:
+                return local_aliases if isinstance(local_aliases, frozenset) else None
         class_local_names = self._class_local_method_aliases(node, class_scope)
         if class_local_names:
             return class_local_names
@@ -2189,19 +2226,49 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
         )
 
+    def _reference_identity_names(self, node: ast.AST) -> frozenset[str]:
+        names = set(self._resolve_reference_names(node) or frozenset())
+        syntactic_name = _resolve_call_name(node)
+        if syntactic_name is not None:
+            names.add(syntactic_name)
+        return frozenset(names)
+
+    def _super_call_preserves_ctypes_loader_init(
+        self,
+        super_call: ast.Call,
+        base_identity_names: list[frozenset[str]],
+        loader_base_indices: frozenset[int],
+    ) -> bool:
+        if not loader_base_indices or super_call.keywords:
+            return False
+        if not super_call.args:
+            return 0 in loader_base_indices
+        if len(super_call.args) != 2:
+            return False
+        first_arg_names = self._reference_identity_names(super_call.args[0])
+        for index, base_names in enumerate(base_identity_names):
+            if first_arg_names & base_names:
+                return any(loader_index > index for loader_index in loader_base_indices)
+        return False
+
     def _initializer_call_preserves_ctypes_loader_init(
         self,
         call: ast.Call,
         class_scope: _AliasScope,
         initializer_scope: _AliasScope,
-        first_base_loader_types: frozenset[str],
+        base_identity_names: list[frozenset[str]],
+        loader_base_indices: frozenset[int],
     ) -> bool:
         if (
-            first_base_loader_types
-            and isinstance(call.func, ast.Attribute)
+            isinstance(call.func, ast.Attribute)
             and call.func.attr == "__init__"
             and isinstance(call.func.value, ast.Call)
             and _resolve_call_name(call.func.value.func) == "super"
+            and self._super_call_preserves_ctypes_loader_init(
+                call.func.value,
+                base_identity_names,
+                loader_base_indices,
+            )
         ):
             return True
         return self._is_ctypes_loader_init_alias(
@@ -2213,14 +2280,16 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         node: ast.AST,
         class_scope: _AliasScope,
         initializer_scope: _AliasScope,
-        first_base_loader_types: frozenset[str],
+        base_identity_names: list[frozenset[str]],
+        loader_base_indices: frozenset[int],
     ) -> bool:
         return any(
             self._initializer_call_preserves_ctypes_loader_init(
                 call,
                 class_scope,
                 initializer_scope,
-                first_base_loader_types,
+                base_identity_names,
+                loader_base_indices,
             )
             for call in self._initializer_node_calls(node)
         )
@@ -2241,14 +2310,16 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         statements: list[ast.stmt],
         class_scope: _AliasScope,
         initializer_scope: _AliasScope,
-        first_base_loader_types: frozenset[str],
+        base_identity_names: list[frozenset[str]],
+        loader_base_indices: frozenset[int],
     ) -> bool:
         for statement in statements:
             if self._initializer_statement_preserves_ctypes_loader_init(
                 statement,
                 class_scope,
                 initializer_scope,
-                first_base_loader_types,
+                base_identity_names,
+                loader_base_indices,
             ):
                 return True
         return False
@@ -2258,7 +2329,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         statement: ast.stmt,
         class_scope: _AliasScope,
         initializer_scope: _AliasScope,
-        first_base_loader_types: frozenset[str],
+        base_identity_names: list[frozenset[str]],
+        loader_base_indices: frozenset[int],
     ) -> bool:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             return False
@@ -2269,28 +2341,32 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     statement.body,
                     class_scope,
                     initializer_scope,
-                    first_base_loader_types,
+                    base_identity_names,
+                    loader_base_indices,
                 )
             if constant_bool is False:
                 return self._initializer_statements_preserve_ctypes_loader_init(
                     statement.orelse,
                     class_scope,
                     initializer_scope,
-                    first_base_loader_types,
+                    base_identity_names,
+                    loader_base_indices,
                 )
             branch_scopes = [dict(initializer_scope), dict(initializer_scope)]
             if self._initializer_statements_preserve_ctypes_loader_init(
                 statement.body,
                 class_scope,
                 branch_scopes[0],
-                first_base_loader_types,
+                base_identity_names,
+                loader_base_indices,
             ):
                 return True
             if self._initializer_statements_preserve_ctypes_loader_init(
                 statement.orelse,
                 class_scope,
                 branch_scopes[1],
-                first_base_loader_types,
+                base_identity_names,
+                loader_base_indices,
             ):
                 return True
             self._merge_initializer_branch_scopes(initializer_scope, branch_scopes)
@@ -2302,14 +2378,16 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     statement.orelse,
                     class_scope,
                     initializer_scope,
-                    first_base_loader_types,
+                    base_identity_names,
+                    loader_base_indices,
                 )
             branch_scope = dict(initializer_scope)
             if self._initializer_statements_preserve_ctypes_loader_init(
                 statement.body,
                 class_scope,
                 branch_scope,
-                first_base_loader_types,
+                base_identity_names,
+                loader_base_indices,
             ):
                 return True
             self._merge_initializer_branch_scopes(initializer_scope, [branch_scope, dict(initializer_scope)])
@@ -2319,61 +2397,89 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 statement.value,
                 class_scope,
                 initializer_scope,
-                first_base_loader_types,
+                base_identity_names,
+                loader_base_indices,
             ):
                 return True
             resolved_value = self._resolve_initializer_reference_names(statement.value, class_scope, initializer_scope)
             for target in statement.targets:
-                for name in _binding_names(target):
+                for name in self._initializer_binding_names(target):
                     initializer_scope[name] = resolved_value
             return False
         if isinstance(statement, ast.AnnAssign):
             if statement.value is None:
-                for name in _binding_names(statement.target):
+                for name in self._initializer_binding_names(statement.target):
                     initializer_scope[name] = None
                 return False
             if self._initializer_node_preserves_ctypes_loader_init(
                 statement.value,
                 class_scope,
                 initializer_scope,
-                first_base_loader_types,
+                base_identity_names,
+                loader_base_indices,
             ):
                 return True
             resolved_value = self._resolve_initializer_reference_names(statement.value, class_scope, initializer_scope)
-            for name in _binding_names(statement.target):
+            for name in self._initializer_binding_names(statement.target):
                 initializer_scope[name] = resolved_value
             return False
         return self._initializer_node_preserves_ctypes_loader_init(
             statement,
             class_scope,
             initializer_scope,
-            first_base_loader_types,
+            base_identity_names,
+            loader_base_indices,
         )
 
-    def _class_preserves_ctypes_loader_init(self, node: ast.ClassDef, class_scope: _AliasScope) -> bool:
-        init_method = next(
+    @staticmethod
+    def _class_method(node: ast.ClassDef, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+        return next(
             (
                 statement
                 for statement in node.body
-                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) and statement.name == "__init__"
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) and statement.name == name
             ),
             None,
         )
-        if init_method is None:
-            if not node.bases:
-                return False
-            return bool(_canonical_ctypes_loader_type_aliases(self._resolve_reference_names(node.bases[0])))
-        first_base_loader_types = (
-            _canonical_ctypes_loader_type_aliases(self._resolve_reference_names(node.bases[0]))
-            if node.bases
-            else frozenset()
+
+    @staticmethod
+    def _return_value_is_obvious_non_instance(value: ast.AST | None) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, ast.Call) and _resolve_call_name(value.func) == "object":
+            return True
+        if isinstance(value, ast.Constant) and value.value is not None:
+            return True
+        return isinstance(value, (ast.Tuple, ast.List, ast.Dict, ast.Set))
+
+    def _class_new_may_skip_init(self, node: ast.ClassDef) -> bool:
+        new_method = self._class_method(node, "__new__")
+        if new_method is None:
+            return False
+        return any(
+            isinstance(statement, ast.Return) and self._return_value_is_obvious_non_instance(statement.value)
+            for statement in new_method.body
         )
+
+    def _class_preserves_ctypes_loader_init(self, node: ast.ClassDef, class_scope: _AliasScope) -> bool:
+        base_identity_names = [self._reference_identity_names(base) for base in node.bases]
+        loader_base_indices = frozenset(
+            index
+            for index, base_names in enumerate(base_identity_names)
+            if _canonical_ctypes_loader_type_aliases(base_names)
+        )
+        init_method = self._class_method(node, "__init__")
+        if init_method is None:
+            if not node.bases or self._class_new_may_skip_init(node):
+                return False
+            return 0 in loader_base_indices
         initializer_scope = self._argument_alias_scope(init_method.args)
         return self._initializer_statements_preserve_ctypes_loader_init(
             init_method.body,
             class_scope,
             initializer_scope,
-            first_base_loader_types,
+            base_identity_names,
+            loader_base_indices,
         )
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -2630,8 +2736,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             normalized_name = _normalized_high_risk_python_call_name(resolved_name)
             if normalized_name is not None:
                 self.risky_calls.add(normalized_name)
-        self._record_setattr_call(node)
         self._record_namespace_write_call(node)
+        self._record_setattr_call(node)
         self.generic_visit(node)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
