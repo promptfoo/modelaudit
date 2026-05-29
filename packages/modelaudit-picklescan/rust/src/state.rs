@@ -2987,7 +2987,12 @@ impl<'a> ScanState<'a> {
         zero_codepoints: &[u32],
     ) -> Option<u32> {
         zero_codepoints.iter().find_map(|zero| {
-            (codepoint >= *zero && codepoint < *zero + 10).then_some(codepoint - *zero)
+            let upper_bound = zero.checked_add(10)?;
+            if codepoint >= *zero && codepoint < upper_bound {
+                Some(codepoint - *zero)
+            } else {
+                None
+            }
         })
     }
 
@@ -6341,6 +6346,11 @@ mod tests {
                 _ => panic!("integer operand did not produce primitive stack value"),
             }
         }
+    }
+
+    #[test]
+    fn str_format_decimal_syntax_rejects_non_digits_without_underflow() {
+        assert_eq!(ScanState::str_format_decimal_digit_value('x'), None);
     }
 
     #[test]
