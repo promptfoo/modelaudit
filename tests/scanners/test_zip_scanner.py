@@ -711,7 +711,7 @@ def test_scan_zip_clears_imported_static_members_after_alias_rebind(tmp_path: Pa
     )
 
 
-def test_scan_zip_preserves_safe_member_overwrite_after_reimport(tmp_path: Path) -> None:
+def test_scan_zip_preserves_safe_module_member_overwrite_after_reimport(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = "import runpy as rp\nrp.run_path = len\nimport runpy as rp\nrp.run_path([])\n"
     with zipfile.ZipFile(archive_path, "w") as archive:
