@@ -2,6 +2,7 @@
 
 import os
 import pickle
+import struct
 import tempfile
 import time
 from collections.abc import Iterator
@@ -11,7 +12,9 @@ from unittest.mock import patch
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
+from modelaudit.scanners import safetensors_scanner
 from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 
@@ -714,6 +717,41 @@ def test_scan_model_streaming_operational_info_failure_sets_exit_code_2(
     assert result.success is False
     assert result.has_errors is True
     assert determine_exit_code(result) == 2
+
+
+def test_scan_model_streaming_oversized_renamed_safetensors_fails_before_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = tmp_path / "weights.jpg"
+    header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1
+    with payload.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.write(b"{")
+        handle.truncate(8 + header_len + 1)
+
+    monkeypatch.setattr(
+        "modelaudit.utils.helpers.file_hash.compute_sha256_hash",
+        lambda _path: pytest.fail("streaming bounded SafeTensors failure must not hash the artifact"),
+    )
+    monkeypatch.setattr(
+        safetensors_scanner.SafeTensorsScanner,
+        "calculate_file_hashes",
+        lambda _self, _path: pytest.fail("streaming bounded SafeTensors failure must not run scanner hashes"),
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(payload, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+
+    assert result.files_scanned == 1
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert "safetensors" in result.scanner_names
+    assert any(check.name == "Header Size Limit" for check in result.checks)
 
 
 def test_scan_model_streaming_content_hash_deterministic():

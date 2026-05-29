@@ -8,7 +8,8 @@ import re
 from pathlib import Path
 from typing import Any, ClassVar
 
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from ..utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
+from .base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger("modelaudit.scanners")
 
@@ -60,6 +61,8 @@ STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset(
 ONNX_STRUCTURE_INCONCLUSIVE_REASON = "onnx_structure_validation_failed"
 ONNX_RAW_DETECTION_INCONCLUSIVE_REASON = "onnx_raw_detection_analysis_incomplete"
 ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
+ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON = "onnx_tentative_candidate_analysis_unavailable"
+ONNX_TENTATIVE_CANDIDATE_PARSE_INCOMPLETE_REASON = "onnx_tentative_candidate_parse_incomplete"
 _PYTHON_OPERATOR_TYPES: frozenset[str] = frozenset(
     {
         "pyfunc",
@@ -139,6 +142,28 @@ def _iter_model_graphs(model: Any) -> Any:
     for training_info in getattr(model, "training_info", []):
         yield training_info.initialization
         yield training_info.algorithm
+
+
+def _iter_graph_and_subgraphs(graph: Any) -> Any:
+    """Yield an ONNX graph and every graph nested below node attributes."""
+    yield graph
+    for node in getattr(graph, "node", []):
+        for attribute in getattr(node, "attribute", []):
+            for subgraph in _iter_attribute_graphs(attribute):
+                yield from _iter_graph_and_subgraphs(subgraph)
+
+
+def _iter_model_initializer_graphs(model: Any) -> Any:
+    """Yield every ONNX graph that can carry tensor initializers."""
+    yield from _iter_graph_and_subgraphs(model.graph)
+    for function in getattr(model, "functions", []):
+        yield from _iter_graph_and_subgraphs(function)
+        for attribute in getattr(function, "attribute_proto", []):
+            for subgraph in _iter_attribute_graphs(attribute):
+                yield from _iter_graph_and_subgraphs(subgraph)
+    for training_info in getattr(model, "training_info", []):
+        yield from _iter_graph_and_subgraphs(training_info.initialization)
+        yield from _iter_graph_and_subgraphs(training_info.algorithm)
 
 
 def _model_declares_python_operator(model: Any) -> bool:
@@ -287,6 +312,12 @@ class OnnxScanner(BaseScanner):
             return False
         return os.path.splitext(path)[1].lower() in cls.supported_extensions
 
+    def _is_tentative_protobuf_route(self) -> bool:
+        format_validation = self.config.get(FORMAT_VALIDATION_CONFIG_KEY)
+        return isinstance(format_validation, dict) and (
+            format_validation.get("routed_format") == PROTOBUF_MODEL_CANDIDATE_FORMAT
+        )
+
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
@@ -305,6 +336,26 @@ class OnnxScanner(BaseScanner):
         self.current_file_path = path
 
         if not _check_onnx():
+            if self._is_tentative_protobuf_route():
+                result.bytes_scanned = file_size
+                result.scanner_name = "unknown"
+                result.metadata["tentative_protobuf_candidate_unanalyzed"] = "onnx_dependency_unavailable"
+                _mark_inconclusive_scan_result(result, ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON)
+                result.add_check(
+                    name="ONNX Candidate Analysis",
+                    passed=False,
+                    message="ONNX analysis dependency is unavailable for an ambiguous protobuf model candidate",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "required_package": "onnx",
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON,
+                    },
+                    rule_code="S902",
+                )
+                _finish_scan_result(result)
+                return result
             result.add_check(
                 name="ONNX Library Check",
                 passed=False,
@@ -355,6 +406,27 @@ class OnnxScanner(BaseScanner):
             # Re-raise keyboard interrupt for graceful shutdown
             raise
         except Exception as e:  # pragma: no cover - unexpected parse errors
+            result.bytes_scanned = file_size
+            if self._is_tentative_protobuf_route():
+                result.scanner_name = "unknown"
+                result.metadata["tentative_protobuf_candidate_unanalyzed"] = "onnx_parse_failed"
+                _mark_inconclusive_scan_result(result, ONNX_TENTATIVE_CANDIDATE_PARSE_INCOMPLETE_REASON)
+                result.add_check(
+                    name="ONNX Candidate Analysis",
+                    passed=False,
+                    message=f"ONNX tentative candidate parsing failed; analysis incomplete: {e}",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "exception": str(e),
+                        "exception_type": type(e).__name__,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": ONNX_TENTATIVE_CANDIDATE_PARSE_INCOMPLETE_REASON,
+                    },
+                    rule_code="S902",
+                )
+                _finish_scan_result(result)
+                return result
             result.add_check(
                 name="ONNX Model Parsing",
                 passed=False,
@@ -365,6 +437,28 @@ class OnnxScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
+
+        has_graph = model.HasField("graph")
+        if model.ir_version <= 0 or not has_graph:
+            if self._is_tentative_protobuf_route() and not has_graph:
+                result.scanner_name = "unknown"
+                result.metadata["tentative_protobuf_candidate_rejected"] = True
+                result.finish(success=True)
+                return result
+            _mark_inconclusive_scan_result(result, ONNX_STRUCTURE_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="ONNX Structure Validation",
+                passed=False,
+                message="Parsed ONNX payload is missing required model structure; analysis incomplete",
+                severity=IssueSeverity.INFO,
+                location=path,
+                rule_code="S902",
+                details={
+                    "scan_outcome_reason": ONNX_STRUCTURE_INCONCLUSIVE_REASON,
+                    "ir_version": model.ir_version,
+                    "has_graph": has_graph,
+                },
+            )
 
         result.metadata.update(
             {
@@ -551,10 +645,12 @@ class OnnxScanner(BaseScanner):
         traversal_files: dict[str, list[str]] = {}  # file -> [tensor_names]
         safe_files: set[str] = set()
 
-        for tensor in model.graph.initializer:
-            self.check_interrupted()
+        for graph in _iter_model_initializer_graphs(model):
+            for tensor in getattr(graph, "initializer", []):
+                self.check_interrupted()
 
-            if tensor.data_location == onnx.TensorProto.EXTERNAL:
+                if tensor.data_location != onnx.TensorProto.EXTERNAL:
+                    continue
                 info = {entry.key: entry.value for entry in tensor.external_data}
                 location = info.get("location")
                 if not location:

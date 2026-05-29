@@ -7,6 +7,7 @@ and improve test maintainability.
 
 from tests.helpers.file_creators import (
     create_malicious_pickle,
+    create_mock_coreml,
     create_mock_gguf,
     create_mock_h5,
     create_mock_manifest,
@@ -15,6 +16,9 @@ from tests.helpers.file_creators import (
     create_mock_pytorch_zip,
     create_mock_safetensors,
     create_safe_pickle,
+    prefix_mock_onnx_with_branching_unknown_groups,
+    prefix_mock_onnx_with_unknown_field,
+    prefix_mock_onnx_with_unknown_group,
     write_mock_pytorch_zip_metadata,
 )
 from tests.helpers.frameworks import (
@@ -31,6 +35,7 @@ from tests.helpers.frameworks import (
 
 __all__ = [
     "create_malicious_pickle",
+    "create_mock_coreml",
     "create_mock_gguf",
     "create_mock_h5",
     "create_mock_manifest",
@@ -39,6 +44,9 @@ __all__ = [
     "create_mock_pytorch_zip",
     "create_mock_safetensors",
     "create_safe_pickle",
+    "prefix_mock_onnx_with_branching_unknown_groups",
+    "prefix_mock_onnx_with_unknown_field",
+    "prefix_mock_onnx_with_unknown_group",
     "requires_dill",
     "requires_h5py",
     "requires_joblib",
