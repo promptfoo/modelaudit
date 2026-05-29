@@ -57,6 +57,7 @@ _TensorFlowProtoRoute = Literal[
 ]
 _TensorFlowOuterHint = Literal["unknown", "tf_metagraph", "tf_savedmodel"]
 _TORCH7_SIGNATURE_READ_BYTES = 4096
+_TORCH7_ASCII_HEADER_MAX_LINE_BYTES = 4096
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
 _ONNX_MODEL_MAX_ROUTING_FIELDS = 4096
 _ONNX_GRAPH_MAX_ROUTING_FIELDS = 4096
@@ -2911,28 +2912,92 @@ def _resolve_inconclusive_tensorflow_flax_overlap(file_path: Path, file_size: in
     return "flax_msgpack"
 
 
-def _has_torch7_ascii_object_signature(prefix: bytes) -> bool:
-    """Return whether text contains a Torch7 ASCII serialized Torch object header."""
-    fields = prefix.splitlines()
-    for offset in range(len(fields) - 5):
-        if fields[offset] != b"4":
+def _read_torch7_ascii_header_fields(prefix: bytes, offset: int) -> list[bytes] | None:
+    """Read the first six Torch7 ASCII header fields without splitting the suffix."""
+    fields: list[bytes] = []
+    position = offset
+    while len(fields) < 6 and position < len(prefix):
+        line_limit = min(len(prefix), position + _TORCH7_ASCII_HEADER_MAX_LINE_BYTES + 1)
+        newline = prefix.find(b"\n", position, line_limit)
+        carriage_return = prefix.find(b"\r", position, line_limit)
+        line_end_candidates = [index for index in (newline, carriage_return) if index != -1]
+        if not line_end_candidates:
+            if line_limit < len(prefix):
+                return None
+            fields.append(prefix[position:line_limit])
+            break
+
+        line_end = min(line_end_candidates)
+        fields.append(prefix[position:line_end])
+        position = line_end + 2 if prefix[line_end : line_end + 2] == b"\r\n" else line_end + 1
+
+    return fields if len(fields) >= 6 else None
+
+
+def _find_torch7_ascii_object_signature_offset(prefix: bytes) -> int | None:
+    """Return the offset of a Torch7 ASCII serialized Torch object header."""
+    for match in re.finditer(rb"4(?:\r\n|[\r\n])", prefix):
+        fields = _read_torch7_ascii_header_fields(prefix, match.start())
+        if fields is None:
             continue
         try:
-            object_index = int(fields[offset + 1])
-            version_length = int(fields[offset + 2])
-            class_name_length = int(fields[offset + 4])
+            object_index = int(fields[1])
+            version_length = int(fields[2])
+            class_name_length = int(fields[4])
         except ValueError:
             continue
 
-        version = fields[offset + 3]
-        class_name = fields[offset + 5]
+        version = fields[3]
+        class_name = fields[5]
         if object_index <= 0 or version_length != len(version) or class_name_length != len(class_name):
             continue
         if re.fullmatch(rb"V [+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", version) is None:
             continue
         if class_name.startswith((b"torch.", b"nn.", b"cunn.", b"cutorch.")):
-            return True
-    return False
+            return match.start()
+    return None
+
+
+def _has_torch7_ascii_object_signature(prefix: bytes) -> bool:
+    """Return whether text contains a Torch7 ASCII serialized Torch object header."""
+    return _find_torch7_ascii_object_signature_offset(prefix) is not None
+
+
+def _has_torch7_binary_object_structure(prefix: bytes, offset: int = 0) -> bool:
+    """Return whether binary Torch7 magic has nearby serialized Torch structure."""
+    if len(prefix) - offset < 8 or not prefix.startswith(b"T7\x00\x00", offset):
+        return False
+    next_marker = prefix.find(b"T7\x00\x00", offset + len(b"T7\x00\x00"))
+    window_end = offset + _TORCH7_SIGNATURE_READ_BYTES if next_marker == -1 else next_marker
+    window = prefix[offset:window_end]
+    lowered = window.lower()
+    has_torch_marker = b"torch" in lowered or b"luat" in lowered
+    has_structure_marker = b"nn." in lowered or b"tensor" in lowered or b"thnn" in lowered
+    return has_torch_marker and has_structure_marker
+
+
+def _find_torch7_binary_object_signature_offset(prefix: bytes) -> int | None:
+    """Return the offset of a binary Torch7 candidate payload."""
+    search_offset = 0
+    while True:
+        match_offset = prefix.find(b"T7\x00\x00", search_offset)
+        if match_offset == -1:
+            return None
+        if _has_torch7_binary_object_structure(prefix, match_offset):
+            return match_offset
+        search_offset = match_offset + 1
+
+
+def _find_torch7_binary_candidate_offset(prefix: bytes) -> int | None:
+    """Return the offset of a binary Torch7 candidate worth secondary analysis."""
+    search_offset = 0
+    while True:
+        match_offset = prefix.find(b"T7\x00\x00", search_offset)
+        if match_offset == -1:
+            return None
+        if len(prefix) - match_offset >= 8:
+            return match_offset
+        search_offset = match_offset + 1
 
 
 def _is_torch7_signature(prefix: bytes) -> bool:
@@ -2948,6 +3013,22 @@ def _is_torch7_signature(prefix: bytes) -> bool:
     has_torch_marker = b"torch" in lowered or b"luat" in lowered
     has_structure_marker = b"nn." in lowered or b"tensor" in lowered or b"thnn" in lowered
     return has_torch_marker and has_structure_marker
+
+
+def find_structural_torch7_offset(payload: bytes) -> int | None:
+    """Return the earliest explicit serialized Torch7 signature offset in bytes."""
+    binary_offset = _find_torch7_binary_object_signature_offset(payload)
+    ascii_offset = _find_torch7_ascii_object_signature_offset(payload)
+    offsets = [offset for offset in (binary_offset, ascii_offset) if offset is not None and offset >= 0]
+    return min(offsets) if offsets else None
+
+
+def find_torch7_candidate_offset(payload: bytes) -> int | None:
+    """Return the earliest Torch7 candidate with structure or nearby Lua risk signal."""
+    binary_offset = _find_torch7_binary_candidate_offset(payload)
+    ascii_offset = _find_torch7_ascii_object_signature_offset(payload)
+    offsets = [offset for offset in (binary_offset, ascii_offset) if offset is not None and offset >= 0]
+    return min(offsets) if offsets else None
 
 
 def is_torch7_suffix_override_candidate(path: str) -> bool:
