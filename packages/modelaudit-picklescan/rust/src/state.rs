@@ -1877,9 +1877,10 @@ impl<'a> ScanState<'a> {
             ("builtins" | "__builtin__" | "__builtins__", "dict.setdefault") => {
                 Some(TrackedDictMutationKind::SetDefault)
             }
-            ("builtins" | "__builtin__" | "__builtins__", "dict.update" | "dict.__ior__") => {
-                Some(TrackedDictMutationKind::Update)
-            }
+            (
+                "builtins" | "__builtin__" | "__builtins__",
+                "dict.__init__" | "dict.update" | "dict.__ior__",
+            ) => Some(TrackedDictMutationKind::Update),
             _ => None,
         }
     }
@@ -4352,17 +4353,16 @@ impl<'a> ScanState<'a> {
                 unknown_key_values_overflowed: false,
                 memo_index: None,
             }),
-            [StackValue::TrackedDict {
-                entries,
-                unknown_key_values,
-                unknown_key_values_overflowed,
-                ..
-            }] => Some(StackValue::TrackedDict {
-                entries: entries.clone(),
-                unknown_key_values: unknown_key_values.clone(),
-                unknown_key_values_overflowed: *unknown_key_values_overflowed,
-                memo_index: None,
-            }),
+            [tracked @ StackValue::TrackedDict { .. }] => {
+                let (entries, unknown_key_values, unknown_key_values_overflowed) =
+                    self.tracked_dict_snapshot(tracked)?;
+                Some(StackValue::TrackedDict {
+                    entries,
+                    unknown_key_values,
+                    unknown_key_values_overflowed,
+                    memo_index: None,
+                })
+            }
             [iterable] => self.tracked_dict_from_pair_iterable(iterable),
             _ => None,
         }
