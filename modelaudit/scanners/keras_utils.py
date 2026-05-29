@@ -35,6 +35,7 @@ _LAMBDA_DANGEROUS_PATTERNS: list[str] = [
     "shutil",
     "ctypes",
 ]
+_MARSHALLED_CODE_FILENAME_RE = re.compile(r"(?i)(?:[A-Za-z]:)?[\\/][^\x00-\x1f\x7f\"'`<>|]+?\.py[co]?")
 
 _EXTRA_SAFE_KERAS_LOSS_IDENTIFIERS: frozenset[str] = frozenset(
     {
@@ -133,6 +134,11 @@ def find_case_insensitive_substrings(text: str, patterns: Iterable[str]) -> list
     """Return configured substrings present in `text` using one lowercase pass."""
     lowered = text.lower()
     return [pattern for pattern in patterns if pattern in lowered]
+
+
+def find_lambda_dangerous_patterns(text: str, patterns: Iterable[str]) -> list[str]:
+    """Match dangerous Lambda bytecode text while ignoring marshalled source filenames."""
+    return find_case_insensitive_substrings(_MARSHALLED_CODE_FILENAME_RE.sub(" ", text), patterns)
 
 
 def iter_keras_serialized_identifiers(value: Any) -> Iterator[tuple[str, Any]]:
@@ -307,7 +313,7 @@ def check_lambda_dict_function(
         )
         return True
 
-    found_patterns = find_case_insensitive_substrings(decoded_str, _LAMBDA_DANGEROUS_PATTERNS)
+    found_patterns = find_lambda_dangerous_patterns(decoded_str, _LAMBDA_DANGEROUS_PATTERNS)
 
     if found_patterns:
         result.add_check(
