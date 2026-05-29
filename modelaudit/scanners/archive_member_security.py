@@ -128,7 +128,6 @@ _CTYPES_LIBRARY_LOADER_TYPE_ALIASES = frozenset(
     for loader_root in _CTYPES_LIBRARY_LOADER_OBJECTS
     if loader_root != _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT
 )
-_CTYPES_LIBRARY_LOADER_VALID_TYPES = _CTYPES_LIBRARY_LOADER_TYPES | _CTYPES_LIBRARY_LOADER_TYPE_ALIASES
 _CTYPES_NATIVE_LIBRARY_LOADING_CALLS = frozenset(
     {
         "ctypes.CDLL",
@@ -575,7 +574,20 @@ def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str]
         suffix = ".".join(parts[prefix_length:])
         if not suffix:
             return aliases
-        return frozenset(f"{alias}.{suffix}" for alias in aliases)
+        resolved_aliases = frozenset(f"{alias}.{suffix}" for alias in aliases)
+        rebound_aliases: set[str] = set()
+        saw_rebound = False
+        for resolved_alias in resolved_aliases:
+            rebound, rebound_found = _lookup_bound_alias(resolved_alias, alias_scopes)
+            if not rebound_found:
+                rebound_aliases.add(resolved_alias)
+                continue
+            saw_rebound = True
+            if rebound is not None:
+                rebound_aliases.update(rebound)
+        if saw_rebound:
+            return frozenset(rebound_aliases) or None
+        return resolved_aliases
     return frozenset({call_name})
 
 
@@ -702,16 +714,33 @@ def _resolve_getattr_call_names(
         attr_name = _resolve_static_string(node.args[1])
         if resolved_target_roots is None or attr_name is None:
             return None
+        resolved_target_roots = frozenset(
+            root for root in resolved_target_roots if root not in _CTYPES_LIBRARY_LOADER_OBJECTS
+        )
+        if not resolved_target_roots:
+            return None
         return _apply_aliases_to_names(
             frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots),
             alias_scopes,
         )
 
-    accessor_names = frozenset(
-        normalized_helper_name.rsplit(".", maxsplit=1)[0]
-        for normalized_helper_name in normalized_helper_names
-        if normalized_helper_name.endswith((".__getattribute__", ".__getattr__"))
+    getattr_accessor_names = (
+        frozenset(
+            normalized_helper_name.rsplit(".", maxsplit=1)[0]
+            for normalized_helper_name in normalized_helper_names
+            if normalized_helper_name.endswith(".__getattr__")
+        )
+        & _CTYPES_LIBRARY_LOADER_OBJECTS
     )
+    getattribute_accessor_names = (
+        frozenset(
+            normalized_helper_name.rsplit(".", maxsplit=1)[0]
+            for normalized_helper_name in normalized_helper_names
+            if normalized_helper_name.endswith(".__getattribute__")
+        )
+        - _CTYPES_LIBRARY_LOADER_OBJECTS
+    )
+    accessor_names = getattr_accessor_names | getattribute_accessor_names
     if accessor_names:
         if len(node.args) != 1 or node.keywords:
             return None
@@ -1223,8 +1252,13 @@ def _resolve_ctypes_library_loader_instance_roots(
         if not _canonical_ctypes_loader_type_aliases(resolved_loader_types):
             return None
         loader_roots.add(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT)
+    library_name_node: ast.AST | None = None
     if len(node.args) == 1 and not node.keywords:
-        library_name = _resolve_static_string(node.args[0])
+        library_name_node = node.args[0]
+    elif not node.args and len(node.keywords) == 1 and node.keywords[0].arg == "name":
+        library_name_node = node.keywords[0].value
+    if library_name_node is not None:
+        library_name = _resolve_static_string(library_name_node)
         for resolved_func_name in resolved_func_names:
             stripped_func_name = _strip_dunder_call_suffixes(resolved_func_name)
             root_name, separator, method_name = stripped_func_name.rpartition(".")

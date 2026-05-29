@@ -596,6 +596,8 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "loader_method = ctypes.LibraryLoader(ctypes.CDLL)\n"
         "loader_method.LoadLibrary('methodlib')\n"
         "loader_method.__getitem__('getitemlib')\n"
+        "loader_method.LoadLibrary(name='keywordlib')\n"
+        "loader_method.__getitem__(name='keywordgetitem')\n"
         "loader_variable = ctypes.LibraryLoader(ctypes.CDLL)\n"
         "library_name = 'variablelib'\n"
         "loader_variable.LoadLibrary(library_name)\n"
@@ -629,6 +631,8 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.LibraryLoader.aliaslib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.methodlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.getitemlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.keywordlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.keywordgetitem" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.<dynamic>" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.subclasslib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.attrlib" in checks_by_rule["S110"].details["reason"]
@@ -778,6 +782,15 @@ def test_scan_zip_preserves_dynamic_member_risk_after_conditional_overwrite(tmp_
         "import ctypes\nctypes.LibraryLoader = len\nctypes.LibraryLoader(ctypes.CDLL).payload\n",
         "import ctypes\nctypes.windll.kernel32 = len\ngetattr(ctypes.windll, 'kernel32')\n",
         "import ctypes\nctypes.windll.kernel32 = len\nctypes.windll.__getattr__('kernel32')\n",
+        "import ctypes\nctypes.cdll.__getattribute__('msvcrt')\n",
+        "import ctypes\nobject.__getattribute__(ctypes.cdll, 'msvcrt')\n",
+        "import os\nos.__getattr__('system')('id')\n",
+        "import builtins\nbuiltins.__getattr__('eval')('1')\n",
+        "import webbrowser\nbrowser = webbrowser.get()\nother = browser\nbrowser.open = len\nother.open([])\n",
+        (
+            "import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+            "other = loader\nloader.payload = len\nother.payload([])\n"
+        ),
     ],
 )
 def test_scan_zip_ignores_benign_namespace_mapping_call(tmp_path: Path, source: str) -> None:
