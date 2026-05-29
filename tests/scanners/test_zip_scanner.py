@@ -1249,6 +1249,146 @@ def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite
     assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
 
 
+def test_scan_zip_preserves_possible_runpy_execution_after_forwarded_conditional_overwrite(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import runpy as rp\nmod = rp\nif replace:\n    mod.run_path = len\nrp.run_path('payload.py')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S108"
+    assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
+
+
+@pytest.mark.parametrize(
+    "safe_state",
+    [
+        "runner = rp.run_path if False else print\nrunner('safe')\n",
+        "runner = print if 1 else rp.run_path\nrunner('safe')\n",
+        "runner = rp.run_path and print\nrunner('safe')\n",
+        "runner = True or rp.run_path\nrunner('safe')\n",
+        "runner = print or rp.run_path\nrunner('safe')\n",
+        "del rp.run_path\nrp.run_path('safe')\n",
+        "getattr(object=rp, name='run_path')('safe')\n",
+    ],
+)
+def test_scan_zip_ignores_proven_safe_runpy_late_state(tmp_path: Path, safe_state: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", "import runpy as rp\n" + safe_state)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "rule_code"),
+    [
+        (
+            "import builtins\nimport runpy as rp\nbuiltins.print = False\n"
+            "runner = print or rp.run_path\nrunner('payload.py')\n",
+            "S108",
+        ),
+        (
+            "import builtins\nimport runpy as rp\nvars(builtins)['print'] = False\n"
+            "runner = print or rp.run_path\nrunner('payload.py')\n",
+            "S108",
+        ),
+        (
+            "import builtins\nimport runpy as rp\nvars(builtins).update({'print': False})\n"
+            "runner = print or rp.run_path\nrunner('payload.py')\n",
+            "S108",
+        ),
+        (
+            "import builtins\nimport webbrowser\nbuiltins.print = False\n"
+            "opener = print or webbrowser.open\nopener('https://example.invalid')\n",
+            "S109",
+        ),
+        (
+            "import builtins\nimport webbrowser\nvars(builtins)['print'] = False\n"
+            "opener = print or webbrowser.open\nopener('https://example.invalid')\n",
+            "S109",
+        ),
+        (
+            "import builtins\nimport webbrowser\nvars(builtins).update({'print': False})\n"
+            "opener = print or webbrowser.open\nopener('https://example.invalid')\n",
+            "S109",
+        ),
+        (
+            "import builtins\nimport ctypes\nbuiltins.print = False\n"
+            "loader = print or ctypes.CDLL\nloader('libpayload.so')\n",
+            "S110",
+        ),
+        (
+            "import builtins\nimport ctypes\nvars(builtins)['print'] = False\n"
+            "loader = print or ctypes.CDLL\nloader('libpayload.so')\n",
+            "S110",
+        ),
+        (
+            "import builtins\nimport ctypes\nvars(builtins).update({'print': False})\n"
+            "loader = print or ctypes.CDLL\nloader('libpayload.so')\n",
+            "S110",
+        ),
+    ],
+)
+def test_scan_zip_preserves_boolean_fallback_risk_after_builtin_mutation(
+    tmp_path: Path, source: str, rule_code: str
+) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert any(
+        check.name == "Python Archive Member Security"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == rule_code
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from runpy import run_path as runner\nFalse and (runner := print)\nrunner('payload.py')\n",
+        (
+            "from runpy import run_path as runner\nclass Broken:\n"
+            "    def __enter__(self):\n        raise RuntimeError()\n"
+            "    def __exit__(self, *args):\n        return False\n"
+            "try:\n    with Broken() as runner:\n        pass\n"
+            "except RuntimeError:\n    pass\nrunner('payload.py')\n"
+        ),
+    ],
+)
+def test_scan_zip_preserves_runpy_risk_after_non_executed_shadow(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert any(
+        check.name == "Python Archive Member Security"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
 def test_scan_zip_preserves_dynamic_member_risk_after_conditional_overwrite(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = (
@@ -1676,6 +1816,190 @@ def test_scan_zip_preserves_restored_runpy_execution_after_static_overwrite(tmp_
         "original = runpy.run_path\n"
         "runpy.run_path = len\n"
         "runpy.run_path = original\n"
+        "runpy.run_path('payload.py')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S108"
+    assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
+
+
+@pytest.mark.parametrize(
+    "restore",
+    [
+        "runpy.__dict__['run_path'] = original\n",
+        "vars(runpy)['run_path'] = original\n",
+        "runpy.__dict__.__setitem__('run_path', original)\n",
+        "runpy.__dict__.update({'run_path': original})\n",
+        "vars(runpy).update({'run_path': original})\n",
+        "runpy.__dict__.update(run_path=original)\n",
+        "vars(runpy).update(run_path=original)\n",
+        "runpy.__dict__.update(**{'run_path': original})\n",
+        "restore = runpy.__dict__.update\nrestore(run_path=original)\n",
+        "dict.update(runpy.__dict__, run_path=original)\n",
+    ],
+)
+def test_scan_zip_preserves_restored_runpy_execution_after_namespace_overwrite(tmp_path: Path, restore: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import runpy\n"
+        "import runpy as rp\n"
+        "original = runpy.run_path\n"
+        "rp.run_path = len\n" + restore + "rp.run_path('payload.py')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S108"
+    assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
+
+
+@pytest.mark.parametrize(
+    "overwrite",
+    [
+        "runpy.__dict__.update(run_path=len)\n",
+        "vars(runpy).update(run_path=len)\n",
+        "runpy.__dict__.update(**{'run_path': len})\n",
+        "overwrite = runpy.__dict__.update\noverwrite(run_path=len)\n",
+        "dict.update(runpy.__dict__, run_path=len)\n",
+    ],
+)
+def test_scan_zip_preserves_safe_runpy_namespace_overwrite(tmp_path: Path, overwrite: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import runpy\n" + overwrite + "runpy.run_path('safe')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_zip_does_not_treat_shadowed_dict_update_as_builtin_descriptor(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import runpy\n"
+        "class Safe:\n"
+        "    @staticmethod\n"
+        "    def update(*args, **kwargs):\n"
+        "        pass\n"
+        "runpy.run_path = len\n"
+        "dict = Safe\n"
+        "dict.update(runpy.__dict__, run_path=runpy.run_path)\n"
+        "runpy.run_path('safe')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "import builtins\nbuiltins.dict = Safe\nbuiltins.dict.update",
+        "import builtins as bi\nbi.dict = Safe\nbi.dict.update",
+    ],
+)
+def test_scan_zip_does_not_treat_shadowed_builtins_dict_update_as_descriptor(tmp_path: Path, prefix: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import runpy\n"
+        "class Safe:\n"
+        "    @staticmethod\n"
+        "    def update(*args, **kwargs):\n"
+        "        pass\n"
+        "runpy.run_path = len\n"
+        f"{prefix}(runpy.__dict__, run_path=runpy.run_path)\n"
+        "runpy.run_path('safe')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_zip_tracks_restored_builtins_dict_descriptor(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import builtins\n"
+        "import runpy\n"
+        "real_dict = builtins.dict\n"
+        "original = runpy.run_path\n"
+        "runpy.run_path = len\n"
+        "class Safe:\n"
+        "    @staticmethod\n"
+        "    def update(*args, **kwargs):\n"
+        "        pass\n"
+        "builtins.dict = Safe\n"
+        "builtins.dict = real_dict\n"
+        "builtins.dict.update(runpy.__dict__, run_path=original)\n"
+        "runpy.run_path('payload.py')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S108"
+    assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
+
+
+@pytest.mark.parametrize(
+    ("shadow", "restore"),
+    [
+        ("dict = Safe\n", "dict.update"),
+        ("import builtins\n    builtins.dict = Safe\n", "builtins.dict.update"),
+    ],
+)
+def test_scan_zip_preserves_canonical_dict_descriptor_after_conditional_shadow(
+    tmp_path: Path, shadow: str, restore: str
+) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import runpy\n"
+        "original = runpy.run_path\n"
+        "runpy.run_path = len\n"
+        "class Safe:\n"
+        "    @staticmethod\n"
+        "    def update(*args, **kwargs):\n"
+        "        pass\n"
+        "if globals().get('enabled'):\n"
+        f"    {shadow}"
+        f"{restore}(runpy.__dict__, run_path=original)\n"
         "runpy.run_path('payload.py')\n"
     )
     with zipfile.ZipFile(archive_path, "w") as archive:

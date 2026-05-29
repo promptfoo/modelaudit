@@ -154,6 +154,8 @@ _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES = (
     | _CTYPES_LIBRARY_LOADER_OBJECTS
     | _CTYPES_LIBRARY_LOADER_CONSTRUCTORS
 )
+_STATIC_TRUTHY_BUILTIN_REFERENCES = frozenset({"builtins.print", "builtins.len"})
+_TRACKED_STATIC_MEMBER_REFERENCES = _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES | _STATIC_TRUTHY_BUILTIN_REFERENCES
 
 # Map each high-risk call name to the rule code that best describes its risk
 # category. SARIF consumers, dashboards, and per-rule severity overrides rely
@@ -296,7 +298,7 @@ def _has_static_overwritable_reference_prefix(name: str) -> bool:
 
 def _is_overwritable_high_risk_reference(name: str) -> bool:
     return (
-        name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
+        name in _TRACKED_STATIC_MEMBER_REFERENCES
         or _webbrowser_controller_launch_call_name(name) is not None
         or _ctypes_loader_overwritable_reference_name(name) is not None
     )
@@ -1113,7 +1115,7 @@ _NAMESPACE_MUTATION_METHODS = _NAMESPACE_WRITE_METHODS | frozenset({"pop"})
 _NAMESPACE_MUTATION_DESCRIPTORS = frozenset(
     f"{prefix}.{method}" for prefix in ("dict", "builtins.dict") for method in _NAMESPACE_MUTATION_METHODS
 )
-_NAMESPACE_MAPPING_METHODS = _NAMESPACE_LOOKUP_METHODS | _NAMESPACE_WRITE_METHODS
+_NAMESPACE_MAPPING_METHODS = _NAMESPACE_LOOKUP_METHODS | _NAMESPACE_WRITE_METHODS | frozenset({"update"})
 
 
 def _resolve_module_namespace_key_names(
@@ -1528,6 +1530,25 @@ def _union_static_reference_names(
     return frozenset(combined) or None
 
 
+def _statically_known_truth_value(node: ast.AST, alias_scopes: _AliasScopes) -> bool | None:
+    if isinstance(node, ast.Constant):
+        if node.value is None:
+            return False
+        if isinstance(node.value, (bool, int, float, complex, str, bytes)):
+            return bool(node.value)
+        return None
+    call_name = _resolve_call_name(node)
+    if call_name is None:
+        return None
+    implicit_builtin_name = f"builtins.{call_name}" if call_name in {"print", "len"} else None
+    if implicit_builtin_name is not None and not _lookup_bound_alias(call_name, alias_scopes)[1]:
+        resolved_names = _apply_aliases(implicit_builtin_name, alias_scopes)
+    else:
+        resolved_names = _apply_aliases(call_name, alias_scopes)
+    known_truthy_names = _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES | _STATIC_TRUTHY_BUILTIN_REFERENCES
+    return True if resolved_names and resolved_names <= known_truthy_names else None
+
+
 def _resolve_static_reference_names(
     node: ast.AST,
     alias_scopes: _AliasScopes,
@@ -1543,6 +1564,14 @@ def _resolve_static_reference_names(
             allow_local_namespace_mapping=allow_local_namespace_mapping,
         )
     if isinstance(node, ast.IfExp):
+        condition_value = _statically_known_truth_value(node.test, alias_scopes)
+        if condition_value is not None:
+            return _resolve_static_reference_names(
+                node.body if condition_value else node.orelse,
+                alias_scopes,
+                allow_module_locals_mapping=allow_module_locals_mapping,
+                allow_local_namespace_mapping=allow_local_namespace_mapping,
+            )
         return _union_static_reference_names(
             (node.body, node.orelse),
             alias_scopes,
@@ -1550,6 +1579,31 @@ def _resolve_static_reference_names(
             allow_local_namespace_mapping=allow_local_namespace_mapping,
         )
     if isinstance(node, ast.BoolOp):
+        for value in node.values[:-1]:
+            truth_value = _statically_known_truth_value(value, alias_scopes)
+            if truth_value is None:
+                break
+            if isinstance(node.op, ast.Or) and truth_value:
+                return _resolve_static_reference_names(
+                    value,
+                    alias_scopes,
+                    allow_module_locals_mapping=allow_module_locals_mapping,
+                    allow_local_namespace_mapping=allow_local_namespace_mapping,
+                )
+            if isinstance(node.op, ast.And) and not truth_value:
+                return _resolve_static_reference_names(
+                    value,
+                    alias_scopes,
+                    allow_module_locals_mapping=allow_module_locals_mapping,
+                    allow_local_namespace_mapping=allow_local_namespace_mapping,
+                )
+        else:
+            return _resolve_static_reference_names(
+                node.values[-1],
+                alias_scopes,
+                allow_module_locals_mapping=allow_module_locals_mapping,
+                allow_local_namespace_mapping=allow_local_namespace_mapping,
+            )
         return _union_static_reference_names(
             node.values,
             alias_scopes,
@@ -1735,7 +1789,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _bind_imported_static_members(self, local_name: str, import_name: str, *, preserve_existing: bool) -> None:
         prefix = f"{import_name}."
-        for reference in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
+        for reference in _TRACKED_STATIC_MEMBER_REFERENCES:
             if not reference.startswith(prefix):
                 continue
             local_reference = f"{local_name}{reference.removeprefix(import_name)}"
@@ -1821,6 +1875,38 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         generation = self._instance_binding_generations.get(local_name, 0) + 1
         self._instance_binding_generations[local_name] = generation
         return _localized_instance_root(root_name, f"{local_name}#{generation}")
+
+    def _has_tracked_local_static_member_binding(self, syntactic_name: str | None) -> bool:
+        if syntactic_name is None or "." not in syntactic_name:
+            return False
+        _member_aliases, has_member_binding = _lookup_bound_alias(syntactic_name, self.alias_scopes)
+        if not has_member_binding:
+            return False
+        root_name, member_suffix = syntactic_name.split(".", maxsplit=1)
+        root_aliases, _found = _lookup_bound_alias(root_name, self.alias_scopes)
+        return isinstance(root_aliases, frozenset) and any(
+            f"{root_alias}.{member_suffix}" in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES for root_alias in root_aliases
+        )
+
+    def _bind_local_static_member_aliases(self, reference_name: str, resolved_names: _AliasValue) -> None:
+        local_names: set[str] = set()
+        for scope_index, scope in enumerate(self.alias_scopes):
+            for local_name in tuple(scope):
+                if "." not in local_name:
+                    continue
+                root_name, member_suffix = local_name.split(".", maxsplit=1)
+                root_aliases, _found = _lookup_bound_alias(root_name, self.alias_scopes[: scope_index + 1])
+                if not isinstance(root_aliases, frozenset):
+                    continue
+                if any(f"{root_alias}.{member_suffix}" == reference_name for root_alias in root_aliases):
+                    local_names.add(local_name)
+        for local_name in local_names:
+            self._bind_name(local_name, resolved_names)
+
+    def _bind_member_reference(self, reference_name: str, resolved_names: _AliasValue) -> None:
+        self._bind_name(reference_name, resolved_names)
+        if reference_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
+            self._bind_local_static_member_aliases(reference_name, resolved_names)
 
     def _bind_module_namespace_key(self, key: str, resolved_names: _AliasValue) -> None:
         self._bind_name(f"{_MODULE_NAMESPACE_WRITE_PREFIX}{key}", resolved_names)
@@ -1921,14 +2007,28 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                         self._bind_name(key, localized_value)
                         self._restore_reassigned_instance_member_defaults(key, localized_value)
                         continue
-                    self._bind_name(f"{root}.{key}", localized_value)
+                    self._bind_member_reference(f"{root}.{key}", localized_value)
         elif isinstance(target, ast.Attribute):
-            syntactic_name, target_names = self._overwritable_target_names(target)
+            syntactic_name, overwritable_target_names = self._overwritable_target_names(target)
+            target_names = set(overwritable_target_names)
+            resolved_owner_names = self._resolve_reference_names(target.value)
+            if target.attr == "dict" and resolved_owner_names is not None and "builtins" in resolved_owner_names:
+                target_names.add("builtins.dict")
+            has_tracked_local_binding = self._has_tracked_local_static_member_binding(syntactic_name)
+            if has_tracked_local_binding and syntactic_name is not None:
+                target_names.add(syntactic_name)
+            if syntactic_name in _TRACKED_STATIC_MEMBER_REFERENCES and self._should_track_syntactic_static_reference(
+                syntactic_name
+            ):
+                target_names.add(syntactic_name)
             if not target_names:
                 return
             resolved_value = self._resolve_binding_value_names(value)
             for target_name in target_names:
-                self._bind_name(target_name, resolved_value)
+                if target_name == "builtins.dict":
+                    self._bind_name(target_name, resolved_value)
+                else:
+                    self._bind_member_reference(target_name, resolved_value)
             if syntactic_name is not None:
                 self._bind_name(syntactic_name, resolved_value)
         elif isinstance(target, ast.Starred):
@@ -1994,7 +2094,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 return
             for target_name in target_names:
                 self._bind_name(target_name, None)
-            if syntactic_name is not None and _is_overwritable_high_risk_reference(syntactic_name):
+            if syntactic_name is not None and target_names:
                 self._bind_name(syntactic_name, None)
         elif isinstance(target, ast.Starred):
             self._delete_target_binding(target.value)
@@ -2110,25 +2210,141 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self.alias_scopes[-1].pop(key, None)
             return
         dotted_name = f"{root}.{key}"
+        if dotted_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
+            self._bind_member_reference(dotted_name, None)
+            return
         for scope in self.alias_scopes:
             scope.pop(dotted_name, None)
 
     def _record_namespace_write_call(self, node: ast.Call) -> None:
-        for roots, key, keyword_value_node in self._resolve_namespace_keyword_update_call(node):
-            resolved_value = self._resolve_binding_value_names(keyword_value_node)
-            for root in roots:
-                if root in _TRACKED_MODULE_NAMESPACE_ALIASES:
-                    localized_value = self._localize_instance_binding_value(key, keyword_value_node, resolved_value)
-                    self._bind_module_namespace_key(key, localized_value)
-                    self._restore_reassigned_instance_member_defaults(key, localized_value)
-                    continue
-                if root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
-                    localized_value = self._localize_instance_binding_value(key, keyword_value_node, resolved_value)
-                    self._bind_name(key, localized_value)
-                    self._restore_reassigned_instance_member_defaults(key, localized_value)
-                    continue
-                self._bind_name(f"{root}.{key}", resolved_value)
-
+        update_roots: frozenset[str] | None = None
+        update_arguments = node.args
+        syntactic_method_name = _resolve_call_name(node.func)
+        resolved_method_names = (
+            _apply_aliases(syntactic_method_name, self.alias_scopes) if syntactic_method_name is not None else None
+        )
+        descriptor_names: set[str] = set()
+        for resolved_method_name in resolved_method_names or frozenset():
+            if resolved_method_name not in {"dict.update", "builtins.dict.update"}:
+                continue
+            descriptor_root = resolved_method_name.removesuffix(".update")
+            rebound_root_names, has_rebound_root = _lookup_bound_alias(descriptor_root, self.alias_scopes)
+            if not has_rebound_root or rebound_root_names == frozenset({descriptor_root}):
+                descriptor_names.add(resolved_method_name)
+        if descriptor_names and node.args:
+            update_roots = _resolve_namespace_mapping_roots(
+                node.args[0],
+                self.alias_scopes,
+                allow_module_locals_mapping=self._non_module_scope_depth == 0,
+                allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+            )
+            update_arguments = node.args[1:]
+        elif isinstance(node.func, ast.Attribute) and node.func.attr == "update":
+            resolved_attribute_methods = self._resolve_reference_names(node.func)
+            attribute_descriptor_names: set[str] = set()
+            for resolved_method_name in (resolved_attribute_methods or frozenset()) & {
+                "dict.update",
+                "builtins.dict.update",
+            }:
+                descriptor_root = resolved_method_name.removesuffix(".update")
+                rebound_root_names, has_rebound_root = _lookup_bound_alias(descriptor_root, self.alias_scopes)
+                if not has_rebound_root or rebound_root_names == frozenset({descriptor_root}):
+                    attribute_descriptor_names.add(resolved_method_name)
+            if attribute_descriptor_names and node.args:
+                update_roots = _resolve_namespace_mapping_roots(
+                    node.args[0],
+                    self.alias_scopes,
+                    allow_module_locals_mapping=self._non_module_scope_depth == 0,
+                    allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+                )
+                update_arguments = node.args[1:]
+            else:
+                update_roots = _resolve_namespace_mapping_roots(
+                    node.func.value,
+                    self.alias_scopes,
+                    allow_module_locals_mapping=self._non_module_scope_depth == 0,
+                    allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+                )
+        else:
+            resolved_method_names = self._resolve_reference_names(node.func)
+            if resolved_method_names is not None:
+                aliased_descriptor_names = resolved_method_names & {"dict.update", "builtins.dict.update"}
+                if aliased_descriptor_names and node.args:
+                    update_roots = _resolve_namespace_mapping_roots(
+                        node.args[0],
+                        self.alias_scopes,
+                        allow_module_locals_mapping=self._non_module_scope_depth == 0,
+                        allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+                    )
+                    update_arguments = node.args[1:]
+                bound_roots = {
+                    name.removesuffix(".__dict__.update")
+                    for name in resolved_method_names
+                    if name.endswith(".__dict__.update")
+                }
+                if bound_roots:
+                    update_roots = frozenset(bound_roots)
+        positional_update = (
+            update_arguments[0] if update_arguments and isinstance(update_arguments[0], ast.Dict) else None
+        )
+        if (
+            update_roots
+            and len(update_arguments) <= 1
+            and (not update_arguments or positional_update is not None)
+            and (
+                positional_update is None
+                or all(
+                    update_key_node is not None and _resolve_static_string(update_key_node) is not None
+                    for update_key_node in positional_update.keys
+                )
+            )
+            and all(
+                keyword.arg is not None
+                or (
+                    isinstance(keyword.value, ast.Dict)
+                    and all(
+                        update_key_node is not None and _resolve_static_string(update_key_node) is not None
+                        for update_key_node in keyword.value.keys
+                    )
+                )
+                for keyword in node.keywords
+            )
+        ):
+            updates: list[tuple[str, ast.expr]] = []
+            if positional_update is not None:
+                for update_key_node, update_value_node in zip(
+                    positional_update.keys, positional_update.values, strict=True
+                ):
+                    if update_key_node is None:
+                        continue
+                    update_key = _resolve_static_string(update_key_node)
+                    if update_key is not None:
+                        updates.append((update_key, update_value_node))
+            for keyword in node.keywords:
+                if keyword.arg is not None:
+                    updates.append((keyword.arg, keyword.value))
+                elif isinstance(keyword.value, ast.Dict):
+                    for update_key_node, update_value_node in zip(
+                        keyword.value.keys, keyword.value.values, strict=True
+                    ):
+                        if update_key_node is None:
+                            continue
+                        update_key = _resolve_static_string(update_key_node)
+                        if update_key is not None:
+                            updates.append((update_key, update_value_node))
+            for update_key, update_value_node in updates:
+                resolved_value = self._resolve_binding_value_names(update_value_node)
+                localized_value = self._localize_instance_binding_value(update_key, update_value_node, resolved_value)
+                for root in update_roots:
+                    if root in _TRACKED_MODULE_NAMESPACE_ALIASES:
+                        self._bind_module_namespace_key(update_key, localized_value)
+                        self._restore_reassigned_instance_member_defaults(update_key, localized_value)
+                    elif root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
+                        self._bind_name(update_key, localized_value)
+                        self._restore_reassigned_instance_member_defaults(update_key, localized_value)
+                    else:
+                        self._bind_member_reference(f"{root}.{update_key}", localized_value)
+            return
         write_call = self._resolve_namespace_write_call(node)
         if write_call is None:
             return
@@ -2154,7 +2370,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 self._bind_name(key, localized_value)
                 self._restore_reassigned_instance_member_defaults(key, localized_value)
                 continue
-            self._bind_name(f"{root}.{key}", resolved_value)
+            self._bind_member_reference(f"{root}.{key}", resolved_value)
 
     def _record_setattr_call(self, node: ast.Call) -> None:
         helper_name = _resolve_call_name(node.func)
@@ -2310,6 +2526,15 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 self._class_scope_ids.discard(id(branch_scope))
             self._pop_alias_scope()
 
+    def _visit_conditional_expression_branch(self, node: ast.AST) -> _AliasScope:
+        branch_scope: _AliasScope = {}
+        self._push_alias_scope(branch_scope)
+        try:
+            self.visit(node)
+            return dict(branch_scope)
+        finally:
+            self._pop_alias_scope()
+
     @staticmethod
     def _constant_bool(node: ast.AST) -> bool | None:
         if isinstance(node, ast.Constant):
@@ -2343,6 +2568,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     self.alias_scopes,
                     allow_module_locals_mapping=self._non_module_scope_depth == 0,
                 )
+            elif name in {"dict", "builtins.dict"}:
+                base_value, found = _lookup_bound_alias(name, self.alias_scopes)
+                if not found:
+                    base_value = frozenset({name})
             else:
                 high_risk_default = self._conditionally_overwritable_high_risk_reference_default(name)
                 if high_risk_default is not None:
@@ -3477,6 +3706,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def visit_Delete(self, node: ast.Delete) -> None:
         for target in node.targets:
             self._delete_target_binding(target)
+            if isinstance(target, ast.Attribute):
+                resolved_owner_names = self._resolve_reference_names(target.value)
+                if target.attr == "dict" and resolved_owner_names is not None and "builtins" in resolved_owner_names:
+                    self._bind_name("builtins.dict", None)
             self.visit(target)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
@@ -3555,6 +3788,39 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         branch_scopes = [self._visit_conditional_branch(node.body)]
         branch_scopes.append(self._visit_conditional_branch(node.orelse) if node.orelse else {})
         self._merge_conditional_branch_scopes(branch_scopes)
+
+    def visit_IfExp(self, node: ast.IfExp) -> None:
+        self.visit(node.test)
+        condition_value = _statically_known_truth_value(node.test, self.alias_scopes)
+        if condition_value is not None:
+            self.visit(node.body if condition_value else node.orelse)
+            return
+        self._merge_conditional_branch_scopes(
+            [
+                self._visit_conditional_expression_branch(node.body),
+                self._visit_conditional_expression_branch(node.orelse),
+            ]
+        )
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> None:
+        for index, value in enumerate(node.values):
+            self.visit(value)
+            if index == len(node.values) - 1:
+                return
+            truth_value = _statically_known_truth_value(value, self.alias_scopes)
+            short_circuits = (isinstance(node.op, ast.Or) and truth_value is True) or (
+                isinstance(node.op, ast.And) and truth_value is False
+            )
+            if short_circuits:
+                return
+            definitely_continues = (isinstance(node.op, ast.Or) and truth_value is False) or (
+                isinstance(node.op, ast.And) and truth_value is True
+            )
+            if definitely_continues:
+                continue
+            remaining = ast.BoolOp(op=node.op, values=node.values[index + 1 :])
+            self._merge_conditional_branch_scopes([self._visit_conditional_expression_branch(remaining), {}])
+            return
 
     def visit_Try(self, node: ast.Try) -> None:
         branch_scopes = [self._visit_conditional_branch([*node.body, *node.orelse])]

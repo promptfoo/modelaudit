@@ -144,6 +144,53 @@ _MAX_PRIORITY_ASSIGNMENT_PROBES = 48
 _MAX_BODY_STATEMENT_NESTING = 100
 _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES = 1_000_000
 _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES = 16_384
+_PROVEN_HIGH_RISK_CALL_PROBES = {
+    "S108": (
+        "runpy.run_path",
+        b"\nimport runpy as __modelaudit_runpy\n__modelaudit_runpy.run_path('payload.py')\n",
+    ),
+    "S109": (
+        "webbrowser.open",
+        b"\nimport webbrowser as __modelaudit_webbrowser\n__modelaudit_webbrowser.open('https://example.invalid')\n",
+    ),
+    "S110": (
+        "ctypes.CDLL",
+        b"\nimport ctypes as __modelaudit_ctypes\n__modelaudit_ctypes.CDLL('payload.so')\n",
+    ),
+}
+_PROVEN_RUNPY_CALL_PROBE = _PROVEN_HIGH_RISK_CALL_PROBES["S108"][1]
+_TYPED_PROOF_BINDING_MARKERS = (
+    b".get",
+    b".open",
+    b"CDLL",
+    b"OleDLL",
+    b"PyDLL",
+    b"WinDLL",
+    b"LoadLibrary",
+    b"LibraryLoader",
+    b"cdll",
+    b"oledll",
+    b"pydll",
+    b"windll",
+)
+_TYPED_PROOF_MEMBER_NAMES = frozenset(
+    {
+        "get",
+        "open",
+        "open_new",
+        "open_new_tab",
+        "CDLL",
+        "OleDLL",
+        "PyDLL",
+        "WinDLL",
+        "LoadLibrary",
+        "LibraryLoader",
+        "cdll",
+        "oledll",
+        "pydll",
+        "windll",
+    }
+)
 _EMBEDDED_PYTHON_START_MARKERS = (b"def ", b"async def ", b"class ", b"import ", b"from ")
 _PRIORITY_EMBEDDED_PYTHON_MODULES = tuple(
     sorted(
@@ -171,7 +218,9 @@ _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN = re.compile(
     rb"from\s+(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")(?:[.\s]|\\\r?\n|$)"
     rb")"
 )
-_EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN = rb"(?:[A-Za-z_]\w*(?:\s*:[^=\n#]+)?|[\(\[][A-Za-z_][^=\n#]*[\)\]])"
+_EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN = (
+    rb"(?:[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*(?:\s*:[^=\n#]+)?|[\(\[][A-Za-z_][^=\n#]*[\)\]])"
+)
 _EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}\x00]+|class\s+\w+[^}\x00]+")
 _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])"
@@ -188,6 +237,11 @@ _EMBEDDED_PYTHON_COMPOUND_CONTEXT_START_PATTERN = re.compile(
 )
 _COMPOUND_HEADER_MATCH_PATTERN = re.compile(
     rb"\b(?:async\s+def|if|elif|else|for|while|try|except|finally|with|class|def)\b"
+)
+_EMBEDDED_PYTHON_STATIC_MEMBER_CONTEXT_START_PATTERN = re.compile(
+    rb"(?<![A-Za-z0-9_'\".])(?:[A-Za-z_]\w*\s*\.\s*__dict__|vars\s*\(\s*[A-Za-z_]\w*\s*\))"
+    rb"\s*(?:\[[^\]\n]*\]\s*=|"
+    rb"\.\s*(?:__setitem__|update)\s*\()"
 )
 _EmbeddedPythonCandidate = tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]
 
@@ -326,6 +380,10 @@ def _bounded_priority_embedded_python_candidate_at_offset(
     else:
         line_start = 0
     bounded_end = min(len(candidate), line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
+    if bounded_end < len(candidate):
+        complete_line_end = candidate.rfind(b"\n", line_start, bounded_end) + 1
+        if complete_line_end > line_start:
+            bounded_end = complete_line_end
     segment_ranges: list[tuple[int, int]] = []
 
     def add_segment(start: int, end: int) -> None:
@@ -344,8 +402,14 @@ def _bounded_priority_embedded_python_candidate_at_offset(
         add_segment(header_start, header_end)
     add_segment(line_start, bounded_end)
 
-    aliases = _priority_import_aliases(_compact_candidate_segments(candidate, segment_ranges))
-    usage_lines = _priority_alias_usage_lines(candidate, aliases, bounded_end) if aliases else []
+    retained_context = _compact_candidate_segments(candidate, segment_ranges)
+    aliases = _priority_import_aliases(retained_context)
+    has_late_reference_syntax = b"(" in candidate[bounded_end:] or b"." in candidate[bounded_end:]
+    usage_lines, proved_rule_codes = (
+        _priority_alias_usage_lines(candidate, aliases, bounded_end)
+        if aliases and has_late_reference_syntax
+        else ([], frozenset())
+    )
     for usage_line in usage_lines:
         add_segment(*usage_line)
 
@@ -356,6 +420,10 @@ def _bounded_priority_embedded_python_candidate_at_offset(
 
     merged_ranges = _merge_candidate_segment_ranges(segment_ranges)
     compact_candidate = _compact_candidate_segments(candidate, merged_ranges)
+    for rule_code in sorted(proved_rule_codes):
+        proof = _PROVEN_HIGH_RISK_CALL_PROBES.get(rule_code)
+        if proof is not None:
+            compact_candidate += proof[1]
     if not merged_ranges:
         return compact_candidate, span, (span,), bool(usage_lines)
 
@@ -374,11 +442,13 @@ def _is_priority_module_name(module_name: str) -> bool:
 
 
 def _priority_import_aliases(candidate: bytes) -> frozenset[bytes]:
-    try:
-        source, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
-        tree = ast.parse(textwrap.dedent(source))
-    except (SyntaxError, ValueError):
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
+    source = textwrap.dedent(source)
+    parsed_snippet = _parse_embedded_python_snippet(source)
+    if parsed_snippet is None:
         return frozenset()
+    tree, parsed_chars = parsed_snippet
+    source = source[:parsed_chars]
 
     aliases: set[bytes] = set()
     for statement in ast.walk(tree):
@@ -409,6 +479,9 @@ def _priority_assignment_aliases(source: str, tree: ast.AST, priority_aliases: s
         if _expression_is_priority_alias_reference(value, discovered_aliases):
             aliases.add(target.encode("utf-8"))
             discovered_aliases.add(target)
+            continue
+        reference_roots = _alias_reference_root_names(value)
+        if reference_roots and reference_roots.isdisjoint(discovered_aliases):
             continue
         if expensive_probes >= _MAX_PRIORITY_ASSIGNMENT_PROBES:
             continue
@@ -481,16 +554,336 @@ def _priority_assignment_probe_calls(target: str) -> list[str]:
         f"{target}.CDLL('payload')",
         f"{target}.LoadLibrary('payload')",
         f"{target}.__getitem__('payload')",
+        f"{target}.msvcrt",
     ]
 
 
 def _priority_alias_usage_lines(
-    candidate: bytes, aliases: frozenset[bytes], search_start: int
-) -> list[tuple[int, int]]:
+    candidate: bytes,
+    aliases: frozenset[bytes],
+    search_start: int,
+) -> tuple[list[tuple[int, int]], frozenset[str]]:
     usage_lines: list[tuple[int, int]] = []
-    pending_shadow_lines: dict[bytes, tuple[int, int]] = {}
-    line_start = search_start
-    multiline_quote: bytes | None = _multiline_string_state_after_line(candidate[:search_start], None)
+    retained_alias_names = {alias.decode("utf-8") for alias in aliases}
+    relevant_binding_names = set(retained_alias_names)
+    late_definitions: dict[str, list[tuple[bytes, tuple[int, int]]]] = {}
+    late_definition_starts: dict[str, list[int]] = {}
+    alias_dependency_names_cache: dict[tuple[int, int], set[str]] = {}
+    definite_shadowed_names: set[str] = set()
+    pending_shadow_spans: dict[str, tuple[int, int]] = {}
+    fail_closed_dangerous_names: set[str] = set()
+    forwarded_rule_codes: dict[str, frozenset[str]] = {}
+    typed_rule_source_names: set[str] = set()
+    typed_member_state_spans: dict[str, list[tuple[int, int]]] = {}
+    typed_member_state_overflow_starts: dict[str, int] = {}
+    typed_member_write_spans: set[tuple[int, int]] = set()
+    typed_binding_state_spans: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    typed_statement_rule_codes: dict[tuple[bytes, tuple[bytes, ...]], frozenset[str]] = {}
+    typed_rule_probe_count = 0
+    forwarded_state_sizes: dict[str, int] = dict.fromkeys(retained_alias_names, 0)
+    forwarded_safe_names: set[str] = set()
+    runpy_member_state_spans: dict[str, list[tuple[int, int]]] = {}
+    fail_closed_runpy_members: set[str] = set()
+    runpy_namespace_update_aliases: dict[str, str] = {}
+    uncertain_runpy_namespace_names: set[str] = set()
+    shadowed_descriptor_names: set[str] = set()
+    uncertain_descriptor_names: set[str] = set()
+    builtins_alias_names: set[str] = {"builtins"}
+    shadowed_builtin_helper_names: set[str] = set()
+    shadowed_truthy_builtin_names: set[str] = set()
+    truthy_builtin_state_spans: list[tuple[int, int]] = []
+    truthy_builtin_capture_names: set[str] = set()
+    late_builtins_import_spans: list[tuple[int, int]] = []
+    uncertain_builtin_helper_names: set[str] = set()
+    canonical_builtin_helper_aliases: dict[str, str] = {
+        "getattr": "getattr",
+        "builtins.getattr": "getattr",
+        "vars": "vars",
+        "builtins.vars": "vars",
+    }
+    builtin_dict_descriptor_aliases: set[str] = {"dict"}
+    builtin_dict_update_aliases: set[str] = set()
+    builtin_dict_mapping_aliases: set[str] = set()
+    uncertain_builtin_dict_mapping_aliases: set[str] = set()
+    builtin_dict_mapping_update_aliases: set[str] = set()
+    uncertain_builtin_dict_mapping_update_aliases: set[str] = set()
+    runpy_namespace_owner_names = {alias.decode("utf-8") for alias in aliases}
+
+    def add_late_definition(name: str, statement: bytes, span: tuple[int, int]) -> None:
+        if late_definition_starts.get(name, [])[-1:] == [span[0]]:
+            return
+        late_definitions.setdefault(name, []).append((statement, span))
+        late_definition_starts.setdefault(name, []).append(span[0])
+
+    def latest_definition_before(name: str, offset: int) -> tuple[bytes, tuple[int, int]] | None:
+        starts = late_definition_starts.get(name)
+        if starts is None:
+            return None
+        definition_index = bisect_left(starts, offset) - 1
+        if definition_index < 0:
+            return None
+        return late_definitions[name][definition_index]
+
+    def typed_member_write_key(statement: bytes) -> str | None:
+        structural_statement = statement.lstrip(b"\x00\xff")
+
+        def tracked_reference(owner: bytes, member: bytes) -> str | None:
+            owner_name = owner.decode("utf-8")
+            member_name = member.decode("utf-8")
+            if owner_name not in retained_alias_names or member_name not in _TYPED_PROOF_MEMBER_NAMES:
+                return None
+            return f"{owner_name}.{member_name}"
+
+        direct_match = re.match(
+            rb"\s*([A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)+)\s*=(?!=)",
+            structural_statement,
+        )
+        if direct_match is not None:
+            reference = re.sub(rb"\s+", b"", direct_match.group(1))
+            owner, _separator, member = reference.partition(b".")
+            tracked = tracked_reference(owner, member)
+            if tracked is not None:
+                return tracked
+
+        mapping_match = re.match(
+            rb"\s*(?:vars\s*\(\s*(?P<vars_owner>[A-Za-z_]\w*)\s*\)|"
+            rb"(?P<dict_owner>[A-Za-z_]\w*)\s*\.\s*__dict__)\s*"
+            rb"\[\s*['\"](?P<member>[A-Za-z_]\w*)['\"]\s*\]\s*=(?!=)",
+            structural_statement,
+        )
+        if mapping_match is not None and "vars" not in shadowed_builtin_helper_names:
+            owner = mapping_match.group("vars_owner") or mapping_match.group("dict_owner")
+            tracked = tracked_reference(owner, mapping_match.group("member"))
+            if tracked is not None:
+                return tracked
+
+        update_match = re.match(
+            rb"\s*(?:vars\s*\(\s*(?P<vars_owner>[A-Za-z_]\w*)\s*\)|"
+            rb"(?P<dict_owner>[A-Za-z_]\w*)\s*\.\s*__dict__)\s*\.\s*update\s*"
+            rb"\(\s*(?P<member>[A-Za-z_]\w*)\s*=",
+            structural_statement,
+        )
+        if update_match is not None and "vars" not in shadowed_builtin_helper_names:
+            owner = update_match.group("vars_owner") or update_match.group("dict_owner")
+            tracked = tracked_reference(owner, update_match.group("member"))
+            if tracked is not None:
+                return tracked
+
+        setattr_match = re.match(
+            rb"\s*setattr\s*\(\s*(?P<owner>[A-Za-z_]\w*)\s*,\s*['\"](?P<member>[A-Za-z_]\w*)['\"]\s*,",
+            structural_statement,
+        )
+        if setattr_match is not None:
+            return tracked_reference(setattr_match.group("owner"), setattr_match.group("member"))
+        return None
+
+    def typed_reference_rule_codes(reference: str | None) -> frozenset[str]:
+        if reference is None:
+            return frozenset()
+        _owner, _separator, member = reference.partition(".")
+        if member in {"get", "open", "open_new", "open_new_tab"}:
+            return frozenset({"S109"})
+        if member in _TYPED_PROOF_MEMBER_NAMES:
+            return frozenset({"S110"})
+        return frozenset()
+
+    def typed_member_state_before(reference: str, offset: int) -> tuple[list[tuple[int, int]], bool]:
+        spans = typed_member_state_spans.get(reference)
+        selected = [span for span in (spans or []) if span[0] < offset]
+        overflow_start = typed_member_state_overflow_starts.get(reference)
+        return selected, overflow_start is not None and overflow_start < offset
+
+    def typed_member_state_signature(reference: str | None, offset: int) -> tuple[bytes, ...]:
+        if reference is None:
+            return ()
+        spans, overflowed = typed_member_state_before(reference, offset)
+        if overflowed:
+            return (b"<overflow>",)
+        return tuple(re.sub(rb"\s+", b"", candidate[start:end]) for start, end in spans)
+
+    def typed_member_state_is_proven_safe(span: tuple[int, int]) -> bool:
+        statement = candidate[span[0] : span[1]].lstrip(b"\x00\xff").strip()
+        if re.search(rb"=\s*print\s*\)?\s*$", statement) is not None:
+            return True
+        return (
+            re.match(
+                rb"setattr\s*\(\s*[A-Za-z_]\w*\s*,\s*['\"][A-Za-z_]\w*['\"]\s*,\s*print\s*\)\s*$",
+                statement,
+            )
+            is not None
+        )
+
+    def typed_member_write_is_inert_forwarding(statement: bytes, reference: str | None) -> bool:
+        if reference is None:
+            return False
+        normalized_statement = re.sub(rb"\s+", b"", statement.lstrip(b"\x00\xff"))
+        encoded_reference = reference.encode("utf-8")
+        return normalized_statement == encoded_reference + b"=" + encoded_reference
+
+    def typed_member_proof_spans(reference: str | None, offset: int) -> tuple[list[tuple[int, int]], bool]:
+        if reference is None:
+            return [], False
+        state_spans, overflowed = typed_member_state_before(reference, offset)
+        if overflowed:
+            return [], True
+        selected: set[tuple[int, int]] = set()
+        selected_size = 0
+        pending = [(candidate[start:end], (start, end)) for start, end in state_spans]
+        while pending:
+            state_statement, state_span = pending.pop()
+            if state_span in selected:
+                continue
+            selected.add(state_span)
+            selected_size += state_span[1] - state_span[0] + 1
+            pending.extend(
+                (candidate[start:end], (start, end)) for start, end in typed_binding_state_spans.get(state_span, [])
+            )
+            for dependency in _alias_binding_dependency_names(state_statement):
+                definition = latest_definition_before(dependency, state_span[0])
+                if definition is not None:
+                    pending.append(definition)
+            for dependency in _assignment_value_dependency_names(state_statement):
+                definition = latest_definition_before(dependency, state_span[0])
+                if definition is not None:
+                    pending.append(definition)
+            if selected_size > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
+                return [], True
+        return sorted(selected), False
+
+    def inferred_binding_rule_codes(name: str, statement: bytes, binding_start: int) -> frozenset[str]:
+        nonlocal typed_rule_probe_count
+        inference_context = priority_context
+        if aliases - _priority_import_aliases(inference_context):
+            retained_prefix_context = _extract_priority_prefix_context(candidate[:search_start])
+            if retained_prefix_context:
+                inference_context = retained_prefix_context + b"\n" + inference_context
+        typed_reference = _simple_late_assignment_value_reference(statement)
+        typed_state_spans, typed_state_overflowed = typed_member_proof_spans(typed_reference, binding_start)
+        if typed_state_overflowed or typed_rule_probe_count >= _MAX_PRIORITY_ASSIGNMENT_PROBES:
+            return typed_reference_rule_codes(typed_reference)
+        typed_rule_probe_count += 1
+        proof = b"\n".join(
+            [
+                inference_context,
+                *(candidate[start:end] for start, end in truthy_builtin_state_spans),
+                *(candidate[start:end] for start, end in typed_state_spans),
+                statement,
+            ]
+        )
+        source, _byte_offsets = _decode_utf8_with_byte_offsets(
+            proof + b"\n" + "\n".join(_priority_assignment_probe_calls(name)).encode("utf-8")
+        )
+        parsed_snippet = _parse_embedded_python_snippet(textwrap.dedent(source))
+        if parsed_snippet is None:
+            return frozenset()
+        return frozenset(
+            rule_code
+            for _call_name, rule_code in _resolve_alias_aware_high_risk_calls(parsed_snippet[0])
+            if rule_code in _PROVEN_HIGH_RISK_CALL_PROBES
+        )
+
+    def bind_forwarded_rule_codes(name: str, statement: bytes, forwarded_dependency: str, binding_start: int) -> None:
+        if forwarded_dependency in forwarded_rule_codes:
+            forwarded_rule_codes[name] = forwarded_rule_codes[forwarded_dependency]
+            return
+        if forwarded_dependency in retained_alias_names and any(
+            marker in statement for marker in _TYPED_PROOF_BINDING_MARKERS
+        ):
+            forwarding = _simple_forwarded_alias_assignment(statement)
+            source_expression = forwarding[2] if forwarding is not None else statement
+            normalized_expression = re.sub(rb"\s+", b"", source_expression)
+            typed_reference = normalized_expression.decode("utf-8") if forwarding is not None else None
+            cache_key = (normalized_expression, typed_member_state_signature(typed_reference, binding_start))
+            inferred = typed_statement_rule_codes.get(cache_key)
+            if inferred is None:
+                inferred = inferred_binding_rule_codes(name, statement, binding_start)
+                typed_statement_rule_codes[cache_key] = inferred
+            typed_inferred = inferred - {"S108"}
+            if typed_inferred:
+                forwarded_rule_codes[name] = frozenset(typed_inferred)
+            return
+        if forwarded_dependency in retained_alias_names:
+            source_statement = b""
+            source_definition_start = binding_start
+        else:
+            source_definition = latest_definition_before(forwarded_dependency, binding_start)
+            if source_definition is None:
+                return
+            source_statement = source_definition[0]
+            source_definition_start = source_definition[1][0]
+        inferred = inferred_binding_rule_codes(forwarded_dependency, source_statement, source_definition_start)
+        typed_inferred = inferred - {"S108"}
+        if typed_inferred:
+            forwarded_rule_codes[forwarded_dependency] = frozenset(typed_inferred)
+            forwarded_rule_codes[name] = frozenset(typed_inferred)
+
+    def proof_rule_codes(root_names: set[str], *, conservative: bool = False) -> frozenset[str]:
+        rule_codes = frozenset(
+            rule_code for root_name in root_names for rule_code in forwarded_rule_codes.get(root_name, frozenset())
+        )
+        return rule_codes or (frozenset({"S108"}) if conservative else frozenset())
+
+    def retained_state_spans(root_names: set[str], endpoint_start: int) -> tuple[list[tuple[int, int]], bool, bool]:
+        selected: set[tuple[int, int]] = set()
+        selected_size = 0
+        pending: list[tuple[bytes, tuple[int, int]]] = []
+        reaches_retained_alias = False
+        for root_name in root_names:
+            definition = latest_definition_before(root_name, endpoint_start)
+            if definition is not None:
+                pending.append(definition)
+            elif root_name in retained_alias_names:
+                reaches_retained_alias = True
+        while pending:
+            statement, span = pending.pop()
+            if span in selected:
+                continue
+            selected.add(span)
+            selected_size += span[1] - span[0] + 1
+            pending.extend(
+                (candidate[state_start:state_end], (state_start, state_end))
+                for state_start, state_end in typed_binding_state_spans.get(span, [])
+            )
+            references = alias_dependency_names_cache.setdefault(span, _alias_binding_dependency_names(statement))
+            if span in typed_member_write_spans:
+                references.update(_assignment_value_dependency_names(statement))
+            for reference in references:
+                definition = latest_definition_before(reference, span[0])
+                if definition is not None:
+                    pending.append(definition)
+                elif reference in retained_alias_names:
+                    reaches_retained_alias = True
+        overflowed = selected_size > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES
+        return ([] if overflowed else sorted(selected)), reaches_retained_alias, overflowed
+
+    def has_inert_forwarding_state(spans: list[tuple[int, int]]) -> bool:
+        return any(
+            b";" in candidate[start:end] and _simple_forwarded_alias_assignment(candidate[start:end]) is not None
+            for start, end in spans
+        )
+
+    context_start = max(0, search_start - _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
+    if context_start:
+        next_line_start = candidate.find(b"\n", context_start, search_start)
+        if next_line_start != -1:
+            context_start = next_line_start + 1
+    priority_context = candidate[context_start:search_start]
+    for context_line in priority_context.splitlines():
+        structural_context_line = _python_structural_line_bytes(context_line.lstrip(b"\x00\xff"))
+        builtins_import = re.match(rb"\s*import\s+builtins(?:\s+as\s+([A-Za-z_]\w*))?", structural_context_line)
+        if builtins_import is not None:
+            builtins_alias_names.add((builtins_import.group(1) or b"builtins").decode("utf-8"))
+        shadowed_truthy_builtin_names.update(
+            _late_mutated_truthy_builtin_names(
+                structural_context_line, builtins_alias_names, shadowed_builtin_helper_names
+            )
+        )
+    line_start = context_start
+    multiline_quote: bytes | None = _multiline_string_state_after_line(candidate[:context_start], None)
+    continued_expression_start: int | None = None
+    continued_parenthesis_depth = 0
+    continued_has_priority_piece = False
+    active_late_headers: list[tuple[int, bytes, int]] = []
     while line_start < len(candidate):
         line_end = candidate.find(b"\n", line_start)
         if line_end == -1:
@@ -502,39 +895,1193 @@ def _priority_alias_usage_lines(
             multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
             line_start = line_end
             continue
-        code_line = _python_structural_line_bytes(line)
-        shadowed_aliases = _line_shadowed_priority_aliases(code_line, aliases)
-        if shadowed_aliases:
-            shadow_line = (
-                line_start,
-                min(
-                    _priority_alias_shadow_segment_end(candidate, line, line_end),
-                    line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES,
-                ),
+        code_start = 0
+        while code_start < len(line) and not 0x20 <= line[code_start] < 0x7F:
+            code_start += 1
+        code_line = _python_structural_line_bytes(line[code_start:])
+        structural_code_line = code_line.strip()
+        line_indent = len(line) - len(line.lstrip())
+        if structural_code_line:
+            while active_late_headers and line_indent <= active_late_headers[-1][0]:
+                active_late_headers.pop()
+        enclosing_headers = (
+            [(header, header_start) for _indent, header, header_start in reversed(active_late_headers)]
+            if line[:1].isspace()
+            else []
+        )
+        if structural_code_line.endswith(b":"):
+            active_late_headers.append((line_indent, structural_code_line, line_start))
+        if line_end > search_start:
+            late_guard_value = _constant_late_binding_guard_value(candidate, line_start, line, enclosing_headers)
+            typed_member_key = (
+                typed_member_write_key(line)
+                if (b"." in line or b"setattr" in line)
+                and any(member.encode("utf-8") in line for member in _TYPED_PROOF_MEMBER_NAMES)
+                else None
             )
-            for alias in shadowed_aliases:
-                pending_shadow_lines[alias] = shadow_line
-        if used_aliases := _line_used_priority_aliases(code_line, aliases):
-            live_aliases = _line_live_priority_aliases(code_line, aliases)
-            active_used_aliases = (used_aliases - shadowed_aliases) | live_aliases
-            if not active_used_aliases:
-                multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
-                line_start = line_end
-                continue
-            for shadow_line in sorted(
-                {shadow_line for alias, shadow_line in pending_shadow_lines.items() if alias in used_aliases}
+            if (
+                typed_member_key is not None
+                and late_guard_value is True
+                and not _is_nested_late_state_statement(candidate, line_start, line, enclosing_headers)
             ):
-                if shadow_line not in usage_lines:
-                    usage_lines.append(shadow_line)
-            usage_line = (line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES))
-            if usage_line not in usage_lines:
-                usage_lines.append(usage_line)
-            called_aliases = _line_called_priority_aliases(code_line, aliases)
-            if (called_aliases & active_used_aliases) or len(usage_lines) >= _MAX_PRIORITY_ALIAS_USAGE_LINES:
-                return usage_lines
+                state_spans = typed_member_state_spans.setdefault(typed_member_key, [])
+                normalized_state = re.sub(rb"\s+", b"", line)
+                if (
+                    not state_spans
+                    or re.sub(rb"\s+", b"", candidate[state_spans[-1][0] : state_spans[-1][1]]) != normalized_state
+                ):
+                    if len(state_spans) >= _MAX_PRIORITY_ASSIGNMENT_PROBES:
+                        typed_member_state_overflow_starts.setdefault(typed_member_key, line_start)
+                    else:
+                        if state_spans:
+                            typed_binding_state_spans[(line_start, line_end)] = [state_spans[-1]]
+                        typed_member_write_spans.add((line_start, line_end))
+                        state_spans.append((line_start, line_end))
+            mutated_truthy_builtin_names: set[str] = set()
+            if late_guard_value is not False:
+                mutated_truthy_builtin_names = _late_mutated_truthy_builtin_names(
+                    line, builtins_alias_names, shadowed_builtin_helper_names
+                )
+                shadowed_truthy_builtin_names.update(mutated_truthy_builtin_names)
+            if mutated_truthy_builtin_names:
+                mutation_start = _late_binding_statement_start(candidate, line_start, line, enclosing_headers)
+                mutation_span = (
+                    mutation_start,
+                    min(line_end, mutation_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES),
+                )
+                capture_spans, _reaches_capture_root, _capture_overflowed = retained_state_spans(
+                    _python_identifier_names(line).intersection(truthy_builtin_capture_names), line_start
+                )
+                for state_span in [*late_builtins_import_spans, *capture_spans, mutation_span]:
+                    if state_span not in truthy_builtin_state_spans:
+                        truthy_builtin_state_spans.append(state_span)
+            shadowed_aliases = _definitely_executed_late_shadow_aliases(
+                code_line,
+                aliases,
+                nested=bool(enclosing_headers),
+            )
+            if shadowed_aliases:
+                shadow_start = _late_binding_statement_start(candidate, line_start, line, enclosing_headers)
+                shadow_span = (
+                    shadow_start,
+                    min(
+                        _priority_alias_shadow_segment_end(candidate, line, line_end),
+                        shadow_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES,
+                    ),
+                )
+                for shadowed_alias in shadowed_aliases:
+                    pending_shadow_spans[shadowed_alias.decode("utf-8")] = shadow_span
+        parenthesis_delta = _line_parenthesis_delta(code_line)
+        has_line_continuation = code_line.rstrip().endswith(b"\\")
+        if continued_expression_start is None:
+            if parenthesis_delta > 0 or has_line_continuation:
+                continued_expression_start = line_start
+                continued_parenthesis_depth = parenthesis_delta
+                continued_has_priority_piece = (
+                    _line_is_continued_priority_alias_piece(code_line, aliases)
+                    or _line_is_continued_priority_name_piece(code_line, relevant_binding_names)
+                    or _line_starts_continued_priority_getattr(code_line)
+                )
+        else:
+            continued_parenthesis_depth += parenthesis_delta
+            continued_has_priority_piece = (
+                continued_has_priority_piece
+                or _line_is_continued_priority_alias_piece(code_line, aliases)
+                or _line_is_continued_priority_name_piece(code_line, relevant_binding_names)
+                or _line_starts_continued_priority_getattr(code_line)
+            )
+            if line_end - continued_expression_start > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
+                continued_expression_start = None
+                continued_parenthesis_depth = 0
+                continued_has_priority_piece = False
+            elif continued_parenthesis_depth <= 0 and not has_line_continuation:
+                if line_end > search_start and continued_has_priority_piece:
+                    fragment = candidate[continued_expression_start:line_end]
+                    root_names = _callable_root_names(fragment)
+                    if not root_names.isdisjoint(definite_shadowed_names):
+                        continued_expression_start = None
+                        continued_parenthesis_depth = 0
+                        continued_has_priority_piece = False
+                        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                        line_start = line_end
+                        continue
+                    if not root_names.isdisjoint(fail_closed_dangerous_names):
+                        usage_lines.append((continued_expression_start, line_end))
+                        return usage_lines, proof_rule_codes(root_names, conservative=True)
+                    priority_aliases = frozenset(name.encode("utf-8") for name in relevant_binding_names)
+                    getattr_member = _priority_getattr_alias_member(
+                        fragment, priority_aliases, shadowed_builtin_helper_names
+                    )
+                    if getattr_member is not None:
+                        root_names.add(getattr_member[2])
+                    state_spans, reaches_retained_alias, overflowed = retained_state_spans(
+                        root_names, continued_expression_start
+                    )
+                    if root_names and (
+                        _fragment_has_continued_priority_alias_call(fragment, aliases)
+                        or getattr_member is not None
+                        or (state_spans and reaches_retained_alias)
+                        or (overflowed and reaches_retained_alias)
+                    ):
+                        usage_lines.extend(truthy_builtin_state_spans)
+                        usage_lines.extend(state_spans)
+                        usage_lines.extend(
+                            span for member_spans in runpy_member_state_spans.values() for span in member_spans
+                        )
+                        usage_lines.append((continued_expression_start, line_end))
+                        needs_proof = (
+                            (overflowed and reaches_retained_alias)
+                            or (
+                                not runpy_member_state_spans
+                                and _line_calls_overbounded_runpy_getattr_alias(
+                                    fragment, priority_aliases, shadowed_builtin_helper_names
+                                )
+                            )
+                            or (reaches_retained_alias and has_inert_forwarding_state(state_spans))
+                        )
+                        return (
+                            usage_lines,
+                            proof_rule_codes(root_names, conservative=True) if needs_proof else frozenset(),
+                        )
+                continued_expression_start = None
+                continued_parenthesis_depth = 0
+                continued_has_priority_piece = False
+        is_simple_forwarding_binding = False
+        if line_end > search_start:
+            binding_name = _simple_late_binding_name(code_line)
+            if binding_name is not None:
+                may_bind_namespace_update = (
+                    b"__dict__" in line
+                    or b"vars" in line
+                    or (
+                        b".update" in line
+                        and not _python_identifier_names(code_line).isdisjoint(runpy_namespace_update_aliases)
+                    )
+                )
+                update_alias = (
+                    _runpy_priority_namespace_update_binding(
+                        line,
+                        frozenset(name.encode("utf-8") for name in runpy_namespace_owner_names),
+                        runpy_namespace_update_aliases,
+                        shadowed_builtin_helper_names,
+                    )
+                    if may_bind_namespace_update
+                    else None
+                )
+                guard_value = _constant_late_binding_guard_value(candidate, line_start, line, enclosing_headers)
+                if guard_value is False:
+                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    line_start = line_end
+                    continue
+                if update_alias is not None:
+                    runpy_namespace_update_aliases[update_alias[0]] = update_alias[1]
+                    if guard_value is None:
+                        uncertain_runpy_namespace_names.add(binding_name)
+                    else:
+                        uncertain_runpy_namespace_names.discard(binding_name)
+                definite_shadowed_names.discard(binding_name)
+                if guard_value is True:
+                    fail_closed_dangerous_names.discard(binding_name)
+                    forwarded_rule_codes.pop(binding_name, None)
+                    typed_rule_source_names.discard(binding_name)
+                if binding_name not in relevant_binding_names and _is_inert_scalar_late_binding(code_line):
+                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    line_start = line_end
+                    continue
+                statement_start = (
+                    line_start
+                    if guard_value is True
+                    and _is_reachable_late_else_binding(candidate, line_start, line, enclosing_headers)
+                    else _late_binding_statement_start(candidate, line_start, line, enclosing_headers)
+                )
+                if statement_start == line_start:
+                    statement_start += code_start
+                statement = candidate[statement_start:line_end]
+                span = (statement_start, line_end)
+                if parenthesis_delta > 0 or has_line_continuation:
+                    statement, span = _bounded_late_binding_statement(candidate, statement_start, line_end)
+                assignment_expression = line[code_start:]
+                if parenthesis_delta > 0 or has_line_continuation:
+                    assignment_expression, _assignment_span = _bounded_late_binding_statement(
+                        candidate, line_start + code_start, line_end
+                    )
+                nested_state_statement = _is_nested_late_state_statement(candidate, line_start, line, enclosing_headers)
+                scoped_binding = _is_scoped_late_binding(candidate, line_start, line, enclosing_headers)
+                referenced_identifiers = _python_identifier_names(statement)
+                forwarded_dependency = _simple_forwarded_alias_dependency_name(statement)
+                is_simple_forwarding_binding = forwarded_dependency is not None
+                if update_alias is None:
+                    forwarded_namespace_owner = runpy_namespace_update_aliases.get(forwarded_dependency or "")
+                    if forwarded_namespace_owner is not None:
+                        runpy_namespace_update_aliases[binding_name] = forwarded_namespace_owner
+                        if guard_value is None or forwarded_dependency in uncertain_runpy_namespace_names:
+                            uncertain_runpy_namespace_names.add(binding_name)
+                        else:
+                            uncertain_runpy_namespace_names.discard(binding_name)
+                    elif guard_value is None and (
+                        binding_name in runpy_namespace_update_aliases or binding_name in runpy_namespace_owner_names
+                    ):
+                        uncertain_runpy_namespace_names.add(binding_name)
+                    else:
+                        runpy_namespace_update_aliases.pop(binding_name, None)
+                        if guard_value is True:
+                            uncertain_runpy_namespace_names.discard(binding_name)
+                if binding_name == "dict" and guard_value is None:
+                    uncertain_descriptor_names.add("dict")
+                descriptor_reference = _simple_late_assignment_value_reference(assignment_expression)
+                canonical_helper_reference = canonical_builtin_helper_aliases.get(descriptor_reference or "")
+                if descriptor_reference in shadowed_builtin_helper_names | uncertain_builtin_helper_names:
+                    canonical_helper_reference = None
+                if binding_name in {"getattr", "vars"} and not scoped_binding:
+                    restored_builtin_helper = guard_value is True and canonical_helper_reference == binding_name
+                    if restored_builtin_helper:
+                        shadowed_builtin_helper_names.discard(binding_name)
+                        uncertain_builtin_helper_names.discard(binding_name)
+                    elif guard_value is None:
+                        shadowed_builtin_helper_names.discard(binding_name)
+                        uncertain_builtin_helper_names.add(binding_name)
+                    else:
+                        shadowed_builtin_helper_names.add(binding_name)
+                        uncertain_builtin_helper_names.discard(binding_name)
+                if not scoped_binding and guard_value is True:
+                    if canonical_helper_reference is not None:
+                        canonical_builtin_helper_aliases[binding_name] = canonical_helper_reference
+                    else:
+                        canonical_builtin_helper_aliases.pop(binding_name, None)
+                if guard_value is True:
+                    if descriptor_reference in builtins_alias_names:
+                        builtins_alias_names.add(binding_name)
+                    else:
+                        builtins_alias_names.discard(binding_name)
+                    is_builtin_dict_descriptor = descriptor_reference in builtin_dict_descriptor_aliases or (
+                        descriptor_reference is not None
+                        and descriptor_reference.removesuffix(".dict") in builtins_alias_names
+                        and descriptor_reference.endswith(".dict")
+                        and "builtins.dict" not in shadowed_descriptor_names
+                    )
+                    if is_builtin_dict_descriptor:
+                        builtin_dict_descriptor_aliases.add(binding_name)
+                    else:
+                        builtin_dict_descriptor_aliases.discard(binding_name)
+                    if binding_name == "dict":
+                        uncertain_descriptor_names.discard("dict")
+                        if is_builtin_dict_descriptor:
+                            shadowed_descriptor_names.discard("dict")
+                        else:
+                            shadowed_descriptor_names.add("dict")
+                binds_builtins_mapping = _late_assignment_binds_builtins_mapping(
+                    assignment_expression,
+                    builtins_alias_names,
+                    builtin_dict_mapping_aliases,
+                    shadowed_builtin_helper_names,
+                )
+                if not scoped_binding and binds_builtins_mapping:
+                    builtin_dict_mapping_aliases.add(binding_name)
+                    if guard_value is None:
+                        uncertain_builtin_dict_mapping_aliases.add(binding_name)
+                    else:
+                        uncertain_builtin_dict_mapping_aliases.discard(binding_name)
+                elif not scoped_binding and guard_value is True:
+                    builtin_dict_mapping_aliases.discard(binding_name)
+                    uncertain_builtin_dict_mapping_aliases.discard(binding_name)
+                update_binding_kind = _late_assignment_builtin_update_kind(
+                    assignment_expression,
+                    builtins_alias_names,
+                    builtin_dict_descriptor_aliases,
+                    shadowed_descriptor_names | uncertain_descriptor_names,
+                    shadowed_builtin_helper_names,
+                    builtin_dict_mapping_aliases,
+                )
+                if (
+                    not scoped_binding
+                    and not nested_state_statement
+                    and (update_binding_kind == "descriptor" or forwarded_dependency in builtin_dict_update_aliases)
+                ):
+                    builtin_dict_update_aliases.add(binding_name)
+                elif not scoped_binding and guard_value is True:
+                    builtin_dict_update_aliases.discard(binding_name)
+                if (
+                    not scoped_binding
+                    and not nested_state_statement
+                    and (
+                        update_binding_kind == "mapping" or forwarded_dependency in builtin_dict_mapping_update_aliases
+                    )
+                ):
+                    builtin_dict_mapping_update_aliases.add(binding_name)
+                    if (
+                        guard_value is None
+                        or forwarded_dependency in uncertain_builtin_dict_mapping_update_aliases
+                        or not referenced_identifiers.isdisjoint(uncertain_builtin_dict_mapping_aliases)
+                    ):
+                        uncertain_builtin_dict_mapping_update_aliases.add(binding_name)
+                    else:
+                        uncertain_builtin_dict_mapping_update_aliases.discard(binding_name)
+                elif not scoped_binding and guard_value is True:
+                    builtin_dict_mapping_update_aliases.discard(binding_name)
+                    uncertain_builtin_dict_mapping_update_aliases.discard(binding_name)
+                elif not scoped_binding and guard_value is None and binding_name in builtin_dict_mapping_update_aliases:
+                    uncertain_builtin_dict_mapping_update_aliases.add(binding_name)
+                if forwarded_dependency in runpy_namespace_owner_names:
+                    forwarded_assignment = _simple_forwarded_alias_assignment(statement)
+                    if forwarded_assignment is not None and b"." not in forwarded_assignment[2]:
+                        runpy_namespace_owner_names.add(binding_name)
+                        if guard_value is None or forwarded_dependency in uncertain_runpy_namespace_names:
+                            uncertain_runpy_namespace_names.add(binding_name)
+                        else:
+                            uncertain_runpy_namespace_names.discard(binding_name)
+                elif guard_value is None and binding_name in runpy_namespace_owner_names:
+                    uncertain_runpy_namespace_names.add(binding_name)
+                alias_dependencies = (
+                    {forwarded_dependency}
+                    if forwarded_dependency is not None
+                    else _alias_binding_dependency_names(statement) or _alias_binding_dependency_names(line)
+                )
+                if update_alias is not None:
+                    alias_dependencies.add(update_alias[1])
+                if descriptor_reference is not None:
+                    typed_state_spans, _typed_state_overflowed = typed_member_state_before(
+                        descriptor_reference, span[0]
+                    )
+                    if typed_state_spans:
+                        typed_binding_state_spans[span] = [typed_state_spans[-1]]
+                        if guard_value is True and typed_member_state_is_proven_safe(typed_state_spans[-1]):
+                            definite_shadowed_names.add(binding_name)
+                            pending_shadow_spans[binding_name] = typed_state_spans[-1]
+                            forwarded_state_sizes.pop(binding_name, None)
+                            forwarded_safe_names.add(binding_name)
+                builtin_value_references = {
+                    *(f"{alias_name}.print" for alias_name in builtins_alias_names),
+                    *(f"{alias_name}.len" for alias_name in builtins_alias_names),
+                }
+                if (
+                    (
+                        descriptor_reference in builtin_value_references
+                        or forwarded_dependency in truthy_builtin_capture_names
+                    )
+                    and binding_name not in relevant_binding_names | fail_closed_dangerous_names
+                    and alias_dependencies.isdisjoint(relevant_binding_names | fail_closed_dangerous_names)
+                ):
+                    truthy_builtin_capture_names.add(binding_name)
+                    alias_dependency_names_cache[span] = alias_dependencies
+                    add_late_definition(binding_name, statement, span)
+                elif guard_value is True:
+                    truthy_builtin_capture_names.discard(binding_name)
+                has_typed_rule_marker = b"." in statement and any(
+                    marker in statement for marker in _TYPED_PROOF_BINDING_MARKERS
+                )
+                if has_typed_rule_marker and not alias_dependencies.isdisjoint(
+                    relevant_binding_names | fail_closed_dangerous_names
+                ):
+                    typed_rule_source_names.add(binding_name)
+                if (
+                    forwarded_dependency is not None
+                    and (
+                        forwarded_dependency in forwarded_rule_codes
+                        or forwarded_dependency in typed_rule_source_names
+                        or (
+                            forwarded_dependency in retained_alias_names
+                            and (has_typed_rule_marker or b"." not in statement)
+                        )
+                    )
+                    and not alias_dependencies.isdisjoint(relevant_binding_names | fail_closed_dangerous_names)
+                ):
+                    bind_forwarded_rule_codes(binding_name, statement, forwarded_dependency, span[0])
+                if binding_name in builtin_dict_update_aliases:
+                    alias_dependency_names_cache[span] = alias_dependencies
+                    add_late_definition(binding_name, statement, span)
+                if (
+                    guard_value is None
+                    and binding_name in relevant_binding_names
+                    and alias_dependencies.isdisjoint(relevant_binding_names)
+                ):
+                    if _is_exhaustive_safe_late_binding(candidate, line_start, line, binding_name):
+                        definite_shadowed_names.add(binding_name)
+                        fail_closed_dangerous_names.discard(binding_name)
+                        forwarded_state_sizes.pop(binding_name, None)
+                        forwarded_safe_names.add(binding_name)
+                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    line_start = line_end
+                    continue
+                if (
+                    forwarded_dependency is None
+                    and not alias_dependencies.isdisjoint(relevant_binding_names | fail_closed_dangerous_names)
+                    and _assignment_may_bind_priority_alias(
+                        statement,
+                        relevant_binding_names | fail_closed_dangerous_names,
+                        shadowed_truthy_builtin_names,
+                    )
+                ):
+                    conditional_state_size = (span[1] - span[0]) + sum(
+                        state_end - state_start for state_start, state_end in truthy_builtin_state_spans
+                    )
+                    if conditional_state_size > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
+                        fail_closed_dangerous_names.add(binding_name)
+                        relevant_binding_names.add(binding_name)
+                        forwarded_state_sizes[binding_name] = conditional_state_size
+                        forwarded_safe_names.discard(binding_name)
+                    else:
+                        alias_dependency_names_cache[span] = alias_dependencies
+                        add_late_definition(binding_name, statement, span)
+                        relevant_binding_names.add(binding_name)
+                        forwarded_state_sizes[binding_name] = conditional_state_size
+                        forwarded_safe_names.discard(binding_name)
+                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    line_start = line_end
+                    continue
+                if (guard_value is None or statement[:1].isspace()) and not alias_dependencies.isdisjoint(
+                    relevant_binding_names | fail_closed_dangerous_names
+                ):
+                    fail_closed_dangerous_names.add(binding_name)
+                    relevant_binding_names.add(binding_name)
+                    forwarded_state_sizes[binding_name] = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES + 1
+                    forwarded_safe_names.discard(binding_name)
+                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    line_start = line_end
+                    continue
+                if forwarded_dependency is not None:
+                    if forwarded_dependency in fail_closed_dangerous_names:
+                        fail_closed_dangerous_names.add(binding_name)
+                        relevant_binding_names.add(binding_name)
+                        forwarded_state_sizes[binding_name] = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES + 1
+                        forwarded_safe_names.discard(binding_name)
+                        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                        line_start = line_end
+                        continue
+                    source_size = forwarded_state_sizes.get(forwarded_dependency)
+                    if source_size is not None:
+                        forwarded_size = source_size + span[1] - span[0]
+                        if forwarded_size > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
+                            fail_closed_dangerous_names.add(binding_name)
+                            relevant_binding_names.add(binding_name)
+                            forwarded_state_sizes[binding_name] = forwarded_size
+                            forwarded_safe_names.discard(binding_name)
+                            multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                            line_start = line_end
+                            continue
+                        forwarded_state_sizes[binding_name] = forwarded_size
+                        forwarded_safe_names.discard(binding_name)
+                    elif (
+                        forwarded_dependency in forwarded_safe_names
+                        or forwarded_dependency not in relevant_binding_names
+                    ):
+                        forwarded_state_sizes.pop(binding_name, None)
+                        forwarded_safe_names.add(binding_name)
+                        if binding_name not in retained_alias_names and binding_name not in late_definitions:
+                            relevant_binding_names.discard(binding_name)
+                            multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                            line_start = line_end
+                            continue
+                elif not alias_dependencies:
+                    forwarded_state_sizes.pop(binding_name, None)
+                    forwarded_safe_names.add(binding_name)
+                    if binding_name not in retained_alias_names and binding_name not in late_definitions:
+                        relevant_binding_names.discard(binding_name)
+                        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                        line_start = line_end
+                        continue
+                if (
+                    binding_name in relevant_binding_names
+                    or forwarded_dependency in relevant_binding_names
+                    or not referenced_identifiers.isdisjoint(relevant_binding_names)
+                ):
+                    alias_dependency_names_cache[span] = alias_dependencies
+                    add_late_definition(binding_name, statement, span)
+                    relevant_binding_names.add(binding_name)
+            elif re.match(rb"\s*(?:import|from)\b", code_line) is not None:
+                builtins_import = re.match(rb"\s*import\s+builtins(?:\s+as\s+([A-Za-z_]\w*))?", code_line)
+                if builtins_import is not None:
+                    builtins_alias_names.add((builtins_import.group(1) or b"builtins").decode("utf-8"))
+                    late_builtins_import_spans.append((line_start, line_end))
+                for name in _statement_defined_names(line):
+                    if name == "dict":
+                        shadowed_descriptor_names.add("dict")
+                    definite_shadowed_names.discard(name)
+                    fail_closed_dangerous_names.discard(name)
+                    forwarded_state_sizes.pop(name, None)
+                    forwarded_safe_names.discard(name)
+                    add_late_definition(name, line, (line_start, line_end))
+            else:
+                descriptor_statement = line
+                if parenthesis_delta > 0 or has_line_continuation:
+                    descriptor_statement, _descriptor_span = _bounded_late_binding_statement(
+                        candidate, line_start, line_end
+                    )
+                descriptor_code_line = _python_structural_line_bytes(descriptor_statement.lstrip(b"\x00\xff"))
+                if b"dict" in descriptor_code_line and (
+                    b"=" in descriptor_code_line
+                    or b"update" in descriptor_code_line
+                    or b"__setitem__" in descriptor_code_line
+                ):
+                    descriptor_write = _builtin_dict_attribute_write_state(
+                        descriptor_statement,
+                        builtins_alias_names,
+                        builtin_dict_descriptor_aliases,
+                        shadowed_descriptor_names,
+                        builtin_dict_mapping_aliases,
+                        builtin_dict_mapping_update_aliases,
+                        shadowed_builtin_helper_names,
+                    )
+                    if descriptor_write is not None and not _is_nested_late_state_statement(
+                        candidate, line_start, line, enclosing_headers
+                    ):
+                        descriptor_guard = _constant_late_binding_guard_value(
+                            candidate, line_start, line, enclosing_headers
+                        )
+                        potentially_conditional_mapping_write = not _python_identifier_names(
+                            descriptor_statement
+                        ).isdisjoint(
+                            uncertain_builtin_dict_mapping_aliases | uncertain_builtin_dict_mapping_update_aliases
+                        )
+                        if descriptor_guard is None or potentially_conditional_mapping_write:
+                            uncertain_descriptor_names.add("builtins.dict")
+                            shadowed_descriptor_names.discard("builtins.dict")
+                        elif descriptor_guard is True:
+                            uncertain_descriptor_names.discard("builtins.dict")
+                            if descriptor_write:
+                                shadowed_descriptor_names.discard("builtins.dict")
+                            else:
+                                shadowed_descriptor_names.add("builtins.dict")
+                helper_write = _builtin_helper_attribute_write_state(
+                    descriptor_statement,
+                    builtins_alias_names,
+                    builtin_dict_mapping_aliases,
+                    shadowed_builtin_helper_names,
+                    canonical_builtin_helper_aliases,
+                )
+                if helper_write is not None and not _is_nested_late_state_statement(
+                    candidate, line_start, line, enclosing_headers
+                ):
+                    helper_name, restores_helper = helper_write
+                    helper_guard = _constant_late_binding_guard_value(candidate, line_start, line, enclosing_headers)
+                    affected_helper_names = {helper_name, f"builtins.{helper_name}"}
+                    if helper_guard is None:
+                        shadowed_builtin_helper_names.difference_update(affected_helper_names)
+                        uncertain_builtin_helper_names.update(affected_helper_names)
+                    elif helper_guard is True:
+                        uncertain_builtin_helper_names.difference_update(affected_helper_names)
+                        if restores_helper:
+                            shadowed_builtin_helper_names.difference_update(affected_helper_names)
+                            canonical_builtin_helper_aliases[helper_name] = helper_name
+                            canonical_builtin_helper_aliases[f"builtins.{helper_name}"] = helper_name
+                        else:
+                            shadowed_builtin_helper_names.update(affected_helper_names)
+                            canonical_builtin_helper_aliases.pop(helper_name, None)
+                            canonical_builtin_helper_aliases.pop(f"builtins.{helper_name}", None)
+                helper_delete = _builtin_helper_delete_state(descriptor_statement, builtins_alias_names)
+                if helper_delete is not None and not _is_nested_late_state_statement(
+                    candidate, line_start, line, enclosing_headers
+                ):
+                    helper_name, restores_helper = helper_delete
+                    helper_guard = _constant_late_binding_guard_value(candidate, line_start, line, enclosing_headers)
+                    if helper_guard is None:
+                        shadowed_builtin_helper_names.discard(helper_name)
+                        uncertain_builtin_helper_names.add(helper_name)
+                    elif helper_guard is True:
+                        uncertain_builtin_helper_names.discard(helper_name)
+                        if restores_helper and f"builtins.{helper_name}" not in shadowed_builtin_helper_names:
+                            shadowed_builtin_helper_names.discard(helper_name)
+                            canonical_builtin_helper_aliases[helper_name] = helper_name
+                        else:
+                            shadowed_builtin_helper_names.add(helper_name)
+                            canonical_builtin_helper_aliases.pop(helper_name, None)
+                shadow_name = _definite_late_shadow_name(line, code_line)
+                if shadow_name is not None:
+                    definite_shadowed_names.add(shadow_name)
+                    pending_shadow_spans[shadow_name] = (
+                        line_start,
+                        min(
+                            _priority_alias_shadow_segment_end(candidate, line, line_end),
+                            line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES,
+                        ),
+                    )
+                    fail_closed_dangerous_names.discard(shadow_name)
+                    forwarded_state_sizes.pop(shadow_name, None)
+                    forwarded_safe_names.discard(shadow_name)
+                    relevant_binding_names.discard(shadow_name)
+        member_statement = line
+        member_statement_span = (line_start, line_end)
+        if parenthesis_delta > 0 or has_line_continuation:
+            member_statement, member_statement_span = _bounded_late_binding_statement(candidate, line_start, line_end)
+        member_code_line = _python_structural_line_bytes(member_statement.lstrip(b"\x00\xff"))
+        could_update_runpy_member = (
+            b"run" in member_statement
+            or b"__dict__" in member_statement
+            or b"vars" in member_statement
+            or not _python_identifier_names(member_code_line).isdisjoint(runpy_namespace_update_aliases)
+            or not _python_identifier_names(member_code_line).isdisjoint(builtin_dict_update_aliases)
+        )
+        member_update = (
+            _runpy_priority_member_update_key(
+                member_statement,
+                member_code_line,
+                frozenset(name.encode("utf-8") for name in relevant_binding_names),
+                runpy_namespace_update_aliases,
+                shadowed_descriptor_names,
+                builtin_dict_update_aliases,
+                builtins_alias_names,
+                shadowed_builtin_helper_names,
+            )
+            if line_end > search_start and could_update_runpy_member
+            else None
+        )
+        if member_update is not None and (
+            _constant_late_binding_guard_value(candidate, line_start, line, enclosing_headers) is False
+            or _is_nested_late_state_statement(candidate, line_start, line, enclosing_headers)
+        ):
+            member_update = None
+        if member_update is not None:
+            member_key, owner_name = member_update
+            prior_member_is_proven_safe = (
+                member_key in runpy_member_state_spans and member_key not in fail_closed_runpy_members
+            )
+            member_start = _late_binding_statement_start(
+                candidate, line_start, line, enclosing_headers, skip_class_header=True
+            )
+            if member_start == line_start:
+                member_code_start = 0
+                while member_code_start < len(line) and not 0x20 <= line[member_code_start] < 0x7F:
+                    member_code_start += 1
+                member_start += member_code_start
+            member_span = (
+                member_start,
+                min(member_statement_span[1], member_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES),
+            )
+            member_dependencies = _runpy_priority_member_update_dependency_names(
+                candidate[member_span[0] : member_span[1]],
+                member_key,
+                runpy_namespace_update_aliases,
+                builtin_dict_update_aliases,
+            )
+            member_dependencies.add(owner_name)
+            dependent_spans, reaches_retained_alias, overflowed = retained_state_spans(
+                member_dependencies, member_start
+            )
+            class_header_spans = [
+                (header_start, candidate.find(b"\n", header_start) + 1)
+                for header, header_start in enclosing_headers
+                if re.match(rb"\s*class\b", header) is not None
+            ]
+            runpy_member_state_spans[member_key] = [*dependent_spans, *class_header_spans, member_span]
+            unresolved_dependencies = member_dependencies - {owner_name, "print"}
+            uncertain_descriptor_update = (
+                _runpy_priority_descriptor_update_name(
+                    member_statement, builtins_alias_names, shadowed_builtin_helper_names
+                )
+                in uncertain_descriptor_names
+            )
+            uncertain_helper_update = _statement_uses_uncertain_builtin_helper(
+                member_statement, uncertain_builtin_helper_names
+            )
+            ambiguous_descriptor_update = (uncertain_descriptor_update or uncertain_helper_update) and (
+                not prior_member_is_proven_safe or bool(unresolved_dependencies)
+            )
+            unresolved_member_update = bool(unresolved_dependencies) and (
+                overflowed or (not dependent_spans and not reaches_retained_alias)
+            )
+            if (
+                ambiguous_descriptor_update
+                or unresolved_member_update
+                or owner_name in uncertain_runpy_namespace_names
+                or not _python_identifier_names(member_statement).isdisjoint(uncertain_runpy_namespace_names)
+            ):
+                fail_closed_runpy_members.add(member_key)
+            else:
+                fail_closed_runpy_members.discard(member_key)
+        if line_end > search_start and typed_member_write_is_inert_forwarding(line, typed_member_key):
+            multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+            line_start = line_end
+            continue
+        has_priority_reference_syntax = not is_simple_forwarding_binding and (b"(" in code_line or b"." in code_line)
+        priority_aliases = frozenset(name.encode("utf-8") for name in relevant_binding_names)
+        tracked_priority_aliases = aliases | priority_aliases
+        getattr_member = (
+            _priority_getattr_alias_member(line, tracked_priority_aliases, shadowed_builtin_helper_names)
+            if has_priority_reference_syntax and b"getattr" in line
+            else None
+        )
+        is_getattr_priority_call = getattr_member is not None
+        if (
+            line_end > search_start
+            and has_priority_reference_syntax
+            and (_line_uses_priority_alias(code_line, tracked_priority_aliases) or is_getattr_priority_call)
+        ):
+            usage_span = (line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES))
+            if _line_calls_priority_alias(code_line, tracked_priority_aliases) or is_getattr_priority_call:
+                root_names = _callable_root_names(code_line)
+                if getattr_member is not None:
+                    root_names.add(getattr_member[2])
+                namespace_update_names = set(runpy_namespace_update_aliases) | builtin_dict_update_aliases
+                if root_names and root_names.issubset(namespace_update_names):
+                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    line_start = line_end
+                    continue
+                if not root_names.isdisjoint(definite_shadowed_names):
+                    usage_lines.extend(
+                        pending_shadow_spans[root_name]
+                        for root_name in sorted(root_names & definite_shadowed_names)
+                        if root_name in pending_shadow_spans
+                    )
+                    usage_lines.append(usage_span)
+                    return usage_lines, frozenset()
+                if not root_names.isdisjoint(fail_closed_dangerous_names):
+                    usage_lines.append(usage_span)
+                    return usage_lines, proof_rule_codes(root_names, conservative=True)
+                state_spans, reaches_retained_alias, overflowed = retained_state_spans(root_names, line_start)
+                if _line_calls_fail_closed_runpy_member(code_line, aliases, fail_closed_runpy_members):
+                    usage_lines.append(usage_span)
+                    return usage_lines, frozenset({"S108"})
+                if overflowed and not reaches_retained_alias:
+                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    line_start = line_end
+                    continue
+                usage_lines.extend(truthy_builtin_state_spans)
+                usage_lines.extend(
+                    pending_shadow_spans[root_name]
+                    for root_name in sorted(root_names)
+                    if root_name in pending_shadow_spans
+                )
+                usage_lines.extend(state_spans)
+                usage_lines.extend(span for member_spans in runpy_member_state_spans.values() for span in member_spans)
+                usage_lines.append(usage_span)
+                needs_proof = (
+                    (overflowed and reaches_retained_alias)
+                    or (
+                        not runpy_member_state_spans
+                        and _line_calls_overbounded_runpy_getattr_alias(line, tracked_priority_aliases)
+                    )
+                    or (reaches_retained_alias and has_inert_forwarding_state(state_spans))
+                )
+                return (
+                    usage_lines,
+                    proof_rule_codes(root_names, conservative=True) if needs_proof else frozenset(),
+                )
+            root_names = _attribute_load_root_names(code_line).intersection(
+                relevant_binding_names | definite_shadowed_names
+            )
+            if root_names:
+                state_spans, reaches_retained_alias, overflowed = retained_state_spans(root_names, line_start)
+                attribute_rule_codes = proof_rule_codes(root_names)
+                if (
+                    not root_names.isdisjoint(fail_closed_dangerous_names)
+                    and root_names.isdisjoint(definite_shadowed_names)
+                    and "S110" in attribute_rule_codes
+                ):
+                    usage_lines.append(usage_span)
+                    return usage_lines, frozenset({"S110"})
+                if (
+                    overflowed
+                    and reaches_retained_alias
+                    and root_names.isdisjoint(definite_shadowed_names)
+                    and "S110" in attribute_rule_codes
+                ):
+                    usage_lines.append(usage_span)
+                    return usage_lines, frozenset({"S110"})
+                resolved_context = b"\n".join(
+                    [priority_context, *(candidate[start:end] for start, end in state_spans), code_line]
+                )
+                if "S110" not in attribute_rule_codes and not _snippet_loads_native_library_attribute(resolved_context):
+                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    line_start = line_end
+                    continue
+                if not root_names.isdisjoint(definite_shadowed_names):
+                    usage_lines.extend(
+                        pending_shadow_spans[root_name]
+                        for root_name in sorted(root_names & definite_shadowed_names)
+                        if root_name in pending_shadow_spans
+                    )
+                    usage_lines.append(usage_span)
+                    return usage_lines, frozenset()
+                if overflowed and not reaches_retained_alias:
+                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    line_start = line_end
+                    continue
+                usage_lines.extend(
+                    pending_shadow_spans[root_name]
+                    for root_name in sorted(root_names)
+                    if root_name in pending_shadow_spans
+                )
+                usage_lines.extend(state_spans)
+                usage_lines.append(usage_span)
+                return (
+                    usage_lines,
+                    proof_rule_codes(root_names, conservative=True)
+                    if overflowed and reaches_retained_alias
+                    else frozenset(),
+                )
+        elif line_end > search_start and b"(" in code_line:
+            potential_root_names = _potential_late_callable_root_names(code_line).intersection(
+                late_definitions.keys() | fail_closed_dangerous_names
+            )
+            potential_root_names.difference_update(runpy_namespace_update_aliases)
+            potential_root_names.difference_update(builtin_dict_update_aliases)
+            if potential_root_names:
+                root_names = _callable_root_names(code_line).intersection(potential_root_names)
+                if not root_names.isdisjoint(definite_shadowed_names):
+                    usage_lines.extend(
+                        pending_shadow_spans[root_name]
+                        for root_name in sorted(root_names & definite_shadowed_names)
+                        if root_name in pending_shadow_spans
+                    )
+                    usage_lines.append(
+                        (line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES))
+                    )
+                    return usage_lines, frozenset()
+                if not root_names.isdisjoint(fail_closed_dangerous_names):
+                    usage_lines.append(
+                        (line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES))
+                    )
+                    return usage_lines, proof_rule_codes(root_names, conservative=True)
+                state_spans, reaches_retained_alias, overflowed = retained_state_spans(root_names, line_start)
+                if (state_spans or overflowed) and reaches_retained_alias:
+                    usage_lines.extend(state_spans)
+                    usage_lines.extend(
+                        span for member_spans in runpy_member_state_spans.values() for span in member_spans
+                    )
+                    usage_lines.append(
+                        (line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES))
+                    )
+                    needs_proof = overflowed or has_inert_forwarding_state(state_spans)
+                    return (
+                        usage_lines,
+                        proof_rule_codes(root_names, conservative=True) if needs_proof else frozenset(),
+                    )
         multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
         line_start = line_end
-    return usage_lines
+    return usage_lines, frozenset()
+
+
+def _simple_late_binding_name(code_line: bytes) -> str | None:
+    match = re.match(rb"\s*([A-Za-z_]\w*)\s*(?::[^=\n]+)?=(?!=)", code_line)
+    return match.group(1).decode("utf-8") if match is not None else None
+
+
+def _simple_forwarded_alias_dependency_name(statement: bytes) -> str | None:
+    assignment = _simple_forwarded_alias_assignment(statement)
+    return assignment[1] if assignment is not None else None
+
+
+def _simple_forwarded_alias_assignment(statement: bytes) -> tuple[str, str, bytes] | None:
+    raw_statement = statement.rstrip()
+
+    def parse_assignment(candidate: bytes) -> tuple[str, str, bytes] | None:
+        match = re.fullmatch(
+            rb"\s*([A-Za-z_]\w*)\s*(?::[^=\n]+)?=\s*(?:\(\s*)*"
+            rb"((?P<root>[A-Za-z_]\w*)(?:\s*\.\s*[A-Za-z_]\w*)*)(?:\s*\))*\s*",
+            candidate,
+        )
+        if match is None:
+            return None
+        return (
+            match.group(1).decode("utf-8"),
+            match.group("root").decode("utf-8"),
+            match.group(2),
+        )
+
+    structural_statement = _python_structural_line_bytes(raw_statement).rstrip()
+    while True:
+        if structural_statement.endswith(b";"):
+            structural_statement = structural_statement[:-1].rstrip()
+            continue
+        separator = structural_statement.rfind(b";")
+        if separator < 0 or not _is_inert_forwarding_suffix(structural_statement[separator + 1 :].strip()):
+            break
+        structural_statement = structural_statement[:separator].rstrip()
+    assignment = parse_assignment(structural_statement)
+    if assignment is not None:
+        return assignment
+    separator = raw_statement.find(b";")
+    if separator >= 0 and _is_inert_forwarding_suffix(raw_statement[separator + 1 :].strip()):
+        return parse_assignment(raw_statement[:separator].rstrip())
+    return None
+
+
+_INERT_FORWARDING_TOKEN_PATTERN = re.compile(
+    rb"\s*(?:"
+    rb"None\b|True\b|False\b|not\b|\.\.\.|"
+    rb"(?:[rRbBuU]{0,2})?(?:'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\")|"
+    rb"(?:0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*|0[bB][01](?:_?[01])*|0[oO][0-7](?:_?[0-7])*|"
+    rb"(?:\d(?:_?\d)*(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)(?:[eE][+-]?\d(?:_?\d)*)?[jJ]?)|"
+    rb"[\(\)\[\]\{\},:;+\-~]"
+    rb")"
+)
+
+
+def _is_inert_forwarding_suffix(suffix: bytes) -> bool:
+    if suffix == b"pass":
+        return True
+    position = 0
+    matched_token = False
+    while position < len(suffix):
+        token_match = _INERT_FORWARDING_TOKEN_PATTERN.match(suffix, position)
+        if token_match is None:
+            return False
+        matched_token = True
+        position = token_match.end()
+    return matched_token
+
+
+def _constant_late_binding_guard_value(
+    candidate: bytes,
+    line_start: int,
+    line: bytes,
+    enclosing_headers: list[tuple[bytes, int]] | None = None,
+) -> bool | None:
+    if not line[:1].isspace():
+        return True
+    headers = (
+        enclosing_headers
+        if enclosing_headers is not None
+        else _late_binding_enclosing_headers(candidate, line_start, line)
+    )
+    if not headers:
+        return None
+    header_values = [_constant_late_header_value(candidate, header, header_start) for header, header_start in headers]
+    if any(value is False for value in header_values):
+        return False
+    if all(value is True for value in header_values):
+        return True
+    return None
+
+
+def _is_nested_late_state_statement(
+    candidate: bytes,
+    line_start: int,
+    line: bytes,
+    enclosing_headers: list[tuple[bytes, int]] | None = None,
+) -> bool:
+    return any(
+        re.match(rb"\s*(?:async\s+def|def)\b", header) is not None
+        for header, _header_start in (
+            enclosing_headers
+            if enclosing_headers is not None
+            else _late_binding_enclosing_headers(candidate, line_start, line)
+        )
+    )
+
+
+def _is_scoped_late_binding(
+    candidate: bytes,
+    line_start: int,
+    line: bytes,
+    enclosing_headers: list[tuple[bytes, int]] | None = None,
+) -> bool:
+    return any(
+        re.match(rb"\s*(?:async\s+def|def)\b", header) is not None
+        for header, _header_start in (
+            enclosing_headers
+            if enclosing_headers is not None
+            else _late_binding_enclosing_headers(candidate, line_start, line)
+        )
+    )
+
+
+def _is_reachable_late_else_binding(
+    candidate: bytes,
+    line_start: int,
+    line: bytes,
+    enclosing_headers: list[tuple[bytes, int]] | None = None,
+) -> bool:
+    return any(
+        header == b"else:" and _constant_late_header_value(candidate, header, header_start) is True
+        for header, header_start in (
+            enclosing_headers
+            if enclosing_headers is not None
+            else _late_binding_enclosing_headers(candidate, line_start, line)
+        )
+    )
+
+
+def _constant_late_header_value(candidate: bytes, header: bytes, header_start: int) -> bool | None:
+    header_line_end = candidate.find(b"\n", header_start)
+    header_line_end = len(candidate) if header_line_end < 0 else header_line_end + 1
+    raw_header = candidate[header_start:header_line_end].strip()
+    guard_match = re.fullmatch(rb"(?:if|elif)\s+(.+?)\s*:\s*(?:#.*)?", raw_header)
+    guard_value: bool | None = None
+    if guard_match is not None:
+        guard_source, _byte_offsets = _decode_utf8_with_byte_offsets(guard_match.group(1))
+        try:
+            guard_expression = ast.parse(guard_source, mode="eval").body
+        except (SyntaxError, ValueError):
+            guard_expression = None
+        if isinstance(guard_expression, ast.Constant):
+            guard_value = bool(guard_expression.value)
+    if raw_header.startswith(b"if "):
+        return guard_value
+    if not raw_header.startswith(b"elif ") and header != b"else:":
+        return None
+    preceding_branches_false = _preceding_late_branch_guards_are_false(candidate, header_start)
+    if raw_header.startswith(b"elif "):
+        if guard_value is False or preceding_branches_false is False:
+            return False
+        if guard_value is True and preceding_branches_false is True:
+            return True
+        return None
+    return preceding_branches_false
+
+
+def _preceding_late_branch_guards_are_false(candidate: bytes, header_start: int) -> bool | None:
+    header_line_end = candidate.find(b"\n", header_start)
+    header_line_end = len(candidate) if header_line_end < 0 else header_line_end + 1
+    header_line = candidate[header_start:header_line_end]
+    header_indent = len(header_line) - len(header_line.lstrip())
+    cursor = header_start
+    unknown_guard = False
+    while cursor > 0 and header_start - cursor < _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
+        previous_start = candidate.rfind(b"\n", 0, max(0, cursor - 1)) + 1
+        previous_line = candidate[previous_start:cursor]
+        cursor = previous_start
+        structural_line = _python_structural_line_bytes(previous_line).strip()
+        if not structural_line:
+            continue
+        previous_indent = len(previous_line) - len(previous_line.lstrip())
+        if previous_indent != header_indent:
+            continue
+        if not structural_line.startswith((b"if ", b"elif ")):
+            return None
+        guard_line_end = candidate.find(b"\n", previous_start)
+        guard_line_end = len(candidate) if guard_line_end < 0 else guard_line_end + 1
+        raw_guard = candidate[previous_start:guard_line_end].strip()
+        guard_match = re.fullmatch(rb"(?:if|elif)\s+(.+?)\s*:\s*(?:#.*)?", raw_guard)
+        if guard_match is None:
+            return None
+        guard_source, _byte_offsets = _decode_utf8_with_byte_offsets(guard_match.group(1))
+        try:
+            expression = ast.parse(guard_source, mode="eval").body
+        except (SyntaxError, ValueError):
+            expression = None
+        if not isinstance(expression, ast.Constant):
+            unknown_guard = True
+        elif bool(expression.value):
+            return False
+        if structural_line.startswith(b"if "):
+            return None if unknown_guard else True
+    return None
+
+
+def _late_binding_statement_start(
+    candidate: bytes,
+    line_start: int,
+    line: bytes,
+    enclosing_headers: list[tuple[bytes, int]] | None = None,
+    skip_class_header: bool = False,
+) -> int:
+    headers = (
+        enclosing_headers
+        if enclosing_headers is not None
+        else _late_binding_enclosing_headers(candidate, line_start, line)
+    )
+    if not skip_class_header:
+        return headers[-1][1] if headers else line_start
+    for header, header_start in reversed(headers):
+        if re.match(rb"\s*class\b", header) is None:
+            return header_start
+    return line_start
+
+
+def _is_exhaustive_safe_late_binding(candidate: bytes, line_start: int, line: bytes, binding_name: str) -> bool:
+    headers = _late_binding_enclosing_headers(candidate, line_start, line)
+    if not headers:
+        return False
+    current_header, current_header_start = headers[0]
+    if not current_header.startswith((b"elif ", b"else:")):
+        return False
+    header_line_end = candidate.find(b"\n", current_header_start)
+    header_line_end = len(candidate) if header_line_end < 0 else header_line_end + 1
+    header_line = candidate[current_header_start:header_line_end]
+    header_indent = len(header_line) - len(header_line.lstrip())
+    chain_start = current_header_start
+    cursor = current_header_start
+    while cursor > 0 and current_header_start - cursor < _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
+        previous_start = candidate.rfind(b"\n", 0, max(0, cursor - 1)) + 1
+        previous_line = candidate[previous_start:cursor]
+        cursor = previous_start
+        structural_line = _python_structural_line_bytes(previous_line).strip()
+        if not structural_line:
+            continue
+        previous_indent = len(previous_line) - len(previous_line.lstrip())
+        if previous_indent != header_indent:
+            continue
+        if structural_line.startswith(b"elif "):
+            chain_start = previous_start
+            continue
+        if structural_line.startswith(b"if "):
+            chain_start = previous_start
+            break
+        return False
+    if chain_start == current_header_start:
+        return False
+    preceding_context = candidate[max(0, chain_start - _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES) : chain_start]
+    if any(
+        _simple_late_binding_name(_python_structural_line_bytes(previous_line)) == "print"
+        for previous_line in preceding_context.splitlines(keepends=True)
+    ):
+        return False
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(candidate[chain_start : line_start + len(line)])
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (SyntaxError, ValueError):
+        return False
+    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.If):
+        return False
+
+    def body_assigns_print(body: list[ast.stmt]) -> bool:
+        for index in range(len(body) - 1, -1, -1):
+            statement = body[index]
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            if binding_name not in {name for target in targets for name in _assignment_target_names(target)}:
+                continue
+            return (
+                isinstance(statement.value, ast.Name)
+                and statement.value.id == "print"
+                and all(isinstance(trailing, ast.Pass) for trailing in body[index + 1 :])
+            )
+        return False
+
+    def exhaustive_safe_if(statement: ast.If) -> bool:
+        if not body_assigns_print(statement.body):
+            return False
+        if isinstance(statement.test, ast.Constant) and bool(statement.test.value):
+            return True
+        if len(statement.orelse) == 1 and isinstance(statement.orelse[0], ast.If):
+            return exhaustive_safe_if(statement.orelse[0])
+        return bool(statement.orelse) and body_assigns_print(statement.orelse)
+
+    return exhaustive_safe_if(tree.body[0])
+
+
+def _late_binding_enclosing_headers(candidate: bytes, line_start: int, line: bytes) -> list[tuple[bytes, int]]:
+    if not line[:1].isspace():
+        return []
+    headers: list[tuple[bytes, int]] = []
+    line_indent = len(line) - len(line.lstrip())
+    cursor = line_start
+    while cursor > 0 and line_start - cursor < _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
+        previous_start = candidate.rfind(b"\n", 0, max(0, cursor - 1)) + 1
+        previous_line = candidate[previous_start:cursor]
+        cursor = previous_start
+        structural_line = _python_structural_line_bytes(previous_line).strip()
+        if not structural_line:
+            continue
+        previous_indent = len(previous_line) - len(previous_line.lstrip())
+        if previous_indent >= line_indent:
+            continue
+        if structural_line.endswith(b":"):
+            headers.append((structural_line, previous_start))
+            line_indent = previous_indent
+            continue
+        break
+    return headers
+
+
+def _definite_late_shadow_name(line: bytes, code_line: bytes) -> str | None:
+    if line[:1].isspace():
+        return None
+    match = re.match(rb"\s*(?:class|def|async\s+def)\s+([A-Za-z_]\w*)\b", code_line)
+    if match is None:
+        match = re.fullmatch(rb"\s*del\s+([A-Za-z_]\w*)\s*", code_line)
+    return match.group(1).decode("utf-8") if match is not None else None
 
 
 def _priority_alias_shadow_segment_end(candidate: bytes, line: bytes, line_end: int) -> int:
@@ -564,29 +2111,1167 @@ def _priority_alias_shadow_segment_end(candidate: bytes, line: bytes, line_end: 
     return segment_end if body_seen else line_end
 
 
-def _line_used_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
-    return frozenset(
-        alias
-        for alias in aliases
-        if re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\()", code_line)
-        or re.search(
-            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?getattr\s*\(\s*" + re.escape(alias) + rb"\s*,",
+def _is_inert_scalar_late_binding(code_line: bytes) -> bool:
+    return (
+        re.fullmatch(
+            rb"\s*[A-Za-z_]\w*\s*(?::[^=\n]+)?=\s*(?:None|True|False|[-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*",
             code_line,
+        )
+        is not None
+    )
+
+
+def _python_identifier_names(statement: bytes) -> set[str]:
+    return {identifier.decode("utf-8") for identifier in re.findall(rb"\b[A-Za-z_]\w*\b", statement)}
+
+
+def _simple_late_assignment_value_reference(statement: bytes) -> str | None:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(statement.lstrip(b"\x00\xff"))
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        return None
+    if len(tree.body) != 1:
+        return None
+    assignment = tree.body[0]
+    if isinstance(assignment, ast.Assign) and len(assignment.targets) == 1:
+        return _simple_reference_name(assignment.value)
+    if isinstance(assignment, ast.AnnAssign) and assignment.value is not None:
+        return _simple_reference_name(assignment.value)
+    return None
+
+
+def _builtin_dict_attribute_write_state(
+    line: bytes,
+    builtins_alias_names: set[str],
+    builtin_dict_descriptor_aliases: set[str],
+    shadowed_descriptor_names: set[str],
+    builtin_dict_mapping_aliases: set[str],
+    builtin_dict_mapping_update_aliases: set[str],
+    shadowed_builtin_helper_names: set[str],
+) -> bool | None:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(line.lstrip(b"\x00\xff"))
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        return None
+
+    def resolves_builtin_descriptor(value: ast.AST) -> bool:
+        reference = _simple_reference_name(value)
+        return reference in builtin_dict_descriptor_aliases or (
+            reference is not None
+            and reference.endswith(".dict")
+            and reference.removesuffix(".dict") in builtins_alias_names
+            and "builtins.dict" not in shadowed_descriptor_names
+        )
+
+    def is_builtins_mapping(node: ast.AST) -> bool:
+        return (
+            (isinstance(node, ast.Name) and node.id in builtin_dict_mapping_aliases)
+            or (
+                isinstance(node, ast.Attribute)
+                and node.attr == "__dict__"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in builtins_alias_names
+            )
+            or (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "vars"
+                and "vars" not in shadowed_builtin_helper_names
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in builtins_alias_names
+            )
+        )
+
+    for statement in tree.body:
+        targets: tuple[ast.AST, ...] = ()
+        value: ast.AST | None = None
+        if isinstance(statement, ast.Assign):
+            targets = tuple(statement.targets)
+            value = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            targets = (statement.target,)
+            value = statement.value
+        if value is not None:
+            for target in targets:
+                is_attribute_target = (
+                    isinstance(target, ast.Attribute)
+                    and target.attr == "dict"
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in builtins_alias_names
+                )
+                is_mapping_target = (
+                    isinstance(target, ast.Subscript)
+                    and _static_getattr_member_name(target.slice) == "dict"
+                    and is_builtins_mapping(target.value)
+                )
+                if not (is_attribute_target or is_mapping_target):
+                    continue
+                return resolves_builtin_descriptor(value)
+        for node in ast.walk(statement):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if (
+                node.func.attr == "__setitem__"
+                and is_builtins_mapping(node.func.value)
+                and len(node.args) >= 2
+                and _static_getattr_member_name(node.args[0]) == "dict"
+            ):
+                return resolves_builtin_descriptor(node.args[1])
+            is_mapping_update = node.func.attr == "update" and is_builtins_mapping(node.func.value)
+            if not is_mapping_update:
+                continue
+            for keyword in node.keywords:
+                if keyword.arg == "dict":
+                    return resolves_builtin_descriptor(keyword.value)
+                if keyword.arg is None and isinstance(keyword.value, ast.Dict):
+                    for key, update_value in zip(keyword.value.keys, keyword.value.values, strict=True):
+                        if key is not None and _static_getattr_member_name(key) == "dict":
+                            return resolves_builtin_descriptor(update_value)
+            for argument in node.args:
+                if isinstance(argument, ast.Dict):
+                    for key, update_value in zip(argument.keys, argument.values, strict=True):
+                        if key is not None and _static_getattr_member_name(key) == "dict":
+                            return resolves_builtin_descriptor(update_value)
+        for node in ast.walk(statement):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id not in builtin_dict_mapping_update_aliases:
+                continue
+            for keyword in node.keywords:
+                if keyword.arg == "dict":
+                    return resolves_builtin_descriptor(keyword.value)
+                if keyword.arg is None and isinstance(keyword.value, ast.Dict):
+                    for key, update_value in zip(keyword.value.keys, keyword.value.values, strict=True):
+                        if key is not None and _static_getattr_member_name(key) == "dict":
+                            return resolves_builtin_descriptor(update_value)
+            for argument in node.args:
+                if isinstance(argument, ast.Dict):
+                    for key, update_value in zip(argument.keys, argument.values, strict=True):
+                        if key is not None and _static_getattr_member_name(key) == "dict":
+                            return resolves_builtin_descriptor(update_value)
+    return None
+
+
+def _builtin_helper_attribute_write_state(
+    statement: bytes,
+    builtins_alias_names: set[str],
+    builtin_dict_mapping_aliases: set[str],
+    shadowed_builtin_helper_names: set[str],
+    canonical_builtin_helper_aliases: dict[str, str],
+) -> tuple[str, bool] | None:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(statement.lstrip(b"\x00\xff"))
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        return None
+
+    def helper_name(node: ast.AST) -> str | None:
+        name = _static_getattr_member_name(node)
+        return name if name in {"getattr", "vars"} else None
+
+    def is_builtins_mapping(node: ast.AST) -> bool:
+        return (
+            (isinstance(node, ast.Name) and node.id in builtin_dict_mapping_aliases)
+            or (
+                isinstance(node, ast.Attribute)
+                and node.attr == "__dict__"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in builtins_alias_names
+            )
+            or (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "vars"
+                and "vars" not in shadowed_builtin_helper_names
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in builtins_alias_names
+            )
+        )
+
+    def is_canonical_helper(value: ast.AST, target_helper: str) -> bool:
+        reference = _simple_reference_name(value)
+        return (
+            canonical_builtin_helper_aliases.get(reference or "") == target_helper
+            and reference not in shadowed_builtin_helper_names
+        )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            target_helper: str | None = None
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr in {"getattr", "vars"}
+                and isinstance(target.value, ast.Name)
+                and target.value.id in builtins_alias_names
+            ):
+                target_helper = target.attr
+            elif isinstance(target, ast.Subscript) and is_builtins_mapping(target.value):
+                target_helper = helper_name(target.slice)
+            if target_helper is not None:
+                return target_helper, is_canonical_helper(node.value, target_helper)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if (
+            node.func.attr == "__setitem__"
+            and is_builtins_mapping(node.func.value)
+            and len(node.args) >= 2
+            and (target_helper := helper_name(node.args[0])) is not None
+        ):
+            return target_helper, is_canonical_helper(node.args[1], target_helper)
+        if node.func.attr != "update" or not is_builtins_mapping(node.func.value):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg in {"getattr", "vars"}:
+                return keyword.arg, is_canonical_helper(keyword.value, keyword.arg)
+            if keyword.arg is None and isinstance(keyword.value, ast.Dict):
+                for key, value in zip(keyword.value.keys, keyword.value.values, strict=True):
+                    if key is not None and (target_helper := helper_name(key)) is not None:
+                        return target_helper, is_canonical_helper(value, target_helper)
+        for argument in node.args:
+            if isinstance(argument, ast.Dict):
+                for key, value in zip(argument.keys, argument.values, strict=True):
+                    if key is not None and (target_helper := helper_name(key)) is not None:
+                        return target_helper, is_canonical_helper(value, target_helper)
+    return None
+
+
+def _statement_uses_uncertain_builtin_helper(statement: bytes, uncertain_builtin_helper_names: set[str]) -> bool:
+    if not uncertain_builtin_helper_names:
+        return False
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(statement.lstrip(b"\x00\xff"))
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        return False
+    return any(
+        isinstance(node, ast.Call) and _simple_reference_name(node.func) in uncertain_builtin_helper_names
+        for node in ast.walk(tree)
+    )
+
+
+def _builtin_helper_delete_state(statement: bytes, builtins_alias_names: set[str]) -> tuple[str, bool] | None:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(statement.lstrip(b"\x00\xff"))
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Delete):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in {"getattr", "vars"}:
+                return target.id, True
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr in {"getattr", "vars"}
+                and isinstance(target.value, ast.Name)
+                and target.value.id in builtins_alias_names
+            ):
+                return f"builtins.{target.attr}", False
+    return None
+
+
+def _late_assignment_binds_builtins_mapping(
+    statement: bytes,
+    builtins_alias_names: set[str],
+    builtin_dict_mapping_aliases: set[str],
+    shadowed_builtin_helper_names: set[str],
+) -> bool:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(statement.lstrip(b"\x00\xff"))
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        return False
+    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Assign):
+        return False
+    value = tree.body[0].value
+    return (
+        (isinstance(value, ast.Name) and value.id in builtin_dict_mapping_aliases)
+        or (
+            isinstance(value, ast.Attribute)
+            and value.attr == "__dict__"
+            and isinstance(value.value, ast.Name)
+            and value.value.id in builtins_alias_names
+        )
+        or (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "vars"
+            and "vars" not in shadowed_builtin_helper_names
+            and len(value.args) == 1
+            and isinstance(value.args[0], ast.Name)
+            and value.args[0].id in builtins_alias_names
         )
     )
 
 
-def _line_called_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
-    return frozenset(
-        alias
+def _late_assignment_builtin_update_kind(
+    statement: bytes,
+    builtins_alias_names: set[str],
+    builtin_dict_descriptor_aliases: set[str],
+    blocked_descriptor_names: set[str],
+    shadowed_builtin_helper_names: set[str],
+    builtin_dict_mapping_aliases: set[str],
+) -> str | None:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(statement.lstrip(b"\x00\xff"))
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        return None
+    if len(tree.body) != 1:
+        return None
+    assignment = tree.body[0]
+    if (isinstance(assignment, ast.Assign) and len(assignment.targets) == 1) or (
+        isinstance(assignment, ast.AnnAssign) and assignment.value is not None
+    ):
+        value = assignment.value
+    else:
+        return None
+    if not isinstance(value, ast.Attribute) or value.attr != "update":
+        return None
+    descriptor_name = _static_builtin_dict_descriptor_name(
+        value.value,
+        builtins_alias_names,
+        builtin_dict_descriptor_aliases,
+        shadowed_builtin_helper_names,
+    )
+    if descriptor_name is not None and descriptor_name not in blocked_descriptor_names:
+        return "descriptor"
+    if (
+        (isinstance(value.value, ast.Name) and value.value.id in builtin_dict_mapping_aliases)
+        or (
+            isinstance(value.value, ast.Attribute)
+            and value.value.attr == "__dict__"
+            and isinstance(value.value.value, ast.Name)
+            and value.value.value.id in builtins_alias_names
+        )
+        or (
+            isinstance(value.value, ast.Call)
+            and isinstance(value.value.func, ast.Name)
+            and value.value.func.id == "vars"
+            and "vars" not in shadowed_builtin_helper_names
+            and len(value.value.args) == 1
+            and isinstance(value.value.args[0], ast.Name)
+            and value.value.args[0].id in builtins_alias_names
+        )
+    ):
+        return "mapping"
+    return None
+
+
+def _alias_reference_root_names(node: ast.AST) -> set[str]:
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, (ast.Attribute, ast.Subscript)):
+        return _alias_reference_root_names(node.value)
+    if (
+        isinstance(node, ast.Call)
+        and _simple_reference_name(node.func) in {"getattr", "builtins.getattr"}
+        and node.args
+    ):
+        return _alias_reference_root_names(node.args[0])
+    if isinstance(node, ast.IfExp):
+        return _alias_reference_root_names(node.body) | _alias_reference_root_names(node.orelse)
+    if isinstance(node, ast.BoolOp):
+        return {root for value in node.values for root in _alias_reference_root_names(value)}
+    return set()
+
+
+def _alias_binding_dependency_names(statement: bytes) -> set[str]:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (SyntaxError, ValueError):
+        return set()
+    dependencies: set[str] = set()
+    for _target, value in _assignment_targets_and_values_in_tree(tree):
+        dependencies.update(_alias_reference_root_names(value))
+    return dependencies
+
+
+def _assignment_value_dependency_names(statement: bytes) -> set[str]:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (SyntaxError, ValueError):
+        return set()
+    dependencies: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            continue
+        if node.value is not None:
+            dependencies.update(_alias_reference_root_names(node.value))
+    return dependencies
+
+
+def _assignment_may_bind_priority_alias(
+    statement: bytes, relevant_names: set[str], shadowed_truthy_builtin_names: set[str]
+) -> bool:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (SyntaxError, ValueError):
+        return False
+
+    def expression_may_bind_priority_alias(value: ast.AST) -> bool:
+        if isinstance(value, ast.IfExp):
+            selected_value = None
+            if isinstance(value.test, ast.Constant):
+                selected_value = value.body if bool(value.test.value) else value.orelse
+            return (
+                expression_may_bind_priority_alias(selected_value)
+                if selected_value is not None
+                else any(expression_may_bind_priority_alias(branch) for branch in (value.body, value.orelse))
+            )
+        if isinstance(value, ast.BoolOp):
+            if isinstance(value.op, ast.Or):
+                for operand in value.values:
+                    if expression_may_bind_priority_alias(operand):
+                        return True
+                    if _definitely_truthy_safe_expression(operand, relevant_names, shadowed_truthy_builtin_names):
+                        return False
+                    if isinstance(operand, ast.Constant) and not bool(operand.value):
+                        continue
+                    return any(expression_may_bind_priority_alias(branch) for branch in value.values[1:])
+                return False
+            for operand in value.values[:-1]:
+                if expression_may_bind_priority_alias(operand):
+                    continue
+                if isinstance(operand, ast.Constant) and not bool(operand.value):
+                    return False
+                if _definitely_truthy_safe_expression(operand, relevant_names, shadowed_truthy_builtin_names):
+                    continue
+                return any(expression_may_bind_priority_alias(branch) for branch in value.values[1:])
+            return expression_may_bind_priority_alias(value.values[-1])
+        return not _alias_reference_root_names(value).isdisjoint(relevant_names)
+
+    for _target, value in _assignment_targets_and_values_in_tree(tree):
+        if isinstance(value, (ast.IfExp, ast.BoolOp)) and expression_may_bind_priority_alias(value):
+            return True
+    return False
+
+
+def _definitely_truthy_safe_expression(
+    value: ast.AST, relevant_names: set[str], shadowed_truthy_builtin_names: set[str]
+) -> bool:
+    if isinstance(value, ast.Constant):
+        return bool(value.value)
+    return (
+        isinstance(value, ast.Name)
+        and value.id == "print"
+        and value.id not in relevant_names
+        and value.id not in shadowed_truthy_builtin_names
+    )
+
+
+def _late_mutated_truthy_builtin_names(
+    statement: bytes, builtins_alias_names: set[str], shadowed_builtin_helper_names: set[str]
+) -> set[str]:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(statement.lstrip(b"\x00\xff"))
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        return set()
+
+    mutated_names: set[str] = set()
+
+    def is_builtin_mapping(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == "__dict__"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in builtins_alias_names
+        ) or (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "vars"
+            and "vars" not in shadowed_builtin_helper_names
+            and len(node.args) == 1
+            and not node.keywords
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in builtins_alias_names
+        )
+
+    def record_target(target: ast.AST) -> None:
+        if isinstance(target, ast.Name) and target.id in {"print", "len"}:
+            mutated_names.add(target.id)
+        elif (
+            isinstance(target, ast.Attribute)
+            and target.attr in {"print", "len"}
+            and isinstance(target.value, ast.Name)
+            and target.value.id in builtins_alias_names
+        ):
+            mutated_names.add(target.attr)
+        elif isinstance(target, ast.Subscript):
+            key = _static_getattr_member_name(target.slice)
+            if key in {"print", "len"} and is_builtin_mapping(target.value):
+                mutated_names.add(key)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                record_target(target)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            record_target(node.target)
+        elif isinstance(node, ast.Delete):
+            for target in node.targets:
+                record_target(target)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"setattr", "delattr"}
+            and len(node.args) >= 2
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in builtins_alias_names
+            and _static_getattr_member_name(node.args[1]) in {"print", "len"}
+        ):
+            member_name = _static_getattr_member_name(node.args[1])
+            if member_name is not None:
+                mutated_names.add(member_name)
+        elif (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and is_builtin_mapping(node.func.value)
+        ):
+            if node.func.attr == "update":
+                mutated_names.update(keyword.arg for keyword in node.keywords if keyword.arg in {"print", "len"})
+                for keyword in node.keywords:
+                    if keyword.arg is None and isinstance(keyword.value, ast.Dict):
+                        mutated_names.update(
+                            member_name
+                            for key in keyword.value.keys
+                            if key is not None and (member_name := _static_getattr_member_name(key)) in {"print", "len"}
+                        )
+                for argument in node.args:
+                    if isinstance(argument, ast.Dict):
+                        mutated_names.update(
+                            member_name
+                            for key in argument.keys
+                            if key is not None and (member_name := _static_getattr_member_name(key)) in {"print", "len"}
+                        )
+            elif (
+                node.func.attr == "__setitem__"
+                and len(node.args) >= 1
+                and _static_getattr_member_name(node.args[0]) in {"print", "len"}
+            ):
+                member_name = _static_getattr_member_name(node.args[0])
+                if member_name is not None:
+                    mutated_names.add(member_name)
+    return mutated_names
+
+
+def _bounded_late_binding_statement(candidate: bytes, line_start: int, line_end: int) -> tuple[bytes, tuple[int, int]]:
+    statement_end = line_end
+    statement = candidate[line_start:statement_end]
+    parenthesis_depth = _line_parenthesis_delta(statement)
+    while (
+        (_line_has_explicit_continuation(statement.splitlines(keepends=True)[-1]) or parenthesis_depth > 0)
+        and statement_end < len(candidate)
+        and statement_end - line_start < _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES
+    ):
+        next_line_end = candidate.find(b"\n", statement_end)
+        statement_end = len(candidate) if next_line_end == -1 else next_line_end + 1
+        next_line = candidate[line_end:statement_end]
+        parenthesis_depth += _line_parenthesis_delta(next_line)
+        line_end = statement_end
+        statement = candidate[line_start:statement_end]
+    span = (line_start, min(statement_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES))
+    return candidate[span[0] : span[1]], span
+
+
+def _callable_root_names(fragment: bytes) -> set[str]:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(fragment)
+    source = textwrap.dedent(source)
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        try:
+            tree = ast.parse("def _candidate():\n" + textwrap.indent(source, "    "))
+        except (SyntaxError, ValueError):
+            return set()
+    root_names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        callable_node = node.func
+        while isinstance(callable_node, (ast.Attribute, ast.Subscript)):
+            callable_node = callable_node.value
+        if isinstance(callable_node, ast.Name):
+            root_names.add(callable_node.id)
+    return root_names
+
+
+def _attribute_load_root_names(fragment: bytes) -> set[str]:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(fragment)
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (SyntaxError, ValueError):
+        return set()
+    root_names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute) or not isinstance(node.ctx, ast.Load):
+            continue
+        root: ast.AST = node
+        while isinstance(root, ast.Attribute):
+            root = root.value
+        if isinstance(root, ast.Name):
+            root_names.add(root.id)
+    return root_names
+
+
+def _snippet_loads_native_library_attribute(source_bytes: bytes) -> bool:
+    if not any(loader_name in source_bytes for loader_name in (b"cdll", b"oledll", b"pydll", b"windll")):
+        return False
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(source_bytes)
+    parsed_snippet = _parse_embedded_python_snippet(textwrap.dedent(source))
+    if parsed_snippet is None:
+        return False
+    return any(code == "S110" for _name, code in _resolve_alias_aware_high_risk_calls(parsed_snippet[0]))
+
+
+def _potential_late_callable_root_names(code_line: bytes) -> set[str]:
+    return {
+        match.group(1).decode("utf-8")
+        for match in re.finditer(
+            rb"(?<![A-Za-z0-9_.])(?:\(\s*)*([A-Za-z_]\w*)\s*(?:\)\s*)*"
+            rb"(?:\.[A-Za-z_]\w*\s*)?(?:\)\s*)*\(",
+            code_line,
+        )
+    }
+
+
+def _fragment_has_continued_priority_alias_call(fragment: bytes, aliases: frozenset[bytes]) -> bool:
+    """Recognize multiline callable roots without promoting passive references."""
+    if not any(
+        re.search(
+            rb"(?<![A-Za-z0-9_])"
+            + re.escape(alias)
+            + rb"(?:[^\x00]*?\)\s*(?:\\\s*\n\s*)?\(|[^\x00\n]*?\\\s*\n\s*(?:\.[A-Za-z_]\w*\s*)?\()",
+            fragment,
+        )
         for alias in aliases
-        if re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\(|\.[A-Za-z_]\w*\s*\()", code_line)
+    ):
+        return False
+    alias_names = {alias.decode("utf-8") for alias in aliases}
+    return bool(_callable_root_names(fragment).intersection(alias_names))
+
+
+def _line_is_continued_priority_alias_piece(code_line: bytes, aliases: frozenset[bytes]) -> bool:
+    return any(
+        re.fullmatch(
+            rb"\s*(?:\(\s*)*" + re.escape(alias) + rb"(?:\s*\)*\s*\.\s*[A-Za-z_]\w*)*\s*\)*\s*(?:\\)?\s*",
+            code_line,
+        )
+        for alias in aliases
+    )
+
+
+def _line_is_continued_priority_name_piece(code_line: bytes, names: set[str]) -> bool:
+    return _line_is_continued_priority_alias_piece(code_line, frozenset(name.encode("utf-8") for name in names))
+
+
+_RUNPY_PRIORITY_MEMBER_NAMES = frozenset({"_run_module_as_main", "run_module", "run_path"})
+
+
+def _runpy_static_namespace_owner(
+    node: ast.AST,
+    aliases: frozenset[bytes],
+    namespace_aliases: dict[str, str] | None = None,
+    shadowed_builtin_helper_names: set[str] | None = None,
+) -> str | None:
+    alias_names = {alias.decode("utf-8") for alias in aliases}
+    if isinstance(node, ast.Name) and node.id in (namespace_aliases or {}):
+        return (namespace_aliases or {})[node.id]
+    if (
+        isinstance(node, ast.Attribute)
+        and node.attr == "__dict__"
+        and isinstance(node.value, ast.Name)
+        and node.value.id in alias_names
+    ):
+        return node.value.id
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "vars"
+        and "vars" not in (shadowed_builtin_helper_names or set())
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id in alias_names
+    ):
+        return node.args[0].id
+    return None
+
+
+def _runpy_static_member_key(node: ast.AST) -> str | None:
+    member_name = _static_getattr_member_name(node)
+    return member_name if member_name in _RUNPY_PRIORITY_MEMBER_NAMES else None
+
+
+def _runpy_priority_namespace_update_binding(
+    line: bytes,
+    aliases: frozenset[bytes],
+    namespace_aliases: dict[str, str] | None = None,
+    shadowed_builtin_helper_names: set[str] | None = None,
+) -> tuple[str, str] | None:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(line.lstrip(b"\x00\xff"))
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        return None
+    for statement in tree.body:
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and isinstance(statement.value, ast.Attribute)
+        ):
+            value = statement.value
+            owner_name = (
+                _runpy_static_namespace_owner(value.value, aliases, namespace_aliases, shadowed_builtin_helper_names)
+                if value.attr == "update"
+                else None
+            )
+            if owner_name is not None:
+                return statement.targets[0].id, owner_name
+            owner_name = _runpy_static_namespace_owner(value, aliases, namespace_aliases, shadowed_builtin_helper_names)
+            if owner_name is not None:
+                return statement.targets[0].id, owner_name
+    return None
+
+
+def _static_builtin_dict_descriptor_name(
+    node: ast.AST,
+    builtins_alias_names: set[str],
+    builtin_dict_descriptor_aliases: set[str] | None = None,
+    shadowed_builtin_helper_names: set[str] | None = None,
+) -> str | None:
+    reference = _simple_reference_name(node)
+    if reference in (builtin_dict_descriptor_aliases or {"dict"}):
+        return "dict"
+    if (
+        reference is not None
+        and reference.endswith(".dict")
+        and reference.removesuffix(".dict") in builtins_alias_names
+    ):
+        return "builtins.dict"
+    if (
+        isinstance(node, ast.Call)
+        and _simple_reference_name(node.func) in {"getattr", "builtins.getattr"}
+        and _simple_reference_name(node.func) not in (shadowed_builtin_helper_names or set())
+        and len(node.args) >= 2
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id in builtins_alias_names
+        and _static_getattr_member_name(node.args[1]) == "dict"
+    ):
+        return "builtins.dict"
+    return None
+
+
+def _runpy_priority_descriptor_update_name(
+    line: bytes,
+    builtins_alias_names: set[str] | None = None,
+    shadowed_builtin_helper_names: set[str] | None = None,
+) -> str | None:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(line.lstrip(b"\x00\xff"))
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute) or node.func.attr != "update":
+            continue
+        descriptor_name = _static_builtin_dict_descriptor_name(
+            node.func.value,
+            builtins_alias_names or {"builtins"},
+            shadowed_builtin_helper_names=shadowed_builtin_helper_names,
+        )
+        if descriptor_name is not None:
+            return descriptor_name
+    return None
+
+
+def _runpy_priority_ast_member_update(
+    line: bytes,
+    aliases: frozenset[bytes],
+    update_aliases: dict[str, str],
+    shadowed_descriptor_names: set[str],
+    descriptor_update_aliases: set[str],
+    builtins_alias_names: set[str],
+    shadowed_builtin_helper_names: set[str],
+) -> tuple[str, str] | None:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(line.lstrip(b"\x00\xff"))
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript):
+                    subscript_owner = _runpy_static_namespace_owner(
+                        target.value, aliases, update_aliases, shadowed_builtin_helper_names
+                    )
+                    member_name = _runpy_static_member_key(target.slice)
+                    if subscript_owner is not None and member_name is not None:
+                        return f"runpy.{member_name}", subscript_owner
+        if not isinstance(node, ast.Call):
+            continue
+        call_owner: str | None = None
+        update_arguments = node.args
+        descriptor_name = (
+            _static_builtin_dict_descriptor_name(
+                node.func.value,
+                builtins_alias_names,
+                shadowed_builtin_helper_names=shadowed_builtin_helper_names,
+            )
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "update"
+            else None
+        )
+        is_local_descriptor = descriptor_name == "dict" and "dict" not in shadowed_descriptor_names
+        is_builtin_descriptor = descriptor_name == "builtins.dict" and "builtins.dict" not in shadowed_descriptor_names
+        is_bound_descriptor = (
+            isinstance(node.func, ast.Name) and node.func.id in descriptor_update_aliases and bool(node.args)
+        )
+        if ((is_local_descriptor or is_builtin_descriptor) and node.args) or is_bound_descriptor:
+            call_owner = _runpy_static_namespace_owner(
+                node.args[0], aliases, update_aliases, shadowed_builtin_helper_names
+            )
+            update_arguments = node.args[1:]
+        elif isinstance(node.func, ast.Attribute) and node.func.attr in {"__setitem__", "update"}:
+            call_owner = _runpy_static_namespace_owner(
+                node.func.value, aliases, update_aliases, shadowed_builtin_helper_names
+            )
+        elif isinstance(node.func, ast.Name):
+            call_owner = update_aliases.get(node.func.id)
+        if call_owner is None:
+            continue
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "__setitem__" and node.args:
+            member_name = _runpy_static_member_key(node.args[0])
+            if member_name is not None:
+                return f"runpy.{member_name}", call_owner
+            continue
+        if not (
+            (isinstance(node.func, ast.Attribute) and node.func.attr == "update") or isinstance(node.func, ast.Name)
+        ):
+            continue
+        for argument in update_arguments:
+            if not isinstance(argument, ast.Dict):
+                continue
+            for key_node in argument.keys:
+                if key_node is not None:
+                    member_name = _runpy_static_member_key(key_node)
+                    if member_name is not None:
+                        return f"runpy.{member_name}", call_owner
+        for keyword in node.keywords:
+            if keyword.arg in _RUNPY_PRIORITY_MEMBER_NAMES:
+                return f"runpy.{keyword.arg}", call_owner
+            if keyword.arg is None and isinstance(keyword.value, ast.Dict):
+                for key_node in keyword.value.keys:
+                    if key_node is not None:
+                        member_name = _runpy_static_member_key(key_node)
+                        if member_name is not None:
+                            return f"runpy.{member_name}", call_owner
+    return None
+
+
+def _runpy_priority_member_update_key(
+    line: bytes,
+    code_line: bytes,
+    aliases: frozenset[bytes],
+    update_aliases: dict[str, str] | None = None,
+    shadowed_descriptor_names: set[str] | None = None,
+    descriptor_update_aliases: set[str] | None = None,
+    builtins_alias_names: set[str] | None = None,
+    shadowed_builtin_helper_names: set[str] | None = None,
+) -> tuple[str, str] | None:
+    ast_update = _runpy_priority_ast_member_update(
+        line,
+        aliases,
+        update_aliases or {},
+        shadowed_descriptor_names or set(),
+        descriptor_update_aliases or set(),
+        builtins_alias_names or {"builtins"},
+        shadowed_builtin_helper_names or set(),
+    )
+    if ast_update is not None:
+        return ast_update
+    member_names = rb"(_run_module_as_main|run_module|run_path)"
+    for alias in aliases:
+        match = re.search(
+            rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*\.\s*" + member_names + rb"\s*(?::[^=\n]+)?=",
+            code_line,
+        )
+        if match is None:
+            match = re.search(
+                rb"\bdel\s+" + re.escape(alias) + rb"\s*\.\s*" + member_names + rb"\b",
+                code_line,
+            )
+        if match is not None:
+            return f"runpy.{match.group(1).decode('utf-8')}", alias.decode("utf-8")
+        for raw_pattern, structural_pattern in (
+            (
+                re.escape(alias) + rb"\s*\.\s*__dict__\s*\[\s*['\"]" + member_names + rb"['\"]\s*\]\s*=",
+                re.escape(alias) + rb"\s*\.\s*__dict__\s*\[\s*\]\s*=",
+            ),
+            (
+                rb"\bvars\s*\(\s*" + re.escape(alias) + rb"\s*\)\s*\[\s*['\"]" + member_names + rb"['\"]\s*\]\s*=",
+                rb"\bvars\s*\(\s*" + re.escape(alias) + rb"\s*\)\s*\[\s*\]\s*=",
+            ),
+            (
+                re.escape(alias) + rb"\s*\.\s*__dict__\s*\.\s*__setitem__\s*\(\s*['\"]" + member_names + rb"['\"]\s*,",
+                re.escape(alias) + rb"\s*\.\s*__dict__\s*\.\s*__setitem__\s*\(\s*,",
+            ),
+            (
+                rb"\bvars\s*\(\s*"
+                + re.escape(alias)
+                + rb"\s*\)\s*\.\s*__setitem__\s*\(\s*['\"]"
+                + member_names
+                + rb"['\"]\s*,",
+                rb"\bvars\s*\(\s*" + re.escape(alias) + rb"\s*\)\s*\.\s*__setitem__\s*\(\s*,",
+            ),
+            (
+                re.escape(alias)
+                + rb"\s*\.\s*__dict__\s*\.\s*update\s*\(\s*\{[^}\n]*?['\"]"
+                + member_names
+                + rb"['\"]\s*:",
+                re.escape(alias) + rb"\s*\.\s*__dict__\s*\.\s*update\s*\(",
+            ),
+            (
+                rb"\bvars\s*\(\s*"
+                + re.escape(alias)
+                + rb"\s*\)\s*\.\s*update\s*\(\s*\{[^}\n]*?['\"]"
+                + member_names
+                + rb"['\"]\s*:",
+                rb"\bvars\s*\(\s*" + re.escape(alias) + rb"\s*\)\s*\.\s*update\s*\(",
+            ),
+            (
+                re.escape(alias) + rb"\s*\.\s*__dict__\s*\.\s*update\s*\([^)\n]*?\b" + member_names + rb"\s*=",
+                re.escape(alias) + rb"\s*\.\s*__dict__\s*\.\s*update\s*\([^)\n]*?\b" + member_names + rb"\s*=",
+            ),
+            (
+                rb"\bvars\s*\(\s*"
+                + re.escape(alias)
+                + rb"\s*\)\s*\.\s*update\s*\([^)\n]*?\b"
+                + member_names
+                + rb"\s*=",
+                rb"\bvars\s*\(\s*"
+                + re.escape(alias)
+                + rb"\s*\)\s*\.\s*update\s*\([^)\n]*?\b"
+                + member_names
+                + rb"\s*=",
+            ),
+        ):
+            match = re.search(raw_pattern, line)
+            if match is not None and b"vars" in raw_pattern and "vars" in (shadowed_builtin_helper_names or set()):
+                continue
+            if match is not None and re.search(structural_pattern, code_line) is not None:
+                return f"runpy.{match.group(1).decode('utf-8')}", alias.decode("utf-8")
+    return None
+
+
+def _runpy_priority_member_update_dependency_names(
+    statement: bytes,
+    member_key: str,
+    update_aliases: dict[str, str] | None = None,
+    descriptor_update_aliases: set[str] | None = None,
+) -> set[str]:
+    normalized_statement = statement.lstrip(b"\x00\xff")
+    dependencies = _assignment_value_dependency_names(normalized_statement)
+    member_name = member_key.removeprefix("runpy.")
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(normalized_statement)
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        return dependencies
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "__setitem__" and len(node.args) >= 2:
+            key = node.args[0]
+            if _static_getattr_member_name(key) == member_name:
+                dependencies.update(_alias_reference_root_names(node.args[1]))
+        elif (isinstance(node.func, ast.Attribute) and node.func.attr == "update") or (
+            isinstance(node.func, ast.Name)
+            and node.func.id in {*((update_aliases or {}).keys()), *(descriptor_update_aliases or set())}
+        ):
+            if isinstance(node.func, ast.Name) and node.func.id in (update_aliases or {}):
+                dependencies.add(node.func.id)
+            if isinstance(node.func, ast.Name) and node.func.id in (descriptor_update_aliases or set()):
+                dependencies.add(node.func.id)
+            descriptor_name = _simple_reference_name(node.func)
+            if descriptor_name is not None and descriptor_name.endswith(".dict.update"):
+                descriptor_owner = descriptor_name.removesuffix(".dict.update")
+                if descriptor_owner != "builtins":
+                    dependencies.add(descriptor_owner)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in (update_aliases or {})
+            ):
+                dependencies.add(node.func.value.id)
+            update_arguments = (
+                node.args[1:]
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "update"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in {"dict", "builtins"}
+                    and node.args
+                )
+                or (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in (descriptor_update_aliases or set())
+                    and node.args
+                )
+                else node.args
+            )
+            for argument in update_arguments:
+                if not isinstance(argument, ast.Dict):
+                    continue
+                for member_key_node, member_value in zip(argument.keys, argument.values, strict=True):
+                    if member_key_node is not None and _static_getattr_member_name(member_key_node) == member_name:
+                        dependencies.update(_alias_reference_root_names(member_value))
+            for keyword in node.keywords:
+                if keyword.arg == member_name:
+                    dependencies.update(_alias_reference_root_names(keyword.value))
+                elif keyword.arg is None and isinstance(keyword.value, ast.Dict):
+                    for member_key_node, member_value in zip(keyword.value.keys, keyword.value.values, strict=True):
+                        if member_key_node is not None and _static_getattr_member_name(member_key_node) == member_name:
+                            dependencies.update(_alias_reference_root_names(member_value))
+    return dependencies
+
+
+def _line_calls_fail_closed_runpy_member(
+    code_line: bytes, aliases: frozenset[bytes], fail_closed_members: set[str]
+) -> bool:
+    for alias in aliases:
+        match = re.search(
+            rb"(?<![A-Za-z0-9_])(?:\(\s*)*"
+            + re.escape(alias)
+            + rb"(?:\s*\)\s*)*\.\s*(_run_module_as_main|run_module|run_path)(?:\s*\)\s*)*\(",
+            code_line,
+        )
+        if match is not None and f"runpy.{match.group(1).decode('utf-8')}" in fail_closed_members:
+            return True
+    return False
+
+
+def _line_starts_continued_priority_getattr(code_line: bytes) -> bool:
+    return re.fullmatch(rb"\s*(?:builtins\s*\.\s*)?getattr\s*(?:\\\s*|\(\s*)", code_line) is not None
+
+
+def _line_uses_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
+    return _fragment_has_continued_priority_alias_call(code_line, aliases) or any(
+        re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\()", code_line)
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?getattr\s*\(\s*" + re.escape(alias) + rb"\s*,",
+            code_line,
+        )
+        for alias in aliases
+    )
+
+
+def _priority_getattr_alias_member(
+    line: bytes,
+    aliases: frozenset[bytes],
+    shadowed_builtin_helper_names: set[str] | None = None,
+) -> tuple[str, ast.AST, str] | None:
+    source, _byte_offsets = _decode_utf8_with_byte_offsets(line.lstrip(b"\x00\xff"))
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (RecursionError, SyntaxError, ValueError):
+        return None
+    alias_names = {alias.decode("utf-8") for alias in aliases}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Call):
+            continue
+        getter = node.func
+        getter_name = _simple_reference_name(getter.func)
+        if getter_name not in {"getattr", "builtins.getattr"} or getter_name in (
+            shadowed_builtin_helper_names or set()
+        ):
+            continue
+        if getter.keywords or len(getter.args) < 2:
+            continue
+        target_node = getter.args[0]
+        member_node = getter.args[1]
+        if (
+            target_node is None
+            or member_node is None
+            or not isinstance(target_node, ast.Name)
+            or target_node.id not in alias_names
+        ):
+            continue
+        member_name = _static_getattr_member_name(member_node)
+        if isinstance(member_name, str) and re.fullmatch(r"[A-Za-z_]\w*", member_name) is not None:
+            return member_name, member_node, target_node.id
+    return None
+
+
+def _line_calls_priority_getattr_alias(line: bytes, aliases: frozenset[bytes]) -> bool:
+    return _priority_getattr_alias_member(line, aliases) is not None
+
+
+def _line_calls_overbounded_runpy_getattr_alias(
+    line: bytes,
+    aliases: frozenset[bytes],
+    shadowed_builtin_helper_names: set[str] | None = None,
+) -> bool:
+    resolved_member = _priority_getattr_alias_member(line, aliases, shadowed_builtin_helper_names)
+    if resolved_member is None or resolved_member[0] not in _RUNPY_PRIORITY_MEMBER_NAMES:
+        return False
+    pending = [resolved_member[1]]
+    parts = 0
+    while pending:
+        current = pending.pop()
+        if isinstance(current, ast.BinOp) and isinstance(current.op, ast.Add):
+            pending.extend((current.right, current.left))
+        elif isinstance(current, ast.Constant) and isinstance(current.value, str):
+            parts += 1
+            if parts > 256:
+                return True
+        else:
+            return False
+    return False
+
+
+def _static_getattr_member_name(node: ast.AST) -> str | None:
+    pieces: list[str] = []
+    pending = [node]
+    visited = 0
+    while pending:
+        current = pending.pop()
+        visited += 1
+        if visited > 8192:
+            return None
+        if isinstance(current, ast.Constant) and isinstance(current.value, str):
+            pieces.append(current.value)
+            continue
+        if isinstance(current, ast.BinOp) and isinstance(current.op, ast.Add):
+            pending.extend((current.right, current.left))
+            continue
+        return None
+    member_name = "".join(pieces)
+    return member_name if len(member_name) <= 256 else None
+
+
+def _line_calls_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
+    return _fragment_has_continued_priority_alias_call(code_line, aliases) or any(
+        re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\(|\.[A-Za-z_]\w*\s*\()", code_line)
         or re.search(
             rb"(?<![A-Za-z0-9_.])(?:builtins\.)?getattr\s*\(\s*"
             + re.escape(alias)
             + rb"\s*,\s*['\"][A-Za-z_]\w*['\"]\s*\)\s*\(",
             code_line,
         )
+        for alias in aliases
     )
 
 
@@ -746,6 +3431,43 @@ def _line_shadowed_priority_aliases(code_line: bytes, aliases: frozenset[bytes])
         or re.search(rb"^\s*class\s+" + re.escape(alias) + rb"\b", code_line)
     )
     return frozenset(shadowed_aliases)
+
+
+def _definitely_executed_late_shadow_aliases(
+    code_line: bytes, aliases: frozenset[bytes], *, nested: bool
+) -> frozenset[bytes]:
+    source = textwrap.dedent(code_line.decode("utf-8", errors="ignore"))
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        if not source.rstrip().endswith(":"):
+            return frozenset()
+        try:
+            tree = ast.parse(f"{source.rstrip()}\n    pass\n")
+        except (SyntaxError, ValueError):
+            return frozenset()
+    except ValueError:
+        return frozenset()
+    if len(tree.body) != 1:
+        return frozenset()
+
+    statement = tree.body[0]
+    if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Import, ast.ImportFrom, ast.Delete)):
+        return _statement_bound_priority_aliases(statement, aliases)
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        statement_name = statement.name.encode("utf-8")
+        return frozenset({statement_name}) if statement_name in aliases else frozenset()
+    if not nested and isinstance(statement, (ast.With, ast.AsyncWith)):
+        return _statement_bound_priority_aliases(statement, aliases)
+    if not nested and isinstance(statement, ast.Expr) and isinstance(statement.value, ast.NamedExpr):
+        return _target_bound_priority_aliases(statement.value.target, aliases)
+    if (
+        isinstance(statement, (ast.For, ast.AsyncFor))
+        and isinstance(statement.iter, (ast.List, ast.Tuple, ast.Set))
+        and statement.iter.elts
+    ):
+        return _target_bound_priority_aliases(statement.target, aliases)
+    return frozenset()
 
 
 def _line_assigned_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
@@ -983,20 +3705,33 @@ def _prioritized_embedded_python_snippets(
             if bounded is not None
             else _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(candidate.lower()) is not None
         )
+        oversized_priority_candidate = (
+            has_priority_marker and bounded is not None and len(candidate) > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES
+        )
+        if oversized_priority_candidate:
+            if selected_priority_candidates >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
+                continue
+            candidate, span, real_ranges = _bounded_priority_embedded_python_candidate(
+                candidate, span, priority_offsets
+            )
+            selected_priority_candidates += 1
         if index >= _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:
             if not has_priority_marker:
                 continue
-            if selected_priority_candidates >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
+            if oversized_priority_candidate:
+                pass
+            elif selected_priority_candidates >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
                 continue
-            if bounded is not None:
+            elif bounded is not None:
                 candidate, span, real_ranges = _bounded_priority_embedded_python_candidate(
                     candidate, span, priority_offsets
                 )
-            else:
+                selected_priority_candidates += 1
+            elif not oversized_priority_candidate:
                 candidate = candidate[:_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES]
                 span = (span[0], span[0] + len(candidate))
                 real_ranges = (span,)
-            selected_priority_candidates += 1
+                selected_priority_candidates += 1
         if span in selected_spans:
             continue
         selected_spans.add(span)
@@ -1123,7 +3858,14 @@ def _line_has_explicit_continuation(line: bytes) -> bool:
 
 def _line_parenthesis_delta(line: bytes) -> int:
     structural = _python_structural_line_bytes(line)
-    return structural.count(b"(") - structural.count(b")")
+    return (
+        structural.count(b"(")
+        + structural.count(b"[")
+        + structural.count(b"{")
+        - structural.count(b")")
+        - structural.count(b"]")
+        - structural.count(b"}")
+    )
 
 
 def _multiline_string_state_after_line(line: bytes, quote: bytes | None) -> bytes | None:
@@ -1141,6 +3883,9 @@ def _is_embedded_top_level_prefix(prefix: bytes) -> bool:
 
 def _context_statement_start(line: bytes) -> int | None:
     for match in _EMBEDDED_PYTHON_CONTEXT_START_PATTERN.finditer(line):
+        if _is_embedded_top_level_prefix(line[: match.start()]):
+            return match.start()
+    for match in _EMBEDDED_PYTHON_STATIC_MEMBER_CONTEXT_START_PATTERN.finditer(line):
         if _is_embedded_top_level_prefix(line[: match.start()]):
             return match.start()
     structural_line = _python_structural_line_bytes(line)
@@ -1201,6 +3946,12 @@ def _tree_imports_priority_module(tree: ast.AST) -> bool:
 
 
 def _is_priority_prefix_context_statement(context: bytes, statement: bytes) -> bool:
+    aliases = _priority_import_aliases(context)
+    if (
+        aliases
+        and _runpy_priority_member_update_key(statement, _python_structural_line_bytes(statement), aliases) is not None
+    ):
+        return True
     code_str, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
     try:
         tree = ast.parse(code_str)
@@ -1284,6 +4035,9 @@ def _extract_priority_prefix_context(data: bytes) -> bytes:
     """Return bounded top-level dangerous imports and aliases from a prefix window."""
     context: list[bytes] = []
     context_size = 0
+    active_priority_names: set[str] = set()
+    compact_alias_expressions: dict[str, bytes] = {}
+    retained_context_names: set[str] = set()
     lines = data.splitlines(keepends=True)
     index = 0
     multiline_quote: bytes | None = None
@@ -1308,10 +4062,32 @@ def _extract_priority_prefix_context(data: bytes) -> bytes:
             paren_depth += _line_parenthesis_delta(continuation)
 
         statement = b"".join(statement_lines).rstrip() + b"\n"
+        compact_forward = _simple_forwarded_alias_assignment(statement)
+        compact_priority_statement = False
+        if compact_forward is not None:
+            target_name, dependency_name, expression = compact_forward
+            retained_expression = compact_alias_expressions.get(dependency_name)
+            if retained_expression is None and dependency_name in active_priority_names:
+                retained_expression = expression
+            if retained_expression is not None:
+                statement = target_name.encode("utf-8") + b" = " + retained_expression + b"\n"
+                compact_alias_expressions[target_name] = retained_expression
+                compact_priority_statement = True
+            elif dependency_name not in retained_context_names and target_name not in retained_context_names:
+                multiline_quote = statement_line_quote
+                index += 1
+                continue
+        else:
+            binding_name = _simple_late_binding_name(_python_structural_line_bytes(statement))
+            if binding_name is not None:
+                compact_alias_expressions.pop(binding_name, None)
+
         current_context = b"".join(context)
-        if not _is_priority_prefix_context_statement(
-            current_context, statement
-        ) and not _is_prefix_context_shadow_statement(current_context, statement):
+        if (
+            not compact_priority_statement
+            and not _is_priority_prefix_context_statement(current_context, statement)
+            and not _is_prefix_context_shadow_statement(current_context, statement)
+        ):
             multiline_quote = statement_line_quote
             index += 1
             continue
@@ -1319,12 +4095,36 @@ def _extract_priority_prefix_context(data: bytes) -> bytes:
             index += 1
             continue
         while context and context_size + len(statement) > _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES:
-            drop_index = _drop_context_statement_index([*context, statement])
+            drop_index = (
+                next(
+                    (
+                        context_index
+                        for context_index, context_statement in enumerate(context)
+                        if _simple_forwarded_alias_assignment(context_statement) is not None
+                    ),
+                    len(context),
+                )
+                if compact_priority_statement
+                else _drop_context_statement_index([*context, statement])
+            )
             if drop_index >= len(context):
                 break
             context_size -= len(context.pop(drop_index))
         context.append(statement)
         context_size += len(statement)
+        if compact_priority_statement:
+            defined_names = {target_name}
+            priority_aliases: set[str] = set()
+        else:
+            defined_names = _statement_defined_names(statement)
+            priority_aliases = (
+                {alias.decode("utf-8") for alias in _priority_import_aliases(statement)}
+                if re.match(rb"\s*(?:import|from)\b", statement) is not None
+                else set()
+            )
+        active_priority_names.difference_update(defined_names - priority_aliases)
+        active_priority_names.update(priority_aliases)
+        retained_context_names.update(defined_names)
         index += 1
 
     return b"".join(context)
@@ -1333,17 +4133,27 @@ def _extract_priority_prefix_context(data: bytes) -> bytes:
 def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]:
     windows = _embedded_python_scan_windows(data)
     if len(windows) == 1:
-        return [(windows[0], False)]
+        return [(windows[0], False), *_contextual_priority_framed_windows(windows[0])]
 
     prefix, tail = windows
-    extraction_windows = [(prefix, False), (tail, False)]
-    import_context = _extract_priority_prefix_context(prefix)
+    extraction_windows = [(prefix, False), *_contextual_priority_framed_windows(prefix), (tail, False)]
+    tail_start = len(data) - len(tail)
+    contextual_tail_offset = tail.find(b"\n") + 1
+    if contextual_tail_offset == 0:
+        contextual_tail_offset = len(tail)
+    contextual_tail = tail[contextual_tail_offset:]
+    prefix_context_end = min(len(prefix), tail_start + contextual_tail_offset)
+    import_context = _extract_priority_prefix_context(data[:prefix_context_end])
     if import_context:
-        extraction_windows.append((import_context + b"\n" + tail, True))
-        tail_starts = [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(tail) if match.start() > 0]
+        contextual_source = import_context + b"\n" + contextual_tail
+        extraction_windows.append((contextual_source, True))
+        extraction_windows.extend(_contextual_priority_framed_windows(contextual_source))
+        tail_starts = [
+            match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(contextual_tail) if match.start() > 0
+        ]
         context_aliases = _priority_import_aliases(import_context)
-        priority_tail_starts = set(_tail_starts_for_priority_alias_uses(tail, tail_starts, context_aliases))
-        for priority_offset in _priority_import_offsets(tail):
+        priority_tail_starts = set(_tail_starts_for_priority_alias_uses(contextual_tail, tail_starts, context_aliases))
+        for priority_offset in _priority_import_offsets(contextual_tail):
             insertion_index = bisect_right(tail_starts, priority_offset)
             if insertion_index:
                 priority_tail_starts.add(tail_starts[insertion_index - 1])
@@ -1354,8 +4164,66 @@ def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]
             *tail_starts[-_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:],
         ]
         for start in dict.fromkeys(selected_starts):
-            extraction_windows.append((import_context + b"\n" + tail[start:], True))
+            extraction_windows.append((import_context + b"\n" + contextual_tail[start:], True))
     return extraction_windows
+
+
+def _contextual_priority_framed_windows(data: bytes) -> list[tuple[bytes, bool]]:
+    first_line_end = data.find(b"\n")
+    if first_line_end < 0 or not any(marker in data[first_line_end + 1 :] for marker in (b"\x00", b"\xff")):
+        return []
+    potential_framed_calls: list[tuple[int, bytes, bytes]] = []
+    offset = 0
+    multiline_quote: bytes | None = None
+    for line in data.splitlines(keepends=True):
+        code_start = 0
+        while code_start < len(line) and not 0x20 <= line[code_start] < 0x7F:
+            code_start += 1
+        structural_line = _python_structural_line_bytes(line[code_start:])
+        if (
+            multiline_quote is None
+            and code_start
+            and (
+                b"(" in structural_line
+                or b"=" in structural_line
+                or structural_line.rstrip().endswith(b"\\")
+                or re.match(rb"\s*(?:if|elif|else)\b", structural_line) is not None
+            )
+        ):
+            potential_framed_calls.append((offset + code_start, line[code_start:], structural_line))
+        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+        offset += len(line)
+    if not potential_framed_calls:
+        return []
+    full_context = _extract_priority_prefix_context(data)
+    aliases = _priority_import_aliases(full_context)
+    if not aliases:
+        return []
+    framed_call_starts = [
+        start
+        for start, raw_line, structural_line in potential_framed_calls
+        if (
+            _line_calls_priority_alias(structural_line, aliases)
+            or _line_calls_priority_getattr_alias(raw_line, aliases)
+            or _line_is_continued_priority_alias_piece(structural_line, aliases)
+            or _line_starts_continued_priority_getattr(structural_line)
+            or _line_parenthesis_delta(structural_line) > 0
+            or _runpy_priority_namespace_update_binding(raw_line, aliases) is not None
+            or _runpy_priority_member_update_key(raw_line, structural_line, aliases) is not None
+            or (
+                _simple_late_binding_name(structural_line) is not None
+                and not _python_identifier_names(raw_line).isdisjoint({alias.decode("utf-8") for alias in aliases})
+            )
+            or re.match(rb"\s*(?:if|elif|else)\b", structural_line) is not None
+        )
+    ]
+    priority_starts = _bounded_priority_tail_starts(framed_call_starts)
+    contextual_windows: list[tuple[bytes, bool]] = []
+    for start in dict.fromkeys(priority_starts):
+        import_context = _extract_priority_prefix_context(data[:start])
+        if import_context:
+            contextual_windows.append((import_context + b"\n" + data[start:], True))
+    return contextual_windows
 
 
 def _bounded_priority_tail_starts(tail_starts: list[int]) -> list[int]:
@@ -1374,7 +4242,8 @@ def _tail_starts_for_priority_alias_uses(
     selected_starts: list[int] = []
     if not tail_starts or not aliases:
         return selected_starts
-    for usage_start, _usage_end in _priority_alias_usage_lines(tail, aliases, 0):
+    usage_lines, _proved_rule_codes = _priority_alias_usage_lines(tail, aliases, 0)
+    for usage_start, _usage_end in usage_lines:
         start_index = bisect_right(tail_starts, usage_start) - 1
         if start_index >= 0:
             selected_starts.append(tail_starts[start_index])
@@ -1537,16 +4406,21 @@ class JITScriptDetector:
         if not any(marker in data for marker in _EMBEDDED_PYTHON_START_MARKERS):
             return False
         for window, include_full_source in _embedded_python_extraction_windows(data):
-            for candidate, _span, _real_ranges in _candidate_embedded_python_snippets(
-                window, include_full_source=include_full_source
-            ):
+            candidates = _candidate_embedded_python_snippets(window, include_full_source=include_full_source)
+            for candidate, _span, _real_ranges in _prioritized_embedded_python_snippets(candidates, bounded=window):
+                if any(probe in candidate for _name, probe in _PROVEN_HIGH_RISK_CALL_PROBES.values()):
+                    return True
                 code_str, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
                 parsed_snippet = _parse_embedded_python_snippet(code_str)
                 if parsed_snippet is None:
                     continue
                 snippet_tree, _parsed_chars = parsed_snippet
-                if JITScriptDetector._ast_contains_dangerous_python(snippet_tree):
-                    return True
+                try:
+                    if JITScriptDetector._ast_contains_dangerous_python(snippet_tree):
+                        return True
+                except RecursionError:
+                    if any(probe in candidate for _name, probe in _PROVEN_HIGH_RISK_CALL_PROBES.values()):
+                        return True
         return False
 
     @staticmethod
@@ -1899,15 +4773,23 @@ class JITScriptDetector:
         bounded_high_risk_calls: set[tuple[str, str]] | None = None
         snippet_high_risk_calls: set[tuple[str, str]] = set()
         parsed_snippet_spans: list[tuple[int, int]] = []
-        try:
-            bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
-            bounded_high_risk_calls = _resolve_alias_aware_high_risk_calls(bounded_tree)
-        except (SyntaxError, UnicodeDecodeError, ValueError):
-            # Binary model blobs commonly contain non-Python framing bytes; keep
-            # raw pattern detection active and fall back to extracted snippets.
-            bounded_high_risk_calls = None
+        skips_unbounded_ast_prepass = len(bounded) > _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES and (
+            (include_full_source and _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(bounded.lower()) is not None)
+            or (not include_full_source and not any(marker in bounded for marker in _EMBEDDED_PYTHON_START_MARKERS))
+        )
+        if not skips_unbounded_ast_prepass:
+            try:
+                bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
+                bounded_high_risk_calls = _resolve_alias_aware_high_risk_calls(bounded_tree)
+            except (SyntaxError, UnicodeDecodeError, ValueError):
+                # Binary model blobs commonly contain non-Python framing bytes; keep
+                # raw pattern detection active and fall back to extracted snippets.
+                bounded_high_risk_calls = None
 
         for match, span, real_ranges in _prioritized_embedded_python_snippets(matches, bounded=bounded):
+            for rule_code, (call_name, probe) in _PROVEN_HIGH_RISK_CALL_PROBES.items():
+                if probe in match:
+                    snippet_high_risk_calls.add((call_name, rule_code))
             try:
                 if _is_span_inside_parsed_spans(span, parsed_snippet_spans):
                     continue

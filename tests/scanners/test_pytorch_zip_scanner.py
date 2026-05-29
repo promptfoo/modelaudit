@@ -11,6 +11,7 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.detectors import jit_script as jit_script_module
 from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, ScanResult
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
@@ -1580,6 +1581,1552 @@ def test_pytorch_zip_scans_unmarked_runpy_execution_in_archive_data(tmp_path: Pa
     assert all(check.rule_code == "S108" for check in matching_failures)
 
 
+@pytest.mark.parametrize(
+    "call",
+    [
+        b"(\n runner\n)('payload.py')\n",
+        b"(\n runner\n) \\\n('payload.py')\n",
+        b"runner \\\n('payload.py')\n",
+        b"rp \\\n    .run_path('payload.py')\n",
+    ],
+)
+def test_pytorch_zip_scans_late_continued_runpy_alias_in_archive_data(tmp_path: Path, call: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    leading_blocks = b"".join(
+        f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+        for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+    )
+    padding_line = b"# pad\n"
+    padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
+    import_line = b"import runpy as rp\n" if call.startswith(b"rp ") else b"from runpy import run_path as runner\n"
+    payload = b"\x00\xff" + leading_blocks + import_line + padding
+    payload += call + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        and "Dynamic module execution detected" in check.message
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("call", [b"(\n runner\n)('safe')\n", b"runner \\\n('safe')\n"])
+def test_pytorch_zip_preserves_visible_safe_rebind_before_late_continued_alias_call(
+    tmp_path: Path, call: bytes
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    leading_blocks = b"".join(
+        f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+        for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+    )
+    padding_line = b"# pad\n"
+    padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
+    payload = b"\x00\xff" + leading_blocks + b"from runpy import run_path as runner\n" + padding
+    payload += b"runner = print\n" + call + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("late_bindings", "call"),
+    [
+        (b"runner = rp.run_path\n", b"runner('payload.py')\n"),
+        (b"runner = rp.run_path\n", b"(runner)('payload.py')\n"),
+        (b"runner = rp.run_path\n", b"(\n runner\n)('payload.py')\n"),
+        (b"runner = rp.run_path\n", b"runner \\\n('payload.py')\n"),
+        (b"first = rp.run_path\nrunner = first\n", b"(runner)('payload.py')\n"),
+        (b"enabled = True\nrunner = rp.run_path if enabled else print\n", b"(runner)('payload.py')\n"),
+        (b"runner = rp.run_path or print\n", b"(runner)('payload.py')\n"),
+        (b"runner = False or rp.run_path\n", b"(runner)('payload.py')\n"),
+        (
+            b"enabled = True\nrunner = (\n    rp.run_path\n    if enabled\n    else print\n)\n",
+            b"(runner)('payload.py')\n",
+        ),
+        (b"mod = rp\n", b"getattr(mod, 'run_path')('payload.py')\n"),
+        (b"\x00\xffmod = rp\n", b"getattr(mod, 'run_path')('payload.py')\n"),
+    ],
+)
+def test_pytorch_zip_scans_late_derived_runpy_alias_in_archive_data(
+    tmp_path: Path, late_bindings: bytes, call: bytes
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    leading_blocks = b"".join(
+        f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+        for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+    )
+    padding_line = b"# pad\n"
+    padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
+    payload = b"\x00\xff" + leading_blocks + b"import runpy as rp\n" + padding + late_bindings + call + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        and "Dynamic module execution detected" in check.message
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scans_long_late_derived_runpy_alias_chain_with_bounded_replay(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding_line = b"# pad\n"
+    padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
+    bindings = b"value_0 = rp.run_path\n" + b"".join(
+        f"value_{index} = value_{index - 1}\n".encode() for index in range(1, 2_000)
+    )
+    payload = b"\x00\xffimport runpy as rp\n" + padding + bindings + b"(value_1999)('payload.py')\n" + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        and "Dynamic module execution detected" in check.message
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_ignores_long_passive_runpy_reference_chain_with_bounded_replay(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding_line = b"# pad\n"
+    padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
+    bindings = b"value_0 = print(rp.run_path)\n" + b"".join(
+        f"value_{index} = value_{index - 1}\n".encode() for index in range(1, 2_000)
+    )
+    payload = b"\x00\xffimport runpy as rp\n" + padding + bindings + b"(value_1999)('safe')\n" + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("safe_rebind", [b"runner = (\n    print\n)\n", b"runner = \\\n    print\n"])
+def test_pytorch_zip_preserves_multiline_safe_rebind_before_late_parenthesized_alias_call(
+    tmp_path: Path, safe_rebind: bytes
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    leading_blocks = b"".join(
+        f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+        for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+    )
+    padding_line = b"# pad\n"
+    padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
+    payload = (
+        b"\x00\xff"
+        + leading_blocks
+        + b"from runpy import run_path as runner\n"
+        + padding
+        + safe_rebind
+        + b"(runner)('safe')\n"
+        + padding
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scans_parenthesized_runpy_alias_after_passive_member_budget(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    leading_blocks = b"".join(
+        f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+        for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+    )
+    padding_line = b"# pad\n"
+    padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
+    passive_members = b"".join(f"rp.mark_{index} = {index}\n".encode() for index in range(8))
+    payload = (
+        b"\x00\xff"
+        + leading_blocks
+        + b"import runpy as rp\n"
+        + padding
+        + passive_members
+        + b"((rp).run_path)('payload.py')\n"
+        + padding
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        and "Dynamic module execution detected" in check.message
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_preserves_safe_member_overwrite_after_passive_alias_members(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding_line = b"# pad\n"
+    padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
+    passive_members = b"".join(f"rp.mark_{index} = {index}\n".encode() for index in range(8))
+    payload = (
+        b"\x00\xffimport runpy as rp\n"
+        + padding
+        + passive_members
+        + b"rp.run_path = print\n"
+        + passive_members
+        + b"((rp).run_path)('safe')\n"
+        + padding
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("late_state", "expect_finding"),
+    [
+        (b"if False:\n    runner = print\n(runner)('payload.py')\n", True),
+        (b"if True:\n    runner = print\n(runner)('safe')\n", False),
+        (b"if True:\n    runner = original\n(runner)('payload.py')\n", True),
+    ],
+)
+def test_pytorch_zip_handles_constant_guarded_late_runpy_alias_binding(
+    tmp_path: Path, late_state: bytes, expect_finding: bool
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    leading_blocks = b"".join(
+        f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+        for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+    )
+    padding_line = b"# pad\n"
+    padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
+    prefix = b"\x00\xff" + leading_blocks + b"from runpy import run_path as runner\n"
+    if b"original" in late_state:
+        prefix += b"original = runner\nrunner = print\n"
+    payload = prefix + padding + late_state + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+    has_dynamic_failure = any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+    assert has_dynamic_failure is expect_finding
+
+
+@pytest.mark.parametrize("shadow", [b"class runner:\n    pass\n", b"del runner\n"])
+def test_pytorch_zip_preserves_definite_late_runpy_alias_shadow(tmp_path: Path, shadow: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding_line = b"# pad\n"
+    padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
+    payload = b"\x00\xfffrom runpy import run_path as runner\n" + padding + shadow + b"(runner)('safe')\n" + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "restore",
+    [
+        b"if False:\n    pass\nelse:\n    runner = original\n",
+        b"if True:\n    if True:\n        runner = original\n",
+    ],
+)
+def test_pytorch_zip_detects_compound_late_runpy_alias_restore(tmp_path: Path, restore: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding_line = b"# pad\n"
+    padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
+    payload = (
+        b"\x00\xfffrom runpy import run_path as runner\n"
+        + b"original = runner\nrunner = print\n"
+        + padding
+        + restore
+        + b"(runner)('payload.py')\n"
+        + padding
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "late_state",
+    [
+        b"runner = rp.run_path if False else print\n(runner)('safe')\n",
+        b"runner = print if 1 else rp.run_path\n(runner)('safe')\n",
+        b"runner = rp.run_path and print\n(runner)('safe')\n",
+        b"runner = True or rp.run_path\n(runner)('safe')\n",
+        b"runner = print or rp.run_path\n(runner)('safe')\n",
+        b"original = runner\nrunner = print\nif False:\n    if True:\n        runner = original\n(runner)('safe')\n",
+        b"original = runner\nrunner = print\nif True:\n    pass\nelse:\n    runner = original\n(runner)('safe')\n",
+        b"original = runner\nrunner = print\nif 1:\n    pass\nelse:\n    runner = original\n(runner)('safe')\n",
+        b"original = runner\nrunner = print\nif False:\n    pass\nelif True:\n    pass\nelse:\n"
+        b"    runner = original\n(runner)('safe')\n",
+        b"original = runner\nrunner = print\nif 'enabled':\n    pass\nelse:\n    runner = original\n(runner)('safe')\n",
+        b"original = runner\nrunner = print\nif True:\n    pass\nelif False:\n    pass\nelse:\n"
+        b"    runner = original\n(runner)('safe')\n",
+        b"if globals().get('enabled'):\n    runner = print\nelif True:\n    runner = print\n(runner)('safe')\n",
+        b"getattr(object=rp, name='run_path')('safe')\n",
+    ],
+)
+def test_pytorch_zip_preserves_definitely_safe_late_conditional_alias_state(tmp_path: Path, late_state: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    payload = b"\x00\xffimport runpy as rp\nfrom runpy import run_path as runner\n" + padding + late_state + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "late_state",
+    [
+        b"enabled = True\nrunner = rp.run_path if enabled else print\n"
+        b"if globals().get('safe'):\n    runner = print\n(runner)('payload.py')\n",
+        b"from runpy import run_path as runner\nif globals().get('enabled'):\n    pass\n"
+        b"elif True:\n    runner = print\n(runner)('payload.py')\n",
+        b"from runpy import run_path as runner\noriginal = runner\nif globals().get('safe'):\n"
+        b"    runner = print\n    if globals().get('restore'):\n        runner = original\n"
+        b"else:\n    runner = print\n(runner)('payload.py')\n",
+        b"from runpy import run_path as runner\nprint = runner\nif globals().get('enabled'):\n"
+        b"    runner = print\nelse:\n    runner = print\n(runner)('payload.py')\n",
+        b"\x00\xfffrom runpy import run_path as runner\nprint = runner\nif globals().get('enabled'):\n"
+        b"    runner = print\nelse:\n    runner = print\n(runner)('payload.py')\n",
+    ],
+)
+def test_pytorch_zip_detects_late_alias_after_uncertain_safe_overwrite(tmp_path: Path, late_state: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    payload = b"\x00\xffimport runpy as rp\n" + padding + late_state + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "late_state",
+    [
+        b"import builtins\nbuiltins.print = False\nrunner = print or rp.run_path\n(runner)('payload.py')\n",
+        b"import builtins\nvars(builtins)['print'] = False\nrunner = print or rp.run_path\n(runner)('payload.py')\n",
+        b"import builtins\nvars(builtins).update({'print': False})\n"
+        b"runner = print or rp.run_path\n(runner)('payload.py')\n",
+        b"import builtins\nvars(builtins)['pri' + 'nt'] = False\n"
+        b"runner = print or rp.run_path\n(runner)('payload.py')\n",
+        b"import builtins\nvars(builtins).update(**{'print': False})\n"
+        b"runner = print or rp.run_path\n(runner)('payload.py')\n",
+        b"from runpy import run_path as runner\nFalse and (runner := print)\n(runner)('payload.py')\n",
+        (
+            b"from runpy import run_path as runner\nclass Broken:\n"
+            b"    def __enter__(self):\n        raise RuntimeError()\n"
+            b"    def __exit__(self, *args):\n        return False\n"
+            b"try:\n    with Broken() as runner:\n        pass\n"
+            b"except RuntimeError:\n    pass\n(runner)('payload.py')\n"
+        ),
+    ],
+)
+def test_pytorch_zip_detects_late_alias_after_non_executed_safe_shadow(tmp_path: Path, late_state: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    payload = b"\x00\xffimport runpy as rp\n" + padding + late_state + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_detects_retained_alias_after_raising_late_with_shadow(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    late_state = (
+        b"class Broken:\n    def __enter__(self):\n        raise RuntimeError()\n"
+        b"    def __exit__(self, *args):\n        return False\n"
+        b"try:\n    with Broken() as runner:\n        pass\n"
+        b"except RuntimeError:\n    pass\n(runner)('payload.py')\n"
+    )
+    payload = b"\x00\xfffrom runpy import run_path as runner\n" + padding + late_state + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_detects_forwarded_late_ctypes_attribute_load(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    payload = b"\x00\xffimport ctypes as c\n" + padding + b"loader = c.cdll\nloader.msvcrt\n" + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S110"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("prefix", "late_state", "rule_code"),
+    [
+        (
+            b"import webbrowser as wb\n",
+            b"import builtins\nvars(builtins)['print'] = False\n"
+            b"opener = print or wb.open\n(opener)('https://example.invalid')\n",
+            "S109",
+        ),
+        (
+            b"import webbrowser as wb\n",
+            b"import builtins\nvars(builtins).update({'print': False})\n"
+            b"opener = print or wb.open\n(opener)('https://example.invalid')\n",
+            "S109",
+        ),
+        (
+            b"import webbrowser as wb\n",
+            b"import builtins\nvars(builtins)['pri' + 'nt'] = False\n"
+            b"opener = print or wb.open\n(opener)('https://example.invalid')\n",
+            "S109",
+        ),
+        (
+            b"import webbrowser as wb\n",
+            b"import builtins\nvars(builtins).update(**{'print': False})\n"
+            b"opener = print or wb.open\n(opener)('https://example.invalid')\n",
+            "S109",
+        ),
+        (
+            b"import ctypes as c\n",
+            b"import builtins\nvars(builtins)['print'] = False\nloader = print or c.CDLL\n(loader)('libpayload.so')\n",
+            "S110",
+        ),
+        (
+            b"import ctypes as c\n",
+            b"import builtins\nvars(builtins).update({'print': False})\n"
+            b"loader = print or c.CDLL\n(loader)('libpayload.so')\n",
+            "S110",
+        ),
+        (
+            b"import ctypes as c\n",
+            b"import builtins\nvars(builtins)['pri' + 'nt'] = False\n"
+            b"loader = print or c.CDLL\n(loader)('libpayload.so')\n",
+            "S110",
+        ),
+        (
+            b"import ctypes as c\n",
+            b"import builtins\nvars(builtins).update(**{'print': False})\n"
+            b"loader = print or c.CDLL\n(loader)('libpayload.so')\n",
+            "S110",
+        ),
+    ],
+)
+def test_pytorch_zip_detects_boolean_fallback_after_builtin_mapping_mutation(
+    tmp_path: Path, prefix: bytes, late_state: bytes, rule_code: str
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    payload = b"\x00\xff" + prefix + padding + late_state + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == rule_code
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("prefix", "late_state", "rule_code"),
+    [
+        (b"import runpy as rp\n", b"runner = print or rp.run_path\nrunner('safe')\n", "S108"),
+        (
+            b"import webbrowser as wb\n",
+            b"opener = print or wb.open\nopener('https://example.invalid')\n",
+            "S109",
+        ),
+        (b"import ctypes as c\n", b"loader = print or c.CDLL\nloader('libpayload.so')\n", "S110"),
+    ],
+)
+def test_pytorch_zip_preserves_safe_boolean_fallback_after_builtin_restore(
+    tmp_path: Path, prefix: bytes, late_state: bytes, rule_code: str
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    state = (
+        b"import builtins\noriginal = builtins.print\n"
+        b"vars(builtins)['print'] = False\nvars(builtins).update({'print': original})\n"
+    )
+    payload = b"\x00\xff" + prefix + padding + state + late_state + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == rule_code
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("prefix", "late_state", "rule_code"),
+    [
+        (
+            b"import webbrowser as wb\n",
+            b"wb.open = print\nopener = wb.open\nopener('safe')\n",
+            "S109",
+        ),
+        (b"import ctypes as c\n", b"c.CDLL = print\nloader = c.CDLL\nloader('safe')\n", "S110"),
+        (b"import ctypes as c\n", b"c.cdll = print\nloader = c.cdll\nloader.msvcrt\n", "S110"),
+        (b"import webbrowser as wb\n", b"vars(wb).update(open=print)\nopener = wb.open\nopener('safe')\n", "S109"),
+        (b"import webbrowser as wb\n", b"setattr(wb, 'open', print)\nopener = wb.open\nopener('safe')\n", "S109"),
+        (b"import ctypes as c\n", b"c.__dict__['CDLL'] = print\nloader = c.CDLL\nloader('safe')\n", "S110"),
+        (b"import ctypes as c\n", b"vars(c).update(CDLL=print)\nloader = c.CDLL\nloader('safe')\n", "S110"),
+    ],
+)
+def test_pytorch_zip_preserves_safe_late_typed_member_overwrite(
+    tmp_path: Path, prefix: bytes, late_state: bytes, rule_code: str
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    payload = b"\x00\xff" + prefix + padding + late_state + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == rule_code
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("prefix", "late_state", "rule_code"),
+    [
+        (
+            b"import webbrowser as wb\n",
+            b"opener = wb.open\nwb.open = print\nopener('https://example.invalid')\n",
+            "S109",
+        ),
+        (b"import ctypes as c\n", b"loader = c.CDLL\nc.CDLL = print\nloader('libpayload.so')\n", "S110"),
+        (b"import ctypes as c\n", b"loader = c.cdll\nc.cdll = print\nloader.msvcrt\n", "S110"),
+        (
+            b"import webbrowser as wb\n",
+            b"original = wb.open\nwb.open = print\nwb.open = original\n"
+            b"opener = wb.open\nopener('https://example.invalid')\n",
+            "S109",
+        ),
+        (
+            b"import ctypes as c\n",
+            b"original = c.CDLL\nc.CDLL = print\nc.CDLL = original\nloader = c.CDLL\nloader('libpayload.so')\n",
+            "S110",
+        ),
+    ],
+)
+def test_pytorch_zip_preserves_dangerous_typed_member_captured_before_safe_overwrite(
+    tmp_path: Path, prefix: bytes, late_state: bytes, rule_code: str
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    payload = b"\x00\xff" + prefix + padding + late_state + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == rule_code
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("prefix", "initial_binding", "endpoint", "rule_code"),
+    [
+        (
+            b"import webbrowser as wb\n",
+            b"value_0 = wb.open\n",
+            b"value_1999('https://example.invalid')\n",
+            "S109",
+        ),
+        (b"import ctypes as c\n", b"value_0 = c.CDLL\n", b"value_1999('libpayload.so')\n", "S110"),
+        (b"import ctypes as c\n", b"value_0 = c.cdll\n", b"value_1999.msvcrt\n", "S110"),
+        (b"from webbrowser import open as value_0\n", b"", b"value_1999('https://example.invalid')\n", "S109"),
+        (b"from ctypes import CDLL as value_0\n", b"", b"value_1999('libpayload.so')\n", "S110"),
+        (b"from ctypes import cdll as value_0\n", b"", b"value_1999.msvcrt\n", "S110"),
+    ],
+)
+def test_pytorch_zip_preserves_late_rule_identity_beyond_replay_budget(
+    tmp_path: Path, prefix: bytes, initial_binding: bytes, endpoint: bytes, rule_code: str
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    bindings = initial_binding + b"".join(f"value_{index} = value_{index - 1}\n".encode() for index in range(1, 2_000))
+    payload = b"\x00\xff" + prefix + padding + bindings + endpoint + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    relevant = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+    ]
+    assert any(check.rule_code == rule_code for check in relevant)
+    assert not any(check.rule_code == "S108" for check in relevant)
+
+
+@pytest.mark.parametrize(
+    ("prefix_state", "late_state", "expect_finding"),
+    [
+        (b"", b"rp.run_path = print\n" + b"rp.run_module = print\n" * 8, False),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"rp.run_path: object = original\n" + b"rp.run_module = print\n" * 8,
+            True,
+        ),
+        (b"", b"del rp.run_path\n", False),
+        (b"", b"rp.__dict__['run_path'] = print\n", False),
+        (b"", b"vars(rp).update(run_path=print)\n", False),
+        (b"", b"rp.__dict__.update({'other': print, 'run_path': print})\n", False),
+        (b"", b"vars(rp).update(other=print, run_path=print)\n", False),
+        (b"", b"rp.__dict__.update(**{'run_path': print})\n", False),
+        (b"", b"dict.update(rp.__dict__, run_path=print)\n", False),
+        (b"", b"overwrite = dict.update\noverwrite(rp.__dict__, run_path=print)\n", False),
+        (b"", b"import builtins\noverwrite = builtins.dict.update\noverwrite(rp.__dict__, run_path=print)\n", False),
+        (b"", b"import builtins as bi\nbi.dict.update(rp.__dict__, run_path=print)\n", False),
+        (b"", b"ns = rp.__dict__\nns.update(run_path=print)\n", False),
+        (b"", b"restore = vars(rp).update\nrestore(run_path=print)\n", False),
+        (b"", b"\x00\xffns = rp.__dict__\nns.update(run_path=print)\n", False),
+        (b"", b"\x00\xffrestore = vars(rp).update\nrestore(run_path=print)\n", False),
+        (b"", b"mod = rp\nns = mod.__dict__\nns.update(run_path=print)\n", False),
+        (b"", b"mod = rp\nrestore = vars(mod).update\nrestore(run_path=print)\n", False),
+        (b"", b"mod = rp\nmapping = mod.__dict__\nrestore = mapping.update\nrestore(run_path=print)\n", False),
+        (
+            b"",
+            b"mod = rp\nmapping = mod.__dict__\nsecond = mapping\nrestore = second.update\nrestore(run_path=print)\n",
+            False,
+        ),
+        (
+            b"",
+            b"mod = rp\nmapping = mod.__dict__\nrestore = mapping.update\napply = restore\napply(run_path=print)\n",
+            False,
+        ),
+        (b"", b"rp.__dict__['run' + '_path'] = print\n", False),
+        (b"", b"rp.__dict__[\n    'run' + '_path'\n] = print\n", False),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+            b"dict = Safe\ndict.update(rp.__dict__, run_path=original)\n",
+            False,
+        ),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"import builtins as bi\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nbi.dict = Safe\nbuiltins.dict.update(rp.__dict__, run_path=original)\n",
+            False,
+        ),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+            b"real_dict = dict\ndict = Safe\ndict = real_dict\n"
+            b"dict.update(rp.__dict__, run_path=original)\n",
+            True,
+        ),
+        (
+            b"",
+            b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+            b"real_dict = dict\ndict = Safe\ndict = real_dict\n"
+            b"dict.update(rp.__dict__, run_path=print)\n",
+            False,
+        ),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"import builtins as bi\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nreal_dict = bi.dict\nbi.dict = Safe\nbi.dict = real_dict\n"
+            b"builtins.dict.update(rp.__dict__, run_path=original)\n",
+            True,
+        ),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"import builtins as bi\nbi.dict.update(rp.__dict__, run_path=original)\n",
+            True,
+        ),
+        (
+            b"",
+            b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+            b"if globals().get('enabled'):\n    dict = Safe\n"
+            b"dict.update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"",
+            b"rp.run_path = print\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nif globals().get('enabled'):\n    dict = Safe\n"
+            b"dict.update(rp.__dict__, run_path=print)\n",
+            False,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nif globals().get('enabled'):\n    builtins.dict = Safe\n"
+            b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"",
+            b"rp.run_path = print\nimport builtins\nclass Safe:\n    @staticmethod\n"
+            b"    def update(*args, **kwargs):\n        pass\nif globals().get('enabled'):\n"
+            b"    builtins.dict = Safe\nbuiltins.dict.update(rp.__dict__, run_path=print)\n",
+            False,
+        ),
+        (
+            b"",
+            b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+            b"if globals().get('enabled'):\n    dict = Safe\n"
+            b"dict.update(\n    rp.__dict__, run_path=print\n)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nbuiltins.__dict__['dict'] = Safe\n"
+            b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nbuiltins.__dict__.update(dict=Safe)\n"
+            b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins as bi\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nvars(bi).update(dict=Safe)\n"
+            b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\nmapping = builtins.__dict__\n"
+            b"mapping.update(dict=real)\nbuiltins.dict.update(rp.__dict__, run_path=original)\n",
+            True,
+        ),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\nbuiltins.__dict__.update(\n"
+            b"    dict=real\n)\nbuiltins.dict.update(rp.__dict__, run_path=original)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins\ngetattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+            False,
+        ),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"import builtins\ngetattr(builtins, 'dict').update(rp.__dict__, run_path=original)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\ndef inert():\n    builtins.dict = Safe\n"
+            b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+            False,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nbi = builtins\nbi.dict = Safe\n"
+            b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"import builtins as bi\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nclass Holder:\n    pass\nbi = Holder()\nbi.dict = Safe\n"
+            b"builtins.dict.update(rp.__dict__, run_path=original)\n",
+            True,
+        ),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"class Restore:\n    rp.run_path = original\n",
+            True,
+        ),
+        (b"", b"class SafeState:\n    rp.run_path = print\n", False),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nclass Shadow:\n    builtins.dict = Safe\n"
+            b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\ngetattr = lambda *args: Safe\n"
+            b"getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\ngetattr = lambda *args: Safe\n"
+            b"getattr(builtins, 'dict').update(rp.__dict__, run_path=original)\n",
+            False,
+        ),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nvars = lambda obj: {}\nvars(builtins).update(dict=Safe)\n"
+            b"builtins.dict.update(rp.__dict__, run_path=original)\n",
+            True,
+        ),
+        (
+            b"",
+            b"restore = (\n    dict.update\n)\nrestore(rp.__dict__, run_path=print)\n",
+            False,
+        ),
+        (
+            b"",
+            b"import builtins\nrestore = getattr(builtins, 'dict').update\nrestore(rp.__dict__, run_path=print)\n",
+            False,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\nmapping = builtins.__dict__\n"
+            b"restore = mapping.update\nrestore(dict=real)\n"
+            b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+            False,
+        ),
+        (
+            b"",
+            b"ns = rp.__dict__\nif globals().get('enabled'):\n    ns = {}\nns.update(run_path=print)\n",
+            True,
+        ),
+        (
+            b"",
+            b"class Safe:\n    run_path = print\nmod = rp\n"
+            b"if globals().get('enabled'):\n    mod = Safe\nmod.run_path = print\n",
+            True,
+        ),
+        (
+            b"",
+            b"class SafeState:\n    apply = dict.update\n    apply(rp.__dict__, run_path=print)\n",
+            False,
+        ),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\ngetattr = lambda *args: Safe\n"
+            b"if globals().get('enabled'):\n    getattr = builtins.getattr\n"
+            b"getattr(builtins, 'dict').update(rp.__dict__, run_path=original)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nbuiltins.getattr = lambda *args: Safe\n"
+            b"builtins.getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nbuiltins.getattr = lambda *args: Safe\n"
+            b"getattr \\\n (builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nif globals().get('enabled'):\n    builtins.getattr = lambda *args: Safe\n"
+            b"getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nbuiltins.__dict__['getattr'] = lambda *args: Safe\n"
+            b"getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nvars(builtins)['getattr'] = lambda *args: Safe\n"
+            b"builtins.getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nvars(builtins).__setitem__('getattr', lambda *args: Safe)\n"
+            b"builtins.getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nvars(builtins).update(getattr=lambda *args: Safe)\n"
+            b"builtins.getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\nbuiltins.vars = lambda obj: {}\n"
+            b"vars(builtins).update(dict=real)\n"
+            b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nreal_getattr = builtins.getattr\nbuiltins.getattr = lambda *args: Safe\n"
+            b"builtins.getattr = real_getattr\n"
+            b"builtins.getattr(builtins, 'dict').update(rp.__dict__, run_path=original)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nbuiltins.getattr = lambda *args: Safe\nbuiltins.getattr = getattr\n"
+            b"builtins.getattr(builtins, 'dict').update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\ngetattr = lambda *args: Safe\ndel getattr\n"
+            b"getattr(builtins, 'dict').update(rp.__dict__, run_path=original)\n",
+            True,
+        ),
+        (
+            b"",
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nvars = lambda obj: {}\ndel vars\nvars(builtins).update(dict=Safe)\n"
+            b"builtins.dict.update(rp.__dict__, run_path=print)\n",
+            True,
+        ),
+        (b"", b"if False:\n    dict = object\ndict.update(rp.__dict__, run_path=print)\n", False),
+        (
+            b"original = rp.run_path\nrp.run_path = print\n",
+            b"if False:\n    dict = object\ndict.update(rp.__dict__, run_path=original)\n",
+            True,
+        ),
+    ],
+)
+def test_pytorch_zip_preserves_latest_late_runpy_member_state(
+    tmp_path: Path, prefix_state: bytes, late_state: bytes, expect_finding: bool
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding_line = b"# pad\n"
+    padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
+    payload = (
+        b"\x00\xffimport runpy as rp\n"
+        + prefix_state
+        + padding
+        + late_state
+        + b"((rp).run_path)('payload.py')\n"
+        + padding
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+    has_dynamic_failure = any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+    assert has_dynamic_failure is expect_finding
+
+
+@pytest.mark.parametrize(
+    ("late_state", "call_line"),
+    [
+        (b"mod = rp\nmod.run_path = original\n", b"((mod).run_path)('payload.py')\n"),
+        (b"mod = rp\nmod.run_path = original\n", b"((rp).run_path)('payload.py')\n"),
+        (b"\x00\xffrp.run_path = original\n\x00\xff", b"((rp).run_path)('payload.py')\n"),
+        (b"\x00\xffrp.run_path = original\n", b"\x00\xff(\n rp.run_path\n)('payload.py')\n"),
+        (b"\x00\xffrp.run_path = original\n", b"\x00\xffrp \\\n .run_path('payload.py')\n"),
+        (
+            b"\x00\xffrp.run_path = original\n",
+            b"\x00\xffgetattr \\\n (rp, 'run_path')('payload.py')\n",
+        ),
+        (
+            b"\x00\xffrp.run_path = original\n",
+            b"\x00\xffgetattr(rp, 'run_path')('payload.py')\n",
+        ),
+        (
+            b"\x00\xffrp.run_path = original\n",
+            b"\x00\xffgetattr(rp, 'run_' + 'path')('payload.py')\n",
+        ),
+        (
+            b"\x00\xffrp.run_path = original\n",
+            b"\x00\xffgetattr \\\n (rp, 'run_' + 'path')('payload.py')\n",
+        ),
+        (
+            b"\x00\xffrp.run_path = original\n",
+            b"\x00\xffgetattr(\n rp, 'run_' + 'path'\n)('payload.py')\n",
+        ),
+        (b"\x00\xffrp.__dict__['run_path'] = original\n", b"((rp).run_path)('payload.py')\n"),
+        (b"\x00\xffvars(rp).update(run_path=original)\n", b"((rp).run_path)('payload.py')\n"),
+        (
+            b"\x00\xffrp.__dict__.update({'other': print, 'run_path': original})\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"\x00\xffvars(rp).update(other=print, run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (b"\x00\xffrp.__dict__.update(**{'run_path': original})\n", b"((rp).run_path)('payload.py')\n"),
+        (
+            b"\x00\xffrp.__dict__.update({'other': {'x': print}, 'run_path': original})\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"restore = rp.__dict__.update\n\x00\xffrestore(run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (b"\x00\xffdict.update(rp.__dict__, run_path=original)\n", b"((rp).run_path)('payload.py')\n"),
+        (
+            b"\x00\xffrestore = dict.update\nrestore(rp.__dict__, run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"import builtins\n\x00\xffrestore = builtins.dict.update\nrestore(rp.__dict__, run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"ns = rp.__dict__\n\x00\xffns.update(run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"restore = vars(rp).update\n\x00\xffrestore(run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"\x00\xffns = rp.__dict__\nns.update(run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"\x00\xffrestore = vars(rp).update\nrestore(run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"mod = rp\nns = mod.__dict__\nns.update(run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"mod = rp\nrestore = vars(mod).update\nrestore(run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"mod = rp\nmapping = mod.__dict__\nrestore = mapping.update\nrestore(run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"mod = rp\nmapping = mod.__dict__\nsecond = mapping\nrestore = second.update\n"
+            b"restore(run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"mod = rp\nmapping = mod.__dict__\nrestore = mapping.update\napply = restore\napply(run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (b"\x00\xffrp.__dict__['run_' + 'path'] = original\n", b"((rp).run_path)('payload.py')\n"),
+        (b"\x00\xffrp.__dict__['run' + '_path'] = original\n", b"((rp).run_path)('payload.py')\n"),
+        (
+            b"\x00\xffrp.__dict__[\n    'run' + '_path'\n] = original\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"\x00\xffrp.__dict__.update(\n    **{'run' + '_path': original}\n)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"\x00\xffrp.__dict__.__setitem__('run_' + 'path', original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"if globals().get('enabled'):\n    rp.run_path = original\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"if globals().get('enabled'):\n    restore = dict.update\nrestore(rp.__dict__, run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"class Restore:\n    rp.run_path = original\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"restore = (\n    dict.update\n)\nrestore(rp.__dict__, run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"import builtins\nrestore = getattr(builtins, 'dict').update\nrestore(rp.__dict__, run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\nmapping = builtins.__dict__\n"
+            b"restore = mapping.update\nrestore(dict=real)\n"
+            b"builtins.dict.update(rp.__dict__, run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\n"
+            b"if globals().get('enabled'):\n    mapping = builtins.__dict__\n"
+            b"mapping.update(dict=real)\nbuiltins.dict.update(rp.__dict__, run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"class Restore:\n    restore = dict.update\n    restore(rp.__dict__, run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+        (
+            b"import builtins\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+            b"        pass\nreal = builtins.dict\nbuiltins.dict = Safe\nmapping = builtins.__dict__\n"
+            b"restore = mapping.update\nif globals().get('enabled'):\n    restore = Safe.update\n"
+            b"restore(dict=real)\nbuiltins.dict.update(rp.__dict__, run_path=original)\n",
+            b"((rp).run_path)('payload.py')\n",
+        ),
+    ],
+)
+def test_pytorch_zip_detects_possible_late_runpy_member_restore(
+    tmp_path: Path, late_state: bytes, call_line: bytes
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    payload = (
+        b"\x00\xffimport runpy as rp\noriginal = rp.run_path\nrp.run_path = print\n"
+        + padding
+        + late_state
+        + call_line
+        + padding
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_detects_tail_framed_runpy_member_restore_with_prefix_context(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    filler = b"# filler\n" * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(b"# filler\n") + 1)
+    payload = (
+        b"\x00\xffimport runpy as rp\noriginal = rp.run_path\nrp.run_path = print\n"
+        + filler
+        + b"\x00\xffrp.run_path = original\n\x00\xff((rp).run_path)('payload.py')\n"
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_detects_deep_folded_framed_runpy_getattr_without_recursion(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    member_expression = b" + ".join([b"'run_'", *([b"''"] * 1_000), b"'path'"])
+    payload = (
+        b"\x00\xffimport runpy as rp\n"
+        + padding
+        + b"\x00\xffgetattr(rp, "
+        + member_expression
+        + b")('payload.py')\n"
+        + padding
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_detects_deep_nested_inert_forwarding_suffix_without_recursion(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    nested_literal = b"[" * 1_200 + b"0" + b"]" * 1_200
+    payload = (
+        b"\x00\xffimport runpy as rp\n"
+        + padding
+        + b"runner = rp.run_path; "
+        + nested_literal
+        + b"\n(runner)('payload.py')\n"
+        + padding
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("frame", [b"", b"\x00\xff"])
+def test_pytorch_zip_detects_late_runpy_call_after_unreachable_member_overwrite(tmp_path: Path, frame: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    payload = (
+        b"\x00\xffimport runpy as rp\n"
+        + padding
+        + frame
+        + b"if False:\n    rp.__dict__.update(run_path=print)\n"
+        + b"rp.run_path('payload.py')\n"
+        + padding
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "shadow_state",
+    [
+        b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+        b"dict = Safe\ndict.update(rp.__dict__, run_path=print)\n",
+        b"import builtins as bi\nclass Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n"
+        b"        pass\nbi.dict = Safe\nbuiltins.dict.update(rp.__dict__, run_path=print)\n",
+    ],
+)
+def test_pytorch_zip_ignores_shadowed_dict_update_before_dangerous_runpy_call(
+    tmp_path: Path, shadow_state: bytes
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    payload = b"\x00\xffimport runpy as rp\n" + padding + shadow_state + b"((rp).run_path)('payload.py')\n" + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "call_line",
+    [b"getattr(rp, 'run_path')('safe')\n", b"getattr(\n    rp, 'run_path'\n)('safe')\n"],
+)
+def test_pytorch_zip_ignores_shadowed_getattr_execution_endpoint(tmp_path: Path, call_line: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    payload = b"\x00\xffimport runpy as rp\n" + padding + b"getattr = lambda obj, name: print\n" + call_line + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_preserves_forwarded_late_runpy_class_shadow(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding_line = b"# pad\n"
+    padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
+    payload = (
+        b"\x00\xffimport runpy as rp\n"
+        + padding
+        + b"runner = rp.run_path\nclass runner:\n    pass\nforward = runner\n(forward)('safe')\n"
+        + padding
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scans_parenthesized_runpy_alias_across_retained_boundary(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    leading_blocks = b"".join(
+        f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+        for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+    )
+    import_line = b"from runpy import run_path as runner\n"
+    boundary_padding_length = (
+        jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES - len(import_line) - len(b"(\n")
+    )
+    boundary_padding = b"#" + b"x" * (boundary_padding_length - 2) + b"\n"
+    trailing_padding = b"# pad\n" * (
+        jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8
+    )
+    payload = (
+        b"\x00\xff"
+        + leading_blocks
+        + import_line
+        + boundary_padding
+        + b"(\n runner\n)('payload.py')\n"
+        + trailing_padding
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S108"
+        and "Dynamic module execution detected" in check.message
+        for check in result.checks
+    )
+
+
 def test_pytorch_zip_scans_webbrowser_and_ctypes_execution_in_archive_data(tmp_path: Path) -> None:
     zip_path = tmp_path / "model.pt"
     payload = (
@@ -1631,6 +3178,24 @@ def test_pytorch_zip_ignores_certain_replaced_runpy_execution_in_archive_data(tm
         check.name == "JIT/Script Code Execution Detection"
         and check.status == CheckStatus.FAILED
         and "Dynamic module execution detected" in check.message
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_ignores_framed_runpy_call_inside_multiline_literal(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    payload = b"\x00\xffimport runpy as rp\npayload = '''\n\x00\xff((rp).run_path)('safe')\n'''\n"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S108"
         for check in result.checks
     )
 
