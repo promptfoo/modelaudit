@@ -17,8 +17,7 @@
 ## Routing & Coverage Invariants
 
 - Prefer trusted file structure and bounded content sniffing over extension-only routing, especially for ZIP-like containers and nested archives.
-- Keep scanner routing metadata descriptor-owned in `scanner_registry_metadata.py`; header-format aliases, content-routed extensions, extension-only format policy, and lazy class exports should come from that descriptor module.
-- Keep trusted content routing decisions shared in `scanners/routing.py` so top-level, nested archive, and registry helper flows cannot disagree. Use `can_handle()` as the final gate for suffix-selected candidates; a strict bounded content route may deliberately own a renamed file even when a legacy suffix-only gate declines it.
+- Keep scanner routing metadata descriptor-owned in `scanner_registry_metadata.py`; header-format aliases, content-routed extensions, extension-only format policy, and lazy class exports should come from that descriptor module, with `can_handle()` as the final content gate.
 - Source discovery filters should consume the registry-backed scannable extension set instead of carrying local allowlists.
 - For routing, prefiltering, or archive-recursion changes, add one malicious positive regression and one benign near-match negative regression.
 - If bounded routing cannot distinguish formats safely, preserve the candidate for tentative analysis; reject disproven or optional-analyzer-unsupported candidates cleanly, and report an inconclusive outcome once an established analysis path cannot complete.

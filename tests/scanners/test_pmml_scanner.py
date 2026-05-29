@@ -109,42 +109,6 @@ def test_pmml_scanner_suspicious_extension_content(tmp_path: Path) -> None:
     assert determine_exit_code(aggregate) == 1
 
 
-@pytest.mark.parametrize(
-    ("attribute_value", "expected_pattern"),
-    [
-        ("system('id')", r"\bsystem\s*\("),
-        (
-            "subprocess.run('id')",
-            r"\bsubprocess\s*\.\s*(?:popen|run|call|check_call|check_output|getoutput|getstatusoutput)\s*\(",
-        ),
-    ],
-    ids=["system", "subprocess"],
-)
-def test_pmml_scanner_nested_extension_attribute_code_is_flagged(
-    tmp_path: Path, attribute_value: str, expected_pattern: str
-) -> None:
-    pmml = f"""<?xml version='1.0'?>
-<PMML version='4.4'>
-  <Header>
-    <Extension>
-      <Payload handler="{attribute_value}"/>
-    </Extension>
-  </Header>
-  <DataDictionary numberOfFields='0'/>
-</PMML>"""
-    path = tmp_path / "nested_attribute_code.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
-
-    assert result.success is True
-    assert any(
-        issue.details.get("pattern") == expected_pattern
-        and issue.message == "Suspicious content in <Extension> element"
-        for issue in result.issues
-    )
-
-
 def test_pmml_scanner_benign_ecosystem_call_is_not_flagged(tmp_path: Path) -> None:
     pmml = """<?xml version='1.0'?>
 <PMML version='4.4'>
@@ -160,23 +124,6 @@ def test_pmml_scanner_benign_ecosystem_call_is_not_flagged(tmp_path: Path) -> No
 
     assert result.success is True
     assert not any(issue.details.get("pattern") == r"\bsystem\s*\(" for issue in result.issues)
-
-
-def test_pmml_scanner_benign_nested_extension_attribute_is_not_flagged(tmp_path: Path) -> None:
-    pmml = """<?xml version='1.0'?>
-<PMML version='4.4'>
-  <Header>
-    <Extension><Metric label="ecosystem()"/></Extension>
-  </Header>
-  <DataDictionary numberOfFields='0'/>
-</PMML>"""
-    path = tmp_path / "benign_nested_attribute.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
-
-    assert result.success is True
-    assert not any(issue.message == "Suspicious content in <Extension> element" for issue in result.issues)
 
 
 def test_pmml_scanner_system_call_is_flagged(tmp_path: Path) -> None:

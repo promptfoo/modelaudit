@@ -59,9 +59,21 @@ from .xgboost_scanner import (
 NESTED_SCAN_CALLBACK_CONFIG_KEY = "_archive_nested_scan_callback"
 NestedScanCallback = Callable[[str, dict[str, Any] | None], ScanResult]
 
-# Compatibility export for registry and archive-dispatch tests.
-_HEADER_FORMAT_TO_SCANNER_ID = HEADER_FORMAT_TO_SCANNER_ID
 
+def _build_header_format_to_scanner_id() -> dict[str, str]:
+    metadata = get_scanner_registry_metadata()
+    header_format_to_scanner_id = {scanner_id: scanner_id for scanner_id in metadata}
+    for scanner_id, scanner_info in metadata.items():
+        for header_format in scanner_info.get("header_formats", ()):
+            header_format_to_scanner_id[str(header_format)] = scanner_id
+    return header_format_to_scanner_id
+
+
+_HEADER_FORMAT_TO_SCANNER_ID: dict[str, str] = _build_header_format_to_scanner_id()
+_COMPRESSED_HEADER_FORMATS: frozenset[str] = frozenset(
+    header_format for header_format, scanner_id in _HEADER_FORMAT_TO_SCANNER_ID.items() if scanner_id == "compressed"
+)
+_R_SERIALIZED_EXTENSIONS: frozenset[str] = frozenset({".rds", ".rda", ".rdata"})
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
@@ -165,12 +177,18 @@ def _nested_scanner_can_handle(
     header_format_override: str | None = None,
 ) -> bool:
     """Honor trusted header routing even when temporary archive paths are suffix-gated."""
+    if scanner_class.can_handle(path):
+        return True
+
+    if not os.path.exists(path):
+        return False
+
     try:
         header_format = header_format_override or detect_file_format(path)
     except Exception:
         return False
 
-    return routed_scanner_can_handle(scanner_class, scanner_id, header_format, path)
+    return _is_direct_header_route(scanner_id, header_format)
 
 
 def _make_unavailable_recognized_format_result(path: str, format_: str, scanner_id: str | None) -> ScanResult:

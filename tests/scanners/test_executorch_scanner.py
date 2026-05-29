@@ -68,11 +68,7 @@ def test_executorch_scanner_invalid_zip(tmp_path: Path) -> None:
     scanner = ExecuTorchScanner()
     result = scanner.scan(str(file_path))
     assert not result.success
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "executorch_format_unrecognized" in result.metadata["scan_outcome_reasons"]
     assert any("executorch" in i.message.lower() for i in result.issues)
-    assert not any(i.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for i in result.issues)
-    assert not any(i.rule_code == "S104" for i in result.issues)
 
 
 def test_executorch_scanner_accepts_binary_program_header(tmp_path: Path) -> None:
@@ -241,77 +237,7 @@ def test_executorch_scanner_rejects_invalid_binary_signature_match(tmp_path: Pat
     result = scanner.scan(str(file_path))
 
     assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "executorch_format_unrecognized" in result.metadata["scan_outcome_reasons"]
-    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
-    assert not any(issue.rule_code == "S104" for issue in result.issues)
-
-
-def test_executorch_scanner_marks_corrupt_zip_inconclusive(tmp_path: Path) -> None:
-    file_path = tmp_path / "corrupt.ptl"
-    file_path.write_bytes(b"PKnot a zip")
-
-    result = ExecuTorchScanner().scan(str(file_path))
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "executorch_zip_parse_failed" in result.metadata["scan_outcome_reasons"]
-    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
-
-
-def test_executorch_scanner_marks_unexpected_zip_error_inconclusive(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    file_path = create_executorch_archive(tmp_path)
-
-    def fail_zip_open(*args: object, **kwargs: object) -> None:
-        raise RuntimeError("archive unavailable")
-
-    monkeypatch.setattr(zipfile, "ZipFile", fail_zip_open)
-
-    result = ExecuTorchScanner().scan(str(file_path))
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "executorch_scan_failed" in result.metadata["scan_outcome_reasons"]
-    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
-
-
-def test_invalid_executorch_candidate_is_inconclusive_and_uncached(tmp_path: Path) -> None:
-    file_path = tmp_path / "invalid.ptl"
-    file_path.write_bytes(b"not zip")
-    cache_dir = tmp_path / "cache"
-
-    reset_cache_manager()
-    try:
-        first_result = scan_model_directory_or_file(
-            str(file_path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        second_result = scan_model_directory_or_file(
-            str(file_path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-
-        for audit_result in (first_result, second_result):
-            metadata = audit_result.file_metadata[str(file_path)]
-            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-            assert "executorch_format_unrecognized" in metadata["scan_outcome_reasons"]
-            assert determine_exit_code(audit_result) == 1
-            assert any(
-                "file type validation failed" in issue.message.lower() and issue.severity == IssueSeverity.WARNING
-                for issue in audit_result.issues
-            )
-            assert not any(issue.rule_code == "S104" for issue in audit_result.issues)
-
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+    assert any(issue.rule_code == "S104" for issue in result.issues)
 
 
 def test_executorch_scanner_scans_polyglot_binary_zip_payload(tmp_path: Path) -> None:
@@ -323,10 +249,8 @@ def test_executorch_scanner_scans_polyglot_binary_zip_payload(tmp_path: Path) ->
     result = scanner.scan(str(file_path))
 
     assert any(check.name == "ExecuTorch Binary Format Validation" for check in result.checks)
-    python_issues = [issue for issue in result.issues if issue.rule_code == "S507"]
-    assert len(python_issues) == 1
-    assert python_issues[0].severity == IssueSeverity.CRITICAL
-    assert not any(issue.rule_code == "S104" for issue in result.issues)
+    assert any(issue.rule_code == "S507" for issue in result.issues)
+    assert any(issue.rule_code == "S104" for issue in result.issues)
 
 
 def test_executorch_scanner_scans_stubbed_zip_payload(tmp_path: Path) -> None:

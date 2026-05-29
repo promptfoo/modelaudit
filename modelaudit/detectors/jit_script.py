@@ -10,7 +10,6 @@ Part of ModelAudit's critical security validation suite.
 """
 
 import ast
-import contextlib
 import re
 import textwrap
 from typing import TYPE_CHECKING, Any
@@ -90,10 +89,6 @@ DANGEROUS_BUILTINS = [
     "reload",
     "file",
 ]
-_BUILTIN_NAMESPACE_PREFIXES = ("__builtin__.", "__builtins__.", "builtins.")
-_JIT_DANGEROUS_BUILTIN_CALL_NAMES = frozenset(DANGEROUS_BUILTINS).union(
-    f"{prefix}{builtin}" for prefix in _BUILTIN_NAMESPACE_PREFIXES for builtin in DANGEROUS_BUILTINS
-)
 
 # Dangerous module imports
 DANGEROUS_IMPORTS = [
@@ -284,6 +279,8 @@ def _decode_utf8_with_byte_offsets(data: bytes) -> tuple[str, list[int]]:
 _SUBPROCESS_CODE_EXECUTION_DESCRIPTION = "Subprocess execution detected"
 _OS_CODE_EXECUTION_DESCRIPTION = "OS command execution detected"
 _RUNPY_CODE_EXECUTION_DESCRIPTION = "Dynamic module execution detected"
+_WEBBROWSER_LAUNCH_DESCRIPTION = "Web browser launch detected"
+_CTYPES_NATIVE_LOADING_DESCRIPTION = "Native library loading detected"
 CODE_EXECUTION_PATTERNS = [
     # Direct execution patterns
     (rb"exec\s*\(", "exec() call detected"),
@@ -298,6 +295,11 @@ CODE_EXECUTION_PATTERNS = [
     ),
     (rb"os\.(system|popen|exec\w*|spawn\w*|posix_spawnp?|startfile)", _OS_CODE_EXECUTION_DESCRIPTION),
     (rb"runpy\.(?:_run_module_as_main|run_module|run_path)", _RUNPY_CODE_EXECUTION_DESCRIPTION),
+    (rb"webbrowser\.(?:get|open|open_new|open_new_tab)", _WEBBROWSER_LAUNCH_DESCRIPTION),
+    (
+        rb"ctypes\.(?:CDLL|OleDLL|PyDLL|WinDLL|LibraryLoader|cdll|oledll|pydll|windll)",
+        _CTYPES_NATIVE_LOADING_DESCRIPTION,
+    ),
     # Network patterns
     (rb"socket\.(socket|create_connection)", "Socket creation detected"),
     (rb"urllib\.(request|urlopen)", "URL request detected"),
@@ -309,13 +311,6 @@ CODE_EXECUTION_PATTERNS = [
     (rb"lambda\s+.*:\s*exec", "Lambda with exec detected"),
     (rb"type\s*\(\s*['\"].*['\"],.*exec", "Dynamic type creation with exec"),
 ]
-_BUILTIN_CODE_EXECUTION_PATTERN_NAMES = {
-    "exec() call detected": "exec",
-    "eval() call detected": "eval",
-    "compile() call detected": "compile",
-    "__import__() call detected": "__import__",
-    "File write operation detected": "open",
-}
 
 
 class JITScriptDetector:
@@ -401,6 +396,9 @@ class JITScriptDetector:
                 if node.module and is_dangerous_import(node.module):
                     return True
             elif isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id in DANGEROUS_BUILTINS:
+                    return True
+
                 operation = dotted_name(node.func)
                 if operation is None:
                     continue
@@ -413,6 +411,10 @@ class JITScriptDetector:
                     "requests.post",
                     "requests.put",
                     "requests.delete",
+                    "subprocess.call",
+                    "subprocess.run",
+                    "subprocess.Popen",
+                    "subprocess.check_output",
                 }:
                     return True
         return False
@@ -424,15 +426,12 @@ class JITScriptDetector:
         import_pattern, from_pattern = patterns or _compile_dangerous_import_patterns(dangerous_import)
         return import_pattern.search(source) is not None or from_pattern.search(source) is not None
 
-    def scan_torchscript(
-        self, data: bytes, context: str = "", *, scan_embedded_python: bool = True
-    ) -> list["JITScriptFinding"]:
+    def scan_torchscript(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Scan TorchScript model data for dangerous operations.
 
         Args:
             data: Binary model data
             context: Context string for reporting
-            scan_embedded_python: Whether to inspect embedded Python snippets in this pass.
 
         Returns:
             List of findings with details
@@ -486,7 +485,7 @@ class JITScriptDetector:
         # Look for embedded Python code even when framework markers are absent.
         # Scanner callers can hand us raw code-bearing blobs, and an attacker can
         # remove marker strings without removing the executable payload.
-        if scan_embedded_python and (b"def " in data or b"class " in data):
+        if b"def " in data or b"class " in data:
             code_findings = self._extract_and_check_python_code(data, "TorchScript", context)
             findings.extend(code_findings)
 
@@ -511,15 +510,12 @@ class JITScriptDetector:
 
         return findings
 
-    def scan_tensorflow(
-        self, data: bytes, context: str = "", *, scan_embedded_python: bool = True
-    ) -> list["JITScriptFinding"]:
+    def scan_tensorflow(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Scan TensorFlow SavedModel for dangerous operations.
 
         Args:
             data: Binary model data or protobuf
             context: Context string for reporting
-            scan_embedded_python: Whether to inspect embedded Python snippets in this pass.
 
         Returns:
             List of findings with details
@@ -573,7 +569,7 @@ class JITScriptDetector:
                 )
 
             # Check for embedded Python code in SavedFunction
-            if scan_embedded_python and (b"python_function" in data or b"function_spec" in data):
+            if b"python_function" in data or b"function_spec" in data:
                 code_findings = self._extract_and_check_python_code(data, "TensorFlow", context)
                 findings.extend(code_findings)
 
@@ -750,28 +746,24 @@ class JITScriptDetector:
                         )
 
                 # Check for dangerous builtins
-                dangerous_builtins = (
-                    _resolve_alias_aware_dangerous_builtins(tree)
-                    if tree is not None
-                    else {builtin for builtin in DANGEROUS_BUILTINS if builtin in code_str}
-                )
-                for builtin in sorted(dangerous_builtins):
-                    findings.append(
-                        create_jit_finding(
-                            message=f"Dangerous builtin '{builtin}' used in embedded code",
-                            severity="CRITICAL",
-                            context=context,
-                            pattern=None,
-                            recommendation=f"Remove {builtin} usage - it can execute arbitrary code",
-                            confidence=0.9,
-                            framework=framework,
-                            code_snippet=code_str[:200],
-                            type="dangerous_builtin",
-                            operation=None,
-                            builtin=builtin,
-                            import_=None,
+                for builtin in DANGEROUS_BUILTINS:
+                    if builtin in code_str:
+                        findings.append(
+                            create_jit_finding(
+                                message=f"Dangerous builtin '{builtin}' used in embedded code",
+                                severity="CRITICAL",
+                                context=context,
+                                pattern=None,
+                                recommendation=f"Remove {builtin} usage - it can execute arbitrary code",
+                                confidence=0.9,
+                                framework=framework,
+                                code_snippet=code_str[:200],
+                                type="dangerous_builtin",
+                                operation=None,
+                                builtin=builtin,
+                                import_=None,
+                            )
                         )
-                    )
 
                 # Use the parsed source, including a completed same-line candidate when applicable.
                 if parsed_snippet is not None:
@@ -785,38 +777,6 @@ class JITScriptDetector:
             except Exception:
                 # Failed to process this code snippet
                 continue
-
-        if saw_snippet_ast:
-            if bounded_os_process_calls is None:
-                bounded_os_process_calls = snippet_os_process_calls
-            if bounded_subprocess_calls is None:
-                bounded_subprocess_calls = snippet_subprocess_calls
-            if bounded_pty_process_calls is None:
-                bounded_pty_process_calls = snippet_pty_process_calls
-            if bounded_runpy_execution_calls is None:
-                bounded_runpy_execution_calls = snippet_runpy_execution_calls
-            if bounded_webbrowser_launch_calls is None:
-                bounded_webbrowser_launch_calls = snippet_webbrowser_launch_calls
-            if bounded_ctypes_native_loading_calls is None:
-                bounded_ctypes_native_loading_calls = snippet_ctypes_native_loading_calls
-
-        def add_code_execution_pattern_finding(description: str) -> None:
-            findings.append(
-                create_jit_finding(
-                    message=description,
-                    severity="CRITICAL",
-                    context=context,
-                    pattern=description,
-                    recommendation="This pattern indicates potential code execution - review carefully",
-                    confidence=0.8,
-                    framework=framework,
-                    code_snippet=None,
-                    type="code_execution_pattern",
-                    operation=None,
-                    builtin=None,
-                    import_=None,
-                )
-            )
 
         # Check for common code execution patterns in binary
         resolved_high_risk_calls = (bounded_high_risk_calls or set()) | snippet_high_risk_calls
@@ -841,6 +801,18 @@ class JITScriptDetector:
             if description == _RUNPY_CODE_EXECUTION_DESCRIPTION:
                 resolved_runpy_call = any(code == "S108" for _, code in resolved_high_risk_calls)
                 if resolved_runpy_call:
+                    pattern_match = True
+                elif bounded_high_risk_calls is not None or raw_match_only_in_parsed_snippets:
+                    continue
+            if description == _WEBBROWSER_LAUNCH_DESCRIPTION:
+                resolved_webbrowser_call = any(code == "S109" for _, code in resolved_high_risk_calls)
+                if resolved_webbrowser_call:
+                    pattern_match = True
+                elif bounded_high_risk_calls is not None or raw_match_only_in_parsed_snippets:
+                    continue
+            if description == _CTYPES_NATIVE_LOADING_DESCRIPTION:
+                resolved_ctypes_call = any(code == "S110" for _, code in resolved_high_risk_calls)
+                if resolved_ctypes_call:
                     pattern_match = True
                 elif bounded_high_risk_calls is not None or raw_match_only_in_parsed_snippets:
                     continue
@@ -925,34 +897,29 @@ class JITScriptDetector:
                 self.generic_visit(node)
 
             def visit_Call(self, node: ast.Call) -> None:
+                # Check for dangerous function calls
+                if isinstance(node.func, ast.Name) and node.func.id in DANGEROUS_BUILTINS:
+                    self.findings.append(
+                        create_jit_finding(
+                            message=f"AST analysis: Dangerous function call '{node.func.id}'",
+                            severity="CRITICAL",
+                            context=context,
+                            pattern=None,
+                            recommendation="Remove dangerous function calls to prevent code execution",
+                            confidence=0.9,
+                            framework=framework,
+                            code_snippet=None,
+                            type="ast_dangerous_call",
+                            operation=None,
+                            builtin=node.func.id,
+                            import_=None,
+                        )
+                    )
                 self.generic_visit(node)
 
         visitor = DangerousNodeVisitor()
         visitor.visit(tree)
         findings.extend(visitor.findings)
-
-        reported_builtins = {
-            finding.builtin
-            for finding in findings
-            if finding.type == "ast_dangerous_call" and finding.builtin is not None
-        }
-        for dangerous_builtin in sorted(_resolve_alias_aware_dangerous_builtins(tree) - reported_builtins):
-            findings.append(
-                create_jit_finding(
-                    message=f"AST analysis: Dangerous function call '{dangerous_builtin}'",
-                    severity="CRITICAL",
-                    context=context,
-                    pattern=None,
-                    recommendation="Remove dangerous function calls to prevent code execution",
-                    confidence=0.9,
-                    framework=framework,
-                    code_snippet=None,
-                    type="ast_dangerous_call",
-                    operation=None,
-                    builtin=dangerous_builtin,
-                    import_=None,
-                )
-            )
 
         return findings
 
@@ -1208,20 +1175,18 @@ class JITScriptDetector:
             elif b"onnx" in data or b"ai.onnx" in data:
                 model_type = "onnx"
 
-        dangerous_python_source = self._looks_like_dangerous_python_source(data)
-
         # Scan based on model type
         if model_type in ["pytorch", "torchscript"]:
-            findings.extend(self.scan_torchscript(data, context, scan_embedded_python=not dangerous_python_source))
+            findings.extend(self.scan_torchscript(data, context))
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
 
         if model_type in ["tensorflow", "tf", "keras"]:
-            findings.extend(self.scan_tensorflow(data, context, scan_embedded_python=not dangerous_python_source))
+            findings.extend(self.scan_tensorflow(data, context))
 
         if model_type == "onnx":
             findings.extend(self.scan_onnx(data, context))
 
-        if model_type == "pickle" and not dangerous_python_source and (b"def " in data or b"class " in data):
+        if model_type == "pickle" and (b"def " in data or b"class " in data):
             findings.extend(self._extract_and_check_python_code(data, "Generic Python", context))
 
         # Always check for generic dangerous patterns
@@ -1230,12 +1195,12 @@ class JITScriptDetector:
         # because that causes false positives (e.g. TorchScript patterns matching ONNX metadata)
         if model_type == "unknown":
             # Check all frameworks if type is unknown
-            findings.extend(self.scan_torchscript(data, context, scan_embedded_python=not dangerous_python_source))
+            findings.extend(self.scan_torchscript(data, context))
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
-            findings.extend(self.scan_tensorflow(data, context, scan_embedded_python=not dangerous_python_source))
+            findings.extend(self.scan_tensorflow(data, context))
             findings.extend(self.scan_onnx(data, context))
 
-        if dangerous_python_source:
+        if self._looks_like_dangerous_python_source(data):
             findings.extend(
                 self._extract_and_check_python_code(
                     data,

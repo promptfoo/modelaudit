@@ -100,7 +100,7 @@ def test_can_handle_rejects_renamed_lightgbm_near_match(tmp_path: Path) -> None:
 
 
 def test_can_handle_rejects_xgboost_like_model_content(tmp_path: Path) -> None:
-    path = tmp_path / "xgb.jpg"
+    path = tmp_path / "xgb.model"
     path.write_text('{"learner":{"gradient_booster":{"name":"gbtree","tree_param":{}}}}', encoding="utf-8")
 
     assert not LightGBMScanner.can_handle(str(path))

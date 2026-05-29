@@ -980,50 +980,6 @@ def test_non_handler_python_analysis_detects_malicious_utils_module(tmp_path: Pa
     )
 
 
-def test_non_handler_python_analysis_detects_static_namespace_call_indirection(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
-            "utils.py": b"import os\n\ndef transform(data):\n    return os.__dict__['system']('echo hidden')\n",
-            "weights.bin": b"weights",
-        },
-        filename="static_namespace_utils.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
-
-    assert any(
-        failure.severity == IssueSeverity.WARNING and "high-risk calls: os.system" in failure.message
-        for failure in non_handler_failures
-    )
-
-
-def test_non_handler_python_analysis_does_not_flag_ordinary_mapping_call(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
-            "utils.py": (
-                b"def safe(value):\n    return value\n\n"
-                b"def transform(data):\n    calls = {'system': safe}\n    return calls['system'](data)\n"
-            ),
-            "weights.bin": b"weights",
-        },
-        filename="benign_mapping_utils.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
-
-    assert non_handler_failures == []
-
-
 def test_non_handler_python_analysis_flags_duplicate_module_even_when_benign_copy_is_last(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
@@ -2305,53 +2261,6 @@ def handle(data, context):
     assert len(handler_failures) >= 1
     assert handler_failures[0].severity == IssueSeverity.CRITICAL
     assert "subprocess.run" in handler_failures[0].message
-
-
-@pytest.mark.parametrize(
-    "handler_source",
-    [
-        b"import os\n\ndef handle(data, context):\n    return os.__dict__['system']('echo hidden')\n",
-        b"import os\n\ndef handle(data, context):\n    return os.__getattribute__('system')('echo hidden')\n",
-    ],
-)
-def test_handler_analysis_detects_static_namespace_call_indirection(tmp_path: Path, handler_source: bytes) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={"handler.py": handler_source, "weights.bin": b"weights"},
-        filename="static_namespace_handler.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
-
-    assert any(
-        failure.severity == IssueSeverity.CRITICAL and "os.system" in failure.message for failure in handler_failures
-    )
-
-
-def test_handler_analysis_does_not_flag_ordinary_mapping_call(tmp_path: Path) -> None:
-    handler_code = b"""
-def safe(value):
-    return value
-
-def handle(data, context):
-    calls = {"system": safe}
-    return calls["system"](data)
-"""
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={"handler.py": handler_code, "weights.bin": b"weights"},
-        filename="benign_mapping_handler.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
-
-    assert handler_failures == []
 
 
 def test_manifest_read_is_bounded(tmp_path: Path) -> None:

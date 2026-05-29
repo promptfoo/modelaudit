@@ -59,7 +59,6 @@ STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset(
     }
 )
 ONNX_STRUCTURE_INCONCLUSIVE_REASON = "onnx_structure_validation_failed"
-ONNX_PARSE_INCONCLUSIVE_REASON = "onnx_model_parse_failed"
 ONNX_RAW_DETECTION_INCONCLUSIVE_REASON = "onnx_raw_detection_analysis_incomplete"
 ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
 ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON = "onnx_tentative_candidate_analysis_unavailable"
@@ -468,17 +467,11 @@ class OnnxScanner(BaseScanner):
                 name="ONNX Model Parsing",
                 passed=False,
                 message=f"Error parsing ONNX model: {e}",
-                severity=IssueSeverity.INFO,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={
-                    "exception": str(e),
-                    "exception_type": type(e).__name__,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": ONNX_PARSE_INCONCLUSIVE_REASON,
-                },
-                rule_code="S902",
+                details={"exception": str(e), "exception_type": type(e).__name__},
             )
-            _finish_scan_result(result)
+            result.finish(success=False)
             return result
 
         has_graph = model.HasField("graph")

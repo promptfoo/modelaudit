@@ -424,10 +424,10 @@ class SkopsScanner(BaseScanner):
 
     def _check_unsafe_joblib_fallback(self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str) -> None:
         """Check for unsafe joblib fallback patterns in skops files."""
-        # Plain sklearn references are normal in schemas and model-card prose;
-        # require an explicit deserialization marker for fallback evidence.
+        # Scan all files for joblib deserialization patterns
         joblib_patterns = [
             b"joblib.load",
+            b"sklearn",
             b"pickle.load",
             b"_pickle",
         ]
@@ -435,11 +435,18 @@ class SkopsScanner(BaseScanner):
         files_with_joblib = []
 
         for file_info in zip_file.filelist:
+            is_metadata = self._is_skops_metadata(file_info.filename)
+
             with suppress(Exception):
                 content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
                 if content is None:
                     continue
                 for pattern in joblib_patterns:
+                    # Only suppress the broad `sklearn` heuristic for metadata
+                    # files; explicit signals like `joblib.load` / `pickle.load`
+                    # must still be reported even inside schema.json.
+                    if is_metadata and pattern == b"sklearn":
+                        continue
                     if pattern in content:
                         files_with_joblib.append(
                             {

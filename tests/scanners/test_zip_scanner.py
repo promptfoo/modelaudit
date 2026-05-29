@@ -273,483 +273,6 @@ def test_scan_zip_flags_aliased_dangerous_python_member(tmp_path: Path) -> None:
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 
-@pytest.mark.parametrize(
-    "dangerous_name",
-    [
-        "os.execl",
-        "os.execle",
-        "os.execlp",
-        "os.execlpe",
-        "os.execv",
-        "os.execve",
-        "os.execvp",
-        "os.execvpe",
-        "os.posix_spawn",
-        "os.posix_spawnp",
-        "os.spawnl",
-        "os.spawnle",
-        "os.spawnlp",
-        "os.spawnlpe",
-        "os.spawnv",
-        "os.spawnve",
-        "os.spawnvp",
-        "os.spawnvpe",
-        "os.startfile",
-    ],
-)
-def test_scan_zip_flags_os_process_launch_python_member(tmp_path: Path, dangerous_name: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", f"import os\n{dangerous_name}('payload')\n")
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S101"
-    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
-
-
-def test_scan_zip_flags_aliased_os_process_launch_python_member(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", "from os import spawnv as run\nrun(0, '/bin/sh', ['sh', '-c', 'id'])\n")
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S101"
-    assert python_checks[0].details["reason"] == "high-risk calls: os.spawnv"
-
-
-@pytest.mark.parametrize(
-    ("source", "dangerous_name"),
-    [
-        (
-            "import asyncio\nasyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
-            "asyncio.create_subprocess_exec",
-        ),
-        (
-            "from asyncio import create_subprocess_shell as run\nrun('id')\n",
-            "asyncio.create_subprocess_shell",
-        ),
-    ],
-)
-def test_scan_zip_flags_asyncio_process_launch_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S103"
-    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
-
-
-def test_scan_zip_preserves_possible_asyncio_launch_after_conditional_overwrite(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    source = (
-        "import asyncio\nif replace:\n    asyncio.create_subprocess_shell = len\n"
-        "asyncio.create_subprocess_shell('id')\n"
-    )
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S103"
-    assert python_checks[0].details["reason"] == "high-risk calls: asyncio.create_subprocess_shell"
-
-
-@pytest.mark.parametrize(
-    ("source", "dangerous_name"),
-    [
-        ("import pty\npty.spawn('/bin/sh')\n", "pty.spawn"),
-        ("from pty import spawn as run\nrun('/bin/sh')\n", "pty.spawn"),
-    ],
-)
-def test_scan_zip_flags_pty_process_launch_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S111"
-    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
-
-
-def test_scan_zip_preserves_possible_pty_launch_after_conditional_overwrite(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    source = "import pty\nif replace:\n    pty.spawn = len\npty.spawn('/bin/sh')\n"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S111"
-    assert python_checks[0].details["reason"] == "high-risk calls: pty.spawn"
-
-
-@pytest.mark.parametrize(
-    ("source", "dangerous_name"),
-    [
-        ("import runpy\nrunpy.run_module('payload')\n", "runpy.run_module"),
-        ("from runpy import run_path as run\nrun('payload.py')\n", "runpy.run_path"),
-    ],
-)
-def test_scan_zip_flags_runpy_execution_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S108"
-    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
-
-
-def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    source = "import runpy\nif replace:\n    runpy.run_path = len\nrunpy.run_path('payload.py')\n"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S108"
-    assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
-
-
-@pytest.mark.parametrize(
-    ("source", "dangerous_name"),
-    [
-        ("import webbrowser\nwebbrowser.open('https://evil.example')\n", "webbrowser.open"),
-        ("from webbrowser import open_new as launch\nlaunch('https://evil.example')\n", "webbrowser.open_new"),
-        ("import webbrowser\nwebbrowser.open_new_tab('https://evil.example')\n", "webbrowser.open_new_tab"),
-        ("import webbrowser\nwebbrowser.get().open('https://evil.example')\n", "webbrowser.open"),
-        ("import webbrowser\ngetattr(webbrowser, 'get')().open('https://evil.example')\n", "webbrowser.open"),
-        ("from webbrowser import *\nget().open('https://evil.example')\n", "webbrowser.open"),
-        (
-            "import webbrowser\ncontroller = webbrowser.get()\ncontroller.open_new_tab('https://evil.example')\n",
-            "webbrowser.open_new_tab",
-        ),
-    ],
-)
-def test_scan_zip_flags_webbrowser_launch_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S109"
-    assert python_checks[0].severity == IssueSeverity.CRITICAL
-    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
-
-
-def test_scan_zip_preserves_possible_webbrowser_launch_after_conditional_overwrite(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    source = "import webbrowser\nif replace:\n    webbrowser.open = len\nwebbrowser.open('https://evil.example')\n"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S109"
-    assert python_checks[0].details["reason"] == "high-risk calls: webbrowser.open"
-
-
-@pytest.mark.parametrize(
-    ("source", "dangerous_name"),
-    [
-        ("import ctypes\nctypes.CDLL('./payload.so')\n", "ctypes.CDLL"),
-        ("import ctypes\nctypes.OleDLL('payload.dll')\n", "ctypes.OleDLL"),
-        ("import ctypes\nctypes.PyDLL('./payload.so')\n", "ctypes.PyDLL"),
-        ("import ctypes\nctypes.WinDLL('payload.dll')\n", "ctypes.WinDLL"),
-        ("import ctypes\nctypes.cdll.LoadLibrary('./payload.so')\n", "ctypes.cdll.LoadLibrary"),
-        ("import ctypes\nctypes.oledll.LoadLibrary('payload.dll')\n", "ctypes.oledll.LoadLibrary"),
-        ("import ctypes\nctypes.pydll.LoadLibrary('./payload.so')\n", "ctypes.pydll.LoadLibrary"),
-        ("import ctypes\nctypes.windll.LoadLibrary('payload.dll')\n", "ctypes.windll.LoadLibrary"),
-        ("from ctypes import CDLL as load\nload('./payload.so')\n", "ctypes.CDLL"),
-        (
-            "import ctypes\nctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('./payload.so')\n",
-            "ctypes.cdll.LoadLibrary",
-        ),
-        (
-            "import ctypes\nctypes.LibraryLoader(ctypes.CDLL).msvcrt.printf(b'hi')\n",
-            "ctypes.cdll.msvcrt",
-        ),
-        (
-            "import ctypes\nloader = ctypes.CDLL\nctypes.LibraryLoader(loader).msvcrt.printf(b'hi')\n",
-            "ctypes.cdll.msvcrt",
-        ),
-        ("import ctypes\nctypes.cdll.msvcrt.printf(b'hi')\n", "ctypes.cdll.msvcrt"),
-        ("import ctypes\ngetattr(ctypes, 'cdll').msvcrt.printf(b'hi')\n", "ctypes.cdll.msvcrt"),
-        ("import ctypes\nctypes.cdll.__getattr__('msvcrt').printf(b'hi')\n", "ctypes.cdll.msvcrt"),
-        ("import ctypes\nctypes.cdll.msvcrt.foo = 1\n", "ctypes.cdll.msvcrt"),
-        ("import _ctypes\n_ctypes.dlopen('libc.so.6')\n", "_ctypes.dlopen"),
-        ("import ctypes\nctypes._dlopen('./payload.so')\n", "ctypes._dlopen"),
-    ],
-)
-def test_scan_zip_flags_ctypes_native_loading_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S110"
-    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
-
-
-def test_scan_zip_preserves_possible_ctypes_native_loading_after_conditional_overwrite(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    source = "import ctypes\nif replace:\n    ctypes.CDLL = len\nctypes.CDLL('./payload.so')\n"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S110"
-    assert python_checks[0].details["reason"] == "high-risk calls: ctypes.CDLL"
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "import os\nos.system.__call__('echo hidden')\n",
-        "import os\nrun = os.system\nrun.__call__('echo hidden')\n",
-        "import os\ngetattr(os.system, '__call__')('echo hidden')\n",
-        "import os\ninvoke = os.system.__call__\nos.system = len\ninvoke('echo hidden')\n",
-        "import os\nrun = os.system\nos.system = len\nrun('echo hidden')\n",
-        "import os\nfrom os import system as run\nos.system = len\nrun('echo hidden')\n",
-        "import os\nfrom os import *\nos.system = len\nsystem('echo hidden')\n",
-        ("import os\ndef run(action=os.system):\n    os.system = len\n    action('echo hidden')\n"),
-        "import os\nrun = os.system\nsetattr(os, 'system', len)\nrun('echo hidden')\n",
-        "import os\nrun = os.system\nos.__dict__.update({'system': len})\nrun('echo hidden')\n",
-        (
-            "import os\n"
-            "replace = os.__dict__.update\n"
-            "replace = lambda values: None\n"
-            "replace({'system': len})\n"
-            "os.system('echo hidden')\n"
-        ),
-        "import os\nif replace:\n    os.__dict__.update({'system': len})\nos.system('echo hidden')\n",
-        "import os\nif swap:\n    os = make_module()\nos.__dict__.update({'system': len})\nos.system('echo hidden')\n",
-        "import os\nif swap:\n    os = make_module()\nsetattr(os, 'system', len)\nos.system('echo hidden')\n",
-        "import os\nif swap:\n    os = make_module()\nos.system = len\nos.system('echo hidden')\n",
-        (
-            "import os\nif swap:\n    os = make_module()\ntarget = os\n"
-            "target.__dict__.update({'system': len})\nos.system('echo hidden')\n"
-        ),
-        (
-            "import os\nif swap:\n    os = make_module()\ntarget = os\n"
-            "setattr(target, 'system', len)\nos.system('echo hidden')\n"
-        ),
-        ("import os\nif swap:\n    os = make_module()\ntarget = os\ntarget.system = len\nos.system('echo hidden')\n"),
-        (
-            "import os\ndef hide(target=os):\n"
-            "    target.__dict__.update({'system': len})\n"
-            "    os.system('echo hidden')\n"
-        ),
-        (
-            "import os\nresolve = getattr\nif swap:\n    resolve = make_resolver()\n"
-            "resolve(os, '__dict__').update({'system': len})\nos.system('echo hidden')\n"
-        ),
-        (
-            "import os\nnamespace = os.__dict__\nif swap:\n    namespace = make_mapping()\n"
-            "namespace.update({'system': len})\nos.system('echo hidden')\n"
-        ),
-        (
-            "import os\ndef hide(namespace=os.__dict__):\n"
-            "    namespace.update({'system': len})\n"
-            "    os.system('echo hidden')\n"
-        ),
-        (
-            "import os\nreplace = dict.update\nif swap:\n    replace = lambda target, values: None\n"
-            "replace(os.__dict__, {'system': len})\nos.system('echo hidden')\n"
-        ),
-        (
-            "import os\ndef hide(namespace=os.__dict__):\n"
-            "    dict.update(namespace, {'system': len})\n"
-            "    os.system('echo hidden')\n"
-        ),
-        "import os\nrun = os.__dict__.pop('system')\nrun('echo hidden')\n",
-        "import os\nif remove:\n    os.__dict__.pop('system')\nos.system('echo hidden')\n",
-        "import os\nif remove:\n    del os.__dict__['system']\nos.system('echo hidden')\n",
-        "import os\nif remove:\n    os.__dict__.__delitem__('system')\nos.system('echo hidden')\n",
-        (
-            "import os\nimport operator\nif remove:\n"
-            "    operator.delitem(os.__dict__, 'system')\nos.system('echo hidden')\n"
-        ),
-        "import os\nrun = os.system\nos.__dict__.clear()\nrun('echo hidden')\n",
-        "import os\nif remove:\n    os.__dict__.clear()\nos.system('echo hidden')\n",
-        "import os\nif swap:\n    os = make_module()\nos.__dict__.clear()\nos.system('echo hidden')\n",
-        ("import os\ndef hide(target=os):\n    setattr(target, 'system', len)\n    os.system('echo hidden')\n"),
-        ("import os\ndef hide(target=os):\n    target.system = len\n    os.system('echo hidden')\n"),
-        (
-            "import os\n"
-            "setattr = lambda target, key, value: None\n"
-            "setattr(os, 'system', len)\n"
-            "os.system('echo hidden')\n"
-        ),
-    ],
-)
-def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_path: Path, source: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].details["reason"] == "high-risk calls: os.system"
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "import os\nos.system = len\nos.system.__call__([])\n",
-        "import os\nos.system = len\ngetattr(os.system, '__call__')([])\n",
-        "import os\nos.system = len\ninvoke = os.system.__call__\ninvoke([])\n",
-        "import os\nos.system = len\nrun = os.system\nrun([])\n",
-        "import os\nos.system = len\nfrom os import system as run\nrun([])\n",
-        "import os\nos.system = len\nfrom os import *\nsystem([])\n",
-        ("import os\nos.system = len\ndef run(action=os.system):\n    action([])\n"),
-        "import os\nsetattr(os, 'system', len)\nos.system([])\n",
-        "import os\nreplace = setattr\nreplace(os, 'system', len)\nos.system([])\n",
-        "import os\nresult = setattr(os, 'system', len)\nos.system([])\n",
-        "import os\nresult: None = setattr(os, 'system', len)\nos.system([])\n",
-        "import os\nsetattr(os, 'system', len)\nrun = os.system\nrun([])\n",
-        "import os\nos.__dict__.__setitem__('system', len)\nos.system([])\n",
-        "import os\nos.__dict__.update({'system': len})\nos.system([])\n",
-        "import os\nvars(os).update({'system': len})\nos.system([])\n",
-        "import os\nreplace = os.__dict__.update\nreplace({'system': len})\nos.system([])\n",
-        "import os\nresult = os.__dict__.update({'system': len})\nos.system([])\n",
-        "import os\nos.__dict__.update({'system': len})\nrun = os.system\nrun([])\n",
-        "import os\ngetattr(os, '__dict__').update({'system': len})\nos.system([])\n",
-        "import os\nos.__getattribute__('__dict__').update({'system': len})\nos.system([])\n",
-        "import os\nobject.__getattribute__(os, '__dict__').update({'system': len})\nos.system([])\n",
-        "import os\nnamespace = os.__dict__\nnamespace.update({'system': len})\nos.system([])\n",
-        "import os\nnamespace = getattr(os, '__dict__')\nnamespace.update({'system': len})\nos.system([])\n",
-        "import os\nreplace = getattr(os, '__dict__').update\nreplace({'system': len})\nos.system([])\n",
-        "import os\ndict.update(os.__dict__, {'system': len})\nos.system([])\n",
-        "import os\ndict.__setitem__(os.__dict__, 'system', len)\nos.system([])\n",
-        "import os\nimport operator\noperator.setitem(os.__dict__, 'system', len)\nos.system([])\n",
-        "import os\nfrom operator import setitem as replace\nreplace(os.__dict__, 'system', len)\nos.system([])\n",
-        "import os\nos.__dict__.pop('system')\nos.system([])\n",
-        "import os\nremove = os.__dict__.pop\nremove('system')\nos.system([])\n",
-        "import os\ndict.pop(os.__dict__, 'system')\nos.system([])\n",
-        "import os\ndel os.__dict__['system']\nos.system([])\n",
-        "import os\ndel os.system\nos.system([])\n",
-        "import os\nos.__dict__.__delitem__('system')\nos.system([])\n",
-        "import os\nremove = os.__dict__.__delitem__\nremove('system')\nos.system([])\n",
-        "import os\ndict.__delitem__(os.__dict__, 'system')\nos.system([])\n",
-        "import os\nimport operator\noperator.delitem(os.__dict__, 'system')\nos.system([])\n",
-        "import os\nos.__dict__.clear()\nos.system([])\n",
-        "import os\nvars(os).clear()\nos.system([])\n",
-        "import os\nclear = os.__dict__.clear\nclear()\nos.system([])\n",
-        "import os\ndict.clear(os.__dict__)\nos.system([])\n",
-        "import subprocess\nsubprocess.__dict__.update({'run': len})\nsubprocess.run([])\n",
-        "import subprocess\nsubprocess.__dict__.pop('run')\nsubprocess.run([])\n",
-        "import subprocess\nsubprocess.__dict__.clear()\nsubprocess.run([])\n",
-        "import os\nos.execvpe = len\nos.execvpe([])\n",
-        "import os\nos.__dict__.update({'spawnv': len})\nos.spawnv([])\n",
-        "import os\nsetattr(os, 'posix_spawn', len)\nos.posix_spawn([])\n",
-        "import asyncio\nasyncio.create_subprocess_shell = len\nasyncio.create_subprocess_shell([])\n",
-        "import pty\npty.spawn = len\npty.spawn([])\n",
-        "import runpy\nrunpy.run_path = len\nrunpy.run_path([])\n",
-        "import webbrowser\nwebbrowser.open = len\nwebbrowser.open([])\n",
-        "import ctypes\nctypes.CDLL = len\nctypes.CDLL([])\n",
-        "import ctypes\nctypes.cdll.LoadLibrary = len\nctypes.cdll.LoadLibrary([])\n",
-        "import ctypes\nctypes.cdll.msvcrt = len\nctypes.cdll.msvcrt([])\n",
-    ],
-)
-def test_scan_zip_allows_callable_captured_after_safe_overwrite(tmp_path: Path, source: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    assert not any(check.name == "Python Archive Member Security" for check in result.checks)
-
-
 def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -765,94 +288,6 @@ def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> N
     assert len(python_checks) == 1
     assert python_checks[0].severity == IssueSeverity.WARNING
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "import os\nimport subprocess\nsetattr(os, 'system', subprocess.run)\nos.system(['id'])\n",
-        "import os\nimport subprocess\nresult = setattr(os, 'system', subprocess.run)\nos.system(['id'])\n",
-        "import os\nimport subprocess\nos.__dict__.update({'system': subprocess.run})\nos.system(['id'])\n",
-        "import os\nimport subprocess\nos.__dict__.__setitem__('system', subprocess.run)\nos.system(['id'])\n",
-        "import os\nimport subprocess\ngetattr(os, '__dict__').update({'system': subprocess.run})\nos.system(['id'])\n",
-        (
-            "import os\nimport subprocess\nnamespace = os.__dict__\n"
-            "namespace.update({'system': subprocess.run})\nos.system(['id'])\n"
-        ),
-        "import os\nimport subprocess\ndict.update(os.__dict__, {'system': subprocess.run})\nos.system(['id'])\n",
-        (
-            "import os\nimport operator\nimport subprocess\n"
-            "operator.setitem(os.__dict__, 'system', subprocess.run)\nos.system(['id'])\n"
-        ),
-        (
-            "import os\nimport subprocess\nos.__dict__.clear()\n"
-            "os.__dict__.update({'system': subprocess.run})\nos.system(['id'])\n"
-        ),
-        "import os\nimport subprocess\nos.execvpe = subprocess.run\nos.execvpe(['id'])\n",
-        (
-            "import asyncio\nimport subprocess\nasyncio.create_subprocess_exec = subprocess.run\n"
-            "asyncio.create_subprocess_exec(['id'])\n"
-        ),
-        "import pty\nimport subprocess\npty.spawn = subprocess.run\npty.spawn(['id'])\n",
-    ],
-)
-def test_scan_zip_reports_dangerous_setattr_replacement(tmp_path: Path, source: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
-
-
-@pytest.mark.parametrize(
-    ("source", "dangerous_name"),
-    [
-        (
-            "import os\nimport subprocess\nsubprocess.__dict__.update({'run': os.system})\nsubprocess.run('id')\n",
-            "os.system",
-        ),
-        (
-            "import subprocess\nrun = subprocess.Popen\nsubprocess.__dict__.clear()\n"
-            "subprocess.__dict__.update({'run': run})\nsubprocess.run([])\n",
-            "subprocess.Popen",
-        ),
-        (
-            "import os\nimport subprocess\nsubprocess.__dict__.update({'list2cmdline': os.system})\n"
-            "subprocess.list2cmdline(['id'])\n",
-            "os.system",
-        ),
-        (
-            "import os\nimport subprocess\nsubprocess.__dict__.update({'CompletedProcess': os.system})\n"
-            "subprocess.CompletedProcess('id')\n",
-            "os.system",
-        ),
-        ("import subprocess\nsubprocess.__dict__.pop('run')(['id'])\n", "subprocess.run"),
-    ],
-)
-def test_scan_zip_reports_dangerous_subprocess_mapping_replacement(
-    tmp_path: Path, source: str, dangerous_name: str
-) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
 
 
 def test_scan_zip_flags_wildcard_import_dangerous_python_member(tmp_path: Path) -> None:
@@ -907,164 +342,6 @@ def test_scan_zip_flags_builtins_getattr_keyword_call_dangerous_python_member(tm
     assert python_checks[0].severity == IssueSeverity.WARNING
     assert python_checks[0].rule_code == "S101"
     assert python_checks[0].details["reason"] == "high-risk calls: os.system"
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "__builtins__['ev' + 'al']('1 + 1')\n",
-        "getattr(__builtins__, 'eval')('1 + 1')\n",
-        "__builtins__.__dict__.get('eval')('1 + 1')\n",
-        "globals()['__builtins__']['ev' + 'al']('1 + 1')\n",
-        "globals().get('__builtins__').get('eval')('1 + 1')\n",
-        "getattr(globals()['__builtins__'], 'eval')('1 + 1')\n",
-        "namespace = globals()\nnamespace['__builtins__']['ev' + 'al']('1 + 1')\n",
-        "namespace = globals()\nnamespace.get('__builtins__').get('eval')('1 + 1')\n",
-        "namespace = globals()\ngetattr(namespace['__builtins__'], 'eval')('1 + 1')\n",
-        "lookup = globals().get\nlookup('__builtins__').get('ev' + 'al')('1 + 1')\n",
-        "namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n",
-        "lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
-        "lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
-        ("run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun.__call__('1 + 1')\n"),
-        "run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun('1 + 1')\n",
-        ("run = globals()['__builtins__']['eval']\nglobals()['__builtins__'].__setitem__('eval', len)\nrun('1 + 1')\n"),
-        (
-            "run = globals()['__builtins__']['eval']\n"
-            "replace = globals()['__builtins__'].__setitem__\n"
-            "replace('eval', len)\n"
-            "run('1 + 1')\n"
-        ),
-        (
-            "run = globals()['__builtins__']['eval']\n"
-            "globals()['__builtins__']['eval'] = __builtins__['exec']\n"
-            "run('1 + 1')\n"
-        ),
-        "globals()['__builtins__'].pop('eval')('1 + 1')\n",
-        "run = globals()['__builtins__'].pop('eval')\nrun('1 + 1')\n",
-        "if remove:\n    del globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval']('1 + 1')\n",
-        "run = globals()['__builtins__']['eval']\nglobals()['__builtins__'].clear()\nrun('1 + 1')\n",
-        "if remove:\n    globals()['__builtins__'].clear()\nglobals()['__builtins__']['eval']('1 + 1')\n",
-    ],
-)
-def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path, source: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S104"
-    assert python_checks[0].details["reason"] == "high-risk calls: __builtins__.eval"
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "callbacks = {'eval': len}\ncallbacks['eval']([])\n",
-        "import builtins as bi\nbi.open('labels.json', 'r')\n",
-        "globals()['__builtins__']['len']([1])\n",
-        "globals = lambda: {'__builtins__': {'eval': len}}\nglobals()['__builtins__']['eval']([])\n",
-        "namespace = globals()\nnamespace['__builtins__']['len']([1])\n",
-        ("namespace = globals()\nnamespace = {'__builtins__': {'eval': len}}\nnamespace['__builtins__']['eval']([])\n"),
-        ("namespace = globals()\nnamespace['__builtins__']['eval'] = len\nnamespace['__builtins__']['eval']([])\n"),
-        "lookup = globals().get\nlookup('__builtins__').get('len')([1])\n",
-        "mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
-        "globals()['__builtins__'].__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
-        "globals()['__builtins__'].update({'eval': len})\nglobals()['__builtins__']['eval']([])\n",
-        (
-            "replace = globals()['__builtins__'].__setitem__\n"
-            "replace('eval', len)\n"
-            "globals()['__builtins__']['eval']([])\n"
-        ),
-        ("replace = globals()['__builtins__'].update\nreplace({'eval': len})\nglobals()['__builtins__']['eval']([])\n"),
-        "import builtins\nbuiltins.__dict__.update({'eval': len})\nbuiltins.eval([])\n",
-        "import builtins\nreplace = builtins.__dict__.update\nreplace({'eval': len})\nbuiltins.eval([])\n",
-        "globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun([])\n",
-        ("globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun.__call__([])\n"),
-        ("globals()['__builtins__'].__setitem__('eval', len)\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
-        (
-            "replace = globals()['__builtins__'].__setitem__\n"
-            "replace('eval', len)\n"
-            "run = globals()['__builtins__']['eval']\n"
-            "run([])\n"
-        ),
-        "globals()['__builtins__'].pop('eval')\nglobals()['__builtins__']['eval']([])\n",
-        "remove = globals()['__builtins__'].pop\nremove('eval')\nglobals()['__builtins__']['eval']([])\n",
-        "del globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval']([])\n",
-        "globals()['__builtins__'].__delitem__('eval')\nglobals()['__builtins__']['eval']([])\n",
-        "globals()['__builtins__'].clear()\nglobals()['__builtins__']['eval']([])\n",
-        "import builtins\nbuiltins.__dict__.clear()\nbuiltins.eval([])\n",
-        "import builtins\ndict.clear(builtins.__dict__)\nbuiltins.eval([])\n",
-    ],
-)
-def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    assert not any(check.name == "Python Archive Member Security" for check in result.checks)
-
-
-@pytest.mark.parametrize(
-    ("source", "dangerous_name"),
-    [
-        (
-            "namespace = globals()\n"
-            "namespace['__builtins__']['eval'] = __builtins__['exec']\n"
-            "namespace['__builtins__']['eval']('pass')\n",
-            "__builtins__.exec",
-        ),
-        (
-            "globals()['__builtins__'].__setitem__('eval', __builtins__['exec'])\n"
-            "globals()['__builtins__']['eval']('pass')\n",
-            "__builtins__.exec",
-        ),
-        (
-            "globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
-            "globals()['__builtins__']['eval']('pass')\n",
-            "__builtins__.exec",
-        ),
-        (
-            "replace = globals()['__builtins__'].__setitem__\n"
-            "replace('eval', __builtins__['exec'])\n"
-            "globals()['__builtins__']['eval']('pass')\n",
-            "__builtins__.exec",
-        ),
-        (
-            "replace = globals()['__builtins__'].update\n"
-            "replace({'eval': __builtins__['exec']})\n"
-            "globals()['__builtins__']['eval']('pass')\n",
-            "__builtins__.exec",
-        ),
-        (
-            "import builtins\nbuiltins.__dict__.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
-            "builtins.exec",
-        ),
-    ],
-)
-def test_scan_zip_reports_dangerous_builtin_reassignment(tmp_path: Path, source: str, dangerous_name: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S104"
-    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
 
 
 def test_scan_zip_flags_aliased_getattr_helper_dangerous_python_member(tmp_path: Path) -> None:
@@ -1300,6 +577,36 @@ def test_scan_zip_flags_runpy_execution_python_member(tmp_path: Path, source: st
     assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
 
 
+def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import webbrowser\n"
+        "webbrowser.get().open.__call__('https://example.invalid')\n"
+        "ctypes.cdll['msvcrt'].printf(b'x')\n"
+        "ctypes.cdll.__getitem__('msvcrt')\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.msvcrt.printf(b'x')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S109", "S110"}
+    assert checks_by_rule["S109"].severity == IssueSeverity.CRITICAL
+    assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
+    assert checks_by_rule["S110"].severity == IssueSeverity.CRITICAL
+    assert "ctypes.cdll.msvcrt" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.msvcrt" in checks_by_rule["S110"].details["reason"]
+
+
 def test_scan_zip_flags_extensionless_runpy_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -1386,6 +693,8 @@ def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite
         "import os\nos.__dict__['runner'] = os.system\nos.__dict__.pop('runner')\nos.runner('safe')\n",
         ("import os\nrunner = os.system\nif True:\n    globals()['runner'] = print\nglobals()['runner']('safe')\n"),
         "import runpy\nrunpy.run_path = len\nrunpy.run_path([])\n",
+        "import webbrowser\nwebbrowser.get = len\nwebbrowser.get([]).open('https://example.invalid')\n",
+        "import ctypes\nctypes.cdll = len\nctypes.cdll['msvcrt'].printf(b'x')\n",
     ],
 )
 def test_scan_zip_ignores_benign_namespace_mapping_call(tmp_path: Path, source: str) -> None:
@@ -1910,47 +1219,6 @@ def test_scan_zip_ignores_benign_python_member(tmp_path: Path) -> None:
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
-@pytest.mark.parametrize(
-    "source",
-    [
-        "import subprocess\nsubprocess.list2cmdline(['input file', '--quiet'])\n",
-        "import subprocess\nsubprocess.CompletedProcess([], 0)\n",
-        "import subprocess\nsubprocess.SubprocessError('failed')\n",
-        "import subprocess\nsubprocess.CalledProcessError(1, ['cmd'])\n",
-        "import subprocess\nsubprocess.TimeoutExpired(['cmd'], 1)\n",
-    ],
-)
-def test_scan_zip_ignores_nonexecuting_subprocess_api(tmp_path: Path, source: str) -> None:
-    archive_path = tmp_path / "source_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("preprocess.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    assert result.success is True
-    assert not any(check.name == "Python Archive Member Security" for check in result.checks)
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-
-
-@pytest.mark.parametrize("dispatch", ["handlers['system'](1.0)", "handlers.get('system')(1.0)"])
-def test_scan_zip_ignores_benign_dictionary_dispatch_python_member(tmp_path: Path, dispatch: str) -> None:
-    archive_path = tmp_path / "source_bundle.zip"
-    source = (
-        "def normalize(value: float) -> float:\n"
-        "    return value / 255.0\n"
-        "handlers = {'system': normalize}\n"
-        f"{dispatch}\n"
-    )
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("preprocess.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    assert result.success is True
-    assert not any(check.name == "Python Archive Member Security" for check in result.checks)
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-
-
 def test_scan_zip_marks_malformed_python_member_incomplete(tmp_path: Path) -> None:
     archive_path = tmp_path / "source_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -1993,7 +1261,7 @@ def test_scan_npz_flags_executable_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.npz"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("arrays.npy", _npy_payload())
-        archive.writestr("bin/pickle_payload.sh", "#!/bin/sh\necho hidden\n")
+        archive.writestr("bin/run.sh", "#!/bin/sh\necho hidden\n")
 
     result = ZipScanner().scan(str(archive_path))
 
@@ -2004,9 +1272,7 @@ def test_scan_npz_flags_executable_member(tmp_path: Path) -> None:
     ]
     assert len(executable_checks) == 1
     assert executable_checks[0].severity == IssueSeverity.WARNING
-    assert executable_checks[0].details["entry"] == "bin/pickle_payload.sh"
-    assert executable_checks[0].rule_code == "S504"
-    assert not [check for check in result.checks if check.rule_code == "S213"]
+    assert executable_checks[0].details["entry"] == "bin/run.sh"
 
 
 def test_scan_npz_flags_extensionless_executable_member(tmp_path: Path) -> None:
@@ -2014,7 +1280,7 @@ def test_scan_npz_flags_extensionless_executable_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.npz"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("arrays.npy", _npy_payload())
-        archive.writestr("bin/pickle_payload", b"\x7fELF" + b"\x00" * 64)
+        archive.writestr("bin/runme", b"\x7fELF" + b"\x00" * 64)
 
     result = ZipScanner().scan(str(archive_path))
 
@@ -2025,9 +1291,7 @@ def test_scan_npz_flags_extensionless_executable_member(tmp_path: Path) -> None:
     ]
     assert len(executable_checks) == 1
     assert executable_checks[0].severity == IssueSeverity.WARNING
-    assert executable_checks[0].details["entry"] == "bin/pickle_payload"
-    assert executable_checks[0].rule_code == "S502"
-    assert not [check for check in result.checks if check.rule_code == "S213"]
+    assert executable_checks[0].details["entry"] == "bin/runme"
 
 
 def test_scan_npz_ignores_extensionless_executable_near_match(tmp_path: Path) -> None:
@@ -2159,12 +1423,6 @@ def test_scan_zip_ignores_benign_python_file_operations(tmp_path: Path) -> None:
         ("import os\nos.system('echo hidden')\n", "S101", "os.system"),
         ("import os\nos.popen('echo hidden')\n", "S101", "os.popen"),
         ("import subprocess\nsubprocess.run(['echo'], check=False)\n", "S103", "subprocess.run"),
-        ("import subprocess\nsubprocess.getoutput('echo hidden')\n", "S103", "subprocess.getoutput"),
-        ("import subprocess\nsubprocess.getstatusoutput('echo hidden')\n", "S103", "subprocess.getstatusoutput"),
-        ("import pty\npty.spawn('/bin/sh')\n", "S111", "pty.spawn"),
-        ("import runpy\nrunpy.run_path('payload.py')\n", "S108", "runpy.run_path"),
-        ("import webbrowser\nwebbrowser.open_new_tab('https://evil.example')\n", "S109", "webbrowser.open_new_tab"),
-        ("import ctypes\nctypes.CDLL('./payload.so')\n", "S110", "ctypes.CDLL"),
         ("import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
         ("import runpy\nrunpy.run_path('payload.py')\n", "S108", "runpy.run_path"),
         ("eval('1 + 1')\n", "S104", "eval"),

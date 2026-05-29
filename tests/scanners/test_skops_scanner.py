@@ -394,33 +394,19 @@ class TestSkopsScannerJoblibFallback:
             f"False positive: bare 'schema' file triggered Unsafe Joblib Fallback Detection: {joblib_checks}"
         )
 
-    def test_sklearn_reference_in_readme_is_not_unsafe_fallback(self, tmp_path: Path) -> None:
-        """Ordinary model-card provenance text is not deserialization evidence."""
-        skops_file = tmp_path / "benign_readme.skops"
-        with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr("schema.json", '{"version": "1.0"}')
-            zf.writestr("README.md", "Trained with sklearn.linear_model.LogisticRegression.\n")
-
-        result = SkopsScanner().scan(str(skops_file))
-        aggregate = scan_model_directory_or_file(str(skops_file), cache_scan_results=False)
-
-        joblib_checks = [c for c in result.checks if "Joblib" in c.name and c.status == CheckStatus.FAILED]
-        assert result.success is True
-        assert not joblib_checks
-        assert determine_exit_code(aggregate) == 0
-
-    def test_explicit_joblib_load_in_data_file_still_detected(self, tmp_path: Path) -> None:
-        """An explicit loader call remains reportable even with a sklearn namespace."""
+    def test_sklearn_in_data_file_still_detected(self, tmp_path: Path) -> None:
+        """Ensure sklearn references in non-metadata files are still flagged."""
         skops_file = tmp_path / "suspicious.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
             zf.writestr("schema.json", '{"version": "1.0"}')
+            # sklearn reference in a data file IS suspicious
             zf.writestr("payload.bin", b"import sklearn; sklearn.externals.joblib.load(f)")
 
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
 
         joblib_checks = [c for c in result.checks if "Joblib" in c.name and c.status == CheckStatus.FAILED]
-        assert len(joblib_checks) > 0, "Explicit joblib.load should still be flagged"
+        assert len(joblib_checks) > 0, "sklearn in a data file should still be flagged"
 
 
 class TestSkopsScannerEdgeCases:

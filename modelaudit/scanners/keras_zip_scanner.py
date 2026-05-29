@@ -613,7 +613,6 @@ class KerasZipScanner(BaseScanner):
                     severity=IssueSeverity.WARNING,
                     location=f"{archive_path}/{filename}",
                     details={"filename": filename},
-                    rule_code="S507",
                 )
             elif is_executable_archive_member_name(normalized_name):
                 result.add_check(
@@ -623,7 +622,6 @@ class KerasZipScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     location=f"{archive_path}/{filename}",
                     details={"filename": filename},
-                    rule_code=executable_archive_member_rule_code(filename),
                 )
 
     @staticmethod

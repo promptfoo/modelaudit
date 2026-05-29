@@ -92,6 +92,49 @@ _RUNPY_CODE_EXECUTION_CALLS = frozenset(
         "runpy.run_path",
     }
 )
+_WEBBROWSER_LAUNCH_CALLS = frozenset(
+    {
+        "webbrowser.open",
+        "webbrowser.open_new",
+        "webbrowser.open_new_tab",
+    }
+)
+_WEBBROWSER_CONTROLLER_FACTORIES = frozenset({"webbrowser.get"})
+_WEBBROWSER_CONTROLLER_LAUNCH_METHODS = frozenset({"open", "open_new", "open_new_tab"})
+_CTYPES_LIBRARY_LOADER_OBJECTS = frozenset(
+    {
+        "ctypes.LibraryLoader",
+        "ctypes.cdll",
+        "ctypes.oledll",
+        "ctypes.pydll",
+        "ctypes.windll",
+    }
+)
+_CTYPES_LIBRARY_LOADER_NON_LOADING_ATTRIBUTES = frozenset({"_FuncPtr", "_dlltype", "_handle", "_name"})
+_CTYPES_LIBRARY_LOADER_CONSTRUCTORS = frozenset({"ctypes.LibraryLoader"})
+_CTYPES_NATIVE_LIBRARY_LOADING_CALLS = frozenset(
+    {
+        "ctypes.CDLL",
+        "ctypes.OleDLL",
+        "ctypes.PyDLL",
+        "ctypes.WinDLL",
+        "ctypes.cdll.__getitem__",
+        "ctypes.cdll.LoadLibrary",
+        "ctypes.oledll.__getitem__",
+        "ctypes.oledll.LoadLibrary",
+        "ctypes.pydll.__getitem__",
+        "ctypes.pydll.LoadLibrary",
+        "ctypes.windll.__getitem__",
+        "ctypes.windll.LoadLibrary",
+    }
+)
+_STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES = (
+    _RUNPY_CODE_EXECUTION_CALLS
+    | _WEBBROWSER_LAUNCH_CALLS
+    | _WEBBROWSER_CONTROLLER_FACTORIES
+    | _CTYPES_NATIVE_LIBRARY_LOADING_CALLS
+    | _CTYPES_LIBRARY_LOADER_OBJECTS
+)
 
 # Map each high-risk call name to the rule code that best describes its risk
 # category. SARIF consumers, dashboards, and per-rule severity overrides rely
@@ -99,13 +142,7 @@ _RUNPY_CODE_EXECUTION_CALLS = frozenset(
 # (eval/exec) just because the scanner hard-coded a single fallback.
 _HIGH_RISK_PYTHON_CALL_RULE_CODES: dict[str, str] = {
     "__import__": "S106",
-    "__builtin__.__import__": "S106",
-    "__builtins__.__import__": "S106",
     "builtins.__import__": "S106",
-    "__builtin__.eval": "S104",
-    "__builtin__.exec": "S104",
-    "__builtins__.eval": "S104",
-    "__builtins__.exec": "S104",
     "builtins.eval": "S104",
     "builtins.exec": "S104",
     "eval": "S104",
@@ -117,23 +154,22 @@ _HIGH_RISK_PYTHON_CALL_RULE_CODES: dict[str, str] = {
     **dict.fromkeys(_OS_PROCESS_EXECUTION_CALLS, "S101"),
     **dict.fromkeys(_ASYNCIO_PROCESS_EXECUTION_CALLS, "S103"),
     **dict.fromkeys(_RUNPY_CODE_EXECUTION_CALLS, "S108"),
+    **dict.fromkeys(_WEBBROWSER_LAUNCH_CALLS, "S109"),
+    **dict.fromkeys(_CTYPES_NATIVE_LIBRARY_LOADING_CALLS, "S110"),
 }
 _HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES: tuple[tuple[str, str], ...] = (("subprocess.", "S103"),)
 _FALLBACK_HIGH_RISK_RULE_CODE = "S104"
 _HIGH_RISK_PYTHON_CALLS = frozenset(_HIGH_RISK_PYTHON_CALL_RULE_CODES)
 
 
-def _split_env_shebang_command(value: str) -> str | None:
-    try:
-        split_parts = shlex.split(value)
-    except ValueError:
-        split_parts = value.split()
-    if not split_parts:
-        return None
-    return split_parts[0].rsplit("/", 1)[-1].lower()
+def _strip_dunder_call_suffixes(reference_name: str) -> str:
+    while reference_name.endswith(".__call__"):
+        reference_name = reference_name.removesuffix(".__call__")
+    return reference_name
 
 
 def _ctypes_loader_attribute_load_name(reference_name: str) -> str | None:
+    reference_name = _strip_dunder_call_suffixes(reference_name)
     parts = reference_name.split(".")
     if len(parts) < 3:
         return None
@@ -148,12 +184,43 @@ def _ctypes_loader_attribute_load_name(reference_name: str) -> str | None:
 
 
 def _webbrowser_controller_launch_call_name(reference_name: str) -> str | None:
+    reference_name = _strip_dunder_call_suffixes(reference_name)
     root_name, separator, method_name = reference_name.rpartition(".")
     if not separator or root_name not in _WEBBROWSER_CONTROLLER_FACTORIES:
         return None
     if method_name not in _WEBBROWSER_CONTROLLER_LAUNCH_METHODS:
         return None
     return f"webbrowser.{method_name}"
+
+
+def _normalized_high_risk_python_call_name(name: str) -> str | None:
+    stripped_name = _strip_dunder_call_suffixes(name)
+    if stripped_name in _HIGH_RISK_PYTHON_CALLS or stripped_name.startswith("subprocess."):
+        return stripped_name
+    webbrowser_launch_name = _webbrowser_controller_launch_call_name(stripped_name)
+    if webbrowser_launch_name is not None:
+        return webbrowser_launch_name
+    ctypes_load_name = _ctypes_loader_attribute_load_name(stripped_name)
+    if ctypes_load_name is not None:
+        return ctypes_load_name
+    return None
+
+
+def _has_static_overwritable_reference_prefix(name: str) -> bool:
+    return any(
+        name == reference_name or name.startswith(f"{reference_name}.")
+        for reference_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
+    )
+
+
+def _split_env_shebang_command(value: str) -> str | None:
+    try:
+        split_parts = shlex.split(value)
+    except ValueError:
+        split_parts = value.split()
+    if not split_parts:
+        return None
+    return split_parts[0].rsplit("/", 1)[-1].lower()
 
 
 def _rule_code_for_high_risk_call(call_name: str) -> str:
@@ -461,17 +528,19 @@ def _resolve_aliases(name: str, alias_scopes: _AliasScopes) -> _AliasValue:
 
 
 def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    direct_aliases, direct_found = _lookup_bound_alias(call_name, alias_scopes)
-    if direct_found:
-        return direct_aliases
-    head, *tail = call_name.split(".")
-    resolved_heads = _resolve_aliases(head, alias_scopes)
-    if resolved_heads is None:
-        return None
-    if not tail:
-        return resolved_heads
-    suffix = ".".join(tail)
-    return frozenset(f"{resolved_head}.{suffix}" for resolved_head in resolved_heads)
+    parts = call_name.split(".")
+    for prefix_length in range(len(parts), 0, -1):
+        prefix = ".".join(parts[:prefix_length])
+        aliases, found = _lookup_bound_alias(prefix, alias_scopes)
+        if not found:
+            continue
+        if aliases is None:
+            return None
+        suffix = ".".join(parts[prefix_length:])
+        if not suffix:
+            return aliases
+        return frozenset(f"{alias}.{suffix}" for alias in aliases)
+    return frozenset({call_name})
 
 
 def _normalize_implicit_builtins_names(
@@ -1008,6 +1077,75 @@ def _resolve_namespace_mapping_lookup_names(
     return resolved_names
 
 
+def _resolve_webbrowser_controller_factory_roots(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    if not isinstance(node, ast.Call):
+        return None
+    resolved_func_names = _resolve_static_reference_names(
+        node.func,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if resolved_func_names is None:
+        return None
+    controller_factories = resolved_func_names & _WEBBROWSER_CONTROLLER_FACTORIES
+    return controller_factories or None
+
+
+def _resolve_ctypes_library_loader_instance_roots(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    if isinstance(node, ast.Subscript):
+        library_name = _resolve_static_string(node.slice)
+        if library_name is None:
+            return None
+        resolved_loader_names = _resolve_static_reference_names(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if resolved_loader_names is None:
+            return None
+        subscript_loader_roots = resolved_loader_names & _CTYPES_LIBRARY_LOADER_OBJECTS
+        return frozenset(f"{loader_root}.{library_name}" for loader_root in subscript_loader_roots) or None
+
+    if not isinstance(node, ast.Call):
+        return None
+
+    resolved_func_names = _resolve_static_reference_names(
+        node.func,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if resolved_func_names is None:
+        return None
+
+    constructor_roots = resolved_func_names & _CTYPES_LIBRARY_LOADER_CONSTRUCTORS
+    loader_roots: set[str] = set(constructor_roots)
+    if len(node.args) == 1 and not node.keywords:
+        library_name = _resolve_static_string(node.args[0])
+        for resolved_func_name in resolved_func_names:
+            stripped_func_name = _strip_dunder_call_suffixes(resolved_func_name)
+            root_name, separator, method_name = stripped_func_name.rpartition(".")
+            if not separator or root_name not in _CTYPES_LIBRARY_LOADER_OBJECTS:
+                continue
+            if library_name is not None and method_name in {"__getitem__", "LoadLibrary"}:
+                loader_roots.add(f"{root_name}.{library_name}")
+    return frozenset(loader_roots) or None
+
+
 def _resolve_static_reference_names(
     node: ast.AST,
     alias_scopes: _AliasScopes,
@@ -1026,6 +1164,8 @@ def _resolve_static_reference_names(
             name.endswith(f".__dict__.{method}") for name in callable_names for method in _NAMESPACE_MAPPING_METHODS
         ):
             return frozenset(f"{name}.__call__" for name in callable_names)
+        if callable_names is not None:
+            return frozenset(f"{name}.__call__" for name in callable_names)
     if isinstance(node, ast.Attribute) and node.attr in _NAMESPACE_MAPPING_METHODS:
         mapping_method_roots = _resolve_namespace_mapping_roots(
             node.value,
@@ -1035,6 +1175,23 @@ def _resolve_static_reference_names(
         )
         if mapping_method_roots is not None:
             return frozenset(f"{root}.__dict__.{node.attr}" for root in mapping_method_roots)
+    ctypes_loader_roots = _resolve_ctypes_library_loader_instance_roots(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if ctypes_loader_roots is not None:
+        return ctypes_loader_roots
+    if isinstance(node, ast.Call):
+        webbrowser_controller_roots = _resolve_webbrowser_controller_factory_roots(
+            node,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if webbrowser_controller_roots is not None:
+            return webbrowser_controller_roots
     call_name = _resolve_call_name(node)
     if call_name is not None:
         resolved_names = _apply_aliases(call_name, alias_scopes)
@@ -1050,6 +1207,30 @@ def _resolve_static_reference_names(
     if getattr_names is not None:
         return _normalize_implicit_builtins_names(getattr_names, alias_scopes)
     if isinstance(node, ast.Attribute) and node.attr != "__call__":
+        ctypes_loader_roots = _resolve_ctypes_library_loader_instance_roots(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if ctypes_loader_roots is not None:
+            return frozenset(f"{root}.{node.attr}" for root in ctypes_loader_roots)
+        webbrowser_controller_roots = _resolve_webbrowser_controller_factory_roots(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if webbrowser_controller_roots is not None:
+            return frozenset(f"{root}.{node.attr}" for root in webbrowser_controller_roots)
+        resolved_value_names = _resolve_static_reference_names(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if resolved_value_names is not None:
+            return frozenset(f"{name}.{node.attr}" for name in resolved_value_names)
         selected_names = _resolve_namespace_mapping_lookup_names(
             node.value,
             alias_scopes,
@@ -1094,21 +1275,16 @@ def _resolve_static_reference_names(
 
 
 def _is_high_risk_python_call_name(name: str) -> bool:
-    return (
-        name in _HIGH_RISK_PYTHON_CALLS
-        or (name.startswith("subprocess.") and name not in _KNOWN_NON_EXECUTING_SUBPROCESS_CALLS)
-        or (_webbrowser_controller_launch_call_name(name) is not None)
-        or (_ctypes_loader_attribute_load_name(name) is not None)
-    )
+    return _normalized_high_risk_python_call_name(name) is not None
 
 
-def _wildcard_import_aliases(
-    module: str, tracked_call_names: frozenset[str] | None = None
-) -> Iterator[tuple[str, str]]:
+def _wildcard_import_aliases(module: str) -> Iterator[tuple[str, str]]:
     prefix = f"{module}."
-    call_names = set(_HIGH_RISK_PYTHON_CALLS if tracked_call_names is None else tracked_call_names)
+    call_names = set(_HIGH_RISK_PYTHON_CALLS)
     if module == "webbrowser":
         call_names.update(_WEBBROWSER_CONTROLLER_FACTORIES)
+    if module == "ctypes":
+        call_names.update(_CTYPES_LIBRARY_LOADER_OBJECTS | _CTYPES_LIBRARY_LOADER_CONSTRUCTORS)
     for call_name in sorted(call_names):
         if not call_name.startswith(prefix):
             continue
@@ -1131,18 +1307,13 @@ def _binding_names(target: ast.AST) -> Iterator[str]:
 
 
 class _HighRiskPythonCallVisitor(ast.NodeVisitor):
-    def __init__(self, tracked_call_names: frozenset[str] | None = None) -> None:
+    def __init__(self) -> None:
         self.alias_scopes: _AliasScopes = [{}]
         self._class_scope_ids: set[int] = set()
         self._comprehension_outer_scope_indices: list[int] = []
         self._call_result_aliases: dict[int, _AliasValue] = {}
         self._non_module_scope_depth = 0
         self.risky_calls: set[str] = set()
-        self.tracked_call_names = tracked_call_names
-
-    def _bind_import_name(self, local_name: str, import_name: str) -> None:
-        effective_names = self._effective_reference_names(frozenset({import_name}))
-        self._bind_name(local_name, self._capture_callable_names(effective_names))
 
     def _resolve_reference_names(self, node: ast.AST) -> frozenset[str] | None:
         return _resolve_static_reference_names(
@@ -1153,237 +1324,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         )
 
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
-        self._bind_import_name(alias.asname or alias.name, import_name)
+        self.alias_scopes[-1][alias.asname or alias.name] = frozenset({import_name})
 
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
         self.alias_scopes[-1][name] = resolved_names
-        if not name.startswith("<"):
-            self.alias_scopes[-1][self._static_uncertain_binding_key(name)] = frozenset()
-            if self._lookup_static_mapping_mutation_alias(name) is not None:
-                self.alias_scopes[-1][self._static_mapping_mutation_alias_key(name)] = None
-
-    @staticmethod
-    def _static_reference_override_key(reference_name: str) -> str:
-        return f"{_STATIC_REFERENCE_OVERRIDE_PREFIX}{reference_name}"
-
-    @staticmethod
-    def _static_cleared_namespace_key(namespace_root: str) -> str:
-        return f"{_STATIC_CLEARED_NAMESPACE_PREFIX}{namespace_root}"
-
-    @staticmethod
-    def _static_mapping_mutation_alias_key(name: str) -> str:
-        return f"{_STATIC_MAPPING_MUTATION_ALIAS_PREFIX}{name}"
-
-    @staticmethod
-    def _static_uncertain_binding_key(name: str) -> str:
-        return f"{_STATIC_UNCERTAIN_BINDING_PREFIX}{name}"
-
-    def _lookup_static_reference_override(self, reference_name: str) -> _AliasValue:
-        override_key = self._static_reference_override_key(reference_name)
-        for aliases in reversed(self.alias_scopes):
-            if override_key in aliases:
-                return aliases[override_key]
-            for key, value in aliases.items():
-                if (
-                    key.startswith(_STATIC_CLEARED_NAMESPACE_PREFIX)
-                    and value is None
-                    and reference_name.startswith(f"{key.removeprefix(_STATIC_CLEARED_NAMESPACE_PREFIX)}.")
-                ):
-                    return None
-        return frozenset({reference_name})
-
-    def _lookup_static_mapping_mutation_alias(self, name: str) -> _AliasValue:
-        alias_key = self._static_mapping_mutation_alias_key(name)
-        for aliases in reversed(self.alias_scopes):
-            if alias_key in aliases:
-                return aliases[alias_key]
-        return None
-
-    def _resolve_certain_static_mapping_mutator_names(self, node: ast.AST) -> frozenset[str] | None:
-        mutator_names = _resolve_static_mapping_mutator_names(node, self.alias_scopes)
-        if mutator_names is not None:
-            return mutator_names
-        if isinstance(node, ast.Name):
-            return self._lookup_static_mapping_mutation_alias(node.id)
-        return None
-
-    def _is_tracked_call_name(self, name: str) -> bool:
-        return (
-            name in self.tracked_call_names
-            if self.tracked_call_names is not None
-            else _is_high_risk_python_call_name(name)
-        )
-
-    @staticmethod
-    def _captured_callable_reference_name(name: str) -> str:
-        return f"{_CAPTURED_CALLABLE_REFERENCE_PREFIX}{name}"
-
-    def _capture_callable_names(self, resolved_names: _AliasValue) -> _AliasValue:
-        if resolved_names is None:
-            return None
-        return frozenset(
-            self._captured_callable_reference_name(name) if self._is_tracked_call_name(name) else name
-            for name in resolved_names
-        )
-
-    def _effective_reference_names(self, resolved_names: frozenset[str]) -> frozenset[str] | None:
-        effective_names: set[str] = set()
-        for resolved_name in resolved_names:
-            if resolved_name.startswith(_CAPTURED_CALLABLE_REFERENCE_PREFIX):
-                effective_names.add(resolved_name.removeprefix(_CAPTURED_CALLABLE_REFERENCE_PREFIX))
-                continue
-            override_names = self._lookup_static_reference_override(resolved_name)
-            if override_names is not None:
-                effective_names.update(
-                    override_name.removeprefix(_CAPTURED_CALLABLE_REFERENCE_PREFIX)
-                    if override_name.startswith(_CAPTURED_CALLABLE_REFERENCE_PREFIX)
-                    else override_name
-                    for override_name in override_names
-                )
-        return frozenset(effective_names) if effective_names else None
-
-    @staticmethod
-    def _invoked_callable_reference_name(name: str) -> str:
-        while name.endswith(".__call__"):
-            name = name.removesuffix(".__call__")
-        return name
-
-    def _resolve_invoked_reference_names(self, node: ast.AST) -> frozenset[str] | None:
-        resolved_names = _resolve_static_reference_names(node, self.alias_scopes)
-        if resolved_names is None:
-            return None
-        callable_names = frozenset(self._invoked_callable_reference_name(name) for name in resolved_names)
-        return self._effective_reference_names(callable_names)
-
-    def _resolve_bound_value_names(self, node: ast.AST) -> _AliasValue:
-        return self._capture_callable_names(self._resolve_invoked_reference_names(node))
-
-    def _bind_static_reference_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
-        if _has_uncertain_static_binding(target, self.alias_scopes):
-            return
-        target_names = _resolve_static_assignment_target_names(target, self.alias_scopes)
-        if target_names is None:
-            return
-
-        self._bind_static_reference_names_to_value(target_names, value)
-
-    def _bind_static_reference_names_to_value(self, target_names: frozenset[str], value: ast.AST) -> None:
-        resolved_value_names = self._resolve_bound_value_names(value)
-        for target_name in target_names:
-            self._bind_name(self._static_reference_override_key(target_name), resolved_value_names)
-
-    def _bind_static_reference_names_as_removed(self, target_names: frozenset[str]) -> None:
-        for target_name in target_names:
-            self._bind_name(self._static_reference_override_key(target_name), None)
-
-    def _bind_static_namespace_roots_as_cleared(self, namespace_roots: frozenset[str]) -> None:
-        current_scope = self.alias_scopes[-1]
-        for namespace_root in namespace_roots:
-            reference_prefix = f"{_STATIC_REFERENCE_OVERRIDE_PREFIX}{namespace_root}."
-            for key in list(current_scope):
-                if key.startswith(reference_prefix):
-                    del current_scope[key]
-            self._bind_name(self._static_cleared_namespace_key(namespace_root), None)
-
-    def _bind_static_reference_target_as_removed(self, target: ast.AST) -> None:
-        if _has_uncertain_static_binding(target, self.alias_scopes):
-            return
-        target_names = _resolve_static_assignment_target_names(target, self.alias_scopes)
-        if target_names is not None:
-            self._bind_static_reference_names_as_removed(target_names)
-
-    def _bind_static_mapping_mutation(self, node: ast.Call, *, model_discarded_removals: bool = False) -> None:
-        """Model unconditional writes through one certain namespace mapping."""
-        if node.keywords:
-            return
-
-        mutator_names = self._resolve_certain_static_mapping_mutator_names(node.func)
-        mutation_args = node.args
-        if mutator_names is not None:
-            methods = {mutator_name.rsplit(".", maxsplit=1)[1] for mutator_name in mutator_names}
-            if len(methods) != 1:
-                return
-            method = next(iter(methods))
-            target_roots = frozenset(mutator_name.rsplit(".", maxsplit=1)[0] for mutator_name in mutator_names)
-        else:
-            if _has_uncertain_static_binding(node.func, self.alias_scopes) or not node.args:
-                return
-            helper_names = self._resolve_invoked_reference_names(node.func)
-            if helper_names is None:
-                return
-            helper_methods = {_STATIC_MAPPING_FUNCTION_MUTATORS.get(helper_name) for helper_name in helper_names}
-            if None in helper_methods or len(helper_methods) != 1:
-                return
-            method = next(helper_method for helper_method in helper_methods if helper_method is not None)
-            resolved_target_roots = _resolve_certain_namespace_mutation_roots(node.args[0], self.alias_scopes)
-            if resolved_target_roots is None:
-                return
-            target_roots = resolved_target_roots
-            mutation_args = node.args[1:]
-
-        mutations: list[tuple[frozenset[str], ast.AST | None]] = []
-        if method == "__setitem__":
-            if len(mutation_args) != 2:
-                return
-            attr_name = _resolve_static_string(mutation_args[0])
-            if attr_name is None:
-                return
-            mutations.append(
-                (frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), mutation_args[1])
-            )
-        elif method == "__delitem__":
-            if len(mutation_args) != 1:
-                return
-            attr_name = _resolve_static_string(mutation_args[0])
-            if attr_name is None:
-                return
-            mutations.append((frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), None))
-        elif method == "clear":
-            if mutation_args:
-                return
-            self._bind_static_namespace_roots_as_cleared(target_roots)
-            return
-        elif method == "update":
-            if len(mutation_args) != 1 or not isinstance(mutation_args[0], ast.Dict):
-                return
-            for attr_name_node, value_node in zip(mutation_args[0].keys, mutation_args[0].values, strict=True):
-                if attr_name_node is None:
-                    return
-                attr_name = _resolve_static_string(attr_name_node)
-                if attr_name is None:
-                    return
-                mutations.append((frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), value_node))
-        elif method == "pop":
-            if not model_discarded_removals or len(mutation_args) not in {1, 2}:
-                return
-            attr_name = _resolve_static_string(mutation_args[0])
-            if attr_name is None:
-                return
-            mutations.append((frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), None))
-        else:
-            return
-
-        for target_names, value in mutations:
-            if value is None:
-                self._bind_static_reference_names_as_removed(target_names)
-            else:
-                self._bind_static_reference_names_to_value(target_names, value)
-
-    def _bind_static_setattr_mutation(self, node: ast.Call) -> None:
-        """Model certain builtin ``setattr`` writes to one resolved reference."""
-        if len(node.args) != 3 or node.keywords:
-            return
-        if _has_uncertain_static_binding(node.args[0], self.alias_scopes):
-            return
-
-        helper_names = self._resolve_invoked_reference_names(node.func)
-        if helper_names is None or not helper_names.issubset(_STATIC_ATTRIBUTE_MUTATION_HELPERS):
-            return
-
-        target_names = _resolve_static_attribute_names(node.args[0], node.args[1], self.alias_scopes)
-        if target_names is None or len(target_names) != 1:
-            return
-        self._bind_static_reference_names_to_value(target_names, node.args[2])
 
     def _bind_name_in_scope(self, scope_index: int, name: str, resolved_names: _AliasValue) -> None:
         self.alias_scopes[scope_index][name] = resolved_names
@@ -1437,7 +1381,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             resolved_value = self._resolve_binding_value_names(value)
             syntactic_name = _resolve_call_name(target)
             for target_name in resolved_target_names:
-                if target_name in _RUNPY_CODE_EXECUTION_CALLS:
+                if target_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
                     self._bind_name(target_name, resolved_value)
                     if syntactic_name is not None:
                         self._bind_name(syntactic_name, resolved_value)
@@ -1617,7 +1561,6 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     self._resolve_binding_value_names(default) if default is not None else None,
                 )
             )
-            self.alias_scopes[-1][self._static_uncertain_binding_key(arg.arg)] = None
         for arg, default in zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True):
             resolved_bindings.append(
                 (
@@ -1629,10 +1572,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self._bind_name(name, resolved_names)
         if arguments.vararg is not None:
             self._bind_name(arguments.vararg.arg, None)
-            self.alias_scopes[-1][self._static_uncertain_binding_key(arguments.vararg.arg)] = None
         if arguments.kwarg is not None:
             self._bind_name(arguments.kwarg.arg, None)
-            self.alias_scopes[-1][self._static_uncertain_binding_key(arguments.kwarg.arg)] = None
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -1643,8 +1584,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             return
         for alias in node.names:
             if alias.name == "*":
-                for local_name, import_name in _wildcard_import_aliases(node.module, self.tracked_call_names):
-                    self._bind_import_name(local_name, import_name)
+                for local_name, import_name in _wildcard_import_aliases(node.module):
+                    self._bind_name(local_name, frozenset({import_name}))
                 continue
             self._record_import(alias, f"{node.module}.{alias.name}")
 
@@ -1699,15 +1640,15 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     self.alias_scopes,
                     allow_module_locals_mapping=self._non_module_scope_depth == 0,
                 )
-            elif name in _RUNPY_CODE_EXECUTION_CALLS:
-                base_value = frozenset({name})
+            elif name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
+                base_value = current_scope.get(name, frozenset({name}))
             else:
                 base_value = current_scope.get(name, frozenset({name}) if implicit_builtins else None)
             values = [scope.get(name, base_value) for scope in branch_scopes]
             concrete_aliases = frozenset(alias for value in values if isinstance(value, frozenset) for alias in value)
             if concrete_aliases:
                 current_scope[name] = concrete_aliases
-            elif any(value is None for value in branch_values):
+            elif any(value is None for value in values):
                 current_scope[name] = None
 
     def _visit_child_scope_without_class_locals(self, body: list[ast.stmt]) -> None:
@@ -1836,30 +1777,24 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
-        if isinstance(node.value, ast.Call):
-            self._bind_static_mapping_mutation(node.value)
-            self._bind_static_setattr_mutation(node.value)
         for target in node.targets:
             self._bind_target_to_value(target, node.value)
-            self._visit_assignment_target(target)
+            self.visit(target)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         if node.annotation is not None:
             self.visit(node.annotation)
         if node.value is not None:
             self.visit(node.value)
-            if isinstance(node.value, ast.Call):
-                self._bind_static_mapping_mutation(node.value)
-                self._bind_static_setattr_mutation(node.value)
             self._bind_target_to_value(node.target, node.value)
         else:
             self._shadow_binding_target(node.target)
-        self._visit_assignment_target(node.target)
+        self.visit(node.target)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.visit(node.value)
         self._shadow_binding_target(node.target)
-        self._visit_assignment_target(node.target)
+        self.visit(node.target)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
@@ -1885,7 +1820,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self._push_alias_scope(body_scope)
         try:
             self._shadow_binding_target(node.target)
-            self._visit_assignment_target(node.target)
+            self.visit(node.target)
             for statement in node.body:
                 self.visit(statement)
             body_scope = dict(body_scope)
@@ -1960,7 +1895,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self.visit(item.context_expr)
             if item.optional_vars is not None:
                 self._shadow_binding_target(item.optional_vars)
-                self._visit_assignment_target(item.optional_vars)
+                self.visit(item.optional_vars)
         for statement in node.body:
             self.visit(statement)
 
@@ -1984,58 +1919,36 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self._call_result_aliases[id(node)] = call_result_names
 
         direct_call_name = _resolve_call_name(node.func)
-        direct_call_head = direct_call_name.split(".", maxsplit=1)[0] if direct_call_name is not None else None
-        direct_head_names = (
-            _resolve_aliases(direct_call_head, self.alias_scopes) if direct_call_head is not None else None
-        )
-        direct_call_shadowed = (
-            direct_call_name is not None
-            and direct_call_name in _RUNPY_CODE_EXECUTION_CALLS
-            and _lookup_bound_alias(direct_call_name, self.alias_scopes)[1]
-        )
-        if (
-            direct_call_name is not None
-            and _is_high_risk_python_call_name(direct_call_name)
-            and direct_head_names == frozenset({direct_call_head})
-            and not direct_call_shadowed
-        ):
-            self.risky_calls.add(direct_call_name)
-        else:
-            resolved_names = self._resolve_reference_names(node.func)
-            if resolved_names is None:
-                resolved_names = frozenset()
-            for resolved_name in resolved_names:
-                if _is_high_risk_python_call_name(resolved_name):
-                    self.risky_calls.add(resolved_name)
+        if direct_call_name is not None:
+            direct_call_head = direct_call_name.split(".", maxsplit=1)[0]
+            direct_head_names = _resolve_aliases(direct_call_head, self.alias_scopes)
+            normalized_direct_name = _normalized_high_risk_python_call_name(direct_call_name)
+            if (
+                normalized_direct_name is not None
+                and direct_head_names == frozenset({direct_call_head})
+                and not _has_static_overwritable_reference_prefix(direct_call_name)
+            ):
+                self.risky_calls.add(normalized_direct_name)
+
+        resolved_names = self._resolve_reference_names(node.func)
+        if resolved_names is None:
+            resolved_names = frozenset()
+        for resolved_name in resolved_names:
+            normalized_name = _normalized_high_risk_python_call_name(resolved_name)
+            if normalized_name is not None:
+                self.risky_calls.add(normalized_name)
         self._record_namespace_write_call(node)
         self.generic_visit(node)
 
-    def visit_Attribute(self, node: ast.Attribute) -> None:
-        if self._suppress_attribute_load_detection_depth == 0:
-            resolved_names = _resolve_static_reference_names(node, self.alias_scopes)
-            effective_names = self._effective_reference_names(resolved_names) if resolved_names is not None else None
-            if effective_names is not None:
-                for resolved_name in effective_names:
-                    load_name = _ctypes_loader_attribute_load_name(resolved_name)
-                    if load_name is not None and self._is_tracked_call_name(load_name):
-                        self.risky_calls.add(load_name)
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        if isinstance(node.ctx, ast.Load):
+            resolved_names = self._resolve_reference_names(node)
+            if resolved_names is not None:
+                for resolved_name in resolved_names:
+                    normalized_name = _normalized_high_risk_python_call_name(resolved_name)
+                    if normalized_name is not None:
+                        self.risky_calls.add(normalized_name)
         self.generic_visit(node)
-
-
-def statically_resolved_python_call_names_in_tree(tree: ast.AST, tracked_call_names: frozenset[str]) -> set[str]:
-    """Return caller-selected static call targets resolved from an AST."""
-    visitor = _HighRiskPythonCallVisitor(tracked_call_names)
-    visitor.visit(tree)
-    return visitor.risky_calls
-
-
-def high_risk_python_calls_in_tree(tree: ast.AST) -> set[HighRiskPythonCall]:
-    """Return the set of high-risk Python calls resolvable from an AST."""
-    visitor = _HighRiskPythonCallVisitor()
-    visitor.visit(tree)
-    return {
-        HighRiskPythonCall(name=name, rule_code=_rule_code_for_high_risk_call(name)) for name in visitor.risky_calls
-    }
 
 
 def high_risk_python_calls_in_tree(tree: ast.AST) -> set[HighRiskPythonCall]:
@@ -2090,11 +2003,12 @@ def _add_python_archive_member_call_checks(
     for rule_code in sorted(calls_by_rule):
         names = sorted(calls_by_rule[rule_code])
         reason = f"high-risk calls: {', '.join(names)}"
+        severity = IssueSeverity.CRITICAL if rule_code in {"S109", "S110"} else IssueSeverity.WARNING
         result.add_check(
             name=_PYTHON_MEMBER_CHECK_NAME,
             passed=False,
             message=f"High-risk Python code found in {archive_kind} member {member_name}: {reason}",
-            severity=IssueSeverity.WARNING,
+            severity=severity,
             location=f"{archive_path}:{member_name}",
             details={"entry": member_name, "reason": reason},
             rule_code=rule_code,

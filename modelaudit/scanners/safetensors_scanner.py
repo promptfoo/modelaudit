@@ -487,7 +487,7 @@ class SafeTensorsScanner(BaseScanner):
                                 ),
                             )
 
-                        if isinstance(value, str) and not self._is_primarily_documentation_metadata(str(key), value):
+                        if isinstance(value, str):
                             lower_val = value.lower()
 
                             # Check for simple code-like patterns
@@ -612,43 +612,11 @@ class SafeTensorsScanner(BaseScanner):
                         },
                     )
 
-    @staticmethod
-    def _is_primarily_documentation_metadata(key: str, value: str) -> bool:
-        """Return True for documentation-scoped, majority narrative metadata."""
-        normalized_key = key.strip().lower().replace("-", "_")
-        if normalized_key not in _DOCUMENTATION_METADATA_KEYS:
-            return False
-
-        lines = [line.strip() for line in value.splitlines() if line.strip()]
-        if not lines:
-            return False
-
-        doc_line_count = 0
-        for line in lines:
-            lowered = line.lower()
-            if lowered.startswith(_DOCUMENTATION_LINE_PREFIXES):
-                doc_line_count += 1
-                continue
-            if (
-                len(line.split()) >= 6
-                and not lowered.startswith(("from ", "import "))
-                and not re.match(r"(?:return\s+)?[A-Za-z_][\w.]*\s*\(", line)
-            ):
-                doc_line_count += 1
-
-        return doc_line_count > len(lines) / 2
-
     def _analyze_metadata_content(self, metadata: dict[str, Any], result: ScanResult, path: str) -> None:
         """Analyze SafeTensors metadata content for injection attacks"""
 
         # Convert metadata to string for pattern analysis
         metadata_str = json.dumps(metadata, indent=2, ensure_ascii=False)
-        executable_metadata = {
-            key: value
-            for key, value in metadata.items()
-            if not (isinstance(value, str) and self._is_primarily_documentation_metadata(str(key), value))
-        }
-        executable_metadata_str = json.dumps(executable_metadata, indent=2, ensure_ascii=False)
 
         # XSS/HTML injection patterns
         html_patterns = [
@@ -698,7 +666,7 @@ class SafeTensorsScanner(BaseScanner):
         ]
 
         for pattern in code_patterns:
-            matches = re.findall(pattern, executable_metadata_str, re.IGNORECASE)
+            matches = re.findall(pattern, metadata_str, re.IGNORECASE)
             if matches:
                 result.add_check(
                     name="SafeTensors Code Injection Detection",

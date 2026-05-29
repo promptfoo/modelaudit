@@ -143,7 +143,6 @@ def pytest_runtest_setup(item):
             "test_jit_script_detector.py",  # JIT embedded Python execution regressions
             "test_keras_h5_scanner.py",  # Keras H5 scanner CVE-2025-9905 tests
             "test_cve_detection.py",  # CVE detection tests
-            "test_jit_script_detector.py",  # JIT embedded Python execution detector tests
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
             "test_pytorch_binary_scanner.py",  # PyTorch binary scanner outcome regressions
             "test_paddle_scanner.py",  # PaddlePaddle scanner tests

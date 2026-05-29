@@ -1294,6 +1294,42 @@ class TorchServeMarScanner(BaseScanner):
             return resolved_head
         return ".".join([resolved_head, *tail])
 
+    def _resolve_getattr_call_name(self, node: ast.AST, aliases: dict[str, str]) -> str | None:
+        if isinstance(node, ast.Attribute) and node.attr == "__call__":
+            return self._resolve_getattr_call_name(node.value, aliases)
+
+        if not isinstance(node, ast.Call):
+            return None
+
+        helper_name = self._resolve_call_name(node.func)
+        if helper_name is None:
+            return None
+
+        resolved_helper_name = self._apply_alias(helper_name, aliases)
+        if resolved_helper_name not in {"getattr", "builtins.getattr"}:
+            return None
+
+        target_root_node: ast.AST | None = node.args[0] if node.args else None
+        attr_name_node: ast.AST | None = node.args[1] if len(node.args) >= 2 else None
+        for keyword in node.keywords:
+            if keyword.arg == "object" and target_root_node is None:
+                target_root_node = keyword.value
+            elif keyword.arg == "name" and attr_name_node is None:
+                attr_name_node = keyword.value
+
+        if target_root_node is None or attr_name_node is None:
+            return None
+
+        target_root = self._resolve_call_name(target_root_node)
+        if target_root is None:
+            return None
+
+        if not isinstance(attr_name_node, ast.Constant) or not isinstance(attr_name_node.value, str):
+            return None
+
+        resolved_target_root = self._apply_alias(target_root, aliases)
+        return f"{resolved_target_root}.{attr_name_node.value}"
+
     def _parse_python_source(self, source_bytes: bytes) -> tuple[ast.Module | None, str | None]:
         try:
             source = source_bytes.decode("utf-8")

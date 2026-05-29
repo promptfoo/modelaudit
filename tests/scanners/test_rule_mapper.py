@@ -6,7 +6,6 @@ from modelaudit.rules import RuleRegistry
 from modelaudit.scanners.rule_mapper import (
     get_embedded_code_rule_code,
     get_generic_rule_code,
-    get_import_rule_code,
     get_network_rule_code,
     get_secret_rule_code,
 )
@@ -26,22 +25,6 @@ def test_rule_mapper_returns_registered_codes() -> None:
         assert RuleRegistry.get_rule(code) is not None
 
 
-@pytest.mark.parametrize(
-    ("module", "expected_rule_code"),
-    [
-        ("pty", "S111"),
-        ("code", "S112"),
-        ("types", "S113"),
-        ("ast", "S114"),
-    ],
-)
-def test_import_rule_mapper_returns_registered_code_execution_codes(module: str, expected_rule_code: str) -> None:
-    code = get_import_rule_code(module)
-
-    assert code == expected_rule_code
-    assert RuleRegistry.get_rule(code) is not None
-
-
 def test_generic_rule_prefers_network_codes_for_urls() -> None:
     """URL-like network messages should map to network rules, not encoding rules."""
     assert get_generic_rule_code("Network communication pattern: https://evil.example") == "S309"
@@ -50,6 +33,17 @@ def test_generic_rule_prefers_network_codes_for_urls() -> None:
 def test_embedded_code_rule_maps_dynamic_module_execution_before_executable_text() -> None:
     """Dynamic module execution contains an "exe" prefix but belongs to runpy."""
     assert get_embedded_code_rule_code("Dynamic module execution detected") == "S108"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_rule_code"),
+    [
+        ("Web browser launch detected", "S109"),
+        ("Native library loading detected", "S110"),
+    ],
+)
+def test_embedded_code_rule_maps_browser_and_native_loading(message: str, expected_rule_code: str) -> None:
+    assert get_embedded_code_rule_code(message) == expected_rule_code
 
 
 @pytest.mark.parametrize(

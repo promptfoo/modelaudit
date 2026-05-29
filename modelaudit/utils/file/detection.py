@@ -914,9 +914,6 @@ PROTO0_1_MAX_PROBE_BYTES: int = 64 * 1024
 # budget aligned with the byte budget so trivial padding cannot hide a later
 # dangerous opcode inside the sampled prefix.
 PROTO0_1_MAX_PROBE_OPCODES: int = PROTO0_1_MAX_PROBE_BYTES
-# Fully inspect short scalar-only text near-matches before candidate routing.
-# Longer files remain unresolved so a late model payload cannot be hidden.
-PROTO0_1_MAX_TRIVIAL_TEXT_VALIDATION_BYTES: int = 1024 * 1024
 PROTO0_1_START_BYTES: bytes = b"()]}cilp0FGIJKLMNSTUVX"
 PROTO0_1_IGNORABLE_TRAILING_BYTES: bytes = b" \t\r\n\x00"
 PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES: tuple[str, ...] = (
@@ -983,21 +980,6 @@ _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES: frozenset[str] = frozenset(
         "STACK_GLOBAL",
     }
 )
-
-
-def _read_proto_length_delimited_bounds_stream(
-    stream: BinaryIO,
-    end_offset: int,
-) -> tuple[int, int, int] | None:
-    """Return bounds for a length-delimited value without reading its payload."""
-    length = _read_proto_varint_stream(stream, end_offset)
-    if length is None:
-        return None
-    value_start = stream.tell()
-    value_end = value_start + length
-    if value_end > end_offset:
-        return None
-    return length, value_start, value_end
 
 
 def _read_proto_length_delimited_bounds_stream(
@@ -1286,7 +1268,7 @@ def _looks_like_onnx_model_proto_stream(stream: BinaryIO, end_offset: int) -> bo
                 return False
 
         fields_seen += 1
-        if has_specification_version and has_description and has_model_type:
+        if has_plausible_ir_version and has_graph:
             return True
 
     if stream.tell() < end_offset:
@@ -2537,14 +2519,7 @@ def _is_tensorflow_metagraph_file(path: str) -> bool:
 
         content = file_path.read_bytes()
         metagraph = MetaGraphDef()
-        parse_failed = False
-        try:
-            metagraph.ParseFromString(content)
-        except Exception:
-            # Protobuf preserves completed fields before a malformed trailing
-            # tag. Keep real graph-bearing payloads routed so scanning can
-            # report both recovered findings and incomplete coverage.
-            parse_failed = True
+        metagraph.ParseFromString(content)
 
         graph_node_count = len(metagraph.graph_def.node)
         function_node_count = sum(len(function.node_def) for function in metagraph.graph_def.library.function)
@@ -3878,10 +3853,6 @@ def detect_file_format_from_magic(path: str) -> str:
             if renamed_tensorflow_format != "unknown":
                 return renamed_tensorflow_format
 
-            renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
-            if renamed_tensorflow_format != "unknown":
-                return renamed_tensorflow_format
-
     except OSError:
         return "unknown"
 
@@ -4119,8 +4090,6 @@ def detect_file_format(path: str) -> str:
     # Check for GGUF/GGML magic bytes
     if magic4 == b"CBM1":
         return "catboost"
-    if magic4 == b"RKNN":
-        return "rknn"
     if magic4 == b"GGUF":
         return "gguf"
     if magic4 in GGML_MAGIC_VARIANTS:

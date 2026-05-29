@@ -137,8 +137,9 @@ _normalize_unclassified_scan_failure = core_results.normalize_unclassified_scan_
 determine_exit_code = core_results.determine_exit_code
 merge_scan_result = core_results.merge_scan_result
 
-# Compatibility export consumed by asset-extraction tests and integrations.
-HEADER_FORMAT_TO_SCANNER_ID = _ROUTED_HEADER_FORMAT_TO_SCANNER_ID
+HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
+_COMPRESSED_HEADER_FORMATS = frozenset({"compressed", "gzip", "bzip2", "xz", "lz4", "zlib"})
+_R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
 _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
 _XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
@@ -307,7 +308,19 @@ def _preferred_scanner_can_handle(
     path: str,
 ) -> bool:
     """Honor trusted header routing even when scanner can_handle is suffix-gated."""
-    return routed_scanner_can_handle(scanner_class, scanner_id, header_format, path)
+    if scanner_class.can_handle(path):
+        return True
+
+    if os.path.exists(path) and _is_direct_header_route(scanner_id, header_format):
+        logger.debug(
+            "Using %s scanner for %s based on detected %s header despite can_handle rejection",
+            scanner_class.name,
+            path,
+            header_format,
+        )
+        return True
+
+    return False
 
 
 def _mark_xgboost_pickle_extension_spoof(result: ScanResult, path: str, ext: str) -> None:

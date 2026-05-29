@@ -669,43 +669,6 @@ def test_pytorch_zip_scanner_normal_archive_skips_relaxed_crc_signal(tmp_path: P
     assert not [check for check in result.checks if check.name == "PyTorch ZIP CRC Handling"]
 
 
-def test_pytorch_zip_scanner_path_traversal_named_pickle_keeps_archive_rule(tmp_path: Path) -> None:
-    model_path = tmp_path / "traversal.pt"
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("version", "3")
-        zip_file.writestr("../../pickle_payload.bin", b"not a pickle")
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    traversal_checks = [
-        check
-        for check in result.checks
-        if check.name == "Path Traversal Protection" and check.status == CheckStatus.FAILED
-    ]
-    assert len(traversal_checks) == 1
-    assert traversal_checks[0].severity == IssueSeverity.CRITICAL
-    assert traversal_checks[0].rule_code == "S405"
-    assert not [check for check in result.checks if check.rule_code == "S213"]
-
-
-def test_pytorch_zip_scanner_executable_named_pickle_keeps_executable_rule(tmp_path: Path) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "executable.pt")
-    with zipfile.ZipFile(model_path, "a") as zip_file:
-        zip_file.writestr("archive/data/pickle_payload.exe", b"not executed")
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    executable_checks = [
-        check
-        for check in result.checks
-        if check.name == "Executable File Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert len(executable_checks) == 1
-    assert executable_checks[0].severity == IssueSeverity.CRITICAL
-    assert executable_checks[0].rule_code == "S501"
-    assert not [check for check in result.checks if check.rule_code == "S213"]
-
-
 def test_pytorch_zip_scanner_scans_shadowed_duplicate_data_pkl(tmp_path: Path) -> None:
     """A benign last-write duplicate must not hide a malicious earlier data.pkl entry."""
     model_path = tmp_path / "duplicate_data_pkl.pt"
@@ -761,8 +724,8 @@ def test_pytorch_zip_scanner_conflicting_duplicate_data_pkl_is_info_only(tmp_pat
     assert result.metadata["pickle_files"] == ["data.pkl", "data.pkl"]
 
 
-def test_pytorch_zip_scanner_invalid_zip(tmp_path: Path) -> None:
-    """Invalid ZIP structure is incomplete coverage, not a detected hazard."""
+def test_pytorch_zip_scanner_invalid_zip(tmp_path):
+    """Test scanning an invalid ZIP file."""
     # Create an invalid ZIP file
     invalid_path = tmp_path / "invalid.pt"
     invalid_path.write_bytes(b"This is not a valid ZIP file")
@@ -770,10 +733,8 @@ def test_pytorch_zip_scanner_invalid_zip(tmp_path: Path) -> None:
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(invalid_path))
 
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "pytorch_zip_format_unrecognized" in result.metadata["scan_outcome_reasons"]
-    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+    # Should have an error about invalid ZIP
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
         "invalid" in issue.message.lower() or "corrupt" in issue.message.lower() or "error" in issue.message.lower()
         for issue in result.issues
@@ -1617,6 +1578,41 @@ def test_pytorch_zip_scans_unmarked_runpy_execution_in_archive_data(tmp_path: Pa
     ]
     assert matching_failures
     assert all(check.rule_code == "S108" for check in matching_failures)
+
+
+def test_pytorch_zip_scans_webbrowser_and_ctypes_execution_in_archive_data(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    payload = (
+        b"\x00\xffdef payload():\n"
+        b"    import ctypes\n"
+        b"    import webbrowser\n"
+        b"    webbrowser.get().open.__call__('https://example.invalid')\n"
+        b"    ctypes.cdll['msvcrt'].printf(b'x')\n"
+        b"    ctypes.cdll.__getitem__('msvcrt')\n"
+        b"    loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        b"    return loader.msvcrt.printf(b'x')\n"
+        b"\x00MODEL-FRAMING"
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    matching_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+    ]
+    assert any(
+        check.rule_code == "S109" and "Web browser launch detected" in check.message for check in matching_failures
+    )
+    assert any(
+        check.rule_code == "S110" and "Native library loading detected" in check.message for check in matching_failures
+    )
 
 
 def test_pytorch_zip_ignores_certain_replaced_runpy_execution_in_archive_data(tmp_path: Path) -> None:

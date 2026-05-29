@@ -77,17 +77,9 @@ def test_cntk_scanner_rejects_misnamed_non_cntk_file(tmp_path: Path) -> None:
     assert not CntkScanner.can_handle(str(path))
 
 
-@pytest.mark.parametrize("filename", ["graph.model", "renamed.jpg"])
-def test_cntk_scanner_handles_strict_signature_independently_of_suffix(tmp_path: Path, filename: str) -> None:
-    path = tmp_path / filename
+def test_cntk_scanner_rejects_model_extension_in_v1_scope(tmp_path: Path) -> None:
+    path = tmp_path / "deferred.model"
     _write_cntkv2(path, payload=b"inputs outputs")
-    assert CntkScanner.can_handle(str(path))
-
-
-def test_cntk_scanner_rejects_renamed_structure_near_match(tmp_path: Path) -> None:
-    path = tmp_path / "near-match.jpg"
-    _write_cntkv2(path, payload=b"inputs outputs", include_structure=False)
-
     assert not CntkScanner.can_handle(str(path))
 
 

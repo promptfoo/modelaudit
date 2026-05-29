@@ -10,7 +10,6 @@ from typing import Any
 from ..scanner_registry_metadata import get_scanner_registry_metadata
 from ..scanner_selection import ScannerSelectionPolicy, policy_from_config
 from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
-from .routing import routed_scanner_can_handle, select_routed_scanner_id
 
 logger = logging.getLogger(__name__)
 
@@ -353,6 +352,14 @@ class ScannerRegistry:
                     return scanner_class
             return None
 
+        # Some ZIP-backed artifacts intentionally use pickle/checkpoint suffixes.
+        # If stricter extension-specific scanners all decline, fall back to the
+        # generic ZIP scanner so helper-level routing does not drop coverage.
+        if is_zip_file and (scanner_selection is None or scanner_selection.allows("zip")):
+            scanner_class = self._load_scanner("zip")
+            if scanner_class and scanner_class.can_handle(path):
+                return scanner_class
+
         try:
             from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
 
@@ -362,7 +369,7 @@ class ScannerRegistry:
             header_format = "unknown"
             extension_format = "unknown"
 
-        header_scanner_id = select_routed_scanner_id(path, header_format, extension=file_ext)
+        header_scanner_id = self.get_scanner_id_for_header_format(header_format)
         header_scanner_info = self._scanners.get(header_scanner_id or "")
         extension_scanner_id = self.get_scanner_id_for_header_format(extension_format)
         compatible_header_route = (
@@ -377,14 +384,7 @@ class ScannerRegistry:
             and (scanner_selection is None or scanner_selection.allows(header_scanner_id))
         ):
             scanner_class = self._load_scanner(header_scanner_id)
-            if scanner_class and routed_scanner_can_handle(scanner_class, header_scanner_id, header_format, path):
-                return scanner_class
-
-        # If structure-specific scanners decline a ZIP, preserve generic ZIP
-        # recursion so nested payload analysis is never dropped.
-        if is_zip_file and (scanner_selection is None or scanner_selection.allows("zip")):
-            scanner_class = self._load_scanner("zip")
-            if scanner_class and scanner_class.can_handle(path):
+            if scanner_class and (scanner_class.can_handle(path) or os.path.exists(path)):
                 return scanner_class
 
         # Manifest-like config files sometimes intentionally use generic or

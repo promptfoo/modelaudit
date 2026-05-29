@@ -16,12 +16,12 @@ from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 # 2) CNTKv2 protobuf artifacts include protobuf key markers for "version" and
 #    "uid", typically alongside structure keys like "CompositeFunction" and
 #    "primitive_functions".
-# 3) Strict content markers disambiguate CNTK from formats that share common
-#    extensions such as XGBoost's ".model".
+# 3) ".model" is intentionally excluded from v1 scanner ownership because it
+#    overlaps with XGBoost's ".model" extension in this codebase.
 DISCOVERY_ASSUMPTIONS = [
     "Legacy CNTK marker uses UTF-16LE BCN/BVersion section headers.",
     "CNTKv2 artifacts expose protobuf key markers for version/uid and graph structure fields.",
-    "Strict content markers permit CNTK ownership independently of a file extension.",
+    "The .model extension is excluded in v1 to avoid ambiguity with XGBoost .model files.",
 ]
 
 _CNTK_SUPPORTED_EXTENSIONS = frozenset({".dnn", ".cmf"})

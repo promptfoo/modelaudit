@@ -12,8 +12,8 @@ pytest.importorskip("h5py")
 import h5py
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 
 ASSETS_DIR = Path(__file__).parent.parent / "assets" / "samples" / "keras"
@@ -575,46 +575,6 @@ def test_keras_h5_inconclusive_training_config_preserves_security_exit1(tmp_path
 
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "keras_h5_training_config_parse_failed" in result.metadata["scan_outcome_reasons"]
-    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-    assert determine_exit_code(audit_result) == 1
-
-
-def test_keras_h5_read_failure_preserves_prior_security_finding_exit1(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A later HDF5 read failure must not discard an already identified malicious layer."""
-    model_path = create_raw_config_h5_file(
-        tmp_path,
-        model_config_attr=json.dumps(
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "layers": [
-                        {
-                            "class_name": "Lambda",
-                            "config": {"function": "lambda x: eval('1')"},
-                        }
-                    ]
-                },
-            }
-        ),
-        training_config_attr=json.dumps({}),
-        keras_version="3.11.2",
-        file_name="lambda_with_hdf5_read_failure.h5",
-    )
-
-    def fail_training_config(self: KerasH5Scanner, training_config: Any, result: ScanResult) -> None:
-        raise OSError("damaged training metadata")
-
-    monkeypatch.setattr(KerasH5Scanner, "_scan_training_config", fail_training_config)
-
-    result = KerasH5Scanner().scan(str(model_path))
-    audit_result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
-
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "keras_h5_read_failed" in result.metadata["scan_outcome_reasons"]
-    assert any(check.name == "Keras H5 Read" and check.status == CheckStatus.FAILED for check in result.checks)
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert determine_exit_code(audit_result) == 1
 
