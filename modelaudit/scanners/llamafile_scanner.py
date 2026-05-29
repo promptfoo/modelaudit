@@ -30,6 +30,8 @@ LLAMAFILE_RUNTIME_PREVIEW_READ_REASON = "llamafile_runtime_preview_read_failed"
 LLAMAFILE_TORCH7_CARVE_FAILURE_REASON = "llamafile_torch7_payload_carve_failed"
 LLAMAFILE_TORCH7_ANALYSIS_INCOMPLETE_REASON = "llamafile_torch7_analysis_incomplete"
 TORCH7_SIGNATURE_WINDOW_BYTES = 4096
+TORCH7_ACTIONABLE_SIGNAL_CHUNK_BYTES = 64 * 1024
+TORCH7_ACTIONABLE_SIGNAL_CARRY_BYTES = 128
 LLAMAFILE_TORCH7_MAX_CANDIDATE_SCANS = 16
 
 ELF_MAGIC = b"\x7fELF"
@@ -601,13 +603,29 @@ class LlamafileScanner(BaseScanner):
         try:
             with path.open("rb") as handle:
                 handle.seek(offset)
-                payload = handle.read(max_scan_bytes)
+                remaining = max_scan_bytes
+                carry = b""
+                first_chunk = True
+                while remaining > 0:
+                    chunk = handle.read(min(TORCH7_ACTIONABLE_SIGNAL_CHUNK_BYTES, remaining))
+                    if not chunk:
+                        return False
+
+                    haystack = carry + chunk
+                    marker_search_start = len(carry) + (len(b"T7\x00\x00") if first_chunk else 0)
+                    next_marker = haystack.find(b"T7\x00\x00", marker_search_start)
+                    signal_window = haystack if next_marker == -1 else haystack[:next_marker]
+                    if TORCH7_ACTIONABLE_BYTES_RE.search(signal_window) is not None:
+                        return True
+                    if next_marker != -1:
+                        return False
+
+                    carry = haystack[-TORCH7_ACTIONABLE_SIGNAL_CARRY_BYTES:]
+                    remaining -= len(chunk)
+                    first_chunk = False
         except OSError:
             return False
-        next_marker = payload.find(b"T7\x00\x00", len(b"T7\x00\x00"))
-        if next_marker != -1:
-            payload = payload[:next_marker]
-        return TORCH7_ACTIONABLE_BYTES_RE.search(payload) is not None
+        return False
 
     def _scan_embedded_torch7_candidate(
         self,

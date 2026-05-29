@@ -340,6 +340,19 @@ def test_llamafile_keeps_searching_after_non_actionable_candidate_cap(tmp_path: 
     )
 
 
+def test_llamafile_torch7_actionable_signal_probe_stops_at_next_marker(tmp_path: Path) -> None:
+    binary = tmp_path / "torch7-signal-after-next-marker.llamafile"
+    first_candidate = b"T7\x00\x00" + (b"A" * 64)
+    second_candidate = b"T7\x00\x00" + (b"A" * (80 * 1024)) + b"cmd = os.execute('id')\n"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=first_candidate + second_candidate))
+
+    first_offset = binary.read_bytes().index(first_candidate)
+    second_offset = binary.read_bytes().index(second_candidate)
+
+    assert not LlamafileScanner._embedded_torch7_candidate_has_actionable_signal(binary, first_offset, 128 * 1024)
+    assert LlamafileScanner._embedded_torch7_candidate_has_actionable_signal(binary, second_offset, 128 * 1024)
+
+
 def test_llamafile_ignores_benign_torch7_magic_only_marker(tmp_path: Path) -> None:
     binary = tmp_path / "benign-torch7-marker-only.llamafile"
     binary.write_bytes(_build_llamafile_blob(embedded_payload=b"T7\x00\x00" + (b"A" * 8192)))
