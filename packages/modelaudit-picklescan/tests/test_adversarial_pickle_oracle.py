@@ -403,6 +403,15 @@ def _has_dynamic_type_callable_attribute_finding(report: PickleReport) -> bool:
     )
 
 
+def _has_dynamic_type_unknown_key_overflow_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.WARNING
+        and finding.rule_code == "DYNAMIC_TYPE_CALLABLE_ATTRIBUTE"
+        and finding.details.get("tracked_dynamic_key_value_overflow") is True
+        for finding in report.findings
+    )
+
+
 def _has_critical_global_finding(report: PickleReport, module: str, name: str) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -2183,6 +2192,12 @@ def _dynamic_dunder_name_payload(method_stem: str) -> bytes:
     return b"".join(parts)
 
 
+def _untracked_str_add_payload(left: str, right: str) -> bytes:
+    parts = [_short_binunicode(b"builtins"), _short_binunicode(b"str.__add__"), b"\x93"]
+    parts += [_text_operand(left), _text_operand(right), b"\x86R"]
+    return b"".join(parts)
+
+
 def _builtins_type_del_finalizer_payload(marker: Path, *, drop_instance: bool) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
@@ -2202,6 +2217,41 @@ def _builtins_type_dynamic_del_finalizer_payload(marker: Path, *, drop_instance:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
     parts += [b"(", _text_operand("DerivedPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85", b"}", _dynamic_dunder_name_payload("del")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"s", b"tR\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R"]
+    if drop_instance:
+        parts += [b"0N"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _builtins_type_dynamic_del_finalizer_overflow_payload(marker: Path, *, drop_instance: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"(", _text_operand("DerivedPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85", b"}"]
+    for index in range(16):
+        parts += [_untracked_str_add_payload("pad", str(index)), _int_operand(0), b"s"]
+    parts += [_untracked_str_add_payload("__de", "l__")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"s", b"tR\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R"]
+    if drop_instance:
+        parts += [b"0N"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _builtins_type_new_dynamic_del_finalizer_payload(marker: Path, *, drop_instance: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type.__new__"), b"\x93"]
+    parts += [b"("]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [_text_operand("DerivedPath")]
     parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
     parts += [b"\x85", b"}", _dynamic_dunder_name_payload("del")]
     parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
@@ -5391,6 +5441,64 @@ def test_scan_bytes_blocks_builtins_type_dynamic_del_finalizer_rce(tmp_path: Pat
     type(control_result).__del__ = _noop_del
 
     report = scan_bytes(payload, source="builtins-type-dynamic-del-finalizer-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_dynamic_type_callable_attribute_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
+
+
+def test_scan_bytes_fails_closed_on_dynamic_type_unknown_key_overflow(tmp_path: Path) -> None:
+    marker = tmp_path / "builtins_type_dynamic_del_overflow_marker"
+    control_payload = _builtins_type_dynamic_del_finalizer_overflow_payload(marker, drop_instance=False)
+    payload = _builtins_type_dynamic_del_finalizer_overflow_payload(marker, drop_instance=True)
+
+    control_report = scan_bytes(
+        control_payload,
+        source="builtins-type-dynamic-del-overflow-control.pkl",
+    )
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_dynamic_type_unknown_key_overflow_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DerivedPath"
+    assert not marker.exists()
+    type(control_result).__del__ = _noop_del
+
+    report = scan_bytes(payload, source="builtins-type-dynamic-del-overflow-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_dynamic_type_unknown_key_overflow_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_type_new_dynamic_del_finalizer_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "builtins_type_new_dynamic_del_finalizer_rce_marker"
+    control_payload = _builtins_type_new_dynamic_del_finalizer_payload(marker, drop_instance=False)
+    payload = _builtins_type_new_dynamic_del_finalizer_payload(marker, drop_instance=True)
+
+    control_report = scan_bytes(
+        control_payload,
+        source="builtins-type-new-dynamic-del-finalizer-control.pkl",
+    )
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_dynamic_type_callable_attribute_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DerivedPath"
+    assert not marker.exists()
+    type(control_result).__del__ = _noop_del
+
+    report = scan_bytes(payload, source="builtins-type-new-dynamic-del-finalizer-rce.pkl")
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert _has_dynamic_type_callable_attribute_finding(report)

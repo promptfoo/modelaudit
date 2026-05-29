@@ -448,7 +448,8 @@ struct CallableInvocation {
 
 struct DynamicTypeCallableAttribute {
     attribute_name: Option<String>,
-    callable: GlobalRef,
+    callable: Option<GlobalRef>,
+    unknown_key_values_overflowed: bool,
 }
 
 enum MappingLookup<'a> {
@@ -895,6 +896,7 @@ impl<'a> ScanState<'a> {
                 self.stack.push(StackValue::TrackedDict {
                     entries: Vec::new(),
                     unknown_key_values: Vec::new(),
+                    unknown_key_values_overflowed: false,
                     memo_index: None,
                 });
             }
@@ -1296,6 +1298,7 @@ impl<'a> ScanState<'a> {
     fn tracked_dict_from_values(&self, values: &[StackValue]) -> StackValue {
         let mut entries = Vec::new();
         let mut unknown_key_values = Vec::new();
+        let mut unknown_key_values_overflowed = false;
         for pair in values.chunks_exact(2) {
             let key = pair
                 .first()
@@ -1306,6 +1309,7 @@ impl<'a> ScanState<'a> {
                 } else {
                     Self::insert_tracked_dict_unknown_key_value(
                         &mut unknown_key_values,
+                        &mut unknown_key_values_overflowed,
                         value.clone(),
                     );
                 }
@@ -1314,6 +1318,7 @@ impl<'a> ScanState<'a> {
         StackValue::TrackedDict {
             entries,
             unknown_key_values,
+            unknown_key_values_overflowed,
             memo_index: None,
         }
     }
@@ -1322,8 +1327,8 @@ impl<'a> ScanState<'a> {
         let memo_index = match self.stack.last_mut() {
             Some(StackValue::TrackedDict {
                 entries,
-                unknown_key_values: _,
                 memo_index,
+                ..
             }) => {
                 Self::insert_tracked_dict_entry(entries, key.to_string(), value.clone());
                 *memo_index
@@ -1341,20 +1346,31 @@ impl<'a> ScanState<'a> {
         let memo_index = match self.stack.last_mut() {
             Some(StackValue::TrackedDict {
                 unknown_key_values,
+                unknown_key_values_overflowed,
                 memo_index,
                 ..
             }) => {
-                Self::insert_tracked_dict_unknown_key_value(unknown_key_values, value.clone());
+                Self::insert_tracked_dict_unknown_key_value(
+                    unknown_key_values,
+                    unknown_key_values_overflowed,
+                    value.clone(),
+                );
                 *memo_index
             }
             _ => None,
         };
         if let Some(memo_index) = memo_index {
             if let Some(StackValue::TrackedDict {
-                unknown_key_values, ..
+                unknown_key_values,
+                unknown_key_values_overflowed,
+                ..
             }) = self.memo.get_mut(&memo_index)
             {
-                Self::insert_tracked_dict_unknown_key_value(unknown_key_values, value);
+                Self::insert_tracked_dict_unknown_key_value(
+                    unknown_key_values,
+                    unknown_key_values_overflowed,
+                    value,
+                );
             }
         }
     }
@@ -1376,10 +1392,13 @@ impl<'a> ScanState<'a> {
 
     fn insert_tracked_dict_unknown_key_value(
         unknown_key_values: &mut Vec<StackValue>,
+        unknown_key_values_overflowed: &mut bool,
         value: StackValue,
     ) {
         if unknown_key_values.len() < MAX_TRACKED_DICT_UNKNOWN_KEY_VALUES {
             unknown_key_values.push(value);
+        } else {
+            *unknown_key_values_overflowed = true;
         }
     }
 
@@ -1602,10 +1621,11 @@ impl<'a> ScanState<'a> {
         op_name: &'static str,
         position: usize,
     ) {
-        if !Self::is_builtin_type_callable(callable_value) {
-            return;
-        }
         let Some(arguments) = arguments else {
+            return;
+        };
+        let Some(arguments) = Self::dynamic_type_constructor_arguments(callable_value, arguments)
+        else {
             return;
         };
         let [type_name_value, _, namespace] = arguments else {
@@ -1622,6 +1642,30 @@ impl<'a> ScanState<'a> {
             let attribute_name = attribute
                 .attribute_name
                 .unwrap_or_else(|| "__dynamic__".to_string());
+            let callable_module = attribute
+                .callable
+                .as_ref()
+                .map_or(DetailValue::None, |callable| {
+                    DetailValue::String(callable.module.clone())
+                });
+            let callable_name = attribute
+                .callable
+                .as_ref()
+                .map_or(DetailValue::None, |callable| {
+                    DetailValue::String(callable.name.clone())
+                });
+            let callable_import_reference = attribute
+                .callable
+                .as_ref()
+                .map_or(DetailValue::None, |callable| {
+                    DetailValue::String(callable.symbol())
+                });
+            let global_position = attribute
+                .callable
+                .as_ref()
+                .map_or(DetailValue::None, |callable| {
+                    DetailValue::UInt(callable.position as u64)
+                });
             self.add_finding(Finding {
                 message: format!(
                     "Found {op_name} opcode constructing a dynamic type with callable attribute: {attribute_name}"
@@ -1645,21 +1689,16 @@ impl<'a> ScanState<'a> {
                         "dynamic_attribute_name".to_string(),
                         DetailValue::Bool(dynamic_attribute_name),
                     ),
-                    (
-                        "callable_module".to_string(),
-                        DetailValue::String(attribute.callable.module.clone()),
-                    ),
-                    (
-                        "callable_name".to_string(),
-                        DetailValue::String(attribute.callable.name.clone()),
-                    ),
+                    ("callable_module".to_string(), callable_module),
+                    ("callable_name".to_string(), callable_name),
                     (
                         "callable_import_reference".to_string(),
-                        DetailValue::String(attribute.callable.symbol()),
+                        callable_import_reference,
                     ),
+                    ("global_position".to_string(), global_position),
                     (
-                        "global_position".to_string(),
-                        DetailValue::UInt(attribute.callable.position as u64),
+                        "tracked_dynamic_key_value_overflow".to_string(),
+                        DetailValue::Bool(attribute.unknown_key_values_overflowed),
                     ),
                 ],
                 why: Some(
@@ -1669,8 +1708,35 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn is_builtin_type_callable(callable_value: Option<&StackValue>) -> bool {
+    fn dynamic_type_constructor_arguments<'args>(
+        callable_value: Option<&StackValue>,
+        arguments: &'args [StackValue],
+    ) -> Option<&'args [StackValue]> {
         let Some(StackValue::Global(reference)) = callable_value else {
+            return None;
+        };
+        if reference.malformed
+            || !matches!(
+                reference.module.as_str(),
+                "builtins" | "__builtin__" | "__builtins__"
+            )
+        {
+            return None;
+        }
+        if reference.name == "type" && arguments.len() == 3 {
+            return Some(arguments);
+        }
+        if reference.name == "type.__new__"
+            && arguments.len() == 4
+            && Self::is_builtin_type_value(arguments.first())
+        {
+            return Some(&arguments[1..]);
+        }
+        None
+    }
+
+    fn is_builtin_type_value(value: Option<&StackValue>) -> bool {
+        let Some(StackValue::Global(reference)) = value else {
             return false;
         };
         !reference.malformed
@@ -1687,6 +1753,7 @@ impl<'a> ScanState<'a> {
         let StackValue::TrackedDict {
             entries,
             unknown_key_values,
+            unknown_key_values_overflowed,
             memo_index,
         } = namespace
         else {
@@ -1702,7 +1769,8 @@ impl<'a> ScanState<'a> {
             if let Some(callable) = Self::callable_reference_from_value(Some(value)) {
                 attributes.push(DynamicTypeCallableAttribute {
                     attribute_name: Some(key),
-                    callable,
+                    callable: Some(callable),
+                    unknown_key_values_overflowed: false,
                 });
             }
         }
@@ -1710,9 +1778,20 @@ impl<'a> ScanState<'a> {
             if let Some(callable) = Self::callable_reference_from_value(Some(value)) {
                 attributes.push(DynamicTypeCallableAttribute {
                     attribute_name: None,
-                    callable,
+                    callable: Some(callable),
+                    unknown_key_values_overflowed: false,
                 });
             }
+        }
+        if self.current_tracked_dict_unknown_key_values_overflowed(
+            *unknown_key_values_overflowed,
+            *memo_index,
+        ) {
+            attributes.push(DynamicTypeCallableAttribute {
+                attribute_name: None,
+                callable: None,
+                unknown_key_values_overflowed: true,
+            });
         }
         attributes
     }
@@ -2820,6 +2899,23 @@ impl<'a> ScanState<'a> {
             .unwrap_or(unknown_key_values)
     }
 
+    fn current_tracked_dict_unknown_key_values_overflowed(
+        &self,
+        unknown_key_values_overflowed: bool,
+        memo_index: Option<i64>,
+    ) -> bool {
+        memo_index
+            .and_then(|index| self.memo.get(&index))
+            .and_then(|value| match value {
+                StackValue::TrackedDict {
+                    unknown_key_values_overflowed,
+                    ..
+                } => Some(*unknown_key_values_overflowed),
+                _ => None,
+            })
+            .unwrap_or(unknown_key_values_overflowed)
+    }
+
     fn formatter_vformat_invocations(
         &self,
         arguments: &[StackValue],
@@ -3492,10 +3588,12 @@ impl<'a> ScanState<'a> {
             StackValue::TrackedDict {
                 entries,
                 unknown_key_values,
+                unknown_key_values_overflowed,
                 ..
             } => StackValue::TrackedDict {
                 entries,
                 unknown_key_values,
+                unknown_key_values_overflowed,
                 memo_index: Some(index),
             },
             value => value,
@@ -3931,12 +4029,14 @@ impl<'a> ScanState<'a> {
 
         let mut result = String::new();
         for (index, item) in items.iter().enumerate() {
+            let item = stack_value_string(item, self.payload)?;
+            let separator_len = if index > 0 { separator.len() } else { 0 };
+            let additional_len = separator_len.saturating_add(item.len());
+            if result.len().saturating_add(additional_len) > MAX_TRACKED_STR_JOIN_RESULT_BYTES {
+                return None;
+            }
             if index > 0 {
                 result.push_str(&separator);
-            }
-            let item = stack_value_string(item, self.payload)?;
-            if result.len().saturating_add(item.len()) > MAX_TRACKED_STR_JOIN_RESULT_BYTES {
-                return None;
             }
             result.push_str(&item);
         }
@@ -5722,6 +5822,61 @@ mod tests {
                 _ => panic!("integer operand did not produce primitive stack value"),
             }
         }
+    }
+
+    #[test]
+    fn str_join_result_counts_separator_bytes_before_appending() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"";
+        let scan = ScanState::new(
+            "str-join-bound.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+        let callable = StackValue::Global(GlobalRef {
+            module: "builtins".to_string(),
+            name: "str.join".to_string(),
+            position: 0,
+            malformed: false,
+        });
+
+        let within_bound = vec![
+            callable.clone(),
+            StackValue::Tuple(vec![
+                StackValue::Text("x".repeat(MAX_TRACKED_STR_JOIN_RESULT_BYTES - 2)),
+                StackValue::Tuple(vec![
+                    StackValue::Text("a".to_string()),
+                    StackValue::Text("b".to_string()),
+                ]),
+            ]),
+        ];
+        assert!(matches!(
+            scan.str_join_result(&within_bound),
+            Some(StackValue::Text(value)) if value.len() == MAX_TRACKED_STR_JOIN_RESULT_BYTES
+        ));
+
+        let over_bound = vec![
+            callable,
+            StackValue::Tuple(vec![
+                StackValue::Text("x".repeat(MAX_TRACKED_STR_JOIN_RESULT_BYTES - 1)),
+                StackValue::Tuple(vec![
+                    StackValue::Text("a".to_string()),
+                    StackValue::Text("b".to_string()),
+                ]),
+            ]),
+        ];
+        assert!(scan.str_join_result(&over_bound).is_none());
     }
 
     #[test]

@@ -60,6 +60,7 @@ pub(crate) enum StackValue {
     TrackedDict {
         entries: Vec<(String, StackValue)>,
         unknown_key_values: Vec<StackValue>,
+        unknown_key_values_overflowed: bool,
         memo_index: Option<i64>,
     },
     MappingWrapper {
@@ -125,12 +126,21 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
         Some(StackValue::TrackedDict {
             entries,
             unknown_key_values,
+            unknown_key_values_overflowed,
             ..
-        }) => format!(
-            "dict(keys={}, dynamic_keys={})",
-            entries.len(),
-            unknown_key_values.len()
-        ),
+        }) => {
+            let overflow = if *unknown_key_values_overflowed {
+                "+overflow"
+            } else {
+                ""
+            };
+            format!(
+                "dict(keys={}, dynamic_keys={}{})",
+                entries.len(),
+                unknown_key_values.len(),
+                overflow
+            )
+        }
         Some(StackValue::MappingWrapper {
             reference,
             mappings,
@@ -242,12 +252,21 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::TrackedDict {
             entries,
             unknown_key_values,
+            unknown_key_values_overflowed,
             ..
-        } => format!(
-            "dict(keys={}, dynamic_keys={})",
-            entries.len(),
-            unknown_key_values.len()
-        ),
+        } => {
+            let overflow = if *unknown_key_values_overflowed {
+                "+overflow"
+            } else {
+                ""
+            };
+            format!(
+                "dict(keys={}, dynamic_keys={}{})",
+                entries.len(),
+                unknown_key_values.len(),
+                overflow
+            )
+        }
         StackValue::MappingWrapper {
             reference,
             mappings,
