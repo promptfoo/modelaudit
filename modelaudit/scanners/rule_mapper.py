@@ -125,6 +125,8 @@ def get_embedded_code_rule_code(code_type: str) -> str | None:
 
     if "torchscript" in code_lower or "jit" in code_lower:
         return _rule("S510")
+    elif "dynamic module execution" in code_lower or "runpy" in code_lower:
+        return _rule("S108")
     elif (
         "windows" in code_lower
         or "pe executable" in code_lower

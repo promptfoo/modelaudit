@@ -1509,6 +1509,58 @@ def test_pytorch_zip_scans_asyncio_subprocess_launch_source_conservatively(tmp_p
     )
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"def payload():\n    return runpy._run_module_as_main('payload')\n",
+        b"def payload():\n    return runpy.run_module('payload')\n",
+        b"def payload():\n    from runpy import run_path as run\n    return run('payload.py')\n",
+        (b"\x00\xffdef payload():\n    from runpy import run_path as run\n    return run('payload.py')\n}"),
+        b"\x00\xfffrom runpy import _run_module_as_main as run\nrun('payload')\n\x00MODEL-FRAMING",
+    ],
+)
+def test_pytorch_zip_scans_unmarked_runpy_execution_in_archive_data(tmp_path: Path, payload: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    jit_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+    ]
+    matching_failures = [
+        check
+        for check in jit_failures
+        if check.location == f"{zip_path}:archive/data/payload.bin"
+        and "Dynamic module execution detected" in check.message
+    ]
+    assert matching_failures
+    assert all(check.rule_code == "S108" for check in matching_failures)
+
+
+def test_pytorch_zip_ignores_certain_replaced_runpy_execution_in_archive_data(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    payload = b"\x00\xffimport runpy\nrunpy.run_path = len\nrunpy.run_path([])\n\x00MODEL-FRAMING"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and "Dynamic module execution detected" in check.message
+        for check in result.checks
+    )
+
+
 def test_pytorch_zip_ignores_string_literal_asyncio_subprocess_launch_with_unrelated_risk(
     tmp_path: Path,
 ) -> None:

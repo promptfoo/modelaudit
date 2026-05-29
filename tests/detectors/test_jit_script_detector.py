@@ -499,6 +499,126 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
         )
 
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"def payload():\n    return runpy._run_module_as_main('payload')\n",
+            b"def payload():\n    return runpy.run_module('payload')\n",
+            b"def payload():\n    from runpy import run_path as run\n    return run('payload.py')\n",
+        ],
+    )
+    def test_scan_model_detects_unmarked_runpy_execution(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_certain_replaced_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = b"def payload():\n    runpy.run_path = len\n    return runpy.run_path([])\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_preserves_possible_runpy_execution_after_conditional_replacement(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def payload():\n    if replace:\n        runpy.run_path = len\n    return runpy.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_binary_prefixed_aliased_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xffdef payload():\n    from runpy import run_path as run\n    return run('payload.py')\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_binary_framed_top_level_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xfffrom runpy import run_path as run\nrun('payload.py')\n\x00MODEL-FRAMING"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_binary_framed_top_level_replaced_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xffimport runpy\nrunpy.run_path = len\nrunpy.run_path([])\n\x00MODEL-FRAMING"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_binary_framed_long_tail_alias_aware_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        tail = b"\n".join(b"tail" for _ in range(jit_script_module._MAX_SNIPPET_PARSE_TRIM_ATTEMPTS + 20))
+        source = (
+            b"\x00\xffdef payload():\n    from runpy import run_path as run\n    return run('payload.py')\n\x00" + tail
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_binary_prefixed_replaced_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xffdef payload():\n    import runpy\n    runpy.run_path = len\n    return runpy.run_path([])\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_ignores_lossy_decoded_string_literal_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    # ignored invalid bytes: "
+            + (b"\xff" * 64)
+            + b"\n    return \"runpy.run_path('payload.py')\"\n\x00\xffMODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_preserves_raw_runpy_match_after_benign_parsed_snippet(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def benign():\n"
+            b"    return \"runpy.run_path('payload.py')\"\n"
+            b"}\n"
+            b"def payload():\n"
+            b"if True print('broken')\n"
+            b"runpy.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
     def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""
         detector_normal = JITScriptDetector({"strict_mode": False})

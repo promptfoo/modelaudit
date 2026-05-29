@@ -140,6 +140,7 @@ def pytest_runtest_setup(item):
             "test_rule_code_registry_consistency.py",  # Scanner literal rule-code registry consistency
             "test_network_comm_detector.py",  # Network URL/path redaction tests
             "test_secrets_detector.py",  # Embedded secret detector redaction tests
+            "test_jit_script_detector.py",  # JIT embedded Python execution regressions
             "test_keras_h5_scanner.py",  # Keras H5 scanner CVE-2025-9905 tests
             "test_cve_detection.py",  # CVE detection tests
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests

@@ -553,6 +553,78 @@ def test_scan_zip_flags_asyncio_subprocess_python_member(tmp_path: Path, source:
 
 
 @pytest.mark.parametrize(
+    ("source", "dangerous_name"),
+    [
+        ("import runpy\nrunpy._run_module_as_main('payload')\n", "runpy._run_module_as_main"),
+        ("import runpy\nrunpy.run_module('payload')\n", "runpy.run_module"),
+        ("from runpy import run_path as run\nrun('payload.py')\n", "runpy.run_path"),
+    ],
+)
+def test_scan_zip_flags_runpy_execution_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S108"
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
+def test_scan_zip_flags_extensionless_runpy_python_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler", "import runpy\nrunpy.run_module('payload')\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S108"
+    assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_module"
+
+
+def test_scan_zip_ignores_extensionless_runpy_near_match(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("notes", "documentation mentions runpy.run_module('payload')\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import runpy\nif replace:\n    runpy.run_path = len\nrunpy.run_path('payload.py')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S108"
+    assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "import os\nos.__dict__['getcwd']()\n",
@@ -590,6 +662,7 @@ def test_scan_zip_flags_asyncio_subprocess_python_member(tmp_path: Path, source:
         "import os\nglobals()['runner'] = os.system\nglobals().pop('runner')\nrunner('safe')\n",
         "import os\nos.__dict__['runner'] = os.system\nos.__dict__.pop('runner')\nos.runner('safe')\n",
         ("import os\nrunner = os.system\nif True:\n    globals()['runner'] = print\nglobals()['runner']('safe')\n"),
+        "import runpy\nrunpy.run_path = len\nrunpy.run_path([])\n",
     ],
 )
 def test_scan_zip_ignores_benign_namespace_mapping_call(tmp_path: Path, source: str) -> None:
@@ -1319,6 +1392,7 @@ def test_scan_zip_ignores_benign_python_file_operations(tmp_path: Path) -> None:
         ("import os\nos.popen('echo hidden')\n", "S101", "os.popen"),
         ("import subprocess\nsubprocess.run(['echo'], check=False)\n", "S103", "subprocess.run"),
         ("import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
+        ("import runpy\nrunpy.run_path('payload.py')\n", "S108", "runpy.run_path"),
         ("eval('1 + 1')\n", "S104", "eval"),
         ("import pickle\npickle.loads(b'\\x80\\x04N.')\n", "S213", "pickle.loads"),
         ("__import__('os').system('echo hidden')\n", "S106", "__import__"),

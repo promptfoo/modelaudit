@@ -757,11 +757,18 @@ def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
             b"    return await launch('id')\n",
             "asyncio.create_subprocess_exec",
         ),
+        (
+            b"import runpy\ndef handle(data, context):\n    return runpy._run_module_as_main('payload')\n",
+            "runpy._run_module_as_main",
+        ),
+        (b"import runpy\ndef handle(data, context):\n    return runpy.run_module('payload')\n", "runpy.run_module"),
+        (
+            b"from runpy import run_path as run\ndef handle(data, context):\n    return run('payload.py')\n",
+            "runpy.run_path",
+        ),
     ],
 )
-def test_scan_detects_os_process_launch_handler_execution_primitive(
-    tmp_path: Path, handler_source: bytes, dangerous_name: str
-) -> None:
+def test_scan_detects_handler_execution_primitive(tmp_path: Path, handler_source: bytes, dangerous_name: str) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
         tmp_path,
@@ -776,6 +783,23 @@ def test_scan_detects_os_process_launch_handler_execution_primitive(
     assert len(handler_failures) == 1
     assert handler_failures[0].severity == IssueSeverity.CRITICAL
     assert dangerous_name in handler_failures[0].message
+
+
+def test_scan_allows_replaced_runpy_handler_api(tmp_path: Path) -> None:
+    handler_source = (
+        b"import runpy\ndef handle(data, context):\n    runpy.run_path = len\n    return runpy.run_path([])\n"
+    )
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="safe_replaced_runpy_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
 
 
 def test_scan_detects_dunder_call_getattr_wrapped_handler_execution_primitive(tmp_path: Path) -> None:
