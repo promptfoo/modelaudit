@@ -621,6 +621,11 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "class MyCDLL(ctypes.CDLL):\n"
         "    pass\n"
         "ctypes.LibraryLoader(MyCDLL).subclasslib\n"
+        "class MyAliasedCDLL(ctypes.CDLL):\n"
+        "    init = ctypes.CDLL.__init__\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        self.init(name)\n"
+        "ctypes.LibraryLoader(MyAliasedCDLL).classaliaslib\n"
         "getattr(ctypes.windll, 'user32')\n"
         "ctypes.windll.__getattr__('advapi32')\n"
         "getattr(ctypes.LibraryLoader(ctypes.CDLL), 'attrlib')\n"
@@ -661,6 +666,7 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.LibraryLoader.conditionalmethod" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.cdll.augmented" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.augmented" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.classaliaslib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.attrlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.user32" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.windll.advapi32" in checks_by_rule["S110"].details["reason"]
@@ -758,6 +764,53 @@ def test_scan_zip_preserves_dynamic_member_risk_after_conditional_overwrite(tmp_
     assert checks_by_rule["S110"].details["reason"] == "high-risk calls: ctypes.windll.kernel32"
 
 
+def test_scan_zip_preserves_library_loader_member_risk_after_other_instance_overwrite(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "safe_loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "safe_loader.payload = len\n"
+        "live_loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "live_loader.payload\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S110"
+    assert python_checks[0].details["reason"] == "high-risk calls: ctypes.LibraryLoader.payload"
+
+
+def test_scan_zip_preserves_webbrowser_member_risk_after_other_controller_overwrite(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import webbrowser\n"
+        "safe_browser = webbrowser.get('safe')\n"
+        "safe_browser.open = len\n"
+        "webbrowser.get('other').open('https://example.invalid')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S109"
+    assert python_checks[0].details["reason"] == "high-risk calls: webbrowser.open"
+
+
 def test_scan_zip_keeps_webbrowser_member_overwrites_controller_local(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = (
@@ -780,30 +833,6 @@ def test_scan_zip_keeps_webbrowser_member_overwrites_controller_local(tmp_path: 
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S109"
     assert python_checks[0].details["reason"] == "high-risk calls: webbrowser.open"
-
-
-def test_scan_zip_keeps_library_loader_member_overwrites_instance_local(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    source = (
-        "import ctypes\n"
-        "safe_loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
-        "safe_loader.payload = len\n"
-        "other_loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
-        "other_loader.payload\n"
-    )
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
-    assert python_checks[0].rule_code == "S110"
-    assert python_checks[0].details["reason"] == "high-risk calls: ctypes.LibraryLoader.payload"
 
 
 def test_scan_zip_restores_dynamic_member_risk_after_delete(tmp_path: Path) -> None:
@@ -1054,6 +1083,7 @@ def test_scan_zip_preserves_safe_runpy_overwrite_before_conditional(tmp_path: Pa
         "import ctypes\nctypes.cdll.__getattribute__('msvcrt')\n",
         "import ctypes\nobject.__getattribute__(ctypes.cdll, 'msvcrt')\n",
         "import ctypes\nctypes.windll.kernel32 = len\nctypes.windll.kernel32\n",
+        "import safe as runpy\nrunpy.run_path = runpy.run_module\nrunpy.run_path('payload')\n",
         "import os\nos.__getattr__('system')('id')\n",
         "import builtins\nbuiltins.__getattr__('eval')('1')\n",
         "import webbrowser\nbrowser = webbrowser.get()\nother = browser\nbrowser.open = len\nother.open([])\n",
