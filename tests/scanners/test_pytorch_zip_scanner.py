@@ -76,6 +76,30 @@ def _pytorch_storage_persistent_id_payload(key: str | bytes) -> bytes:
     )
 
 
+def _pytorch_storage_persistent_id_payload_with_popped_key(key: str, popped_key: str) -> bytes:
+    payload = _pytorch_storage_persistent_id_payload(key)
+    popped_key_bytes = popped_key.encode("utf-8")
+    assert len(popped_key_bytes) < 256
+    assert payload.endswith(b"Q.")
+    return payload[:-2] + b"\x8c" + bytes([len(popped_key_bytes)]) + popped_key_bytes + b"\x940" + payload[-2:]
+
+
+def _short_binbytes(value: bytes) -> bytes:
+    assert len(value) < 256
+    return b"C" + bytes([len(value)]) + value + b"\x94"
+
+
+def _fake_byte_storage_persistent_id_payload(key: str) -> bytes:
+    return (
+        b"\x80\x04("
+        + _short_binbytes(b"storage")
+        + _short_binbytes(b"FakeStorage")
+        + _short_binbytes(key.encode("utf-8"))
+        + _short_binbytes(b"cpu")
+        + b"K\x01tQ."
+    )
+
+
 def _write_zip_with_duplicate_data_pkl(zip_path: Path, first_payload: bytes, second_payload: bytes) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
@@ -506,6 +530,56 @@ def test_pytorch_zip_scanner_probes_unreferenced_numeric_storage_lookalike(tmp_p
 
     result = PyTorchZipScanner().scan(str(model_path))
 
+    assert any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("file") == "archive/data/999"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_only_probes_popped_storage_key_decoys(tmp_path: Path) -> None:
+    """Scanner-only fallback trust must follow the actual BINPERSID operand."""
+    model_path = create_mock_pytorch_zip(tmp_path / "popped_storage_decoy.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload_with_popped_key("0", "999"))
+        zip_file.writestr("archive/data/0", b"\x00" * 8)
+        zip_file.writestr("archive/data/999", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner(config={"scanners": ["pytorch_zip"]}).scan(str(model_path))
+
+    assert result.success is False
+    trusted_keys = {
+        check.details.get("pytorch_storage_key")
+        for check in result.checks
+        if check.details.get("trusted_pytorch_archive_context") is True
+    }
+    assert trusted_keys == {"0"}
+    assert any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("file") == "archive/data/999"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_only_rejects_fake_byte_storage_descriptors(tmp_path: Path) -> None:
+    """Scanner-only fallback trust must require a real torch storage GLOBAL descriptor."""
+    model_path = create_mock_pytorch_zip(tmp_path / "fake_byte_storage.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", _fake_byte_storage_persistent_id_payload("999"))
+        zip_file.writestr("archive/data/999", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner(config={"scanners": ["pytorch_zip"]}).scan(str(model_path))
+
+    assert result.success is False
+    assert not any(
+        check.details.get("trusted_pytorch_archive_context") is True
+        and check.details.get("pytorch_storage_key") == "999"
+        for check in result.checks
+    )
     assert any(
         check.name == "Executable File Detection"
         and check.status == CheckStatus.FAILED
@@ -1365,6 +1439,259 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
     ]
     assert jit_failures
     assert any(check.location == f"{zip_path}:archive/data/payload.bin" for check in jit_failures)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"def payload():\n    return os.posix_spawn('/bin/sh', ['sh'], {})\n",
+        b"def payload():\n    return os.posix_spawnp('sh', ['sh'], {})\n",
+        b"def payload():\n    return os.startfile('payload.exe')\n",
+        b"def payload():\n    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], {})\n",
+        (b"\x00\xffimport os\ndef payload():\n    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], {})\n}"),
+        b"def payload():\n    os.posix_spawn = len\n    return os.posix_spawn([])\n",
+        b"def payload(data):\n    os.posix_spawn = pickle.loads\n    return os.posix_spawn(data)\n",
+    ],
+)
+def test_pytorch_zip_scans_os_process_launch_source_conservatively(tmp_path: Path, payload: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    jit_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(
+        check.location == f"{zip_path}:archive/data/payload.bin" and "OS command execution detected" in check.message
+        for check in jit_failures
+    )
+
+
+def test_pytorch_zip_allows_framed_benign_dict_literal_os_accessor(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    payload = b"\x00\xffdef payload():\n    import os\n    return {'cwd': getattr(os, 'getcwd')()}\n}"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and "OS command execution detected" in check.message
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_ignores_binary_framed_string_literal_os_process_launch(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    payload = b"\x00\xffdef payload():\n    return \"os.posix_spawn('/bin/sh', ['sh'], {})\"\n}"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and "OS command execution detected" in check.message
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"async def payload():\n    return await asyncio.create_subprocess_shell('id')\n",
+        b"async def payload():\n    return await asyncio.subprocess.create_subprocess_exec('id')\n",
+        (
+            b"from asyncio import create_subprocess_exec as launch\n"
+            b"async def payload():\n    return await launch('id')\n"
+        ),
+        (
+            b"\x00\xffdef payload():\n"
+            b"    from asyncio import create_subprocess_shell as launch\n"
+            b"    return launch('id')\n"
+            b"}"
+        ),
+    ],
+)
+def test_pytorch_zip_scans_asyncio_subprocess_launch_source_conservatively(tmp_path: Path, payload: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    jit_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(
+        check.location == f"{zip_path}:archive/data/payload.bin" and "Subprocess execution detected" in check.message
+        for check in jit_failures
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"def payload():\n    return runpy._run_module_as_main('payload')\n",
+        b"def payload():\n    return runpy.run_module('payload')\n",
+        b"def payload():\n    from runpy import run_path as run\n    return run('payload.py')\n",
+        (b"\x00\xffdef payload():\n    from runpy import run_path as run\n    return run('payload.py')\n}"),
+        b"\x00\xfffrom runpy import _run_module_as_main as run\nrun('payload')\n\x00MODEL-FRAMING",
+    ],
+)
+def test_pytorch_zip_scans_unmarked_runpy_execution_in_archive_data(tmp_path: Path, payload: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    jit_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+    ]
+    matching_failures = [
+        check
+        for check in jit_failures
+        if check.location == f"{zip_path}:archive/data/payload.bin"
+        and "Dynamic module execution detected" in check.message
+    ]
+    assert matching_failures
+    assert all(check.rule_code == "S108" for check in matching_failures)
+
+
+def test_pytorch_zip_scans_webbrowser_and_ctypes_execution_in_archive_data(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    payload = (
+        b"\x00\xffdef payload():\n"
+        b"    import ctypes\n"
+        b"    import webbrowser\n"
+        b"    webbrowser.get().open.__call__('https://example.invalid')\n"
+        b"    ctypes.cdll['msvcrt'].printf(b'x')\n"
+        b"    ctypes.cdll.__getitem__('msvcrt')\n"
+        b"    loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        b"    return loader.msvcrt.printf(b'x')\n"
+        b"\x00MODEL-FRAMING"
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    matching_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+    ]
+    assert any(
+        check.rule_code == "S109" and "Web browser launch detected" in check.message for check in matching_failures
+    )
+    assert any(
+        check.rule_code == "S110" and "Native library loading detected" in check.message for check in matching_failures
+    )
+
+
+def test_pytorch_zip_ignores_certain_replaced_runpy_execution_in_archive_data(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    payload = b"\x00\xffimport runpy\nrunpy.run_path = len\nrunpy.run_path([])\n\x00MODEL-FRAMING"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and "Dynamic module execution detected" in check.message
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_ignores_string_literal_asyncio_subprocess_launch_with_unrelated_risk(
+    tmp_path: Path,
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    payload = (
+        b"import pickle\n\n"
+        b"def payload(data):\n"
+        b"    pickle.loads(data)\n"
+        b"    return \"asyncio.create_subprocess_shell('id')\"\n"
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and "Subprocess execution detected" in check.message
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        (
+            b"import os\n"
+            b"import subprocess\n\n"
+            b"def payload(args):\n"
+            b"    marker = os.posix_spawn\n"
+            b"    return subprocess.list2cmdline(args)\n"
+        ),
+        (
+            b"import os\n"
+            b"import subprocess\n\n"
+            b"def payload():\n"
+            b"    marker = os.posix_spawn\n"
+            b"    return subprocess.run(['echo', 'ok'], check=False)\n"
+        ),
+    ],
+)
+def test_pytorch_zip_ignores_uninvoked_os_process_reference_with_unrelated_risk(tmp_path: Path, payload: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and "OS command execution detected" in check.message
+        for check in result.checks
+    )
 
 
 def test_pytorch_zip_ignores_non_source_eval_text_in_archive_data(tmp_path: Path) -> None:

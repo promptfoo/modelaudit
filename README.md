@@ -70,7 +70,7 @@ ModelAudit includes 45 registered scanners covering model, archive, and configur
 | **PyTorch**             | `.pt`, `.pth`, `.ckpt`, `.bin`                                                              | HIGH   |
 | **Joblib**              | `.joblib`                                                                                   | HIGH   |
 | **NumPy**               | `.npy`, `.npz`                                                                              | HIGH   |
-| **R Serialized**        | `.rds`, `.rda`, `.rdata`                                                                    | HIGH   |
+| **R Serialized**        | `.rds`, `.rda`, `.rdata`, signature-valid renamed workspace artifacts                       | HIGH   |
 | **TensorFlow**          | `.pb`, `.meta`, SavedModel dirs                                                             | MEDIUM |
 | **Keras**               | `.h5`, `.hdf5`, `.keras`                                                                    | MEDIUM |
 | **ONNX**                | `.onnx`                                                                                     | MEDIUM |

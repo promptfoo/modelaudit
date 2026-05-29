@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+import shlex
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -40,24 +41,100 @@ _MACHO_FAT_MAGICS = {
 }
 _VERSIONED_SHARED_OBJECT_SUFFIX_RE = re.compile(r"\.so(?:\.[0-9]+)+$")
 _PYTHON_ARCHIVE_MEMBER_SUFFIXES = (".py", ".pyw")
-_HIGH_RISK_PYTHON_CALLS = {
-    "__import__",
-    "builtins.__import__",
-    "builtins.eval",
-    "builtins.exec",
-    "eval",
-    "exec",
-    "importlib.import_module",
-    "os.popen",
-    "os.system",
-    "pickle.load",
-    "pickle.loads",
-    "subprocess.call",
-    "subprocess.check_call",
-    "subprocess.check_output",
-    "subprocess.Popen",
-    "subprocess.run",
-}
+_PYTHON_SHEBANG_COMMAND_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?w?|pypy(?:\d+(?:\.\d+)*)?)$")
+_ENV_SHEBANG_OPTIONS_WITH_ARGUMENT = frozenset({"-u", "--unset", "-C", "--chdir"})
+_OS_PROCESS_EXECUTION_CALLS = frozenset(
+    {
+        "os.execl",
+        "os.execle",
+        "os.execlp",
+        "os.execlpe",
+        "os.execv",
+        "os.execve",
+        "os.execvp",
+        "os.execvpe",
+        "os.popen",
+        "os.posix_spawn",
+        "os.posix_spawnp",
+        "os.spawnl",
+        "os.spawnle",
+        "os.spawnlp",
+        "os.spawnlpe",
+        "os.spawnv",
+        "os.spawnve",
+        "os.spawnvp",
+        "os.spawnvpe",
+        "os.startfile",
+        "os.system",
+    }
+)
+_ASYNCIO_PROCESS_EXECUTION_CALLS = frozenset(
+    {
+        "asyncio.create_subprocess_exec",
+        "asyncio.create_subprocess_shell",
+        "asyncio.subprocess.create_subprocess_exec",
+        "asyncio.subprocess.create_subprocess_shell",
+    }
+)
+_SUBPROCESS_PROCESS_EXECUTION_CALLS = frozenset(
+    {
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.Popen",
+        "subprocess.run",
+    }
+)
+_RUNPY_CODE_EXECUTION_CALLS = frozenset(
+    {
+        "runpy._run_module_as_main",
+        "runpy.run_module",
+        "runpy.run_path",
+    }
+)
+_WEBBROWSER_LAUNCH_CALLS = frozenset(
+    {
+        "webbrowser.open",
+        "webbrowser.open_new",
+        "webbrowser.open_new_tab",
+    }
+)
+_WEBBROWSER_CONTROLLER_FACTORIES = frozenset({"webbrowser.get"})
+_WEBBROWSER_CONTROLLER_LAUNCH_METHODS = frozenset({"open", "open_new", "open_new_tab"})
+_CTYPES_LIBRARY_LOADER_OBJECTS = frozenset(
+    {
+        "ctypes.LibraryLoader",
+        "ctypes.cdll",
+        "ctypes.oledll",
+        "ctypes.pydll",
+        "ctypes.windll",
+    }
+)
+_CTYPES_LIBRARY_LOADER_NON_LOADING_ATTRIBUTES = frozenset({"_FuncPtr", "_dlltype", "_handle", "_name"})
+_CTYPES_LIBRARY_LOADER_CONSTRUCTORS = frozenset({"ctypes.LibraryLoader"})
+_CTYPES_NATIVE_LIBRARY_LOADING_CALLS = frozenset(
+    {
+        "ctypes.CDLL",
+        "ctypes.OleDLL",
+        "ctypes.PyDLL",
+        "ctypes.WinDLL",
+        "ctypes.cdll.__getitem__",
+        "ctypes.cdll.LoadLibrary",
+        "ctypes.oledll.__getitem__",
+        "ctypes.oledll.LoadLibrary",
+        "ctypes.pydll.__getitem__",
+        "ctypes.pydll.LoadLibrary",
+        "ctypes.windll.__getitem__",
+        "ctypes.windll.LoadLibrary",
+    }
+)
+_STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES = (
+    _RUNPY_CODE_EXECUTION_CALLS
+    | _WEBBROWSER_LAUNCH_CALLS
+    | _WEBBROWSER_CONTROLLER_FACTORIES
+    | _CTYPES_NATIVE_LIBRARY_LOADING_CALLS
+    | _CTYPES_LIBRARY_LOADER_OBJECTS
+)
 
 # Map each high-risk call name to the rule code that best describes its risk
 # category. SARIF consumers, dashboards, and per-rule severity overrides rely
@@ -71,13 +148,79 @@ _HIGH_RISK_PYTHON_CALL_RULE_CODES: dict[str, str] = {
     "eval": "S104",
     "exec": "S104",
     "importlib.import_module": "S107",
-    "os.popen": "S101",
-    "os.system": "S101",
     "pickle.load": "S213",
     "pickle.loads": "S213",
+    **dict.fromkeys(_SUBPROCESS_PROCESS_EXECUTION_CALLS, "S103"),
+    **dict.fromkeys(_OS_PROCESS_EXECUTION_CALLS, "S101"),
+    **dict.fromkeys(_ASYNCIO_PROCESS_EXECUTION_CALLS, "S103"),
+    **dict.fromkeys(_RUNPY_CODE_EXECUTION_CALLS, "S108"),
+    **dict.fromkeys(_WEBBROWSER_LAUNCH_CALLS, "S109"),
+    **dict.fromkeys(_CTYPES_NATIVE_LIBRARY_LOADING_CALLS, "S110"),
 }
 _HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES: tuple[tuple[str, str], ...] = (("subprocess.", "S103"),)
 _FALLBACK_HIGH_RISK_RULE_CODE = "S104"
+_HIGH_RISK_PYTHON_CALLS = frozenset(_HIGH_RISK_PYTHON_CALL_RULE_CODES)
+
+
+def _strip_dunder_call_suffixes(reference_name: str) -> str:
+    while reference_name.endswith(".__call__"):
+        reference_name = reference_name.removesuffix(".__call__")
+    return reference_name
+
+
+def _ctypes_loader_attribute_load_name(reference_name: str) -> str | None:
+    reference_name = _strip_dunder_call_suffixes(reference_name)
+    parts = reference_name.split(".")
+    if len(parts) < 3:
+        return None
+
+    loader_root = ".".join(parts[:2])
+    library_name = parts[2]
+    if loader_root not in _CTYPES_LIBRARY_LOADER_OBJECTS:
+        return None
+    if library_name.startswith("_") or library_name in _CTYPES_LIBRARY_LOADER_NON_LOADING_ATTRIBUTES:
+        return None
+    return f"{loader_root}.{library_name}"
+
+
+def _webbrowser_controller_launch_call_name(reference_name: str) -> str | None:
+    reference_name = _strip_dunder_call_suffixes(reference_name)
+    root_name, separator, method_name = reference_name.rpartition(".")
+    if not separator or root_name not in _WEBBROWSER_CONTROLLER_FACTORIES:
+        return None
+    if method_name not in _WEBBROWSER_CONTROLLER_LAUNCH_METHODS:
+        return None
+    return f"webbrowser.{method_name}"
+
+
+def _normalized_high_risk_python_call_name(name: str) -> str | None:
+    stripped_name = _strip_dunder_call_suffixes(name)
+    if stripped_name in _HIGH_RISK_PYTHON_CALLS or stripped_name.startswith("subprocess."):
+        return stripped_name
+    webbrowser_launch_name = _webbrowser_controller_launch_call_name(stripped_name)
+    if webbrowser_launch_name is not None:
+        return webbrowser_launch_name
+    ctypes_load_name = _ctypes_loader_attribute_load_name(stripped_name)
+    if ctypes_load_name is not None:
+        return ctypes_load_name
+    return None
+
+
+def _has_static_overwritable_reference_prefix(name: str) -> bool:
+    return any(
+        name == reference_name or name.startswith(f"{reference_name}.")
+        for reference_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
+    )
+
+
+def _split_env_shebang_command(value: str) -> str | None:
+    try:
+        split_parts = shlex.split(value)
+    except ValueError:
+        split_parts = value.split()
+    if not split_parts:
+        return None
+    return split_parts[0].rsplit("/", 1)[-1].lower()
 
 
 def _rule_code_for_high_risk_call(call_name: str) -> str:
@@ -85,6 +228,10 @@ def _rule_code_for_high_risk_call(call_name: str) -> str:
     direct = _HIGH_RISK_PYTHON_CALL_RULE_CODES.get(call_name)
     if direct is not None:
         return direct
+    if _webbrowser_controller_launch_call_name(call_name) is not None:
+        return "S109"
+    if _ctypes_loader_attribute_load_name(call_name) is not None:
+        return "S110"
     for prefix, code in _HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES:
         if call_name.startswith(prefix):
             return code
@@ -228,6 +375,76 @@ def is_executable_archive_member_content(path: str) -> bool:
     return probe_executable_archive_member_content(path) == "detected"
 
 
+def _shebang_command_name(source_bytes: bytes) -> str | None:
+    if not source_bytes.startswith(b"#!"):
+        return None
+    first_line = source_bytes.splitlines()[0][2:].decode("utf-8", errors="ignore").strip()
+    if not first_line:
+        return None
+    try:
+        parts = shlex.split(first_line)
+    except ValueError:
+        parts = first_line.split()
+    if not parts:
+        return None
+
+    command = parts[0].rsplit("/", 1)[-1].lower()
+    if command != "env":
+        return command
+
+    index = 1
+    while index < len(parts):
+        token = parts[index]
+        if token in {"-S", "--split-string"}:
+            if index + 1 >= len(parts):
+                return None
+            return _split_env_shebang_command(parts[index + 1])
+        if token.startswith("--split-string="):
+            return _split_env_shebang_command(token.split("=", 1)[1])
+        if token.startswith("-S") and token != "-S":
+            return _split_env_shebang_command(token[2:])
+        if token in _ENV_SHEBANG_OPTIONS_WITH_ARGUMENT:
+            index += 2
+            continue
+        if token == "--" or token.startswith("--unset=") or token.startswith("--chdir="):
+            index += 1
+            continue
+        if token.startswith("-") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            index += 1
+            continue
+        return token.rsplit("/", 1)[-1].lower()
+    return None
+
+
+def _python_member_has_non_python_shebang(source_bytes: bytes) -> bool:
+    if not source_bytes.startswith(b"#!"):
+        return False
+    command = _shebang_command_name(source_bytes)
+    return command is None or _PYTHON_SHEBANG_COMMAND_RE.fullmatch(command) is None
+
+
+def _probe_python_archive_member_executable_content(path: str) -> ExecutableArchiveMemberProbeOutcome:
+    try:
+        with open(path, "rb") as member_file:
+            prefix_cache = member_file.read(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES)
+            if prefix_cache.startswith(b"#!"):
+                return "detected" if _python_member_has_non_python_shebang(prefix_cache) else "absent"
+
+            def read_prefix(limit: int) -> bytes:
+                nonlocal prefix_cache
+                if limit <= len(prefix_cache) or not prefix_cache.startswith(b"MZ"):
+                    return prefix_cache[:limit]
+                member_file.seek(0)
+                expanded_prefix = member_file.read(limit)
+                if len(expanded_prefix) > len(prefix_cache):
+                    prefix_cache = expanded_prefix
+                return prefix_cache[:limit]
+
+            return probe_executable_archive_member_signature(read_prefix)
+    except OSError:
+        return "absent"
+
+
 def executable_archive_member_content_rule_code(path: str) -> str | None:
     """Return the executable rule code implied by an archive member's content."""
     try:
@@ -311,17 +528,19 @@ def _resolve_aliases(name: str, alias_scopes: _AliasScopes) -> _AliasValue:
 
 
 def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    direct_aliases, direct_found = _lookup_bound_alias(call_name, alias_scopes)
-    if direct_found:
-        return direct_aliases
-    head, *tail = call_name.split(".")
-    resolved_heads = _resolve_aliases(head, alias_scopes)
-    if resolved_heads is None:
-        return None
-    if not tail:
-        return resolved_heads
-    suffix = ".".join(tail)
-    return frozenset(f"{resolved_head}.{suffix}" for resolved_head in resolved_heads)
+    parts = call_name.split(".")
+    for prefix_length in range(len(parts), 0, -1):
+        prefix = ".".join(parts[:prefix_length])
+        aliases, found = _lookup_bound_alias(prefix, alias_scopes)
+        if not found:
+            continue
+        if aliases is None:
+            return None
+        suffix = ".".join(parts[prefix_length:])
+        if not suffix:
+            return aliases
+        return frozenset(f"{alias}.{suffix}" for alias in aliases)
+    return frozenset({call_name})
 
 
 def _normalize_implicit_builtins_names(
@@ -858,6 +1077,75 @@ def _resolve_namespace_mapping_lookup_names(
     return resolved_names
 
 
+def _resolve_webbrowser_controller_factory_roots(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    if not isinstance(node, ast.Call):
+        return None
+    resolved_func_names = _resolve_static_reference_names(
+        node.func,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if resolved_func_names is None:
+        return None
+    controller_factories = resolved_func_names & _WEBBROWSER_CONTROLLER_FACTORIES
+    return controller_factories or None
+
+
+def _resolve_ctypes_library_loader_instance_roots(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    if isinstance(node, ast.Subscript):
+        library_name = _resolve_static_string(node.slice)
+        if library_name is None:
+            return None
+        resolved_loader_names = _resolve_static_reference_names(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if resolved_loader_names is None:
+            return None
+        subscript_loader_roots = resolved_loader_names & _CTYPES_LIBRARY_LOADER_OBJECTS
+        return frozenset(f"{loader_root}.{library_name}" for loader_root in subscript_loader_roots) or None
+
+    if not isinstance(node, ast.Call):
+        return None
+
+    resolved_func_names = _resolve_static_reference_names(
+        node.func,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if resolved_func_names is None:
+        return None
+
+    constructor_roots = resolved_func_names & _CTYPES_LIBRARY_LOADER_CONSTRUCTORS
+    loader_roots: set[str] = set(constructor_roots)
+    if len(node.args) == 1 and not node.keywords:
+        library_name = _resolve_static_string(node.args[0])
+        for resolved_func_name in resolved_func_names:
+            stripped_func_name = _strip_dunder_call_suffixes(resolved_func_name)
+            root_name, separator, method_name = stripped_func_name.rpartition(".")
+            if not separator or root_name not in _CTYPES_LIBRARY_LOADER_OBJECTS:
+                continue
+            if library_name is not None and method_name in {"__getitem__", "LoadLibrary"}:
+                loader_roots.add(f"{root_name}.{library_name}")
+    return frozenset(loader_roots) or None
+
+
 def _resolve_static_reference_names(
     node: ast.AST,
     alias_scopes: _AliasScopes,
@@ -876,6 +1164,8 @@ def _resolve_static_reference_names(
             name.endswith(f".__dict__.{method}") for name in callable_names for method in _NAMESPACE_MAPPING_METHODS
         ):
             return frozenset(f"{name}.__call__" for name in callable_names)
+        if callable_names is not None:
+            return frozenset(f"{name}.__call__" for name in callable_names)
     if isinstance(node, ast.Attribute) and node.attr in _NAMESPACE_MAPPING_METHODS:
         mapping_method_roots = _resolve_namespace_mapping_roots(
             node.value,
@@ -885,6 +1175,23 @@ def _resolve_static_reference_names(
         )
         if mapping_method_roots is not None:
             return frozenset(f"{root}.__dict__.{node.attr}" for root in mapping_method_roots)
+    ctypes_loader_roots = _resolve_ctypes_library_loader_instance_roots(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if ctypes_loader_roots is not None:
+        return ctypes_loader_roots
+    if isinstance(node, ast.Call):
+        webbrowser_controller_roots = _resolve_webbrowser_controller_factory_roots(
+            node,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if webbrowser_controller_roots is not None:
+            return webbrowser_controller_roots
     call_name = _resolve_call_name(node)
     if call_name is not None:
         resolved_names = _apply_aliases(call_name, alias_scopes)
@@ -900,6 +1207,30 @@ def _resolve_static_reference_names(
     if getattr_names is not None:
         return _normalize_implicit_builtins_names(getattr_names, alias_scopes)
     if isinstance(node, ast.Attribute) and node.attr != "__call__":
+        ctypes_loader_roots = _resolve_ctypes_library_loader_instance_roots(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if ctypes_loader_roots is not None:
+            return frozenset(f"{root}.{node.attr}" for root in ctypes_loader_roots)
+        webbrowser_controller_roots = _resolve_webbrowser_controller_factory_roots(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if webbrowser_controller_roots is not None:
+            return frozenset(f"{root}.{node.attr}" for root in webbrowser_controller_roots)
+        resolved_value_names = _resolve_static_reference_names(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if resolved_value_names is not None:
+            return frozenset(f"{name}.{node.attr}" for name in resolved_value_names)
         selected_names = _resolve_namespace_mapping_lookup_names(
             node.value,
             alias_scopes,
@@ -944,15 +1275,24 @@ def _resolve_static_reference_names(
 
 
 def _is_high_risk_python_call_name(name: str) -> bool:
-    return name in _HIGH_RISK_PYTHON_CALLS or name.startswith("subprocess.")
+    return _normalized_high_risk_python_call_name(name) is not None
 
 
 def _wildcard_import_aliases(module: str) -> Iterator[tuple[str, str]]:
     prefix = f"{module}."
-    for call_name in sorted(_HIGH_RISK_PYTHON_CALLS):
+    call_names = set(_HIGH_RISK_PYTHON_CALLS)
+    if module == "webbrowser":
+        call_names.update(_WEBBROWSER_CONTROLLER_FACTORIES)
+    if module == "ctypes":
+        call_names.update(_CTYPES_LIBRARY_LOADER_OBJECTS | _CTYPES_LIBRARY_LOADER_CONSTRUCTORS)
+    for call_name in sorted(call_names):
         if not call_name.startswith(prefix):
             continue
         exported_name = call_name.removeprefix(prefix).split(".", maxsplit=1)[0]
+        if exported_name.startswith("_"):
+            continue
+        if module == "asyncio" and exported_name == "subprocess":
+            continue
         yield exported_name, f"{module}.{exported_name}"
 
 
@@ -1034,6 +1374,17 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                         self._bind_name(key, resolved_value)
                         continue
                     self._bind_name(f"{root}.{key}", resolved_value)
+        elif isinstance(target, ast.Attribute):
+            resolved_target_names = self._resolve_reference_names(target)
+            if resolved_target_names is None:
+                return
+            resolved_value = self._resolve_binding_value_names(value)
+            syntactic_name = _resolve_call_name(target)
+            for target_name in resolved_target_names:
+                if target_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
+                    self._bind_name(target_name, resolved_value)
+                    if syntactic_name is not None:
+                        self._bind_name(syntactic_name, resolved_value)
         elif isinstance(target, ast.Starred):
             # Starred unpacking (``a, *b = seq``) binds ``b`` to a list slice,
             # which is not a single static reference; drop the binding so we
@@ -1289,6 +1640,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     self.alias_scopes,
                     allow_module_locals_mapping=self._non_module_scope_depth == 0,
                 )
+            elif name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
+                base_value = current_scope.get(name, frozenset({name}))
             else:
                 base_value = current_scope.get(name, frozenset({name}) if implicit_builtins else None)
             values = [scope.get(name, base_value) for scope in branch_scopes]
@@ -1566,25 +1919,45 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self._call_result_aliases[id(node)] = call_result_names
 
         direct_call_name = _resolve_call_name(node.func)
-        direct_call_head = direct_call_name.split(".", maxsplit=1)[0] if direct_call_name is not None else None
-        direct_head_names = (
-            _resolve_aliases(direct_call_head, self.alias_scopes) if direct_call_head is not None else None
-        )
-        if (
-            direct_call_name is not None
-            and _is_high_risk_python_call_name(direct_call_name)
-            and direct_head_names == frozenset({direct_call_head})
-        ):
-            self.risky_calls.add(direct_call_name)
-        else:
-            resolved_names = self._resolve_reference_names(node.func)
-            if resolved_names is None:
-                resolved_names = frozenset()
-            for resolved_name in resolved_names:
-                if _is_high_risk_python_call_name(resolved_name):
-                    self.risky_calls.add(resolved_name)
+        if direct_call_name is not None:
+            direct_call_head = direct_call_name.split(".", maxsplit=1)[0]
+            direct_head_names = _resolve_aliases(direct_call_head, self.alias_scopes)
+            normalized_direct_name = _normalized_high_risk_python_call_name(direct_call_name)
+            if (
+                normalized_direct_name is not None
+                and direct_head_names == frozenset({direct_call_head})
+                and not _has_static_overwritable_reference_prefix(direct_call_name)
+            ):
+                self.risky_calls.add(normalized_direct_name)
+
+        resolved_names = self._resolve_reference_names(node.func)
+        if resolved_names is None:
+            resolved_names = frozenset()
+        for resolved_name in resolved_names:
+            normalized_name = _normalized_high_risk_python_call_name(resolved_name)
+            if normalized_name is not None:
+                self.risky_calls.add(normalized_name)
         self._record_namespace_write_call(node)
         self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        if isinstance(node.ctx, ast.Load):
+            resolved_names = self._resolve_reference_names(node)
+            if resolved_names is not None:
+                for resolved_name in resolved_names:
+                    normalized_name = _normalized_high_risk_python_call_name(resolved_name)
+                    if normalized_name is not None:
+                        self.risky_calls.add(normalized_name)
+        self.generic_visit(node)
+
+
+def high_risk_python_calls_in_tree(tree: ast.AST) -> set[HighRiskPythonCall]:
+    """Return high-risk calls resolvable from an already parsed Python tree."""
+    visitor = _HighRiskPythonCallVisitor()
+    visitor.visit(tree)
+    return {
+        HighRiskPythonCall(name=name, rule_code=_rule_code_for_high_risk_call(name)) for name in visitor.risky_calls
+    }
 
 
 def high_risk_python_calls_in_source(source_bytes: bytes) -> set[HighRiskPythonCall]:
@@ -1602,15 +1975,45 @@ def high_risk_python_calls_in_source(source_bytes: bytes) -> set[HighRiskPythonC
     except (SyntaxError, ValueError) as exc:
         raise PythonArchiveMemberParseError(str(exc)) from exc
 
-    visitor = _HighRiskPythonCallVisitor()
-    visitor.visit(tree)
-    return {
-        HighRiskPythonCall(name=name, rule_code=_rule_code_for_high_risk_call(name)) for name in visitor.risky_calls
-    }
+    return high_risk_python_calls_in_tree(tree)
 
 
 _PYTHON_MEMBER_CHECK_NAME = "Python Archive Member Security"
 _EXECUTABLE_MEMBER_CHECK_NAME = "Executable Archive Member Detection"
+
+
+def _add_python_archive_member_call_checks(
+    *,
+    archive_kind: str,
+    archive_path: str,
+    member_name: str,
+    result: ScanResult,
+    calls: set[HighRiskPythonCall],
+) -> bool:
+    if not calls:
+        return False
+
+    # Emit one finding per rule code so SARIF consumers, dashboards, and
+    # per-rule severity overrides see accurate attribution (``os.system``
+    # as S101, ``subprocess.run`` as S103, etc.) instead of one S104
+    # catch-all that aggregates unrelated risk categories.
+    calls_by_rule: dict[str, list[str]] = {}
+    for call in calls:
+        calls_by_rule.setdefault(call.rule_code, []).append(call.name)
+    for rule_code in sorted(calls_by_rule):
+        names = sorted(calls_by_rule[rule_code])
+        reason = f"high-risk calls: {', '.join(names)}"
+        severity = IssueSeverity.CRITICAL if rule_code in {"S109", "S110"} else IssueSeverity.WARNING
+        result.add_check(
+            name=_PYTHON_MEMBER_CHECK_NAME,
+            passed=False,
+            message=f"High-risk Python code found in {archive_kind} member {member_name}: {reason}",
+            severity=severity,
+            location=f"{archive_path}:{member_name}",
+            details={"entry": member_name, "reason": reason},
+            rule_code=rule_code,
+        )
+    return True
 
 
 def _add_executable_archive_member_check(
@@ -1661,6 +2064,7 @@ def scan_archive_member_for_known_risks(
     python_analysis_incomplete_reason: str,
     executable_analysis_incomplete_reason: str,
     analyze_python_source: bool = True,
+    analyze_executable_content: bool = True,
 ) -> None:
     """Inspect generic archive members that nested dispatch would otherwise ignore.
 
@@ -1690,6 +2094,23 @@ def scan_archive_member_for_known_risks(
                     "analysis_incomplete": True,
                 },
             )
+            if analyze_executable_content and tmp_path is not None:
+                executable_probe_outcome = _probe_python_archive_member_executable_content(tmp_path)
+                if executable_probe_outcome == "detected":
+                    _add_executable_archive_member_check(
+                        archive_kind=archive_kind,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        result=result,
+                    )
+                elif executable_probe_outcome == "incomplete":
+                    _add_incomplete_executable_archive_member_check(
+                        archive_kind=archive_kind,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        result=result,
+                        incomplete_reason=executable_analysis_incomplete_reason,
+                    )
             return
 
         if tmp_path is None:
@@ -1706,10 +2127,8 @@ def scan_archive_member_for_known_risks(
 
         try:
             with open(tmp_path, "rb") as member_file:
-                calls = high_risk_python_calls_in_source(member_file.read())
-        except PythonArchiveMemberParseError as exc:
-            executable_probe_outcome = probe_executable_archive_member_content(tmp_path)
-            if executable_probe_outcome == "detected":
+                source_bytes = member_file.read()
+            if analyze_executable_content and _python_member_has_non_python_shebang(source_bytes):
                 _add_executable_archive_member_check(
                     archive_kind=archive_kind,
                     archive_path=archive_path,
@@ -1717,15 +2136,27 @@ def scan_archive_member_for_known_risks(
                     result=result,
                 )
                 return
-            if executable_probe_outcome == "incomplete":
-                _add_incomplete_executable_archive_member_check(
-                    archive_kind=archive_kind,
-                    archive_path=archive_path,
-                    member_name=member_name,
-                    result=result,
-                    incomplete_reason=executable_analysis_incomplete_reason,
-                )
-                return
+            calls = high_risk_python_calls_in_source(source_bytes)
+        except PythonArchiveMemberParseError as exc:
+            if analyze_executable_content:
+                executable_probe_outcome = _probe_python_archive_member_executable_content(tmp_path)
+                if executable_probe_outcome == "detected":
+                    _add_executable_archive_member_check(
+                        archive_kind=archive_kind,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        result=result,
+                    )
+                    return
+                if executable_probe_outcome == "incomplete":
+                    _add_incomplete_executable_archive_member_check(
+                        archive_kind=archive_kind,
+                        archive_path=archive_path,
+                        member_name=member_name,
+                        result=result,
+                        incomplete_reason=executable_analysis_incomplete_reason,
+                    )
+                    return
 
             mark_archive_scan_incomplete(result, python_analysis_incomplete_reason)
             result.add_check(
@@ -1743,26 +2174,34 @@ def scan_archive_member_for_known_risks(
             )
             return
 
-        # Emit one finding per rule code so SARIF consumers, dashboards, and
-        # per-rule severity overrides see accurate attribution (``os.system``
-        # as S101, ``subprocess.run`` as S103, etc.) instead of one S104
-        # catch-all that aggregates unrelated risk categories.
-        calls_by_rule: dict[str, list[str]] = {}
-        for call in calls:
-            calls_by_rule.setdefault(call.rule_code, []).append(call.name)
-        for rule_code in sorted(calls_by_rule):
-            names = sorted(calls_by_rule[rule_code])
-            reason = f"high-risk calls: {', '.join(names)}"
-            result.add_check(
-                name=_PYTHON_MEMBER_CHECK_NAME,
-                passed=False,
-                message=f"High-risk Python code found in {archive_kind} member {member_name}: {reason}",
-                severity=IssueSeverity.WARNING,
-                location=location,
-                details={"entry": member_name, "reason": reason},
-                rule_code=rule_code,
-            )
+        _add_python_archive_member_call_checks(
+            archive_kind=archive_kind,
+            archive_path=archive_path,
+            member_name=member_name,
+            result=result,
+            calls=calls,
+        )
         return
+
+    if (
+        analyze_python_source
+        and "." not in normalized_lower.rsplit("/", maxsplit=1)[-1]
+        and total_size <= max_python_analysis_bytes
+        and tmp_path is not None
+    ):
+        try:
+            with open(tmp_path, "rb") as member_file:
+                calls = high_risk_python_calls_in_source(member_file.read())
+        except (OSError, PythonArchiveMemberParseError):
+            calls = set()
+        if _add_python_archive_member_call_checks(
+            archive_kind=archive_kind,
+            archive_path=archive_path,
+            member_name=member_name,
+            result=result,
+            calls=calls,
+        ):
+            return
 
     if is_executable_archive_member_name(normalized_lower):
         _add_executable_archive_member_check(
@@ -1773,7 +2212,7 @@ def scan_archive_member_for_known_risks(
         )
         return
 
-    if tmp_path is None:
+    if tmp_path is None or not analyze_executable_content:
         return
 
     executable_probe_outcome = probe_executable_archive_member_content(tmp_path)

