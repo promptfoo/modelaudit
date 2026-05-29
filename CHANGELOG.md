@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect embedded Python `runpy.run_module`, `runpy.run_path`, and `runpy._run_module_as_main` dynamic-module execution calls
 - preserve embedded Python runpy, webbrowser, and ctypes findings across continued imports, late aliases, and bounded tail-window extraction gaps
 - detect embedded Python `webbrowser` launches and `ctypes` native-library loads in archives and JIT-scanned content
+- resolve embedded `ctypes` loads through more CDLL-subclass construction forms (`__new__` returning inside `try`/`for`/`while`/`with`, `super()`/`*args` initializer forwarding) and indirect loader/controller bindings (conditional, boolean, walrus, and loop-bound expressions)
+- honor benign loader/controller member overwrites spelled as `setattr(..., **{})` or starred `setattr(*(...))`
+- fail closed on deeply nested embedded Python members and bound embedded-snippet alias probing so crafted archives cannot crash or stall the scan
 - scan dangerous RKNN safe-key metadata values instead of suppressing the whole key-value string
 - scan ONNX external data initializers in nested graphs, functions, and training graphs
 - route protocol-0 JAX checkpoint pickles through pickle opcode security checks

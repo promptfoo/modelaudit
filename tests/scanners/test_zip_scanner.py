@@ -6150,3 +6150,94 @@ class TestZipScanner:
         # A truncated archive is invalid — scan must not raise an unhandled exception
         assert result.success is False
         assert len(result.issues) > 0
+
+
+def _scan_python_member_checks(tmp_path: Path, source: str) -> dict[str | None, Any]:
+    """Scan ``source`` as a Python archive member; return failed checks by rule code."""
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+    result = ZipScanner().scan(str(archive_path))
+    return {
+        check.rule_code: check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    }
+
+
+def test_scan_zip_pr1402_resolves_subclass_initializer_bypasses(tmp_path: Path) -> None:
+    # A ctypes.CDLL subclass that preserves the native-loading initializer must be
+    # flagged regardless of how construction is spelled (PR #1402 follow-up gaps).
+    source = (
+        "import ctypes\n"
+        "class NewInTry(ctypes.CDLL):\n"
+        "    def __new__(cls, name):\n"
+        "        try:\n"
+        "            return super().__new__(cls)\n"
+        "        except Exception:\n"
+        "            raise\n"
+        "ctypes.LibraryLoader(NewInTry).newintry\n"
+        "class SuperForward(ctypes.CDLL):\n"
+        "    def __init__(self, *a):\n"
+        "        super().__init__(*a)\n"
+        "ctypes.LibraryLoader(SuperForward).superforwardlib\n"
+        "class DirectForward(ctypes.CDLL):\n"
+        "    def __init__(self, *a):\n"
+        "        ctypes.CDLL.__init__(self, *a)\n"
+        "ctypes.LibraryLoader(DirectForward).directforwardlib\n"
+    )
+    checks = _scan_python_member_checks(tmp_path, source)
+    assert set(checks) == {"S110"}
+    reason = checks["S110"].details["reason"]
+    for member in ("newintry", "superforwardlib", "directforwardlib"):
+        assert f"ctypes.LibraryLoader.{member}" in reason
+
+
+def test_scan_zip_pr1402_resolves_indirect_loader_bindings(tmp_path: Path) -> None:
+    source = (
+        "import ctypes\n"
+        "flag = True\n"
+        "ternary = ctypes.cdll if flag else None\n"
+        "ternary.ternarylib\n"
+        "boolean = ctypes.cdll or None\n"
+        "boolean.booleanlib\n"
+        "(walrus := ctypes.CDLL)('walruslib')\n"
+        "for looped in [ctypes.cdll]:\n"
+        "    looped.loopedlib\n"
+    )
+    checks = _scan_python_member_checks(tmp_path, source)
+    assert set(checks) == {"S110"}
+    reason = checks["S110"].details["reason"]
+    for member in ("ternarylib", "booleanlib", "loopedlib"):
+        assert f"ctypes.cdll.{member}" in reason
+    assert "ctypes.CDLL" in reason
+
+
+def test_scan_zip_pr1402_honors_benign_setattr_overwrite_edges(tmp_path: Path) -> None:
+    # A safe overwrite spelled with a trailing empty ``**{}`` or a starred tuple is
+    # equivalent to a plain ``setattr`` and must not produce a critical finding.
+    benign = (
+        "import ctypes\n"
+        "setattr(ctypes.windll, 'safe_member', len, **{})\n"
+        "ctypes.windll.safe_member\n"
+        "setattr(*(ctypes.windll, 'starred_member', len))\n"
+        "ctypes.windll.starred_member\n"
+    )
+    assert _scan_python_member_checks(tmp_path, benign) == {}
+
+    # A genuine native load inside the same shape still flags (no silent disable).
+    loading = "import ctypes\nctypes.windll.kernel32\n"
+    assert set(_scan_python_member_checks(tmp_path, loading)) == {"S110"}
+
+
+def test_scan_zip_pr1402_fails_closed_on_deeply_nested_member(tmp_path: Path) -> None:
+    # A crafted deeply-nested member must not crash the scan with RecursionError;
+    # analysis fails closed (marked incomplete) instead.
+    source = "import ctypes\nctypes.cdll" + ".a" * 6000 + "\n"
+    archive_path = tmp_path / "deep.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert any(check.details.get("analysis_incomplete") for check in result.checks)

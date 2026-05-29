@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import re
 import shlex
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -741,6 +741,15 @@ def _keyword_is_empty_static_kwargs(keyword: ast.keyword) -> bool:
         and not keyword.value.keys
         and not keyword.value.values
     )
+
+
+def _keywords_are_all_empty_static_kwargs(keywords: list[ast.keyword]) -> bool:
+    """True when ``keywords`` carries no runtime keyword (only empty ``**{}``).
+
+    ``setattr``/``delattr`` are positional-only, but Python still accepts a
+    trailing empty ``**{}`` unpack, which is equivalent to passing no keyword.
+    """
+    return all(_keyword_is_empty_static_kwargs(keyword) for keyword in keywords)
 
 
 def _static_keyword_arguments(keywords: list[ast.keyword]) -> dict[str, ast.AST] | None:
@@ -1493,6 +1502,32 @@ def _resolve_ctypes_library_loader_instance_roots(
     return frozenset(loader_roots) or None
 
 
+def _union_static_reference_names(
+    nodes: Iterable[ast.AST],
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    """Resolve each candidate value and union the known references.
+
+    Used for expressions that evaluate to one of several operands at runtime
+    (``a if c else b``, ``a or b``); a member load on the result is risky when
+    *any* operand resolves to a loader/controller.
+    """
+    combined: set[str] = set()
+    for sub_node in nodes:
+        resolved = _resolve_static_reference_names(
+            sub_node,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if resolved:
+            combined.update(resolved)
+    return frozenset(combined) or None
+
+
 def _resolve_static_reference_names(
     node: ast.AST,
     alias_scopes: _AliasScopes,
@@ -1500,6 +1535,27 @@ def _resolve_static_reference_names(
     allow_module_locals_mapping: bool = False,
     allow_local_namespace_mapping: bool = False,
 ) -> frozenset[str] | None:
+    if isinstance(node, ast.NamedExpr):
+        return _resolve_static_reference_names(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+    if isinstance(node, ast.IfExp):
+        return _union_static_reference_names(
+            (node.body, node.orelse),
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+    if isinstance(node, ast.BoolOp):
+        return _union_static_reference_names(
+            node.values,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
     if isinstance(node, ast.Attribute) and node.attr == "__call__":
         callable_names = _resolve_static_reference_names(
             node.value,
@@ -2105,22 +2161,23 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         resolved_helper_names = _apply_aliases(helper_name, self.alias_scopes) if helper_name is not None else None
         if not resolved_helper_names or not (resolved_helper_names & {"setattr", "builtins.setattr"}):
             return
-        if len(node.args) != 3 or node.keywords:
+        expanded_args = _expanded_static_call_args(node)
+        if expanded_args is None or len(expanded_args) != 3 or not _keywords_are_all_empty_static_kwargs(node.keywords):
             return
-        attr_name = _resolve_static_string(node.args[1])
+        attr_name = _resolve_static_string(expanded_args[1])
         if attr_name is None:
             return
-        target_roots = self._resolve_reference_names(node.args[0])
+        target_roots = self._resolve_reference_names(expanded_args[0])
         if target_roots is None:
             return
-        resolved_value = self._resolve_binding_value_names(node.args[2])
+        resolved_value = self._resolve_binding_value_names(expanded_args[2])
         target_names = {
             target_name
             for target_root in target_roots
             for target_name in (f"{target_root}.{attr_name}",)
             if _is_overwritable_high_risk_reference(target_name)
         }
-        syntactic_target_root = _resolve_call_name(node.args[0])
+        syntactic_target_root = _resolve_call_name(expanded_args[0])
         syntactic_target_name = f"{syntactic_target_root}.{attr_name}" if syntactic_target_root is not None else None
         if syntactic_target_name is not None and target_names:
             target_names.add(syntactic_target_name)
@@ -2133,7 +2190,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if not resolved_helper_names or not (resolved_helper_names & {"delattr", "builtins.delattr"}):
             return
         expanded_args = _expanded_static_call_args(node)
-        if expanded_args is None or len(expanded_args) != 2 or node.keywords:
+        if expanded_args is None or len(expanded_args) != 2 or not _keywords_are_all_empty_static_kwargs(node.keywords):
             return
         target_node = expanded_args[0]
         attr_name = _resolve_static_string(expanded_args[1])
@@ -2614,6 +2671,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     @staticmethod
     def _call_has_loader_name_argument(call: ast.Call, *, bound_method: bool) -> bool:
+        # A dynamic ``*args`` / ``**kwargs`` forward (e.g. the transparent subclass
+        # idiom ``def __init__(self, *args): super().__init__(*args)``) can pass the
+        # library name through to the loader initializer at runtime, so treat it as
+        # preserving the native load rather than requiring statically resolvable args.
+        if _HighRiskPythonCallVisitor._call_forwards_dynamic_arguments(call):
+            return True
         expanded_args = _expanded_static_call_args(call)
         init_arguments = _CTYPES_LOADER_INIT_ARGUMENTS[1:] if bound_method else _CTYPES_LOADER_INIT_ARGUMENTS
         keyword_values = _static_call_keyword_arguments(
@@ -2633,6 +2696,17 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         return "name" in keyword_values
 
     @staticmethod
+    def _call_forwards_dynamic_arguments(call: ast.Call) -> bool:
+        """True when a call forwards dynamic ``*args`` / ``**kwargs`` it cannot resolve.
+
+        Statically-known ``*(...)`` unpacks and ``**{...}`` mappings are excluded;
+        those are evaluated precisely by the caller.
+        """
+        if any(isinstance(arg, ast.Starred) and not isinstance(arg.value, (ast.Tuple, ast.List)) for arg in call.args):
+            return True
+        return any(keyword.arg is None and not isinstance(keyword.value, ast.Dict) for keyword in call.keywords)
+
+    @staticmethod
     def _node_resolves_to_initializer_self(
         node: ast.AST,
         initializer_scope: _AliasScope,
@@ -2650,6 +2724,15 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         initializer_scope: _AliasScope,
         initializer_self_names: frozenset[str],
     ) -> bool:
+        # ``self`` is the first positional argument; a dynamic ``*args`` tail (e.g.
+        # ``ctypes.CDLL.__init__(self, *args)``) does not change that, so validate a
+        # leading concrete positional directly before requiring full static expansion.
+        if call.args and not isinstance(call.args[0], ast.Starred):
+            return _HighRiskPythonCallVisitor._node_resolves_to_initializer_self(
+                call.args[0],
+                initializer_scope,
+                initializer_self_names,
+            )
         expanded_args = _expanded_static_call_args(call)
         keyword_values = _static_call_keyword_arguments(call.keywords, _CTYPES_LOADER_INIT_KEYWORDS)
         if expanded_args is None or keyword_values is None:
@@ -3204,7 +3287,29 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 statement_may_continue, statement_may_return_instance = self._new_if_flow(statement)
                 may_continue = statement_may_continue
                 may_return_instance = may_return_instance or statement_may_return_instance
+                continue
+            # try/for/while/with bodies may conditionally execute a nested ``return``;
+            # an instance-returning return inside them still runs the inherited
+            # initializer, so the block must not be assumed to skip ``__init__``.
+            for nested_body in self._new_nested_statement_bodies(statement):
+                _, nested_may_return_instance = self._new_statements_flow(nested_body)
+                may_return_instance = may_return_instance or nested_may_return_instance
         return may_continue, may_return_instance
+
+    @staticmethod
+    def _new_nested_statement_bodies(statement: ast.stmt) -> list[list[ast.stmt]]:
+        if isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
+            return [statement.body, statement.orelse]
+        if isinstance(statement, (ast.With, ast.AsyncWith)):
+            return [statement.body]
+        if isinstance(statement, ast.Try):
+            return [
+                statement.body,
+                *(handler.body for handler in statement.handlers),
+                statement.orelse,
+                statement.finalbody,
+            ]
+        return []
 
     def _new_if_flow(self, statement: ast.If) -> tuple[bool, bool]:
         constant_bool = self._constant_bool(statement.test)
@@ -3397,7 +3502,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         body_scope: _AliasScope = {}
         self._push_alias_scope(body_scope)
         try:
-            self._shadow_binding_target(node.target)
+            # Bind the loop variable to the union of a literal iterable's elements
+            # (e.g. ``for lib in [ctypes.cdll]: lib.msvcrt``); non-literal iterables
+            # still shadow the target.
+            self._bind_comprehension_target(node.target, node.iter)
             self.visit(node.target)
             for statement in node.body:
                 self.visit(statement)
@@ -3562,14 +3670,20 @@ def high_risk_python_calls_in_source(source_bytes: bytes) -> set[HighRiskPythonC
     lossily replaced before parsing.
 
     Raises:
-        PythonArchiveMemberParseError: when the source cannot be parsed.
+        PythonArchiveMemberParseError: when the source cannot be parsed or
+            analysis exceeds the interpreter recursion limit (deeply nested
+            source). Callers fail closed by marking the scan incomplete rather
+            than letting a crafted member crash the scan or silently pass.
     """
     try:
         tree = ast.parse(source_bytes)
-    except (SyntaxError, ValueError) as exc:
+    except (SyntaxError, ValueError, RecursionError) as exc:
         raise PythonArchiveMemberParseError(str(exc)) from exc
 
-    return high_risk_python_calls_in_tree(tree)
+    try:
+        return high_risk_python_calls_in_tree(tree)
+    except RecursionError as exc:
+        raise PythonArchiveMemberParseError(f"analysis exceeded recursion limit: {exc}") from exc
 
 
 _PYTHON_MEMBER_CHECK_NAME = "Python Archive Member Security"
