@@ -129,6 +129,7 @@ _CTYPES_LIBRARY_LOADER_TYPE_ALIASES = frozenset(
     if loader_root != _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT
 )
 _CTYPES_LOADER_INIT_KEYWORDS = frozenset({"self", "name", "mode", "handle", "use_errno", "use_last_error", "winmode"})
+_CTYPES_LOADER_INIT_ARGUMENTS = ("self", "name", "mode", "handle", "use_errno", "use_last_error", "winmode")
 _CTYPES_NATIVE_LIBRARY_LOADING_CALLS = frozenset(
     {
         "ctypes.CDLL",
@@ -2548,11 +2549,17 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     @staticmethod
     def _call_has_loader_name_argument(call: ast.Call, *, bound_method: bool) -> bool:
         expanded_args = _expanded_static_call_args(call)
+        init_arguments = _CTYPES_LOADER_INIT_ARGUMENTS[1:] if bound_method else _CTYPES_LOADER_INIT_ARGUMENTS
         keyword_values = _static_call_keyword_arguments(
             call.keywords,
             _CTYPES_LOADER_INIT_KEYWORDS - frozenset({"self"}) if bound_method else _CTYPES_LOADER_INIT_KEYWORDS,
         )
         if expanded_args is None or keyword_values is None:
+            return False
+        if len(expanded_args) > len(init_arguments):
+            return False
+        positional_names = frozenset(init_arguments[: len(expanded_args)])
+        if positional_names & keyword_values.keys():
             return False
         required_positional_count = 1 if bound_method else 2
         if len(expanded_args) >= required_positional_count:
