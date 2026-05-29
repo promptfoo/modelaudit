@@ -500,6 +500,7 @@ pub(crate) struct ScanState<'a> {
     first_buffer_opcode_position: Option<usize>,
     persistent_id_count: usize,
     first_persistent_id_position: Option<usize>,
+    next_internal_memo_index: i64,
     status: ScanStatus,
     verdict: ScanVerdict,
     seen_finding_keys: HashSet<FindingDedupeKey>,
@@ -557,6 +558,7 @@ impl<'a> ScanState<'a> {
             first_buffer_opcode_position: None,
             persistent_id_count: 0,
             first_persistent_id_position: None,
+            next_internal_memo_index: -1,
             status: ScanStatus::Complete,
             verdict: ScanVerdict::Clean,
             seen_finding_keys: HashSet::new(),
@@ -886,9 +888,7 @@ impl<'a> ScanState<'a> {
                 self.stack.pop();
             }
             "DUP" => {
-                if let Some(value) = self.stack.last().cloned() {
-                    self.stack.push(value);
-                }
+                self.duplicate_top_stack_value();
             }
             "POP_MARK" => {
                 self.pop_to_mark();
@@ -944,7 +944,7 @@ impl<'a> ScanState<'a> {
             "PUT" | "BINPUT" | "LONG_BINPUT" => {
                 if let Some(value) = self.stack.last().cloned() {
                     if let Some(index) = opcode.arg.as_i64() {
-                        let value = Self::with_memo_index(value, index);
+                        let value = self.with_memo_index(value, index);
                         if let Some(top) = self.stack.last_mut() {
                             *top = value.clone();
                         }
@@ -954,8 +954,8 @@ impl<'a> ScanState<'a> {
             }
             "MEMOIZE" => {
                 if let Some(value) = self.stack.last().cloned() {
-                    let index = self.memo.len() as i64;
-                    let value = Self::with_memo_index(value, index);
+                    let index = self.next_public_memoize_index();
+                    let value = self.with_memo_index(value, index);
                     if let Some(top) = self.stack.last_mut() {
                         *top = value.clone();
                     }
@@ -1275,6 +1275,39 @@ impl<'a> ScanState<'a> {
         values
     }
 
+    fn duplicate_top_stack_value(&mut self) {
+        let Some(value) = self.stack.last().cloned() else {
+            return;
+        };
+        if matches!(
+            value,
+            StackValue::TrackedDict {
+                memo_index: None,
+                ..
+            }
+        ) {
+            let index = self.allocate_internal_memo_index();
+            let shared = self.with_memo_index(value, index);
+            if let Some(top) = self.stack.last_mut() {
+                *top = shared.clone();
+            }
+            self.memo.insert(index, shared.clone());
+            self.stack.push(shared);
+        } else {
+            self.stack.push(value);
+        }
+    }
+
+    fn allocate_internal_memo_index(&mut self) -> i64 {
+        let index = self.next_internal_memo_index;
+        self.next_internal_memo_index -= 1;
+        index
+    }
+
+    fn next_public_memoize_index(&self) -> i64 {
+        self.memo.keys().filter(|index| **index >= 0).count() as i64
+    }
+
     fn apply_setitem(&mut self) {
         let value = self.pop_value_operand_preserving_mark();
         let key = self.pop_value_operand_preserving_mark();
@@ -1530,6 +1563,12 @@ impl<'a> ScanState<'a> {
             callable_value.as_ref(),
             argument_values.as_deref(),
         );
+        self.apply_dynamic_type_attribute_mutation(
+            callable_value.as_ref(),
+            argument_values.as_deref(),
+            opcode.name,
+            position,
+        );
 
         let mut invocations = Vec::new();
         if let Some(invocation) = Self::callable_invocation_for_value(
@@ -1652,74 +1691,87 @@ impl<'a> ScanState<'a> {
 
         let type_name = stack_value_string(type_name_value, self.payload);
         for attribute in attributes {
-            let dynamic_attribute_name = attribute.attribute_name.is_none();
-            let attribute_name = attribute
-                .attribute_name
-                .unwrap_or_else(|| "__dynamic__".to_string());
-            let callable_module = attribute
-                .callable
-                .as_ref()
-                .map_or(DetailValue::None, |callable| {
-                    DetailValue::String(callable.module.clone())
-                });
-            let callable_name = attribute
-                .callable
-                .as_ref()
-                .map_or(DetailValue::None, |callable| {
-                    DetailValue::String(callable.name.clone())
-                });
-            let callable_import_reference = attribute
-                .callable
-                .as_ref()
-                .map_or(DetailValue::None, |callable| {
-                    DetailValue::String(callable.symbol())
-                });
-            let global_position = attribute
-                .callable
-                .as_ref()
-                .map_or(DetailValue::None, |callable| {
-                    DetailValue::UInt(callable.position as u64)
-                });
-            self.add_finding(Finding {
-                message: format!(
-                    "Found {op_name} opcode constructing a dynamic type with callable attribute: {attribute_name}"
-                ),
-                severity: "warning",
-                location: Some(format!("{} (pos {})", self.source, position)),
-                rule_code: Some("DYNAMIC_TYPE_CALLABLE_ATTRIBUTE"),
-                details: vec![
-                    ("opcode".to_string(), DetailValue::String(op_name.to_string())),
-                    (
-                        "type_name".to_string(),
-                        type_name
-                            .clone()
-                            .map_or(DetailValue::None, DetailValue::String),
-                    ),
-                    (
-                        "attribute_name".to_string(),
-                        DetailValue::String(attribute_name),
-                    ),
-                    (
-                        "dynamic_attribute_name".to_string(),
-                        DetailValue::Bool(dynamic_attribute_name),
-                    ),
-                    ("callable_module".to_string(), callable_module),
-                    ("callable_name".to_string(), callable_name),
-                    (
-                        "callable_import_reference".to_string(),
-                        callable_import_reference,
-                    ),
-                    ("global_position".to_string(), global_position),
-                    (
-                        "tracked_dynamic_key_value_overflow".to_string(),
-                        DetailValue::Bool(attribute.unknown_key_values_overflowed),
-                    ),
-                ],
-                why: Some(
-                    "Dynamically constructed classes can install attacker-controlled protocol hooks such as __del__ or __repr__; those hooks may execute during or after deserialization.",
-                ),
-            });
+            self.add_dynamic_type_callable_attribute_finding(
+                op_name,
+                position,
+                type_name.clone(),
+                attribute,
+            );
         }
+    }
+
+    fn add_dynamic_type_callable_attribute_finding(
+        &mut self,
+        op_name: &'static str,
+        position: usize,
+        type_name: Option<String>,
+        attribute: DynamicTypeCallableAttribute,
+    ) {
+        let dynamic_attribute_name = attribute.attribute_name.is_none();
+        let attribute_name = attribute
+            .attribute_name
+            .unwrap_or_else(|| "__dynamic__".to_string());
+        let callable_module = attribute
+            .callable
+            .as_ref()
+            .map_or(DetailValue::None, |callable| {
+                DetailValue::String(callable.module.clone())
+            });
+        let callable_name = attribute
+            .callable
+            .as_ref()
+            .map_or(DetailValue::None, |callable| {
+                DetailValue::String(callable.name.clone())
+            });
+        let callable_import_reference = attribute
+            .callable
+            .as_ref()
+            .map_or(DetailValue::None, |callable| {
+                DetailValue::String(callable.symbol())
+            });
+        let global_position = attribute
+            .callable
+            .as_ref()
+            .map_or(DetailValue::None, |callable| {
+                DetailValue::UInt(callable.position as u64)
+            });
+        self.add_finding(Finding {
+            message: format!(
+                "Found {op_name} opcode constructing a dynamic type with callable attribute: {attribute_name}"
+            ),
+            severity: "warning",
+            location: Some(format!("{} (pos {})", self.source, position)),
+            rule_code: Some("DYNAMIC_TYPE_CALLABLE_ATTRIBUTE"),
+            details: vec![
+                ("opcode".to_string(), DetailValue::String(op_name.to_string())),
+                (
+                    "type_name".to_string(),
+                    type_name.map_or(DetailValue::None, DetailValue::String),
+                ),
+                (
+                    "attribute_name".to_string(),
+                    DetailValue::String(attribute_name),
+                ),
+                (
+                    "dynamic_attribute_name".to_string(),
+                    DetailValue::Bool(dynamic_attribute_name),
+                ),
+                ("callable_module".to_string(), callable_module),
+                ("callable_name".to_string(), callable_name),
+                (
+                    "callable_import_reference".to_string(),
+                    callable_import_reference,
+                ),
+                ("global_position".to_string(), global_position),
+                (
+                    "tracked_dynamic_key_value_overflow".to_string(),
+                    DetailValue::Bool(attribute.unknown_key_values_overflowed),
+                ),
+            ],
+            why: Some(
+                "Dynamically constructed classes can install attacker-controlled protocol hooks such as __del__ or __repr__; those hooks may execute during or after deserialization.",
+            ),
+        });
     }
 
     fn dynamic_type_constructor_arguments<'args>(
@@ -1737,7 +1789,7 @@ impl<'a> ScanState<'a> {
         {
             return None;
         }
-        if reference.name == "type" && arguments.len() == 3 {
+        if arguments.len() == 3 && Self::is_builtin_type_reference(reference) {
             return Some(arguments);
         }
         if reference.name == "type.__new__"
@@ -1759,12 +1811,16 @@ impl<'a> ScanState<'a> {
         let Some(StackValue::Global(reference)) = value else {
             return false;
         };
+        Self::is_builtin_type_reference(reference)
+    }
+
+    fn is_builtin_type_reference(reference: &GlobalRef) -> bool {
         !reference.malformed
             && matches!(
                 (reference.module.as_str(), reference.name.as_str()),
                 (
                     "builtins" | "__builtin__" | "__builtins__",
-                    "type" | "type.__class__"
+                    "type" | "type.__class__" | "object.__class__"
                 )
             )
     }
@@ -1857,6 +1913,82 @@ impl<'a> ScanState<'a> {
                 self.record_tracked_dict_update_mutation(target, source);
             }
         }
+    }
+
+    fn apply_dynamic_type_attribute_mutation(
+        &mut self,
+        callable_value: Option<&StackValue>,
+        arguments: Option<&[StackValue]>,
+        op_name: &'static str,
+        position: usize,
+    ) {
+        if !matches!(op_name, "REDUCE" | "OBJ") {
+            return;
+        }
+        let Some(StackValue::Global(reference)) = callable_value else {
+            return;
+        };
+        if !Self::is_type_setattr_reference(reference) {
+            return;
+        }
+        let Some([target, key, value]) = arguments else {
+            return;
+        };
+        let Some(type_name) = self.dynamic_type_name(target) else {
+            return;
+        };
+
+        let callable = Self::callable_reference_from_value(Some(value));
+        let unresolved_value = callable.is_none();
+        let attribute = if let Some(key) = stack_value_string(key, self.payload) {
+            let key = key.to_ascii_lowercase();
+            if !is_suspicious_magic_method(&key) {
+                return;
+            }
+            DynamicTypeCallableAttribute {
+                attribute_name: Some(key),
+                callable,
+                unknown_key_values_overflowed: unresolved_value,
+            }
+        } else {
+            DynamicTypeCallableAttribute {
+                attribute_name: None,
+                callable,
+                unknown_key_values_overflowed: unresolved_value,
+            }
+        };
+        self.add_dynamic_type_callable_attribute_finding(op_name, position, type_name, attribute);
+    }
+
+    fn is_type_setattr_reference(reference: &GlobalRef) -> bool {
+        !reference.malformed
+            && matches!(
+                (reference.module.as_str(), reference.name.as_str()),
+                (
+                    "builtins" | "__builtin__" | "__builtins__",
+                    "type.__setattr__"
+                )
+            )
+    }
+
+    fn dynamic_type_name(&self, value: &StackValue) -> Option<Option<String>> {
+        let StackValue::DynamicType {
+            type_name,
+            memo_index,
+        } = value
+        else {
+            return None;
+        };
+        if let Some(memo_index) = memo_index {
+            if let Some(StackValue::DynamicType {
+                type_name: memoized_type_name,
+                ..
+            }) = self.memo.get(memo_index)
+            {
+                return Some(memoized_type_name.clone().or_else(|| type_name.clone()));
+            }
+        }
+        Some(type_name.clone())
     }
 
     fn tracked_dict_mutation_kind(
@@ -3816,23 +3948,40 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn with_memo_index(value: StackValue, index: i64) -> StackValue {
+    fn with_memo_index(&self, value: StackValue, index: i64) -> StackValue {
         match value {
             StackValue::FutureCallbacks(mut callbacks) => {
                 callbacks.memo_index = Some(index);
                 StackValue::FutureCallbacks(callbacks)
             }
+            StackValue::DynamicType { type_name, .. } => StackValue::DynamicType {
+                type_name,
+                memo_index: Some(index),
+            },
             StackValue::TrackedDict {
                 entries,
                 unknown_key_values,
                 unknown_key_values_overflowed,
-                ..
-            } => StackValue::TrackedDict {
-                entries,
-                unknown_key_values,
-                unknown_key_values_overflowed,
-                memo_index: Some(index),
-            },
+                memo_index,
+            } => {
+                let entries = self
+                    .current_tracked_dict_entries(&entries, memo_index)
+                    .to_vec();
+                let unknown_key_values = self
+                    .current_tracked_dict_unknown_key_values(&unknown_key_values, memo_index)
+                    .to_vec();
+                let unknown_key_values_overflowed = self
+                    .current_tracked_dict_unknown_key_values_overflowed(
+                        unknown_key_values_overflowed,
+                        memo_index,
+                    );
+                StackValue::TrackedDict {
+                    entries,
+                    unknown_key_values,
+                    unknown_key_values_overflowed,
+                    memo_index: Some(index),
+                }
+            }
             value => value,
         }
     }
@@ -3895,6 +4044,10 @@ impl<'a> ScanState<'a> {
             self.stack.push(mapping_wrapper);
             return;
         }
+        if let Some(dynamic_type) = self.dynamic_type_result(values) {
+            self.stack.push(dynamic_type);
+            return;
+        }
         if let Some(tracked_dict) = self.dict_constructor_result(values) {
             self.stack.push(tracked_dict);
             return;
@@ -3924,6 +4077,19 @@ impl<'a> ScanState<'a> {
             return;
         }
         self.push_constructed_result(values.first());
+    }
+
+    fn dynamic_type_result(&self, values: &[StackValue]) -> Option<StackValue> {
+        let arguments = Self::tuple_argument_values(values.get(1))?;
+        let constructor_arguments =
+            Self::dynamic_type_constructor_arguments(values.first(), &arguments)?;
+        let type_name = constructor_arguments
+            .first()
+            .and_then(|value| stack_value_string(value, self.payload));
+        Some(StackValue::DynamicType {
+            type_name,
+            memo_index: None,
+        })
     }
 
     fn call_iterator_result(values: &[StackValue]) -> Option<StackValue> {
@@ -4488,6 +4654,16 @@ impl<'a> ScanState<'a> {
                 if !reference.malformed =>
             {
                 self.stack.push(StackValue::Constructed(reference.clone()));
+            }
+            Some(StackValue::DynamicType { type_name, .. }) => {
+                self.stack.push(StackValue::Constructed(GlobalRef {
+                    module: "__dynamic_type__".to_string(),
+                    name: type_name
+                        .clone()
+                        .unwrap_or_else(|| "__dynamic__".to_string()),
+                    position: 0,
+                    malformed: false,
+                }));
             }
             _ => self.stack.push(StackValue::Other),
         }

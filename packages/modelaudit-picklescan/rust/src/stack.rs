@@ -57,6 +57,10 @@ pub(crate) enum StackValue {
     DefaultDict {
         default_factory: GlobalRef,
     },
+    DynamicType {
+        type_name: Option<String>,
+        memo_index: Option<i64>,
+    },
     TrackedDict {
         entries: Vec<(String, StackValue)>,
         unknown_key_values: Vec<StackValue>,
@@ -118,6 +122,14 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
         Some(StackValue::DefaultDict { default_factory }) => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
+        Some(StackValue::DynamicType {
+            type_name,
+            memo_index,
+        }) => format!(
+            "dynamic_type(name={}, memo={})",
+            type_name.as_deref().unwrap_or("unknown"),
+            memo_index.map_or_else(|| "none".to_string(), |index| index.to_string())
+        ),
         Some(StackValue::TrackedDict {
             entries,
             unknown_key_values,
@@ -244,6 +256,14 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::DefaultDict { default_factory } => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
+        StackValue::DynamicType {
+            type_name,
+            memo_index,
+        } => format!(
+            "dynamic_type(name={}, memo={})",
+            type_name.as_deref().unwrap_or("unknown"),
+            memo_index.map_or_else(|| "none".to_string(), |index| index.to_string())
+        ),
         StackValue::TrackedDict {
             entries,
             unknown_key_values,
