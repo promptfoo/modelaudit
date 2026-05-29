@@ -403,7 +403,12 @@ def _resolve_ctypes_library_loader_instance_roots(node: ast.AST, alias_scopes: _
             instance_roots = frozenset(
                 root
                 for resolved_arg_name in resolved_arg_names
-                if (root := _CTYPES_LIBRARY_LOADER_CONSTRUCTOR_INSTANCE_ROOTS.get(resolved_arg_name)) is not None
+                if (
+                    root := _CTYPES_LIBRARY_LOADER_CONSTRUCTOR_INSTANCE_ROOTS.get(
+                        resolved_arg_name.removeprefix(_CAPTURED_CALLABLE_REFERENCE_PREFIX)
+                    )
+                )
+                is not None
             )
             if instance_roots:
                 return instance_roots
@@ -415,9 +420,9 @@ def _resolve_webbrowser_controller_factory_roots(node: ast.AST, alias_scopes: _A
         return None
 
     factory_name = _resolve_call_name(node.func)
-    if factory_name is None:
-        return None
-    resolved_factory_names = _apply_aliases(factory_name, alias_scopes)
+    resolved_factory_names = _apply_aliases(factory_name, alias_scopes) if factory_name is not None else None
+    if resolved_factory_names is None:
+        resolved_factory_names = _resolve_getattr_call_names(node.func, alias_scopes)
     if resolved_factory_names is None:
         return None
 

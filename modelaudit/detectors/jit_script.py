@@ -133,6 +133,31 @@ def _compile_dangerous_import_patterns(dangerous_import: str) -> tuple[re.Patter
 _DANGEROUS_IMPORT_PATTERNS = {
     dangerous_import: _compile_dangerous_import_patterns(dangerous_import) for dangerous_import in DANGEROUS_IMPORTS
 }
+_SNIPPET_IMPORT_CONTEXT_LINES = 50
+
+
+def _extract_nearby_python_prelude_line(line: bytes) -> bytes | None:
+    stripped = line.lstrip()
+    if stripped.startswith((b"import ", b"from ")):
+        return stripped
+    import_fragment = re.search(rb"(?a)(?:^|[^A-Za-z0-9_])((?:from|import)\s+[^\r\n]+)$", stripped)
+    if import_fragment is not None:
+        return import_fragment.group(1)
+    if re.match(rb"(?a)^[A-Za-z_][A-Za-z0-9_]*\s*=", stripped):
+        return stripped
+    return None
+
+
+def _prepend_nearby_imports(bounded: bytes, match: re.Match[bytes]) -> bytes:
+    """Carry nearby module-scope aliases into extracted functions without parsing the whole blob."""
+    prelude_lines = [
+        prelude_line
+        for line in bounded[: match.start()].splitlines()[-_SNIPPET_IMPORT_CONTEXT_LINES:]
+        if (prelude_line := _extract_nearby_python_prelude_line(line)) is not None
+    ]
+    if not prelude_lines:
+        return match.group(0)
+    return b"\n".join([*prelude_lines, match.group(0)])
 
 
 def _resolve_alias_aware_dangerous_builtins(tree: ast.AST) -> set[str]:
@@ -603,7 +628,11 @@ class JITScriptDetector:
 
         bounded = data if include_full_source else data[:1000000]
         python_code_pattern = rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+"
-        matches = [bounded] if include_full_source else re.findall(python_code_pattern, bounded)
+        matches = (
+            [bounded]
+            if include_full_source
+            else [_prepend_nearby_imports(bounded, match) for match in re.finditer(python_code_pattern, bounded)]
+        )
         bounded_dangerous_builtins: set[str] | None = None
         bounded_os_process_calls: set[str] | None = None
         bounded_subprocess_calls: set[str] | None = None

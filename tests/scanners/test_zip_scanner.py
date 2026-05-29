@@ -359,6 +359,7 @@ def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite
         ("from webbrowser import open_new as launch\nlaunch('https://evil.example')\n", "webbrowser.open_new"),
         ("import webbrowser\nwebbrowser.open_new_tab('https://evil.example')\n", "webbrowser.open_new_tab"),
         ("import webbrowser\nwebbrowser.get().open('https://evil.example')\n", "webbrowser.open"),
+        ("import webbrowser\ngetattr(webbrowser, 'get')().open('https://evil.example')\n", "webbrowser.open"),
         ("from webbrowser import *\nget().open('https://evil.example')\n", "webbrowser.open"),
         (
             "import webbrowser\ncontroller = webbrowser.get()\ncontroller.open_new_tab('https://evil.example')\n",
@@ -420,6 +421,10 @@ def test_scan_zip_preserves_possible_webbrowser_launch_after_conditional_overwri
         ),
         (
             "import ctypes\nctypes.LibraryLoader(ctypes.CDLL).msvcrt.printf(b'hi')\n",
+            "ctypes.cdll.msvcrt",
+        ),
+        (
+            "import ctypes\nloader = ctypes.CDLL\nctypes.LibraryLoader(loader).msvcrt.printf(b'hi')\n",
             "ctypes.cdll.msvcrt",
         ),
         ("import ctypes\nctypes.cdll.msvcrt.printf(b'hi')\n", "ctypes.cdll.msvcrt"),

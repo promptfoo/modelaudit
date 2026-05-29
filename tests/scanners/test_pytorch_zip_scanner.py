@@ -1304,6 +1304,7 @@ def test_pytorch_zip_ignores_certain_replaced_runpy_execution_in_archive_data(tm
         b"def payload():\n    from webbrowser import open_new as launch\n    return launch('https://evil.example')\n",
         b"def payload():\n    return webbrowser.open_new_tab('https://evil.example')\n",
         b"def payload():\n    return webbrowser.get().open('https://evil.example')\n",
+        b"def payload():\n    import webbrowser\n    return getattr(webbrowser, 'get')().open('https://evil.example')\n",
         b"def payload():\n    from webbrowser import *\n    return get().open('https://evil.example')\n",
         (
             b"def payload():\n"
@@ -1359,6 +1360,7 @@ def test_pytorch_zip_ignores_certain_replaced_webbrowser_launch_in_archive_data(
         b"def payload():\n    return ctypes.windll.LoadLibrary('payload.dll')\n",
         b"def payload():\n    return ctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('./payload.so')\n",
         b"def payload():\n    return ctypes.LibraryLoader(ctypes.CDLL).msvcrt.printf(b'hi')\n",
+        b"def payload():\n    loader = ctypes.CDLL\n    return ctypes.LibraryLoader(loader).msvcrt.printf(b'hi')\n",
         b"def payload():\n    return ctypes.cdll.msvcrt.printf(b'hi')\n",
         b"def payload():\n    return getattr(ctypes, 'cdll').msvcrt.printf(b'hi')\n",
         b"def payload():\n    return ctypes.cdll.__getattr__('msvcrt').printf(b'hi')\n",

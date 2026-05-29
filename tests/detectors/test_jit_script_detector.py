@@ -542,6 +542,18 @@ class TestJITScriptDetector:
 
         assert any(f.type == "code_execution_pattern" and f.pattern == "Web browser launch detected" for f in findings)
 
+    def test_scan_model_detects_binary_prefixed_module_scope_webbrowser_alias(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xfffrom webbrowser import open_new as launch\n"
+            b"def payload():\n"
+            b"    return launch('https://evil.example')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(f.type == "code_execution_pattern" and f.pattern == "Web browser launch detected" for f in findings)
+
     def test_scan_model_ignores_certain_replaced_webbrowser_launch(self) -> None:
         detector = JITScriptDetector()
         source = b"def payload():\n    webbrowser.open = len\n    return webbrowser.open([])\n"
@@ -597,6 +609,21 @@ class TestJITScriptDetector:
     def test_scan_model_detects_binary_prefixed_aliased_ctypes_native_loading(self) -> None:
         detector = JITScriptDetector()
         source = b"\x00\xff" + b"def payload():\n    from ctypes import CDLL as load\n    return load('./payload.so')\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
+        )
+
+    def test_scan_model_detects_binary_prefixed_module_scope_ctypes_alias(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffimport ctypes as ct\n"
+            b"loader = ct.CDLL\n"
+            b"def payload():\n"
+            b"    return ct.LibraryLoader(loader).msvcrt.printf(b'hi')\n"
+        )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
