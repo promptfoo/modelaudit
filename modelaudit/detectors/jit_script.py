@@ -161,6 +161,7 @@ _PRIORITY_EMBEDDED_PYTHON_ALIAS_ASSIGNMENT_PATTERN = re.compile(rb"(?m)^\s*[a-z_
 _DIRECT_PRIORITY_EMBEDDED_PYTHON_ALIAS_ASSIGNMENT_PATTERN = re.compile(
     rb"(?m)^\s*[a-z_]\w*\s*=\s*(?:" + _PRIORITY_EMBEDDED_PYTHON_MODULE_PATTERN + rb")\."
 )
+_PRIORITY_EMBEDDED_PYTHON_SIMPLE_ALIAS_ASSIGNMENT_PATTERN = re.compile(rb"(?m)^\s*[a-z_]\w*\s*=\s*[a-z_]\w*")
 _EMBEDDED_PYTHON_BLOCK_PATTERN = re.compile(rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+")
 _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])"
@@ -277,6 +278,13 @@ def _bounded_priority_embedded_python_candidate(
     priority_relative_offset = priority_offsets[index] - span[0]
     if priority_relative_offset >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
         line_start = candidate.rfind(b"\n", 0, priority_relative_offset) + 1
+        block_header_end = candidate.find(b"\n")
+        if block_header_end != -1 and candidate[:block_header_end].lstrip().startswith(
+            (b"def ", b"async def ", b"class ")
+        ):
+            bounded_end = min(len(candidate), line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
+            compact_candidate = candidate[: block_header_end + 1] + candidate[line_start:bounded_end]
+            return compact_candidate, (span[0], span[0] + len(compact_candidate))
     else:
         line_start = 0
     bounded_end = min(len(candidate), line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
@@ -365,6 +373,17 @@ def _line_parenthesis_delta(line: bytes) -> int:
     return line.count(b"(") - line.count(b")")
 
 
+def _multiline_string_state_after_line(line: bytes, quote: bytes | None) -> bytes | None:
+    code = _strip_python_comment_bytes(line)
+    if quote is not None:
+        return None if quote in code else quote
+    triple_quotes = [(offset, marker) for marker in (b'"""', b"'''") if (offset := code.find(marker)) != -1]
+    if not triple_quotes:
+        return None
+    quote_offset, marker = min(triple_quotes, key=lambda item: item[0])
+    return None if marker in code[quote_offset + len(marker) :] else marker
+
+
 def _embedded_python_context_statement_start(line: bytes) -> int | None:
     for match in _EMBEDDED_PYTHON_CONTEXT_STATEMENT_START_PATTERN.finditer(line):
         prefix = line[: match.start()]
@@ -382,7 +401,10 @@ def _is_priority_import_context_statement(statement: bytes, *, has_context: bool
         return True
     if _DIRECT_PRIORITY_EMBEDDED_PYTHON_ALIAS_ASSIGNMENT_PATTERN.match(lowered) is not None:
         return True
-    return has_context and _PRIORITY_EMBEDDED_PYTHON_ALIAS_ASSIGNMENT_PATTERN.match(lowered) is not None
+    return has_context and (
+        _PRIORITY_EMBEDDED_PYTHON_ALIAS_ASSIGNMENT_PATTERN.match(lowered) is not None
+        or _PRIORITY_EMBEDDED_PYTHON_SIMPLE_ALIAS_ASSIGNMENT_PATTERN.match(lowered) is not None
+    )
 
 
 def _extract_priority_import_context(data: bytes) -> bytes:
@@ -391,12 +413,19 @@ def _extract_priority_import_context(data: bytes) -> bytes:
     context_size = 0
     lines = data.splitlines(keepends=True)
     index = 0
+    multiline_quote: bytes | None = None
     while index < len(lines):
+        if multiline_quote is not None:
+            multiline_quote = _multiline_string_state_after_line(lines[index], multiline_quote)
+            index += 1
+            continue
         statement_start = _embedded_python_context_statement_start(lines[index])
         if statement_start is None:
+            multiline_quote = _multiline_string_state_after_line(lines[index], None)
             index += 1
             continue
 
+        statement_line_quote = _multiline_string_state_after_line(lines[index], None)
         statement_lines = [lines[index][statement_start:]]
         paren_depth = _line_parenthesis_delta(statement_lines[0])
         while (_line_has_explicit_continuation(statement_lines[-1]) or paren_depth > 0) and index + 1 < len(lines):
@@ -407,12 +436,14 @@ def _extract_priority_import_context(data: bytes) -> bytes:
 
         statement = b"".join(statement_lines).rstrip() + b"\n"
         if not _is_priority_import_context_statement(statement, has_context=bool(context)):
+            multiline_quote = statement_line_quote
             index += 1
             continue
         code_str, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
         try:
             ast.parse(code_str)
         except (SyntaxError, ValueError):
+            multiline_quote = statement_line_quote
             index += 1
             continue
         if context_size + len(statement) > _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES:
