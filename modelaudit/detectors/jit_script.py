@@ -382,15 +382,18 @@ def _priority_import_aliases(candidate: bytes) -> frozenset[bytes]:
                         )
                     else:
                         aliases.add((alias.asname or alias.name).encode("utf-8"))
-    aliases.update(_priority_assignment_aliases(source, tree))
+    aliases.update(_priority_assignment_aliases(source, tree, {alias.decode("utf-8") for alias in aliases}))
     return frozenset(aliases)
 
 
-def _priority_assignment_aliases(source: str, tree: ast.AST) -> set[bytes]:
+def _priority_assignment_aliases(source: str, tree: ast.AST, priority_aliases: set[str]) -> set[bytes]:
     aliases: set[bytes] = set()
-    targets = _assignment_targets_in_tree(tree)
-    for target in targets:
-        aliases.add(target.encode("utf-8"))
+    discovered_aliases = set(priority_aliases)
+    for target, value in _assignment_targets_and_values_in_tree(tree):
+        if _expression_is_priority_alias_reference(value, discovered_aliases):
+            aliases.add(target.encode("utf-8"))
+            discovered_aliases.add(target)
+            continue
         probe = f"{source}\n" + "\n".join(_priority_assignment_probe_calls(target))
         try:
             probe_tree = ast.parse(probe)
@@ -398,18 +401,44 @@ def _priority_assignment_aliases(source: str, tree: ast.AST) -> set[bytes]:
             continue
         if _resolve_alias_aware_high_risk_calls(probe_tree):
             aliases.add(target.encode("utf-8"))
+            discovered_aliases.add(target)
     return aliases
 
 
-def _assignment_targets_in_tree(tree: ast.AST) -> list[str]:
-    targets: list[str] = []
+def _assignment_targets_and_values_in_tree(tree: ast.AST) -> list[tuple[str, ast.AST]]:
+    targets_and_values: list[tuple[str, ast.AST]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
             for target in node.targets:
-                targets.extend(_assignment_target_names(target))
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            targets.extend(_assignment_target_names(node.target))
-    return targets
+                targets_and_values.extend((name, node.value) for name in _assignment_target_names(target))
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+            targets_and_values.extend((name, node.value) for name in _assignment_target_names(node.target))
+    return targets_and_values
+
+
+def _expression_is_priority_alias_reference(node: ast.AST, aliases: set[str]) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in aliases
+    if isinstance(node, ast.Attribute):
+        return _expression_is_priority_alias_reference(node.value, aliases)
+    if isinstance(node, ast.Subscript):
+        return _expression_is_priority_alias_reference(node.value, aliases)
+    if isinstance(node, ast.Call):
+        call_name = _simple_reference_name(node.func)
+        if call_name in {"getattr", "builtins.getattr"} and len(node.args) >= 2 and not node.keywords:
+            return _expression_is_priority_alias_reference(node.args[0], aliases)
+    return False
+
+
+def _simple_reference_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _simple_reference_name(node.value)
+        if parent is None:
+            return None
+        return f"{parent}.{node.attr}"
+    return None
 
 
 def _priority_assignment_probe_calls(target: str) -> list[str]:
@@ -464,12 +493,25 @@ def _priority_alias_usage_lines(
 
 
 def _line_uses_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
-    return any(re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\()", code_line) for alias in aliases)
+    return any(
+        re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\()", code_line)
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?getattr\s*\(\s*" + re.escape(alias) + rb"\s*,",
+            code_line,
+        )
+        for alias in aliases
+    )
 
 
 def _line_calls_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
     return any(
         re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\(|\.[A-Za-z_]\w*\s*\()", code_line)
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?getattr\s*\(\s*"
+            + re.escape(alias)
+            + rb"\s*,\s*['\"][A-Za-z_]\w*['\"]\s*\)\s*\(",
+            code_line,
+        )
         for alias in aliases
     )
 
@@ -734,6 +776,15 @@ def _is_priority_prefix_context_statement(context: bytes, statement: bytes) -> b
     return _is_priority_assignment_context(context, statement)
 
 
+def _is_prefix_context_shadow_statement(context: bytes, statement: bytes) -> bool:
+    if not context:
+        return False
+    context_names = _prefix_context_binding_names(context)
+    if not context_names:
+        return False
+    return not _statement_defined_names(statement).isdisjoint(context_names)
+
+
 def _statement_defined_names(statement: bytes) -> set[str]:
     statement_str, _byte_offsets = _decode_utf8_with_byte_offsets(statement)
     try:
@@ -823,7 +874,9 @@ def _extract_priority_prefix_context(data: bytes) -> bytes:
 
         statement = b"".join(statement_lines).rstrip() + b"\n"
         current_context = b"".join(context)
-        if not _is_priority_prefix_context_statement(current_context, statement):
+        if not _is_priority_prefix_context_statement(
+            current_context, statement
+        ) and not _is_prefix_context_shadow_statement(current_context, statement):
             multiline_quote = statement_line_quote
             index += 1
             continue
@@ -859,22 +912,23 @@ def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]
             insertion_index = bisect_right(tail_starts, priority_offset)
             if insertion_index:
                 priority_tail_starts.add(tail_starts[insertion_index - 1])
-        context_names = _prefix_context_binding_names(import_context)
-        for start in tail_starts:
-            probe = tail[start : start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES]
-            if any(
-                re.search(rb"(?<![A-Za-z0-9_])" + re.escape(name.encode()) + rb"\s*(?:\(|\.)", probe)
-                for name in context_names
-            ):
-                priority_tail_starts.add(start)
+        priority_tail_start_list = _bounded_priority_tail_starts(sorted(priority_tail_starts))
         selected_starts = [
             *tail_starts[:_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS],
-            *sorted(priority_tail_starts),
+            *priority_tail_start_list,
             *tail_starts[-_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:],
         ]
         for start in dict.fromkeys(selected_starts):
             extraction_windows.append((import_context + b"\n" + tail[start:], True))
     return extraction_windows
+
+
+def _bounded_priority_tail_starts(tail_starts: list[int]) -> list[int]:
+    if len(tail_starts) <= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
+        return tail_starts
+    head_count = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS // 2
+    tail_count = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS - head_count
+    return [*tail_starts[:head_count], *tail_starts[-tail_count:]]
 
 
 def _tail_starts_for_priority_alias_uses(

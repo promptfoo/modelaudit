@@ -971,6 +971,33 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
+    def test_scan_model_ignores_unrelated_assignment_alias_before_delayed_priority_call(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy as rp\nx = 1\n"
+            + padding
+            + b"x()\n"
+            + padding
+            + b"rp.run_path('payload.py')\n"
+            + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
     def test_scan_model_detects_late_function_local_assignment_alias_after_priority_window(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
@@ -985,6 +1012,31 @@ class TestJITScriptDetector:
             b"\x00\xff" + leading_blocks + b"def payload():\n"
             b"    import runpy\n"
             b"    run = runpy.run_path\n" + padding + b"    return run('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_late_getattr_priority_alias_call(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy as rp\n"
+            + padding
+            + b"getattr(rp, 'run_path')('payload.py')\n"
+            + padding
         )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
@@ -1051,6 +1103,30 @@ class TestJITScriptDetector:
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
         assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_embedded_python_prefix_context_tail_starts_are_bounded(self) -> None:
+        prefix = b"\x00\xffimport runpy as rp\n" + b"# prefix\n" * 1024
+        tail_blocks = b"".join(
+            f'def harmless_{index}():\n    """rp.run_path(\'payload.py\')"""\n    return {index}\n'.encode()
+            for index in range(128)
+        )
+        data = prefix + (b"# middle\n" * 130_000) + tail_blocks
+
+        windows = jit_script_module._embedded_python_extraction_windows(data)
+
+        assert len(windows) <= 3 + (2 * jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
+
+    def test_scan_model_carries_prefix_alias_shadowing_into_tail_context(self) -> None:
+        detector = JITScriptDetector()
+        prefix = b"\x00\xffclass Safe:\n    run_path = len\nimport runpy as rp\nrp = Safe()\n" + b"# prefix\n" * 1024
+        tail = b"def payload():\n    return rp.run_path([])\n"
+        source = prefix + (b"# middle\n" * 130_000) + tail
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
