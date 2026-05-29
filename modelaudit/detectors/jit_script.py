@@ -137,6 +137,25 @@ def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
     return {(call.name, call.rule_code) for call in high_risk_python_calls_in_tree(tree)}
 
 
+def _parse_embedded_python_snippet(code_str: str) -> ast.AST | None:
+    """Parse an extracted Python snippet, trimming trailing binary framing when needed."""
+    try:
+        return ast.parse(code_str)
+    except (SyntaxError, ValueError):
+        pass
+
+    lines = code_str.splitlines()
+    for end in range(len(lines) - 1, 0, -1):
+        candidate = "\n".join(lines[:end])
+        if candidate.strip() == "":
+            continue
+        try:
+            return ast.parse(f"{candidate}\n")
+        except (SyntaxError, ValueError):
+            continue
+    return None
+
+
 # Patterns that indicate code execution attempts
 _OS_CODE_EXECUTION_DESCRIPTION = "OS command execution detected"
 CODE_EXECUTION_PATTERNS = [
@@ -584,15 +603,12 @@ class JITScriptDetector:
                             )
                         )
 
-                # Try to parse as AST for deeper analysis
-                try:
-                    tree = ast.parse(code_str)
+                # Try to parse as AST for deeper analysis.
+                tree = _parse_embedded_python_snippet(code_str)
+                if tree is not None:
                     snippet_high_risk_calls.update(_resolve_alias_aware_high_risk_calls(tree))
                     ast_findings = self._analyze_ast(tree, framework, context)
                     findings.extend(ast_findings)
-                except SyntaxError:
-                    # Not valid Python, might be partial or corrupted
-                    pass
 
             except Exception:
                 # Failed to process this code snippet
