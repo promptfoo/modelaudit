@@ -182,6 +182,44 @@ def _has_raw_match_outside_parsed_spans(raw_spans: list[tuple[int, int]], parsed
     return False
 
 
+def _decode_utf8_with_byte_offsets(data: bytes) -> tuple[str, list[int]]:
+    """Decode UTF-8 like errors='ignore' while mapping decoded character offsets to byte offsets."""
+    chars: list[str] = []
+    byte_offsets = [0]
+    index = 0
+    while index < len(data):
+        byte = data[index]
+        if byte < 0x80:
+            chars.append(chr(byte))
+            index += 1
+            byte_offsets.append(index)
+            continue
+
+        if 0xC2 <= byte <= 0xDF:
+            length = 2
+        elif 0xE0 <= byte <= 0xEF:
+            length = 3
+        elif 0xF0 <= byte <= 0xF4:
+            length = 4
+        else:
+            index += 1
+            continue
+
+        chunk = data[index : index + length]
+        if len(chunk) != length or any((continuation & 0xC0) != 0x80 for continuation in chunk[1:]):
+            index += 1
+            continue
+        try:
+            chars.append(chunk.decode("utf-8"))
+        except UnicodeDecodeError:
+            index += 1
+            continue
+        index += length
+        byte_offsets.append(index)
+
+    return "".join(chars), byte_offsets
+
+
 # Patterns that indicate code execution attempts
 _SUBPROCESS_CODE_EXECUTION_DESCRIPTION = "Subprocess execution detected"
 _OS_CODE_EXECUTION_DESCRIPTION = "OS command execution detected"
@@ -597,7 +635,7 @@ class JITScriptDetector:
 
         for match, span in matches[:10]:  # Analyze first 10 code snippets
             try:
-                code_str = match.decode("utf-8", errors="ignore")
+                code_str, byte_offsets = _decode_utf8_with_byte_offsets(match)
 
                 # Check for dangerous imports
                 for dangerous_import in DANGEROUS_IMPORTS:
@@ -643,7 +681,7 @@ class JITScriptDetector:
                 parsed_snippet = _parse_embedded_python_snippet(code_str)
                 if parsed_snippet is not None:
                     tree, parsed_chars = parsed_snippet
-                    parsed_byte_length = len(code_str[:parsed_chars].encode("utf-8", errors="ignore"))
+                    parsed_byte_length = byte_offsets[parsed_chars]
                     parsed_snippet_spans.append((span[0], min(span[1], span[0] + parsed_byte_length)))
                     snippet_high_risk_calls.update(_resolve_alias_aware_high_risk_calls(tree))
                     ast_findings = self._analyze_ast(tree, framework, context)

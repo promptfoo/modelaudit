@@ -408,6 +408,21 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
         )
 
+    def test_scan_model_ignores_lossy_decoded_string_literal_asyncio_subprocess_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"\x00\xffdef payload():\n"
+            b"    # ignored invalid bytes: "
+            + (b"\xff" * 64)
+            + b"\n    return \"asyncio.create_subprocess_shell('id')\"\n\x00\xffMODEL-FRAMING"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
     def test_parse_embedded_python_snippet_caps_trim_attempts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         parse_calls = 0
 
