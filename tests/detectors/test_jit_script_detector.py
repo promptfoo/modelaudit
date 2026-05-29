@@ -1080,6 +1080,33 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
         )
 
+    @pytest.mark.parametrize("shadow_line", [b"run, other = len, 1\n", b"(run) = len\n", b"[run] = [len]\n"])
+    def test_scan_model_honors_destructured_alias_shadowing_before_late_priority_call(self, shadow_line: bytes) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        padding_line = b"# pad\n"
+        padding = padding_line * (
+            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
+        )
+        source = (
+            b"\x00\xff"
+            + leading_blocks
+            + b"import runpy\nrun = runpy.run_path\n"
+            + padding
+            + shadow_line
+            + padding
+            + b"run([])\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
     def test_scan_model_ignores_unrelated_assignment_alias_before_delayed_priority_call(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(
@@ -1857,11 +1884,20 @@ class TestJITScriptDetector:
             b"    import ctypes\n"
             b"    hasattr(ctypes.cdll, 'hasattrlib')\n"
             b"    hasattr(ctypes.LibraryLoader(ctypes.CDLL), 'hasattrpayload')\n"
+            b"    ctypes.cdll.__getattr__(name='keywordgetattr')\n"
+            b"    ctypes.LibraryLoader(*(ctypes.CDLL,)).starredlib\n"
             b"    class LocalAliasCDLL(ctypes.CDLL):\n"
             b"        def __init__(self, name: str) -> None:\n"
             b"            init = ctypes.CDLL.__init__\n"
             b"            init(self, name)\n"
             b"    ctypes.LibraryLoader(LocalAliasCDLL).localaliaslib\n"
+            b"    class Safe:\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            self.name = name\n"
+            b"    class SkipSafeCDLL(Safe, ctypes.CDLL):\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            super(Safe, self).__init__(name)\n"
+            b"    ctypes.LibraryLoader(SkipSafeCDLL).superskiplib\n"
             b"\x00MODEL-FRAMING"
         )
 
@@ -1968,6 +2004,18 @@ class TestJITScriptDetector:
             b"                ctypes.CDLL.__init__(self, name)\n"
             b"    ctypes.LibraryLoader(DeadDelegateCDLL).payload\n"
             b"    DeadDelegateCDLL('/missing')\n"
+            b"    class InstanceShadowCDLL(ctypes.CDLL):\n"
+            b"        init = ctypes.CDLL.__init__\n"
+            b"        def __init__(self, name: str) -> None:\n"
+            b"            self.init = lambda name: None\n"
+            b"            self.init(name)\n"
+            b"    ctypes.LibraryLoader(InstanceShadowCDLL).payload\n"
+            b"    InstanceShadowCDLL('/missing')\n"
+            b"    class NewSkipsInitCDLL(ctypes.CDLL):\n"
+            b"        def __new__(cls, name: str):\n"
+            b"            return object()\n"
+            b"    ctypes.LibraryLoader(NewSkipsInitCDLL).payload\n"
+            b"    NewSkipsInitCDLL('/missing')\n"
             b"\x00MODEL-FRAMING"
         )
 

@@ -524,14 +524,53 @@ def _line_calls_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> b
     )
 
 
-def _line_shadows_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
-    assignment_operators = rb"\+=|-=|\*=|//=|/=|%=|\*\*=|@=|&=|\|=|\^=|>>=|<<=|=(?!=)"
-    return any(
-        re.search(
-            rb"(?:^|[;:])\s*" + re.escape(alias) + rb"\s*(?::[^=\n]+)?\s*(?:" + assignment_operators + rb")",
-            code_line,
+def _target_binds_priority_alias(target: ast.AST, aliases: frozenset[bytes]) -> bool:
+    if isinstance(target, ast.Name):
+        return target.id.encode() in aliases
+    if isinstance(target, ast.Starred):
+        return _target_binds_priority_alias(target.value, aliases)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return any(_target_binds_priority_alias(element, aliases) for element in target.elts)
+    return False
+
+
+def _statement_binds_priority_alias(statement: ast.stmt, aliases: frozenset[bytes]) -> bool:
+    if isinstance(statement, ast.Assign):
+        return any(_target_binds_priority_alias(target, aliases) for target in statement.targets)
+    if isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+        return _target_binds_priority_alias(statement.target, aliases)
+    if isinstance(statement, (ast.For, ast.AsyncFor)):
+        return _target_binds_priority_alias(statement.target, aliases)
+    if isinstance(statement, (ast.With, ast.AsyncWith)):
+        return any(
+            item.optional_vars is not None and _target_binds_priority_alias(item.optional_vars, aliases)
+            for item in statement.items
         )
-        or re.search(rb"^\s*(?:async\s+)?def\s+" + re.escape(alias) + rb"\b", code_line)
+    return False
+
+
+def _line_assigns_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
+    try:
+        tree = ast.parse(code_line.decode("utf-8", errors="ignore"))
+    except SyntaxError:
+        return False
+
+    pending = list(reversed(tree.body))
+    while pending:
+        statement = pending.pop()
+        if _statement_binds_priority_alias(statement, aliases):
+            return True
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        pending.extend(
+            child for child in reversed(list(ast.iter_child_nodes(statement))) if isinstance(child, ast.stmt)
+        )
+    return False
+
+
+def _line_shadows_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
+    return _line_assigns_priority_alias(code_line, aliases) or any(
+        re.search(rb"^\s*(?:async\s+)?def\s+" + re.escape(alias) + rb"\b", code_line)
         or re.search(rb"^\s*class\s+" + re.escape(alias) + rb"\b", code_line)
         for alias in aliases
     )

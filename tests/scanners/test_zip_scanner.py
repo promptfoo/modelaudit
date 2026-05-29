@@ -637,11 +637,21 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
         "loader_getattr.__getattr__(library_name)\n"
         "hasattr(ctypes.cdll, 'hasattrlib')\n"
         "hasattr(ctypes.LibraryLoader(ctypes.CDLL), 'hasattrpayload')\n"
+        "ctypes.cdll.__getattr__(name='keywordgetattr')\n"
+        "loader_getattr.__getattr__(name='localizedkeywordgetattr')\n"
+        "ctypes.LibraryLoader(*(ctypes.CDLL,)).starredlib\n"
         "class LocalAliasCDLL(ctypes.CDLL):\n"
         "    def __init__(self, name: str) -> None:\n"
         "        init = ctypes.CDLL.__init__\n"
         "        init(self, name)\n"
         "ctypes.LibraryLoader(LocalAliasCDLL).localaliaslib\n"
+        "class Safe:\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        self.name = name\n"
+        "class SkipSafeCDLL(Safe, ctypes.CDLL):\n"
+        "    def __init__(self, name: str) -> None:\n"
+        "        super(Safe, self).__init__(name)\n"
+        "ctypes.LibraryLoader(SkipSafeCDLL).superskiplib\n"
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
@@ -689,6 +699,10 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.cdll.hasattrlib" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.hasattrpayload" in checks_by_rule["S110"].details["reason"]
     assert "ctypes.LibraryLoader.localaliaslib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.cdll.keywordgetattr" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.localizedkeywordgetattr" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.starredlib" in checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.superskiplib" in checks_by_rule["S110"].details["reason"]
 
 
 def test_scan_zip_flags_webbrowser_controller_getattribute_launch(tmp_path: Path) -> None:
@@ -1196,6 +1210,20 @@ def test_scan_zip_preserves_safe_runpy_overwrite_before_conditional(tmp_path: Pa
             "        if False:\n"
             "            ctypes.CDLL.__init__(self, name)\n"
             "ctypes.LibraryLoader(DeadDelegateCDLL).payload\nDeadDelegateCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass InstanceShadowCDLL(ctypes.CDLL):\n"
+            "    init = ctypes.CDLL.__init__\n"
+            "    def __init__(self, name: str) -> None:\n"
+            "        self.init = lambda name: None\n"
+            "        self.init(name)\n"
+            "ctypes.LibraryLoader(InstanceShadowCDLL).payload\nInstanceShadowCDLL('/missing')\n"
+        ),
+        (
+            "import ctypes\nclass NewSkipsInitCDLL(ctypes.CDLL):\n"
+            "    def __new__(cls, name: str):\n"
+            "        return object()\n"
+            "ctypes.LibraryLoader(NewSkipsInitCDLL).payload\nNewSkipsInitCDLL('/missing')\n"
         ),
         (
             "import ctypes\nclass SafeCDLL(ctypes.CDLL):\n"
