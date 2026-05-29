@@ -23,7 +23,7 @@ from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
-from .keras_utils import find_case_insensitive_substrings
+from .keras_utils import find_case_insensitive_substrings, find_lambda_dangerous_patterns
 
 logger = logging.getLogger(__name__)
 
@@ -1308,7 +1308,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 "webbrowser",
                             ]
 
-                            found_patterns = find_case_insensitive_substrings(decoded_str, dangerous_patterns)
+                            found_patterns = find_lambda_dangerous_patterns(decoded_str, dangerous_patterns)
 
                             if found_patterns:
                                 result.add_check(
