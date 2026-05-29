@@ -275,53 +275,42 @@ def _bounded_priority_embedded_python_candidate(
     priority_relative_offset = priority_offsets[index] - span[0]
     if priority_relative_offset >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES:
         line_start = candidate.rfind(b"\n", 0, priority_relative_offset) + 1
-        block_header_end = candidate.find(b"\n")
-        if block_header_end != -1 and candidate[:block_header_end].lstrip().startswith(
-            (b"def ", b"async def ", b"class ")
-        ):
-            bounded_end = min(len(candidate), line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
-            compact_candidate = candidate[: block_header_end + 1] + candidate[line_start:bounded_end]
-            return _append_late_priority_alias_usage(
-                candidate,
-                compact_candidate,
-                bounded_end,
-                span[0],
-                span[0] + line_start,
-                span[0] + bounded_end,
-            )
     else:
         line_start = 0
     bounded_end = min(len(candidate), line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
-    bounded_candidate = candidate[line_start:bounded_end]
-    return _append_late_priority_alias_usage(
-        candidate,
-        bounded_candidate,
-        bounded_end,
-        span[0],
-        span[0] + line_start,
-        span[0] + bounded_end,
-    )
+    segment_ranges: list[tuple[int, int]] = []
 
+    def add_segment(start: int, end: int) -> None:
+        if end > start:
+            segment_ranges.append((start, end))
 
-def _append_late_priority_alias_usage(
-    candidate: bytes,
-    bounded_candidate: bytes,
-    search_start: int,
-    candidate_span_start: int,
-    span_start: int,
-    span_end: int,
-) -> tuple[bytes, tuple[int, int]]:
-    aliases = _priority_import_aliases(bounded_candidate)
-    if not aliases:
-        return bounded_candidate, (span_start, span_end)
+    block_header_end = candidate.find(b"\n")
+    if (
+        block_header_end != -1
+        and line_start > block_header_end
+        and candidate[:block_header_end].lstrip().startswith((b"def ", b"async def ", b"class "))
+    ):
+        add_segment(0, block_header_end + 1)
+    add_segment(line_start, bounded_end)
 
-    usage_line = _priority_alias_usage_line(candidate, aliases, search_start)
-    if usage_line is None:
-        return bounded_candidate, (span_start, span_end)
+    aliases = _priority_import_aliases(_compact_candidate_segments(candidate, segment_ranges))
+    usage_line = _priority_alias_usage_line(candidate, aliases, bounded_end) if aliases else None
+    if usage_line is not None:
+        add_segment(*usage_line)
 
-    usage_start, usage_end = usage_line
-    compact_candidate = bounded_candidate.rstrip() + b"\n" + candidate[usage_start:usage_end]
-    return compact_candidate, (span_start, max(span_end, candidate_span_start + usage_end))
+    tail_start = max(bounded_end, len(candidate) - _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
+    tail_start = candidate.rfind(b"\n", 0, tail_start) + 1
+    if bounded_end < tail_start < len(candidate):
+        add_segment(tail_start, len(candidate))
+
+    merged_ranges = _merge_candidate_segment_ranges(segment_ranges)
+    compact_candidate = _compact_candidate_segments(candidate, merged_ranges)
+    if not merged_ranges:
+        return compact_candidate, span
+
+    span_start = span[0] + merged_ranges[0][0]
+    span_end = span[0] + max(end for _start, end in merged_ranges)
+    return compact_candidate, (span_start, span_end)
 
 
 def _priority_import_aliases(candidate: bytes) -> frozenset[bytes]:
@@ -362,6 +351,24 @@ def _priority_alias_usage_line(
             return line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
         line_start = line_end
     return None
+
+
+def _merge_candidate_segment_ranges(segment_ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(segment_ranges):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (previous_start, max(previous_end, end))
+    return merged
+
+
+def _compact_candidate_segments(candidate: bytes, segment_ranges: list[tuple[int, int]]) -> bytes:
+    if len(segment_ranges) == 1:
+        start, end = segment_ranges[0]
+        return candidate[start:end]
+    return b"\n".join(candidate[start:end].rstrip(b"\n") for start, end in segment_ranges)
 
 
 def _prioritized_embedded_python_snippets(
@@ -631,13 +638,14 @@ def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]
     import_context = _extract_priority_prefix_context(prefix)
     if import_context:
         extraction_windows.append((import_context + b"\n" + tail, True))
-        for start in _embedded_python_start_offsets(tail)[:_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS]:
-            extraction_windows.append((import_context + b"\n" + tail[start:], False))
+        tail_starts = [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(tail) if match.start() > 0]
+        selected_starts = [
+            *tail_starts[:_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS],
+            *tail_starts[-_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:],
+        ]
+        for start in dict.fromkeys(selected_starts):
+            extraction_windows.append((import_context + b"\n" + tail[start:], True))
     return extraction_windows
-
-
-def _embedded_python_start_offsets(data: bytes) -> list[int]:
-    return [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(data)]
 
 
 def _has_raw_match_outside_parsed_spans(raw_spans: list[tuple[int, int]], parsed_spans: list[tuple[int, int]]) -> bool:
@@ -1210,7 +1218,10 @@ class JITScriptDetector:
                 if parsed_snippet is not None:
                     tree, parsed_chars = parsed_snippet
                     parsed_byte_length = byte_offsets[parsed_chars]
-                    parsed_snippet_spans.append((span[0], min(span[1], span[0] + parsed_byte_length)))
+                    parsed_end = (
+                        span[1] if span[1] - span[0] > len(match) + 1 else min(span[1], span[0] + parsed_byte_length)
+                    )
+                    parsed_snippet_spans.append((span[0], parsed_end))
                     snippet_high_risk_calls.update(_resolve_alias_aware_high_risk_calls(tree))
                     ast_findings = self._analyze_ast(tree, framework, context)
                     findings.extend(ast_findings)
