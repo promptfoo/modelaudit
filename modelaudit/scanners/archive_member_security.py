@@ -107,6 +107,7 @@ _WEBBROWSER_CONTROLLER_LAUNCH_METHODS = frozenset({"open", "open_new", "open_new
 _CTYPES_NATIVE_LIBRARY_LOADING_CALLS = frozenset(
     {
         "_ctypes.dlopen",
+        "ctypes._dlopen",
         "ctypes.CDLL",
         "ctypes.LibraryLoader.LoadLibrary",
         "ctypes.OleDLL",
@@ -119,6 +120,12 @@ _CTYPES_NATIVE_LIBRARY_LOADING_CALLS = frozenset(
     }
 )
 _CTYPES_LIBRARY_LOADER_CONSTRUCTORS = frozenset({"ctypes.LibraryLoader"})
+_CTYPES_LIBRARY_LOADER_CONSTRUCTOR_INSTANCE_ROOTS = {
+    "ctypes.CDLL": "ctypes.cdll",
+    "ctypes.OleDLL": "ctypes.oledll",
+    "ctypes.PyDLL": "ctypes.pydll",
+    "ctypes.WinDLL": "ctypes.windll",
+}
 _CTYPES_LIBRARY_LOADER_OBJECTS = frozenset(
     {
         "ctypes.cdll",
@@ -385,7 +392,22 @@ def _resolve_ctypes_library_loader_instance_roots(node: ast.AST, alias_scopes: _
         return None
 
     loader_roots = resolved_constructor_names & _CTYPES_LIBRARY_LOADER_CONSTRUCTORS
-    return frozenset(loader_roots) if loader_roots else None
+    if not loader_roots:
+        return None
+    if node.args:
+        constructor_arg_name = _resolve_call_name(node.args[0])
+        resolved_arg_names = (
+            _apply_aliases(constructor_arg_name, alias_scopes) if constructor_arg_name is not None else None
+        )
+        if resolved_arg_names is not None:
+            instance_roots = frozenset(
+                root
+                for resolved_arg_name in resolved_arg_names
+                if (root := _CTYPES_LIBRARY_LOADER_CONSTRUCTOR_INSTANCE_ROOTS.get(resolved_arg_name)) is not None
+            )
+            if instance_roots:
+                return instance_roots
+    return frozenset(loader_roots)
 
 
 def _resolve_webbrowser_controller_factory_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
@@ -886,7 +908,10 @@ def _wildcard_import_aliases(
     module: str, tracked_call_names: frozenset[str] | None = None
 ) -> Iterator[tuple[str, str]]:
     prefix = f"{module}."
-    for call_name in sorted(_HIGH_RISK_PYTHON_CALLS if tracked_call_names is None else tracked_call_names):
+    call_names = set(_HIGH_RISK_PYTHON_CALLS if tracked_call_names is None else tracked_call_names)
+    if module == "webbrowser":
+        call_names.update(_WEBBROWSER_CONTROLLER_FACTORIES)
+    for call_name in sorted(call_names):
         if not call_name.startswith(prefix):
             continue
         exported_name = call_name.removeprefix(prefix).split(".", maxsplit=1)[0]

@@ -515,6 +515,7 @@ class TestJITScriptDetector:
             b"def payload():\n    from webbrowser import open_new as launch\n    return launch('https://evil.example')\n",
             b"def payload():\n    return webbrowser.open_new_tab('https://evil.example')\n",
             b"def payload():\n    return webbrowser.get().open('https://evil.example')\n",
+            b"def payload():\n    from webbrowser import *\n    return get().open('https://evil.example')\n",
             (
                 b"def payload():\n"
                 b"    controller = webbrowser.get()\n"
@@ -575,11 +576,13 @@ class TestJITScriptDetector:
             b"def payload():\n    return ctypes.windll.LoadLibrary('payload.dll')\n",
             b"def payload():\n    from ctypes import CDLL as load\n    return load('./payload.so')\n",
             b"def payload():\n    return ctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('./payload.so')\n",
+            b"def payload():\n    return ctypes.LibraryLoader(ctypes.CDLL).msvcrt.printf(b'hi')\n",
             b"def payload():\n    return ctypes.cdll.msvcrt.printf(b'hi')\n",
             b"def payload():\n    return getattr(ctypes, 'cdll').msvcrt.printf(b'hi')\n",
             b"def payload():\n    return ctypes.cdll.__getattr__('msvcrt').printf(b'hi')\n",
             b"def payload():\n    ctypes.cdll.msvcrt.foo = 1\n",
             b"def payload():\n    import _ctypes\n    return _ctypes.dlopen('libc.so.6')\n",
+            b"def payload():\n    import ctypes\n    return ctypes._dlopen('./payload.so')\n",
         ],
     )
     def test_scan_model_detects_unmarked_ctypes_native_loading(self, source: bytes) -> None:

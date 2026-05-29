@@ -359,6 +359,7 @@ def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite
         ("from webbrowser import open_new as launch\nlaunch('https://evil.example')\n", "webbrowser.open_new"),
         ("import webbrowser\nwebbrowser.open_new_tab('https://evil.example')\n", "webbrowser.open_new_tab"),
         ("import webbrowser\nwebbrowser.get().open('https://evil.example')\n", "webbrowser.open"),
+        ("from webbrowser import *\nget().open('https://evil.example')\n", "webbrowser.open"),
         (
             "import webbrowser\ncontroller = webbrowser.get()\ncontroller.open_new_tab('https://evil.example')\n",
             "webbrowser.open_new_tab",
@@ -415,13 +416,18 @@ def test_scan_zip_preserves_possible_webbrowser_launch_after_conditional_overwri
         ("from ctypes import CDLL as load\nload('./payload.so')\n", "ctypes.CDLL"),
         (
             "import ctypes\nctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('./payload.so')\n",
-            "ctypes.LibraryLoader.LoadLibrary",
+            "ctypes.cdll.LoadLibrary",
+        ),
+        (
+            "import ctypes\nctypes.LibraryLoader(ctypes.CDLL).msvcrt.printf(b'hi')\n",
+            "ctypes.cdll.msvcrt",
         ),
         ("import ctypes\nctypes.cdll.msvcrt.printf(b'hi')\n", "ctypes.cdll.msvcrt"),
         ("import ctypes\ngetattr(ctypes, 'cdll').msvcrt.printf(b'hi')\n", "ctypes.cdll.msvcrt"),
         ("import ctypes\nctypes.cdll.__getattr__('msvcrt').printf(b'hi')\n", "ctypes.cdll.msvcrt"),
         ("import ctypes\nctypes.cdll.msvcrt.foo = 1\n", "ctypes.cdll.msvcrt"),
         ("import _ctypes\n_ctypes.dlopen('libc.so.6')\n", "_ctypes.dlopen"),
+        ("import ctypes\nctypes._dlopen('./payload.so')\n", "ctypes._dlopen"),
     ],
 )
 def test_scan_zip_flags_ctypes_native_loading_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
