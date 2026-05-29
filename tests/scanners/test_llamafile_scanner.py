@@ -222,6 +222,24 @@ def test_llamafile_continues_after_structural_torch7_decoy(tmp_path: Path) -> No
     )
 
 
+def test_llamafile_prefers_later_critical_torch7_candidate_over_warning_decoy(tmp_path: Path) -> None:
+    binary = tmp_path / "torch7-warning-decoy-then-critical.llamafile"
+    warning_decoy = b"T7\x00\x00torch.FloatTensor nn.Sequential\npackage.loadlib('libx.so', 'luaopen_x')\n"
+    critical_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('bash -c id')\n"
+    embedded_payload = warning_decoy + (b"A" * 8192) + critical_payload
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=embedded_payload))
+
+    result = LlamafileScanner(config={"torch7_max_scan_bytes": 128}).scan(str(binary))
+
+    assert result.metadata["embedded_torch7_offset"] == binary.read_bytes().index(critical_payload)
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
 def test_llamafile_preserves_magic_only_binary_torch7_payload(tmp_path: Path) -> None:
     binary = tmp_path / "magic-only-binary-torch7.llamafile"
     torch7_payload = b"T7\x00\x00" + (b"\x01\x02\x03\x04" * 1024) + b"cmd = os.execute('id')\n"

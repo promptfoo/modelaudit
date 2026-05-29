@@ -488,17 +488,21 @@ class LlamafileScanner(BaseScanner):
         from .torch7_scanner import Torch7Scanner
 
         scanner = Torch7Scanner(config=self.config)
+        best_actionable: tuple[ScanResult, int, int, IssueSeverity] | None = None
         deferred_incomplete: tuple[ScanResult, int, int] | None = None
         next_offset: int | None = offset
 
         while next_offset is not None:
             embedded_result, carve_size = self._scan_embedded_torch7_candidate(path, scanner, result, next_offset)
             if embedded_result is not None:
-                if self._torch7_result_has_actionable_findings(embedded_result):
-                    result.metadata["embedded_torch7_offset"] = next_offset
-                    result.metadata["embedded_torch7_size"] = carve_size
-                    self._append_torch7_findings(result, embedded_result, next_offset)
-                    return
+                actionable_severity = self._torch7_result_actionable_severity(embedded_result)
+                if actionable_severity is not None:
+                    if best_actionable is None or self._torch7_severity_rank(
+                        actionable_severity
+                    ) > self._torch7_severity_rank(best_actionable[3]):
+                        best_actionable = (embedded_result, next_offset, carve_size, actionable_severity)
+                    if actionable_severity == IssueSeverity.CRITICAL:
+                        break
                 if deferred_incomplete is None and self._torch7_result_is_incomplete(embedded_result):
                     deferred_incomplete = (embedded_result, next_offset, carve_size)
 
@@ -507,6 +511,13 @@ class LlamafileScanner(BaseScanner):
                 self.max_payload_scan_bytes,
                 start_offset=next_offset + 1,
             )
+
+        if best_actionable is not None:
+            embedded_result, actionable_offset, carve_size, _ = best_actionable
+            result.metadata["embedded_torch7_offset"] = actionable_offset
+            result.metadata["embedded_torch7_size"] = carve_size
+            self._append_torch7_findings(result, embedded_result, actionable_offset)
+            return
 
         if deferred_incomplete is not None:
             embedded_result, incomplete_offset, carve_size = deferred_incomplete
@@ -546,11 +557,26 @@ class LlamafileScanner(BaseScanner):
             carved_path.unlink(missing_ok=True)
 
     @staticmethod
-    def _torch7_result_has_actionable_findings(result: ScanResult) -> bool:
-        return any(
-            check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    def _torch7_result_actionable_severity(result: ScanResult) -> IssueSeverity | None:
+        severities = [
+            check.severity
             for check in result.checks
-        ) or any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+            if check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        ]
+        severities.extend(
+            issue.severity
+            for issue in result.issues
+            if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        )
+        if IssueSeverity.CRITICAL in severities:
+            return IssueSeverity.CRITICAL
+        if IssueSeverity.WARNING in severities:
+            return IssueSeverity.WARNING
+        return None
+
+    @staticmethod
+    def _torch7_severity_rank(severity: IssueSeverity) -> int:
+        return 2 if severity == IssueSeverity.CRITICAL else 1
 
     @staticmethod
     def _torch7_result_is_incomplete(result: ScanResult) -> bool:
