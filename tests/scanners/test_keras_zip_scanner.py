@@ -2459,6 +2459,49 @@ class TestCVE20251550ModuleReferences:
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
         assert "builtins" in cve_issues[0].message
 
+    @pytest.mark.parametrize(
+        ("module_value", "key", "expected_root"),
+        [
+            ("posix", "module", "posix"),
+            ("nt", "fn_module", "nt"),
+            ("_ctypes", "module", "_ctypes"),
+            ("posix.path", "fn_module", "posix"),
+        ],
+    )
+    def test_native_dangerous_module_roots_are_critical(
+        self,
+        tmp_path: Path,
+        module_value: str,
+        key: str,
+        expected_root: str,
+    ) -> None:
+        """Native system module roots should be treated like their public wrappers."""
+        scanner = KerasZipScanner()
+        layer: dict[str, Any] = {
+            "class_name": "Dense",
+            "name": "native_evil",
+            "config": {"units": 1},
+        }
+        if key == "module":
+            layer[key] = module_value
+        else:
+            layer["config"][key] = module_value
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [layer]},
+        }
+
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [
+            issue
+            for issue in result.issues
+            if issue.details.get("cve_id") == "CVE-2025-1550" and issue.details.get("module") == module_value
+        ]
+        assert cve_issues
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["module"].split(".")[0] == expected_root
+
     def test_untrusted_module_custom_package(self, tmp_path: Path) -> None:
         """Unknown module references in callable context should be flagged as WARNING."""
         scanner = KerasZipScanner()
