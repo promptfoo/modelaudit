@@ -1300,10 +1300,8 @@ class Jinja2TemplateScanner(BaseScanner):
         return detail == "empty_result" or detail.startswith("exitcode=")
 
     def _template_has_static_render_budget_risk(self, template_content: str) -> bool:
-        if (
-            re.search(r"(['\"])(?:\\.|(?!\1).){1,256}\1\s*\*\s*\d{5,}", template_content)
-            or re.search(r"\d{5,}\s*\*\s*(['\"])(?:\\.|(?!\1).){1,256}\1", template_content)
-            or re.search(r"\brange\(\s*\d{5,}", template_content)
+        if re.search(r"(['\"])(?:\\.|(?!\1).){1,256}\1\s*\*\s*\d{5,}", template_content) or re.search(
+            r"\d{5,}\s*\*\s*(['\"])(?:\\.|(?!\1).){1,256}\1", template_content
         ):
             return True
         return self._template_ast_has_static_render_budget_risk(template_content)
@@ -1356,7 +1354,14 @@ class Jinja2TemplateScanner(BaseScanner):
         for node in parsed.find_all(jinja2.nodes.Call):
             if not isinstance(node.node, jinja2.nodes.Name) or node.node.name != "range" or not node.args:
                 continue
-            range_bound = self._constant_int_expression_value(node.args[0], range_threshold)
+            range_count = self._constant_range_iteration_count(node.args, range_threshold)
+            if range_count is not None:
+                if range_count >= range_threshold:
+                    return True
+                continue
+
+            stop_arg = node.args[1] if len(node.args) >= 2 else node.args[0]
+            range_bound = self._constant_int_expression_value(stop_arg, range_threshold)
             if range_bound is not None and abs(range_bound) >= range_threshold:
                 return True
 
@@ -1418,6 +1423,33 @@ class Jinja2TemplateScanner(BaseScanner):
                 return cap + 1
             return self._cap_constant_int(left**right, cap)
         return None
+
+    def _constant_range_iteration_count(self, args: list[Any], cap: int) -> int | None:
+        values: list[int] = []
+        for arg in args[:3]:
+            value = self._constant_int_expression_value(arg, cap)
+            if value is None:
+                return None
+            values.append(value)
+
+        if len(values) == 1:
+            start = 0
+            stop = values[0]
+            step = 1
+        else:
+            start = values[0]
+            stop = values[1]
+            step = values[2] if len(values) >= 3 else 1
+
+        if start is None or stop is None or step is None or step == 0:
+            return None
+        if step > 0:
+            if stop <= start:
+                return 0
+            return min(((stop - start - 1) // step) + 1, cap + 1)
+        if stop >= start:
+            return 0
+        return min(((start - stop - 1) // abs(step)) + 1, cap + 1)
 
     def _cap_constant_int(self, value: int, cap: int) -> int:
         if abs(value) <= cap:

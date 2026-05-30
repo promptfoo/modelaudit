@@ -1027,6 +1027,50 @@ class TestJinja2TemplateScannerEdgeCases:
         assert len(budget_checks) == 1
         assert budget_checks[0].details["budget_type"] == "worker_unavailable"
 
+    def test_unavailable_sandbox_worker_fails_closed_for_multi_arg_static_expression_range(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "range-expression.jinja"
+        template_file.write_text("{{ range(0, 10 ** 8)|list }}", encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner()
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        budget_checks = [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+        assert len(budget_checks) == 1
+        assert budget_checks[0].details["budget_type"] == "worker_unavailable"
+
+    def test_unavailable_sandbox_worker_keeps_small_multi_arg_range_clean(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "small-range-expression.jinja"
+        template_file.write_text("{{ range(99999, 100000)|list }}", encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner()
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
     def test_unavailable_sandbox_worker_fails_closed_for_static_render_amplification(
         self,
         tmp_path: Path,
