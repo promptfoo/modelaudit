@@ -1807,6 +1807,32 @@ def test_scan_jfrog_url_success(
 
 @patch("modelaudit.cli.is_jfrog_url")
 @patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_with_max_size_forwards_download_budget(
+    mock_scan_jfrog: MagicMock,
+    mock_is_jfrog: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """CLI --max-size should cap JFrog acquisition before scan-time limits run."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    mock_is_jfrog.return_value = True
+    mock_scan_jfrog.return_value = create_mock_scan_result(
+        bytes_scanned=5, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--max-size", "5B", "https://company.jfrog.io/artifactory/repo/model.bin"])
+
+    assert result.exit_code == 0
+    mock_scan_jfrog.assert_called_once()
+    call_kwargs = mock_scan_jfrog.call_args.kwargs
+    assert call_kwargs["max_download_size"] == 5
+    assert call_kwargs["max_file_size"] == 5
+    assert call_kwargs["max_total_size"] == 5
+
+
+@patch("modelaudit.cli.is_jfrog_url")
+@patch("modelaudit.cli.scan_jfrog_artifact")
 def test_scan_jfrog_url_download_failure(mock_scan_jfrog, mock_is_jfrog):
     """Test handling of JFrog download failures."""
     mock_is_jfrog.return_value = True

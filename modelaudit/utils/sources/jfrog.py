@@ -1,5 +1,6 @@
 """Utilities for handling JFrog Artifactory downloads and folder operations."""
 
+import contextlib
 import ipaddress
 import logging
 import os
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Constants
 MAX_RECURSION_DEPTH = 64  # Prevent runaway recursion in folder traversal
+JFROG_DOWNLOAD_CHUNK_SIZE = 8192
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
     r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|secret|api-key|api_key|apikey|sig)[^=\s&]*=)[^\s&#]+",
     re.IGNORECASE,
@@ -119,6 +121,7 @@ class JFrogFileInfo(TypedDict):
 
     type: Literal["file"]
     size: int
+    size_known: bool
     path: str
     repo: str
 
@@ -231,12 +234,82 @@ def _build_jfrog_auth_headers(
     return {}
 
 
+def _positive_limit(*limits: int | None) -> int | None:
+    positive_limits = [limit for limit in limits if limit is not None and limit > 0]
+    return min(positive_limits) if positive_limits else None
+
+
+def _coerce_nonnegative_size(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return None
+
+
+def _listed_file_known_size(file_info: dict[str, Any]) -> int | None:
+    if file_info.get("size_known") is False:
+        return None
+    return _coerce_nonnegative_size(file_info.get("size"))
+
+
+def _require_size_within_limit(
+    *,
+    size: int | None,
+    limit: int | None,
+    display_url: str,
+    description: str,
+) -> None:
+    if limit is None:
+        return
+
+    if size is None:
+        return
+
+    if size > limit:
+        raise ValueError(
+            f"JFrog {description} size ({format_size(size)}) exceeds maximum allowed size "
+            f"({format_size(limit)}) for {display_url}"
+        )
+
+
+def _require_known_size_within_limit(
+    *,
+    size: int | None,
+    limit: int | None,
+    display_url: str,
+    description: str,
+) -> None:
+    if limit is None:
+        return
+
+    if size is None:
+        raise ValueError(
+            f"Cannot verify JFrog {description} size for {display_url}; refusing to download with maximum "
+            f"allowed size {format_size(limit)}"
+        )
+
+    _require_size_within_limit(size=size, limit=limit, display_url=display_url, description=description)
+
+
+def _cleanup_failed_artifact_download(temp_dir: Path | None, partial_path: Path | None) -> None:
+    if temp_dir is not None and temp_dir.exists():
+        shutil.rmtree(temp_dir)
+        return
+    if partial_path is not None and partial_path.exists() and partial_path.is_file():
+        with contextlib.suppress(OSError):
+            partial_path.unlink()
+
+
 def download_artifact(
     url: str,
     cache_dir: Path | None = None,
     api_token: str | None = None,
     access_token: str | None = None,
     timeout: int = 30,
+    max_size: int | None = None,
 ) -> Path:
     """
     Download an artifact from JFrog Artifactory with proper authentication.
@@ -253,6 +326,7 @@ def download_artifact(
         api_token: JFrog API token (recommended)
         access_token: JFrog access token
         timeout: Request timeout in seconds
+        max_size: Maximum bytes to download (None = unlimited)
 
     Returns:
         Path to the downloaded file
@@ -265,6 +339,7 @@ def download_artifact(
     display_url = redact_jfrog_url_for_display(url)
     if not is_jfrog_url(url):
         raise ValueError(f"Not a JFrog URL: {display_url}")
+    max_download_size = max_size if max_size is not None and max_size >= 0 else None
 
     filename = os.path.basename(urlparse(url).path)
     temp_dir: Path | None = None
@@ -274,6 +349,7 @@ def download_artifact(
     else:
         dest_path = cache_dir / filename
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path: Path | None = None
 
     headers = _build_jfrog_auth_headers(url, api_token=api_token, access_token=access_token)
 
@@ -301,17 +377,44 @@ def download_artifact(
         # Raise an exception for HTTP error responses
         response.raise_for_status()
 
-        # Download the file in chunks
-        with open(dest_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
+        content_length = None
+        response_headers = getattr(response, "headers", {})
+        if hasattr(response_headers, "get"):
+            content_length = _coerce_nonnegative_size(response_headers.get("Content-Length"))
+        _require_size_within_limit(
+            size=content_length,
+            limit=max_download_size,
+            display_url=display_url,
+            description="artifact",
+        )
+
+        # Download the file to a staging path so failed attempts never clobber caller-owned cache files.
+        bytes_written = 0
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{filename}.",
+            suffix=".tmp",
+            dir=dest_path.parent,
+            delete=False,
+        ) as f:
+            partial_path = Path(f.name)
+            chunk_size = 1 if max_download_size is not None else JFROG_DOWNLOAD_CHUNK_SIZE
+            for chunk in response.iter_content(chunk_size=chunk_size):
                 if chunk:  # Filter out keep-alive chunks
+                    bytes_written += len(chunk)
+                    _require_size_within_limit(
+                        size=bytes_written,
+                        limit=max_download_size,
+                        display_url=display_url,
+                        description="artifact",
+                    )
                     f.write(chunk)
 
+        partial_path.replace(dest_path)
+        partial_path = None
         return dest_path
 
     except requests.exceptions.HTTPError as e:  # type: ignore[attr-defined]
-        if temp_dir is not None and temp_dir.exists():
-            shutil.rmtree(temp_dir)
+        _cleanup_failed_artifact_download(temp_dir, partial_path)
         error_msg = redact_jfrog_error_for_display(e, url)
         if e.response.status_code == 401:
             raise Exception(
@@ -324,13 +427,11 @@ def download_artifact(
 
         raise Exception(f"HTTP error {e.response.status_code} downloading from {display_url}: {error_msg}") from e
     except requests.exceptions.RequestException as e:  # type: ignore[attr-defined]
-        if temp_dir is not None and temp_dir.exists():
-            shutil.rmtree(temp_dir)
+        _cleanup_failed_artifact_download(temp_dir, partial_path)
         error_msg = redact_jfrog_error_for_display(e, url)
         raise Exception(f"Network error downloading from {display_url}: {error_msg}") from e
     except Exception as e:
-        if temp_dir is not None and temp_dir.exists():
-            shutil.rmtree(temp_dir)
+        _cleanup_failed_artifact_download(temp_dir, partial_path)
         error_msg = redact_jfrog_error_for_display(e, url)
         raise Exception(f"Failed to download artifact from {display_url}: {error_msg}") from e
 
@@ -449,9 +550,11 @@ def detect_jfrog_target_type(
             )
         else:
             # It's a file
+            file_size = _coerce_nonnegative_size(data.get("size"))
             return JFrogFileInfo(
                 type="file",
-                size=data.get("size", 0),
+                size=file_size or 0,
+                size_known=file_size is not None,
                 path=data.get("path", ""),
                 repo=data.get("repo", ""),
             )
@@ -541,14 +644,19 @@ def list_jfrog_folder_contents(
                     _collect_files(child_url, depth + 1)
             else:
                 # It's a file
-                size = child.get("size", 0)
+                parsed_size = _coerce_nonnegative_size(child.get("size"))
+                size = parsed_size or 0
+                size_known = parsed_size is not None
 
                 # Optionally fetch accurate size if requested
-                if fetch_sizes and size == 0:
+                if fetch_sizes and (not size_known or size == 0):
                     try:
                         file_info = detect_jfrog_target_type(child_url, api_token, access_token, timeout)
                         if file_info["type"] == "file":
-                            size = file_info.get("size", 0)
+                            fetched_size = _coerce_nonnegative_size(file_info.get("size"))
+                            if fetched_size is not None:
+                                size = fetched_size
+                            size_known = bool(file_info.get("size_known", fetched_size is not None))
                     except Exception as e:
                         logger.warning(
                             "Failed to fetch size for "
@@ -560,6 +668,7 @@ def list_jfrog_folder_contents(
                         "name": child_name,
                         "path": child_url,
                         "size": size,
+                        "size_known": size_known,
                         "human_size": format_size(size) if size > 0 else "Unknown",
                     }
                 )
@@ -582,6 +691,9 @@ def download_jfrog_folder(
     show_progress: bool = True,
     fetch_sizes: bool = False,
     scannable_extensions: Collection[str] | None = None,
+    max_size: int | None = None,
+    max_file_size: int | None = None,
+    max_total_size: int | None = None,
 ) -> Path:
     """Download all files from a JFrog folder.
 
@@ -594,6 +706,9 @@ def download_jfrog_folder(
         selective: Whether to filter only scannable model files
         show_progress: Whether to show download progress
         fetch_sizes: Whether to fetch accurate file sizes for progress reporting
+        max_size: Maximum cumulative bytes to download (None or 0 = unlimited)
+        max_file_size: Maximum bytes for any single selected file (None or 0 = unlimited)
+        max_total_size: Maximum cumulative bytes to download (None or 0 = unlimited)
 
     Returns:
         Path to directory containing downloaded files
@@ -606,6 +721,9 @@ def download_jfrog_folder(
     if not is_jfrog_url(url):
         raise ValueError(f"Not a JFrog URL: {display_url}")
 
+    total_limit = _positive_limit(max_size, max_total_size)
+    per_file_limit = _positive_limit(max_file_size)
+
     # List all files in the folder
     list_kwargs: dict[str, Any] = {}
     if scannable_extensions is not None:
@@ -617,12 +735,38 @@ def download_jfrog_folder(
         timeout,
         recursive=True,
         selective=selective,
-        fetch_sizes=fetch_sizes,
+        fetch_sizes=fetch_sizes or total_limit is not None or per_file_limit is not None,
         **list_kwargs,
     )
 
     if not files:
         raise ValueError("No scannable model files found in JFrog folder")
+
+    declared_total_size = 0
+    for file_info in files:
+        file_url = str(file_info["path"])
+        display_file_url = redact_jfrog_url_for_display(file_url)
+        file_size = _listed_file_known_size(file_info)
+        _require_known_size_within_limit(
+            size=file_size,
+            limit=per_file_limit,
+            display_url=display_file_url,
+            description="artifact",
+        )
+        _require_known_size_within_limit(
+            size=file_size,
+            limit=total_limit,
+            display_url=display_file_url,
+            description="selected artifact",
+        )
+        if file_size is not None:
+            declared_total_size += file_size
+        _require_size_within_limit(
+            size=declared_total_size,
+            limit=total_limit,
+            display_url=display_url,
+            description="folder selected-file total",
+        )
 
     # Create download directory
     owns_download_dir = cache_dir is None
@@ -634,7 +778,7 @@ def download_jfrog_folder(
         download_dir.mkdir(parents=True, exist_ok=True)
 
     if show_progress:
-        total_size = sum(f["size"] for f in files)
+        total_size = sum(_listed_file_known_size(f) or 0 for f in files)
         size_info = format_size(total_size) if total_size > 0 else "size unknown"
         click.echo(f"Found {len(files)} scannable files ({size_info}) in JFrog folder")
 
@@ -650,70 +794,129 @@ def download_jfrog_folder(
 
     completed_downloads = 0
     downloaded_files: list[Path] = []
+    actual_downloaded_size = 0
+    backup_dir: Path | None = None
+    backup_paths: dict[Path, Path] = {}
+    protected_existing_paths: set[Path] = set()
+    backup_restore_failed = False
 
-    for file_info in files:
-        local_file: Path | None = None
-        downloaded_file: Path | None = None
-        try:
-            if show_progress:
-                size_display = file_info["human_size"] if file_info["human_size"] != "Unknown" else "size unknown"
-                click.echo(f"Downloading {file_info['name']} ({size_display})")
+    def _backup_existing_file(path: Path) -> None:
+        nonlocal backup_dir
+        if owns_download_dir or path in backup_paths or not path.exists() or not path.is_file():
+            return
+        protected_existing_paths.add(path)
+        if backup_dir is None:
+            backup_dir = Path(tempfile.mkdtemp(prefix="modelaudit_jfrog_folder_backup_"))
+        backup_path = backup_dir / f"{len(backup_paths)}.bak"
+        shutil.copy2(path, backup_path)
+        backup_paths[path] = backup_path
 
-            # Calculate relative path for local storage
-            file_url_parsed = urlparse(file_info["path"])
-            file_path_parts = file_url_parsed.path.strip("/").split("/")
-
+    def _restore_backups() -> None:
+        nonlocal backup_restore_failed
+        for original_path, backup_path in backup_paths.items():
             try:
-                file_artifactory_index = file_path_parts.index("artifactory")
-                file_repo_path = "/".join(file_path_parts[file_artifactory_index + 1 :])
+                original_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(backup_path, original_path)
+            except OSError as exc:
+                backup_restore_failed = True
+                raise Exception(
+                    f"Failed to restore original JFrog cache file {original_path} from backup {backup_path}: {exc}"
+                ) from exc
 
-                if base_repo_path and file_repo_path.startswith(base_repo_path + "/"):
-                    relative_path = file_repo_path[len(base_repo_path) + 1 :]
-                elif base_repo_path and file_repo_path == base_repo_path:
+    def _cleanup_backups() -> None:
+        if not backup_restore_failed and backup_dir is not None and backup_dir.exists():
+            shutil.rmtree(backup_dir, ignore_errors=True)
+
+    try:
+        for file_info in files:
+            local_file: Path | None = None
+            downloaded_file: Path | None = None
+            try:
+                if show_progress:
+                    size_display = file_info["human_size"] if file_info["human_size"] != "Unknown" else "size unknown"
+                    click.echo(f"Downloading {file_info['name']} ({size_display})")
+
+                # Calculate relative path for local storage
+                file_url_parsed = urlparse(file_info["path"])
+                file_path_parts = file_url_parsed.path.strip("/").split("/")
+
+                try:
+                    file_artifactory_index = file_path_parts.index("artifactory")
+                    file_repo_path = "/".join(file_path_parts[file_artifactory_index + 1 :])
+
+                    if base_repo_path and file_repo_path.startswith(base_repo_path + "/"):
+                        relative_path = file_repo_path[len(base_repo_path) + 1 :]
+                    elif base_repo_path and file_repo_path == base_repo_path:
+                        relative_path = Path(file_info["name"]).name
+                    else:
+                        relative_path = Path(file_info["name"]).name
+                except (ValueError, IndexError):
                     relative_path = Path(file_info["name"]).name
-                else:
-                    relative_path = Path(file_info["name"]).name
-            except (ValueError, IndexError):
-                relative_path = Path(file_info["name"]).name
 
-            local_file = _safe_download_path(download_dir, relative_path)
-            local_file.parent.mkdir(parents=True, exist_ok=True)
+                local_file = _safe_download_path(download_dir, relative_path)
+                local_file.parent.mkdir(parents=True, exist_ok=True)
+                expected_downloaded_file = local_file.parent / Path(file_url_parsed.path).name
+                _backup_existing_file(local_file)
+                if expected_downloaded_file != local_file:
+                    _backup_existing_file(expected_downloaded_file)
+                remaining_total_size = total_limit - actual_downloaded_size if total_limit is not None else None
+                file_limits = [limit for limit in (per_file_limit, remaining_total_size) if limit is not None]
+                file_download_limit = min(file_limits) if file_limits else None
 
-            # Download the individual file
-            download_artifact(
-                file_info["path"],
-                cache_dir=local_file.parent,
-                api_token=api_token,
-                access_token=access_token,
-                timeout=timeout,
-            )
+                # Download the individual file
+                downloaded_file = download_artifact(
+                    file_info["path"],
+                    cache_dir=local_file.parent,
+                    api_token=api_token,
+                    access_token=access_token,
+                    timeout=timeout,
+                    max_size=file_download_limit,
+                )
 
-            # Move to correct location if needed
-            downloaded_file = local_file.parent / Path(file_info["path"]).name
-            if downloaded_file != local_file and downloaded_file.exists():
-                if local_file.exists():
-                    local_file.unlink()
-                downloaded_file.rename(local_file)
-                downloaded_file = local_file
-            completed_downloads += 1
-            downloaded_files.append(downloaded_file)
+                # Move to correct location if needed
+                if downloaded_file != local_file and downloaded_file.exists():
+                    if local_file.exists():
+                        local_file.unlink()
+                    downloaded_file.rename(local_file)
+                    downloaded_file = local_file
+                if downloaded_file.exists():
+                    actual_downloaded_size += downloaded_file.stat().st_size
+                _require_size_within_limit(
+                    size=actual_downloaded_size,
+                    limit=total_limit,
+                    display_url=display_url,
+                    description="folder selected-file total",
+                )
+                completed_downloads += 1
+                downloaded_files.append(downloaded_file)
 
-        except Exception as e:
-            redacted_error = redact_jfrog_error_for_display(e)
-            error_msg = f"Failed to download {file_info['name']}: {redacted_error}"
-            logger.warning(error_msg)
-            if show_progress:
-                click.echo("❌ Aborting JFrog folder download to avoid scanning a partial dataset")
-            current_file_candidates = [path for path in (local_file, downloaded_file) if path is not None]
-            _cleanup_failed_folder_download(
-                download_dir,
-                owns_download_dir=owns_download_dir,
-                downloaded_files=downloaded_files,
-                current_file_candidates=current_file_candidates,
-            )
-            raise Exception(
-                "JFrog folder download failed after "
-                f"{completed_downloads} of {len(files)} file(s) completed. {file_info['name']}: {redacted_error}"
-            ) from e
+            except Exception as e:
+                redacted_error = redact_jfrog_error_for_display(e)
+                error_msg = f"Failed to download {file_info['name']}: {redacted_error}"
+                logger.warning(error_msg)
+                if show_progress:
+                    click.echo("❌ Aborting JFrog folder download to avoid scanning a partial dataset")
+                current_file_candidates = [
+                    path
+                    for path in (local_file, downloaded_file)
+                    if path is not None and path not in backup_paths and path not in protected_existing_paths
+                ]
+                _cleanup_failed_folder_download(
+                    download_dir,
+                    owns_download_dir=owns_download_dir,
+                    downloaded_files=[
+                        path
+                        for path in downloaded_files
+                        if path not in backup_paths and path not in protected_existing_paths
+                    ],
+                    current_file_candidates=current_file_candidates,
+                )
+                _restore_backups()
+                raise Exception(
+                    "JFrog folder download failed after "
+                    f"{completed_downloads} of {len(files)} file(s) completed. {file_info['name']}: {redacted_error}"
+                ) from e
 
-    return download_dir
+        return download_dir
+    finally:
+        _cleanup_backups()

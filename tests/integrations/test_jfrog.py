@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -66,6 +67,7 @@ class TestJFrogDownload:
         # Mock successful response
         mock_response = mock_get.return_value
         mock_response.raise_for_status.return_value = None
+        mock_response.headers = {"Content-Length": "4"}
         mock_response.iter_content.return_value = [b"data"]
         monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
 
@@ -80,6 +82,96 @@ class TestJFrogDownload:
         call_args = mock_get.call_args
         assert "X-JFrog-Art-Api" in call_args[1]["headers"]
         assert call_args[1]["headers"]["X-JFrog-Art-Api"] == "test-token"
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_rejects_content_length_over_max_size(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Declared oversized artifacts should fail before writing a body."""
+        mock_response = mock_get.return_value
+        mock_response.raise_for_status.return_value = None
+        mock_response.headers = {"Content-Length": "6"}
+        mock_response.iter_content.return_value = [b"oversized"]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        with pytest.raises(Exception, match="exceeds maximum allowed size"):
+            download_artifact(
+                "https://company.jfrog.io/artifactory/repo/model.bin",
+                cache_dir=tmp_path,
+                api_token="test-token",
+                max_size=5,
+            )
+
+        assert not (tmp_path / "model.bin").exists()
+        assert not any(tmp_path.iterdir())
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_rejects_content_length_over_max_size_preserves_existing_file(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Failed bounded downloads must not delete caller-owned cache files."""
+        existing_file = tmp_path / "model.bin"
+        existing_file.write_bytes(b"keep me")
+        mock_response = mock_get.return_value
+        mock_response.raise_for_status.return_value = None
+        mock_response.headers = {"Content-Length": "6"}
+        mock_response.iter_content.return_value = [b"oversized"]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        with pytest.raises(Exception, match="exceeds maximum allowed size"):
+            download_artifact(
+                "https://company.jfrog.io/artifactory/repo/model.bin",
+                cache_dir=tmp_path,
+                api_token="test-token",
+                max_size=5,
+            )
+
+        assert existing_file.read_bytes() == b"keep me"
+        assert list(tmp_path.iterdir()) == [existing_file]
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_stream_enforces_max_size_and_cleans_partial_file(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Streaming responses without Content-Length must still be byte-capped."""
+        mock_response = mock_get.return_value
+        mock_response.raise_for_status.return_value = None
+        mock_response.headers = {}
+        mock_response.iter_content.return_value = [b"1", b"2", b"3", b"4", b"5", b"6"]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        with pytest.raises(Exception, match="exceeds maximum allowed size"):
+            download_artifact(
+                "https://company.jfrog.io/artifactory/repo/model.bin",
+                cache_dir=tmp_path,
+                api_token="test-token",
+                max_size=5,
+            )
+
+        assert not (tmp_path / "model.bin").exists()
+        assert not any(tmp_path.iterdir())
+        mock_response.iter_content.assert_called_once_with(chunk_size=1)
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_allows_unknown_content_length_under_max_size(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Absent Content-Length is allowed when the streamed body stays within budget."""
+        mock_response = mock_get.return_value
+        mock_response.raise_for_status.return_value = None
+        mock_response.headers = {}
+        mock_response.iter_content.return_value = [b"123", b"45"]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        result = download_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            cache_dir=tmp_path,
+            api_token="test-token",
+            max_size=5,
+        )
+
+        assert result.read_bytes() == b"12345"
+        mock_response.iter_content.assert_called_once_with(chunk_size=1)
 
     def test_invalid_url(self):
         with pytest.raises(ValueError):
@@ -634,6 +726,312 @@ class TestJFrogFolderDownload:
 
         assert result_dir == tmp_path
         assert len(list(tmp_path.glob("**/*"))) >= 2  # At least 2 files downloaded
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_rejects_oversized_selected_file_before_download(
+        self, mock_list: MagicMock, mock_download: MagicMock, tmp_path: Path
+    ) -> None:
+        """Selected files that exceed the configured file budget should not be fetched."""
+        mock_list.return_value = [
+            {
+                "name": "large-model.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/large-model.pt",
+                "size": 6,
+                "size_known": True,
+                "human_size": "6.0 B",
+            }
+        ]
+
+        with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                api_token="test-token",
+                show_progress=False,
+                max_file_size=5,
+            )
+
+        mock_download.assert_not_called()
+        assert not any(tmp_path.iterdir())
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.detect_jfrog_target_type")
+    def test_download_jfrog_folder_resolves_unknown_selected_file_size_when_capped(
+        self, mock_detect: MagicMock, mock_download: MagicMock, tmp_path: Path
+    ) -> None:
+        """Bounded folder downloads should use Storage API file metadata before failing closed."""
+
+        def mock_detect_side_effect(url: str, *args: object, **kwargs: object) -> dict[str, object]:
+            if url.endswith("model.pt"):
+                return {"type": "file", "repo": "repo", "path": "/models/model.pt", "size": 4, "size_known": True}
+            return {
+                "type": "folder",
+                "repo": "repo",
+                "path": "/models",
+                "children": [{"uri": "/model.pt", "folder": False}],
+            }
+
+        def mock_download_side_effect(url: str, cache_dir: Path, **kwargs: object) -> Path:
+            assert kwargs["max_size"] == 5
+            path = cache_dir / Path(url).name
+            path.write_bytes(b"data")
+            return path
+
+        mock_detect.side_effect = mock_detect_side_effect
+        mock_download.side_effect = mock_download_side_effect
+
+        result = download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            api_token="test-token",
+            show_progress=False,
+            max_size=5,
+        )
+
+        assert result == tmp_path
+        assert (tmp_path / "model.pt").read_bytes() == b"data"
+        assert mock_detect.call_count == 3
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_rejects_unknown_selected_file_size_when_capped(
+        self, mock_list: MagicMock, mock_download: MagicMock, tmp_path: Path
+    ) -> None:
+        """Unknown selected-file sizes should fail closed when a total download cap is active."""
+        mock_list.return_value = [
+            {
+                "name": "model.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model.pt",
+                "size": 0,
+                "size_known": False,
+                "human_size": "Unknown",
+            }
+        ]
+
+        with pytest.raises(ValueError, match="Cannot verify JFrog selected artifact size"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                api_token="test-token",
+                show_progress=False,
+                max_size=5,
+            )
+
+        mock_download.assert_not_called()
+        assert not any(tmp_path.iterdir())
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_passes_remaining_total_budget_to_artifacts(
+        self, mock_list: MagicMock, mock_download: MagicMock, tmp_path: Path
+    ) -> None:
+        """Folder downloads should enforce one cumulative budget across selected files."""
+        mock_list.return_value = [
+            {
+                "name": "model1.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model1.pt",
+                "size": 4,
+                "size_known": True,
+                "human_size": "4.0 B",
+            },
+            {
+                "name": "model2.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model2.pt",
+                "size": 5,
+                "size_known": True,
+                "human_size": "5.0 B",
+            },
+        ]
+        seen_limits: list[int | None] = []
+
+        def mock_download_side_effect(url: str, cache_dir: Path, **kwargs: object) -> Path:
+            max_size = kwargs.get("max_size")
+            assert max_size is None or isinstance(max_size, int)
+            seen_limits.append(max_size)
+            path = cache_dir / Path(url).name
+            path.write_bytes(b"x" * (4 if path.name == "model1.pt" else 5))
+            return path
+
+        mock_download.side_effect = mock_download_side_effect
+
+        result = download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            api_token="test-token",
+            show_progress=False,
+            max_size=9,
+        )
+
+        assert result == tmp_path
+        assert seen_limits == [9, 5]
+        assert (tmp_path / "model1.pt").stat().st_size == 4
+        assert (tmp_path / "model2.pt").stat().st_size == 5
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_rejects_total_over_budget_before_download(
+        self, mock_list: MagicMock, mock_download: MagicMock, tmp_path: Path
+    ) -> None:
+        """Declared selected-file totals should be capped before any artifact body is fetched."""
+        mock_list.return_value = [
+            {
+                "name": "model1.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model1.pt",
+                "size": 6,
+                "size_known": True,
+                "human_size": "6.0 B",
+            },
+            {
+                "name": "model2.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model2.pt",
+                "size": 5,
+                "size_known": True,
+                "human_size": "5.0 B",
+            },
+        ]
+
+        with pytest.raises(ValueError, match="folder selected-file total"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                api_token="test-token",
+                show_progress=False,
+                max_size=10,
+            )
+
+        mock_download.assert_not_called()
+        assert not any(tmp_path.iterdir())
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_failed_child_preserves_existing_file(
+        self, mock_list: MagicMock, mock_download: MagicMock, tmp_path: Path
+    ) -> None:
+        """Folder abort cleanup must not delete caller-owned cache files."""
+        existing_file = tmp_path / "model.pt"
+        existing_file.write_bytes(b"keep me")
+        mock_list.return_value = [
+            {
+                "name": "model.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model.pt",
+                "size": 4,
+                "size_known": True,
+                "human_size": "4.0 B",
+            }
+        ]
+        mock_download.side_effect = Exception("exceeds maximum allowed size")
+
+        with pytest.raises(Exception, match="JFrog folder download failed"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                api_token="test-token",
+                show_progress=False,
+                max_size=5,
+            )
+
+        assert existing_file.read_bytes() == b"keep me"
+        assert list(tmp_path.iterdir()) == [existing_file]
+
+    @patch("modelaudit.utils.sources.jfrog.shutil.copy2")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_backup_failure_preserves_existing_file(
+        self, mock_list: MagicMock, mock_download: MagicMock, mock_copy: MagicMock, tmp_path: Path
+    ) -> None:
+        """Backup failures should not make caller-owned files eligible for abort cleanup."""
+        existing_file = tmp_path / "model.pt"
+        existing_file.write_bytes(b"keep me")
+        mock_list.return_value = [
+            {
+                "name": "model.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model.pt",
+                "size": 4,
+                "size_known": True,
+                "human_size": "4.0 B",
+            }
+        ]
+        mock_copy.side_effect = OSError("backup volume full")
+
+        with pytest.raises(Exception, match="JFrog folder download failed"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                api_token="test-token",
+                show_progress=False,
+                max_size=5,
+            )
+
+        mock_download.assert_not_called()
+        assert existing_file.read_bytes() == b"keep me"
+        assert list(tmp_path.iterdir()) == [existing_file]
+
+    @patch("modelaudit.utils.sources.jfrog.tempfile.mkdtemp")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_restore_failure_keeps_backup(
+        self, mock_list: MagicMock, mock_download: MagicMock, mock_mkdtemp: MagicMock, tmp_path: Path
+    ) -> None:
+        """Restore failures should retain the backup so original bytes are recoverable."""
+        existing_file = tmp_path / "model1.pt"
+        existing_file.write_bytes(b"original")
+        backup_dir = tmp_path / "backup"
+        backup_dir.mkdir()
+        mock_mkdtemp.return_value = str(backup_dir)
+        mock_list.return_value = [
+            {
+                "name": "model1.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model1.pt",
+                "size": 4,
+                "size_known": True,
+                "human_size": "4.0 B",
+            },
+            {
+                "name": "model2.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model2.pt",
+                "size": 4,
+                "size_known": True,
+                "human_size": "4.0 B",
+            },
+        ]
+
+        def mock_download_side_effect(url: str, cache_dir: Path, **kwargs: object) -> Path:
+            path = cache_dir / Path(url).name
+            if path.name == "model2.pt":
+                raise Exception("boom")
+            path.write_bytes(b"new")
+            return path
+
+        original_copy2 = shutil.copy2
+
+        def fail_restore_copy(
+            src: str | Path,
+            dst: str | Path,
+            *,
+            follow_symlinks: bool = True,
+        ) -> Path:
+            if Path(dst) == existing_file:
+                raise OSError("restore failed")
+            return Path(original_copy2(src, dst, follow_symlinks=follow_symlinks))
+
+        mock_download.side_effect = mock_download_side_effect
+        with (
+            patch("modelaudit.utils.sources.jfrog.shutil.copy2", side_effect=fail_restore_copy),
+            pytest.raises(Exception, match="Failed to restore original JFrog cache file"),
+        ):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                api_token="test-token",
+                show_progress=False,
+                max_size=8,
+            )
+
+        assert existing_file.read_bytes() == b"new"
+        backup_files = list(backup_dir.glob("*.bak"))
+        assert len(backup_files) == 1
+        assert backup_files[0].read_bytes() == b"original"
 
     @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
     def test_download_jfrog_folder_no_files(self, mock_list):

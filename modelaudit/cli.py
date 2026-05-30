@@ -1642,6 +1642,8 @@ def _resolve_scan_source_for_path(
             jfrog_scan_kwargs: dict[str, Any] = {}
             if runtime.scannable_extensions is not None:
                 jfrog_scan_kwargs["scannable_extensions"] = runtime.scannable_extensions
+            if runtime.max_download_bytes is not None:
+                jfrog_scan_kwargs["max_download_size"] = runtime.max_download_bytes
             jfrog_results: ModelAuditResultModel = scan_jfrog_artifact(
                 path,
                 api_token=runtime.jfrog_api_token,
