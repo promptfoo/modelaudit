@@ -19,10 +19,21 @@ Key Features:
 """
 
 import json
+import multiprocessing as mp
 import os
+import queue
 import re
 import warnings
-from typing import Any, ClassVar
+from contextlib import suppress
+from typing import Any, ClassVar, cast
+
+try:
+    import resource
+
+    HAS_RESOURCE_LIMITS = True
+except ImportError:
+    resource = None  # type: ignore[assignment]
+    HAS_RESOURCE_LIMITS = False
 
 from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
 
@@ -73,6 +84,58 @@ _DETECTION_MESSAGE_LABELS = {
 _RAW_PARSE_FALLBACK_CONTEXT_BYTES = 1024
 _RAW_PARSE_FALLBACK_MAX_WINDOWS = 8
 _RAW_PARSE_FALLBACK_READ_BYTES = 256 * 1024
+_DEFAULT_SANDBOX_RENDER_TIMEOUT_SECONDS = 0.5
+_DEFAULT_SANDBOX_RENDER_MAX_OUTPUT_CHARS = 64 * 1024
+_DEFAULT_SANDBOX_RENDER_MAX_MEMORY_BYTES = 512 * 1024 * 1024
+_SANDBOX_RENDER_BUDGET_REASON = "jinja2_sandbox_render_budget_exceeded"
+
+
+class _SandboxRenderBudgetExceeded(Exception):
+    pass
+
+
+def _limit_sandbox_worker_memory(max_memory_bytes: int) -> None:
+    if not HAS_RESOURCE_LIMITS or resource is None:
+        return
+
+    for limit_name in ("RLIMIT_AS", "RLIMIT_DATA"):
+        limit_id = getattr(resource, limit_name, None)
+        if limit_id is None:
+            continue
+        try:
+            _soft_limit, hard_limit = resource.getrlimit(limit_id)
+            capped_limit = max_memory_bytes
+            if hard_limit != resource.RLIM_INFINITY:
+                capped_limit = min(capped_limit, hard_limit)
+            resource.setrlimit(limit_id, (capped_limit, hard_limit))
+        except (OSError, ValueError):
+            continue
+
+
+def _sandbox_render_probe_worker(
+    template_content: str,
+    max_output_chars: int,
+    max_memory_bytes: int,
+    result_queue: Any,
+) -> None:
+    try:
+        _limit_sandbox_worker_memory(max_memory_bytes)
+        env = jinja2.sandbox.SandboxedEnvironment()
+        template = env.from_string(template_content)
+        rendered_chars = 0
+        for chunk in template.generate(messages=[], config={}):
+            rendered_chars += len(str(chunk))
+            if rendered_chars > max_output_chars:
+                raise _SandboxRenderBudgetExceeded
+        result_queue.put(("safe", None))
+    except jinja2.exceptions.SecurityError:
+        result_queue.put(("security_error", None))
+    except _SandboxRenderBudgetExceeded:
+        result_queue.put(("budget_exceeded", "output"))
+    except MemoryError:
+        result_queue.put(("budget_exceeded", "memory"))
+    except Exception as exc:
+        result_queue.put(("render_error", type(exc).__name__))
 
 
 def _compile_all_patterns() -> dict[str, list[tuple[re.Pattern[str], str]]]:
@@ -144,9 +207,35 @@ class Jinja2TemplateScanner(BaseScanner):
         self.sensitivity_level = self.config.get("sensitivity_level", "medium")  # low/medium/high
         self.max_template_size = self.config.get("max_template_size", 50000)  # Skip huge templates
         self.enable_sandbox_test = self.config.get("enable_sandbox_test", True) and HAS_JINJA2_SANDBOX
+        self.sandbox_render_timeout_seconds = self._positive_float_config(
+            "sandbox_render_timeout_seconds",
+            _DEFAULT_SANDBOX_RENDER_TIMEOUT_SECONDS,
+        )
+        self.sandbox_render_max_output_chars = self._positive_int_config(
+            "sandbox_render_max_output_chars",
+            _DEFAULT_SANDBOX_RENDER_MAX_OUTPUT_CHARS,
+        )
+        self.sandbox_render_max_memory_bytes = self._positive_int_config(
+            "sandbox_render_max_memory_bytes",
+            _DEFAULT_SANDBOX_RENDER_MAX_MEMORY_BYTES,
+        )
         self.skip_common_patterns = self.config.get("skip_common_patterns", True)  # Ignore common ML patterns
 
         self._compiled_patterns = _COMPILED_JINJA2_SSTI_PATTERNS
+
+    def _positive_float_config(self, key: str, default: float) -> float:
+        try:
+            value = float(self.config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
+    def _positive_int_config(self, key: str, default: int) -> int:
+        try:
+            value = int(self.config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -339,7 +428,14 @@ class Jinja2TemplateScanner(BaseScanner):
     ) -> ScanResult:
         total_detections = 0
         for template_location, template_content in templates.items():
-            detections = self._analyze_template(template_content, context, f"{path}:{template_location}")
+            detections, analysis_failures = self._analyze_template(
+                template_content,
+                context,
+                f"{path}:{template_location}",
+            )
+            for failure in analysis_failures:
+                self._mark_inconclusive_scan_result(result, f"{path}:{template_location}", failure)
+
             total_detections += len(detections)
 
             for detection in detections:
@@ -423,6 +519,17 @@ class Jinja2TemplateScanner(BaseScanner):
                 name="Template Read",
                 passed=False,
                 message="Template analysis incomplete because the standalone template could not be read as UTF-8 text",
+                severity=IssueSeverity.INFO,
+                location=location,
+                details=failure,
+            )
+            return
+
+        if reason == _SANDBOX_RENDER_BUDGET_REASON:
+            result.add_check(
+                name="Template Sandbox Safety Probe",
+                passed=False,
+                message="Template sandbox safety probe incomplete because the render budget was exceeded",
                 severity=IssueSeverity.INFO,
                 location=location,
                 details=failure,
@@ -847,13 +954,19 @@ class Jinja2TemplateScanner(BaseScanner):
 
         return any(indicator in text for indicator in _JINJA_TEMPLATE_INDICATORS)
 
-    def _analyze_template(self, template_content: str, context: MLContext, location: str) -> list[DetectionResult]:
+    def _analyze_template(
+        self,
+        template_content: str,
+        context: MLContext,
+        location: str,
+    ) -> tuple[list[DetectionResult], list[dict[str, Any]]]:
         """Analyze template content for SSTI patterns"""
         detections: list[DetectionResult] = []
+        analysis_failures: list[dict[str, Any]] = []
 
         # Skip empty or very short templates
         if not template_content or len(template_content.strip()) < 3:
-            return detections
+            return detections, analysis_failures
 
         # Check each pattern category
         for category, compiled_patterns in self._compiled_patterns.items():
@@ -878,8 +991,10 @@ class Jinja2TemplateScanner(BaseScanner):
 
         # Optional: Test template safety with sandboxing
         if self.enable_sandbox_test and HAS_JINJA2_SANDBOX:
-            sandbox_result = self._test_template_safety(template_content)
-            if not sandbox_result:
+            sandbox_safe, sandbox_failure = self._test_template_safety(template_content, location)
+            if sandbox_failure:
+                analysis_failures.append(sandbox_failure)
+            if not sandbox_safe:
                 detections.append(
                     DetectionResult(
                         pattern_type="sandbox_violation",
@@ -891,7 +1006,7 @@ class Jinja2TemplateScanner(BaseScanner):
                     )
                 )
 
-        return detections
+        return detections, analysis_failures
 
     def _is_common_ml_pattern(self, match_text: str, context: MLContext) -> bool:
         """Check if match is a common, benign ML pattern"""
@@ -1060,26 +1175,90 @@ class Jinja2TemplateScanner(BaseScanner):
 
         return why
 
-    def _test_template_safety(self, template_content: str) -> bool:
+    def _test_template_safety(self, template_content: str, location: str) -> tuple[bool, dict[str, Any] | None]:
         """Test if template is safe using Jinja2 sandboxing"""
         if not HAS_JINJA2_SANDBOX:
-            return True  # Can't test, assume safe
+            return True, None  # Can't test, assume safe
 
         try:
-            # Test with sandboxed environment
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # Suppress Jinja2 warnings
+                status, detail = self._test_template_safety_with_budget(template_content)
 
-                env = jinja2.sandbox.SandboxedEnvironment()
-                template = env.from_string(template_content)
+        except Exception as exc:
+            return True, self._sandbox_render_budget_failure(location, "worker_error", type(exc).__name__)
 
-                # Try to render with minimal context
-                template.render(messages=[], config={})
-                return True
+        if status == "security_error":
+            return False, None
+        if status in {"budget_exceeded", "timeout", "worker_error", "worker_unavailable"}:
+            return True, self._sandbox_render_budget_failure(location, status, detail)
+        return True, None
 
-        except jinja2.exceptions.SecurityError:
-            # Template contains dangerous operations
-            return False
-        except Exception:
-            # Other errors don't indicate security issues
-            return True
+    def _sandbox_render_budget_failure(
+        self,
+        location: str,
+        budget_type: str,
+        detail: str | None = None,
+    ) -> dict[str, Any]:
+        failure: dict[str, Any] = {
+            "format": "sandbox",
+            "reason": _SANDBOX_RENDER_BUDGET_REASON,
+            "budget_type": budget_type,
+            "sandbox_render_timeout_seconds": self.sandbox_render_timeout_seconds,
+            "sandbox_render_max_output_chars": self.sandbox_render_max_output_chars,
+            "sandbox_render_max_memory_bytes": self.sandbox_render_max_memory_bytes,
+            "template_location": location,
+        }
+        if detail:
+            failure["detail"] = detail
+        return failure
+
+    def _test_template_safety_with_budget(self, template_content: str) -> tuple[str, str | None]:
+        result_queue: Any | None = None
+        process: Any | None = None
+        try:
+            start_method = "fork" if "fork" in mp.get_all_start_methods() else None
+            context = mp.get_context(start_method) if start_method else mp.get_context()
+            result_queue = context.Queue(maxsize=1)
+            process = cast(Any, context).Process(
+                target=_sandbox_render_probe_worker,
+                args=(
+                    template_content,
+                    self.sandbox_render_max_output_chars,
+                    self.sandbox_render_max_memory_bytes,
+                    result_queue,
+                ),
+            )
+            process.daemon = True
+            process.start()
+        except Exception as exc:
+            if result_queue is not None:
+                result_queue.close()
+            return "worker_unavailable", type(exc).__name__
+
+        assert result_queue is not None
+        assert process is not None
+        try:
+            process.join(self.sandbox_render_timeout_seconds)
+            if process.is_alive():
+                process.terminate()
+                process.join(1)
+                if process.is_alive() and hasattr(process, "kill"):
+                    process.kill()
+                    process.join(1)
+                return "timeout", None
+
+            try:
+                status, _detail = result_queue.get_nowait()
+            except queue.Empty:
+                if process.exitcode not in (0, None):
+                    return "worker_error", f"exitcode={process.exitcode}"
+                return "worker_error", "empty_result"
+
+            return str(status), str(_detail) if _detail else None
+        finally:
+            result_queue.close()
+            result_queue.join_thread()
+            if hasattr(process, "close"):
+                with suppress(ValueError):
+                    process.close()

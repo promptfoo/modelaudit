@@ -1,6 +1,7 @@
 """Tests for Jinja2TemplateScanner covering CVE-2024-34359 and SSTI detection."""
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -729,6 +730,133 @@ class TestJinja2TemplateScannerEdgeCases:
         assert "scan_outcome" not in result.metadata
         assert not [c for c in result.checks if c.name == "Template Size Limit"]
         assert [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+
+    def test_sandbox_probe_output_budget_is_inconclusive_without_security_finding(self, tmp_path: Path) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "amplify.jinja"
+        template_file.write_text("{{ 'A' * 1000000 }}", encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner(
+            {
+                "sandbox_render_max_output_chars": 16,
+                "sandbox_render_timeout_seconds": 2,
+            }
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_sandbox_render_budget_exceeded" in result.metadata["scan_outcome_reasons"]
+        budget_checks = [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+        assert len(budget_checks) == 1
+        assert budget_checks[0].status == CheckStatus.FAILED
+        assert budget_checks[0].severity == IssueSeverity.INFO
+        assert budget_checks[0].details["budget_type"] == "budget_exceeded"
+        assert budget_checks[0].details["detail"] == "output"
+        assert not [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+
+        aggregate_result = scan_model_directory_or_file(
+            str(template_file),
+            config={
+                "cache_scan_results": False,
+                "sandbox_render_max_output_chars": 16,
+                "sandbox_render_timeout_seconds": 2,
+            },
+        )
+        assert determine_exit_code(aggregate_result) == 2
+
+    def test_sandbox_probe_timeout_bounds_low_output_execution(self, tmp_path: Path) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "cpu.jinja"
+        template_file.write_text(
+            "{% for i in range(100000) %}{% for j in range(100000) %}{% endfor %}{% endfor %}",
+            encoding="utf-8",
+        )
+
+        start = time.monotonic()
+        result = Jinja2TemplateScanner({"sandbox_render_timeout_seconds": 0.05}).scan(str(template_file))
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 5
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        budget_checks = [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+        assert len(budget_checks) == 1
+        assert budget_checks[0].details["budget_type"] == "timeout"
+
+    def test_sandbox_budget_preserves_static_findings_and_security_exit(self, tmp_path: Path) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "static-and-amplify.jinja"
+        template_file.write_text(
+            r"{{ '\x41' }}{{ 'A' * 1000000 }}",
+            encoding="utf-8",
+        )
+
+        result = Jinja2TemplateScanner(
+            {
+                "sandbox_render_max_output_chars": 16,
+                "sandbox_render_timeout_seconds": 2,
+            }
+        ).scan(str(template_file))
+
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_sandbox_render_budget_exceeded" in result.metadata["scan_outcome_reasons"]
+        failed_checks = [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+        assert any(c.details.get("pattern_type") == "obfuscation" for c in failed_checks)
+        assert not any(c.details.get("pattern_type") == "sandbox_violation" for c in failed_checks)
+
+        aggregate_result = scan_model_directory_or_file(
+            str(template_file),
+            config={
+                "cache_scan_results": False,
+                "sandbox_render_max_output_chars": 16,
+                "sandbox_render_timeout_seconds": 2,
+            },
+        )
+        assert determine_exit_code(aggregate_result) == 1
+
+    def test_benign_template_below_sandbox_budget_remains_clean(self, tmp_path: Path) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "benign.jinja"
+        template_file.write_text("Hello {{ messages|length }} {{ 'ok' * 2 }}", encoding="utf-8")
+
+        result = Jinja2TemplateScanner(
+            {
+                "sandbox_render_max_output_chars": 64,
+                "sandbox_render_timeout_seconds": 2,
+            }
+        ).scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert any(c.name == "Jinja2 SSTI Analysis" and c.status == CheckStatus.PASSED for c in result.checks)
+        assert not [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
+    def test_sandbox_security_error_still_reports_violation(self) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        scanner = Jinja2TemplateScanner({"sandbox_render_timeout_seconds": 2})
+
+        safe, failure = scanner._test_template_safety("{{ [].__class__.__mro__ }}", "template_content")
+
+        assert safe is False
+        assert failure is None
+
+    def test_disabled_sandbox_probe_skips_render_budget(self, tmp_path: Path) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "amplify.jinja"
+        template_file.write_text("{{ 'A' * 1000000 }}", encoding="utf-8")
+
+        result = Jinja2TemplateScanner(
+            {
+                "enable_sandbox_test": False,
+                "sandbox_render_max_output_chars": 16,
+            }
+        ).scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
 
     def test_path_traversal_suppression_does_not_hide_object_traversal_ssti(self, tmp_path: Path) -> None:
         tokenizer_file = tmp_path / "tokenizer_config.json"

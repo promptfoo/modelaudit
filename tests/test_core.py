@@ -21,7 +21,7 @@ import pytest
 from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import normalize_material_scan_config
-from modelaudit.core import scan_file, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner, mxnet_scanner, safetensors_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
@@ -2245,6 +2245,45 @@ def test_scan_file_oversized_standalone_jinja_result_is_not_cached(tmp_path: Pat
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+def test_scan_file_jinja_sandbox_budget_result_is_not_cached(tmp_path: Path) -> None:
+    pytest.importorskip("jinja2.sandbox")
+    template_file = tmp_path / "amplify.jinja"
+    template_file.write_text("{{ 'A' * 1000000 }}", encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+        "sandbox_render_max_output_chars": 16,
+        "sandbox_render_timeout_seconds": 2,
+    }
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(template_file), config=config)
+        second = scan_file(str(template_file), config=config)
+
+        assert first.scanner_name == "jinja2_template"
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_sandbox_render_budget_exceeded" in first.metadata["scan_outcome_reasons"]
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    aggregate = scan_model_directory_or_file(
+        str(template_file),
+        config={
+            "cache_scan_results": False,
+            "sandbox_render_max_output_chars": 16,
+            "sandbox_render_timeout_seconds": 2,
+        },
+    )
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_scan_file_unreadable_standalone_jinja_result_is_not_cached(tmp_path: Path) -> None:

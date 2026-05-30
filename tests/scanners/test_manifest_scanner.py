@@ -743,6 +743,42 @@ def test_manifest_scanner_keeps_benign_chat_templates_clean(tmp_path: Path) -> N
     )
 
 
+def test_manifest_scanner_propagates_jinja_sandbox_budget_inconclusive(tmp_path: Path) -> None:
+    pytest.importorskip("jinja2.sandbox")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": "{{ 'A' * 1000000 }}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = {
+        "sandbox_render_max_output_chars": 16,
+        "sandbox_render_timeout_seconds": 2,
+    }
+
+    result = ManifestScanner(config=config).scan(str(config_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jinja2_sandbox_render_budget_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Template Sandbox Safety Probe"
+        and check.status == CheckStatus.FAILED
+        and check.details["reason"] == "jinja2_sandbox_render_budget_exceeded"
+        for check in result.checks
+    )
+
+    aggregate_result = scan_model_directory_or_file(
+        str(config_path),
+        config={**config, "cache_scan_results": False},
+    )
+    assert determine_exit_code(aggregate_result) == 2
+
+
 def test_manifest_scanner_delegates_templates_from_parsed_content(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
