@@ -1654,6 +1654,9 @@ class KerasZipScanner(BaseScanner):
                 )
                 return
 
+            if not isinstance(link, h5py.HardLink):
+                return
+
             obj = h5_file.get(name, getlink=False)
             if isinstance(obj, h5py.Dataset) and obj.external:
                 findings.append(

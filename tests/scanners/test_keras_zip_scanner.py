@@ -327,6 +327,51 @@ class TestKerasZipScanner:
         assert cve_issues[0].details["external_references"][0]["kind"] == expected_kind
         assert determine_exit_code(aggregate_result) == 1
 
+    def test_hdf5_link_traversal_does_not_resolve_soft_links(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """SoftLink aliases must not be dereferenced while collecting external-reference metadata."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        external_source = tmp_path / "external_source.h5"
+        with h5py.File(external_source, "w") as f:
+            f.create_dataset("payload", data=[1.0, 2.0])
+
+        weights_path = tmp_path / "soft_alias.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            f["external_kernel"] = h5py.ExternalLink(external_source.name, "/payload")
+            f["soft_alias"] = h5py.SoftLink("/external_kernel")
+
+        original_get = h5py.Group.get
+
+        def guarded_get(
+            self: Any,
+            name: Any,
+            default: Any = None,
+            getclass: bool = False,
+            getlink: bool = False,
+        ) -> Any:
+            if name == "soft_alias" and not getlink:
+                raise AssertionError("SoftLink target was followed")
+            return original_get(self, name, default=default, getclass=getclass, getlink=getlink)
+
+        monkeypatch.setattr(h5py.Group, "get", guarded_get)
+
+        with h5py.File(weights_path, "r") as h5_file:
+            findings = KerasZipScanner._collect_hdf5_external_references(h5_file)
+
+        assert findings == [
+            {
+                "kind": "ExternalLink",
+                "hdf5_path": "/external_kernel",
+                "filename": "external_source.h5",
+                "path": "/payload",
+            },
+        ]
+
     @pytest.mark.parametrize(
         "keras_version",
         ["3.12.1rc1", "3.12.1a0", "3.12.1.dev0", "3.13.2rc1", "3.13.2dev0"],
