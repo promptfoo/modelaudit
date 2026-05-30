@@ -687,11 +687,11 @@ class TestCLIMetadataCommand:
 
         from modelaudit.cli import cli
 
-        secret_token = "SAFE_METADATA_SECRET_TOKEN"
-        secret_url = "https://example.com/model.bin?token=SAFE_METADATA_URL_TOKEN"
+        metadata_owner = "training-team"
+        metadata_source = "https://example.com/model.bin?download=1"
         header = {
             "t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
-            "__metadata__": {"api_key": secret_token, "source": secret_url},
+            "__metadata__": {"owner": metadata_owner, "source": metadata_source},
         }
         header_json = json.dumps(header).encode("utf-8")
 
@@ -712,9 +712,8 @@ class TestCLIMetadataCommand:
         assert output["has_custom_metadata"] is True
         assert output["custom_metadata_entry_count"] == 2
         serialized = json.dumps(output, sort_keys=True)
-        assert secret_token not in serialized
-        assert secret_url not in serialized
-        assert "SAFE_METADATA_URL_TOKEN" not in serialized
+        assert metadata_owner not in serialized
+        assert metadata_source not in serialized
 
     def test_cli_metadata_table_output(self, tmp_path: Path) -> None:
         """Test CLI metadata command with default table output."""
