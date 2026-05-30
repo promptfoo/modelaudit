@@ -1275,19 +1275,22 @@ class Jinja2TemplateScanner(BaseScanner):
                 status, detail = self._test_template_safety_with_budget(template_content)
 
         except Exception as exc:
-            return True, self._sandbox_render_budget_failure(location, "worker_error", type(exc).__name__)
+            failure = self._sandbox_render_budget_failure(location, "worker_error", type(exc).__name__)
+            if self._template_has_static_sandbox_probe_risk(template_content):
+                return False, failure
+            return True, failure
 
         if status == "security_error":
             return False, None
         if self._sandbox_probe_unavailable(status, detail):
-            if self._template_has_static_render_budget_risk(
-                template_content
-            ) or self._template_has_static_sandbox_probe_risk(template_content):
+            if self._template_has_static_sandbox_probe_risk(template_content):
+                return False, self._sandbox_render_budget_failure(location, "worker_unavailable", detail)
+            if self._template_has_static_render_budget_risk(template_content):
                 return True, self._sandbox_render_budget_failure(location, "worker_unavailable", detail)
             return True, None
         if status in {"budget_exceeded", "timeout", "worker_error"}:
             failure = self._sandbox_render_budget_failure(location, status, detail)
-            if self._template_has_static_sandbox_risk(template_content):
+            if self._template_has_static_sandbox_probe_risk(template_content):
                 return False, failure
             return True, failure
         return True, None
@@ -1350,9 +1353,16 @@ class Jinja2TemplateScanner(BaseScanner):
         if parsed is None:
             return False
 
-        range_threshold = 10_000
+        range_threshold = max(1, self.sandbox_render_max_output_chars)
+        for node in parsed.find_all(jinja2.nodes.Filter):
+            if node.name != "list" or not self._is_range_call(node.node):
+                continue
+            projected_size = self._constant_range_rendered_list_size(node.node.args, range_threshold)
+            if projected_size is not None and projected_size > self.sandbox_render_max_output_chars:
+                return True
+
         for node in parsed.find_all(jinja2.nodes.Call):
-            if not isinstance(node.node, jinja2.nodes.Name) or node.node.name != "range" or not node.args:
+            if not self._is_range_call(node):
                 continue
             range_count = self._constant_range_iteration_count(node.args, range_threshold)
             if range_count is not None:
@@ -1371,6 +1381,14 @@ class Jinja2TemplateScanner(BaseScanner):
                 return True
 
         return False
+
+    def _is_range_call(self, node: Any) -> bool:
+        return (
+            isinstance(node, jinja2.nodes.Call)
+            and isinstance(node.node, jinja2.nodes.Name)
+            and node.node.name == "range"
+            and bool(node.args)
+        )
 
     def _parse_template_ast(self, template_content: str) -> Any | None:
         try:
@@ -1392,9 +1410,72 @@ class Jinja2TemplateScanner(BaseScanner):
     def _constant_sequence_size(self, node: Any) -> int | None:
         if isinstance(node, jinja2.nodes.Const) and isinstance(node.value, str | bytes):
             return len(node.value)
+        if isinstance(node, jinja2.nodes.Const) and isinstance(node.value, int | float | bool):
+            return len(str(node.value))
         if isinstance(node, jinja2.nodes.List | jinja2.nodes.Tuple):
-            return len(node.items)
+            item_sizes: list[int] = []
+            is_tuple = isinstance(node, jinja2.nodes.Tuple)
+            if is_tuple and not node.items:
+                return 2
+            total = 2
+            for item in node.items:
+                item_size = self._constant_rendered_item_size(item)
+                if item_size is None:
+                    return None
+                item_sizes.append(item_size)
+                total += item_size
+            if len(node.items) > 1:
+                total += (len(node.items) - 1) * 2
+            if is_tuple and len(item_sizes) == 1:
+                total += 1
+            return total
+        if isinstance(node, jinja2.nodes.Dict):
+            total = 2
+            for item in cast(list[Any], node.items):
+                key_size = self._constant_rendered_item_size(item.key)
+                value_size = self._constant_rendered_item_size(item.value)
+                if key_size is None or value_size is None:
+                    return None
+                total += key_size + 2 + value_size
+            if len(node.items) > 1:
+                total += (len(node.items) - 1) * 2
+            return total
         return None
+
+    def _constant_rendered_item_size(self, node: Any) -> int | None:
+        if isinstance(node, jinja2.nodes.Const):
+            if isinstance(node.value, str | bytes):
+                return len(repr(node.value))
+            if isinstance(node.value, int | float | bool):
+                return len(str(node.value))
+            if node.value is None:
+                return len("None")
+            return None
+        return self._constant_sequence_size(node)
+
+    def _constant_range_rendered_list_size(self, args: list[Any], cap: int) -> int | None:
+        range_values = self._constant_range_values(args, cap)
+        if range_values is None:
+            return None
+        start, stop, step = range_values
+        count = self._range_iteration_count(start, stop, step, cap)
+        if count == 0:
+            return 2
+
+        min_rendered_size = 2 + count + ((count - 1) * 2)
+        if min_rendered_size > cap:
+            return cap + 1
+
+        total = 1
+        for checked, value in enumerate(range(start, stop, step), start=1):
+            if checked > 1:
+                total += 2
+            total += len(str(value))
+            if total + 1 > cap:
+                return cap + 1
+            if checked >= min(count, 100_000):
+                break
+        return total + 1
 
     def _constant_int_expression_value(self, node: Any, cap: int) -> int | None:
         if isinstance(node, jinja2.nodes.Const):
@@ -1425,6 +1506,12 @@ class Jinja2TemplateScanner(BaseScanner):
         return None
 
     def _constant_range_iteration_count(self, args: list[Any], cap: int) -> int | None:
+        range_values = self._constant_range_values(args, cap)
+        if range_values is None:
+            return None
+        return self._range_iteration_count(*range_values, cap)
+
+    def _constant_range_values(self, args: list[Any], cap: int) -> tuple[int, int, int] | None:
         values: list[int] = []
         for arg in args[:3]:
             value = self._constant_int_expression_value(arg, cap)
@@ -1441,8 +1528,11 @@ class Jinja2TemplateScanner(BaseScanner):
             stop = values[1]
             step = values[2] if len(values) >= 3 else 1
 
-        if start is None or stop is None or step is None or step == 0:
+        if step == 0:
             return None
+        return start, stop, step
+
+    def _range_iteration_count(self, start: int, stop: int, step: int, cap: int) -> int:
         if step > 0:
             if stop <= start:
                 return 0
