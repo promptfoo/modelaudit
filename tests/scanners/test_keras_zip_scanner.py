@@ -2320,8 +2320,9 @@ class TestCVE202549655TorchModuleWrapper:
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
         assert len(cve_issues) >= 1, "Should detect TorchModuleWrapper in nested model"
 
-    def test_no_cve_for_fixed_keras_version(self, tmp_path: Path) -> None:
-        """Keras >=3.11.3 should not be CVE-attributed for TorchModuleWrapper."""
+    @pytest.mark.parametrize("keras_version", ["3.11.3", "3.11.3+local", "3.11.3.post1", "3.11.4.dev0"])
+    def test_no_cve_for_fixed_keras_version(self, tmp_path: Path, keras_version: str) -> None:
+        """Keras builds at or after final 3.11.3 should not be CVE-attributed."""
         scanner = KerasZipScanner()
         config = {
             "class_name": "Sequential",
@@ -2335,7 +2336,7 @@ class TestCVE202549655TorchModuleWrapper:
                 ]
             },
         }
-        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, "3.11.3"))
+        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, keras_version))
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
         assert len(cve_issues) == 0, "Fixed Keras versions should not get CVE-2025-49655 attribution"
         risk_checks = [c for c in result.checks if c.name == "TorchModuleWrapper Version Risk Check"]
@@ -2367,6 +2368,26 @@ class TestCVE202549655TorchModuleWrapper:
             cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
             assert len(cve_issues) >= 1, f"Prerelease {prerelease_version} should be treated as vulnerable"
             assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    @pytest.mark.parametrize("keras_version", ["3.11.3a0", "3.11.3b1", "3.11.3rc1", "3.11.3.dev0"])
+    def test_fixed_boundary_prerelease_versions_treated_as_vulnerable(
+        self,
+        tmp_path: Path,
+        keras_version: str,
+    ) -> None:
+        """Prereleases of the fixed boundary sort before final 3.11.3 and remain vulnerable."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
+        }
+
+        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, keras_version))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
+        assert cve_issues
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["keras_version"] == keras_version
 
     def test_torch_module_wrapper_version_unknown(self, tmp_path: Path) -> None:
         """Missing or non-canonical version should emit warning, not pass."""

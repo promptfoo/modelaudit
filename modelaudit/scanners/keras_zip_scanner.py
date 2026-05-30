@@ -1041,7 +1041,7 @@ class KerasZipScanner(BaseScanner):
 
     @staticmethod
     def _is_vulnerable_keras_3_11_x(version: str) -> bool | None:
-        """Return True for Keras 3.11.0-3.11.2 (including prerelease/dev), else False/None."""
+        """Return True for vulnerable Keras 3.11 TorchModuleWrapper versions."""
         version_match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+-]*)$", version.strip())
         if not version_match:
             return None
@@ -1052,15 +1052,16 @@ class KerasZipScanner(BaseScanner):
             patch = int(version_match.group(3) or 0)
             suffix = (version_match.group(4) or "").strip().lower()
 
-            if suffix and not (
-                re.search(r"(?:^|[.\-])(dev|rc|a|b|alpha|beta|pre|preview)\d*", suffix)
-                or suffix.startswith("+")
-                or suffix.startswith(".post")
-                or suffix.startswith("post")
-            ):
+            is_prerelease = bool(re.search(r"(?:^|[.\-])(dev|rc|a|b|alpha|beta|pre|preview)\d*", suffix))
+            is_fixed_metadata_suffix = suffix.startswith("+") or suffix.startswith(".post") or suffix.startswith("post")
+            if suffix and not (is_prerelease or is_fixed_metadata_suffix):
                 return None
 
-            return major == 3 and minor == 11 and 0 <= patch <= 2
+            if major != 3 or minor != 11:
+                return False
+            if 0 <= patch <= 2:
+                return True
+            return bool(patch == 3 and is_prerelease)
         except ValueError:
             return None
 
