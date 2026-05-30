@@ -139,16 +139,24 @@ class KerasH5Scanner(BaseScanner):
         # Check if h5py is installed
         if not HAS_H5PY:
             result = self._create_result()
+            reason = "keras_h5_h5py_unavailable"
+            result.metadata["file_size"] = self.get_file_size(path)
+            self._mark_inconclusive_scan_result(result, reason)
             result.add_check(
                 name="H5PY Library Check",
                 passed=False,
                 message="h5py is required for Keras H5 scanning. Install with 'pip install modelaudit[h5]'.",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"path": path, "required_package": "h5py"},
+                details={
+                    "path": path,
+                    "required_package": "h5py",
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
+                },
                 rule_code="S902",
             )
-            result.finish(success=True)
+            self._finish_scan_result(result)
             return result
 
         result = self._create_result()

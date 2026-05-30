@@ -13,6 +13,7 @@ import h5py
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners import keras_h5_scanner as keras_h5_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 
@@ -291,6 +292,28 @@ def test_keras_h5_scanner_benign_model_has_no_warning_noise(tmp_path: Path) -> N
     result = scanner.scan(str(model_path))
 
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def test_missing_h5py_returns_inconclusive_exit2_without_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recognized H5 file cannot be considered fully scanned without h5py."""
+    model_path = create_h5_with_external_link(tmp_path)
+    reason = "keras_h5_h5py_unavailable"
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+
+    _assert_inconclusive_keras_h5_scan(
+        model_path,
+        reason,
+        "H5PY Library Check",
+        "h5py is required for Keras H5 scanning",
+    )
+    _assert_inconclusive_keras_h5_scan_not_cached(
+        model_path,
+        reason,
+        tmp_path / "missing-h5py-cache",
+    )
 
 
 def _assert_inconclusive_keras_h5_scan(
