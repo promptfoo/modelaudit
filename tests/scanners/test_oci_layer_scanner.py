@@ -1142,6 +1142,45 @@ class TestOciLayerScanner:
         assert len(checks) == 1
         assert checks[0].status.value == "passed"
 
+    def test_scan_layer_reports_hardlink_target_traversal_from_layer_root(self, tmp_path: Path) -> None:
+        """Hardlink targets are archive-root relative, not relative to the link directory."""
+        layer_path = tmp_path / "unsafe-hardlink.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("dir/link")
+            link_info.type = tarfile.LNKTYPE
+            link_info.linkname = "../dir/model.bin"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "unsafe-hardlink.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["unsafe-hardlink.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert len(checks) == 1
+        assert checks[0].severity == IssueSeverity.CRITICAL
+        assert checks[0].details["target"] == "../dir/model.bin"
+
+    def test_scan_layer_allows_safe_hardlink_target_from_layer_root(self, tmp_path: Path) -> None:
+        """Benign hardlink targets under the archive root should remain clean."""
+        layer_path = tmp_path / "safe-hardlink.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("dir/link")
+            link_info.type = tarfile.LNKTYPE
+            link_info.linkname = "dir/model.bin"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "safe-hardlink.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["safe-hardlink.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert len(checks) == 1
+        assert checks[0].status.value == "passed"
+
     def test_scan_corrupted_tar_layer(self, tmp_path: Path) -> None:
         """Test scanning corrupted tar layer."""
         # Create a file that looks like tar.gz but is corrupted

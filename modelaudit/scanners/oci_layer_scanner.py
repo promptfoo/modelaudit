@@ -148,7 +148,7 @@ class OciLayerScanner(BaseScanner):
 
         if member.issym() or member.islnk():
             target = member.linkname
-            target_base = os.path.dirname(resolved_name)
+            target_base = os.path.dirname(resolved_name) if member.issym() else temp_base
             _target_resolved, target_safe = sanitize_archive_path(target, target_base)
             details = {"layer": layer_ref, "member": name, "target": target}
             if not target_safe:
