@@ -76,6 +76,7 @@ class TestFormatSarifOutput:
                 severity=IssueSeverity.WARNING,
                 location=raw_path,
                 details={"source": raw_path, raw_path: {"nested": [raw_path]}},
+                why=f"Why contains {raw_path}",
                 timestamp=time.time(),
             )
         ]

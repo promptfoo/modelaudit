@@ -7,6 +7,7 @@ import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -171,17 +172,19 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
         f"Dangerous payload from {stream_url}",
         severity=IssueSeverity.CRITICAL,
         location=f"{stream_url}:payload",
-        details={"source": stream_url, "nested": [stream_url]},
+        details={"source": stream_url, "nested": [stream_url], stream_url: {"source": stream_url}},
     )
     scan_result.add_check(
-        name="Streaming Payload",
+        name=f"Streaming Payload {stream_url}",
         passed=False,
         message=f"Checked {stream_url}",
         severity=IssueSeverity.CRITICAL,
         location=f"{stream_url} (header)",
-        details={"source": stream_url},
+        details={"source": stream_url, stream_url: {"source": stream_url}},
         why=f"Matched {stream_url}",
     )
+    cast(Any, scan_result.issues[0]).source_index = {stream_url: stream_url}
+    cast(Any, scan_result.checks[0]).source_index = {stream_url: stream_url}
     scan_result.finish(success=True)
 
     with (

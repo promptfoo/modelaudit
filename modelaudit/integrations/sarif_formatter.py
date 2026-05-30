@@ -193,7 +193,8 @@ def _create_rules(issues: list, *, prefiltered: bool = False) -> list[dict[str, 
 
             # Add help information if available
             if hasattr(issue, "why") and issue.why:
-                rule["help"] = {"text": issue.why, "markdown": issue.why}
+                redacted_why = _redact_text_for_sarif(issue.why)
+                rule["help"] = {"text": redacted_why, "markdown": redacted_why}
 
             rules.append(rule)
 

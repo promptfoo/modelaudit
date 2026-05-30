@@ -183,7 +183,12 @@ def _redact_stream_value_for_reporting(value: Any, stream_url: str, report_url: 
     if isinstance(value, str):
         return value.replace(stream_url, report_url)
     if isinstance(value, dict):
-        return {key: _redact_stream_value_for_reporting(item, stream_url, report_url) for key, item in value.items()}
+        return {
+            _redact_stream_value_for_reporting(key, stream_url, report_url): _redact_stream_value_for_reporting(
+                item, stream_url, report_url
+            )
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value]
     if isinstance(value, tuple):
@@ -192,14 +197,16 @@ def _redact_stream_value_for_reporting(value: Any, stream_url: str, report_url: 
 
 
 def _redact_stream_record_for_reporting(record: Issue | Check, stream_url: str, report_url: str) -> None:
-    if record.location:
-        record.location = _redact_stream_value_for_reporting(record.location, stream_url, report_url)
-    if record.message:
-        record.message = _redact_stream_value_for_reporting(record.message, stream_url, report_url)
-    if record.why:
-        record.why = _redact_stream_value_for_reporting(record.why, stream_url, report_url)
+    for attr in ("location", "message", "why", "rule_code", "type", "name"):
+        value = getattr(record, attr, None)
+        if isinstance(value, str):
+            setattr(record, attr, _redact_stream_value_for_reporting(value, stream_url, report_url))
     if record.details:
         record.details = _redact_stream_value_for_reporting(record.details, stream_url, report_url)
+    if record.model_extra:
+        redacted_extra = _redact_stream_value_for_reporting(record.model_extra, stream_url, report_url)
+        record.model_extra.clear()
+        record.model_extra.update(redacted_extra)
 
 
 def _redact_stream_scan_result_for_reporting(scan_result: ScanResult, stream_url: str, report_url: str) -> None:
