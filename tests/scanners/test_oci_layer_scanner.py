@@ -1142,6 +1142,45 @@ class TestOciLayerScanner:
         assert len(checks) == 1
         assert checks[0].status.value == "passed"
 
+    def test_scan_layer_allows_symlink_target_under_layer_root(self, tmp_path: Path) -> None:
+        """Symlink targets are resolved from the link directory but contained by the layer root."""
+        layer_path = tmp_path / "safe-sibling-link.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("usr/bin/tool")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "../lib/tool"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "safe-sibling-link.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["safe-sibling-link.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert len(checks) == 1
+        assert checks[0].status.value == "passed"
+
+    def test_scan_layer_reports_symlink_target_traversal_outside_layer_root(self, tmp_path: Path) -> None:
+        """Symlink targets that escape the layer root should still be rejected."""
+        layer_path = tmp_path / "unsafe-relative-link.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("usr/bin/tool")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "../../../etc/passwd"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "unsafe-relative-link.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["unsafe-relative-link.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert len(checks) == 1
+        assert checks[0].severity == IssueSeverity.CRITICAL
+        assert checks[0].details["target"] == "../../../etc/passwd"
+
     def test_scan_layer_reports_hardlink_target_traversal_from_layer_root(self, tmp_path: Path) -> None:
         """Hardlink targets are archive-root relative, not relative to the link directory."""
         layer_path = tmp_path / "unsafe-hardlink.tar.gz"

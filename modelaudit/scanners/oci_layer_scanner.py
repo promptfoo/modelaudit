@@ -148,8 +148,12 @@ class OciLayerScanner(BaseScanner):
 
         if member.issym() or member.islnk():
             target = member.linkname
-            target_base = os.path.dirname(resolved_name) if member.issym() else temp_base
-            _target_resolved, target_safe = sanitize_archive_path(target, target_base)
+            _target_resolved, target_safe = self._resolve_link_target(
+                target,
+                resolved_member_name=resolved_name,
+                extraction_root=temp_base,
+                is_symlink=member.issym(),
+            )
             details = {"layer": layer_ref, "member": name, "target": target}
             if not target_safe:
                 if is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
@@ -190,6 +194,24 @@ class OciLayerScanner(BaseScanner):
             return False
 
         return True
+
+    @staticmethod
+    def _resolve_link_target(
+        target: str,
+        *,
+        resolved_member_name: str,
+        extraction_root: str,
+        is_symlink: bool,
+    ) -> tuple[str, bool]:
+        if not is_symlink:
+            return sanitize_archive_path(target, extraction_root)
+        if is_absolute_archive_path(target):
+            return target, False
+
+        normalized_target = target.replace("\\", os.sep).replace("/", os.sep)
+        target_base = os.path.dirname(resolved_member_name)
+        target_resolved = os.path.normpath(os.path.join(target_base, normalized_target))
+        return target_resolved, is_within_directory(extraction_root, target_resolved)
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
