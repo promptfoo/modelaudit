@@ -1,15 +1,17 @@
 """Utilities for handling JFrog Artifactory downloads and folder operations."""
 
 import ipaddress
+import json
 import logging
 import os
 import re
 import shutil
+import struct
 import tempfile
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TypedDict
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import click
 import requests
@@ -20,11 +22,17 @@ logger = logging.getLogger(__name__)
 
 # Constants
 MAX_RECURSION_DEPTH = 64  # Prevent runaway recursion in folder traversal
+_MAX_JFROG_PROBE_REDIRECTS = 5
+_JFROG_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
     r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|secret|api-key|api_key|apikey|sig)[^=\s&]*=)[^\s&#]+",
     re.IGNORECASE,
 )
 _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
+_JFROG_CONTENT_SNIFF_BYTES = 64 * 1024
+_JFROG_AUTH_HEADER_NAMES = frozenset({"authorization", "x-jfrog-art-api"})
+_TFLITE_MAGIC_OFFSET = 4
+_TFLITE_MAGIC_BYTES = b"TFL3"
 
 
 def redact_jfrog_url_for_display(url: str) -> str:
@@ -189,6 +197,19 @@ def _is_jfrog_service_host(hostname: str) -> bool:
     return hostname == "jfrog.io" or hostname.endswith(".jfrog.io") or _is_local_jfrog_host(hostname)
 
 
+def _get_requests_prepared_hostname(url: str) -> str:
+    """Return the hostname Requests will connect to after URL preparation."""
+    try:
+        prepared_url = requests.Request("GET", url).prepare().url
+    except requests.exceptions.RequestException:
+        return ""
+
+    if not prepared_url:
+        return ""
+
+    return _normalize_hostname(urlparse(prepared_url).hostname or "")
+
+
 def _is_trusted_jfrog_auth_target(url: str) -> bool:
     """Return True when credentials may be sent to this JFrog URL."""
     parsed = urlparse(url)
@@ -197,6 +218,17 @@ def _is_trusted_jfrog_auth_target(url: str) -> bool:
 
     hostname = _normalize_hostname(parsed.hostname or "")
     return bool(hostname and hostname in _get_trusted_jfrog_hosts())
+
+
+def _is_trusted_jfrog_probe_auth_target(url: str) -> bool:
+    """Return True when bounded probe credentials may be sent to this effective JFrog URL."""
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        return False
+
+    hostname = _normalize_hostname(parsed.hostname or "")
+    prepared_hostname = _get_requests_prepared_hostname(url)
+    return bool(hostname and hostname == prepared_hostname and hostname in _get_trusted_jfrog_hosts())
 
 
 def _build_jfrog_auth_headers(
@@ -406,6 +438,239 @@ def filter_scannable_files(
     return scannable
 
 
+def _strip_jfrog_auth_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    """Remove credential-bearing JFrog headers while keeping bounded probe headers."""
+    return {name: value for name, value in headers.items() if name.lower() not in _JFROG_AUTH_HEADER_NAMES}
+
+
+def _build_jfrog_probe_auth_headers(
+    url: str,
+    *,
+    api_token: str | None,
+    access_token: str | None,
+) -> dict[str, str]:
+    """Build JFrog auth headers for bounded probes only when Requests' effective host is trusted."""
+    headers = _build_jfrog_auth_headers(url, api_token=api_token, access_token=access_token)
+    if not headers or _is_trusted_jfrog_probe_auth_target(url):
+        return headers
+    logger.warning(
+        "Skipping JFrog probe credentials for parser-confused or untrusted URL %s",
+        redact_jfrog_url_for_display(url),
+    )
+    return {}
+
+
+def _get_jfrog_probe_response_with_redirect_policy(
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout: int,
+) -> requests.Response:
+    """GET a JFrog probe URL while stripping credentials from untrusted redirects."""
+    current_url = url
+    current_headers = headers
+    unauthenticated_headers = _strip_jfrog_auth_headers(headers)
+
+    for _redirect_count in range(_MAX_JFROG_PROBE_REDIRECTS + 1):
+        response = requests.get(
+            current_url,
+            headers=current_headers,
+            stream=True,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        if response.status_code not in _JFROG_REDIRECT_STATUS_CODES:
+            return response
+
+        location = response.headers.get("Location")
+        if not location:
+            response.close()
+            raise requests.exceptions.TooManyRedirects(
+                "JFrog probe redirect from "
+                f"{redact_jfrog_url_for_display(current_url)} did not include a Location header"
+            )
+
+        current_url = urljoin(current_url, location)
+        response.close()
+        current_headers = headers if _is_trusted_jfrog_probe_auth_target(current_url) else unauthenticated_headers
+
+    raise requests.exceptions.TooManyRedirects(
+        f"Exceeded {_MAX_JFROG_PROBE_REDIRECTS} redirects for JFrog URL {redact_jfrog_url_for_display(url)}"
+    )
+
+
+def _looks_like_remote_safetensors(prefix: bytes, size_hint: int) -> bool:
+    """Recognize enough SafeTensors framing to preserve a remote candidate."""
+    if len(prefix) < 9:
+        return False
+    if 0 < size_hint <= 8:
+        return False
+
+    try:
+        header_len = struct.unpack("<Q", prefix[:8])[0]
+    except struct.error:
+        return False
+
+    if header_len <= 0:
+        return False
+    if prefix[8:9] != b"{":
+        return False
+    if size_hint > 0 and header_len > size_hint - 8:
+        return False
+
+    header = prefix[8 : 8 + header_len]
+    if len(header) < header_len:
+        return True
+
+    try:
+        return isinstance(json.loads(header.decode("utf-8")), dict)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+
+
+def _detect_jfrog_content_route_format(
+    file_info: dict[str, Any],
+    *,
+    api_token: str | None = None,
+    access_token: str | None = None,
+    timeout: int = 30,
+) -> str | None:
+    """Return a content-routed model format for a JFrog file, if cheaply identifiable."""
+    file_url = str(file_info["path"])
+    headers = _build_jfrog_probe_auth_headers(file_url, api_token=api_token, access_token=access_token)
+    headers = {
+        **headers,
+        "Range": f"bytes=0-{_JFROG_CONTENT_SNIFF_BYTES - 1}",
+        "Accept-Encoding": "identity",
+    }
+
+    response: requests.Response | None = None
+    try:
+        response = _get_jfrog_probe_response_with_redirect_policy(file_url, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=_JFROG_CONTENT_SNIFF_BYTES):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= _JFROG_CONTENT_SNIFF_BYTES:
+                break
+        prefix = b"".join(chunks)[:_JFROG_CONTENT_SNIFF_BYTES]
+    except Exception as exc:
+        raise ValueError(
+            "JFrog folder selective filtering incomplete: unable to inspect skipped artifact "
+            f"{redact_jfrog_url_for_display(file_url)}: {redact_jfrog_error_for_display(exc, file_url)}"
+        ) from exc
+    finally:
+        if response is not None:
+            response.close()
+
+    if not prefix:
+        return None
+
+    try:
+        size_hint = int(file_info.get("size", 0) or 0)
+    except (TypeError, ValueError):
+        size_hint = 0
+
+    if _looks_like_remote_safetensors(prefix, size_hint):
+        return "safetensors"
+
+    from modelaudit.utils.file.detection import (
+        _could_start_proto0_or_1_pickle,
+        _looks_like_proto0_or_1_pickle,
+        detect_format_from_magic_bytes,
+    )
+
+    detected_format = detect_format_from_magic_bytes(
+        prefix[:4],
+        prefix[:8],
+        prefix[:16],
+        max(size_hint, len(prefix), 1),
+        None,
+    )
+    if (
+        detected_format == "unknown"
+        and prefix[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + len(_TFLITE_MAGIC_BYTES)] == _TFLITE_MAGIC_BYTES
+    ):
+        return "tflite"
+    if (
+        detected_format == "unknown"
+        and _could_start_proto0_or_1_pickle(prefix)
+        and _looks_like_proto0_or_1_pickle(
+            prefix,
+            sample_is_prefix=size_hint > len(prefix) or len(prefix) >= _JFROG_CONTENT_SNIFF_BYTES,
+        )
+    ):
+        return "pickle"
+    return None if detected_format == "unknown" else detected_format
+
+
+def _scanner_ids_for_detected_jfrog_format(detected_format: str) -> set[str]:
+    from modelaudit.scanner_registry_metadata import get_scanner_registry_metadata
+
+    scanner_ids: set[str] = set()
+    for scanner_id, scanner_info in get_scanner_registry_metadata().items():
+        if detected_format == scanner_id or detected_format in scanner_info.get("header_formats", ()):
+            scanner_ids.add(scanner_id)
+        if detected_format == "zip" and ".zip" in scanner_info.get("content_routed_extensions", ()):
+            scanner_ids.add(scanner_id)
+    return scanner_ids
+
+
+def _jfrog_detected_format_allowed(detected_format: str, scanner_selection: Mapping[str, Any] | None) -> bool:
+    if not scanner_selection:
+        return True
+
+    from modelaudit.scanner_selection import SCANNER_SELECTION_CONFIG_KEY, policy_from_config
+
+    policy = policy_from_config({SCANNER_SELECTION_CONFIG_KEY: scanner_selection})
+    if not policy.active:
+        return True
+
+    scanner_ids = _scanner_ids_for_detected_jfrog_format(detected_format)
+    return any(policy.allows(scanner_id) for scanner_id in scanner_ids)
+
+
+def _filter_scannable_jfrog_files(
+    files: list[dict[str, Any]],
+    *,
+    api_token: str | None = None,
+    access_token: str | None = None,
+    timeout: int = 30,
+    scannable_extensions: Collection[str] | None = None,
+    scanner_selection: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Select suffix-matching files plus bounded content-routed renamed model files."""
+    scannable = filter_scannable_files(files, scannable_extensions=scannable_extensions)
+    if scannable_extensions is not None and scanner_selection is None:
+        return scannable
+
+    scannable_paths = {str(file["path"]) for file in scannable}
+    for file_info in files:
+        file_path = str(file_info["path"])
+        if file_path in scannable_paths:
+            continue
+        detected_format = _detect_jfrog_content_route_format(
+            file_info,
+            api_token=api_token,
+            access_token=access_token,
+            timeout=timeout,
+        )
+        if detected_format is None:
+            continue
+        if not _jfrog_detected_format_allowed(detected_format, scanner_selection):
+            continue
+        routed_file_info = dict(file_info)
+        routed_file_info["content_detected_format"] = detected_format
+        scannable.append(routed_file_info)
+        scannable_paths.add(file_path)
+
+    return scannable
+
+
 def detect_jfrog_target_type(
     url: str, api_token: str | None = None, access_token: str | None = None, timeout: int = 30
 ) -> JFrogFileInfo | JFrogFolderInfo:
@@ -582,6 +847,7 @@ def download_jfrog_folder(
     show_progress: bool = True,
     fetch_sizes: bool = False,
     scannable_extensions: Collection[str] | None = None,
+    scanner_selection: Mapping[str, Any] | None = None,
 ) -> Path:
     """Download all files from a JFrog folder.
 
@@ -594,6 +860,7 @@ def download_jfrog_folder(
         selective: Whether to filter only scannable model files
         show_progress: Whether to show download progress
         fetch_sizes: Whether to fetch accurate file sizes for progress reporting
+        scanner_selection: Optional normalized scanner-selection policy for content-routed filtering
 
     Returns:
         Path to directory containing downloaded files
@@ -616,10 +883,19 @@ def download_jfrog_folder(
         access_token,
         timeout,
         recursive=True,
-        selective=selective,
+        selective=False,
         fetch_sizes=fetch_sizes,
         **list_kwargs,
     )
+    if selective:
+        files = _filter_scannable_jfrog_files(
+            files,
+            api_token=api_token,
+            access_token=access_token,
+            timeout=timeout,
+            scannable_extensions=scannable_extensions,
+            scanner_selection=scanner_selection,
+        )
 
     if not files:
         raise ValueError("No scannable model files found in JFrog folder")

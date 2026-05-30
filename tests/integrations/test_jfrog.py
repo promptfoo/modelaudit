@@ -1,13 +1,16 @@
 import logging
 import os
+import struct
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
 
+from modelaudit.scanner_selection import scanner_selection_config_from_inputs
 from modelaudit.utils.sources.jfrog import (
     detect_jfrog_target_type,
     download_artifact,
@@ -19,6 +22,28 @@ from modelaudit.utils.sources.jfrog import (
     list_jfrog_folder_contents,
     redact_jfrog_url_for_display,
 )
+
+
+class _FakeStreamingResponse:
+    def __init__(self, payload: bytes, *, status_code: int = 200, headers: dict[str, str] | None = None) -> None:
+        self.payload = payload
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.closed = False
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            error_response = MagicMock(spec=requests.Response)
+            error_response.status_code = self.status_code
+            raise requests.exceptions.HTTPError(response=error_response)
+        return None
+
+    def iter_content(self, chunk_size: int = 1) -> Iterator[bytes]:
+        for offset in range(0, len(self.payload), chunk_size):
+            yield self.payload[offset : offset + chunk_size]
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class TestJFrogURLDetection:
@@ -642,6 +667,433 @@ class TestJFrogFolderDownload:
 
         with pytest.raises(ValueError, match="No scannable model files found"):
             download_jfrog_folder("https://company.jfrog.io/artifactory/repo/empty-folder/")
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_selective_includes_content_routed_skipped_file(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Selective downloads should include renamed model artifacts found by bounded content sniffing."""
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        tflite_url = "https://company.jfrog.io/artifactory/repo/models/evil.payload"
+        proto0_pickle_url = "https://company.jfrog.io/artifactory/repo/models/pickle.payload"
+        safetensors_url = "https://company.jfrog.io/artifactory/repo/models/weights.jpg"
+        unknown_size_safetensors_url = "https://company.jfrog.io/artifactory/repo/models/large-weights.jpg"
+        preview_url = "https://company.jfrog.io/artifactory/repo/models/preview.png"
+        tflite_payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
+        proto0_pickle_payload = b"cposix\nsystem\n(S'echo pwned'\ntR."
+        safetensors_header = b'{"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}'
+        safetensors_payload = struct.pack("<Q", len(safetensors_header)) + safetensors_header + b"\x00\x00\x00\x00"
+        large_safetensors_probe = struct.pack("<Q", 70_000) + b"{" + (b" " * (64 * 1024 - 9))
+        preview_payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        mock_list.return_value = [
+            {
+                "name": "model.pkl",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model.pkl",
+                "size": 1024,
+                "human_size": "1.0 KB",
+            },
+            {"name": "evil.payload", "path": tflite_url, "size": len(tflite_payload), "human_size": "24 B"},
+            {
+                "name": "pickle.payload",
+                "path": proto0_pickle_url,
+                "size": len(proto0_pickle_payload),
+                "human_size": "32 B",
+            },
+            {
+                "name": "weights.jpg",
+                "path": safetensors_url,
+                "size": len(safetensors_payload),
+                "human_size": "72 B",
+            },
+            {
+                "name": "large-weights.jpg",
+                "path": unknown_size_safetensors_url,
+                "size": 0,
+                "human_size": "Unknown",
+            },
+            {"name": "preview.png", "path": preview_url, "size": len(preview_payload), "human_size": "24 B"},
+        ]
+
+        def get_side_effect(url: str, **_kwargs: object) -> _FakeStreamingResponse:
+            if url == tflite_url:
+                return _FakeStreamingResponse(tflite_payload)
+            if url == proto0_pickle_url:
+                return _FakeStreamingResponse(proto0_pickle_payload)
+            if url == safetensors_url:
+                return _FakeStreamingResponse(safetensors_payload)
+            if url == unknown_size_safetensors_url:
+                return _FakeStreamingResponse(large_safetensors_probe)
+            if url == preview_url:
+                return _FakeStreamingResponse(preview_payload)
+            raise AssertionError(f"unexpected content probe: {url}")
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            filename = Path(url).name
+            downloaded_file = cache_dir / filename
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_get.side_effect = get_side_effect
+        mock_download.side_effect = download_side_effect
+
+        result_dir = download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            api_token="test-token",
+            show_progress=False,
+        )
+
+        assert result_dir == tmp_path
+        assert mock_list.call_args.kwargs["selective"] is False
+        assert {call.args[0] for call in mock_get.call_args_list} == {
+            tflite_url,
+            proto0_pickle_url,
+            safetensors_url,
+            unknown_size_safetensors_url,
+            preview_url,
+        }
+        assert all(call.kwargs["headers"]["Range"] == "bytes=0-65535" for call in mock_get.call_args_list)
+        assert all(call.kwargs["headers"]["X-JFrog-Art-Api"] == "test-token" for call in mock_get.call_args_list)
+        assert [call.args[0].rsplit("/", 1)[-1] for call in mock_download.call_args_list] == [
+            "model.pkl",
+            "evil.payload",
+            "pickle.payload",
+            "weights.jpg",
+            "large-weights.jpg",
+        ]
+        assert (tmp_path / "evil.payload").exists()
+        assert (tmp_path / "pickle.payload").exists()
+        assert (tmp_path / "weights.jpg").exists()
+        assert (tmp_path / "large-weights.jpg").exists()
+        assert not (tmp_path / "preview.png").exists()
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_selective_skips_benign_unsupported_content(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Benign unsupported content should not become a full artifact download."""
+        preview_url = "https://company.jfrog.io/artifactory/repo/models/preview.png"
+        malformed_safetensors_url = "https://company.jfrog.io/artifactory/repo/models/framing.jpg"
+        preview_payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        malformed_safetensors_payload = struct.pack("<Q", 12) + b"{not-json!!!"
+        mock_list.return_value = [
+            {"name": "preview.png", "path": preview_url, "size": len(preview_payload), "human_size": "24 B"},
+            {
+                "name": "framing.jpg",
+                "path": malformed_safetensors_url,
+                "size": len(malformed_safetensors_payload),
+                "human_size": "20 B",
+            },
+        ]
+
+        def get_side_effect(url: str, **_kwargs: object) -> _FakeStreamingResponse:
+            if url == preview_url:
+                return _FakeStreamingResponse(preview_payload)
+            if url == malformed_safetensors_url:
+                return _FakeStreamingResponse(malformed_safetensors_payload)
+            raise AssertionError(f"unexpected content probe: {url}")
+
+        mock_get.side_effect = get_side_effect
+
+        with pytest.raises(ValueError, match="No scannable model files found"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                show_progress=False,
+            )
+
+        assert {call.args[0] for call in mock_get.call_args_list} == {preview_url, malformed_safetensors_url}
+        mock_download.assert_not_called()
+        assert not any(tmp_path.iterdir())
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_probe_strips_credentials_on_untrusted_redirect(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Content probes must not forward JFrog API tokens across untrusted redirects."""
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        hidden_url = "https://company.jfrog.io/artifactory/repo/models/evil.payload"
+        redirected_url = "https://evil.example/artifacts/evil.payload"
+        payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
+        redirect_response = _FakeStreamingResponse(b"", status_code=302, headers={"Location": redirected_url})
+        final_response = _FakeStreamingResponse(payload)
+        mock_get.side_effect = [redirect_response, final_response]
+        mock_list.return_value = [
+            {"name": "evil.payload", "path": hidden_url, "size": len(payload), "human_size": "24 B"}
+        ]
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(url).name
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            api_token="test-token",
+            show_progress=False,
+        )
+
+        assert mock_get.call_args_list[0].args[0] == hidden_url
+        assert mock_get.call_args_list[0].kwargs["headers"]["X-JFrog-Art-Api"] == "test-token"
+        assert mock_get.call_args_list[1].args[0] == redirected_url
+        assert "X-JFrog-Art-Api" not in mock_get.call_args_list[1].kwargs["headers"]
+        assert mock_get.call_args_list[1].kwargs["headers"]["Range"] == "bytes=0-65535"
+        assert all(call.kwargs["allow_redirects"] is False for call in mock_get.call_args_list)
+        assert redirect_response.closed is True
+        assert (tmp_path / "evil.payload").exists()
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_probe_strips_credentials_on_parser_confused_redirect(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Redirect auth trust must use the host Requests will actually contact."""
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        hidden_url = "https://company.jfrog.io/artifactory/repo/models/evil.payload"
+        redirected_url = "https://evil.example\\@company.jfrog.io/artifacts/evil.payload"
+        payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
+        redirect_response = _FakeStreamingResponse(b"", status_code=302, headers={"Location": redirected_url})
+        final_response = _FakeStreamingResponse(payload)
+        mock_get.side_effect = [redirect_response, final_response]
+        mock_list.return_value = [
+            {"name": "evil.payload", "path": hidden_url, "size": len(payload), "human_size": "24 B"}
+        ]
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(url).name
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            api_token="test-token",
+            show_progress=False,
+        )
+
+        assert mock_get.call_args_list[0].kwargs["headers"]["X-JFrog-Art-Api"] == "test-token"
+        assert mock_get.call_args_list[1].args[0] == redirected_url
+        assert "X-JFrog-Art-Api" not in mock_get.call_args_list[1].kwargs["headers"]
+        assert mock_get.call_args_list[1].kwargs["headers"]["Range"] == "bytes=0-65535"
+        assert all(call.kwargs["allow_redirects"] is False for call in mock_get.call_args_list)
+        assert redirect_response.closed is True
+        assert (tmp_path / "evil.payload").exists()
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_probe_preserves_credentials_on_trusted_redirect(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Relative redirects on a trusted JFrog host can keep auth while still bounding the probe."""
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        hidden_url = "https://company.jfrog.io/artifactory/repo/models/evil.payload"
+        payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
+        redirect_response = _FakeStreamingResponse(
+            b"", status_code=307, headers={"Location": "evil.payload?download=1"}
+        )
+        final_response = _FakeStreamingResponse(payload)
+        mock_get.side_effect = [redirect_response, final_response]
+        mock_list.return_value = [
+            {"name": "evil.payload", "path": hidden_url, "size": len(payload), "human_size": "24 B"}
+        ]
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(url).name
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            api_token="test-token",
+            show_progress=False,
+        )
+
+        assert mock_get.call_args_list[1].args[0] == (
+            "https://company.jfrog.io/artifactory/repo/models/evil.payload?download=1"
+        )
+        assert mock_get.call_args_list[1].kwargs["headers"]["X-JFrog-Art-Api"] == "test-token"
+        assert mock_get.call_args_list[1].kwargs["headers"]["Range"] == "bytes=0-65535"
+        assert redirect_response.closed is True
+        assert (tmp_path / "evil.payload").exists()
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_selective_fails_closed_when_skipped_content_cannot_be_inspected(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Skipped remote files must be inspectable before selective filtering excludes them."""
+        hidden_url = "https://user:leaky-pass@company.jfrog.io/artifactory/repo/models/evil.payload?token=leaky-token"
+        mock_list.return_value = [
+            {
+                "name": "model.pkl",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model.pkl",
+                "size": 1024,
+                "human_size": "1.0 KB",
+            },
+            {"name": "evil.payload", "path": hidden_url, "size": 24, "human_size": "24 B"},
+        ]
+        mock_get.side_effect = PermissionError(f"denied {hidden_url}")
+
+        with pytest.raises(ValueError) as excinfo:
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                show_progress=False,
+            )
+
+        error = str(excinfo.value)
+        assert "selective filtering incomplete" in error
+        assert "evil.payload" in error
+        assert "leaky-pass" not in error
+        assert "leaky-token" not in error
+        assert "?token=" not in error
+        mock_download.assert_not_called()
+        assert not any(tmp_path.iterdir())
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_scanner_selection_includes_matching_content_route_only(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Scanner allowlists should admit matching renamed content without pulling unrelated formats."""
+        safetensors_url = "https://company.jfrog.io/artifactory/repo/models/weights.jpg"
+        pickle_url = "https://company.jfrog.io/artifactory/repo/models/pickle.payload"
+        safetensors_header = b'{"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}'
+        safetensors_payload = struct.pack("<Q", len(safetensors_header)) + safetensors_header + b"\x00\x00\x00\x00"
+        pickle_payload = b"\x80\x04cos\nsystem\n."
+        mock_list.return_value = [
+            {
+                "name": "weights.jpg",
+                "path": safetensors_url,
+                "size": len(safetensors_payload),
+                "human_size": "72 B",
+            },
+            {"name": "pickle.payload", "path": pickle_url, "size": len(pickle_payload), "human_size": "16 B"},
+        ]
+
+        def get_side_effect(url: str, **_kwargs: object) -> _FakeStreamingResponse:
+            if url == safetensors_url:
+                return _FakeStreamingResponse(safetensors_payload)
+            if url == pickle_url:
+                return _FakeStreamingResponse(pickle_payload)
+            raise AssertionError(f"unexpected content probe: {url}")
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(url).name
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_get.side_effect = get_side_effect
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            show_progress=False,
+            scannable_extensions={".safetensors"},
+            scanner_selection=scanner_selection_config_from_inputs(scanners=["safetensors"]),
+        )
+
+        assert {call.args[0] for call in mock_get.call_args_list} == {safetensors_url, pickle_url}
+        assert [call.args[0].rsplit("/", 1)[-1] for call in mock_download.call_args_list] == ["weights.jpg"]
+        assert (tmp_path / "weights.jpg").exists()
+        assert not (tmp_path / "pickle.payload").exists()
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_selected_extensions_do_not_probe_skipped_content(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Explicit scanner-extension filtering should not pull in content for excluded scanners."""
+        mock_list.return_value = [
+            {
+                "name": "weights.safetensors",
+                "path": "https://company.jfrog.io/artifactory/repo/models/weights.safetensors",
+                "size": 1024,
+                "human_size": "1.0 KB",
+            },
+            {
+                "name": "evil.payload",
+                "path": "https://company.jfrog.io/artifactory/repo/models/evil.payload",
+                "size": 24,
+                "human_size": "24 B",
+            },
+        ]
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            filename = Path(url).name
+            downloaded_file = cache_dir / filename
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            show_progress=False,
+            scannable_extensions={".safetensors"},
+        )
+
+        mock_get.assert_not_called()
+        assert [call.args[0].rsplit("/", 1)[-1] for call in mock_download.call_args_list] == ["weights.safetensors"]
+        assert (tmp_path / "weights.safetensors").exists()
+        assert not (tmp_path / "evil.payload").exists()
 
     @patch("modelaudit.utils.sources.jfrog.download_artifact")
     @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
