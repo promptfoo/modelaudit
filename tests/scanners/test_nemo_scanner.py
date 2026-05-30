@@ -3453,6 +3453,654 @@ class TestCVE202523304HydraTarget:
         assert len(review_checks) == 1
         assert review_checks[0].severity == IssueSeverity.INFO
 
+    @pytest.mark.parametrize(
+        ("target", "target_config"),
+        [
+            (
+                "urllib.request.urlretrieve",
+                {
+                    "_target_": "urllib.request.urlretrieve",
+                    "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                    "filename": "/tmp/modelaudit-nemo-download",
+                },
+            ),
+            (
+                "urllib.request.urlopen",
+                {
+                    "_target_": "urllib.request.urlopen",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "requests.get",
+                {
+                    "_target_": "requests.get",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "requests.api.get",
+                {
+                    "_target_": "requests.api.get",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "requests.sessions.Session.get",
+                {
+                    "_target_": "requests.sessions.Session.get",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "requests.Session.send",
+                {
+                    "_target_": "requests.Session.send",
+                    "_args_": [{"_target_": "requests.Request", "url": "http://169.254.169.254/latest/meta-data/"}],
+                },
+            ),
+            (
+                "httpx.post",
+                {
+                    "_target_": "httpx.post",
+                    "url": "http://169.254.169.254/latest/user-data",
+                    "data": "payload",
+                },
+            ),
+            (
+                "httpx._api.post",
+                {
+                    "_target_": "httpx._api.post",
+                    "url": "http://169.254.169.254/latest/user-data",
+                    "data": "payload",
+                },
+            ),
+            (
+                "httpx.Client.get",
+                {
+                    "_target_": "httpx.Client.get",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "httpx._client.Client.send",
+                {
+                    "_target_": "httpx._client.Client.send",
+                    "_args_": [{"_target_": "httpx.Request", "method": "GET", "url": "http://169.254.169.254/"}],
+                },
+            ),
+            (
+                "urllib3.request",
+                {
+                    "_target_": "urllib3.request",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.PoolManager.request",
+                {
+                    "_target_": "urllib3.PoolManager.request",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.poolmanager.PoolManager.request",
+                {
+                    "_target_": "urllib3.poolmanager.PoolManager.request",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.poolmanager.ProxyManager.urlopen",
+                {
+                    "_target_": "urllib3.poolmanager.ProxyManager.urlopen",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.HTTPConnectionPool.request",
+                {
+                    "_target_": "urllib3.HTTPConnectionPool.request",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.connectionpool.HTTPSConnectionPool.urlopen",
+                {
+                    "_target_": "urllib3.connectionpool.HTTPSConnectionPool.urlopen",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib.request.OpenerDirector.open",
+                {
+                    "_target_": "urllib.request.OpenerDirector.open",
+                    "_args_": ["http://169.254.169.254/latest/meta-data/"],
+                },
+            ),
+            (
+                "urllib.request.URLopener.retrieve",
+                {
+                    "_target_": "urllib.request.URLopener.retrieve",
+                    "_args_": [
+                        "http://169.254.169.254/latest/meta-data/",
+                        "/tmp/modelaudit-nemo-download",
+                    ],
+                },
+            ),
+            (
+                "urllib.request.URLopener.open_http",
+                {
+                    "_target_": "urllib.request.URLopener.open_http",
+                    "_args_": ["http://169.254.169.254/latest/meta-data/"],
+                },
+            ),
+            (
+                "urllib.request.FancyURLopener.open_https",
+                {
+                    "_target_": "urllib.request.FancyURLopener.open_https",
+                    "_args_": ["https://169.254.169.254/latest/meta-data/"],
+                },
+            ),
+            (
+                "urllib.request.URLopener.open_local_file",
+                {
+                    "_target_": "urllib.request.URLopener.open_local_file",
+                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "http.client.HTTPConnection.request",
+                {
+                    "_target_": "http.client.HTTPConnection.request",
+                    "method": "GET",
+                    "url": "/latest/meta-data/",
+                },
+            ),
+            (
+                "http.client.HTTPConnection.connect",
+                {
+                    "_target_": "http.client.HTTPConnection.connect",
+                    "_args_": [{"_target_": "http.client.HTTPConnection", "host": "169.254.169.254"}],
+                },
+            ),
+            (
+                "socket.create_connection",
+                {
+                    "_target_": "socket.create_connection",
+                    "_args_": [["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "socket.socket.sendto",
+                {
+                    "_target_": "socket.socket.sendto",
+                    "_args_": [{"_target_": "socket.socket"}, b"GET /", ["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "socket.SocketType.connect",
+                {
+                    "_target_": "socket.SocketType.connect",
+                    "_args_": [["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "_socket.SocketType.sendall",
+                {
+                    "_target_": "_socket.SocketType.sendall",
+                    "_args_": [{"_target_": "_socket.SocketType"}, b"GET /"],
+                },
+            ),
+            (
+                "_socket.socket.sendto",
+                {
+                    "_target_": "_socket.socket.sendto",
+                    "_args_": [{"_target_": "_socket.socket"}, b"GET /", ["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "socket.socket.connect",
+                {
+                    "_target_": "socket.socket.connect",
+                    "_args_": [["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "pathlib.Path.write_text",
+                {
+                    "_target_": "pathlib.Path.write_text",
+                    "_args_": ["/tmp/modelaudit-nemo-write", "payload"],
+                },
+            ),
+            (
+                "pathlib.Path.read_text",
+                {
+                    "_target_": "pathlib.Path.read_text",
+                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.Path.read_bytes",
+                {
+                    "_target_": "pathlib.Path.read_bytes",
+                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "builtins.open",
+                {
+                    "_target_": "builtins.open",
+                    "_args_": ["/tmp/modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "_io.FileIO",
+                {
+                    "_target_": "_io.FileIO",
+                    "_args_": ["/tmp/modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "io.FileIO",
+                {
+                    "_target_": "io.FileIO",
+                    "_args_": ["/tmp/modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "_io.open",
+                {
+                    "_target_": "_io.open",
+                    "_args_": ["/tmp/modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "io.open_code",
+                {
+                    "_target_": "io.open_code",
+                    "_args_": ["/tmp/modelaudit-nemo-secret.py"],
+                },
+            ),
+            (
+                "_io.open_code",
+                {
+                    "_target_": "_io.open_code",
+                    "_args_": ["/tmp/modelaudit-nemo-secret.py"],
+                },
+            ),
+            (
+                "os.open",
+                {
+                    "_target_": "os.open",
+                    "_args_": ["/tmp/modelaudit-nemo-write", 65],
+                },
+            ),
+            (
+                "posix.open",
+                {
+                    "_target_": "posix.open",
+                    "_args_": ["/tmp/modelaudit-nemo-write", 65],
+                },
+            ),
+            (
+                "pathlib.PosixPath.write_text",
+                {
+                    "_target_": "pathlib.PosixPath.write_text",
+                    "_args_": ["/tmp/modelaudit-nemo-write", "payload"],
+                },
+            ),
+            (
+                "pathlib.PosixPath.read_text",
+                {
+                    "_target_": "pathlib.PosixPath.read_text",
+                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.PosixPath.read_bytes",
+                {
+                    "_target_": "pathlib.PosixPath.read_bytes",
+                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "os.rename",
+                {
+                    "_target_": "os.rename",
+                    "_args_": ["/tmp/modelaudit-nemo-source", "/tmp/modelaudit-nemo-dest"],
+                },
+            ),
+            (
+                "os.replace",
+                {
+                    "_target_": "os.replace",
+                    "_args_": ["/tmp/modelaudit-nemo-source", "/tmp/modelaudit-nemo-dest"],
+                },
+            ),
+            (
+                "pathlib.Path.rename",
+                {
+                    "_target_": "pathlib.Path.rename",
+                    "_args_": ["/tmp/modelaudit-nemo-source", "/tmp/modelaudit-nemo-dest"],
+                },
+            ),
+            (
+                "pathlib.Path.touch",
+                {
+                    "_target_": "pathlib.Path.touch",
+                    "_args_": ["/tmp/modelaudit-nemo-created"],
+                },
+            ),
+            (
+                "pathlib.Path.symlink_to",
+                {
+                    "_target_": "pathlib.Path.symlink_to",
+                    "_args_": ["/tmp/modelaudit-nemo-link", "/tmp/modelaudit-nemo-target"],
+                },
+            ),
+            (
+                "pathlib.PosixPath.hardlink_to",
+                {
+                    "_target_": "pathlib.PosixPath.hardlink_to",
+                    "_args_": ["/tmp/modelaudit-nemo-link", "/tmp/modelaudit-nemo-target"],
+                },
+            ),
+            (
+                "pathlib.WindowsPath.read_text",
+                {
+                    "_target_": "pathlib.WindowsPath.read_text",
+                    "_args_": ["C:/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "shutil.copyfile",
+                {
+                    "_target_": "shutil.copyfile",
+                    "_args_": ["/tmp/modelaudit-nemo-source", "/tmp/modelaudit-nemo-dest"],
+                },
+            ),
+        ],
+    )
+    def test_network_and_file_access_targets_are_dangerous(
+        self,
+        tmp_path: Path,
+        target: str,
+        target_config: dict[str, Any],
+    ) -> None:
+        """Network and file-access callables must not fall through to INFO-only review."""
+        path = _create_nemo_file(tmp_path, {"model": target_config})
+
+        result = NemoScanner().scan(str(path))
+
+        cve_checks = [
+            check
+            for check in result.checks
+            if check.name == "CVE-2025-23304: Dangerous Hydra _target_" and check.details.get("target") == target
+        ]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["cve_id"] == "CVE-2025-23304"
+
+    @pytest.mark.parametrize(
+        ("target", "target_config"),
+        [
+            (
+                "urllib.request.urlretrieve",
+                {
+                    "_target_": "urllib.request.urlretrieve",
+                    "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                    "filename": "/tmp/modelaudit-nemo-download",
+                },
+            ),
+            (
+                "socket.create_connection",
+                {
+                    "_target_": "socket.create_connection",
+                    "_args_": [["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "requests.api.get",
+                {
+                    "_target_": "requests.api.get",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "requests.sessions.Session.get",
+                {
+                    "_target_": "requests.sessions.Session.get",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "httpx.Client.get",
+                {
+                    "_target_": "httpx.Client.get",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.request",
+                {
+                    "_target_": "urllib3.request",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.connectionpool.HTTPConnectionPool.request",
+                {
+                    "_target_": "urllib3.connectionpool.HTTPConnectionPool.request",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib3.poolmanager.PoolManager.request",
+                {
+                    "_target_": "urllib3.poolmanager.PoolManager.request",
+                    "method": "GET",
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                },
+            ),
+            (
+                "urllib.request.URLopener.retrieve",
+                {
+                    "_target_": "urllib.request.URLopener.retrieve",
+                    "_args_": [
+                        "http://169.254.169.254/latest/meta-data/",
+                        "/tmp/modelaudit-nemo-download",
+                    ],
+                },
+            ),
+            (
+                "urllib.request.URLopener.open_http",
+                {
+                    "_target_": "urllib.request.URLopener.open_http",
+                    "_args_": ["http://169.254.169.254/latest/meta-data/"],
+                },
+            ),
+            (
+                "http.client.HTTPConnection.connect",
+                {
+                    "_target_": "http.client.HTTPConnection.connect",
+                    "_args_": [{"_target_": "http.client.HTTPConnection", "host": "169.254.169.254"}],
+                },
+            ),
+            (
+                "socket.socket.connect",
+                {
+                    "_target_": "socket.socket.connect",
+                    "_args_": [["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "_socket.socket.sendto",
+                {
+                    "_target_": "_socket.socket.sendto",
+                    "_args_": [{"_target_": "_socket.socket"}, b"GET /", ["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "_socket.SocketType.connect",
+                {
+                    "_target_": "_socket.SocketType.connect",
+                    "_args_": [["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "_io.FileIO",
+                {
+                    "_target_": "_io.FileIO",
+                    "_args_": ["/tmp/modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "io.FileIO",
+                {
+                    "_target_": "io.FileIO",
+                    "_args_": ["/tmp/modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "_io.open",
+                {
+                    "_target_": "_io.open",
+                    "_args_": ["/tmp/modelaudit-nemo-write", "w"],
+                },
+            ),
+            (
+                "io.open_code",
+                {
+                    "_target_": "io.open_code",
+                    "_args_": ["/tmp/modelaudit-nemo-secret.py"],
+                },
+            ),
+            (
+                "posix.open",
+                {
+                    "_target_": "posix.open",
+                    "_args_": ["/tmp/modelaudit-nemo-write", 65],
+                },
+            ),
+            (
+                "pathlib.PosixPath.write_text",
+                {
+                    "_target_": "pathlib.PosixPath.write_text",
+                    "_args_": ["/tmp/modelaudit-nemo-write", "payload"],
+                },
+            ),
+            (
+                "pathlib.PosixPath.read_text",
+                {
+                    "_target_": "pathlib.PosixPath.read_text",
+                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.PosixPath.read_bytes",
+                {
+                    "_target_": "pathlib.PosixPath.read_bytes",
+                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "os.rename",
+                {
+                    "_target_": "os.rename",
+                    "_args_": ["/tmp/modelaudit-nemo-source", "/tmp/modelaudit-nemo-dest"],
+                },
+            ),
+            (
+                "os.replace",
+                {
+                    "_target_": "os.replace",
+                    "_args_": ["/tmp/modelaudit-nemo-source", "/tmp/modelaudit-nemo-dest"],
+                },
+            ),
+            (
+                "pathlib.Path.symlink_to",
+                {
+                    "_target_": "pathlib.Path.symlink_to",
+                    "_args_": ["/tmp/modelaudit-nemo-link", "/tmp/modelaudit-nemo-target"],
+                },
+            ),
+        ],
+    )
+    def test_network_and_file_access_targets_fail_aggregate_scan(
+        self,
+        tmp_path: Path,
+        target: str,
+        target_config: dict[str, Any],
+    ) -> None:
+        """SSRF and file-access Hydra targets should produce aggregate exit 1."""
+        config = {"model": target_config}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False},
+        )
+
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and issue.details.get("target") == target
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
+
+    def test_unknown_request_named_custom_target_remains_review_only(self, tmp_path: Path) -> None:
+        """Exact sink coverage should not promote benign request-like custom factories."""
+        config = {"model": {"_target_": "custom_package.requests_get_factory.SafeBuilder"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        review_checks = [
+            check
+            for check in result.checks
+            if check.name == "Hydra _target_ Review"
+            and check.details.get("target") == "custom_package.requests_get_factory.SafeBuilder"
+        ]
+        assert len(review_checks) == 1
+        assert review_checks[0].severity == IssueSeverity.INFO
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "http.client.HTTPConnection.putrequest",
+            "http.client.HTTPSConnection.putrequest",
+            "httpx.Client.stream",
+            "httpx._client.Client.stream",
+            "httpx.AsyncClient.get",
+            "httpx._client.AsyncClient.request",
+        ],
+    )
+    def test_non_io_target_invocations_remain_review_only(self, tmp_path: Path, target: str) -> None:
+        """Exact coverage should not promote callables that only prepare data or return lazy handles."""
+        config = {"model": {"_target_": target}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        review_checks = [
+            check
+            for check in result.checks
+            if check.name == "Hydra _target_ Review" and check.details.get("target") == target
+        ]
+        assert len(review_checks) == 1
+        assert review_checks[0].severity == IssueSeverity.INFO
+
     def test_torch_load_target_fails_aggregate_scan(self, tmp_path: Path) -> None:
         """A NeMo config using torch.load should produce a security failure, not exit 0."""
         config = {"model": {"_target_": "torch.load", "f": "payload.pt"}}
