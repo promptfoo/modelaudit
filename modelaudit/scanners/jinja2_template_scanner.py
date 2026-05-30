@@ -126,6 +126,39 @@ def _limit_sandbox_worker_memory(max_memory_bytes: int) -> None:
             continue
 
 
+def _project_repeated_value_size(left: Any, right: Any) -> int | None:
+    if isinstance(left, int) and hasattr(right, "__len__"):
+        return max(left, 0) * len(right)
+    if isinstance(right, int) and hasattr(left, "__len__"):
+        return max(right, 0) * len(left)
+    return None
+
+
+def _project_combined_value_size(left: Any, right: Any) -> int | None:
+    if isinstance(left, str | bytes | list | tuple) and isinstance(right, type(left)):
+        return len(left) + len(right)
+    return None
+
+
+def _create_budgeted_sandbox_environment(max_output_chars: int) -> Any:
+    class _BudgetedSandboxEnvironment(jinja2.sandbox.SandboxedEnvironment):
+        intercepted_binops = frozenset({"*", "+"})
+
+        def call_binop(self, context: Any, operator: str, left: Any, right: Any) -> Any:
+            projected_size = None
+            if operator == "*":
+                projected_size = _project_repeated_value_size(left, right)
+            elif operator == "+":
+                projected_size = _project_combined_value_size(left, right)
+
+            if projected_size is not None and projected_size > max_output_chars:
+                raise _SandboxRenderBudgetExceeded
+
+            return super().call_binop(context, operator, left, right)
+
+    return _BudgetedSandboxEnvironment()
+
+
 def _sandbox_render_probe_worker(
     template_content: str,
     max_output_chars: int,
@@ -134,7 +167,7 @@ def _sandbox_render_probe_worker(
 ) -> None:
     try:
         _limit_sandbox_worker_memory(max_memory_bytes)
-        env = jinja2.sandbox.SandboxedEnvironment()
+        env = _create_budgeted_sandbox_environment(max_output_chars)
         template = env.from_string(template_content)
         rendered_chars = 0
         for chunk in template.generate(messages=[], config={}):
@@ -1204,9 +1237,20 @@ class Jinja2TemplateScanner(BaseScanner):
 
         if status == "security_error":
             return False, None
-        if status in {"budget_exceeded", "timeout", "worker_error", "worker_unavailable"}:
+        if status == "worker_unavailable":
+            if self._template_has_static_render_budget_risk(template_content):
+                return True, self._sandbox_render_budget_failure(location, status, detail)
+            return True, None
+        if status in {"budget_exceeded", "timeout", "worker_error"}:
             return True, self._sandbox_render_budget_failure(location, status, detail)
         return True, None
+
+    def _template_has_static_render_budget_risk(self, template_content: str) -> bool:
+        return bool(
+            re.search(r"(['\"])(?:\\.|(?!\1).){1,256}\1\s*\*\s*\d{5,}", template_content)
+            or re.search(r"\d{5,}\s*\*\s*(['\"])(?:\\.|(?!\1).){1,256}\1", template_content)
+            or re.search(r"\brange\(\s*\d{5,}", template_content)
+        )
 
     def _sandbox_render_budget_failure(
         self,
