@@ -237,16 +237,27 @@ def test_keras_h5_scanner_detects_cve_2026_1669_external_storage(tmp_path: Path)
     ]
 
 
-def test_keras_h5_scanner_skips_cve_2026_1669_on_fixed_version(tmp_path: Path) -> None:
-    """Fixed Keras versions should not emit warning-level CVE-2026-1669 findings."""
-    model_path = create_h5_with_external_link(tmp_path, keras_version="3.13.2")
+@pytest.mark.parametrize(
+    "fixture_factory",
+    [create_h5_with_external_link, create_h5_with_external_storage],
+)
+def test_keras_h5_scanner_flags_external_references_despite_fixed_file_version(
+    tmp_path: Path,
+    fixture_factory: Any,
+) -> None:
+    """Standalone H5 files cannot use artifact-controlled keras_version to suppress external refs."""
+    model_path = fixture_factory(tmp_path, keras_version="3.13.2")
 
     scanner = KerasH5Scanner()
     result = scanner.scan(str(model_path))
 
-    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
-    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
-    assert any(
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].severity == IssueSeverity.WARNING
+    assert cve_issues[0].details["keras_version"] == "3.13.2"
+    assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
+    assert cve_issues[0].details["version_source"] == "hdf5_file_attribute"
+    assert not any(
         check.name == "HDF5 External Weight Reference Version Check" and check.status == CheckStatus.PASSED
         for check in result.checks
     )
@@ -624,6 +635,44 @@ def test_keras_h5_scanner_skips_generic_hdf5_external_links_without_keras_metada
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
+def test_keras_h5_scanner_skips_generic_hdf5_external_link_with_only_keras_version(tmp_path: Path) -> None:
+    """A keras_version attribute alone must not classify a generic HDF5 file as Keras weights."""
+    generic_path = tmp_path / "generic_with_version.h5"
+    with h5py.File(generic_path, "w") as f:
+        f.attrs["keras_version"] = "3.13.2"
+        f["linked"] = h5py.ExternalLink("external_source.h5", "/payload")
+
+    result = KerasH5Scanner().scan(str(generic_path))
+
+    assert result.success is True
+    assert result.metadata["keras_version"] == "3.13.2"
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def test_keras_h5_scanner_skips_generic_hdf5_external_storage_with_only_keras_version(tmp_path: Path) -> None:
+    """Artifact-controlled version metadata should not turn generic external storage into a Keras CVE."""
+    raw_storage = tmp_path / "generic.raw"
+    raw_storage.write_bytes(b"\x00" * 8)
+
+    generic_path = tmp_path / "generic_with_external_storage.h5"
+    with h5py.File(generic_path, "w") as f:
+        f.attrs["keras_version"] = "3.13.2"
+        f.create_dataset(
+            "external_values",
+            shape=(2,),
+            dtype="float32",
+            external=[(raw_storage.name, 0, 8)],
+        )
+
+    result = KerasH5Scanner().scan(str(generic_path))
+
+    assert result.success is True
+    assert result.metadata["keras_version"] == "3.13.2"
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
 def test_keras_h5_scanner_skips_generic_nested_weight_like_groups(tmp_path: Path) -> None:
     """Nested generic groups named vars/weights must not imply a Keras weights file."""
     generic_path = tmp_path / "generic_nested.h5"
@@ -674,6 +723,7 @@ def test_keras_h5_scanner_flags_weights_only_external_link_without_keras_metadat
 
     weights_path = tmp_path / "weights_only.h5"
     with h5py.File(weights_path, "w") as f:
+        f.attrs["keras_version"] = "3.13.2"
         f.attrs["layer_names"] = [b"dense"]
         dense = f.create_group("dense")
         dense.attrs["weight_names"] = [b"kernel:0"]
@@ -684,7 +734,8 @@ def test_keras_h5_scanner_flags_weights_only_external_link_without_keras_metadat
     cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
     assert len(cve_issues) == 1
     assert cve_issues[0].severity == IssueSeverity.WARNING
-    assert cve_issues[0].details["parse_status"] == "unknown"
+    assert cve_issues[0].details["keras_version"] == "3.13.2"
+    assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
     assert cve_issues[0].details["external_references"] == [
         {
             "kind": "ExternalLink",
@@ -703,6 +754,7 @@ def test_keras_h5_scanner_flags_keras3_weights_external_link_without_legacy_attr
 
     weights_path = tmp_path / "model.weights.h5"
     with h5py.File(weights_path, "w") as f:
+        f.attrs["keras_version"] = "3.13.2"
         vars_group = f.create_group("layers").create_group("dense").create_group("vars")
         vars_group["0"] = h5py.ExternalLink(external_source.name, "/payload")
 
@@ -710,7 +762,8 @@ def test_keras_h5_scanner_flags_keras3_weights_external_link_without_legacy_attr
 
     cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
     assert len(cve_issues) == 1
-    assert cve_issues[0].details["parse_status"] == "unknown"
+    assert cve_issues[0].details["keras_version"] == "3.13.2"
+    assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
     assert cve_issues[0].details["external_references"] == [
         {
             "kind": "ExternalLink",

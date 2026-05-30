@@ -173,11 +173,7 @@ class KerasH5Scanner(BaseScanner):
                 # CVE-2026-1669 applies to weight loading too. Inspect full
                 # Keras files and weights-like HDF5 layouts while leaving
                 # unrelated generic HDF5 artifacts quiet.
-                if (
-                    "model_config" in f.attrs
-                    or "keras_version" in result.metadata
-                    or self._has_weights_like_hdf5_layout(f, path)
-                ):
+                if "model_config" in f.attrs or self._has_weights_like_hdf5_layout(f, path):
                     self._check_hdf5_external_references(f, result, path)
 
                 # Check if this is a Keras model file
@@ -504,21 +500,28 @@ class KerasH5Scanner(BaseScanner):
             )
             return
 
-        if vuln_status is False and isinstance(keras_version, str):
-            result.add_check(
-                name="HDF5 External Weight Reference Version Check",
-                passed=True,
-                message=(
-                    f"HDF5 external references detected in weights, but Keras {keras_version} is outside the known "
-                    "CVE-2026-1669 vulnerable ranges"
-                ),
-                location=location,
-                details={"keras_version": keras_version, "external_references": findings},
-            )
-            return
-
         if isinstance(keras_version, str):
             details["keras_version"] = keras_version
+            if vuln_status is False:
+                details["parse_status"] = "untrusted_artifact_version"
+                details["version_source"] = "hdf5_file_attribute"
+                result.add_check(
+                    name="HDF5 External Weight Reference Risk (Untrusted Version Metadata)",
+                    passed=False,
+                    message=(
+                        "HDF5 external references detected in standalone Keras H5 weights; "
+                        f"the file claims Keras {keras_version}, but artifact-controlled version metadata "
+                        "cannot prove the loader runtime is outside the CVE-2026-1669 vulnerable ranges"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    location=location,
+                    details=details
+                    | {
+                        "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
+                    },
+                    why=get_cve_2026_1669_explanation("hdf5_external_reference"),
+                )
+                return
 
         result.add_check(
             name="HDF5 External Weight Reference Risk (Version Unknown)",
