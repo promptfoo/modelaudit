@@ -1081,6 +1081,67 @@ class TestOciLayerScanner:
 
         assert result.success is True
 
+    def test_scan_layer_reports_member_path_traversal_metadata(self, tmp_path: Path) -> None:
+        """Unsafe member names should be reported even though OCI uses temp extraction."""
+        payload = tmp_path / "payload.pkl"
+        payload.write_bytes(b"safe")
+
+        layer_path = tmp_path / "traversal.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(payload, arcname="../../payload.pkl")
+
+        manifest_path = tmp_path / "traversal.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["traversal.tar.gz"]}))
+
+        with patch("modelaudit.core.scan_file") as mock_scan:
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        mock_scan.assert_not_called()
+        assert result.success is False
+        checks = [check for check in result.checks if check.name == "Path Traversal Protection"]
+        assert len(checks) == 1
+        assert checks[0].severity == IssueSeverity.CRITICAL
+        assert checks[0].details["member"] == "../../payload.pkl"
+
+    def test_scan_layer_reports_unsafe_link_metadata(self, tmp_path: Path) -> None:
+        """Unsafe symlink/hardlink targets should be reported from layer metadata."""
+        layer_path = tmp_path / "unsafe-link.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("links/passwd")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "/etc/passwd"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "unsafe-link.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["unsafe-link.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert len(checks) == 1
+        assert checks[0].severity == IssueSeverity.CRITICAL
+        assert checks[0].details["target"] == "/etc/passwd"
+
+    def test_scan_layer_allows_safe_link_metadata(self, tmp_path: Path) -> None:
+        """Benign relative link metadata should remain clean."""
+        layer_path = tmp_path / "safe-link.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            link_info = tarfile.TarInfo("links/model")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "model.bin"
+            tar.addfile(link_info)
+
+        manifest_path = tmp_path / "safe-link.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["safe-link.tar.gz"]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert len(checks) == 1
+        assert checks[0].status.value == "passed"
+
     def test_scan_corrupted_tar_layer(self, tmp_path: Path) -> None:
         """Test scanning corrupted tar layer."""
         # Create a file that looks like tar.gz but is corrupted

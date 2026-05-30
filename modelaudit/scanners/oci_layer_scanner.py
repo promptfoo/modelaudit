@@ -10,7 +10,7 @@ from typing import Any, ClassVar
 from urllib.parse import urlparse
 
 from ..scanner_results import mark_inconclusive_scan_result
-from ..utils import is_within_directory, sanitize_archive_path
+from ..utils import is_absolute_archive_path, is_critical_system_path, is_within_directory, sanitize_archive_path
 from ..utils.file.detection import (
     MARKED_PROTOCOL0_GLOBAL_RE,
     PROTOCOL0_GLOBAL_RE,
@@ -27,6 +27,20 @@ try:
     HAS_YAML = True
 except Exception:
     HAS_YAML = False
+
+CRITICAL_SYSTEM_PATHS = [
+    "/etc",
+    "/bin",
+    "/usr",
+    "/var",
+    "/lib",
+    "/boot",
+    "/sys",
+    "/proc",
+    "/dev",
+    "/sbin",
+    "C:\\Windows",
+]
 
 
 class OciLayerScanner(BaseScanner):
@@ -108,6 +122,74 @@ class OciLayerScanner(BaseScanner):
                     best_candidate = (candidate_width, start, candidate)
 
         return best_candidate[2] if best_candidate is not None else None
+
+    def _validate_layer_member_metadata(
+        self,
+        result: ScanResult,
+        *,
+        manifest_path: str,
+        layer_ref: str,
+        member: tarfile.TarInfo,
+    ) -> bool | None:
+        name = member.name
+        temp_base = os.path.join(tempfile.gettempdir(), "extract_oci_layer")
+        resolved_name, is_safe = sanitize_archive_path(name, temp_base)
+        if not is_safe:
+            result.add_check(
+                name="Path Traversal Protection",
+                passed=False,
+                message=f"Layer member {name} attempted path traversal outside the layer",
+                severity=IssueSeverity.CRITICAL,
+                location=f"{manifest_path}:{layer_ref}:{name}",
+                details={"layer": layer_ref, "member": name},
+                rule_code="S405",
+            )
+            return None
+
+        if member.issym() or member.islnk():
+            target = member.linkname
+            target_base = os.path.dirname(resolved_name)
+            _target_resolved, target_safe = sanitize_archive_path(target, target_base)
+            details = {"layer": layer_ref, "member": name, "target": target}
+            if not target_safe:
+                if is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
+                    message = f"Layer link {name} points to critical system path: {target}"
+                else:
+                    message = f"Layer link {name} resolves outside extraction directory"
+                result.add_check(
+                    name="Symlink Safety Validation",
+                    passed=False,
+                    message=message,
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{manifest_path}:{layer_ref}:{name}",
+                    details=details,
+                    rule_code="S406",
+                )
+                return None
+
+            if is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
+                result.add_check(
+                    name="Symlink Safety Validation",
+                    passed=False,
+                    message=f"Layer link {name} points to critical system path: {target}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{manifest_path}:{layer_ref}:{name}",
+                    details=details,
+                    rule_code="S408",
+                )
+                return None
+
+            result.add_check(
+                name="Symlink Safety Validation",
+                passed=True,
+                message=f"Layer link {name} is safe",
+                location=f"{manifest_path}:{layer_ref}:{name}",
+                details=details,
+                rule_code=None,
+            )
+            return False
+
+        return True
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -388,6 +470,17 @@ class OciLayerScanner(BaseScanner):
 
                 with tarfile.open(layer_path, "r:gz") as tar:
                     for member in tar:
+                        metadata_action = self._validate_layer_member_metadata(
+                            result,
+                            manifest_path=path,
+                            layer_ref=layer_ref,
+                            member=member,
+                        )
+                        if metadata_action is None:
+                            scan_complete = False
+                            continue
+                        if metadata_action is False:
+                            continue
                         if not member.isfile():
                             continue
                         name = member.name
