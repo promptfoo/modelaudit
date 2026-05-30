@@ -108,17 +108,16 @@ def _limit_sandbox_worker_memory(max_memory_bytes: int) -> None:
         return
 
     baseline_virtual_memory_bytes = _current_process_virtual_memory_bytes()
+    if baseline_virtual_memory_bytes is None:
+        return
+
     for limit_name in ("RLIMIT_AS",):
         limit_id = getattr(resource, limit_name, None)
         if limit_id is None:
             continue
         try:
             _soft_limit, hard_limit = resource.getrlimit(limit_id)
-            capped_limit = (
-                baseline_virtual_memory_bytes + max_memory_bytes
-                if baseline_virtual_memory_bytes is not None
-                else max_memory_bytes
-            )
+            capped_limit = baseline_virtual_memory_bytes + max_memory_bytes
             if hard_limit != resource.RLIM_INFINITY:
                 capped_limit = min(capped_limit, hard_limit)
             resource.setrlimit(limit_id, (capped_limit, hard_limit))
@@ -1240,7 +1239,9 @@ class Jinja2TemplateScanner(BaseScanner):
         if status == "security_error":
             return False, None
         if status == "worker_unavailable":
-            if self._template_has_static_render_budget_risk(template_content):
+            if self._template_has_static_render_budget_risk(template_content) or self._template_has_static_sandbox_risk(
+                template_content
+            ):
                 return True, self._sandbox_render_budget_failure(location, status, detail)
             return True, None
         if status in {"budget_exceeded", "timeout", "worker_error"}:
@@ -1252,6 +1253,13 @@ class Jinja2TemplateScanner(BaseScanner):
             re.search(r"(['\"])(?:\\.|(?!\1).){1,256}\1\s*\*\s*\d{5,}", template_content)
             or re.search(r"\d{5,}\s*\*\s*(['\"])(?:\\.|(?!\1).){1,256}\1", template_content)
             or re.search(r"\brange\(\s*\d{5,}", template_content)
+        )
+
+    def _template_has_static_sandbox_risk(self, template_content: str) -> bool:
+        return bool(
+            re.search(r"\.\s*__\w+__", template_content)
+            or re.search(r"\|\s*attr\s*\(\s*['\"]__\w+__", template_content)
+            or re.search(r"\[\s*['\"]__\w+__['\"]\s*\]", template_content)
         )
 
     def _sandbox_render_budget_failure(

@@ -943,6 +943,54 @@ class TestJinja2TemplateScannerEdgeCases:
         assert len(budget_checks) == 1
         assert budget_checks[0].details["budget_type"] == "worker_unavailable"
 
+    def test_unavailable_sandbox_worker_fails_closed_for_static_sandbox_risk(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "dunder.jinja"
+        template_file.write_text("{{ messages.__class__ }}", encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner()
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        budget_checks = [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+        assert len(budget_checks) == 1
+        assert budget_checks[0].details["budget_type"] == "worker_unavailable"
+        assert not [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+
+    def test_sandbox_worker_memory_limit_skips_unknown_virtual_baseline(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls: list[tuple[int, tuple[int, int]]] = []
+
+        class FakeResource:
+            RLIMIT_AS = 1
+            RLIM_INFINITY = -1
+
+            def getrlimit(self, _limit_id: int) -> tuple[int, int]:
+                return (-1, self.RLIM_INFINITY)
+
+            def setrlimit(self, limit_id: int, limits: tuple[int, int]) -> None:
+                calls.append((limit_id, limits))
+
+        monkeypatch.setattr(jinja2_template_scanner, "HAS_RESOURCE_LIMITS", True)
+        monkeypatch.setattr(jinja2_template_scanner, "resource", FakeResource())
+        monkeypatch.setattr(jinja2_template_scanner, "_current_process_virtual_memory_bytes", lambda: None)
+
+        jinja2_template_scanner._limit_sandbox_worker_memory(1024)
+
+        assert calls == []
+
     def test_path_traversal_suppression_does_not_hide_object_traversal_ssti(self, tmp_path: Path) -> None:
         tokenizer_file = tmp_path / "tokenizer_config.json"
         tokenizer_file.write_text(
