@@ -36,6 +36,7 @@ PYTHON_LITERAL_JOINED_FRAGMENT_RE: Final[str] = (
     rf"(?:(?:\s+|\s*\+\s*|\s*%\s*\(?\s*){PYTHON_STRING_LITERAL_FRAGMENT_RE}\s*\)?)"
 )
 PYTHON_RESIDUAL_LITERAL_OPERATOR_RE: Final[str] = r"(?:[\(\.,+*/%]|\b(?:or|and|if|else)\b)"
+QUOTED_KEY_CONTENT_PATTERN: Final[str] = rf"(?:[^\\\"']|\\[\s\S]){{0,{MAX_KEY_EXPRESSION_CHARS}}}"
 SERIALIZED_BACKSLASH_ESCAPE_TOKEN: Final[str] = (
     r"\\+(?:u+005c|x5c|134|U0000005c|u\{0*5c\}|N\{(?:reverse solidus|backslash)\})"
 )
@@ -95,9 +96,9 @@ AUTHORIZATION_SCHEME_PATTERN: Final[str] = r"(?:[a-z0-9!#$%&'*+.^_`|~-]+\s+)?"
 SENSITIVE_ASSIGNMENT_KEY_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)^{SENSITIVE_ASSIGNMENT_KEY}$")
 AUTHORIZATION_KEY_RE: Final[re.Pattern[str]] = re.compile(r"(?i)^authorization$")
 QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)(\\*)([\"'])((?:\\.|[^\"'])*)\1\2\s*{ASSIGNMENT_SEPARATOR}\s*"
+    rf"(?i)(\\*)([\"'])({QUOTED_KEY_CONTENT_PATTERN})\1\2\s*{ASSIGNMENT_SEPARATOR}\s*"
 )
-KEY_LITERAL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\\*)([\"'])((?:\\.|[^\"'])*)\1\2")
+KEY_LITERAL_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)(\\*)([\"'])({QUOTED_KEY_CONTENT_PATTERN})\1\2")
 COMPOSED_QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)((?:{PYTHON_STRING_LITERAL_FRAGMENT_RE}(?:\s*\+\s*|\s+))+{PYTHON_STRING_LITERAL_FRAGMENT_RE})"
     rf"\s*{ASSIGNMENT_SEPARATOR}\s*"
