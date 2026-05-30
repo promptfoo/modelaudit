@@ -1633,6 +1633,33 @@ class TestJITScriptDetector:
 
         assert len(windows) <= 3 + (2 * jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
 
+    def test_embedded_python_middle_priority_probe_is_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 64)
+        monkeypatch.setattr(jit_script_module, "_MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES", 32)
+        original_priority_import_offsets = jit_script_module._priority_import_offsets
+        inspected_lengths: list[int] = []
+
+        def recording_priority_import_offsets(bounded: bytes) -> list[int]:
+            inspected_lengths.append(len(bounded))
+            return original_priority_import_offsets(bounded)
+
+        monkeypatch.setattr(jit_script_module, "_priority_import_offsets", recording_priority_import_offsets)
+        data = (
+            b"\x00\xffdef prefix():\n    return 1\n"
+            + b"# middle\n" * 40
+            + b"import runpy as rp\n"
+            + b"# more middle\n" * 40
+            + b"def payload():\n    return rp.run_path('payload.py')\n"
+        )
+
+        windows = jit_script_module._embedded_python_extraction_windows(data)
+
+        assert windows
+        assert len(data) > 2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES
+        assert inspected_lengths
+        assert max(inspected_lengths) < len(data)
+        assert max(inspected_lengths) <= 2 * jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES
+
     def test_scan_model_reports_incomplete_coverage_for_middle_window_omission(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1643,6 +1670,24 @@ class TestJITScriptDetector:
         tail = b"# tail\n" * 80 + b"\x00\xffdef postlude():\n    return 2\n"
 
         findings = detector.scan_model(prefix + hidden_middle + tail, "pytorch", "payload.bin")
+
+        incomplete = [finding for finding in findings if finding.type == "analysis_incomplete"]
+        assert len(incomplete) == 1
+        assert incomplete[0].details["scan_outcome_reason"] == (
+            jit_script_module.JIT_EMBEDDED_PYTHON_WINDOW_TRUNCATION_REASON
+        )
+        assert incomplete[0].details["omitted_bytes"] > 0
+        assert not any(finding.severity == "CRITICAL" for finding in findings)
+
+    def test_scan_model_reports_incomplete_when_only_middle_has_framed_python(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        detector = JITScriptDetector()
+        monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 64)
+        hidden_middle = b"\x00\xffdef payload():\n    return eval('1+1')\n"
+        data = (b"A" * 64) + hidden_middle + (b"B" * 64)
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
 
         incomplete = [finding for finding in findings if finding.type == "analysis_incomplete"]
         assert len(incomplete) == 1
@@ -1693,6 +1738,42 @@ class TestJITScriptDetector:
 
         assert any(finding.type == "analysis_incomplete" for finding in findings)
         assert not any(finding.severity in {"CRITICAL", "WARNING"} for finding in findings)
+
+    def test_scan_model_does_not_mark_onnx_marker_noise_incomplete(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        detector = JITScriptDetector()
+        monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 128)
+        marker_noise = b"\x00\xffdef benign_weight_marker():\n    opened = 1\n    return opened\n"
+        data = b"ONNX" + b"\x00" * 160 + marker_noise + b"\x00" * 160
+
+        findings = detector.scan_model(data, "onnx", "model.onnx")
+
+        assert not any(finding.type == "analysis_incomplete" for finding in findings)
+        assert not any(finding.severity == "CRITICAL" for finding in findings)
+
+    def test_scan_model_does_not_flag_builtin_substring_inside_identifier(self) -> None:
+        detector = JITScriptDetector()
+        data = b"\x00\xffdef benign_weight_marker():\n    opened = 1\n    file_count = opened\n    return file_count\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+        assert not any(finding.severity == "CRITICAL" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"\x00\xffdef benign(stream):\n    return stream.open('x')\n",
+            b"\x00\xffdef benign():\n    return 'open'\n",
+        ],
+    )
+    def test_scan_model_does_not_flag_method_or_literal_as_builtin_call(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+        assert not any(finding.type == "ast_dangerous_call" for finding in findings)
+        assert not any(finding.severity == "CRITICAL" for finding in findings)
 
     def test_scan_model_carries_prefix_alias_shadowing_into_tail_context(self) -> None:
         detector = JITScriptDetector()

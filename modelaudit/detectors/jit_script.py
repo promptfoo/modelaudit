@@ -1105,6 +1105,24 @@ def _embedded_python_middle_bytes_omitted(data: bytes) -> bool:
     return len(data) > 2 * _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES
 
 
+def _bounded_middle_priority_import_offsets(data: bytes) -> list[int]:
+    if not _embedded_python_middle_bytes_omitted(data):
+        return []
+    omitted_start = _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES
+    omitted_end = len(data) - _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES
+    probe_bytes = 2 * _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES
+    probe_ranges = [
+        (omitted_start, min(omitted_end, omitted_start + probe_bytes)),
+        (max(omitted_start, omitted_end - probe_bytes), omitted_end),
+    ]
+    offsets: list[int] = []
+    for start, end in dict.fromkeys(probe_ranges):
+        if end <= start:
+            continue
+        offsets.extend(start + offset for offset in _priority_import_offsets(data[start:end]))
+    return offsets
+
+
 def _python_structural_line_bytes(line: bytes) -> bytes:
     structural = bytearray()
     quote_marker: bytes | None = None
@@ -1449,10 +1467,10 @@ def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]
     if _embedded_python_middle_bytes_omitted(data):
         omitted_start = len(prefix)
         omitted_end = len(data) - len(tail)
-        middle_priority_offsets = [
-            offset for offset in _priority_import_offsets(data) if omitted_start <= offset < omitted_end
-        ]
+        middle_priority_offsets = _bounded_middle_priority_import_offsets(data)
         for priority_offset in _bounded_priority_tail_starts(middle_priority_offsets):
+            if not omitted_start <= priority_offset < omitted_end:
+                continue
             context_start = max(omitted_start, priority_offset - _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES)
             context_end = min(omitted_end, priority_offset + _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES)
             middle_context = _extract_priority_prefix_context(data[context_start:context_end])
@@ -1652,6 +1670,20 @@ class JITScriptDetector:
         return False
 
     @staticmethod
+    def _has_parseable_framed_python_source(data: bytes) -> bool:
+        """Return whether bounded embedded-Python windows contain parseable source."""
+        if not any(marker in data for marker in _EMBEDDED_PYTHON_START_MARKERS):
+            return False
+        for window, include_full_source in _embedded_python_extraction_windows(data):
+            for candidate, _span, _real_ranges in _candidate_embedded_python_snippets(
+                window, include_full_source=include_full_source
+            ):
+                code_str, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
+                if _parse_embedded_python_snippet(code_str) is not None:
+                    return True
+        return False
+
+    @staticmethod
     def _ast_contains_dangerous_python(tree: ast.AST) -> bool:
         """Return whether parsed Python contains modeled dangerous operations."""
         if _resolve_alias_aware_high_risk_calls(tree):
@@ -1708,6 +1740,14 @@ class JITScriptDetector:
         patterns = _DANGEROUS_IMPORT_PATTERNS.get(dangerous_import)
         import_pattern, from_pattern = patterns or _compile_dangerous_import_patterns(dangerous_import)
         return import_pattern.search(source) is not None or from_pattern.search(source) is not None
+
+    @staticmethod
+    def _dangerous_builtin_calls_in_tree(tree: ast.AST) -> set[str]:
+        builtins: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in DANGEROUS_BUILTINS:
+                builtins.add(node.func.id)
+        return builtins
 
     @staticmethod
     def _dangerous_imports_in_tree(tree: ast.AST) -> set[str]:
@@ -2054,6 +2094,9 @@ class JITScriptDetector:
                 parsed_imports = (
                     self._dangerous_imports_in_tree(parsed_snippet[0]) if parsed_snippet is not None else None
                 )
+                parsed_builtin_calls = (
+                    self._dangerous_builtin_calls_in_tree(parsed_snippet[0]) if parsed_snippet is not None else None
+                )
                 # Check for dangerous imports
                 for dangerous_import in DANGEROUS_IMPORTS:
                     if self._contains_dangerous_import(code_str, dangerous_import) and (
@@ -2078,7 +2121,12 @@ class JITScriptDetector:
 
                 # Check for dangerous builtins
                 for builtin in DANGEROUS_BUILTINS:
-                    if builtin in code_str:
+                    has_builtin_call = (
+                        builtin in parsed_builtin_calls
+                        if parsed_builtin_calls is not None
+                        else re.search(rf"(?<![.\w]){re.escape(builtin)}\s*\(", code_str) is not None
+                    )
+                    if has_builtin_call:
                         findings.append(
                             create_jit_finding(
                                 message=f"Dangerous builtin '{builtin}' used in embedded code",
@@ -2531,7 +2579,16 @@ class JITScriptDetector:
             findings.extend(self.scan_tensorflow(data, context))
             findings.extend(self.scan_onnx(data, context))
 
-        has_embedded_python_markers = any(marker in data for marker in _EMBEDDED_PYTHON_START_MARKERS)
+        trusted_embedded_python_model = model_type in {"pytorch", "torchscript", "pickle"}
+        should_probe_embedded_python_coverage = trusted_embedded_python_model or model_type == "unknown"
+        has_parseable_framed_python_source = (
+            should_probe_embedded_python_coverage and self._has_parseable_framed_python_source(data)
+        )
+        has_trusted_omitted_python_marker = (
+            trusted_embedded_python_model
+            and _embedded_python_middle_bytes_omitted(data)
+            and any(marker in data for marker in _EMBEDDED_PYTHON_START_MARKERS)
+        )
         if self._looks_like_dangerous_python_source(data):
             findings.extend(
                 self._extract_and_check_python_code(
@@ -2541,7 +2598,7 @@ class JITScriptDetector:
                     include_full_source=True,
                 )
             )
-        elif has_embedded_python_markers:
+        elif has_parseable_framed_python_source or has_trusted_omitted_python_marker:
             if _embedded_python_middle_bytes_omitted(data):
                 findings.append(
                     _create_embedded_python_analysis_incomplete_finding(

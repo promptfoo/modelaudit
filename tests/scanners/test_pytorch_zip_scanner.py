@@ -1262,6 +1262,28 @@ def test_pytorch_zip_jit_internal_window_truncation_marks_inconclusive(
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_pytorch_zip_jit_hidden_middle_only_source_marks_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 64)
+    hidden_middle = b"\x00\xffdef payload():\n    return eval('1+1')\n"
+    model_path = _create_pytorch_zip_with_jit_source(
+        tmp_path / "hidden_middle_only.pt",
+        (b"A" * 64) + hidden_middle + (b"B" * 64),
+        member_name="archive/code/debug/source",
+    )
+
+    result = PyTorchZipScanner().scan(str(model_path))
+    aggregate = scan_model_directory_or_file(str(model_path), cache_enabled=False, scanners=["pytorch_zip"])
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert jit_script_module.JIT_EMBEDDED_PYTHON_WINDOW_TRUNCATION_REASON in result.metadata["scan_outcome_reasons"]
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert determine_exit_code(aggregate) == 2
+
+
 def test_pytorch_zip_jit_internal_snippet_budget_marks_inconclusive(tmp_path: Path) -> None:
     leading_blocks = b"".join(
         f"def benign_{index}():\n    return {index}\n}}\x00".encode()

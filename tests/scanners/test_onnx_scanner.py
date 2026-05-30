@@ -14,6 +14,7 @@ from onnx.onnx_ml_pb2 import StringStringEntryProto
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.detectors import jit_script as jit_script_module
 from modelaudit.detectors.jit_script import JITScriptDetector
 from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
@@ -835,6 +836,27 @@ def test_onnx_scanner_pyop_bytes_in_weight_data_not_flagged(tmp_path: Path) -> N
 
     assert result.success is True
     assert _python_operator_issues(result) == []
+
+
+def test_onnx_scanner_python_marker_bytes_in_weight_data_not_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Raw tensor bytes that resemble framed Python are not treated as JIT coverage gaps."""
+    monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 128)
+    weight_bytes = (
+        b"\x00" * 160 + b"\x00\xffdef benign_weight_marker():\n    opened = 1\n    return opened\n" + b"\x00" * 160
+    )
+    model_path = _save_model_with_int8_weight(tmp_path, weight_bytes)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert "analysis_incomplete" not in result.metadata
+    assert jit_script_module.JIT_EMBEDDED_PYTHON_WINDOW_TRUNCATION_REASON not in result.metadata.get(
+        "scan_outcome_reasons", []
+    )
+    assert not [check for check in result.checks if check.name == "JIT/Script Analysis Incomplete"]
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_onnx_scanner_real_pyop_node_still_flagged_despite_weight_bytes(tmp_path: Path) -> None:
