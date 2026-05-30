@@ -1138,6 +1138,22 @@ def test_sensitive_command_assignment_preserves_command_evidence() -> None:
     assert redacted.count("os.system") >= 5
 
 
+def test_sensitive_command_assignment_redacts_low_entropy_tails() -> None:
+    """Command-valued sensitive assignments should not leak adjacent low-entropy values."""
+    text = (
+        'client_secret=os.system("id") + hunter2; '
+        'client_secret=os.system("id") hunter2; '
+        'client_secret=("safe", os.system("id"))'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert "safe" not in redacted
+    assert 'os.system("id")' in redacted
+    assert f'os.system("id") + {REDACTED_EVIDENCE_VALUE}' in redacted
+
+
 def test_command_context_literals_redact_credential_arguments() -> None:
     """Command-preserving evidence should still redact credential-bearing arguments."""
     cases = [

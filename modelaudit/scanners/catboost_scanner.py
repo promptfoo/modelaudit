@@ -148,7 +148,8 @@ def _redact_urls_for_display(text: str) -> str:
 
 def _redact_evidence_for_display(text: str, max_chars: int = 160) -> str:
     text = _redact_reversible_base64_evidence(text)
-    text = redact_evidence_string(_redact_urls_for_display(text), max_chars=max_chars)
+    text = _redact_standalone_secret_tokens(_redact_urls_for_display(text))
+    text = redact_evidence_string(text, max_chars=max_chars)
     return _redact_standalone_secret_tokens(text)
 
 

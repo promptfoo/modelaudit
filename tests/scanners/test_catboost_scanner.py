@@ -1344,6 +1344,8 @@ def test_catboost_sarif_preserves_process_context_while_redacting_command_expres
 
 
 def test_catboost_sarif_reports_sanitized_decoded_encoded_payload_evidence(tmp_path: Path) -> None:
+    boundary_secret = "sk-boundarysecret1234567890"
+    boundary_payload = f'os.system("id"); {"P" * 130} {boundary_secret}'
     base64_raw = (
         'os.system("id"); client_secret=CATBOOST_B64_RAW_SECRET_123456; https://collector.evil.example/upload'
     ).ljust(90, "A")
@@ -1362,6 +1364,7 @@ def test_catboost_sarif_reports_sanitized_decoded_encoded_payload_evidence(tmp_p
     model_path.write_bytes(
         _build_cbm(
             [
+                boundary_payload,
                 base64_payload,
                 hex_payload,
                 url_payload,
@@ -1382,6 +1385,7 @@ def test_catboost_sarif_reports_sanitized_decoded_encoded_payload_evidence(tmp_p
     assert "adjacentpass9" not in failed_details
     assert "urlpass9" not in failed_details
     assert "sk-standalone-secret" not in failed_details
+    assert "sk-boundary" not in failed_details
     assert base64_payload not in failed_details
     assert hex_payload not in failed_details
     assert url_payload not in failed_details
@@ -1393,6 +1397,7 @@ def test_catboost_sarif_reports_sanitized_decoded_encoded_payload_evidence(tmp_p
     assert "adjacentpass9" not in sarif
     assert "urlpass9" not in sarif
     assert "sk-standalone-secret" not in sarif
+    assert "sk-boundary" not in sarif
     assert base64_payload not in sarif
     assert hex_payload not in sarif
     assert url_payload not in sarif

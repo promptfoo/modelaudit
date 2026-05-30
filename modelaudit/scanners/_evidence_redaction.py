@@ -138,6 +138,9 @@ COMMAND_LITERAL_SENSITIVE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(?<![-/\w.])(?![-/])[A-Za-z0-9_.+/=-]*(?:api[_-]?key|client[_-]?secret|credential|password|passwd|"
     r"private[_-]?key|secret|signature|token)[A-Za-z0-9_.+/=-]*(?![/\w.-])"
 )
+COMMAND_SENSITIVE_VALUE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![<\w.])[A-Za-z0-9][A-Za-z0-9_@./:=+-]{2,}(?![>\w.])"
+)
 COMMAND_SECRET_OPTION_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)((?<!\w)--(?:password|passwd|pass|proxy-password|client[_-]?secret|api[_-]?key|token|secret)"
     r"(?:=|\s+))(?:\"[^\"]*\"|'[^']*'|[^\s\"';&|)]+)"
@@ -1517,10 +1520,7 @@ def _redact_sensitive_literal_expressions(text: str) -> str:
         segment = text[match.end() : segment_end]
         pieces.append(text[cursor : match.start()])
         if COMMAND_EVIDENCE_RE.search(segment):
-            pieces.append(
-                f"{text[match.start() : match.end()]}"
-                f"{_redact_command_evidence_text(_redact_command_string_literals(segment))}"
-            )
+            pieces.append(f"{text[match.start() : match.end()]}{_redact_sensitive_command_value(segment)}")
         elif PYTHON_STRING_LITERAL_DETECT_RE.search(segment):
             trailing_whitespace = re.search(r"\s*$", segment)
             suffix = trailing_whitespace.group(0) if trailing_whitespace else ""
@@ -1590,7 +1590,7 @@ def _redact_residual_expression_literals(text: str) -> str:
 def _redact_unquoted_sensitive_assignment(match: re.Match[str]) -> str:
     value = match.group(3)
     if COMMAND_EVIDENCE_RE.search(value):
-        return f"{match.group(1)}{_redact_command_evidence_text(_redact_command_string_literals(value))}"
+        return f"{match.group(1)}{_redact_sensitive_command_value(value)}"
     trailing_whitespace = re.search(r"\s*$", value)
     suffix = trailing_whitespace.group(0) if trailing_whitespace else ""
     return f"{match.group(1)}{REDACTED_EVIDENCE_VALUE}{suffix}"
@@ -1609,6 +1609,94 @@ def _redact_bare_authorization_value(match: re.Match[str]) -> str:
 
 def _redact_command_user_password(match: re.Match[str]) -> str:
     return f"{match.group(1)}{match.group(2)}{match.group(3)}{REDACTED_EVIDENCE_VALUE}{match.group(5)}"
+
+
+def _find_command_context_end(text: str, start: int) -> int:
+    quote: str | None = None
+    quote_slashes = 0
+    triple = False
+    bracket_depth = 0
+    closed_top_level_call = False
+    index = start
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            current_slashes = _count_preceding_backslashes(text, index) if char == quote else -1
+            closes_plain_quote = quote_slashes == 0 and current_slashes % 2 == 0
+            closes_serialized_quote = quote_slashes > 0 and current_slashes == quote_slashes
+            if triple and text.startswith(quote * 3, index) and (closes_plain_quote or closes_serialized_quote):
+                quote = None
+                quote_slashes = 0
+                triple = False
+                index += 3
+            elif not triple and char == quote and (closes_plain_quote or closes_serialized_quote):
+                quote = None
+                quote_slashes = 0
+                index += 1
+            else:
+                index += 1
+            continue
+
+        if char in {"'", '"'}:
+            quote = char
+            quote_slashes = _count_preceding_backslashes(text, index)
+            triple = text.startswith(char * 3, index)
+            index += 3 if triple else 1
+            continue
+        if bracket_depth == 0 and index > start:
+            if char in {",", ";", "|", "\n", ")", "]", "}"}:
+                return index
+            if closed_top_level_call and (char.isspace() or char in {"+", "-", "*", "/", "%"}):
+                return index
+        if char in "([{":
+            bracket_depth += 1
+        elif char in ")]}":
+            if bracket_depth == 0:
+                return index
+            bracket_depth -= 1
+            if bracket_depth == 0:
+                closed_top_level_call = True
+        index += 1
+    return len(text)
+
+
+def _command_context_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for match in COMMAND_EVIDENCE_RE.finditer(text):
+        end = _find_command_context_end(text, match.start()) if "(" in match.group(0) else match.end()
+        if spans and match.start() <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], end))
+        else:
+            spans.append((match.start(), end))
+    return spans
+
+
+def _redact_sensitive_command_value_chunk(text: str) -> str:
+    markers = f"({re.escape(REDACTED_EVIDENCE_VALUE)}|{re.escape(REDACTED_URL_CREDENTIALS)})"
+    parts = re.split(markers, text)
+    redacted_parts = [
+        part
+        if part in {REDACTED_EVIDENCE_VALUE, REDACTED_URL_CREDENTIALS}
+        else COMMAND_SENSITIVE_VALUE_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, part)
+        for part in parts
+    ]
+    return "".join(redacted_parts)
+
+
+def _redact_non_command_sensitive_value_tokens(text: str) -> str:
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in _command_context_spans(text):
+        pieces.append(_redact_sensitive_command_value_chunk(text[cursor:start]))
+        pieces.append(text[start:end])
+        cursor = end
+    pieces.append(_redact_sensitive_command_value_chunk(text[cursor:]))
+    return "".join(pieces)
+
+
+def _redact_sensitive_command_value(text: str) -> str:
+    redacted = _redact_command_evidence_text(_redact_command_string_literals(text))
+    return _redact_non_command_sensitive_value_tokens(redacted)
 
 
 def _redact_command_string_literals(text: str) -> str:
