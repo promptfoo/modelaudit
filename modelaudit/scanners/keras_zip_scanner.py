@@ -1969,24 +1969,26 @@ class KerasZipScanner(BaseScanner):
 
     @staticmethod
     def _is_vulnerable_to_cve_2024_3660(version: str) -> bool:
-        """Return True for Keras versions lower than 2.13.0.
+        """Return True for Keras versions lower than 2.13.0, including prereleases of 2.13.0.
 
         Handles two-part versions (e.g. "2.10") by treating missing patch as 0.
         """
-        parts = version.split(".", 2)
-        if len(parts) < 2:
+        version_match = _KERAS_RELEASE_VERSION_PATTERN.match(version)
+        if not version_match:
             return False
+
         try:
-            major = int(parts[0])
-            minor = int(parts[1])
-            patch = 0
-            if len(parts) == 3:
-                patch_digits = "".join(ch for ch in parts[2] if ch.isdigit())
-                if patch_digits:
-                    patch = int(patch_digits)
-            return (major, minor, patch) < (2, 13, 0)
+            major = int(version_match.group(1))
+            minor = int(version_match.group(2))
+            patch = int(version_match.group(3) or 0)
         except ValueError:
             return False
+
+        suffix = (version_match.group(4) or "").strip().lower()
+        public_suffix = suffix.lstrip("._-")
+        is_prerelease = not suffix.startswith("+") and bool(_KERAS_PRERELEASE_SUFFIX_PATTERN.match(public_suffix))
+        parsed = (major, minor, patch)
+        return parsed < (2, 13, 0) or (parsed == (2, 13, 0) and is_prerelease)
 
     @staticmethod
     def _is_vulnerable_to_cve_2025_12058(version: str) -> bool:
