@@ -886,18 +886,22 @@ class TestNetworkCommDetector:
         """Surrounding snippets should not leak non-URL credentials near network calls."""
         detector = NetworkCommDetector()
         data = (
-            b'requests.get("https://example.com/model.bin") '
-            b"api_key=NETWORK_ADJACENT_SECRET Authorization: Bearer NETWORK_BEARER_SECRET"
+            b"requests.get(1) "
+            b'json={"api_key": "JSONSECRET123"} '
+            b"api_key=ADJACENTSECRET123 Authorization: Bearer BEARERSECRET123"
         )
 
         findings = detector.scan(data, "hook.py")
         network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+        snippet = str(network_finding["snippet"])
         serialized = json.dumps(network_finding, sort_keys=True)
 
-        assert "NETWORK_ADJACENT_SECRET" not in serialized
-        assert "NETWORK_BEARER_SECRET" not in serialized
+        assert "ADJACENTSECRET123" not in serialized
+        assert "BEARERSECRET123" not in serialized
+        assert "JSONSECRET123" not in serialized
         assert "api_key=<redacted>" in serialized
         assert "Authorization: Bearer <redacted>" in serialized
+        assert '"api_key": "<redacted>"' in snippet
 
     def test_network_function_snippets_expand_forward_urls_before_redaction(self) -> None:
         """Long URL tails after the function token should be included before URL redaction."""

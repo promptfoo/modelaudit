@@ -24,6 +24,19 @@ def test_redacts_compound_credential_assignments() -> None:
     assert f"service-private-key={REDACTED_EVIDENCE_VALUE}" in redacted
 
 
+def test_redacts_quoted_key_credential_values() -> None:
+    """JSON and Python dict style credential keys should not preserve raw values."""
+    text = 'json={"api_key": "JSONSECRET123", "safe": "value"} config={\'client_secret\': \'PYSECRET456\'}'
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "JSONSECRET123" not in redacted
+    assert "PYSECRET456" not in redacted
+    assert f'"api_key": "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f"'client_secret': '{REDACTED_EVIDENCE_VALUE}'" in redacted
+    assert '"safe": "value"' in redacted
+
+
 def test_redacts_compound_sensitive_query_parameters() -> None:
     """Compound query credential keys should be redacted in URL evidence."""
     text = "url=https://example.com/callback?client_secret=CLIENTSECRET123&refresh_token=REFRESHTOKEN456&ok=1"
