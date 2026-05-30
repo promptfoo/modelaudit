@@ -915,6 +915,14 @@ class KerasH5Scanner(BaseScanner):
         module_name = layer_config.get("module")
         function_name = layer_config.get("function_name")
 
+        if isinstance(function_str, dict) and check_lambda_dict_function(
+            function_str,
+            result,
+            self.current_file_path,
+            layer_config.get("name", "lambda"),
+        ):
+            return
+
         # Check if there's actual Python code to validate
         if function_str and isinstance(function_str, str):
             # First check if it matches safe patterns
@@ -1019,9 +1027,6 @@ class KerasH5Scanner(BaseScanner):
                     },
                     rule_code=None,  # Passing check
                 )
-        elif isinstance(function_str, dict):
-            # Keras 3.x dict-format Lambda: {"class_name": "__lambda__", "config": {"code": ...}}
-            check_lambda_dict_function(function_str, result, self.current_file_path, layer_config.get("name", "lambda"))
         # Don't flag Lambda layers without code - they might just be placeholders
 
     @staticmethod
