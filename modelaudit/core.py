@@ -640,6 +640,23 @@ def _should_defer_hash_for_safetensors_header_limit(file_path: str, config: dict
     return should_defer_safetensors_header_limit_hash(file_path, max_header_bytes)
 
 
+def _should_defer_hash_for_max_file_size(file_path: str, config: dict[str, Any]) -> bool:
+    """Avoid hashing files that regular scanning will reject on max_file_size."""
+    try:
+        max_file_size = int(config.get("max_file_size", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if max_file_size <= 0:
+        return False
+
+    try:
+        file_size = os.path.getsize(file_path)
+    except OSError:
+        return False
+
+    return file_size > max_file_size and not should_use_advanced_handler(file_path)
+
+
 def _hash_files_by_path(file_paths: list[str], *, config: dict[str, Any] | None = None) -> dict[str, str]:
     """Hash files individually so scan results stay path-specific.
 
@@ -655,8 +672,12 @@ def _hash_files_by_path(file_paths: list[str], *, config: dict[str, Any] | None 
     hashes_by_inode: dict[tuple[int, int, int, int], str] = {}
 
     for file_path in file_paths:
-        if _should_defer_hash_for_safetensors_header_limit(file_path, config or {}):
+        hash_config = config or {}
+        if _should_defer_hash_for_safetensors_header_limit(file_path, hash_config):
             content_hashes[file_path] = f"unhashable_bounded_safetensors_{id(file_path)}"
+            continue
+        if _should_defer_hash_for_max_file_size(file_path, hash_config):
+            content_hashes[file_path] = f"unhashable_max_file_size_{id(file_path)}"
             continue
         try:
             inode_key: tuple[int, int, int, int] | None = None

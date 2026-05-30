@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.core import scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 
 
@@ -267,6 +267,40 @@ class TestHashGenerationEdgeCases:
 
         assert content_hashes[str(source)] == content_hashes[str(linked_path)]
         assert hashed_paths == [str(source)]
+
+    def test_directory_scan_does_not_hash_files_over_max_file_size(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Directory hash prepass should not read files regular scanning will reject."""
+        from modelaudit import core
+
+        oversized = tmp_path / "oversized.pkl"
+        oversized.write_bytes(b"X" * 128)
+        small = tmp_path / "small.pkl"
+        small.write_bytes(pickle.dumps({"safe": True}))
+
+        original_hash = core._calculate_file_hash
+        hashed_paths: list[str] = []
+
+        def fail_if_oversized_hashed(path: str) -> str:
+            hashed_paths.append(path)
+            if path == str(oversized):
+                raise AssertionError("oversized file was hashed before max_file_size rejection")
+            return original_hash(path)
+
+        monkeypatch.setattr(core, "_calculate_file_hash", fail_if_oversized_hashed)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            max_file_size=64,
+            cache_scan_results=False,
+        )
+
+        assert str(oversized) not in hashed_paths
+        assert str(small) in hashed_paths
+        assert determine_exit_code(result) == 2
+        assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
+        assert result.has_errors is True
 
     def test_unhashable_files_excluded_from_hash(self, tmp_path, monkeypatch):
         """Test that files failing to hash are excluded from aggregate hash."""
