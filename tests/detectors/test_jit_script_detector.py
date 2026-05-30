@@ -1633,6 +1633,67 @@ class TestJITScriptDetector:
 
         assert len(windows) <= 3 + (2 * jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
 
+    def test_scan_model_reports_incomplete_coverage_for_middle_window_omission(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        detector = JITScriptDetector()
+        monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 256)
+        prefix = b"\x00\xffdef prelude():\n    return 1\n" + b"# prefix\n" * 80
+        hidden_middle = b"\x00\xffdef payload():\n    sink = eval\n    return sink('1+1')\n"
+        tail = b"# tail\n" * 80 + b"\x00\xffdef postlude():\n    return 2\n"
+
+        findings = detector.scan_model(prefix + hidden_middle + tail, "pytorch", "payload.bin")
+
+        incomplete = [finding for finding in findings if finding.type == "analysis_incomplete"]
+        assert len(incomplete) == 1
+        assert incomplete[0].details["scan_outcome_reason"] == (
+            jit_script_module.JIT_EMBEDDED_PYTHON_WINDOW_TRUNCATION_REASON
+        )
+        assert incomplete[0].details["omitted_bytes"] > 0
+        assert not any(finding.severity == "CRITICAL" for finding in findings)
+
+    def test_scan_model_reports_incomplete_coverage_when_snippet_budget_drops_candidates(self) -> None:
+        detector = JITScriptDetector()
+        leading_blocks = b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+        hidden_payload = b"def payload():\n    sink = eval\n    return sink('1+1')\n"
+        source = b"\x00\xff" + leading_blocks + hidden_payload
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        incomplete = [finding for finding in findings if finding.type == "analysis_incomplete"]
+        assert len(incomplete) == 1
+        assert incomplete[0].details["scan_outcome_reason"] == (
+            jit_script_module.JIT_EMBEDDED_PYTHON_SNIPPET_BUDGET_REASON
+        )
+        assert incomplete[0].details["candidate_count"] > incomplete[0].details["selected_candidate_count"]
+        assert not any(finding.severity == "CRITICAL" for finding in findings)
+
+    def test_scan_model_benign_within_budget_stays_clean(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xff" + b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_benign_over_budget_is_incomplete_without_security_finding(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00\xff" + b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(finding.type == "analysis_incomplete" for finding in findings)
+        assert not any(finding.severity in {"CRITICAL", "WARNING"} for finding in findings)
+
     def test_scan_model_carries_prefix_alias_shadowing_into_tail_context(self) -> None:
         detector = JITScriptDetector()
         prefix = b"\x00\xffclass Safe:\n    run_path = len\nimport runpy as rp\nrp = Safe()\n" + b"# prefix\n" * 1024

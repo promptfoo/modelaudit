@@ -16,11 +16,13 @@ from ..scanner_results import (
     INCONCLUSIVE_SCAN_OUTCOME,
     OPERATIONAL_ERROR_METADATA_KEY,
     SCAN_OUTCOME_METADATA_KEY,
+    SCAN_OUTCOME_REASONS_METADATA_KEY,
     Check,
     CheckStatus,
     Issue,
     IssueSeverity,
     ScanResult,
+    mark_inconclusive_scan_result,
 )
 from ..utils.helpers.interrupt_handler import check_interrupted
 from .rule_mapper import get_embedded_code_rule_code, get_network_rule_code, get_secret_rule_code
@@ -115,6 +117,7 @@ _WHITELIST_DOWNGRADE_EXEMPT_KEYWORD_PATTERN: Final[re.Pattern[str]] = re.compile
     r")\b",
     re.IGNORECASE,
 )
+JIT_SCRIPT_ANALYSIS_INCOMPLETE_CHECK_NAME: Final[str] = "JIT/Script Analysis Incomplete"
 DEFAULT_MAX_FILE_READ_SIZE: Final[int] = 512 * 1024 * 1024
 DEFAULT_READ_CHUNK_SIZE: Final[int] = 8 * 1024 * 1024
 
@@ -796,9 +799,13 @@ class BaseScanner(ABC):
         """Emit explicit JIT/Script checks from detector findings and return the count."""
         severity_map = {
             "CRITICAL": IssueSeverity.CRITICAL,
+            "HIGH": IssueSeverity.CRITICAL,
             "WARNING": IssueSeverity.WARNING,
             "INFO": IssueSeverity.INFO,
         }
+
+        incomplete_entries: list[dict[str, Any]] = []
+        incomplete_reasons: list[str] = []
 
         for finding in findings:
             # Handle both dict and Pydantic model findings.
@@ -823,6 +830,23 @@ class BaseScanner(ABC):
                 recommendation = getattr(finding, "recommendation", "Review JIT/Script code for security")
                 details = finding.__dict__ if hasattr(finding, "__dict__") else {"object": str(finding)}
 
+            detector_details = details.get("details") if isinstance(details.get("details"), dict) else {}
+            if details.get("type") == "analysis_incomplete" or detector_details.get("analysis_incomplete") is True:
+                reason = detector_details.get("scan_outcome_reason")
+                if not isinstance(reason, str) or not reason:
+                    reason = "jit_script_analysis_incomplete"
+                mark_inconclusive_scan_result(result, reason)
+                if reason not in incomplete_reasons:
+                    incomplete_reasons.append(reason)
+                entry = {
+                    "location": location,
+                    "message": message,
+                    "reason": reason,
+                    **detector_details,
+                }
+                incomplete_entries.append(entry)
+                continue
+
             jit_indicator = f"{details.get('type', '')} {message} {model_type}".strip()
             jit_rule_code = get_embedded_code_rule_code(jit_indicator)
             if not jit_rule_code:
@@ -838,6 +862,27 @@ class BaseScanner(ABC):
                 location=location,
                 details=details,
                 why=recommendation,
+            )
+
+        if incomplete_entries:
+            count = len(incomplete_entries)
+            noun = "limit" if count == 1 else "limits"
+            result.add_check(
+                name=JIT_SCRIPT_ANALYSIS_INCOMPLETE_CHECK_NAME,
+                passed=False,
+                message=f"JIT/script analysis incomplete because detector coverage hit {count} bounded {noun}",
+                severity=IssueSeverity.INFO,
+                location=context or incomplete_entries[0]["location"],
+                details={
+                    "analysis_incomplete": True,
+                    SCAN_OUTCOME_REASONS_METADATA_KEY: incomplete_reasons,
+                    "entries": incomplete_entries,
+                    "incomplete_count": count,
+                },
+                why=(
+                    "The JIT/script detector could not prove full embedded-code coverage within bounded analysis "
+                    "limits."
+                ),
             )
 
         if not findings and context:

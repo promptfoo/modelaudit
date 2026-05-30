@@ -11,6 +11,7 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.detectors import jit_script as jit_script_module
 from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, ScanResult
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
@@ -57,6 +58,20 @@ def _malicious_eval_pickle_payload() -> bytes:
 
 def _malicious_proto0_system_payload() -> bytes:
     return b"cposix\nsystem\n(S'echo hidden'\ntR."
+
+
+def _create_pytorch_zip_with_jit_source(
+    path: Path,
+    source: bytes,
+    *,
+    member_name: str = "archive/code/debug/source.py",
+) -> Path:
+    with zipfile.ZipFile(path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zip_file.writestr(member_name, source)
+    return path
 
 
 def _pytorch_storage_persistent_id_payload(key: str | bytes) -> bytes:
@@ -1220,6 +1235,56 @@ def test_pytorch_zip_jit_scan_read_failure_marks_inconclusive(
     assert details["zip_entries"] == ["archive/code/debug/source.py"]
     assert details["entries"][0]["exception_type"] == "OSError"
     assert details["entries"][0]["exception"] == "member read failed"
+
+
+def test_pytorch_zip_jit_internal_window_truncation_marks_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 256)
+    prefix = b"\x00\xffdef prelude():\n    return 1\n" + b"# prefix\n" * 80
+    hidden_middle = b"\x00\xffdef payload():\n    sink = eval\n    return sink('1+1')\n"
+    tail = b"# tail\n" * 80 + b"\x00\xffdef postlude():\n    return 2\n"
+    model_path = _create_pytorch_zip_with_jit_source(
+        tmp_path / "internal_window_limit.pt", prefix + hidden_middle + tail
+    )
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert jit_script_module.JIT_EMBEDDED_PYTHON_WINDOW_TRUNCATION_REASON in result.metadata["scan_outcome_reasons"]
+    assert "pytorch_zip_jit_member_size_limit" not in result.metadata["scan_outcome_reasons"]
+    incomplete_checks = [check for check in result.checks if check.name == "JIT/Script Analysis Incomplete"]
+    assert len(incomplete_checks) == 1
+    assert incomplete_checks[0].severity == IssueSeverity.INFO
+    assert incomplete_checks[0].details["entries"][0]["omitted_bytes"] > 0
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_pytorch_zip_jit_internal_snippet_budget_marks_inconclusive(tmp_path: Path) -> None:
+    leading_blocks = b"".join(
+        f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+        for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+    )
+    hidden_payload = b"def payload():\n    sink = eval\n    return sink('1+1')\n"
+    model_path = _create_pytorch_zip_with_jit_source(
+        tmp_path / "internal_snippet_limit.pt",
+        b"\x00\xff" + leading_blocks + hidden_payload,
+    )
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert jit_script_module.JIT_EMBEDDED_PYTHON_SNIPPET_BUDGET_REASON in result.metadata["scan_outcome_reasons"]
+    incomplete_checks = [check for check in result.checks if check.name == "JIT/Script Analysis Incomplete"]
+    assert len(incomplete_checks) == 1
+    assert (
+        incomplete_checks[0].details["entries"][0]["candidate_count"]
+        > (incomplete_checks[0].details["entries"][0]["selected_candidate_count"])
+    )
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_pytorch_zip_jit_scan_aggregates_many_oversize_members_into_one_check(
@@ -3316,21 +3381,38 @@ def _assert_pytorch_zip_inconclusive_not_cached(
     *,
     expected_success: bool,
     expected_exit_code: int,
+    scanners: list[str] | None = None,
 ) -> None:
     reset_cache_manager()
     try:
-        first = scan_model_directory_or_file(
-            str(path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        second = scan_model_directory_or_file(
-            str(path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
+        if scanners is None:
+            first = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            second = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+        else:
+            first = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                scanners=scanners,
+            )
+            second = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                scanners=scanners,
+            )
 
         for aggregate in (first, second):
             metadata = aggregate.file_metadata[str(path)]
@@ -3383,6 +3465,54 @@ def test_pytorch_zip_tensor_metadata_truncation_is_exit2_and_not_cached(tmp_path
         expected_success=False,
         expected_exit_code=2,
     )
+
+
+def test_pytorch_zip_jit_internal_benign_truncation_is_exit2_and_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 256)
+    prefix = b"\x00\xffdef prelude():\n    return 1\n" + b"# prefix\n" * 80
+    benign_middle = b"\x00\xffdef middle():\n    return 2\n"
+    tail = b"# tail\n" * 80 + b"\x00\xffdef postlude():\n    return 3\n"
+    zip_path = _create_pytorch_zip_with_jit_source(
+        tmp_path / "benign_internal_truncation.pt",
+        prefix + benign_middle + tail,
+        member_name="archive/code/debug/source",
+    )
+
+    _assert_pytorch_zip_inconclusive_not_cached(
+        zip_path,
+        tmp_path / "jit-internal-truncation-cache",
+        jit_script_module.JIT_EMBEDDED_PYTHON_WINDOW_TRUNCATION_REASON,
+        expected_success=False,
+        expected_exit_code=2,
+        scanners=["pytorch_zip"],
+    )
+
+
+def test_pytorch_zip_visible_jit_finding_preserved_when_coverage_is_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 256)
+    visible_payload = b"\x00\xffdef payload():\n    return eval('1+1')\n"
+    omitted_region = b"# middle\n" * 80
+    tail = b"# tail\n" * 80 + b"\x00\xffdef postlude():\n    return 3\n"
+    zip_path = _create_pytorch_zip_with_jit_source(
+        tmp_path / "finding_plus_incomplete.pt",
+        visible_payload + omitted_region + tail,
+    )
+
+    aggregate = scan_model_directory_or_file(str(zip_path), cache_enabled=False, scanners=["pytorch_zip"])
+    metadata = aggregate.file_metadata[str(zip_path)]
+
+    assert metadata["analysis_incomplete"] is True
+    assert jit_script_module.JIT_EMBEDDED_PYTHON_WINDOW_TRUNCATION_REASON in metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in aggregate.issues
+    )
+    assert determine_exit_code(aggregate) == 1
 
 
 # --- CVE-2022-45907 version check tests ---
