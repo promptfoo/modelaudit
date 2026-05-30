@@ -10,6 +10,7 @@ import struct
 from typing import Any, ClassVar
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
+from ._evidence_redaction import REDACTED_EVIDENCE_VALUE, redact_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 CATBOOST_MAGIC = b"CBM1"
@@ -41,7 +42,9 @@ _SCRIPT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(?:import\s+os|import\s+subprocess|from\s+os\s+import)\b", re.IGNORECASE), "python import block"),
 ]
 _BASE64_PAYLOAD_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{100,}={0,2})")
+_BASE64_EVIDENCE_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9+/])(?:[A-Za-z0-9+/]{24,}={0,2})(?![A-Za-z0-9+/=])")
 _HEX_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2}){8,}")
+_MAX_ENCODED_EVIDENCE_CHARS = 8192
 
 _SUSPICIOUS_NETWORK_KEYWORDS = (
     "webhook",
@@ -72,6 +75,44 @@ _BENIGN_METADATA_KEYS = {
 }
 
 
+def _decode_hex_escape_payload(payload: str) -> str:
+    try:
+        return bytes(int(item[2:], 16) for item in re.findall(r"\\x[0-9a-fA-F]{2}", payload)).decode(
+            "utf-8",
+            errors="ignore",
+        )
+    except ValueError:
+        return ""
+
+
+def _decode_base64_evidence_payload(payload: str) -> str:
+    if len(payload) > _MAX_ENCODED_EVIDENCE_CHARS or len(payload) % 4 == 1:
+        return ""
+    padded_payload = payload + "=" * ((4 - (len(payload) % 4)) % 4)
+    try:
+        return base64.b64decode(padded_payload, validate=True).decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _redact_reversible_base64_evidence(text: str, depth: int = 0) -> str:
+    if depth >= 2:
+        return text
+
+    def replace_payload(match: re.Match[str]) -> str:
+        decoded_text = _decode_base64_evidence_payload(match.group(0))
+        if not decoded_text:
+            return match.group(0)
+
+        decoded_text = _redact_reversible_base64_evidence(decoded_text, depth + 1)
+        redacted_decoded = redact_evidence_string(decoded_text, max_chars=160)
+        if REDACTED_EVIDENCE_VALUE in redacted_decoded:
+            return redacted_decoded
+        return match.group(0)
+
+    return _BASE64_EVIDENCE_TOKEN_PATTERN.sub(replace_payload, text)
+
+
 class _CatBoostParseError(ValueError):
     """Raised when CatBoost structure parsing fails."""
 
@@ -96,6 +137,11 @@ def _redact_url_for_display(url: str) -> str:
 
 def _redact_urls_for_display(text: str) -> str:
     return _URL_PATTERN.sub(lambda match: _redact_url_for_display(match.group(0)), text)
+
+
+def _redact_evidence_for_display(text: str, max_chars: int = 160) -> str:
+    text = _redact_reversible_base64_evidence(text)
+    return redact_evidence_string(_redact_urls_for_display(text), max_chars=max_chars)
 
 
 class CatBoostScanner(BaseScanner):
@@ -366,13 +412,11 @@ class CatBoostScanner(BaseScanner):
     def _summarize_matches(matches: list[dict[str, str]], limit: int = 5) -> list[dict[str, str]]:
         summarized: list[dict[str, str]] = []
         for item in matches[:limit]:
-            text = _redact_urls_for_display(item.get("text", ""))
-            excerpt = text if len(text) <= 160 else f"{text[:157]}..."
             summarized.append(
                 {
                     "section": item.get("section", "unknown"),
                     "pattern": item.get("pattern", ""),
-                    "excerpt": excerpt,
+                    "excerpt": _redact_evidence_for_display(item.get("text", "")),
                 },
             )
         return summarized
@@ -453,10 +497,11 @@ class CatBoostScanner(BaseScanner):
                     script_matches.append({"text": text, "section": fragment["section"], "pattern": reason})
                     break
 
-            if _HEX_ESCAPE_PATTERN.search(text):
+            if hex_match := _HEX_ESCAPE_PATTERN.search(text):
+                decoded_hex = _decode_hex_escape_payload(hex_match.group(0))
                 encoded_matches.append(
                     {
-                        "text": text,
+                        "text": decoded_hex or text,
                         "section": fragment["section"],
                         "pattern": "hex-escaped payload pattern",
                     },
@@ -480,7 +525,7 @@ class CatBoostScanner(BaseScanner):
                 ):
                     encoded_matches.append(
                         {
-                            "text": payload,
+                            "text": decoded_text or payload,
                             "section": fragment["section"],
                             "pattern": "base64 payload with executable/network indicators",
                         },
