@@ -1011,6 +1011,48 @@ def test_lambda_safe_prefix_with_comment_token_in_malicious_payload_is_flagged(t
     )
 
 
+def test_lambda_dynamic_builtins_dispatch_is_not_marked_safe(tmp_path: Path) -> None:
+    """Computed execution names should not receive a passed Lambda code-analysis check."""
+    dynamic_exec_lambda = (
+        "lambda x: (lambda b: (b if isinstance(b, dict) else vars(b))"
+        "[bytes((101,120,101,99)).decode()]"
+        "(bytes((112,114,105,110,116,40,49,41)).decode()))"
+        "(globals()[bytes((95,95,98,117,105,108,116,105,110,115,95,95)).decode()])"
+    )
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "dynamic_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {"function": dynamic_exec_lambda},
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Code Analysis" and check.details.get("allowlist_status") == "not_allowlisted"
+    ]
+    assert matching_checks
+    assert matching_checks[0].status == CheckStatus.FAILED
+    assert matching_checks[0].severity == IssueSeverity.WARNING
+    assert not any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.PASSED
+        and "safe Python code" in check.message
+        for check in result.checks
+    )
+
+
 def test_lambda_dict_bytecode_without_dangerous_patterns_stays_warning(tmp_path: Path) -> None:
     encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
     model_path = create_custom_h5_file(

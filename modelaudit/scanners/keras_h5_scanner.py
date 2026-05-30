@@ -957,17 +957,20 @@ class KerasH5Scanner(BaseScanner):
                         rule_code="S507",  # Python embedded code
                     )
                 else:
-                    # Valid Python but not dangerous - record as passed
+                    # Valid Python outside the narrow allowlist is still attacker-controlled executable code.
                     result.add_check(
                         name="Lambda Layer Code Analysis",
-                        passed=True,
-                        message="Lambda layer contains safe Python code",
+                        passed=False,
+                        message="Lambda layer contains non-allowlisted Python code",
+                        severity=IssueSeverity.WARNING,
                         location=self.current_file_path,
                         details={
                             "layer_class": "Lambda",
                             "validation_status": "valid_python",
+                            "code_analysis": risk_desc,
+                            "allowlist_status": "not_allowlisted",
                         },
-                        rule_code=None,  # Passing check
+                        rule_code="S507",  # Python embedded code
                     )
             else:
                 # Not valid Python syntax - might be a configuration issue
