@@ -13,6 +13,7 @@ import h5py
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 
@@ -1079,6 +1080,62 @@ def test_lambda_dict_bytecode_with_dangerous_pattern_still_critical(tmp_path: Pa
     ]
     assert len(dangerous_checks) == 1
     assert {"eval", "__import__", "os.system"}.issubset(set(dangerous_checks[0].details["dangerous_patterns"]))
+
+
+def test_lambda_code_previews_redact_credentials_in_json_and_sarif(tmp_path: Path) -> None:
+    direct_secret = "H5_DIRECT_SECRET"
+    dict_secret = "H5_DICT_SECRET"
+    encoded_code = base64.b64encode(
+        f"import os\nclient_secret='{dict_secret}'\nos.system('id')\n".encode(),
+    ).decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "redacted_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "direct_lambda",
+                            "function": f"lambda x: (eval('1'), \"client_secret='{direct_secret}'\", x)[-1]",
+                        },
+                    },
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "dict_lambda",
+                            "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                        },
+                    },
+                ],
+            },
+        },
+    )
+
+    scanner_result = KerasH5Scanner().scan(str(model_path))
+    previews = [
+        check.details.get("code_preview")
+        for check in scanner_result.checks
+        if check.name == "Lambda Layer Code Analysis" and check.details.get("code_preview")
+    ]
+    assert previews
+    string_previews = [preview for preview in previews if isinstance(preview, str)]
+    assert len(string_previews) == len(previews)
+    assert all(direct_secret not in preview and dict_secret not in preview for preview in string_previews)
+    assert any("<redacted>" in preview for preview in string_previews)
+
+    audit_result = scan_model_directory_or_file(str(model_path))
+    json_output = audit_result.model_dump_json(indent=2, exclude_none=True)
+    sarif_output = format_sarif_output(audit_result, [str(model_path)])
+
+    assert direct_secret not in json_output
+    assert dict_secret not in json_output
+    assert direct_secret not in sarif_output
+    assert dict_secret not in sarif_output
+    assert "<redacted>" in json_output
+    assert "<redacted>" in sarif_output
 
 
 def test_keras_h5_scanner_empty_file(tmp_path):
