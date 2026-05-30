@@ -62,6 +62,19 @@ def test_redacts_prefixed_python_string_values_for_quoted_keys() -> None:
     assert "'safe': b'value'" in redacted
 
 
+def test_redacts_prefixed_quoted_assignments_without_second_pass_corruption() -> None:
+    """Unquoted assignment redaction should not rewrite Python string prefixes."""
+    text = 'api_key = f"FSECRET123" client_secret=b"BYTESECRET456" safe=f"value"'
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "FSECRET123" not in redacted
+    assert "BYTESECRET456" not in redacted
+    assert f'api_key = f"{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f'client_secret=b"{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert 'safe=f"value"' in redacted
+
+
 def test_redacts_compound_sensitive_query_parameters() -> None:
     """Compound query credential keys should be redacted in URL evidence."""
     text = "url=https://example.com/callback?client_secret=CLIENTSECRET123&refresh_token=REFRESHTOKEN456&ok=1"
