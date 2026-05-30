@@ -50,6 +50,9 @@ class OciLayerScanner(BaseScanner):
     _MANIFEST_PROBE_CHUNK_BYTES: ClassVar[int] = 8192
     _MEMBER_HEADER_PROBE_BYTES: ClassVar[int] = 64
     _DEFAULT_MAX_LAYER_FILE_SIZE: ClassVar[int] = 10 * 1024 * 1024 * 1024
+    _DEFAULT_MAX_LAYER_ENTRIES: ClassVar[int] = 10000
+    _DEFAULT_MAX_DECOMPRESSED_BYTES: ClassVar[int] = 512 * 1024 * 1024
+    _DEFAULT_MAX_DECOMPRESSION_RATIO: ClassVar[float] = 250.0
     _REMOTE_LAYER_REF_SCHEMES: ClassVar[frozenset[str]] = frozenset({"http", "https", "s3", "gs", "oci"})
     _PARENT_IDENTITY_METADATA_KEYS: ClassVar[frozenset[str]] = frozenset({"file_size", "file_hashes"})
 
@@ -84,6 +87,125 @@ class OciLayerScanner(BaseScanner):
                 configured_max_file_size,
                 self._DEFAULT_MAX_LAYER_FILE_SIZE,
             )
+        self.max_layer_entries = self._normalize_positive_int_config(
+            self.config.get("max_oci_layer_entries", self.config.get("max_tar_entries")),
+            self._DEFAULT_MAX_LAYER_ENTRIES,
+        )
+        self.max_decompressed_bytes = self._normalize_positive_int_config(
+            self.config.get("compressed_max_decompressed_bytes"),
+            self._DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        self.max_decompression_ratio = self._normalize_positive_float_config(
+            self.config.get("compressed_max_decompression_ratio"),
+            self._DEFAULT_MAX_DECOMPRESSION_RATIO,
+        )
+
+    @staticmethod
+    def _normalize_positive_float_config(value: Any, default: float) -> float:
+        """Return a positive float config value, or default for invalid input."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            return default
+        return float(value)
+
+    def _add_layer_budget_check(
+        self,
+        result: ScanResult,
+        *,
+        manifest_path: str,
+        layer_ref: str,
+        reason: str,
+        message: str,
+        details: dict[str, Any],
+    ) -> None:
+        self._mark_incomplete_coverage(result, reason)
+        result.add_check(
+            name="Layer Decompression Budget Check",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=f"{manifest_path}:{layer_ref}",
+            details={
+                "layer": layer_ref,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+                **details,
+            },
+            rule_code="S902",
+        )
+
+    def _preflight_layer_budget(
+        self,
+        layer_path: str,
+        *,
+        manifest_path: str,
+        layer_ref: str,
+        compressed_size: int,
+        result: ScanResult,
+    ) -> bool:
+        entry_count = 0
+        decompressed_size = 0
+        payload_size = 0
+
+        with tarfile.open(layer_path, "r:gz") as tar:
+            for member in tar:
+                entry_count += 1
+                if entry_count > self.max_layer_entries:
+                    self._add_layer_budget_check(
+                        result,
+                        manifest_path=manifest_path,
+                        layer_ref=layer_ref,
+                        reason="oci_layer_entry_count_exceeded",
+                        message=(
+                            f"Layer {self._normalize_layer_ref(layer_ref)} contains too many entries "
+                            f"({entry_count} > {self.max_layer_entries})"
+                        ),
+                        details={"entries": entry_count, "max_entries": self.max_layer_entries},
+                    )
+                    return False
+
+                payload_size += max(0, member.size)
+                decompressed_size = max(payload_size, tar.offset)
+                ratio = (decompressed_size / compressed_size) if compressed_size > 0 else 0.0
+                if decompressed_size > self.max_decompressed_bytes:
+                    self._add_layer_budget_check(
+                        result,
+                        manifest_path=manifest_path,
+                        layer_ref=layer_ref,
+                        reason="oci_layer_decompressed_size_exceeded",
+                        message=(
+                            f"Layer {self._normalize_layer_ref(layer_ref)} decompressed size exceeded limit "
+                            f"({decompressed_size} > {self.max_decompressed_bytes})"
+                        ),
+                        details={
+                            "decompressed_size": decompressed_size,
+                            "compressed_size": compressed_size,
+                            "max_decompressed_size": self.max_decompressed_bytes,
+                            "entries": entry_count,
+                        },
+                    )
+                    return False
+
+                if compressed_size > 0 and ratio > self.max_decompression_ratio:
+                    self._add_layer_budget_check(
+                        result,
+                        manifest_path=manifest_path,
+                        layer_ref=layer_ref,
+                        reason="oci_layer_decompression_ratio_exceeded",
+                        message=(
+                            f"Layer {self._normalize_layer_ref(layer_ref)} decompression ratio exceeded limit "
+                            f"({ratio:.1f}x > {self.max_decompression_ratio:.1f}x)"
+                        ),
+                        details={
+                            "decompressed_size": decompressed_size,
+                            "compressed_size": compressed_size,
+                            "max_ratio": self.max_decompression_ratio,
+                            "actual_ratio": ratio,
+                            "entries": entry_count,
+                        },
+                    )
+                    return False
+
+        return True
 
     @staticmethod
     def _get_scannable_extension(member_name: str) -> str | None:
@@ -384,6 +506,16 @@ class OciLayerScanner(BaseScanner):
                         },
                         rule_code="S902",
                     )
+                    continue
+
+                if not self._preflight_layer_budget(
+                    layer_path,
+                    manifest_path=path,
+                    layer_ref=layer_ref,
+                    compressed_size=layer_size,
+                    result=result,
+                ):
+                    scan_complete = False
                     continue
 
                 with tarfile.open(layer_path, "r:gz") as tar:

@@ -276,12 +276,14 @@ class TestOciLayerScanner:
                 cache_enabled=True,
                 cache_dir=str(cache_dir),
                 min_cache_file_size=0,
+                compressed_max_decompression_ratio=1000.0,
             )
             second = scan_model_directory_or_file(
                 str(manifest_path),
                 cache_enabled=True,
                 cache_dir=str(cache_dir),
                 min_cache_file_size=0,
+                compressed_max_decompression_ratio=1000.0,
             )
 
             for aggregate in (first, second):
@@ -943,6 +945,50 @@ class TestOciLayerScanner:
         assert result.success is True
         assert result.metadata.get("scan_outcome") != "inconclusive"
         assert not any(check.name == "Layer Member Size Check" for check in result.checks)
+
+    def test_scan_layer_rejects_decompression_ratio_before_copying(self, tmp_path: Path) -> None:
+        """High-ratio gzip layers should fail closed before member extraction."""
+        compressible_member = tmp_path / "zeros.bin"
+        compressible_member.write_bytes(b"\x00" * 65536)
+
+        layer_path = tmp_path / "ratio.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(compressible_member, arcname="zeros.bin")
+
+        manifest_path = tmp_path / "ratio.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["ratio.tar.gz"]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"compressed_max_decompression_ratio": 2.0}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert mock_copy.call_count == 0
+        assert "oci_layer_decompression_ratio_exceeded" in result.metadata["scan_outcome_reasons"]
+        checks = [check for check in result.checks if check.name == "Layer Decompression Budget Check"]
+        assert len(checks) == 1
+        assert checks[0].severity == IssueSeverity.INFO
+
+    def test_scan_layer_rejects_entry_count_before_copying(self, tmp_path: Path) -> None:
+        """Layer entry count exhaustion should fail closed before member extraction."""
+        layer_path = tmp_path / "many.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            for index in range(3):
+                member_path = tmp_path / f"member-{index}.bin"
+                member_path.write_bytes(b"safe")
+                tar.add(member_path, arcname=f"member-{index}.bin")
+
+        manifest_path = tmp_path / "many.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["many.tar.gz"]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"max_oci_layer_entries": 2}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert mock_copy.call_count == 0
+        assert "oci_layer_entry_count_exceeded" in result.metadata["scan_outcome_reasons"]
+        checks = [check for check in result.checks if check.name == "Layer Decompression Budget Check"]
+        assert len(checks) == 1
+        assert checks[0].details["entries"] == 3
 
     def test_scan_layer_rewrites_embedded_issue_and_check_locations(self, tmp_path: Path) -> None:
         """Embedded scan results should reference the OCI member, not temp extraction paths."""
