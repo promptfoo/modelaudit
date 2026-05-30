@@ -61,6 +61,37 @@ class TestFormatSarifOutput:
         assert len(run["results"]) == 1
         assert len(run["tool"]["driver"]["rules"]) == 1
 
+    def test_signed_stream_paths_are_redacted(self) -> None:
+        """SARIF must not retain signed URL query material in paths."""
+        raw_path = (
+            "stream://https://bucket.s3.amazonaws.com/model.pkl?"
+            "X-Amz-Credential=AKIASECRET&X-Amz-Signature=deadbeef&token=secret-token"
+        )
+        safe_path = "stream://https://bucket.s3.amazonaws.com/model.pkl"
+        result = create_initial_audit_result()
+        result.assets = [AssetModel(path=raw_path, type="pickle")]
+        result.issues = [
+            Issue(
+                message=f"Test security issue from {raw_path}",
+                severity=IssueSeverity.WARNING,
+                location=raw_path,
+                details={"source": raw_path, raw_path: {"nested": [raw_path]}},
+                timestamp=time.time(),
+            )
+        ]
+        result.finalize_statistics()
+
+        output = format_sarif_output(result, [raw_path])
+        parsed = json.loads(output)
+        invocation = parsed["runs"][0]["invocations"][0]
+
+        for leaked in ("AKIASECRET", "deadbeef", "secret-token", "X-Amz-Signature"):
+            assert leaked not in output
+        assert raw_path not in output
+        assert safe_path in output
+        assert safe_path in invocation["commandLine"]
+        assert invocation["arguments"] == [safe_path]
+
     def test_verbose_includes_debug(self):
         """Test that verbose mode includes debug issues."""
         result = create_initial_audit_result()

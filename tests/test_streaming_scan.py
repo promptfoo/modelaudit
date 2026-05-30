@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
+from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners import safetensors_scanner
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
@@ -154,6 +155,94 @@ def test_scan_model_directory_or_file_partial_streaming_security_finding_returns
     assert metadata["scan_outcome"] == "inconclusive"
     assert result.success is True
     assert determine_exit_code(result) == 1
+
+
+def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
+    """stream:// scans must preserve raw scanner input but redact persisted output."""
+    stream_url = (
+        "https://bucket.s3.amazonaws.com/model.pkl?"
+        "X-Amz-Credential=AKIASECRET&X-Amz-Signature=deadbeef&token=secret-token"
+    )
+    safe_url = "https://bucket.s3.amazonaws.com/model.pkl"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.bytes_scanned = 128
+    scan_result.metadata["source_url"] = stream_url
+    scan_result.add_issue(
+        f"Dangerous payload from {stream_url}",
+        severity=IssueSeverity.CRITICAL,
+        location=f"{stream_url}:payload",
+        details={"source": stream_url, "nested": [stream_url]},
+    )
+    scan_result.add_check(
+        name="Streaming Payload",
+        passed=False,
+        message=f"Checked {stream_url}",
+        severity=IssueSeverity.CRITICAL,
+        location=f"{stream_url} (header)",
+        details={"source": stream_url},
+        why=f"Matched {stream_url}",
+    )
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file") as mock_stream,
+        patch("modelaudit.scanners.get_scanner_for_file") as mock_scanner,
+    ):
+        dummy_scanner = object()
+        mock_scanner.return_value = dummy_scanner
+        mock_stream.return_value = (scan_result, True)
+
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    mock_stream.assert_called_once_with(stream_url, dummy_scanner)
+    json_text = result.model_dump_json(exclude_none=True)
+    sarif_text = format_sarif_output(result, [f"stream://{stream_url}"])
+
+    for leaked in ("AKIASECRET", "deadbeef", "secret-token", "X-Amz-Signature"):
+        assert leaked not in json_text
+        assert leaked not in sarif_text
+    assert stream_url not in json_text
+    assert stream_url not in sarif_text
+    assert safe_url in json_text
+    assert safe_url in sarif_text
+    assert safe_url in result.file_metadata
+    assert all(asset.path != stream_url for asset in result.assets)
+
+
+def test_streaming_signed_url_no_scanner_error_is_redacted() -> None:
+    """stream:// scanner-routing failures must not persist signed URL material."""
+    stream_url = "https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=deadbeef&token=secret-token"
+
+    with patch("modelaudit.scanners.get_scanner_for_file", return_value=None) as mock_scanner:
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    mock_scanner.assert_called_once()
+    json_text = result.model_dump_json(exclude_none=True)
+    assert "deadbeef" not in json_text
+    assert "secret-token" not in json_text
+    assert "X-Amz-Signature" not in json_text
+    assert "stream://https://bucket.s3.amazonaws.com/model.pkl" in json_text
+    assert all(asset.path != f"stream://{stream_url}" for asset in result.assets)
+    assert determine_exit_code(result) == 2
+
+
+def test_streaming_signed_url_analysis_none_error_is_redacted() -> None:
+    """stream:// analysis failures must not persist signed URL material."""
+    stream_url = "https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=deadbeef&token=secret-token"
+
+    with (
+        patch("modelaudit.core.stream_analyze_file", return_value=(None, False)),
+        patch("modelaudit.scanners.get_scanner_for_file", return_value=object()),
+    ):
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    json_text = result.model_dump_json(exclude_none=True)
+    assert "deadbeef" not in json_text
+    assert "secret-token" not in json_text
+    assert "X-Amz-Signature" not in json_text
+    assert "stream://https://bucket.s3.amazonaws.com/model.pkl" in json_text
+    assert all(asset.path != f"stream://{stream_url}" for asset in result.assets)
+    assert determine_exit_code(result) == 2
 
 
 def test_scan_model_streaming_basic(temp_test_files: list[Path]) -> None:

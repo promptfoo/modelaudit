@@ -6,6 +6,7 @@ integration with security tools and CI/CD pipelines.
 
 import contextlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -18,6 +19,12 @@ from modelaudit.core_results import (
 )
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
+from modelaudit.utils.sources.cloud_storage import redact_url_for_display as _redact_url_for_display
+
+_URL_TOKEN_RE = re.compile(
+    r"(stream://[a-z][a-z0-9+.-]*://[^\s\"'<>]+|[a-z][a-z0-9+.-]*://[^\s\"'<>]+)",
+    re.IGNORECASE,
+)
 
 
 def format_sarif_output(
@@ -50,6 +57,7 @@ def _create_run(
     verbose: bool,
 ) -> dict[str, Any]:
     """Create a SARIF run object from ModelAudit results."""
+    safe_scan_paths = [_redact_path_for_sarif(path) for path in scan_paths]
 
     # Filter issues based on verbosity
     issues = audit_result.issues
@@ -86,8 +94,8 @@ def _create_run(
         "invocations": [
             {
                 "executionSuccessful": exit_code != 2,
-                "commandLine": f"modelaudit {' '.join(scan_paths)}",
-                "arguments": scan_paths,
+                "commandLine": f"modelaudit {' '.join(safe_scan_paths)}",
+                "arguments": safe_scan_paths,
                 "workingDirectory": {"uri": Path.cwd().as_uri()},
                 "exitCode": exit_code,
                 "exitCodeDescription": _exit_code_description(audit_result, exit_code),
@@ -211,7 +219,7 @@ def _create_results(
             "ruleId": rule_id,
             "ruleIndex": rule_indices[rule_id],
             "level": _severity_to_sarif_level(issue.severity),
-            "message": {"text": issue.message},
+            "message": {"text": _redact_text_for_sarif(issue.message)},
             "locations": [],
             "partialFingerprints": {},
             "relatedLocations": [],
@@ -245,7 +253,7 @@ def _create_results(
         result["partialFingerprints"]["primaryLocationLineHash"] = fingerprint  # type: ignore[index]
 
         # Add properties with additional details
-        properties = dict(issue.details or {})
+        properties = _redact_value_for_sarif(dict(issue.details or {}))
         properties.pop("rule_code", None)
         properties.pop("issue_type", None)
         rule_code = _get_issue_rule_code(issue)
@@ -320,7 +328,8 @@ def _get_rule_id(issue: Any) -> str:
         return f"MA{str(issue.type).replace(' ', '-').upper()}"
 
     # Generate from message if no type
-    base = issue.message[:30].replace(" ", "-").replace(":", "").upper()
+    redacted_message = _redact_text_for_sarif(issue.message)
+    base = redacted_message[:30].replace(" ", "-").replace(":", "").upper()
     # Remove special characters
     base = "".join(c if c.isalnum() or c == "-" else "" for c in base)
     return f"MA-{base}"
@@ -340,7 +349,8 @@ def _get_rule_name(issue: Any) -> str:
         return str(issue.type).replace("_", " ").title()
 
     # Extract from message
-    return str(issue.message.split(":")[0] if ":" in issue.message else issue.message[:50])
+    redacted_message = _redact_text_for_sarif(issue.message)
+    return str(redacted_message.split(":")[0] if ":" in redacted_message else redacted_message[:50])
 
 
 def _get_rule_short_description(issue: Any) -> str:
@@ -361,7 +371,7 @@ def _get_rule_short_description(issue: Any) -> str:
     elif "blacklist" in lowered_message:
         return "Blacklisted model name detected"
     else:
-        return str(issue.message[:100])
+        return str(_redact_text_for_sarif(issue.message)[:100])
 
 
 def _get_rule_full_description(issue: Any) -> str:
@@ -369,7 +379,7 @@ def _get_rule_full_description(issue: Any) -> str:
     desc = _get_rule_short_description(issue)
 
     if hasattr(issue, "why") and issue.why:
-        desc += f" {issue.why}"
+        desc += f" {_redact_text_for_sarif(issue.why)}"
 
     return desc
 
@@ -421,6 +431,7 @@ def _get_tags_for_issue(issue: Any) -> list[str]:
 
 def _normalize_path_to_uri(path: str) -> str:
     """Normalize a file path to a URI format."""
+    path = _redact_path_for_sarif(path)
     # Convert to Path object for normalization
     p = Path(path)
 
@@ -433,6 +444,33 @@ def _normalize_path_to_uri(path: str) -> str:
 
     # URL-encode special characters
     return quote(uri_path, safe="/")
+
+
+def _redact_path_for_sarif(path: str) -> str:
+    """Return a SARIF-safe path without signed URL material."""
+    if path.startswith("stream://"):
+        return f"stream://{_redact_url_for_display(path[9:])}"
+    return _redact_url_for_display(path)
+
+
+def _redact_text_for_sarif(text: str) -> str:
+    """Redact signed URL tokens embedded in SARIF text fields."""
+    return _URL_TOKEN_RE.sub(lambda match: _redact_path_for_sarif(match.group(0)), text)
+
+
+def _redact_value_for_sarif(value: Any) -> Any:
+    if isinstance(value, str):
+        return _redact_text_for_sarif(value)
+    if isinstance(value, dict):
+        return {
+            _redact_text_for_sarif(key) if isinstance(key, str) else key: _redact_value_for_sarif(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_value_for_sarif(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_value_for_sarif(item) for item in value)
+    return value
 
 
 def _get_mime_type(file_type: str) -> str:

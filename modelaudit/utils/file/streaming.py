@@ -11,7 +11,7 @@ import click
 if TYPE_CHECKING:
     from modelaudit.scanner_results import ScanResult
     from modelaudit.scanners.base import BaseScanner
-from modelaudit.utils.sources.cloud_storage import get_fs_protocol
+from modelaudit.utils.sources.cloud_storage import get_fs_protocol, redact_cloud_error_for_display
 
 from .detection import _has_zip_magic
 
@@ -250,7 +250,7 @@ def stream_analyze_file(
         try:
             ctx = click.get_current_context(silent=True)
             if ctx and ctx.params.get("verbose"):
-                click.echo(f"Streaming analysis failed: {e}")
+                click.echo(f"Streaming analysis failed: {redact_cloud_error_for_display(e, url)}")
         except Exception:
             # Not in a Click context, just log silently
             pass
