@@ -155,7 +155,186 @@ _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES = (
     | _CTYPES_LIBRARY_LOADER_CONSTRUCTORS
 )
 _STATIC_TRUTHY_BUILTIN_REFERENCES = frozenset({"builtins.print", "builtins.len"})
-_TRACKED_STATIC_MEMBER_REFERENCES = _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES | _STATIC_TRUTHY_BUILTIN_REFERENCES
+_STATIC_SIDE_EFFECT_FREE_BUILTIN_REFERENCES = frozenset({"builtins.object"})
+_STATIC_DISPATCH_DECORATOR_REFERENCES = frozenset({"builtins.staticmethod", "builtins.classmethod"})
+_STATIC_CLASS_CREATION_REFERENCES = frozenset({"builtins.__build_class__"})
+_STATIC_MODULE_REGISTRY_REFERENCES = frozenset({"sys.modules"})
+_STATIC_MODULE_TYPE_REFERENCES = frozenset(
+    f"{root}.__class__" for root in {"builtins", "contextlib", "ctypes", "runpy", "sys", "webbrowser"}
+)
+_STATIC_MUTABLE_BUILTIN_HELPER_REFERENCES = frozenset(
+    {"builtins.getattr", "builtins.vars", "builtins.setattr", "builtins.delattr"}
+)
+_STATIC_CONTEXT_MANAGER_HELPER_REFERENCES = frozenset({"contextlib.nullcontext"})
+_STATIC_CTYPES_LIBRARY_LOADER_CONSTRUCTION_DISPATCH_REFERENCES = frozenset(
+    {"ctypes.LibraryLoader.__new__", "ctypes.LibraryLoader.__init__", "ctypes.LibraryLoader.__setattr__"}
+)
+_STATIC_CTYPES_LIBRARY_LOADER_ATTRIBUTE_DISPATCH_REFERENCES = frozenset(
+    {"ctypes.LibraryLoader.__getattribute__", "ctypes.LibraryLoader.__getattr__", "ctypes.LibraryLoader.__setattr__"}
+)
+_STATIC_CTYPES_LIBRARY_LOADER_EXISTING_ATTRIBUTE_DISPATCH_REFERENCES = frozenset(
+    {"ctypes.LibraryLoader.__getattribute__"}
+)
+_STATIC_CTYPES_LIBRARY_LOADER_ITEM_DISPATCH_REFERENCES = frozenset(
+    {
+        "ctypes.LibraryLoader.__getitem__",
+        "ctypes.LibraryLoader.__getattribute__",
+        "ctypes.LibraryLoader.__getattr__",
+        "ctypes.LibraryLoader.__setattr__",
+    }
+)
+_STATIC_CTYPES_LIBRARY_LOADER_LOAD_LIBRARY_DISPATCH_REFERENCES = frozenset(
+    {"ctypes.LibraryLoader.__getattribute__", "ctypes.LibraryLoader.LoadLibrary"}
+)
+_STATIC_CTYPES_LIBRARY_LOADER_MUTATION_DISPATCH_REFERENCES = frozenset({"ctypes.LibraryLoader.__setattr__"})
+_STATIC_CTYPES_LIBRARY_LOADER_DELETE_DISPATCH_REFERENCES = frozenset({"ctypes.LibraryLoader.__delattr__"})
+_STATIC_CTYPES_LIBRARY_LOADER_ITEM_STORE_DISPATCH_REFERENCES = frozenset({"ctypes.LibraryLoader.__setitem__"})
+_STATIC_CTYPES_LIBRARY_LOADER_ITEM_DELETE_DISPATCH_REFERENCES = frozenset({"ctypes.LibraryLoader.__delitem__"})
+_STATIC_CTYPES_LIBRARY_LOADER_TRUTH_DISPATCH_REFERENCES = frozenset(
+    {"ctypes.LibraryLoader.__bool__", "ctypes.LibraryLoader.__len__"}
+)
+_STATIC_CTYPES_LIBRARY_LOADER_CALL_DISPATCH_REFERENCES = frozenset({"ctypes.LibraryLoader.__call__"})
+_STATIC_CTYPES_LIBRARY_LOADER_GENERIC_PROTOCOL_DISPATCH_REFERENCES = frozenset(
+    {
+        "ctypes.LibraryLoader.__bool__",
+        "ctypes.LibraryLoader.__len__",
+        "ctypes.LibraryLoader.__iter__",
+        "ctypes.LibraryLoader.__aiter__",
+        "ctypes.LibraryLoader.__anext__",
+        "ctypes.LibraryLoader.__reversed__",
+        "ctypes.LibraryLoader.__contains__",
+        "ctypes.LibraryLoader.__eq__",
+        "ctypes.LibraryLoader.__ne__",
+        "ctypes.LibraryLoader.__lt__",
+        "ctypes.LibraryLoader.__le__",
+        "ctypes.LibraryLoader.__gt__",
+        "ctypes.LibraryLoader.__ge__",
+        "ctypes.LibraryLoader.__format__",
+        "ctypes.LibraryLoader.__str__",
+        "ctypes.LibraryLoader.__repr__",
+        "ctypes.LibraryLoader.__hash__",
+        "ctypes.LibraryLoader.__index__",
+        "ctypes.LibraryLoader.__enter__",
+        "ctypes.LibraryLoader.__exit__",
+        "ctypes.LibraryLoader.__aenter__",
+        "ctypes.LibraryLoader.__aexit__",
+        "ctypes.LibraryLoader.__await__",
+        "ctypes.LibraryLoader.__mro_entries__",
+        "ctypes.LibraryLoader.__call__",
+        "ctypes.LibraryLoader.keys",
+        "ctypes.LibraryLoader.__getitem__",
+        "ctypes.LibraryLoader.__setitem__",
+        "ctypes.LibraryLoader.__delitem__",
+        "ctypes.LibraryLoader.__pos__",
+        "ctypes.LibraryLoader.__neg__",
+        "ctypes.LibraryLoader.__invert__",
+        "ctypes.LibraryLoader.__add__",
+        "ctypes.LibraryLoader.__radd__",
+        "ctypes.LibraryLoader.__iadd__",
+        "ctypes.LibraryLoader.__sub__",
+        "ctypes.LibraryLoader.__rsub__",
+        "ctypes.LibraryLoader.__isub__",
+        "ctypes.LibraryLoader.__mul__",
+        "ctypes.LibraryLoader.__rmul__",
+        "ctypes.LibraryLoader.__imul__",
+        "ctypes.LibraryLoader.__matmul__",
+        "ctypes.LibraryLoader.__rmatmul__",
+        "ctypes.LibraryLoader.__imatmul__",
+        "ctypes.LibraryLoader.__truediv__",
+        "ctypes.LibraryLoader.__rtruediv__",
+        "ctypes.LibraryLoader.__itruediv__",
+        "ctypes.LibraryLoader.__floordiv__",
+        "ctypes.LibraryLoader.__rfloordiv__",
+        "ctypes.LibraryLoader.__ifloordiv__",
+        "ctypes.LibraryLoader.__mod__",
+        "ctypes.LibraryLoader.__rmod__",
+        "ctypes.LibraryLoader.__imod__",
+        "ctypes.LibraryLoader.__divmod__",
+        "ctypes.LibraryLoader.__rdivmod__",
+        "ctypes.LibraryLoader.__pow__",
+        "ctypes.LibraryLoader.__rpow__",
+        "ctypes.LibraryLoader.__ipow__",
+        "ctypes.LibraryLoader.__lshift__",
+        "ctypes.LibraryLoader.__rlshift__",
+        "ctypes.LibraryLoader.__ilshift__",
+        "ctypes.LibraryLoader.__rshift__",
+        "ctypes.LibraryLoader.__rrshift__",
+        "ctypes.LibraryLoader.__irshift__",
+        "ctypes.LibraryLoader.__and__",
+        "ctypes.LibraryLoader.__rand__",
+        "ctypes.LibraryLoader.__iand__",
+        "ctypes.LibraryLoader.__xor__",
+        "ctypes.LibraryLoader.__rxor__",
+        "ctypes.LibraryLoader.__ixor__",
+        "ctypes.LibraryLoader.__or__",
+        "ctypes.LibraryLoader.__ror__",
+        "ctypes.LibraryLoader.__ior__",
+    }
+)
+_STATIC_CTYPES_LIBRARY_LOADER_ITERATION_DISPATCH_REFERENCES = frozenset(
+    {"ctypes.LibraryLoader.__iter__", "ctypes.LibraryLoader.__getitem__"}
+)
+_STATIC_CTYPES_LIBRARY_LOADER_ASYNC_ITERATION_DISPATCH_REFERENCES = frozenset(
+    {"ctypes.LibraryLoader.__aiter__", "ctypes.LibraryLoader.__anext__"}
+)
+_STATIC_CTYPES_LIBRARY_LOADER_HASH_DISPATCH_REFERENCES = frozenset({"ctypes.LibraryLoader.__hash__"})
+_STATIC_CTYPES_LIBRARY_LOADER_MAPPING_EXPANSION_DISPATCH_REFERENCES = frozenset(
+    {"ctypes.LibraryLoader.keys", "ctypes.LibraryLoader.__getitem__"}
+)
+_STATIC_CTYPES_LIBRARY_LOADER_FORMAT_DISPATCH_REFERENCES = frozenset(
+    {"ctypes.LibraryLoader.__format__", "ctypes.LibraryLoader.__str__", "ctypes.LibraryLoader.__repr__"}
+)
+_STATIC_CTYPES_LIBRARY_LOADER_INDEX_DISPATCH_REFERENCES = frozenset({"ctypes.LibraryLoader.__index__"})
+_STATIC_CTYPES_LIBRARY_LOADER_CONTEXT_DISPATCH_REFERENCES = frozenset(
+    {"ctypes.LibraryLoader.__enter__", "ctypes.LibraryLoader.__exit__"}
+)
+_STATIC_CTYPES_LIBRARY_LOADER_ASYNC_CONTEXT_DISPATCH_REFERENCES = frozenset(
+    {"ctypes.LibraryLoader.__aenter__", "ctypes.LibraryLoader.__aexit__"}
+)
+_STATIC_CTYPES_LIBRARY_LOADER_AWAIT_DISPATCH_REFERENCES = frozenset({"ctypes.LibraryLoader.__await__"})
+_STATIC_CTYPES_LIBRARY_LOADER_MRO_DISPATCH_REFERENCES = frozenset({"ctypes.LibraryLoader.__mro_entries__"})
+_STATIC_CTYPES_LIBRARY_LOADER_MATCH_DISPATCH_REFERENCES = frozenset(
+    {
+        "ctypes.LibraryLoader.__len__",
+        "ctypes.LibraryLoader.__getitem__",
+        "ctypes.LibraryLoader.keys",
+        "ctypes.LibraryLoader.__eq__",
+    }
+)
+_STATIC_CTYPES_LIBRARY_LOADER_DISPATCH_REFERENCES = (
+    _STATIC_CTYPES_LIBRARY_LOADER_CONSTRUCTION_DISPATCH_REFERENCES
+    | _STATIC_CTYPES_LIBRARY_LOADER_ATTRIBUTE_DISPATCH_REFERENCES
+    | _STATIC_CTYPES_LIBRARY_LOADER_ITEM_DISPATCH_REFERENCES
+    | _STATIC_CTYPES_LIBRARY_LOADER_LOAD_LIBRARY_DISPATCH_REFERENCES
+    | _STATIC_CTYPES_LIBRARY_LOADER_DELETE_DISPATCH_REFERENCES
+    | _STATIC_CTYPES_LIBRARY_LOADER_ITEM_STORE_DISPATCH_REFERENCES
+    | _STATIC_CTYPES_LIBRARY_LOADER_ITEM_DELETE_DISPATCH_REFERENCES
+    | _STATIC_CTYPES_LIBRARY_LOADER_TRUTH_DISPATCH_REFERENCES
+    | _STATIC_CTYPES_LIBRARY_LOADER_CALL_DISPATCH_REFERENCES
+    | _STATIC_CTYPES_LIBRARY_LOADER_GENERIC_PROTOCOL_DISPATCH_REFERENCES
+)
+_STATIC_UNCERTAIN_MEMBER_PREFIX = "<uncertain>:"
+_STATIC_CANONICAL_MEMBER_PREFIX = "<canonical-member>:"
+_STATIC_INERT_METHOD_PREFIX = "<inert-method>:"
+_STATIC_INERT_VALUE_PREFIX = "<inert-value>:"
+_STATIC_INERT_MEMBER_STATUS_PREFIX = "<inert-member-status>:"
+_STATIC_INERT_CTYPES_LIBRARY_LOADER = f"{_STATIC_INERT_VALUE_PREFIX}ctypes.LibraryLoader"
+_SYS_MODULES_BINDING_PREFIX = "<sys-modules>:"
+_TRACKED_STATIC_MEMBER_REFERENCES = (
+    _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
+    | _STATIC_TRUTHY_BUILTIN_REFERENCES
+    | _STATIC_SIDE_EFFECT_FREE_BUILTIN_REFERENCES
+    | _STATIC_DISPATCH_DECORATOR_REFERENCES
+    | _STATIC_CLASS_CREATION_REFERENCES
+    | _STATIC_MODULE_REGISTRY_REFERENCES
+    | _STATIC_MODULE_TYPE_REFERENCES
+    | _STATIC_MUTABLE_BUILTIN_HELPER_REFERENCES
+    | _STATIC_CONTEXT_MANAGER_HELPER_REFERENCES
+    | _STATIC_CTYPES_LIBRARY_LOADER_DISPATCH_REFERENCES
+)
+_TRACKED_STATIC_MODULE_ROOTS = frozenset(
+    reference.partition(".")[0] for reference in _TRACKED_STATIC_MEMBER_REFERENCES if "." in reference
+)
 
 # Map each high-risk call name to the rule code that best describes its risk
 # category. SARIF consumers, dashboards, and per-rule severity overrides rely
@@ -694,12 +873,22 @@ def _normalize_implicit_builtins_names(
 ) -> frozenset[str] | None:
     if names is None or _resolve_aliases("__builtins__", alias_scopes) != frozenset({"__builtins__"}):
         return names
-    return frozenset(
-        f"builtins{name.removeprefix('__builtins__')}"
-        if name == "__builtins__" or name.startswith("__builtins__.")
-        else name
-        for name in names
-    )
+    normalized_names: set[str] = set()
+    for name in names:
+        if name == "object" and not _lookup_bound_alias(name, alias_scopes)[1]:
+            normalized_names.update(_apply_aliases("builtins.object", alias_scopes) or frozenset())
+        elif name == "__builtins__" or name.startswith("__builtins__."):
+            normalized_names.add(f"builtins{name.removeprefix('__builtins__')}")
+        elif "." not in name and not _lookup_bound_alias(name, alias_scopes)[1]:
+            builtin_names, builtin_found = _lookup_bound_alias(f"builtins.{name}", alias_scopes)
+            if builtin_found:
+                if isinstance(builtin_names, frozenset):
+                    normalized_names.update(builtin_names)
+            else:
+                normalized_names.add(name)
+        else:
+            normalized_names.add(name)
+    return frozenset(normalized_names) or None
 
 
 _MAX_STATIC_STRING_LENGTH = 1024
@@ -730,6 +919,28 @@ def _resolve_static_string(node: ast.AST) -> str | None:
         parts.append(current.value)
 
     return "".join(parts)
+
+
+def _resolve_static_namespace_update_items(node: ast.AST) -> list[tuple[str, ast.expr]] | None:
+    """Resolve bounded literal mapping updates accepted by dict.update and dict.__ior__."""
+    if isinstance(node, ast.Dict):
+        updates: list[tuple[str, ast.expr]] = []
+        for key, value in zip(node.keys, node.values, strict=True):
+            if key is None or (resolved_key := _resolve_static_string(key)) is None:
+                return None
+            updates.append((resolved_key, value))
+        return updates
+    if isinstance(node, (ast.List, ast.Tuple)):
+        updates = []
+        for element in node.elts:
+            if not isinstance(element, (ast.List, ast.Tuple)) or len(element.elts) != 2:
+                return None
+            resolved_key = _resolve_static_string(element.elts[0])
+            if resolved_key is None:
+                return None
+            updates.append((resolved_key, element.elts[1]))
+        return updates
+    return None
 
 
 def _is_static_non_string(node: ast.AST) -> bool:
@@ -931,6 +1142,9 @@ def _resolve_getattr_call_names(
             frozenset(f"{target_root}.{attr_name}" for target_root in getattribute_accessor_names),
             alias_scopes,
         )
+        getattribute_names = _augment_noncanonical_module_member_names(
+            getattribute_names, getattribute_accessor_names, attr_name, alias_scopes
+        )
         if getattribute_names is not None:
             resolved_names.update(getattribute_names)
         return frozenset(resolved_names) or None
@@ -964,10 +1178,33 @@ def _resolve_getattr_call_names(
         return _apply_aliases_to_names(ctypes_member_names, alias_scopes)
     if attr_name is None:
         return _ctypes_loader_member_load_names(resolved_target_roots, attr_name) or None
-    return _apply_aliases_to_names(
-        frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots),
+    return _augment_noncanonical_module_member_names(
+        _apply_aliases_to_names(
+            frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots),
+            alias_scopes,
+        ),
+        resolved_target_roots,
+        attr_name,
         alias_scopes,
     )
+
+
+def _augment_noncanonical_module_member_names(
+    resolved_names: frozenset[str] | None,
+    target_roots: frozenset[str],
+    attr_name: str,
+    alias_scopes: _AliasScopes,
+) -> frozenset[str] | None:
+    uncertain_names = frozenset(
+        f"{target_root}.{attr_name}"
+        for target_root in target_roots
+        if target_root in _TRACKED_STATIC_MODULE_ROOTS
+        and _resolve_aliases(f"{target_root}.__class__", alias_scopes) != frozenset({f"{target_root}.__class__"})
+        and _is_overwritable_high_risk_reference(f"{target_root}.{attr_name}")
+    )
+    if uncertain_names:
+        return frozenset({*(resolved_names or frozenset()), *uncertain_names})
+    return resolved_names
 
 
 def _resolve_namespace_mapping_roots(
@@ -997,6 +1234,17 @@ def _resolve_namespace_mapping_roots(
         return mapping_aliases
 
     if isinstance(node, ast.Attribute) and node.attr == "__dict__":
+        resolved_module_names = _resolve_static_reference_names(
+            node.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        tracked_module_roots = frozenset(
+            name for name in resolved_module_names or frozenset() if name in _TRACKED_STATIC_MODULE_ROOTS
+        )
+        if tracked_module_roots:
+            return tracked_module_roots
         nested_roots = _resolve_namespace_mapping_roots(
             node.value,
             alias_scopes,
@@ -1111,7 +1359,7 @@ _NAMESPACE_LOOKUP_DESCRIPTORS = frozenset(
     f"{prefix}.{method}" for prefix in ("dict", "builtins.dict") for method in _NAMESPACE_LOOKUP_METHODS
 )
 _NAMESPACE_WRITE_METHODS = frozenset({"__setitem__", "setdefault"})
-_NAMESPACE_MUTATION_METHODS = _NAMESPACE_WRITE_METHODS | frozenset({"pop"})
+_NAMESPACE_MUTATION_METHODS = _NAMESPACE_WRITE_METHODS | frozenset({"pop", "__delitem__"})
 _NAMESPACE_MUTATION_DESCRIPTORS = frozenset(
     f"{prefix}.{method}" for prefix in ("dict", "builtins.dict") for method in _NAMESPACE_MUTATION_METHODS
 )
@@ -1549,6 +1797,30 @@ def _statically_known_truth_value(node: ast.AST, alias_scopes: _AliasScopes) -> 
     return True if resolved_names and resolved_names <= known_truthy_names else None
 
 
+def _resolve_sys_modules_lookup_names(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    if not isinstance(node, ast.Subscript):
+        return None
+    module_name = _resolve_static_string(node.slice)
+    if module_name not in _TRACKED_STATIC_MODULE_ROOTS:
+        return None
+    registry_names = _resolve_static_reference_names(
+        node.value,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if registry_names != frozenset({"sys.modules"}):
+        return None
+    selected_names, found = _lookup_bound_alias(f"{_SYS_MODULES_BINDING_PREFIX}{module_name}", alias_scopes)
+    return selected_names if found else frozenset({module_name})
+
+
 def _resolve_static_reference_names(
     node: ast.AST,
     alias_scopes: _AliasScopes,
@@ -1610,6 +1882,14 @@ def _resolve_static_reference_names(
             allow_module_locals_mapping=allow_module_locals_mapping,
             allow_local_namespace_mapping=allow_local_namespace_mapping,
         )
+    sys_modules_names = _resolve_sys_modules_lookup_names(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if sys_modules_names is not None:
+        return sys_modules_names
     if isinstance(node, ast.Attribute) and node.attr == "__call__":
         callable_names = _resolve_static_reference_names(
             node.value,
@@ -1770,6 +2050,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.alias_scopes: _AliasScopes = [{}]
         self._class_scope_ids: set[int] = set()
         self._comprehension_outer_scope_indices: list[int] = []
+        self._comprehension_unknown_side_effects: list[bool] = []
+        self._deferred_execution_depth = 0
         self._call_result_aliases: dict[int, _AliasValue] = {}
         self._known_class_names: set[str] = set()
         self._classes_with_local_initializers: set[str] = set()
@@ -1777,17 +2059,137 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self._class_identity_aliases: dict[str, frozenset[str]] = {}
         self._instance_binding_generations: dict[str, int] = {}
         self._non_module_scope_depth = 0
+        self._annotations_are_postponed = False
         self.risky_calls: set[str] = set()
 
+    def visit_Module(self, node: ast.Module) -> None:
+        annotations_are_postponed = self._annotations_are_postponed
+        self._annotations_are_postponed = any(
+            isinstance(statement, ast.ImportFrom)
+            and statement.module == "__future__"
+            and any(alias.name == "annotations" for alias in statement.names)
+            for statement in node.body
+        )
+        try:
+            for statement in node.body:
+                self.visit(statement)
+        finally:
+            self._annotations_are_postponed = annotations_are_postponed
+
     def _resolve_reference_names(self, node: ast.AST) -> frozenset[str] | None:
-        return _resolve_static_reference_names(
+        resolved_names = _resolve_static_reference_names(
             node,
             self.alias_scopes,
             allow_module_locals_mapping=self._non_module_scope_depth == 0,
             allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
         )
+        noncanonical_namespace_roots = self._noncanonical_module_namespace_roots(node)
+        if noncanonical_namespace_roots:
+            resolved_names = self._merge_alias_values(
+                resolved_names, frozenset(f"{root}.__dict__" for root in noncanonical_namespace_roots)
+            )
+        if isinstance(node, ast.Attribute):
+            owner_names = _resolve_static_reference_names(
+                node.value,
+                self.alias_scopes,
+                allow_module_locals_mapping=self._non_module_scope_depth == 0,
+                allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+            )
+            module_roots = frozenset(
+                owner_name for owner_name in owner_names or frozenset() if owner_name in _TRACKED_STATIC_MODULE_ROOTS
+            )
+            uncertain_names = frozenset(
+                f"{module_root}.{node.attr}"
+                for module_root in module_roots
+                if _is_overwritable_high_risk_reference(f"{module_root}.{node.attr}")
+            )
+            if uncertain_names and not self._module_attribute_helper_has_canonical_dispatch(module_roots):
+                return self._merge_alias_values(resolved_names, uncertain_names)
+        uncertain_namespace_names = self._noncanonical_namespace_lookup_names(node)
+        if uncertain_namespace_names:
+            return self._merge_alias_values(resolved_names, uncertain_namespace_names)
+        return resolved_names
 
-    def _bind_imported_static_members(self, local_name: str, import_name: str, *, preserve_existing: bool) -> None:
+    def _noncanonical_module_namespace_roots(self, node: ast.AST) -> frozenset[str]:
+        module_node: ast.AST | None = None
+        if isinstance(node, ast.Attribute) and node.attr == "__dict__":
+            module_node = node.value
+        elif isinstance(node, ast.Call):
+            helper_names = _resolve_static_reference_names(
+                node.func,
+                self.alias_scopes,
+                allow_module_locals_mapping=self._non_module_scope_depth == 0,
+                allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+            )
+            if (
+                helper_names and helper_names <= {"vars", "builtins.vars"} and len(node.args) == 1 and not node.keywords
+            ) or (
+                helper_names
+                and helper_names <= {"getattr", "builtins.getattr"}
+                and len(node.args) >= 2
+                and _resolve_static_string(node.args[1]) == "__dict__"
+            ):
+                module_node = node.args[0]
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "__getattribute__"
+                and len(node.args) == 1
+                and not node.keywords
+                and _resolve_static_string(node.args[0]) == "__dict__"
+            ):
+                module_node = node.func.value
+        if module_node is None:
+            return frozenset()
+        resolved_module_names = _resolve_static_reference_names(
+            module_node,
+            self.alias_scopes,
+            allow_module_locals_mapping=self._non_module_scope_depth == 0,
+            allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+        )
+        module_roots = frozenset(
+            name for name in resolved_module_names or frozenset() if name in _TRACKED_STATIC_MODULE_ROOTS
+        )
+        if module_roots and not self._module_attribute_helper_has_canonical_dispatch(module_roots):
+            return module_roots
+        return frozenset()
+
+    def _noncanonical_namespace_lookup_names(self, node: ast.AST) -> frozenset[str]:
+        mapping_node: ast.AST | None = None
+        key_node: ast.AST | None = None
+        if isinstance(node, ast.Subscript):
+            mapping_node = node.value
+            key_node = node.slice
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.args:
+            if node.func.attr not in _NAMESPACE_LOOKUP_METHODS:
+                return frozenset()
+            descriptor_names = _resolve_static_reference_names(
+                node.func,
+                self.alias_scopes,
+                allow_module_locals_mapping=self._non_module_scope_depth == 0,
+                allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+            )
+            is_descriptor = bool(descriptor_names and descriptor_names & _NAMESPACE_LOOKUP_DESCRIPTORS)
+            mapping_node = node.args[0] if is_descriptor else node.func.value
+            key_node = node.args[1] if is_descriptor and len(node.args) > 1 else node.args[0]
+        if mapping_node is None or key_node is None:
+            return frozenset()
+        member_name = _resolve_static_string(key_node)
+        if member_name is None:
+            return frozenset()
+        return frozenset(
+            f"{root}.{member_name}"
+            for root in self._noncanonical_module_namespace_roots(mapping_node)
+            if _is_overwritable_high_risk_reference(f"{root}.{member_name}")
+        )
+
+    def _bind_imported_static_members(
+        self,
+        local_name: str,
+        import_name: str,
+        *,
+        preserve_existing: bool,
+        reset_to_canonical: bool = False,
+    ) -> None:
         prefix = f"{import_name}."
         for reference in _TRACKED_STATIC_MEMBER_REFERENCES:
             if not reference.startswith(prefix):
@@ -1795,10 +2197,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             local_reference = f"{local_name}{reference.removeprefix(import_name)}"
             if preserve_existing and local_reference in self.alias_scopes[-1]:
                 continue
-            self.alias_scopes[-1][local_reference] = _resolve_aliases(
-                reference,
-                self.alias_scopes,
-            )
+            if reset_to_canonical:
+                self.alias_scopes[-1][local_reference] = frozenset({reference})
+                continue
+            canonical_name = f"{_STATIC_CANONICAL_MEMBER_PREFIX}{reference}"
+            canonical_binding, found = _lookup_bound_alias(canonical_name, self.alias_scopes)
+            self.alias_scopes[-1][local_reference] = canonical_binding if found else frozenset({reference})
 
     def _shadow_member_bindings(self, scope_index: int, local_name: str) -> None:
         if "." in local_name or local_name.startswith(_MODULE_NAMESPACE_WRITE_PREFIX):
@@ -1812,10 +2216,28 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
         local_name = alias.asname or alias.name
+        registry_binding, registry_found = _lookup_bound_alias(
+            f"{_SYS_MODULES_BINDING_PREFIX}{import_name}", self.alias_scopes
+        )
+        reset_to_canonical = registry_found and registry_binding != frozenset({import_name})
         previous_names, _found = _lookup_bound_alias(local_name, self.alias_scopes)
-        preserve_existing = isinstance(previous_names, frozenset) and import_name in previous_names
-        self._bind_name(local_name, frozenset({import_name}))
-        self._bind_imported_static_members(local_name, import_name, preserve_existing=preserve_existing)
+        preserve_existing = (
+            not reset_to_canonical and isinstance(previous_names, frozenset) and import_name in previous_names
+        )
+        imported_binding: _AliasValue = frozenset({import_name})
+        if import_name in _TRACKED_STATIC_MEMBER_REFERENCES:
+            current_binding, found = _lookup_bound_alias(
+                f"{_STATIC_CANONICAL_MEMBER_PREFIX}{import_name}", self.alias_scopes
+            )
+            if found:
+                imported_binding = current_binding
+        self._bind_name(local_name, imported_binding)
+        self._bind_imported_static_members(
+            local_name,
+            import_name,
+            preserve_existing=preserve_existing,
+            reset_to_canonical=reset_to_canonical,
+        )
 
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
         previous_names, _found = _lookup_bound_alias(name, self.alias_scopes)
@@ -1850,6 +2272,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if not isinstance(resolved_names, frozenset):
             return resolved_names
         localized_names = set(resolved_names)
+        if _STATIC_INERT_CTYPES_LIBRARY_LOADER in localized_names:
+            localized_names.remove(_STATIC_INERT_CTYPES_LIBRARY_LOADER)
+            localized_names.add(
+                self._localized_instance_root_for_binding(_STATIC_INERT_CTYPES_LIBRARY_LOADER, local_name)
+            )
         if _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT in localized_names:
             localized_names.remove(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT)
             localized_names.add(
@@ -1904,6 +2331,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self._bind_name(local_name, resolved_names)
 
     def _bind_member_reference(self, reference_name: str, resolved_names: _AliasValue) -> None:
+        if reference_name in _TRACKED_STATIC_MEMBER_REFERENCES:
+            self._bind_name(f"{_STATIC_CANONICAL_MEMBER_PREFIX}{reference_name}", resolved_names)
         self._bind_name(reference_name, resolved_names)
         if reference_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
             self._bind_local_static_member_aliases(reference_name, resolved_names)
@@ -1940,12 +2369,35 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def _resolve_binding_value_names(self, value: ast.AST | None) -> _AliasValue:
         if value is None:
             return None
+        inert_call_result = self._statically_inert_call_result_names(value)
+        if inert_call_result is not None:
+            return inert_call_result
         if isinstance(value, ast.Call) and id(value) in self._call_result_aliases:
             return self._call_result_aliases[id(value)]
         value_name = _resolve_call_name(value)
         if value_name is not None and _is_high_risk_python_call_name(value_name):
             return frozenset({value_name})
         return self._resolve_reference_names(value)
+
+    def _statically_inert_call_result_names(self, value: ast.AST) -> frozenset[str] | None:
+        if not self._is_statically_inert_loader_construction(
+            value
+        ) or not self._statically_inert_loader_dispatch_is_canonical(
+            _STATIC_CTYPES_LIBRARY_LOADER_CONSTRUCTION_DISPATCH_REFERENCES
+        ):
+            return None
+        return frozenset({_STATIC_INERT_CTYPES_LIBRARY_LOADER})
+
+    def _is_statically_inert_loader_construction(self, value: ast.AST) -> bool:
+        if not isinstance(value, ast.Call) or self._resolve_reference_names(value.func) != frozenset(
+            {"ctypes.LibraryLoader"}
+        ):
+            return False
+        loader_type_node = _single_static_call_argument(value.args, value.keywords, keyword_name="dlltype")
+        return loader_type_node is not None and self._resolve_reference_names(loader_type_node) in {
+            frozenset({"len"}),
+            frozenset({"builtins.len"}),
+        }
 
     def _restore_reassigned_instance_member_defaults(self, target_name: str, resolved_names: _AliasValue) -> None:
         if not isinstance(resolved_names, frozenset):
@@ -1975,6 +2427,16 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def _pop_alias_scope(self) -> None:
         self.alias_scopes.pop()
 
+    def _sys_modules_target_name(self, target: ast.AST) -> str | None:
+        if not isinstance(target, ast.Subscript):
+            return None
+        module_name = _resolve_static_string(target.slice)
+        if module_name not in _TRACKED_STATIC_MODULE_ROOTS:
+            return None
+        if self._resolve_reference_names(target.value) != frozenset({"sys.modules"}):
+            return None
+        return f"{_SYS_MODULES_BINDING_PREFIX}{module_name}"
+
     def _bind_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         if isinstance(target, ast.Name):
             resolved_names = self._resolve_binding_value_names(value)
@@ -1988,6 +2450,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 else:
                     self._class_identity_aliases.pop(target.id, None)
         elif isinstance(target, ast.Subscript):
+            registry_target_name = self._sys_modules_target_name(target)
+            if registry_target_name is not None:
+                self._bind_name(registry_target_name, self._resolve_binding_value_names(value))
+                return
             key = _resolve_static_string(target.slice)
             roots = _resolve_namespace_mapping_roots(
                 target.value,
@@ -1996,7 +2462,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
             )
             if key is not None and roots is not None:
+                if self._namespace_mapping_dispatch_is_uncertain(roots):
+                    self._invalidate_unknown_callable_side_effects()
+                    return
                 resolved_value = self._resolve_binding_value_names(value)
+                roots = self._promote_mutated_statically_inert_loader_roots(roots, key, value, resolved_value)
                 localized_value = self._localize_instance_binding_value(key, value, resolved_value)
                 for root in roots:
                     if root in _TRACKED_MODULE_NAMESPACE_ALIASES:
@@ -2007,11 +2477,23 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                         self._bind_name(key, localized_value)
                         self._restore_reassigned_instance_member_defaults(key, localized_value)
                         continue
-                    self._bind_member_reference(f"{root}.{key}", localized_value)
+                    if root.startswith(_STATIC_INERT_VALUE_PREFIX):
+                        self._record_statically_inert_loader_member_write(frozenset({root}), key, localized_value)
+                    else:
+                        self._bind_member_reference(f"{root}.{key}", localized_value)
         elif isinstance(target, ast.Attribute):
+            self._discard_statically_inert_class_method_binding(target)
+            resolved_owner_names = self._resolve_reference_names(target.value)
+            resolved_value = self._resolve_binding_value_names(value)
+            resolved_owner_names = self._promote_mutated_statically_inert_loader_roots(
+                resolved_owner_names or frozenset(),
+                target.attr,
+                value,
+                resolved_value,
+                invokes_setattr_dispatch=True,
+            )
             syntactic_name, overwritable_target_names = self._overwritable_target_names(target)
             target_names = set(overwritable_target_names)
-            resolved_owner_names = self._resolve_reference_names(target.value)
             if target.attr == "dict" and resolved_owner_names is not None and "builtins" in resolved_owner_names:
                 target_names.add("builtins.dict")
             has_tracked_local_binding = self._has_tracked_local_static_member_binding(syntactic_name)
@@ -2021,9 +2503,22 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 syntactic_name
             ):
                 target_names.add(syntactic_name)
+            module_roots = frozenset(
+                owner_name
+                for owner_name in resolved_owner_names or frozenset()
+                if owner_name in _TRACKED_STATIC_MODULE_ROOTS
+            )
+            if module_roots and not self._module_attribute_helper_has_canonical_dispatch(module_roots):
+                self._invalidate_unknown_callable_side_effects()
+                return
+            self._record_statically_inert_loader_member_write(
+                resolved_owner_names or frozenset(), target.attr, resolved_value
+            )
             if not target_names:
                 return
-            resolved_value = self._resolve_binding_value_names(value)
+            if self._tracked_module_attribute_dispatch_is_uncertain(target_names):
+                self._invalidate_unknown_callable_side_effects()
+                return
             for target_name in target_names:
                 if target_name == "builtins.dict":
                     self._bind_name(target_name, resolved_value)
@@ -2031,6 +2526,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     self._bind_member_reference(target_name, resolved_value)
             if syntactic_name is not None:
                 self._bind_name(syntactic_name, resolved_value)
+                if self._non_module_scope_depth == 0:
+                    class_identity_names = self._resolve_class_identity_names(value)
+                    if class_identity_names:
+                        self._class_identity_aliases[syntactic_name] = class_identity_names
+                    else:
+                        self._class_identity_aliases.pop(syntactic_name, None)
         elif isinstance(target, ast.Starred):
             # Starred unpacking (``a, *b = seq``) binds ``b`` to a list slice,
             # which is not a single static reference; drop the binding so we
@@ -2075,6 +2576,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 return
             self._bind_name(target.id, None)
         elif isinstance(target, ast.Subscript):
+            registry_target_name = self._sys_modules_target_name(target)
+            if registry_target_name is not None:
+                self._bind_name(registry_target_name, None)
+                return
             key = _resolve_static_string(target.slice)
             roots = _resolve_namespace_mapping_roots(
                 target.value,
@@ -2083,19 +2588,40 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
             )
             if key is not None and roots is not None:
+                if self._namespace_mapping_dispatch_is_uncertain(roots):
+                    self._invalidate_unknown_callable_side_effects()
+                    return
                 for root in roots:
                     self._delete_namespace_key(root, key)
         elif isinstance(target, ast.Attribute):
+            self._discard_statically_inert_class_method_binding(target)
             syntactic_name, target_names = self._overwritable_target_names(target)
+            resolved_owner_names = self._resolve_reference_names(target.value)
+            self._record_deleted_statically_inert_loader_member(resolved_owner_names or frozenset(), target.attr)
+            module_roots = frozenset(
+                owner_name
+                for owner_name in resolved_owner_names or frozenset()
+                if owner_name in _TRACKED_STATIC_MODULE_ROOTS
+            )
+            if module_roots and not self._module_attribute_helper_has_canonical_dispatch(module_roots):
+                self._invalidate_unknown_callable_side_effects()
+                return
+            if syntactic_name in _TRACKED_STATIC_MEMBER_REFERENCES and self._should_track_syntactic_static_reference(
+                syntactic_name
+            ):
+                target_names = frozenset({*target_names, syntactic_name})
             dynamic_target_names = {
                 target_name for target_name in target_names if _is_dynamic_overwritable_high_risk_reference(target_name)
             }
+            if self._tracked_module_attribute_dispatch_is_uncertain(target_names):
+                self._invalidate_unknown_callable_side_effects()
+                return
             if dynamic_target_names and self._restore_deleted_dynamic_target_bindings(target_names, syntactic_name):
                 return
             for target_name in target_names:
-                self._bind_name(target_name, None)
+                self._bind_member_reference(target_name, frozenset())
             if syntactic_name is not None and target_names:
-                self._bind_name(syntactic_name, None)
+                self._bind_member_reference(syntactic_name, frozenset())
         elif isinstance(target, ast.Starred):
             self._delete_target_binding(target.value)
         elif isinstance(target, (ast.Tuple, ast.List)):
@@ -2120,8 +2646,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             )
             method_name = node.func.attr
             argument_offset = 1 if is_descriptor else 0
-            if method_name == "__setitem__":
+            if method_name in {"__setitem__", "__delitem__"}:
                 expected_arg_counts = {3} if is_descriptor else {2}
+                if method_name == "__delitem__":
+                    expected_arg_counts = {2} if is_descriptor else {1}
             else:
                 expected_arg_counts = {2, 3} if is_descriptor else {1, 2}
             if len(node.args) not in expected_arg_counts:
@@ -2133,6 +2661,42 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 if method_name in _NAMESPACE_WRITE_METHODS and len(node.args) > argument_offset + 1
                 else None
             )
+        elif isinstance(node.func, ast.Name):
+            resolved_descriptor_names = self._resolve_reference_names(node.func)
+            for bound_method in ("__setitem__", "setdefault", "pop", "__delitem__"):
+                bound_roots = {
+                    resolved_name.removesuffix(f".__dict__.{bound_method}")
+                    for resolved_name in resolved_descriptor_names or frozenset()
+                    if resolved_name.endswith(f".__dict__.{bound_method}")
+                }
+                expected_lengths = {
+                    "__setitem__": {2},
+                    "setdefault": {1, 2},
+                    "pop": {1, 2},
+                    "__delitem__": {1},
+                }[bound_method]
+                if bound_roots and len(node.args) in expected_lengths:
+                    key = _resolve_static_string(node.args[0])
+                    if key is not None:
+                        value_node = (
+                            node.args[1] if bound_method in _NAMESPACE_WRITE_METHODS and len(node.args) > 1 else None
+                        )
+                        return bound_method, frozenset(bound_roots), key, value_node
+            descriptor_methods = {
+                resolved_name.rsplit(".", maxsplit=1)[-1]
+                for resolved_name in (resolved_descriptor_names or frozenset()) & _NAMESPACE_MUTATION_DESCRIPTORS
+            }
+            if len(descriptor_methods) != 1:
+                return None
+            method_name = descriptor_methods.pop()
+            expected_arg_counts = {3} if method_name == "__setitem__" else {2, 3}
+            if method_name == "__delitem__":
+                expected_arg_counts = {2}
+            if len(node.args) not in expected_arg_counts:
+                return None
+            mapping_node = node.args[0]
+            key_node = node.args[1]
+            value_node = node.args[2] if method_name in _NAMESPACE_WRITE_METHODS and len(node.args) > 2 else None
         else:
             return None
 
@@ -2179,18 +2743,18 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 allow_module_locals_mapping=self._non_module_scope_depth == 0,
             )
             if guaranteed:
-                return existing_names
+                return default_names if existing_names == frozenset() else existing_names
             return self._merge_alias_values(existing_names, default_names)
         if root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
             existing_names, guaranteed = _resolve_local_namespace_key_names(key, self.alias_scopes)
             if guaranteed:
-                return existing_names
+                return default_names if existing_names == frozenset() else existing_names
             return self._merge_alias_values(default_names)
 
         member_name = f"{root}.{key}"
         existing_names, guaranteed = _lookup_bound_alias(member_name, self.alias_scopes)
         if guaranteed:
-            return existing_names
+            return default_names if existing_names == frozenset() else existing_names
         return self._merge_alias_values(frozenset({member_name}), default_names)
 
     def _delete_module_namespace_key(self, key: str) -> None:
@@ -2209,25 +2773,73 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
             self.alias_scopes[-1].pop(key, None)
             return
+        self._record_deleted_statically_inert_loader_member(frozenset({root}), key)
         dotted_name = f"{root}.{key}"
-        if dotted_name in _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES:
-            self._bind_member_reference(dotted_name, None)
+        if dotted_name in _TRACKED_STATIC_MEMBER_REFERENCES:
+            self._bind_member_reference(dotted_name, frozenset())
             return
         for scope in self.alias_scopes:
             scope.pop(dotted_name, None)
 
-    def _record_namespace_write_call(self, node: ast.Call) -> None:
+    def _apply_static_namespace_updates(self, roots: frozenset[str], updates: list[tuple[str, ast.expr]]) -> None:
+        if self._namespace_mapping_dispatch_is_uncertain(roots):
+            self._invalidate_unknown_callable_side_effects()
+            return
+        for update_key, update_value_node in updates:
+            resolved_value = self._resolve_binding_value_names(update_value_node)
+            roots = self._promote_mutated_statically_inert_loader_roots(
+                roots, update_key, update_value_node, resolved_value
+            )
+            localized_value = self._localize_instance_binding_value(update_key, update_value_node, resolved_value)
+            for root in roots:
+                if root in _TRACKED_MODULE_NAMESPACE_ALIASES:
+                    self._bind_module_namespace_key(update_key, localized_value)
+                    self._restore_reassigned_instance_member_defaults(update_key, localized_value)
+                elif root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
+                    self._bind_name(update_key, localized_value)
+                    self._restore_reassigned_instance_member_defaults(update_key, localized_value)
+                else:
+                    self._bind_member_reference(f"{root}.{update_key}", localized_value)
+
+    def _invalidate_unknown_namespace_updates(self, roots: frozenset[str]) -> None:
+        for root in roots:
+            prefix = f"{root}."
+            for reference_name in _TRACKED_STATIC_MEMBER_REFERENCES:
+                if reference_name.startswith(prefix):
+                    self._bind_member_reference(
+                        reference_name,
+                        frozenset({reference_name, f"{_STATIC_UNCERTAIN_MEMBER_PREFIX}{reference_name}"}),
+                    )
+
+    def _invalidate_unknown_callable_side_effects(self) -> None:
+        if self._comprehension_unknown_side_effects and self._deferred_execution_depth == 0:
+            self._comprehension_unknown_side_effects[-1] = True
+        self._invalidate_statically_inert_class_methods()
+        self._invalidate_statically_inert_values()
+        for reference_name in _TRACKED_STATIC_MEMBER_REFERENCES:
+            self._bind_member_reference(
+                reference_name,
+                frozenset({reference_name, f"{_STATIC_UNCERTAIN_MEMBER_PREFIX}{reference_name}"}),
+            )
+
+    def _record_namespace_write_call(self, node: ast.Call) -> bool:
         update_roots: frozenset[str] | None = None
         update_arguments = node.args
+        update_methods = {"update", "__ior__"}
         syntactic_method_name = _resolve_call_name(node.func)
         resolved_method_names = (
             _apply_aliases(syntactic_method_name, self.alias_scopes) if syntactic_method_name is not None else None
         )
         descriptor_names: set[str] = set()
         for resolved_method_name in resolved_method_names or frozenset():
-            if resolved_method_name not in {"dict.update", "builtins.dict.update"}:
+            if resolved_method_name not in {
+                "dict.update",
+                "builtins.dict.update",
+                "dict.__ior__",
+                "builtins.dict.__ior__",
+            }:
                 continue
-            descriptor_root = resolved_method_name.removesuffix(".update")
+            descriptor_root = resolved_method_name.rsplit(".", maxsplit=1)[0]
             rebound_root_names, has_rebound_root = _lookup_bound_alias(descriptor_root, self.alias_scopes)
             if not has_rebound_root or rebound_root_names == frozenset({descriptor_root}):
                 descriptor_names.add(resolved_method_name)
@@ -2239,14 +2851,16 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
             )
             update_arguments = node.args[1:]
-        elif isinstance(node.func, ast.Attribute) and node.func.attr == "update":
+        elif isinstance(node.func, ast.Attribute) and node.func.attr in update_methods:
             resolved_attribute_methods = self._resolve_reference_names(node.func)
             attribute_descriptor_names: set[str] = set()
             for resolved_method_name in (resolved_attribute_methods or frozenset()) & {
                 "dict.update",
                 "builtins.dict.update",
+                "dict.__ior__",
+                "builtins.dict.__ior__",
             }:
-                descriptor_root = resolved_method_name.removesuffix(".update")
+                descriptor_root = resolved_method_name.rsplit(".", maxsplit=1)[0]
                 rebound_root_names, has_rebound_root = _lookup_bound_alias(descriptor_root, self.alias_scopes)
                 if not has_rebound_root or rebound_root_names == frozenset({descriptor_root}):
                     attribute_descriptor_names.add(resolved_method_name)
@@ -2268,7 +2882,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         else:
             resolved_method_names = self._resolve_reference_names(node.func)
             if resolved_method_names is not None:
-                aliased_descriptor_names = resolved_method_names & {"dict.update", "builtins.dict.update"}
+                aliased_descriptor_names = resolved_method_names & {
+                    "dict.update",
+                    "builtins.dict.update",
+                    "dict.__ior__",
+                    "builtins.dict.__ior__",
+                }
                 if aliased_descriptor_names and node.args:
                     update_roots = _resolve_namespace_mapping_roots(
                         node.args[0],
@@ -2278,26 +2897,17 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     )
                     update_arguments = node.args[1:]
                 bound_roots = {
-                    name.removesuffix(".__dict__.update")
+                    name.rsplit(".__dict__.", maxsplit=1)[0]
                     for name in resolved_method_names
-                    if name.endswith(".__dict__.update")
+                    if name.endswith((".__dict__.update", ".__dict__.__ior__"))
                 }
                 if bound_roots:
                     update_roots = frozenset(bound_roots)
-        positional_update = (
-            update_arguments[0] if update_arguments and isinstance(update_arguments[0], ast.Dict) else None
-        )
+        positional_updates = _resolve_static_namespace_update_items(update_arguments[0]) if update_arguments else []
         if (
-            update_roots
+            update_roots is not None
             and len(update_arguments) <= 1
-            and (not update_arguments or positional_update is not None)
-            and (
-                positional_update is None
-                or all(
-                    update_key_node is not None and _resolve_static_string(update_key_node) is not None
-                    for update_key_node in positional_update.keys
-                )
-            )
+            and positional_updates is not None
             and all(
                 keyword.arg is not None
                 or (
@@ -2310,16 +2920,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 for keyword in node.keywords
             )
         ):
-            updates: list[tuple[str, ast.expr]] = []
-            if positional_update is not None:
-                for update_key_node, update_value_node in zip(
-                    positional_update.keys, positional_update.values, strict=True
-                ):
-                    if update_key_node is None:
-                        continue
-                    update_key = _resolve_static_string(update_key_node)
-                    if update_key is not None:
-                        updates.append((update_key, update_value_node))
+            updates = list(positional_updates)
             for keyword in node.keywords:
                 if keyword.arg is not None:
                     updates.append((keyword.arg, keyword.value))
@@ -2332,30 +2933,26 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                         update_key = _resolve_static_string(update_key_node)
                         if update_key is not None:
                             updates.append((update_key, update_value_node))
-            for update_key, update_value_node in updates:
-                resolved_value = self._resolve_binding_value_names(update_value_node)
-                localized_value = self._localize_instance_binding_value(update_key, update_value_node, resolved_value)
-                for root in update_roots:
-                    if root in _TRACKED_MODULE_NAMESPACE_ALIASES:
-                        self._bind_module_namespace_key(update_key, localized_value)
-                        self._restore_reassigned_instance_member_defaults(update_key, localized_value)
-                    elif root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
-                        self._bind_name(update_key, localized_value)
-                        self._restore_reassigned_instance_member_defaults(update_key, localized_value)
-                    else:
-                        self._bind_member_reference(f"{root}.{update_key}", localized_value)
-            return
+            self._apply_static_namespace_updates(update_roots, updates)
+            return True
+        if update_roots is not None:
+            self._invalidate_unknown_namespace_updates(update_roots)
+            return True
         write_call = self._resolve_namespace_write_call(node)
         if write_call is None:
-            return
+            return False
 
         method_name, roots, key, value_node = write_call
-        if method_name == "pop":
+        if self._namespace_mapping_dispatch_is_uncertain(roots):
+            self._invalidate_unknown_callable_side_effects()
+            return True
+        if method_name in {"pop", "__delitem__"}:
             for root in roots:
                 self._delete_namespace_key(root, key)
-            return
+            return True
 
         value_names = self._resolve_binding_value_names(value_node) if value_node is not None else None
+        roots = self._promote_mutated_statically_inert_loader_roots(roots, key, value_node, value_names)
         for root in roots:
             resolved_value = (
                 self._setdefault_value_for_key(root, key, value_names) if method_name == "setdefault" else value_names
@@ -2371,50 +2968,60 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 self._restore_reassigned_instance_member_defaults(key, localized_value)
                 continue
             self._bind_member_reference(f"{root}.{key}", resolved_value)
+        return True
 
-    def _record_setattr_call(self, node: ast.Call) -> None:
+    def _record_setattr_call(self, node: ast.Call) -> bool:
         helper_name = _resolve_call_name(node.func)
         resolved_helper_names = _apply_aliases(helper_name, self.alias_scopes) if helper_name is not None else None
-        if not resolved_helper_names or not (resolved_helper_names & {"setattr", "builtins.setattr"}):
-            return
         expanded_args = _expanded_static_call_args(node)
-        if expanded_args is None or len(expanded_args) != 3 or not _keywords_are_all_empty_static_kwargs(node.keywords):
-            return
-        attr_name = _resolve_static_string(expanded_args[1])
+        if expanded_args is None or not _keywords_are_all_empty_static_kwargs(node.keywords):
+            return False
+        target_node: ast.AST
+        value_node: ast.AST
+        is_bound_inert_setattr = False
+        if resolved_helper_names and resolved_helper_names & {"setattr", "builtins.setattr"}:
+            if len(expanded_args) != 3:
+                return False
+            target_node, attr_node, value_node = expanded_args
+        elif isinstance(node.func, ast.Attribute) and node.func.attr == "__setattr__":
+            if len(expanded_args) != 2:
+                return False
+            target_node = node.func.value
+            attr_node, value_node = expanded_args
+            is_bound_inert_setattr = True
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "__call__"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "__setattr__"
+        ):
+            if len(expanded_args) != 2:
+                return False
+            target_node = node.func.value.value
+            attr_node, value_node = expanded_args
+            is_bound_inert_setattr = True
+        else:
+            return False
+        attr_name = _resolve_static_string(attr_node)
         if attr_name is None:
-            return
-        target_roots = self._resolve_reference_names(expanded_args[0])
-        if target_roots is None:
-            return
-        resolved_value = self._resolve_binding_value_names(expanded_args[2])
-        target_names = {
-            target_name
-            for target_root in target_roots
-            for target_name in (f"{target_root}.{attr_name}",)
-            if _is_overwritable_high_risk_reference(target_name)
-        }
-        syntactic_target_root = _resolve_call_name(expanded_args[0])
-        syntactic_target_name = f"{syntactic_target_root}.{attr_name}" if syntactic_target_root is not None else None
-        if syntactic_target_name is not None and target_names:
-            target_names.add(syntactic_target_name)
-        for target_name in target_names:
-            self._bind_name(target_name, resolved_value)
-
-    def _record_delattr_call(self, node: ast.Call) -> None:
-        helper_name = _resolve_call_name(node.func)
-        resolved_helper_names = _apply_aliases(helper_name, self.alias_scopes) if helper_name is not None else None
-        if not resolved_helper_names or not (resolved_helper_names & {"delattr", "builtins.delattr"}):
-            return
-        expanded_args = _expanded_static_call_args(node)
-        if expanded_args is None or len(expanded_args) != 2 or not _keywords_are_all_empty_static_kwargs(node.keywords):
-            return
-        target_node = expanded_args[0]
-        attr_name = _resolve_static_string(expanded_args[1])
-        if attr_name is None:
-            return
+            return False
+        for class_name in self._resolve_class_identity_names(target_node):
+            self._bind_name(f"{_STATIC_INERT_METHOD_PREFIX}{class_name}.{attr_name}", None)
         target_roots = self._resolve_reference_names(target_node)
         if target_roots is None:
-            return
+            return False
+        target_is_statically_inert = self._contains_statically_inert_value(target_roots)
+        if is_bound_inert_setattr and not target_is_statically_inert:
+            return False
+        resolved_value = self._resolve_binding_value_names(value_node)
+        target_roots = self._promote_mutated_statically_inert_loader_roots(
+            target_roots,
+            attr_name,
+            value_node,
+            resolved_value,
+            invokes_setattr_dispatch=True,
+        )
+        self._record_statically_inert_loader_member_write(target_roots, attr_name, resolved_value)
         target_names = {
             target_name
             for target_root in target_roots
@@ -2425,15 +3032,255 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         syntactic_target_name = f"{syntactic_target_root}.{attr_name}" if syntactic_target_root is not None else None
         if syntactic_target_name is not None and target_names:
             target_names.add(syntactic_target_name)
+        for target_name in target_names:
+            self._bind_member_reference(target_name, resolved_value)
+        return target_is_statically_inert or (
+            bool(target_names) and self._module_attribute_helper_has_canonical_dispatch(target_roots)
+        )
+
+    def _record_delattr_call(self, node: ast.Call) -> bool:
+        helper_name = _resolve_call_name(node.func)
+        resolved_helper_names = _apply_aliases(helper_name, self.alias_scopes) if helper_name is not None else None
+        if not resolved_helper_names or not (resolved_helper_names & {"delattr", "builtins.delattr"}):
+            return False
+        expanded_args = _expanded_static_call_args(node)
+        if expanded_args is None or len(expanded_args) != 2 or not _keywords_are_all_empty_static_kwargs(node.keywords):
+            return False
+        target_node = expanded_args[0]
+        attr_name = _resolve_static_string(expanded_args[1])
+        if attr_name is None:
+            return False
+        for class_name in self._resolve_class_identity_names(target_node):
+            self._bind_name(f"{_STATIC_INERT_METHOD_PREFIX}{class_name}.{attr_name}", None)
+        target_roots = self._resolve_reference_names(target_node)
+        if target_roots is None:
+            return False
+        self._invalidate_noncanonical_statically_inert_loader_dispatch(
+            target_node, _STATIC_CTYPES_LIBRARY_LOADER_DELETE_DISPATCH_REFERENCES
+        )
+        self._record_deleted_statically_inert_loader_member(target_roots, attr_name)
+        target_names = {
+            target_name
+            for target_root in target_roots
+            for target_name in (f"{target_root}.{attr_name}",)
+            if _is_overwritable_high_risk_reference(target_name)
+        }
+        syntactic_target_root = _resolve_call_name(target_node)
+        syntactic_target_name = f"{syntactic_target_root}.{attr_name}" if syntactic_target_root is not None else None
+        if syntactic_target_name is not None and target_names:
+            target_names.add(syntactic_target_name)
+        has_canonical_dispatch = self._module_attribute_helper_has_canonical_dispatch(target_roots)
         if self._restore_deleted_dynamic_target_bindings(target_names, syntactic_target_name):
-            return
+            return True
         for target_name in target_names:
             if _is_overwritable_high_risk_reference(target_name):
-                self._bind_name(target_name, None)
+                self._bind_member_reference(target_name, frozenset())
+        return bool(target_names) and has_canonical_dispatch
+
+    def _module_attribute_helper_has_canonical_dispatch(self, target_roots: frozenset[str]) -> bool:
+        if not target_roots or not target_roots <= _TRACKED_STATIC_MODULE_ROOTS:
+            return False
+        return all(
+            _resolve_aliases(f"{target_root}.__class__", self.alias_scopes) == frozenset({f"{target_root}.__class__"})
+            for target_root in target_roots
+        )
+
+    def _namespace_mapping_dispatch_is_uncertain(self, roots: frozenset[str]) -> bool:
+        module_roots = frozenset(root for root in roots if root in _TRACKED_STATIC_MODULE_ROOTS)
+        return bool(module_roots) and not self._module_attribute_helper_has_canonical_dispatch(module_roots)
+
+    def _truthy_builtin_call_is_statically_side_effect_free(
+        self, node: ast.Call, resolved_function_names: frozenset[str] | None
+    ) -> bool:
+        if resolved_function_names in {frozenset({"len"}), frozenset({"builtins.len"})}:
+            return (
+                len(node.args) == 1
+                and not node.keywords
+                and self._literal_class_metadata_value_is_statically_inert(node.args[0])
+            )
+        if resolved_function_names in {frozenset({"dict"}), frozenset({"builtins.dict"})}:
+            return (
+                not node.args
+                and not node.keywords
+                and _resolve_aliases("builtins.dict", self.alias_scopes) == frozenset({"builtins.dict"})
+            )
+        return False
+
+    def _static_module_getattr_call_is_side_effect_free(
+        self, node: ast.Call, resolved_function_names: frozenset[str] | None
+    ) -> bool:
+        if not resolved_function_names or not resolved_function_names <= {"getattr", "builtins.getattr"}:
+            return False
+        if "getattr" in resolved_function_names and (
+            _lookup_bound_alias("getattr", self.alias_scopes)[1]
+            or _resolve_aliases("builtins.getattr", self.alias_scopes) != frozenset({"builtins.getattr"})
+        ):
+            return False
+        if node.keywords:
+            return True
+        if len(node.args) not in {2, 3}:
+            return False
+        target_roots = self._resolve_reference_names(node.args[0])
+        if target_roots is None:
+            return False
+        if self._module_attribute_helper_has_canonical_dispatch(target_roots):
+            return True
+        resolved_result_names = self._resolve_reference_names(node)
+        return (
+            bool(target_roots)
+            and all(_is_tracked_dynamic_instance_root(root) for root in target_roots)
+            and resolved_result_names in {frozenset({"len"}), frozenset({"builtins.len"})}
+        )
+
+    def _static_ctypes_loader_getattribute_call_is_side_effect_free(self, node: ast.Call) -> bool:
+        if not isinstance(node.func, ast.Attribute) or node.func.attr != "__getattribute__" or node.keywords:
+            return False
+        if len(node.args) == 1:
+            target_node = node.func.value
+        elif len(node.args) == 2 and self._resolve_reference_names(node.func.value) == frozenset({"builtins.object"}):
+            target_node = node.args[0]
+        else:
+            return False
+        target_roots = self._resolve_reference_names(target_node)
+        return (
+            target_roots is not None
+            and bool(target_roots)
+            and target_roots <= _CTYPES_LIBRARY_LOADER_OBJECTS
+            and self._module_attribute_helper_has_canonical_dispatch(frozenset({"ctypes"}))
+        )
+
+    def _unbound_explicit_dunder_call_is_nonexecuting(self, node: ast.Call) -> bool:
+        current_func: ast.AST = node.func
+        while isinstance(current_func, ast.Call):
+            current_func = current_func.func
+        if (
+            not isinstance(current_func, ast.Attribute)
+            or current_func.attr not in {"__getattr__", "__getattribute__"}
+            or not isinstance(current_func.value, ast.Name)
+        ):
+            return False
+        _binding, found = _lookup_bound_alias(current_func.value.id, self.alias_scopes)
+        return not found and current_func.value.id != "object"
+
+    def _tracked_module_attribute_dispatch_is_uncertain(self, target_names: set[str] | frozenset[str]) -> bool:
+        module_roots = frozenset(
+            target_name.partition(".")[0]
+            for target_name in target_names
+            if target_name.partition(".")[0] in _TRACKED_STATIC_MODULE_ROOTS
+        )
+        return bool(module_roots) and not self._module_attribute_helper_has_canonical_dispatch(module_roots)
+
+    def _tracked_module_attribute_load_dispatch_is_uncertain(self, node: ast.Attribute) -> bool:
+        owner_names = self._resolve_reference_names(node.value)
+        module_roots = frozenset(
+            owner_name for owner_name in owner_names or frozenset() if owner_name in _TRACKED_STATIC_MODULE_ROOTS
+        )
+        return bool(module_roots) and not self._module_attribute_helper_has_canonical_dispatch(module_roots)
+
+    def _visit_truth_test(self, node: ast.AST) -> bool:
+        self.visit(node)
+        return self._invalidate_noncanonical_module_protocol_use(
+            node, inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_TRUTH_DISPATCH_REFERENCES
+        )
+
+    def _invalidate_noncanonical_module_protocol_use(
+        self, node: ast.AST, *, inert_loader_dispatch_references: frozenset[str] = frozenset()
+    ) -> bool:
+        if inert_loader_dispatch_references:
+            self._invalidate_noncanonical_statically_inert_loader_dispatch(node, inert_loader_dispatch_references)
+        resolved_names = self._resolve_reference_names(node)
+        module_roots = frozenset(
+            resolved_name
+            for resolved_name in resolved_names or frozenset()
+            if resolved_name in _TRACKED_STATIC_MODULE_ROOTS
+        )
+        if module_roots and not self._module_attribute_helper_has_canonical_dispatch(module_roots):
+            self._invalidate_unknown_callable_side_effects()
+            return True
+        return False
+
+    @staticmethod
+    def _inert_loader_unary_dispatch_references(operator: ast.unaryop) -> frozenset[str]:
+        member = {
+            ast.UAdd: "__pos__",
+            ast.USub: "__neg__",
+            ast.Invert: "__invert__",
+        }.get(type(operator))
+        return frozenset({f"ctypes.LibraryLoader.{member}"}) if member is not None else frozenset()
+
+    @staticmethod
+    def _inert_loader_binary_dispatch_references(operator: ast.operator, *, augmented: bool = False) -> frozenset[str]:
+        member = {
+            ast.Add: "add",
+            ast.Sub: "sub",
+            ast.Mult: "mul",
+            ast.MatMult: "matmul",
+            ast.Div: "truediv",
+            ast.FloorDiv: "floordiv",
+            ast.Mod: "mod",
+            ast.Pow: "pow",
+            ast.LShift: "lshift",
+            ast.RShift: "rshift",
+            ast.BitAnd: "and",
+            ast.BitXor: "xor",
+            ast.BitOr: "or",
+        }.get(type(operator))
+        if member is None:
+            return frozenset()
+        prefixes = {"", "r", "i"} if augmented else {"", "r"}
+        return frozenset(f"ctypes.LibraryLoader.__{prefix}{member}__" for prefix in prefixes)
+
+    @staticmethod
+    def _inert_loader_compare_dispatch_references(operator: ast.cmpop) -> frozenset[str]:
+        references = {
+            ast.Eq: {"__eq__"},
+            ast.NotEq: {"__ne__"},
+            ast.Lt: {"__lt__", "__gt__"},
+            ast.LtE: {"__le__", "__ge__"},
+            ast.Gt: {"__gt__", "__lt__"},
+            ast.GtE: {"__ge__", "__le__"},
+            ast.In: {"__contains__", "__iter__"},
+            ast.NotIn: {"__contains__", "__iter__"},
+        }.get(type(operator), set())
+        return frozenset(f"ctypes.LibraryLoader.{reference}" for reference in references)
 
     def _shadow_binding_target(self, target: ast.AST) -> None:
         for name in _binding_names(target):
             self._bind_name(name, None)
+        if isinstance(target, (ast.Attribute, ast.Subscript)):
+            if not self._restore_possible_qualified_high_risk_target(target):
+                self._bind_target_to_value(target, ast.Constant(value=None))
+        elif isinstance(target, ast.Starred):
+            self._shadow_binding_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                self._shadow_binding_target(element)
+
+    def _restore_possible_qualified_high_risk_target(self, target: ast.Attribute | ast.Subscript) -> bool:
+        target_names: set[str] = set()
+        syntactic_name: str | None = None
+        if isinstance(target, ast.Attribute):
+            syntactic_name, overwritable_target_names = self._overwritable_target_names(target)
+            target_names.update(overwritable_target_names)
+        else:
+            key = _resolve_static_string(target.slice)
+            roots = _resolve_namespace_mapping_roots(
+                target.value,
+                self.alias_scopes,
+                allow_module_locals_mapping=self._non_module_scope_depth == 0,
+                allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+            )
+            if key is not None and roots is not None:
+                target_names.update(
+                    f"{root}.{key}" for root in roots if _is_overwritable_high_risk_reference(f"{root}.{key}")
+                )
+        if not target_names:
+            return False
+        for target_name in target_names:
+            self._bind_member_reference(target_name, frozenset({target_name}))
+        if syntactic_name is not None:
+            self._bind_name(syntactic_name, frozenset(target_names))
+        return True
 
     def _resolve_target_bindings(self, target: ast.AST, value: ast.AST) -> _AliasScope:
         if isinstance(target, ast.Name):
@@ -2454,12 +3301,40 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if not isinstance(iterable, (ast.Tuple, ast.List, ast.Set)):
             self._shadow_binding_target(target)
             return
-        candidate_bindings = [self._resolve_target_bindings(target, element) for element in iterable.elts]
-        for name in _binding_names(target):
-            resolved_names = frozenset(
-                alias for bindings in candidate_bindings for alias in (bindings.get(name) or frozenset())
-            )
-            self._bind_name(name, resolved_names or None)
+        if len(iterable.elts) == 1:
+            self._bind_target_to_value(target, iterable.elts[0])
+            return
+        branch_scopes: list[_AliasScope] = []
+        for element in iterable.elts:
+            branch_scope: _AliasScope = {}
+            self._push_alias_scope(branch_scope)
+            try:
+                self._bind_target_to_value(target, element)
+                branch_scopes.append(dict(branch_scope))
+            finally:
+                self._pop_alias_scope()
+        self._merge_conditional_branch_scopes(branch_scopes)
+
+    def _invalidate_unpacking_target_value(self, target: ast.AST, value: ast.AST) -> None:
+        if not isinstance(target, (ast.Tuple, ast.List)):
+            return
+        self._invalidate_noncanonical_module_protocol_use(
+            value, inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_ITERATION_DISPATCH_REFERENCES
+        )
+        if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+            for target_element, value_element in zip(target.elts, value.elts, strict=True):
+                self._invalidate_unpacking_target_value(target_element, value_element)
+
+    def _invalidate_iterated_unpacking_target(self, target: ast.AST, iterable: ast.AST) -> None:
+        if not isinstance(target, (ast.Tuple, ast.List)):
+            return
+        if isinstance(iterable, (ast.Tuple, ast.List, ast.Set)):
+            for element in iterable.elts:
+                self._invalidate_unpacking_target_value(target, element)
+        elif isinstance(iterable, ast.Dict):
+            for key in iterable.keys:
+                if key is not None:
+                    self._invalidate_unpacking_target_value(target, key)
 
     def _bind_arguments(self, arguments: ast.arguments) -> None:
         positional_args = [*arguments.posonlyargs, *arguments.args]
@@ -2495,6 +3370,17 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if node.module is None:
+            return
+        if node.module in _TRACKED_STATIC_MODULE_ROOTS and not self._module_attribute_helper_has_canonical_dispatch(
+            frozenset({node.module})
+        ):
+            self._invalidate_unknown_callable_side_effects()
+            for alias in node.names:
+                if alias.name == "*":
+                    for local_name, _import_name in _wildcard_import_aliases(node.module):
+                        self._bind_name(local_name, None)
+                else:
+                    self._bind_name(alias.asname or alias.name, None)
             return
         for alias in node.names:
             if alias.name == "*":
@@ -2561,7 +3447,15 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         branch_names = {name for scope in branch_scopes for name in scope}
         for name in branch_names:
             implicit_builtins = name == "__builtins__" and len(self.alias_scopes) == 1
-            if name.startswith(_MODULE_NAMESPACE_WRITE_PREFIX):
+            if name.startswith(_STATIC_INERT_METHOD_PREFIX):
+                base_value = current_scope.get(name)
+                values = [scope.get(name, base_value) for scope in branch_scopes]
+                current_scope[name] = values[0] if values and all(value == values[0] for value in values) else None
+                continue
+            if name.startswith(_STATIC_CANONICAL_MEMBER_PREFIX):
+                reference_name = name.removeprefix(_STATIC_CANONICAL_MEMBER_PREFIX)
+                base_value = current_scope.get(name, frozenset({reference_name}))
+            elif name.startswith(_MODULE_NAMESPACE_WRITE_PREFIX):
                 key = name.removeprefix(_MODULE_NAMESPACE_WRITE_PREFIX)
                 base_value, _guaranteed = _resolve_module_namespace_key_names(
                     key,
@@ -2634,11 +3528,21 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def _visit_function_scope(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         for decorator in node.decorator_list:
             self.visit(decorator)
+            self._invalidate_noncanonical_module_protocol_use(
+                decorator, inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_CALL_DISPATCH_REFERENCES
+            )
         for default in [*node.args.defaults, *node.args.kw_defaults]:
             if default is not None:
                 self.visit(default)
-        if node.returns is not None:
-            self.visit(node.returns)
+        if not self._annotations_are_postponed:
+            for argument in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]:
+                if argument.annotation is not None:
+                    self.visit(argument.annotation)
+            for optional_argument in [node.args.vararg, node.args.kwarg]:
+                if optional_argument is not None and optional_argument.annotation is not None:
+                    self.visit(optional_argument.annotation)
+            if node.returns is not None:
+                self.visit(node.returns)
         self._push_alias_scope()
         try:
             self._bind_arguments(node.args)
@@ -3452,6 +4356,304 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 return True
         return False
 
+    @staticmethod
+    def _method_body_is_statically_inert(method: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        return all(
+            isinstance(statement, ast.Pass)
+            or (
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Constant)
+                and isinstance(statement.value.value, str)
+            )
+            for statement in method.body
+        )
+
+    @staticmethod
+    def _literal_class_metadata_value_is_statically_inert(value: ast.AST) -> bool:
+        if isinstance(value, ast.Constant):
+            return True
+        if isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+            return all(
+                _HighRiskPythonCallVisitor._literal_class_metadata_value_is_statically_inert(item)
+                for item in value.elts
+            )
+        if isinstance(value, ast.Dict):
+            return all(
+                key is not None
+                and _HighRiskPythonCallVisitor._literal_class_metadata_value_is_statically_inert(key)
+                and _HighRiskPythonCallVisitor._literal_class_metadata_value_is_statically_inert(item)
+                for key, item in zip(value.keys, value.values, strict=True)
+            )
+        return False
+
+    @staticmethod
+    def _class_metadata_annotation_is_statically_inert(annotation: ast.AST) -> bool:
+        return (
+            isinstance(annotation, ast.Name) and annotation.id in {"bool", "bytes", "float", "int", "object", "str"}
+        ) or (isinstance(annotation, ast.Constant) and isinstance(annotation.value, str))
+
+    def _record_statically_inert_class_methods(self, node: ast.ClassDef, class_scope: _AliasScope) -> None:
+        if len(self.alias_scopes) != 1 or node.decorator_list or node.bases or node.keywords:
+            return
+        if _resolve_aliases("builtins.__build_class__", self.alias_scopes) != frozenset({"builtins.__build_class__"}):
+            return
+        method_names = {
+            statement.name for statement in node.body if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for class_statement in node.body:
+            if isinstance(class_statement, ast.Pass) or (
+                isinstance(class_statement, ast.Expr)
+                and isinstance(class_statement.value, ast.Constant)
+                and isinstance(class_statement.value.value, str)
+            ):
+                continue
+            if (
+                isinstance(class_statement, ast.Assign)
+                and all(
+                    isinstance(target, ast.Name) and target.id not in method_names | {"staticmethod", "classmethod"}
+                    for target in class_statement.targets
+                )
+                and self._literal_class_metadata_value_is_statically_inert(class_statement.value)
+            ):
+                continue
+            if (
+                isinstance(class_statement, ast.AnnAssign)
+                and isinstance(class_statement.target, ast.Name)
+                and class_statement.target.id not in method_names | {"staticmethod", "classmethod"}
+                and (
+                    class_statement.value is None
+                    or self._literal_class_metadata_value_is_statically_inert(class_statement.value)
+                )
+                and self._class_metadata_annotation_is_statically_inert(class_statement.annotation)
+            ):
+                continue
+            if not isinstance(class_statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return
+            if not self._method_body_is_statically_inert(class_statement):
+                return
+            if not self._class_method_has_unshadowed_builtin_dispatch(class_statement, class_scope):
+                return
+        for method_name in method_names:
+            statement = self._class_method(node, method_name)
+            if statement is None:
+                continue
+            if not self._method_body_is_statically_inert(statement):
+                continue
+            if self._class_method_has_unshadowed_builtin_dispatch(statement, class_scope):
+                inert_name = f"{node.name}.{statement.name}"
+                self._bind_name(f"{_STATIC_INERT_METHOD_PREFIX}{inert_name}", frozenset({inert_name}))
+
+    def _class_method_has_unshadowed_builtin_dispatch(
+        self, method: ast.FunctionDef | ast.AsyncFunctionDef, class_scope: _AliasScope
+    ) -> bool:
+        if len(method.decorator_list) != 1:
+            return False
+        for decorator in method.decorator_list:
+            reference_name = _resolve_call_name(decorator)
+            if reference_name not in {"staticmethod", "classmethod"}:
+                continue
+            if reference_name in class_scope:
+                return False
+            _binding, found = _lookup_bound_alias(reference_name, self.alias_scopes)
+            canonical_name = f"builtins.{reference_name}"
+            if not found and _resolve_aliases(canonical_name, self.alias_scopes) == frozenset({canonical_name}):
+                return True
+        return False
+
+    def _is_statically_inert_class_method_call(self, func: ast.AST) -> bool:
+        if not isinstance(func, ast.Attribute):
+            return False
+        class_names = self._resolve_class_identity_names(func.value)
+        return bool(class_names) and all(
+            _lookup_bound_alias(f"{_STATIC_INERT_METHOD_PREFIX}{class_name}.{func.attr}", self.alias_scopes)
+            == (frozenset({f"{class_name}.{func.attr}"}), True)
+            for class_name in class_names
+        )
+
+    def _discard_statically_inert_class_method_binding(self, target: ast.Attribute) -> None:
+        for class_name in self._resolve_class_identity_names(target.value):
+            self._bind_name(f"{_STATIC_INERT_METHOD_PREFIX}{class_name}.{target.attr}", None)
+
+    def _discard_statically_inert_class_bindings(self, class_name: str) -> None:
+        inert_prefix = f"{_STATIC_INERT_METHOD_PREFIX}{class_name}."
+        inert_names = {name for scope in self.alias_scopes for name in scope if name.startswith(inert_prefix)}
+        for inert_name in inert_names:
+            self._bind_name(inert_name, None)
+
+    def _invalidate_statically_inert_class_methods(self) -> None:
+        inert_names = {
+            name for scope in self.alias_scopes for name in scope if name.startswith(_STATIC_INERT_METHOD_PREFIX)
+        }
+        for inert_name in inert_names:
+            self._bind_name(inert_name, None)
+
+    @staticmethod
+    def _contains_statically_inert_value(names: _AliasValue) -> bool:
+        return isinstance(names, frozenset) and any(name.startswith(_STATIC_INERT_VALUE_PREFIX) for name in names)
+
+    @staticmethod
+    def _promoted_statically_inert_loader_root(root: str) -> str:
+        suffix = root.removeprefix(_STATIC_INERT_CTYPES_LIBRARY_LOADER)
+        return f"{_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT}{suffix}"
+
+    def _statically_inert_loader_write_is_safe(
+        self, member_name: str, value: ast.AST | None, resolved_value: _AliasValue
+    ) -> bool:
+        if not self._statically_inert_loader_dispatch_is_canonical(
+            _STATIC_CTYPES_LIBRARY_LOADER_MUTATION_DISPATCH_REFERENCES
+        ):
+            return False
+        if resolved_value in {frozenset({"len"}), frozenset({"builtins.len"})}:
+            return True
+        return (
+            member_name != "_dlltype"
+            and value is not None
+            and (
+                self._literal_class_metadata_value_is_statically_inert(value)
+                or (
+                    isinstance(value, ast.Call)
+                    and not value.args
+                    and not value.keywords
+                    and (
+                        self._resolve_reference_names(value.func) == frozenset({"builtins.object"})
+                        or (
+                            self._resolve_reference_names(value.func)
+                            in {frozenset({"dict"}), frozenset({"builtins.dict"})}
+                            and _resolve_aliases("builtins.dict", self.alias_scopes) == frozenset({"builtins.dict"})
+                        )
+                    )
+                )
+            )
+        )
+
+    def _statically_inert_loader_dispatch_is_canonical(self, dispatch_references: frozenset[str]) -> bool:
+        return all(
+            _resolve_aliases(reference, self.alias_scopes) == frozenset({reference})
+            for reference in dispatch_references
+        )
+
+    def _record_statically_inert_loader_member_write(
+        self, roots: frozenset[str], member_name: str, resolved_value: _AliasValue
+    ) -> None:
+        for root in roots:
+            if root.startswith(_STATIC_INERT_VALUE_PREFIX):
+                self._bind_name(f"{_STATIC_INERT_MEMBER_STATUS_PREFIX}{root}.{member_name}", frozenset({"present"}))
+                self._bind_name(f"{root}.{member_name}", resolved_value)
+
+    def _record_deleted_statically_inert_loader_member(self, roots: frozenset[str], member_name: str) -> None:
+        for root in roots:
+            if root.startswith(_STATIC_INERT_VALUE_PREFIX):
+                self._bind_name(f"{_STATIC_INERT_MEMBER_STATUS_PREFIX}{root}.{member_name}", frozenset({"deleted"}))
+                self._bind_name(f"{root}.{member_name}", frozenset())
+
+    def _statically_inert_loader_member_was_deleted(self, roots: frozenset[str], member_name: str) -> bool:
+        return any(
+            root.startswith(_STATIC_INERT_VALUE_PREFIX)
+            and _lookup_bound_alias(f"{_STATIC_INERT_MEMBER_STATUS_PREFIX}{root}.{member_name}", self.alias_scopes)
+            == (frozenset({"deleted"}), True)
+            for root in roots
+        )
+
+    def _statically_inert_loader_member_is_present(self, roots: frozenset[str], member_name: str) -> bool:
+        return any(
+            root.startswith(_STATIC_INERT_VALUE_PREFIX)
+            and _lookup_bound_alias(f"{_STATIC_INERT_MEMBER_STATUS_PREFIX}{root}.{member_name}", self.alias_scopes)
+            == (frozenset({"present"}), True)
+            for root in roots
+        )
+
+    def _invalidate_noncanonical_statically_inert_loader_dispatch(
+        self, target: ast.AST, dispatch_references: frozenset[str]
+    ) -> None:
+        target_names = self._resolve_reference_names(target)
+        if self._contains_statically_inert_value(
+            target_names
+        ) and not self._statically_inert_loader_dispatch_is_canonical(dispatch_references):
+            self._invalidate_unknown_callable_side_effects()
+
+    def _statically_present_inert_loader_reflective_read(
+        self, node: ast.Call
+    ) -> tuple[ast.AST, frozenset[str], frozenset[str]] | None:
+        helper_names = self._resolve_reference_names(node.func)
+        is_getattr = bool(helper_names and helper_names <= {"getattr", "builtins.getattr"})
+        is_hasattr = bool(helper_names and helper_names <= {"hasattr", "builtins.hasattr"})
+        if not (is_getattr or is_hasattr) or node.keywords:
+            return None
+        expected_arg_counts = {2, 3} if is_getattr else {2}
+        if len(node.args) not in expected_arg_counts:
+            return None
+        target_node, attr_node = node.args[:2]
+        attr_name = _resolve_static_string(attr_node)
+        target_names = self._resolve_reference_names(target_node) or frozenset()
+        inert_roots = frozenset(root for root in target_names if root.startswith(_STATIC_INERT_VALUE_PREFIX))
+        if attr_name is None or not inert_roots:
+            return None
+        is_present = (
+            attr_name in _CTYPES_LIBRARY_LOADER_NON_LOADING_ATTRIBUTES
+            and not self._statically_inert_loader_member_was_deleted(inert_roots, attr_name)
+        ) or self._statically_inert_loader_member_is_present(inert_roots, attr_name)
+        if not is_present:
+            return None
+        resolved_names: set[str] = set()
+        if is_getattr:
+            for root in inert_roots:
+                member_names, found = _lookup_bound_alias(f"{root}.{attr_name}", self.alias_scopes)
+                if found and isinstance(member_names, frozenset):
+                    resolved_names.update(member_names)
+        return (
+            target_node,
+            frozenset(resolved_names),
+            _STATIC_CTYPES_LIBRARY_LOADER_EXISTING_ATTRIBUTE_DISPATCH_REFERENCES,
+        )
+
+    def _promote_mutated_statically_inert_loader_roots(
+        self,
+        roots: frozenset[str],
+        member_name: str,
+        value: ast.AST | None,
+        resolved_value: _AliasValue,
+        *,
+        invokes_setattr_dispatch: bool = False,
+    ) -> frozenset[str]:
+        inert_roots = frozenset(root for root in roots if root.startswith(_STATIC_INERT_VALUE_PREFIX))
+        if (
+            inert_roots
+            and invokes_setattr_dispatch
+            and not self._statically_inert_loader_dispatch_is_canonical(
+                _STATIC_CTYPES_LIBRARY_LOADER_MUTATION_DISPATCH_REFERENCES
+            )
+        ):
+            self._invalidate_unknown_callable_side_effects()
+        if not inert_roots or self._statically_inert_loader_write_is_safe(member_name, value, resolved_value):
+            return roots
+        self._invalidate_statically_inert_values(inert_roots)
+        return frozenset(
+            self._promoted_statically_inert_loader_root(root) if root in inert_roots else root for root in roots
+        )
+
+    def _invalidate_statically_inert_values(self, invalidated_roots: frozenset[str] | None = None) -> None:
+        visible_names = {name for scope in self.alias_scopes for name in scope}
+        for name in visible_names:
+            resolved_names, found = _lookup_bound_alias(name, self.alias_scopes)
+            if found and isinstance(resolved_names, frozenset):
+                matching_roots = frozenset(
+                    root
+                    for root in resolved_names
+                    if root.startswith(_STATIC_INERT_VALUE_PREFIX)
+                    and (invalidated_roots is None or root in invalidated_roots)
+                )
+                if not matching_roots:
+                    continue
+                # After an escape or unsafe mutation, fail closed as a loader with
+                # an executable member instead of dropping the object identity.
+                self._bind_name(
+                    name,
+                    frozenset(
+                        (resolved_names - matching_roots)
+                        | {self._promoted_statically_inert_loader_root(root) for root in matching_roots}
+                    ),
+                )
+
     def _class_has_local_initializer(
         self,
         node: ast.ClassDef,
@@ -3593,6 +4795,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         )
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._discard_statically_inert_class_bindings(node.name)
         base_ctypes_loader_aliases = frozenset(
             alias
             for base in node.bases
@@ -3600,13 +4803,32 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         )
         for decorator in node.decorator_list:
             self.visit(decorator)
+            self._invalidate_noncanonical_module_protocol_use(
+                decorator, inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_CALL_DISPATCH_REFERENCES
+            )
         for base in node.bases:
             self.visit(base)
+            self._invalidate_noncanonical_module_protocol_use(
+                base, inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_MRO_DISPATCH_REFERENCES
+            )
         for keyword in node.keywords:
             self.visit(keyword)
+            dispatch_references = (
+                _STATIC_CTYPES_LIBRARY_LOADER_CALL_DISPATCH_REFERENCES
+                if keyword.arg == "metaclass"
+                else (
+                    _STATIC_CTYPES_LIBRARY_LOADER_MAPPING_EXPANSION_DISPATCH_REFERENCES
+                    if keyword.arg is None
+                    else frozenset()
+                )
+            )
+            self._invalidate_noncanonical_module_protocol_use(
+                keyword.value, inert_loader_dispatch_references=dispatch_references
+            )
         class_scope = self._visit_class_scope(node.body)
         self._known_class_names.add(node.name)
         self._class_identity_aliases[node.name] = frozenset({node.name})
+        self._record_statically_inert_class_methods(node, class_scope)
         init_method = self._class_method(node, "__init__")
         if self._class_has_local_initializer(node, class_scope, init_method):
             self._classes_with_local_initializers.add(node.name)
@@ -3617,6 +4839,35 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         )
         self._bind_name(node.name, ctypes_loader_type_aliases or None)
 
+    @staticmethod
+    def _match_pattern_uses_subject_protocol(pattern: ast.pattern) -> bool:
+        if isinstance(pattern, (ast.MatchValue, ast.MatchSequence, ast.MatchMapping, ast.MatchClass)):
+            return True
+        if isinstance(pattern, ast.MatchAs):
+            return pattern.pattern is not None and _HighRiskPythonCallVisitor._match_pattern_uses_subject_protocol(
+                pattern.pattern
+            )
+        if isinstance(pattern, ast.MatchOr):
+            return any(
+                _HighRiskPythonCallVisitor._match_pattern_uses_subject_protocol(option) for option in pattern.patterns
+            )
+        return False
+
+    def visit_Match(self, node: ast.Match) -> None:
+        self.visit(node.subject)
+        if any(self._match_pattern_uses_subject_protocol(case.pattern) for case in node.cases):
+            self._invalidate_noncanonical_module_protocol_use(
+                node.subject, inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_MATCH_DISPATCH_REFERENCES
+            )
+        branch_scopes: list[_AliasScope] = []
+        for case in node.cases:
+            self.visit(case.pattern)
+            if case.guard is not None:
+                self._visit_truth_test(case.guard)
+            branch_scopes.append(self._visit_conditional_branch(case.body))
+        branch_scopes.append({})
+        self._merge_conditional_branch_scopes(branch_scopes)
+
     def visit_Lambda(self, node: ast.Lambda) -> None:
         for default in [*node.args.defaults, *node.args.kw_defaults]:
             if default is not None:
@@ -3625,65 +4876,134 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         try:
             self._bind_arguments(node.args)
             self._non_module_scope_depth += 1
+            self._deferred_execution_depth += 1
             try:
                 self.visit(node.body)
             finally:
+                self._deferred_execution_depth -= 1
                 self._non_module_scope_depth -= 1
         finally:
             self._pop_alias_scope()
 
     def _visit_comprehension(
-        self, generators: list[ast.comprehension], result_nodes: list[ast.AST], *, inline_module_scope: bool
+        self,
+        generators: list[ast.comprehension],
+        result_nodes: list[ast.AST],
+        *,
+        inline_module_scope: bool,
+        eager_body: bool = True,
+        hashed_result_nodes: tuple[ast.AST, ...] = (),
     ) -> None:
         if not generators:
             return
         self.visit(generators[0].iter)
+        self._invalidate_noncanonical_module_protocol_use(
+            generators[0].iter,
+            inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_ITERATION_DISPATCH_REFERENCES,
+        )
+        if self._literal_iter_truth(generators[0].iter) is False:
+            return
         outer_scope_index = len(self.alias_scopes) - 1
         self._push_alias_scope()
         self._comprehension_outer_scope_indices.append(outer_scope_index)
+        self._comprehension_unknown_side_effects.append(False)
         has_module_locals = inline_module_scope and self._non_module_scope_depth == 0
         if not has_module_locals:
             self._non_module_scope_depth += 1
         try:
             first_generator, *remaining_generators = generators
+            self._invalidate_iterated_unpacking_target(first_generator.target, first_generator.iter)
             self._bind_comprehension_target(first_generator.target, first_generator.iter)
             self.visit(first_generator.target)
             for condition in first_generator.ifs:
-                self.visit(condition)
+                self._visit_truth_test(condition)
             for generator in remaining_generators:
                 self.visit(generator.iter)
+                self._invalidate_noncanonical_module_protocol_use(
+                    generator.iter,
+                    inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_ITERATION_DISPATCH_REFERENCES,
+                )
+                self._invalidate_iterated_unpacking_target(generator.target, generator.iter)
                 self._bind_comprehension_target(generator.target, generator.iter)
                 self.visit(generator.target)
                 for condition in generator.ifs:
-                    self.visit(condition)
+                    self._visit_truth_test(condition)
             for result_node in result_nodes:
                 self.visit(result_node)
+                if any(result_node is hashed_result_node for hashed_result_node in hashed_result_nodes):
+                    self._invalidate_noncanonical_module_protocol_use(
+                        result_node,
+                        inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_HASH_DISPATCH_REFERENCES,
+                    )
         finally:
             if not has_module_locals:
                 self._non_module_scope_depth -= 1
+            has_unknown_side_effects = self._comprehension_unknown_side_effects.pop()
             self._comprehension_outer_scope_indices.pop()
             self._pop_alias_scope()
+        if has_unknown_side_effects and eager_body:
+            self._invalidate_unknown_callable_side_effects()
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._visit_comprehension(node.generators, [node.elt], inline_module_scope=False)
 
     def visit_SetComp(self, node: ast.SetComp) -> None:
-        self._visit_comprehension(node.generators, [node.elt], inline_module_scope=False)
+        self._visit_comprehension(
+            node.generators,
+            [node.elt],
+            inline_module_scope=False,
+            hashed_result_nodes=(node.elt,),
+        )
 
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
-        self._visit_comprehension(node.generators, [node.elt], inline_module_scope=False)
+        self._visit_comprehension(node.generators, [node.elt], inline_module_scope=False, eager_body=False)
 
     def visit_DictComp(self, node: ast.DictComp) -> None:
-        self._visit_comprehension(node.generators, [node.key, node.value], inline_module_scope=False)
+        self._visit_comprehension(
+            node.generators,
+            [node.key, node.value],
+            inline_module_scope=False,
+            hashed_result_nodes=(node.key,),
+        )
+
+    def visit_Dict(self, node: ast.Dict) -> None:
+        for key, value in zip(node.keys, node.values, strict=True):
+            if key is not None:
+                self.visit(key)
+                self._invalidate_noncanonical_module_protocol_use(
+                    key, inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_HASH_DISPATCH_REFERENCES
+                )
+            self.visit(value)
+            if key is None:
+                self._invalidate_noncanonical_module_protocol_use(
+                    value,
+                    inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_MAPPING_EXPANSION_DISPATCH_REFERENCES,
+                )
+
+    def visit_Set(self, node: ast.Set) -> None:
+        for element in node.elts:
+            self.visit(element)
+            self._invalidate_noncanonical_module_protocol_use(
+                element, inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_HASH_DISPATCH_REFERENCES
+            )
+
+    def visit_Starred(self, node: ast.Starred) -> None:
+        self.visit(node.value)
+        if isinstance(node.ctx, ast.Load):
+            self._invalidate_noncanonical_module_protocol_use(
+                node.value,
+                inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_ITERATION_DISPATCH_REFERENCES,
+            )
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
         for target in node.targets:
+            self._invalidate_unpacking_target_value(target, node.value)
             self._bind_target_to_value(target, node.value)
             self.visit(target)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        if node.annotation is not None:
+        if node.annotation is not None and not self._annotations_are_postponed:
             self.visit(node.annotation)
         if node.value is not None:
             self.visit(node.value)
@@ -3694,6 +5014,29 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.visit(node.value)
+        dispatch_references = self._inert_loader_binary_dispatch_references(node.op, augmented=True)
+        self._invalidate_noncanonical_module_protocol_use(
+            node.target, inert_loader_dispatch_references=dispatch_references
+        )
+        self._invalidate_noncanonical_module_protocol_use(
+            node.value, inert_loader_dispatch_references=dispatch_references
+        )
+        if isinstance(node.op, ast.BitOr):
+            roots = _resolve_namespace_mapping_roots(
+                node.target,
+                self.alias_scopes,
+                allow_module_locals_mapping=self._non_module_scope_depth == 0,
+                allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+            )
+            updates = _resolve_static_namespace_update_items(node.value)
+            if roots is not None and updates is not None:
+                self._apply_static_namespace_updates(roots, updates)
+                self.visit(node.target)
+                return
+            if roots is not None:
+                self._invalidate_unknown_namespace_updates(roots)
+                self.visit(node.target)
+                return
         resolved_names = self._resolve_reference_names(node.target)
         if resolved_names is not None:
             for resolved_name in resolved_names:
@@ -3705,6 +5048,14 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def visit_Delete(self, node: ast.Delete) -> None:
         for target in node.targets:
+            if isinstance(target, ast.Attribute):
+                self._invalidate_noncanonical_statically_inert_loader_dispatch(
+                    target.value, _STATIC_CTYPES_LIBRARY_LOADER_DELETE_DISPATCH_REFERENCES
+                )
+            elif isinstance(target, ast.Subscript):
+                self._invalidate_noncanonical_statically_inert_loader_dispatch(
+                    target.value, _STATIC_CTYPES_LIBRARY_LOADER_ITEM_DELETE_DISPATCH_REFERENCES
+                )
             self._delete_target_binding(target)
             if isinstance(target, ast.Attribute):
                 resolved_owner_names = self._resolve_reference_names(target.value)
@@ -3726,12 +5077,21 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _visit_loop(self, node: ast.For | ast.AsyncFor) -> None:
         self.visit(node.iter)
+        dispatch_references = (
+            _STATIC_CTYPES_LIBRARY_LOADER_ASYNC_ITERATION_DISPATCH_REFERENCES
+            if isinstance(node, ast.AsyncFor)
+            else _STATIC_CTYPES_LIBRARY_LOADER_ITERATION_DISPATCH_REFERENCES
+        )
+        self._invalidate_noncanonical_module_protocol_use(
+            node.iter, inert_loader_dispatch_references=dispatch_references
+        )
         iter_truth = self._literal_iter_truth(node.iter)
         if iter_truth is False:
             for statement in node.orelse:
                 self.visit(statement)
             return
 
+        self._invalidate_iterated_unpacking_target(node.target, node.iter)
         body_scope: _AliasScope = {}
         self._push_alias_scope(body_scope)
         try:
@@ -3742,6 +5102,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self.visit(node.target)
             for statement in node.body:
                 self.visit(statement)
+            if (
+                isinstance(node.iter, (ast.List, ast.Tuple))
+                and node.iter.elts
+                and all(isinstance(statement, ast.Pass) for statement in node.body)
+            ):
+                self._bind_target_to_value(node.target, node.iter.elts[-1])
             body_scope = dict(body_scope)
         finally:
             self._pop_alias_scope()
@@ -3759,7 +5125,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self._visit_loop(node)
 
     def visit_While(self, node: ast.While) -> None:
-        self.visit(node.test)
+        self._visit_truth_test(node.test)
         constant_bool = self._constant_bool(node.test)
         if constant_bool is False:
             for statement in node.orelse:
@@ -3774,7 +5140,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self._merge_conditional_branch_scopes(branch_scopes)
 
     def visit_If(self, node: ast.If) -> None:
-        self.visit(node.test)
+        self._visit_truth_test(node.test)
         constant_bool = self._constant_bool(node.test)
         if constant_bool is True:
             for statement in node.body:
@@ -3790,7 +5156,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self._merge_conditional_branch_scopes(branch_scopes)
 
     def visit_IfExp(self, node: ast.IfExp) -> None:
-        self.visit(node.test)
+        self._visit_truth_test(node.test)
         condition_value = _statically_known_truth_value(node.test, self.alias_scopes)
         if condition_value is not None:
             self.visit(node.body if condition_value else node.orelse)
@@ -3807,6 +5173,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self.visit(value)
             if index == len(node.values) - 1:
                 return
+            self._invalidate_noncanonical_module_protocol_use(
+                value, inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_TRUTH_DISPATCH_REFERENCES
+            )
             truth_value = _statically_known_truth_value(value, self.alias_scopes)
             short_circuits = (isinstance(node.op, ast.Or) and truth_value is True) or (
                 isinstance(node.op, ast.And) and truth_value is False
@@ -3821,6 +5190,74 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             remaining = ast.BoolOp(op=node.op, values=node.values[index + 1 :])
             self._merge_conditional_branch_scopes([self._visit_conditional_expression_branch(remaining), {}])
             return
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> None:
+        if isinstance(node.op, ast.Not):
+            self._visit_truth_test(node.operand)
+            return
+        self.visit(node.operand)
+        self._invalidate_noncanonical_module_protocol_use(
+            node.operand, inert_loader_dispatch_references=self._inert_loader_unary_dispatch_references(node.op)
+        )
+
+    def visit_BinOp(self, node: ast.BinOp) -> None:
+        self.visit(node.left)
+        self.visit(node.right)
+        dispatch_references = self._inert_loader_binary_dispatch_references(node.op)
+        self._invalidate_noncanonical_module_protocol_use(
+            node.left, inert_loader_dispatch_references=dispatch_references
+        )
+        self._invalidate_noncanonical_module_protocol_use(
+            node.right, inert_loader_dispatch_references=dispatch_references
+        )
+
+    def visit_Compare(self, node: ast.Compare) -> None:
+        self.visit(node.left)
+        left = node.left
+        for operator, comparator in zip(node.ops, node.comparators, strict=True):
+            self.visit(comparator)
+            if not isinstance(operator, (ast.Is, ast.IsNot)):
+                dispatch_references = self._inert_loader_compare_dispatch_references(operator)
+                self._invalidate_noncanonical_module_protocol_use(
+                    left, inert_loader_dispatch_references=dispatch_references
+                )
+                self._invalidate_noncanonical_module_protocol_use(
+                    comparator, inert_loader_dispatch_references=dispatch_references
+                )
+            left = comparator
+
+    def visit_FormattedValue(self, node: ast.FormattedValue) -> None:
+        self.visit(node.value)
+        self._invalidate_noncanonical_module_protocol_use(
+            node.value, inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_FORMAT_DISPATCH_REFERENCES
+        )
+        if node.format_spec is not None:
+            self.visit(node.format_spec)
+
+    def visit_Await(self, node: ast.Await) -> None:
+        self.visit(node.value)
+        self._invalidate_noncanonical_module_protocol_use(
+            node.value, inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_AWAIT_DISPATCH_REFERENCES
+        )
+
+    def visit_YieldFrom(self, node: ast.YieldFrom) -> None:
+        self.visit(node.value)
+        self._invalidate_noncanonical_module_protocol_use(
+            node.value, inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_ITERATION_DISPATCH_REFERENCES
+        )
+
+    def visit_Slice(self, node: ast.Slice) -> None:
+        for value in (node.lower, node.upper, node.step):
+            if value is not None:
+                self.visit(value)
+                self._invalidate_noncanonical_module_protocol_use(
+                    value, inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_INDEX_DISPATCH_REFERENCES
+                )
+
+    def visit_Assert(self, node: ast.Assert) -> None:
+        self._visit_truth_test(node.test)
+        if node.msg is not None:
+            self.visit(node.msg)
 
     def visit_Try(self, node: ast.Try) -> None:
         branch_scopes = [self._visit_conditional_branch([*node.body, *node.orelse])]
@@ -3845,8 +5282,35 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def _visit_with(self, node: ast.With | ast.AsyncWith) -> None:
         for item in node.items:
             self.visit(item.context_expr)
+            dispatch_references = (
+                _STATIC_CTYPES_LIBRARY_LOADER_ASYNC_CONTEXT_DISPATCH_REFERENCES
+                if isinstance(node, ast.AsyncWith)
+                else _STATIC_CTYPES_LIBRARY_LOADER_CONTEXT_DISPATCH_REFERENCES
+            )
+            self._invalidate_noncanonical_module_protocol_use(
+                item.context_expr, inert_loader_dispatch_references=dispatch_references
+            )
             if item.optional_vars is not None:
-                self._shadow_binding_target(item.optional_vars)
+                bound_value: ast.AST | None = None
+                has_bound_value = False
+                if isinstance(item.context_expr, ast.Call) and self._resolve_reference_names(
+                    item.context_expr.func
+                ) == frozenset({"contextlib.nullcontext"}):
+                    if len(item.context_expr.args) == 1 and not item.context_expr.keywords:
+                        bound_value = item.context_expr.args[0]
+                        has_bound_value = True
+                    elif (
+                        not item.context_expr.args
+                        and len(item.context_expr.keywords) == 1
+                        and item.context_expr.keywords[0].arg == "enter_result"
+                    ):
+                        bound_value = item.context_expr.keywords[0].value
+                        has_bound_value = True
+                if not has_bound_value or bound_value is None:
+                    self._shadow_binding_target(item.optional_vars)
+                else:
+                    self._invalidate_unpacking_target_value(item.optional_vars, bound_value)
+                    self._bind_target_to_value(item.optional_vars, bound_value)
                 self.visit(item.optional_vars)
         for statement in node.body:
             self.visit(statement)
@@ -3866,7 +5330,28 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self.visit(statement)
 
     def visit_Call(self, node: ast.Call) -> None:
-        call_result_names = self._resolve_reference_names(node)
+        if self._noncanonical_module_namespace_roots(node):
+            self._invalidate_unknown_callable_side_effects()
+        self._invalidate_noncanonical_statically_inert_loader_dispatch(
+            node.func, _STATIC_CTYPES_LIBRARY_LOADER_CALL_DISPATCH_REFERENCES
+        )
+        if isinstance(node.func, ast.Attribute) and node.func.attr in {"LoadLibrary", "__getitem__"}:
+            dispatch_references = (
+                _STATIC_CTYPES_LIBRARY_LOADER_LOAD_LIBRARY_DISPATCH_REFERENCES
+                if node.func.attr == "LoadLibrary"
+                else _STATIC_CTYPES_LIBRARY_LOADER_ITEM_DISPATCH_REFERENCES
+            )
+            self._invalidate_noncanonical_statically_inert_loader_dispatch(node.func.value, dispatch_references)
+        modeled_statically_present_reflective_read = self._statically_present_inert_loader_reflective_read(node)
+        if modeled_statically_present_reflective_read is not None:
+            target_node, _member_names, dispatch_references = modeled_statically_present_reflective_read
+            self._invalidate_noncanonical_statically_inert_loader_dispatch(target_node, dispatch_references)
+        risky_call_count_before = len(self.risky_calls)
+        call_result_names = (
+            modeled_statically_present_reflective_read[1]
+            if modeled_statically_present_reflective_read is not None
+            else self._resolve_reference_names(node)
+        )
         if call_result_names is not None:
             self._call_result_aliases[id(node)] = call_result_names
             for call_result_name in call_result_names:
@@ -3893,12 +5378,100 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             normalized_name = _normalized_high_risk_python_call_name(resolved_name)
             if normalized_name is not None:
                 self.risky_calls.add(normalized_name)
-        self._record_namespace_write_call(node)
-        self._record_setattr_call(node)
-        self._record_delattr_call(node)
-        self.generic_visit(node)
+        self.visit(node.func)
+        for argument in node.args:
+            self.visit(argument)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+            if keyword.arg is None:
+                self._invalidate_noncanonical_module_protocol_use(
+                    keyword.value,
+                    inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_MAPPING_EXPANSION_DISPATCH_REFERENCES,
+                )
+        if self._is_statically_inert_loader_construction(
+            node
+        ) and not self._statically_inert_loader_dispatch_is_canonical(
+            _STATIC_CTYPES_LIBRARY_LOADER_CONSTRUCTION_DISPATCH_REFERENCES
+        ):
+            self._invalidate_unknown_callable_side_effects()
+        modeled_namespace_mutation = self._record_namespace_write_call(node)
+        modeled_static_helper_mutation = self._record_setattr_call(node) or self._record_delattr_call(node)
+        resolved_function_names = self._resolve_reference_names(node.func)
+        modeled_truthy_builtin_call = self._truthy_builtin_call_is_statically_side_effect_free(
+            node, resolved_function_names
+        )
+        modeled_static_module_getattr_call = self._static_module_getattr_call_is_side_effect_free(
+            node, resolved_function_names
+        )
+        modeled_static_ctypes_loader_getattribute_call = (
+            self._static_ctypes_loader_getattribute_call_is_side_effect_free(node)
+        )
+        modeled_statically_present_reflective_call = (
+            modeled_statically_present_reflective_read is not None
+            and self._statically_inert_loader_dispatch_is_canonical(modeled_statically_present_reflective_read[2])
+        )
+        modeled_unbound_explicit_dunder_call = self._unbound_explicit_dunder_call_is_nonexecuting(node)
+        namespace_lookup_roots = (
+            _resolve_namespace_mapping_roots(
+                node,
+                self.alias_scopes,
+                allow_module_locals_mapping=self._non_module_scope_depth == 0,
+                allow_local_namespace_mapping=bool(self._comprehension_outer_scope_indices),
+            )
+            if resolved_function_names and resolved_function_names <= {"vars", "builtins.vars"}
+            else None
+        )
+        modeled_static_namespace_lookup = namespace_lookup_roots is not None and (
+            self._module_attribute_helper_has_canonical_dispatch(namespace_lookup_roots)
+        )
+        modeled_reported_high_risk_call = bool(
+            len(self.risky_calls) > risky_call_count_before
+            or (
+                resolved_function_names
+                and any(
+                    _normalized_high_risk_python_call_name(resolved_name) is not None
+                    for resolved_name in resolved_function_names
+                )
+            )
+        )
+        modeled_statically_inert_value_call = self._contains_statically_inert_value(resolved_function_names)
+        known_modeled_call_names = (
+            _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
+            | _STATIC_SIDE_EFFECT_FREE_BUILTIN_REFERENCES
+            | _STATIC_DISPATCH_DECORATOR_REFERENCES
+            | _STATIC_CONTEXT_MANAGER_HELPER_REFERENCES
+        )
+        if (
+            not modeled_namespace_mutation
+            and not modeled_static_helper_mutation
+            and not modeled_truthy_builtin_call
+            and not modeled_static_module_getattr_call
+            and not modeled_static_ctypes_loader_getattribute_call
+            and not modeled_statically_present_reflective_call
+            and not modeled_unbound_explicit_dunder_call
+            and not modeled_static_namespace_lookup
+            and not modeled_reported_high_risk_call
+            and not modeled_statically_inert_value_call
+            and not self._is_statically_inert_class_method_call(node.func)
+            and (not resolved_function_names or not resolved_function_names <= known_modeled_call_names)
+        ):
+            self._invalidate_unknown_callable_side_effects()
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
+        dispatch_references = (
+            _STATIC_CTYPES_LIBRARY_LOADER_ITEM_DISPATCH_REFERENCES
+            if isinstance(node.ctx, ast.Load)
+            else (
+                _STATIC_CTYPES_LIBRARY_LOADER_ITEM_STORE_DISPATCH_REFERENCES
+                if isinstance(node.ctx, ast.Store)
+                else _STATIC_CTYPES_LIBRARY_LOADER_ITEM_DELETE_DISPATCH_REFERENCES
+            )
+        )
+        self._invalidate_noncanonical_statically_inert_loader_dispatch(node.value, dispatch_references)
+        self._invalidate_noncanonical_module_protocol_use(node.value)
+        self._invalidate_noncanonical_module_protocol_use(
+            node.slice, inert_loader_dispatch_references=_STATIC_CTYPES_LIBRARY_LOADER_INDEX_DISPATCH_REFERENCES
+        )
         if isinstance(node.ctx, ast.Load):
             resolved_names = self._resolve_reference_names(node)
             if resolved_names is not None:
@@ -3910,6 +5483,22 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if isinstance(node.ctx, ast.Load):
+            owner_names = self._resolve_reference_names(node.value) or frozenset()
+            dispatch_references = (
+                _STATIC_CTYPES_LIBRARY_LOADER_EXISTING_ATTRIBUTE_DISPATCH_REFERENCES
+                if (
+                    node.attr in _CTYPES_LIBRARY_LOADER_NON_LOADING_ATTRIBUTES
+                    and not self._statically_inert_loader_member_was_deleted(owner_names, node.attr)
+                )
+                or self._statically_inert_loader_member_is_present(owner_names, node.attr)
+                or node.attr == "LoadLibrary"
+                else _STATIC_CTYPES_LIBRARY_LOADER_ATTRIBUTE_DISPATCH_REFERENCES
+            )
+            self._invalidate_noncanonical_statically_inert_loader_dispatch(node.value, dispatch_references)
+            if self._noncanonical_module_namespace_roots(
+                node
+            ) or self._tracked_module_attribute_load_dispatch_is_uncertain(node):
+                self._invalidate_unknown_callable_side_effects()
             resolved_names = self._resolve_reference_names(node)
             if resolved_names is not None:
                 for resolved_name in resolved_names:
