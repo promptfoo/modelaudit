@@ -70,6 +70,7 @@ _DETECTION_MESSAGE_LABELS = {
     "environment_access": "environment access",
     "sandbox_violation": "sandbox violation",
 }
+_MAX_REPORTED_TEMPLATE_LOCATIONS = 20
 _RAW_PARSE_FALLBACK_CONTEXT_BYTES = 1024
 _RAW_PARSE_FALLBACK_MAX_WINDOWS = 8
 _RAW_PARSE_FALLBACK_READ_BYTES = 256 * 1024
@@ -230,7 +231,7 @@ class Jinja2TemplateScanner(BaseScanner):
                         name="Template Extraction",
                         passed=False,
                         message=(
-                            "Template analysis incomplete because standalone template exceeds the size limit"
+                            "Template analysis incomplete because one or more extracted templates exceed the size limit"
                             if size_limited
                             else (
                                 "Template analysis incomplete because standalone template could not be read"
@@ -298,14 +299,19 @@ class Jinja2TemplateScanner(BaseScanner):
             "confidence": context.confidence,
         }
         bounded_templates: dict[str, str] = {}
-        oversized_template_locations: list[str] = []
+        oversized_failures: list[dict[str, Any]] = []
         for template_location, template_content in templates.items():
             if len(template_content) <= self.max_template_size:
                 bounded_templates[template_location] = template_content
             else:
-                oversized_template_locations.append(template_location)
+                self._add_template_size_failure(
+                    oversized_failures,
+                    "extracted",
+                    template_location,
+                    len(template_content),
+                )
 
-        if oversized_template_locations:
+        if oversized_failures:
             result.metadata[_INCONCLUSIVE_METADATA_KEY] = INCONCLUSIVE_SCAN_OUTCOME
             result.metadata[_INCONCLUSIVE_REASONS_METADATA_KEY] = ["jinja2_template_size_limit_exceeded"]
             result.add_check(
@@ -314,11 +320,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 message="Template analysis incomplete because one or more extracted templates exceed the size limit",
                 severity=IssueSeverity.INFO,
                 location=path,
-                details={
-                    "reason": "jinja2_template_size_limit_exceeded",
-                    "max_template_size": self.max_template_size,
-                    "skipped_template_locations": oversized_template_locations,
-                },
+                details=oversized_failures[0],
             )
 
         if not bounded_templates:
@@ -494,7 +496,9 @@ class Jinja2TemplateScanner(BaseScanner):
 
         try:
             if context.file_type == "gguf" and HAS_GGUF:
-                templates.update(self._extract_gguf_templates(path))
+                extracted, failures = self._extract_gguf_templates(path)
+                templates.update(extracted)
+                extraction_failures.extend(failures)
             elif context.file_type in ["json", "tokenizer_config"]:
                 extracted, failures = self._extract_json_templates(path)
                 templates.update(extracted)
@@ -512,9 +516,10 @@ class Jinja2TemplateScanner(BaseScanner):
 
         return templates, extraction_failures
 
-    def _extract_gguf_templates(self, path: str) -> dict[str, str]:
+    def _extract_gguf_templates(self, path: str) -> tuple[dict[str, str], list[dict[str, Any]]]:
         """Extract chat templates from GGUF metadata"""
-        templates = {}
+        templates: dict[str, str] = {}
+        extraction_failures: list[dict[str, Any]] = []
 
         try:
             reader = GGUFReader(path)
@@ -529,13 +534,19 @@ class Jinja2TemplateScanner(BaseScanner):
                     else:
                         template_str = str(value)
 
-                    if template_str and len(template_str) <= self.max_template_size:
-                        templates["tokenizer.chat_template"] = template_str
+                    if template_str:
+                        self._add_template_candidate(
+                            template_str,
+                            templates,
+                            "tokenizer.chat_template",
+                            extraction_failures,
+                            "gguf",
+                        )
 
         except Exception as e:
             logger.debug(f"Error extracting GGUF templates: {e}")
 
-        return templates
+        return templates, extraction_failures
 
     def _extract_json_templates(self, path: str) -> tuple[dict[str, str], list[dict[str, Any]]]:
         """Extract templates from JSON configuration files"""
@@ -648,15 +659,56 @@ class Jinja2TemplateScanner(BaseScanner):
             templates[template_path] = value
             return
 
-        extraction_failures.append(
-            {
+        self._add_template_size_failure(
+            extraction_failures,
+            config_format,
+            template_path,
+            len(value),
+        )
+
+    def _add_template_size_failure(
+        self,
+        extraction_failures: list[dict[str, Any]],
+        config_format: str,
+        template_path: str,
+        template_size: int,
+    ) -> None:
+        for failure in extraction_failures:
+            if (
+                failure.get("format") == config_format
+                and failure.get("reason") == "jinja2_template_size_limit_exceeded"
+                and failure.get("max_template_size") == self.max_template_size
+            ):
+                break
+        else:
+            failure = {
                 "format": config_format,
                 "reason": "jinja2_template_size_limit_exceeded",
                 "max_template_size": self.max_template_size,
-                "skipped_template_locations": [template_path],
-                "template_size": len(value),
+                "skipped_template_locations": [],
+                "skipped_template_location_count": 0,
+                "skipped_template_locations_truncated": False,
+                "template_size": 0,
             }
-        )
+            extraction_failures.append(failure)
+
+        failure["skipped_template_location_count"] = int(failure["skipped_template_location_count"]) + 1
+        locations = failure["skipped_template_locations"]
+        if isinstance(locations, list) and len(locations) < _MAX_REPORTED_TEMPLATE_LOCATIONS:
+            locations.append(template_path)
+        else:
+            failure["skipped_template_locations_truncated"] = True
+        failure["template_size"] = max(int(failure["template_size"]), template_size)
+
+    def _legacy_template_size_failure(
+        self,
+        config_format: str,
+        template_path: str,
+        template_size: int,
+    ) -> dict[str, Any]:
+        extraction_failures: list[dict[str, Any]] = []
+        self._add_template_size_failure(extraction_failures, config_format, template_path, template_size)
+        return extraction_failures[0]
 
     def _extract_raw_template_fallback(self, path: str, templates: dict[str, str], template_key: str) -> None:
         for index, fallback_text in enumerate(self._raw_template_fallback_windows_from_file(path)):
@@ -824,12 +876,11 @@ class Jinja2TemplateScanner(BaseScanner):
 
             if len(content) > self.max_template_size:
                 extraction_failures.append(
-                    {
-                        "format": "template",
-                        "reason": "jinja2_template_size_limit_exceeded",
-                        "max_template_size": self.max_template_size,
-                        "skipped_template_locations": ["template_content"],
-                    }
+                    self._legacy_template_size_failure(
+                        "template",
+                        "template_content",
+                        len(content),
+                    )
                 )
             elif content:
                 templates["template_content"] = content

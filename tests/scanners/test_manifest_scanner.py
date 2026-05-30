@@ -722,6 +722,76 @@ def test_manifest_scanner_delegates_malicious_chat_templates_to_jinja_analysis(t
     )
 
 
+def test_manifest_scanner_delegates_nested_chat_template_containers_to_jinja_analysis(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    payload = "{{ ''.__class__.__mro__[1].__subclasses__() }}"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": {
+                    "default": payload,
+                    "description": "plain prose",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner().scan(str(config_path))
+
+    assert any(
+        check.name == "Jinja2 Template Injection Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details["template_location"] == "chat_template.default"
+        for check in result.checks
+    )
+
+
+def test_manifest_scanner_nested_oversized_chat_template_fails_closed(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    payload = "{{ message['content'] }}" + (" safe" * 32)
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": {
+                    "default": payload,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner(config={"max_template_size": 64}).scan(str(config_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jinja2_template_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    size_checks = [c for c in result.checks if c.name == "Template Size Limit"]
+    assert len(size_checks) == 1
+    assert size_checks[0].details["skipped_template_locations"] == ["chat_template.default"]
+
+
+def test_manifest_scanner_ignores_plain_nested_chat_template_container_strings(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": {
+                    "description": "plain prose",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner().scan(str(config_path))
+
+    assert not any(check.name.startswith("Jinja2") or check.name == "Template Size Limit" for check in result.checks)
+
+
 def test_manifest_scanner_keeps_benign_chat_templates_clean(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text(

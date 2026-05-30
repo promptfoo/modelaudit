@@ -10,6 +10,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import jinja2_template_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.jinja2_template_scanner import Jinja2TemplateScanner
+from tests.helpers import create_mock_gguf
 
 JINJA2_ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets" / "samples" / "jinja2"
 MALICIOUS_JSON_FIXTURES = tuple(sorted((JINJA2_ASSETS_DIR / "malicious").glob("*.json"))) + tuple(
@@ -716,6 +717,41 @@ class TestJinja2TemplateScannerEdgeCases:
         assert "jinja2_template_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
         assert [c for c in result.checks if c.name == "Template Size Limit"]
         assert not [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+
+    def test_many_oversized_json_template_candidates_have_bounded_reporting(self, tmp_path: Path) -> None:
+        tokenizer_file = tmp_path / "tokenizer_config.json"
+        payload = "{{ message['content'] }}" + (" safe" * 32)
+        tokenizer_file.write_text(
+            json.dumps({f"template_candidate_{index}": payload for index in range(25)}),
+            encoding="utf-8",
+        )
+
+        result = Jinja2TemplateScanner({"max_template_size": 64}).scan(str(tokenizer_file))
+
+        size_checks = [c for c in result.checks if c.name == "Template Size Limit"]
+        assert result.success is False
+        assert len(size_checks) == 1
+        assert size_checks[0].details["skipped_template_location_count"] == 25
+        assert len(size_checks[0].details["skipped_template_locations"]) == 20
+        assert size_checks[0].details["skipped_template_locations_truncated"] is True
+        assert size_checks[0].details["template_size"] == len(payload)
+
+    def test_direct_gguf_oversized_chat_template_fails_closed(self, tmp_path: Path) -> None:
+        pytest.importorskip("gguf")
+        gguf_file = create_mock_gguf(
+            tmp_path / "large-template.gguf",
+            metadata={"tokenizer.chat_template": "{{ content }}" * 10000},
+        )
+
+        result = Jinja2TemplateScanner().scan(str(gguf_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_template_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        size_checks = [c for c in result.checks if c.name == "Template Size Limit"]
+        assert len(size_checks) == 1
+        assert size_checks[0].details["format"] == "gguf"
+        assert size_checks[0].details["skipped_template_locations"] == ["tokenizer.chat_template"]
 
     def test_small_json_chat_template_still_analyzed(self, tmp_path: Path) -> None:
         payload = "{{ lipsum.__globals__.os.popen('id') }}"

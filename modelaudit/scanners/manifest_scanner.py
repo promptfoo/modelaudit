@@ -177,6 +177,7 @@ HASH_INTEGRITY_KEYS = [
 # Regex pattern for hexadecimal strings (used to detect hash values)
 HEX_PATTERN = re.compile(r"^[a-fA-F0-9]+$")
 JINJA_TEMPLATE_FIELD_NAMES = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
+JINJA_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
 
 # Comprehensive allowlist of trusted domains for ML model configs
 # URLs from domains NOT in this list will be flagged as untrusted
@@ -977,17 +978,55 @@ class ManifestScanner(BaseScanner):
             templates: dict[str, str] = {}
             for key, item in value.items():
                 child_path = f"{path}.{key}" if path else str(key)
-                if key in JINJA_TEMPLATE_FIELD_NAMES and isinstance(item, str) and item.strip():
-                    templates[child_path] = item
+                if key in JINJA_TEMPLATE_FIELD_NAMES:
+                    templates.update(cls._collect_jinja_template_container(item, child_path))
+                    continue
                 templates.update(cls._collect_jinja_template_fields(item, child_path))
             return templates
         if isinstance(value, list):
-            templates = {}
+            list_templates: dict[str, str] = {}
             for index, item in enumerate(value):
                 child_path = f"{path}[{index}]" if path else f"[{index}]"
-                templates.update(cls._collect_jinja_template_fields(item, child_path))
-            return templates
+                list_templates.update(cls._collect_jinja_template_fields(item, child_path))
+            return list_templates
         return {}
+
+    @classmethod
+    def _collect_jinja_template_container(cls, value: Any, path: str) -> dict[str, str]:
+        if isinstance(value, str):
+            if value.strip() and (
+                path.rsplit(".", 1)[-1] in JINJA_TEMPLATE_FIELD_NAMES or cls._looks_like_jinja(value)
+            ):
+                return {path: value}
+            return {}
+
+        if isinstance(value, dict):
+            templates: dict[str, str] = {}
+            for key, item in value.items():
+                child_path = f"{path}.{key}"
+                if isinstance(item, str):
+                    if item.strip() and cls._looks_like_jinja(item):
+                        templates[child_path] = item
+                    continue
+                templates.update(cls._collect_jinja_template_container(item, child_path))
+            return templates
+
+        if isinstance(value, list):
+            list_templates: dict[str, str] = {}
+            for index, item in enumerate(value):
+                child_path = f"{path}[{index}]"
+                if isinstance(item, str):
+                    if item.strip() and cls._looks_like_jinja(item):
+                        list_templates[child_path] = item
+                    continue
+                list_templates.update(cls._collect_jinja_template_container(item, child_path))
+            return list_templates
+
+        return {}
+
+    @staticmethod
+    def _looks_like_jinja(value: str) -> bool:
+        return any(indicator in value for indicator in JINJA_TEMPLATE_INDICATORS)
 
     def _parse_ini_file(self, content: str) -> dict[str, Any]:
         """Parse INI-style manifests into nested dictionaries."""
