@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Final
+from typing import Any, Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
@@ -123,3 +123,26 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     return _truncate(redacted, max_chars)
+
+
+def _is_sensitive_detail_key(key: str) -> bool:
+    normalized = key.lower()
+    return normalized in SENSITIVE_QUERY_KEYS or re.fullmatch(SENSITIVE_ASSIGNMENT_KEY, normalized) is not None
+
+
+def redact_evidence_value(value: Any, max_string_chars: int = 180) -> Any:
+    """Recursively redact credentials from scanner detail values."""
+    if isinstance(value, str):
+        return redact_evidence_string(value, max_chars=max_string_chars)
+    if isinstance(value, dict):
+        return {
+            key: REDACTED_EVIDENCE_VALUE
+            if isinstance(key, str) and _is_sensitive_detail_key(key)
+            else redact_evidence_value(child, max_string_chars=max_string_chars)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_evidence_value(child, max_string_chars=max_string_chars) for child in value]
+    if isinstance(value, tuple):
+        return tuple(redact_evidence_value(child, max_string_chars=max_string_chars) for child in value)
+    return value

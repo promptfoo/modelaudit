@@ -21,6 +21,7 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners import keras_zip_scanner as keras_zip_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner, _has_get_file_reference
@@ -1874,6 +1875,63 @@ __import__('pickle').loads(data)
         assert any(check.details.get("layer_class") == "MaliciousLayer" for check in custom_layer_checks)
         assert any(check.details.get("identifier") == "MaliciousMetric" for check in custom_metric_checks)
         assert any(check.details.get("identifier") == "malicious_loss" for check in custom_loss_checks)
+
+    def test_keras_zip_details_redact_credentials_in_json_and_sarif(self, tmp_path: Path) -> None:
+        direct_secret = "ZIP_DIRECT_SECRET"
+        dict_secret = "ZIP_DICT_SECRET"
+        custom_secret = "ZIP_CUSTOM_SECRET"
+        nested_secret = "ZIP_NESTED_SECRET"
+        direct_code = f"import os\nclient_secret='{direct_secret}'\nos.system('id')\n"
+        dict_code = f"import os\ntoken='{dict_secret}'\nos.system('id')\n"
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "direct_lambda",
+                        "config": {
+                            "function": [base64.b64encode(direct_code.encode()).decode()],
+                        },
+                    },
+                    {
+                        "class_name": "Lambda",
+                        "name": "dict_lambda",
+                        "config": {
+                            "function": {
+                                "class_name": "__lambda__",
+                                "config": {"code": base64.b64encode(dict_code.encode()).decode()},
+                            },
+                        },
+                    },
+                    {
+                        "class_name": "SecretLayer",
+                        "name": "secret_layer",
+                        "config": {
+                            "api_key": custom_secret,
+                            "nested": {"token": nested_secret},
+                            "units": 4,
+                        },
+                    },
+                ]
+            },
+        }
+        model_path = create_configured_keras_zip(tmp_path, config, file_name="redacted_details.keras")
+        raw_secrets = [direct_secret, dict_secret, custom_secret, nested_secret]
+
+        scanner_result = KerasZipScanner().scan(str(model_path))
+        details_json = json.dumps([check.details for check in scanner_result.checks], default=str)
+        assert all(secret not in details_json for secret in raw_secrets)
+        assert "<redacted>" in details_json
+
+        audit_result = scan_model_directory_or_file(str(model_path))
+        json_output = audit_result.model_dump_json(indent=2, exclude_none=True)
+        sarif_output = format_sarif_output(audit_result, [str(model_path)])
+
+        assert all(secret not in json_output for secret in raw_secrets)
+        assert all(secret not in sarif_output for secret in raw_secrets)
+        assert "<redacted>" in json_output
+        assert "<redacted>" in sarif_output
 
     def test_compile_config_detects_nested_metric_and_loss_mappings(self, tmp_path: Path) -> None:
         """Nested compile_config structures should not bypass custom-object detection."""

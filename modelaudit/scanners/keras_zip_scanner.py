@@ -31,6 +31,7 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
+from ._evidence_redaction import redact_evidence_string, redact_evidence_value
 from .archive_dispatch import SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY
 from .archive_member_security import is_executable_archive_member_name
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
@@ -876,7 +877,7 @@ class KerasZipScanner(BaseScanner):
                     details={
                         "layer_class": layer_class,
                         "layer_name": layer_name,
-                        "layer_config": layer.get("config", {}),
+                        "layer_config": redact_evidence_value(layer.get("config", {}), max_string_chars=200),
                         "risk": "Custom layer classes require external code to load and may execute arbitrary logic",
                     },
                     rule_code="S810",
@@ -1862,7 +1863,7 @@ class KerasZipScanner(BaseScanner):
                                 "layer_name": layer_name,
                                 "layer_class": "Lambda",
                                 "dangerous_patterns": found_patterns,
-                                "code_preview": (decoded_str[:200] + "..." if len(decoded_str) > 200 else decoded_str),
+                                "code_preview": redact_evidence_string(decoded_str, max_chars=200),
                                 "encoding": "base64",
                             },
                             why=(
@@ -1887,9 +1888,7 @@ class KerasZipScanner(BaseScanner):
                                         "layer_name": layer_name,
                                         "layer_class": "Lambda",
                                         "code_analysis": risk_desc,
-                                        "code_preview": (
-                                            decoded_str[:200] + "..." if len(decoded_str) > 200 else decoded_str
-                                        ),
+                                        "code_preview": redact_evidence_string(decoded_str, max_chars=200),
                                     },
                                     why=get_pattern_explanation("lambda_layer"),
                                 )
