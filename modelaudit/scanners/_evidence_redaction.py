@@ -47,6 +47,7 @@ SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|credential|"
     r"password|passwd|private[_-]?key|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
 )
+QUOTED_SENSITIVE_KEY: Final[str] = rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|authorization)"
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?)" r"[^\s\"';&|]+"
 )
@@ -55,11 +56,14 @@ SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)(?![rubf]*[\"'])[^\s\"';&|]+"
 )
 PYTHON_STRING_PREFIX: Final[str] = r"[rubf]*"
+PYTHON_QUOTE_DELIMITER: Final[str] = r"(?:'''|\"\"\"|[\"'])"
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)({PYTHON_STRING_PREFIX})([\"'])(?:\\.|(?!\4).)*\4"
+    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)({PYTHON_STRING_PREFIX})"
+    rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\4)[\s\S])*\4"
 )
 QUOTED_SENSITIVE_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)([\"']{SENSITIVE_ASSIGNMENT_KEY}[\"']\s*:\s*)({PYTHON_STRING_PREFIX})([\"'])(?:\\.|(?!\3).)*\3"
+    rf"(?i)([\"']{QUOTED_SENSITIVE_KEY}[\"']\s*:\s*)({PYTHON_STRING_PREFIX})"
+    rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\3)[\s\S])*\3"
 )
 
 
