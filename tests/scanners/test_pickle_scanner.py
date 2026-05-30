@@ -15,6 +15,7 @@ from modelaudit.core_results import merge_scan_result
 from modelaudit.models import create_initial_audit_result
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
+    _BINARY_TAIL_SCAN_BYTES,
     ALWAYS_DANGEROUS_FUNCTIONS,
     ALWAYS_DANGEROUS_MODULES,
     PickleScanner,
@@ -1467,6 +1468,24 @@ def test_scan_pytorch_extension_detects_executable_tail_after_pickle_stream(tmp_
 
     assert result.success is False
     assert any(issue.rule_code == "S502" for issue in result.issues)
+
+
+def test_scan_pytorch_extension_marks_out_of_window_binary_tail_incomplete(tmp_path: Path) -> None:
+    pickle_payload = pickle.dumps({"safe": True}, protocol=4)
+    path = tmp_path / "model.pt"
+    path.write_bytes(pickle_payload + (b"A" * (_BINARY_TAIL_SCAN_BYTES + 8)) + b"\x7fELF/bin/sh\x00")
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pickle_binary_tail_scan_window_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert not any(issue.rule_code == "S502" for issue in result.issues)
+    checks = [check for check in result.checks if check.name == "Pickle Binary Tail Coverage"]
+    assert len(checks) == 1
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].details["tail_bytes_scanned"] == _BINARY_TAIL_SCAN_BYTES
+    assert checks[0].details["tail_bytes_total"] > _BINARY_TAIL_SCAN_BYTES
 
 
 def test_scan_file_detects_executable_tail_past_raw_scan_window(tmp_path: Path) -> None:
