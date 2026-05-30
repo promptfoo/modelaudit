@@ -1535,6 +1535,26 @@ class KerasZipScanner(BaseScanner):
             return
 
         if not HAS_H5PY:
+            weights_entry = weights_info.filename
+            reason = "keras_zip_embedded_weights_h5py_unavailable"
+            self._mark_inconclusive_scan_result(result, reason)
+            result.add_check(
+                name="Embedded Weights H5PY Library Check",
+                passed=False,
+                message=(
+                    "Skipping embedded model.weights.h5 inspection because h5py is required for HDF5 weights "
+                    "analysis. Install with 'pip install modelaudit[h5]'."
+                ),
+                severity=IssueSeverity.INFO,
+                location=f"{self.current_file_path}:{weights_entry}",
+                details={
+                    "entry": weights_entry,
+                    "required_package": "h5py",
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
+                },
+                rule_code="S902",
+            )
             return
 
         temp_path = None

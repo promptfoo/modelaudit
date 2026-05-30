@@ -246,6 +246,83 @@ class TestKerasZipScanner:
 
         assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
+    def test_embedded_weights_missing_h5py_returns_exit2_and_skips_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Embedded HDF5 weights cannot be considered fully scanned without h5py."""
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        reason = "keras_zip_embedded_weights_h5py_unavailable"
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.12.0",
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert reason in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Embedded Weights H5PY Library Check"
+            and check.status == CheckStatus.FAILED
+            and check.details["entry"] == "model.weights.h5"
+            and check.details["scan_outcome_reason"] == reason
+            for check in result.checks
+        )
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+        cache_dir = tmp_path / "missing-h5py-cache"
+        reset_cache_manager()
+        try:
+            first_result = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            second_result = scan_model_directory_or_file(
+                str(keras_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            for audit_result in (first_result, second_result):
+                metadata = audit_result.file_metadata[str(keras_path)]
+                assert determine_exit_code(audit_result) == 2
+                assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+                assert reason in metadata.get("scan_outcome_reasons")
+                assert not any(
+                    issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in audit_result.issues
+                )
+
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_missing_h5py_without_embedded_weights_stays_conclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Archives without embedded HDF5 weights do not require h5py for this check."""
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.12.0",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.success is True
+        assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        assert not any(check.name == "Embedded Weights H5PY Library Check" for check in result.checks)
+
     @pytest.mark.parametrize(
         ("config", "reason", "expected_check_name"),
         [
