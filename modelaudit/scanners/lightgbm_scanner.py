@@ -10,6 +10,7 @@ from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
+from ._evidence_redaction import redact_evidence_string
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 _LIGHTGBM_HEADER_MARKERS: tuple[str, ...] = (
@@ -112,6 +113,10 @@ def _redact_url_for_display(url: str) -> str:
 
 def _redact_urls_for_display(text: str) -> str:
     return _URL_PATTERN.sub(lambda match: _redact_url_for_display(match.group(0)), text)
+
+
+def _redact_excerpt_for_display(text: str) -> str:
+    return redact_evidence_string(_redact_urls_for_display(text), max_chars=200)
 
 
 class LightGBMScanner(BaseScanner):
@@ -245,7 +250,7 @@ class LightGBMScanner(BaseScanner):
                     hit = {
                         "line": str(line_number),
                         "reason": reason,
-                        "excerpt": _redact_urls_for_display(line)[:200],
+                        "excerpt": _redact_excerpt_for_display(line),
                     }
                     if is_comment:
                         warning_command_hits.append(hit)
@@ -264,12 +269,12 @@ class LightGBMScanner(BaseScanner):
                     network_hits.append({"line": str(line_number), "type": "public_ip", "value": candidate_ip})
 
             if not safe_prefix and self._looks_like_external_reference(line):
-                path_hits.append({"line": str(line_number), "excerpt": _redact_urls_for_display(line)[:200]})
+                path_hits.append({"line": str(line_number), "excerpt": _redact_excerpt_for_display(line)})
 
             if (_BASE64_PATTERN.search(line) or _HEX_ESCAPE_PATTERN.search(line)) and _EXECUTION_CONTEXT_PATTERN.search(
                 line
             ):
-                encoded_hits.append({"line": str(line_number), "excerpt": _redact_urls_for_display(line)[:200]})
+                encoded_hits.append({"line": str(line_number), "excerpt": _redact_excerpt_for_display(line)})
 
         if critical_command_hits:
             result.add_check(
