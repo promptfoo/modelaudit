@@ -968,8 +968,32 @@ class TestOciLayerScanner:
         assert len(checks) == 1
         assert checks[0].severity == IssueSeverity.INFO
 
-    def test_scan_layer_rejects_entry_count_before_copying(self, tmp_path: Path) -> None:
-        """Layer entry count exhaustion should fail closed before member extraction."""
+    def test_scan_layer_rejects_padded_decompression_ratio_before_copying(self, tmp_path: Path) -> None:
+        """Trailing gzip padding should not dilute the decompression-ratio denominator."""
+        compressible_member = tmp_path / "zeros.bin"
+        compressible_member.write_bytes(b"\x00" * 65536)
+
+        layer_path = tmp_path / "padded-ratio.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(compressible_member, arcname="zeros.bin")
+        layer_path.write_bytes(layer_path.read_bytes() + (b"\x00" * 256 * 1024))
+
+        manifest_path = tmp_path / "padded-ratio.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["padded-ratio.tar.gz"]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"compressed_max_decompression_ratio": 2.0}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert mock_copy.call_count == 0
+        assert "oci_layer_decompression_ratio_exceeded" in result.metadata["scan_outcome_reasons"]
+        checks = [check for check in result.checks if check.name == "Layer Decompression Budget Check"]
+        assert len(checks) == 1
+        assert checks[0].details["compressed_size"] < layer_path.stat().st_size
+        assert checks[0].details["actual_ratio"] > 2.0
+
+    def test_scan_layer_scans_in_budget_members_before_entry_count_exhaustion(self, tmp_path: Path) -> None:
+        """Layer entry exhaustion should preserve findings from members already within budget."""
         layer_path = tmp_path / "many.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
             for index in range(3):
@@ -984,11 +1008,36 @@ class TestOciLayerScanner:
             result = OciLayerScanner({"max_oci_layer_entries": 2}).scan(str(manifest_path))
 
         assert result.success is False
-        assert mock_copy.call_count == 0
+        assert mock_copy.call_count == 2
         assert "oci_layer_entry_count_exceeded" in result.metadata["scan_outcome_reasons"]
         checks = [check for check in result.checks if check.name == "Layer Decompression Budget Check"]
         assert len(checks) == 1
         assert checks[0].details["entries"] == 3
+
+    def test_scan_layer_reports_early_malicious_member_before_entry_count_exhaustion(self, tmp_path: Path) -> None:
+        """Later filler entries should not suppress malicious members scanned before the cap is hit."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        benign_member = tmp_path / "notes.txt"
+        benign_member.write_text("safe")
+
+        layer_path = tmp_path / "early-malicious.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(evil_pickle, arcname="payload.pkl")
+            tar.add(benign_member, arcname="notes-1.txt")
+            tar.add(benign_member, arcname="notes-2.txt")
+
+        manifest_path = tmp_path / "early-malicious.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["early-malicious.tar.gz"]}))
+
+        result = OciLayerScanner({"max_oci_layer_entries": 2}).scan(str(manifest_path))
+
+        assert result.success is False
+        assert "oci_layer_entry_count_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and "early-malicious.manifest:early-malicious.tar.gz:payload.pkl" in (issue.location or "")
+            for issue in result.issues
+        )
 
     def test_scan_layer_rewrites_embedded_issue_and_check_locations(self, tmp_path: Path) -> None:
         """Embedded scan results should reference the OCI member, not temp extraction paths."""

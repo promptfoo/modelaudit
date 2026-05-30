@@ -5,6 +5,7 @@ import os
 import shutil
 import tarfile
 import tempfile
+import zlib
 from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import urlparse
@@ -49,6 +50,8 @@ class OciLayerScanner(BaseScanner):
     _LAYER_ARCHIVE_SUFFIX: ClassVar[str] = ".tar.gz"
     _MANIFEST_PROBE_CHUNK_BYTES: ClassVar[int] = 8192
     _MEMBER_HEADER_PROBE_BYTES: ClassVar[int] = 64
+    _GZIP_CHUNK_BYTES: ClassVar[int] = 1024 * 1024
+    _GZIP_OUTPUT_CHUNK_BYTES: ClassVar[int] = 1024 * 1024
     _DEFAULT_MAX_LAYER_FILE_SIZE: ClassVar[int] = 10 * 1024 * 1024 * 1024
     _DEFAULT_MAX_LAYER_ENTRIES: ClassVar[int] = 10000
     _DEFAULT_MAX_DECOMPRESSED_BYTES: ClassVar[int] = 512 * 1024 * 1024
@@ -133,79 +136,31 @@ class OciLayerScanner(BaseScanner):
             rule_code="S902",
         )
 
-    def _preflight_layer_budget(
-        self,
-        layer_path: str,
-        *,
-        manifest_path: str,
-        layer_ref: str,
-        compressed_size: int,
-        result: ScanResult,
-    ) -> bool:
-        entry_count = 0
-        decompressed_size = 0
-        payload_size = 0
-
-        with tarfile.open(layer_path, "r:gz") as tar:
-            for member in tar:
-                entry_count += 1
-                if entry_count > self.max_layer_entries:
-                    self._add_layer_budget_check(
-                        result,
-                        manifest_path=manifest_path,
-                        layer_ref=layer_ref,
-                        reason="oci_layer_entry_count_exceeded",
-                        message=(
-                            f"Layer {self._normalize_layer_ref(layer_ref)} contains too many entries "
-                            f"({entry_count} > {self.max_layer_entries})"
-                        ),
-                        details={"entries": entry_count, "max_entries": self.max_layer_entries},
-                    )
-                    return False
-
-                payload_size += max(0, member.size)
-                decompressed_size = max(payload_size, tar.offset)
-                ratio = (decompressed_size / compressed_size) if compressed_size > 0 else 0.0
-                if decompressed_size > self.max_decompressed_bytes:
-                    self._add_layer_budget_check(
-                        result,
-                        manifest_path=manifest_path,
-                        layer_ref=layer_ref,
-                        reason="oci_layer_decompressed_size_exceeded",
-                        message=(
-                            f"Layer {self._normalize_layer_ref(layer_ref)} decompressed size exceeded limit "
-                            f"({decompressed_size} > {self.max_decompressed_bytes})"
-                        ),
-                        details={
-                            "decompressed_size": decompressed_size,
-                            "compressed_size": compressed_size,
-                            "max_decompressed_size": self.max_decompressed_bytes,
-                            "entries": entry_count,
-                        },
-                    )
-                    return False
-
-                if compressed_size > 0 and ratio > self.max_decompression_ratio:
-                    self._add_layer_budget_check(
-                        result,
-                        manifest_path=manifest_path,
-                        layer_ref=layer_ref,
-                        reason="oci_layer_decompression_ratio_exceeded",
-                        message=(
-                            f"Layer {self._normalize_layer_ref(layer_ref)} decompression ratio exceeded limit "
-                            f"({ratio:.1f}x > {self.max_decompression_ratio:.1f}x)"
-                        ),
-                        details={
-                            "decompressed_size": decompressed_size,
-                            "compressed_size": compressed_size,
-                            "max_ratio": self.max_decompression_ratio,
-                            "actual_ratio": ratio,
-                            "entries": entry_count,
-                        },
-                    )
-                    return False
-
-        return True
+    def _gzip_stream_consumed_size(self, layer_path: str) -> int | None:
+        decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        compressed_read = 0
+        decompressed_seen = 0
+        with open(layer_path, "rb") as layer_file:
+            while True:
+                chunk = layer_file.read(self._GZIP_CHUNK_BYTES)
+                if not chunk:
+                    break
+                compressed_read += len(chunk)
+                data = chunk
+                while data:
+                    try:
+                        output = decompressor.decompress(data, self._GZIP_OUTPUT_CHUNK_BYTES)
+                    except zlib.error:
+                        return None
+                    decompressed_seen += len(output)
+                    if decompressed_seen > self.max_decompressed_bytes:
+                        return None
+                    if decompressor.eof:
+                        return compressed_read - len(decompressor.unused_data)
+                    data = decompressor.unconsumed_tail
+        if decompressor.eof:
+            return compressed_read - len(decompressor.unused_data)
+        return None
 
     @staticmethod
     def _get_scannable_extension(member_name: str) -> str | None:
@@ -508,18 +463,71 @@ class OciLayerScanner(BaseScanner):
                     )
                     continue
 
-                if not self._preflight_layer_budget(
-                    layer_path,
-                    manifest_path=path,
-                    layer_ref=layer_ref,
-                    compressed_size=layer_size,
-                    result=result,
-                ):
-                    scan_complete = False
-                    continue
-
+                compressed_budget_size = self._gzip_stream_consumed_size(layer_path) or layer_size
+                layer_entry_count = 0
+                layer_payload_size = 0
                 with tarfile.open(layer_path, "r:gz") as tar:
                     for member in tar:
+                        layer_entry_count += 1
+                        if layer_entry_count > self.max_layer_entries:
+                            scan_complete = False
+                            self._add_layer_budget_check(
+                                result,
+                                manifest_path=path,
+                                layer_ref=layer_ref,
+                                reason="oci_layer_entry_count_exceeded",
+                                message=(
+                                    f"Layer {self._normalize_layer_ref(layer_ref)} contains too many entries "
+                                    f"({layer_entry_count} > {self.max_layer_entries})"
+                                ),
+                                details={"entries": layer_entry_count, "max_entries": self.max_layer_entries},
+                            )
+                            break
+
+                        layer_payload_size += max(0, member.size)
+                        decompressed_size = max(layer_payload_size, tar.offset)
+                        ratio = (decompressed_size / compressed_budget_size) if compressed_budget_size > 0 else 0.0
+                        if decompressed_size > self.max_decompressed_bytes:
+                            scan_complete = False
+                            self._add_layer_budget_check(
+                                result,
+                                manifest_path=path,
+                                layer_ref=layer_ref,
+                                reason="oci_layer_decompressed_size_exceeded",
+                                message=(
+                                    f"Layer {self._normalize_layer_ref(layer_ref)} decompressed size exceeded limit "
+                                    f"({decompressed_size} > {self.max_decompressed_bytes})"
+                                ),
+                                details={
+                                    "decompressed_size": decompressed_size,
+                                    "compressed_size": compressed_budget_size,
+                                    "max_decompressed_size": self.max_decompressed_bytes,
+                                    "entries": layer_entry_count,
+                                },
+                            )
+                            break
+
+                        if compressed_budget_size > 0 and ratio > self.max_decompression_ratio:
+                            scan_complete = False
+                            self._add_layer_budget_check(
+                                result,
+                                manifest_path=path,
+                                layer_ref=layer_ref,
+                                reason="oci_layer_decompression_ratio_exceeded",
+                                message=(
+                                    f"Layer {self._normalize_layer_ref(layer_ref)} decompression ratio exceeded limit "
+                                    f"({ratio:.1f}x > {self.max_decompression_ratio:.1f}x)"
+                                ),
+                                details={
+                                    "decompressed_size": decompressed_size,
+                                    "compressed_size": compressed_budget_size,
+                                    "max_ratio": self.max_decompression_ratio,
+                                    "actual_ratio": ratio,
+                                    "entries": layer_entry_count,
+                                },
+                            )
+                            break
+
                         if not member.isfile():
                             continue
                         name = member.name
