@@ -6,9 +6,153 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from ..models import ModelAuditResultModel
+from ..models import Check, CheckStatus, Issue, IssueSeverity, ModelAuditResultModel, create_initial_audit_result
 
 logger = logging.getLogger(__name__)
+
+_MLFLOW_DOWNLOAD_BUDGET_CHECK = "MLflow Download Size Check"
+
+
+def _finite_budget(max_file_size: int, max_total_size: int) -> bool:
+    return max_file_size > 0 or max_total_size > 0
+
+
+def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[str, Any]) -> ModelAuditResultModel:
+    result = create_initial_audit_result()
+    result.scanner_names = ["mlflow"]
+    result.has_errors = True
+    result.success = False
+
+    why = (
+        "ModelAudit cannot safely acquire this MLflow artifact within the configured scan budget. "
+        "Refusing the download avoids unbounded network, disk, or elapsed-time use before scanning begins."
+    )
+    result.checks.append(
+        Check(
+            name=_MLFLOW_DOWNLOAD_BUDGET_CHECK,
+            status=CheckStatus.FAILED,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=model_uri,
+            details=details,
+            why=why,
+        )
+    )
+    result.issues.append(
+        Issue(
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=model_uri,
+            details=details,
+            why=why,
+            type="mlflow_download_budget",
+        )
+    )
+    result.finalize_statistics()
+    return result
+
+
+def _preflight_mlflow_download_budget(
+    mlflow_module: Any,
+    model_uri: str,
+    *,
+    max_file_size: int,
+    max_total_size: int,
+) -> ModelAuditResultModel | None:
+    if not _finite_budget(max_file_size, max_total_size):
+        return None
+
+    details: dict[str, Any] = {
+        "model_uri": model_uri,
+        "max_file_size": max_file_size,
+        "max_total_size": max_total_size,
+    }
+    try:
+        artifact_repository = mlflow_module.artifacts.get_artifact_repository(model_uri)
+        list_artifacts = artifact_repository.list_artifacts
+    except Exception as e:
+        details["reason"] = "artifact_size_unavailable"
+        details["error"] = str(e)
+        return _mlflow_budget_failure_result(
+            model_uri,
+            "Unable to determine MLflow artifact size before download",
+            details,
+        )
+
+    total_size = 0
+    file_count = 0
+    pending_dirs: list[str | None] = [None]
+    visited_dirs: set[str | None] = set()
+    try:
+        while pending_dirs:
+            current_path = pending_dirs.pop()
+            if current_path in visited_dirs:
+                continue
+            visited_dirs.add(current_path)
+            artifact_infos = list_artifacts(current_path)
+            if artifact_infos is None:
+                raise ValueError(f"Artifact listing returned no size information for {current_path or '<root>'}")
+
+            for artifact_info in artifact_infos:
+                artifact_path = getattr(artifact_info, "path", None)
+                if getattr(artifact_info, "is_dir", False):
+                    if isinstance(artifact_path, str):
+                        pending_dirs.append(artifact_path)
+                    else:
+                        raise ValueError("Artifact directory entry did not include a path")
+                    continue
+
+                file_size = getattr(artifact_info, "file_size", None)
+                if not isinstance(file_size, int) or file_size < 0:
+                    raise ValueError(f"Artifact file size unavailable for {artifact_path or '<unknown>'}")
+
+                file_count += 1
+                total_size += file_size
+                if max_file_size > 0 and file_size > max_file_size:
+                    details.update(
+                        {
+                            "reason": "artifact_file_size_exceeded",
+                            "artifact_path": artifact_path,
+                            "artifact_file_size": file_size,
+                        }
+                    )
+                    return _mlflow_budget_failure_result(
+                        model_uri,
+                        f"MLflow artifact file too large to download: {file_size} bytes (max: {max_file_size})",
+                        details,
+                    )
+                if max_total_size > 0 and total_size > max_total_size:
+                    details.update(
+                        {
+                            "reason": "artifact_total_size_exceeded",
+                            "artifact_total_size": total_size,
+                            "artifact_file_count": file_count,
+                        }
+                    )
+                    return _mlflow_budget_failure_result(
+                        model_uri,
+                        f"MLflow artifact total size too large to download: {total_size} bytes (max: {max_total_size})",
+                        details,
+                    )
+    except Exception as e:
+        details["reason"] = "artifact_size_unavailable"
+        details["error"] = str(e)
+        return _mlflow_budget_failure_result(
+            model_uri,
+            "Unable to determine MLflow artifact size before download",
+            details,
+        )
+
+    if file_count == 0:
+        details["reason"] = "artifact_size_unavailable"
+        details["artifact_file_count"] = 0
+        return _mlflow_budget_failure_result(
+            model_uri,
+            "Unable to determine MLflow artifact size before download",
+            details,
+        )
+
+    return None
 
 
 def _prepare_download_dir(model_uri: str, cache_dir: str | None) -> tuple[str, bool]:
@@ -78,6 +222,16 @@ def scan_mlflow_model(
     cache_enabled = scan_kwargs.pop("cache_enabled", True)
     raw_cache_dir = scan_kwargs.pop("cache_dir", None)
     scan_cache_dir = str(Path(raw_cache_dir).expanduser()) if cache_enabled and raw_cache_dir else None
+
+    budget_failure = _preflight_mlflow_download_budget(
+        mlflow,
+        model_uri,
+        max_file_size=max_file_size,
+        max_total_size=max_total_size,
+    )
+    if budget_failure is not None:
+        return budget_failure
+
     download_dir, cleanup_download_dir = _prepare_download_dir(model_uri, scan_cache_dir)
 
     try:

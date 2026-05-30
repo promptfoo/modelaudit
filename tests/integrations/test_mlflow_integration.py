@@ -1,10 +1,12 @@
 import hashlib
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from modelaudit.core import determine_exit_code
 from modelaudit.integrations.mlflow import scan_mlflow_model
 
 
@@ -23,6 +25,11 @@ def test_scan_mlflow_model_success(mock_scan, mock_mkdtemp, mock_rmtree):
     # Mock MLflow
     mock_mlflow = MagicMock()
     mock_mlflow.artifacts.download_artifacts.return_value = "/tmp/test_model"
+    mock_repo = MagicMock()
+    mock_repo.list_artifacts.return_value = [
+        SimpleNamespace(path="model.pkl", is_dir=False, file_size=1024),
+    ]
+    mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
 
     # Create a temporary directory for the test
     temp_dir = "/tmp/modelaudit_mlflow_test"
@@ -54,6 +61,8 @@ def test_scan_mlflow_model_success(mock_scan, mock_mkdtemp, mock_rmtree):
     mock_mlflow.artifacts.download_artifacts.assert_called_once_with(
         artifact_uri="models:/TestModel/1", dst_path=temp_dir
     )
+    mock_mlflow.artifacts.get_artifact_repository.assert_called_once_with("models:/TestModel/1")
+    mock_repo.list_artifacts.assert_called_once_with(None)
 
     # Verify scan was called with correct parameters
     mock_scan.assert_called_once_with(
@@ -71,6 +80,55 @@ def test_scan_mlflow_model_success(mock_scan, mock_mkdtemp, mock_rmtree):
 
     # Verify results
     assert results == mock_scan.return_value  # Verify the mock was called correctly
+
+
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_unknown_size_before_download(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+) -> None:
+    """Finite budgets should fail closed before MLflow downloads unknown-size artifacts."""
+    mock_mlflow = MagicMock()
+    mock_mlflow.artifacts.get_artifact_repository.side_effect = RuntimeError("size unavailable")
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1", max_file_size=1000)
+
+    mock_mlflow.artifacts.download_artifacts.assert_not_called()
+    mock_mkdtemp.assert_not_called()
+    mock_scan.assert_not_called()
+    assert determine_exit_code(result) == 2
+    assert result.success is False
+    assert result.has_errors is True
+    assert result.checks[0].name == "MLflow Download Size Check"
+    assert result.checks[0].details["reason"] == "artifact_size_unavailable"
+
+
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_oversized_artifact_before_download(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+) -> None:
+    """Finite budgets should reject oversized MLflow artifacts before download."""
+    mock_mlflow = MagicMock()
+    mock_repo = MagicMock()
+    mock_repo.list_artifacts.return_value = [
+        SimpleNamespace(path="large.bin", is_dir=False, file_size=2048),
+    ]
+    mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1", max_file_size=1024)
+
+    mock_mlflow.artifacts.download_artifacts.assert_not_called()
+    mock_mkdtemp.assert_not_called()
+    mock_scan.assert_not_called()
+    assert determine_exit_code(result) == 2
+    assert result.success is False
+    assert result.checks[0].details["reason"] == "artifact_file_size_exceeded"
+    assert result.checks[0].details["artifact_path"] == "large.bin"
 
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
