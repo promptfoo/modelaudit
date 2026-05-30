@@ -24,6 +24,8 @@ import os
 import platform
 import queue
 import re
+import signal
+import threading
 import warnings
 from contextlib import suppress
 from typing import Any, ClassVar, cast
@@ -93,6 +95,10 @@ _SANDBOX_RENDER_BUDGET_REASON = "jinja2_sandbox_render_budget_exceeded"
 
 
 class _SandboxRenderBudgetExceeded(Exception):
+    pass
+
+
+class _SandboxRenderTimedOut(Exception):
     pass
 
 
@@ -189,6 +195,74 @@ def _create_budgeted_sandbox_environment(max_output_chars: int) -> Any:
     return _BudgetedSandboxEnvironment()
 
 
+def _run_budgeted_sandbox_render(template_content: str, max_output_chars: int) -> tuple[str, str | None]:
+    try:
+        env = _create_budgeted_sandbox_environment(max_output_chars)
+        template = env.from_string(template_content)
+        rendered_chars = 0
+        for chunk in template.generate(messages=[], config={}):
+            rendered_chars += len(str(chunk))
+            if rendered_chars > max_output_chars:
+                raise _SandboxRenderBudgetExceeded
+        return "safe", None
+    except jinja2.exceptions.SecurityError:
+        return "security_error", None
+    except _SandboxRenderTimedOut:
+        return "timeout", None
+    except _SandboxRenderBudgetExceeded:
+        return "budget_exceeded", "output"
+    except MemoryError:
+        return "budget_exceeded", "memory"
+    except OverflowError:
+        return "budget_exceeded", "range"
+    except Exception as exc:
+        return "render_error", type(exc).__name__
+
+
+def _inline_sandbox_timeout_primitives() -> tuple[Any, Any, Any] | None:
+    if threading.current_thread() is not threading.main_thread():
+        return None
+    setitimer = getattr(signal, "setitimer", None)
+    itimer_real = getattr(signal, "ITIMER_REAL", None)
+    sigalrm = getattr(signal, "SIGALRM", None)
+    if not callable(setitimer) or itimer_real is None or sigalrm is None:
+        return None
+    return setitimer, itimer_real, sigalrm
+
+
+def _sandbox_render_probe_inline(
+    template_content: str,
+    max_output_chars: int,
+    timeout_seconds: float,
+) -> tuple[str, str | None]:
+    primitives = _inline_sandbox_timeout_primitives()
+    if primitives is None:
+        return "worker_unavailable", "inline_timeout_unavailable"
+
+    setitimer, itimer_real, sigalrm = primitives
+    previous_handler: Any | None = None
+    previous_timer: tuple[float, float] | None = None
+
+    def _raise_timeout(_signum: int, _frame: Any) -> None:
+        raise _SandboxRenderTimedOut
+
+    try:
+        previous_handler = signal.getsignal(sigalrm)
+        previous_timer = cast(tuple[float, float], setitimer(itimer_real, 0))
+        signal.signal(sigalrm, _raise_timeout)
+        setitimer(itimer_real, max(timeout_seconds, 0.001))
+        return _run_budgeted_sandbox_render(template_content, max_output_chars)
+    finally:
+        with suppress(Exception):
+            setitimer(itimer_real, 0)
+        if previous_handler is not None:
+            with suppress(Exception):
+                signal.signal(sigalrm, previous_handler)
+        if previous_timer is not None and previous_timer[0] > 0:
+            with suppress(Exception):
+                setitimer(itimer_real, previous_timer[0], previous_timer[1])
+
+
 def _sandbox_render_probe_worker(
     template_content: str,
     max_output_chars: int,
@@ -198,25 +272,10 @@ def _sandbox_render_probe_worker(
 ) -> None:
     try:
         _limit_sandbox_worker_memory(max_memory_bytes)
-        env = _create_budgeted_sandbox_environment(max_output_chars)
         ready_queue.put(("ready", None))
-        template = env.from_string(template_content)
-        rendered_chars = 0
-        for chunk in template.generate(messages=[], config={}):
-            rendered_chars += len(str(chunk))
-            if rendered_chars > max_output_chars:
-                raise _SandboxRenderBudgetExceeded
-        result_queue.put(("safe", None))
-    except jinja2.exceptions.SecurityError:
-        result_queue.put(("security_error", None))
-    except _SandboxRenderBudgetExceeded:
-        result_queue.put(("budget_exceeded", "output"))
-    except MemoryError:
-        result_queue.put(("budget_exceeded", "memory"))
-    except OverflowError:
-        result_queue.put(("budget_exceeded", "range"))
+        result_queue.put(_run_budgeted_sandbox_render(template_content, max_output_chars))
     except Exception as exc:
-        result_queue.put(("render_error", type(exc).__name__))
+        result_queue.put(("worker_error", type(exc).__name__))
 
 
 def _compile_all_patterns() -> dict[str, list[tuple[re.Pattern[str], str]]]:
@@ -1276,7 +1335,11 @@ class Jinja2TemplateScanner(BaseScanner):
                 template_content
             ):
                 return True, self._sandbox_render_budget_failure(location, status, detail)
-            return True, None
+            status, detail = self._test_template_safety_inline_with_budget(template_content)
+            if status == "security_error":
+                return False, None
+            if status == "worker_unavailable":
+                return True, None
         if status in {"budget_exceeded", "timeout", "worker_error"}:
             failure = self._sandbox_render_budget_failure(location, status, detail)
             if self._template_has_static_sandbox_risk(template_content):
@@ -1316,6 +1379,13 @@ class Jinja2TemplateScanner(BaseScanner):
         if detail:
             failure["detail"] = detail
         return failure
+
+    def _test_template_safety_inline_with_budget(self, template_content: str) -> tuple[str, str | None]:
+        return _sandbox_render_probe_inline(
+            template_content,
+            self.sandbox_render_max_output_chars,
+            self.sandbox_render_timeout_seconds,
+        )
 
     def _test_template_safety_with_budget(self, template_content: str) -> tuple[str, str | None]:
         result_queue: Any | None = None
@@ -1364,7 +1434,7 @@ class Jinja2TemplateScanner(BaseScanner):
                     if process.is_alive() and hasattr(process, "kill"):
                         process.kill()
                         process.join(1)
-                    return "worker_error", "startup_timeout"
+                    return "worker_unavailable", "startup_timeout"
 
             process.join(self.sandbox_render_timeout_seconds)
             if process.is_alive():

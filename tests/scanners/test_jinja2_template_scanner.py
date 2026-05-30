@@ -938,6 +938,55 @@ class TestJinja2TemplateScannerEdgeCases:
         assert "scan_outcome" not in result.metadata
         assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
 
+    def test_unavailable_sandbox_worker_uses_inline_probe_for_non_static_template(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        scanner = Jinja2TemplateScanner()
+        calls: list[str] = []
+
+        def unavailable_probe(_template_content: str) -> tuple[str, str]:
+            return "worker_unavailable", "AssertionError"
+
+        def inline_probe(template_content: str) -> tuple[str, None]:
+            calls.append(template_content)
+            return "security_error", None
+
+        monkeypatch.setattr(scanner, "_test_template_safety_with_budget", unavailable_probe)
+        monkeypatch.setattr(scanner, "_test_template_safety_inline_with_budget", inline_probe)
+
+        safe, failure = scanner._test_template_safety("{{ value|safe }}", "template_content")
+
+        assert calls == ["{{ value|safe }}"]
+        assert safe is False
+        assert failure is None
+
+    def test_spawn_startup_timeout_keeps_benign_template_clean_without_inline_timeout(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "benign.jinja"
+        template_file.write_text("Hello, {{ name }}! Welcome to {{ site }}.", encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner()
+
+        def startup_timeout_probe(_template_content: str) -> tuple[str, str]:
+            return "worker_unavailable", "startup_timeout"
+
+        def unavailable_inline_probe(_template_content: str) -> tuple[str, str]:
+            return "worker_unavailable", "inline_timeout_unavailable"
+
+        monkeypatch.setattr(scanner, "_test_template_safety_with_budget", startup_timeout_probe)
+        monkeypatch.setattr(scanner, "_test_template_safety_inline_with_budget", unavailable_inline_probe)
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
     def test_unavailable_sandbox_worker_fails_closed_for_static_render_amplification(
         self,
         tmp_path: Path,
