@@ -1773,6 +1773,197 @@ __import__('pickle').loads(data)
 
         assert import_found, "Should detect __import__ in nested Lambda"
 
+    def test_wrapped_layer_config_layer_scans_nested_lambda(self, tmp_path: Path) -> None:
+        """Wrapper layers with `config.layer` must not hide nested Lambda payloads."""
+        malicious_code = '__import__("os").system("cmd")'
+        encoded_code = base64.b64encode(malicious_code.encode()).decode()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "TimeDistributed",
+                            "name": "wrapped_lambda",
+                            "config": {
+                                "layer": {
+                                    "class_name": "Lambda",
+                                    "name": "inner_lambda",
+                                    "config": {"function": [encoded_code, None, None]},
+                                },
+                            },
+                        }
+                    ]
+                },
+            },
+            keras_version="2.10.0",
+            file_name="wrapped_lambda.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        audit_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2024-3660"]
+        dangerous_lambda = [check for check in result.checks if check.name == "Dangerous Lambda Layer"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["layer_name"] == "inner_lambda"
+        assert dangerous_lambda
+        assert determine_exit_code(audit_result) == 1
+
+    def test_wrapped_layer_config_layer_scans_nested_custom_layer(self, tmp_path: Path) -> None:
+        """Wrapper-owned custom layer configs should use the same checks as normal layers."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "TimeDistributed",
+                            "name": "wrapped_custom",
+                            "config": {
+                                "layer": {
+                                    "class_name": "MaliciousLayer",
+                                    "name": "inner_custom",
+                                    "config": {"name": "inner_bad"},
+                                },
+                            },
+                        }
+                    ]
+                },
+            },
+            file_name="wrapped_custom.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert any(
+            check.name == "Custom Layer Class Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("layer_class") == "MaliciousLayer"
+            for check in result.checks
+        )
+
+    def test_wrapped_layer_config_backward_layer_scans_nested_custom_layer(self, tmp_path: Path) -> None:
+        """Bidirectional backward layers must not hide custom nested classes."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Functional",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "Bidirectional",
+                            "name": "bidirectional_wrapper",
+                            "config": {
+                                "layer": {
+                                    "class_name": "LSTM",
+                                    "name": "forward_lstm",
+                                    "config": {"name": "forward_lstm"},
+                                },
+                                "backward_layer": {
+                                    "class_name": "MaliciousRecurrentLayer",
+                                    "name": "inner_backward",
+                                    "config": {"name": "inner_backward"},
+                                },
+                            },
+                        }
+                    ]
+                },
+            },
+            file_name="wrapped_backward_custom.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        audit_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        assert result.metadata["model_class"] == "Functional"
+        assert any(
+            check.name == "Custom Layer Class Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("layer_class") == "MaliciousRecurrentLayer"
+            for check in result.checks
+        )
+        assert determine_exit_code(audit_result) == 1
+
+    def test_wrapped_layer_config_recurrent_cells_are_scanned(self, tmp_path: Path) -> None:
+        """RNN cell containers must not hide custom nested cells."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "RNN",
+                            "name": "stacked_cell_wrapper",
+                            "config": {
+                                "cell": {
+                                    "class_name": "StackedRNNCells",
+                                    "name": "stacked_cells",
+                                    "config": {
+                                        "cells": [
+                                            {
+                                                "class_name": "LSTMCell",
+                                                "name": "safe_cell",
+                                                "config": {"name": "safe_cell"},
+                                            },
+                                            {
+                                                "class_name": "MaliciousCell",
+                                                "name": "inner_bad_cell",
+                                                "config": {"name": "inner_bad_cell"},
+                                            },
+                                        ]
+                                    },
+                                }
+                            },
+                        }
+                    ]
+                },
+            },
+            file_name="wrapped_recurrent_cell.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert any(
+            check.name == "Custom Layer Class Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("layer_class") == "MaliciousCell"
+            for check in result.checks
+        )
+
+    def test_wrapped_layer_config_invalid_layer_type_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
+        """Malformed wrapper `config.layer` values make nested-layer coverage incomplete."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "TimeDistributed",
+                            "name": "broken_wrapper",
+                            "config": {"layer": "not a layer dict"},
+                        }
+                    ]
+                },
+            },
+            file_name="broken_wrapped_layer.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        audit_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_wrapped_layer_invalid_type" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Wrapped Layer Type Validation" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+        assert determine_exit_code(audit_result) == 2
+
     def test_invalid_json_config(self, tmp_path: Path) -> None:
         """Test handling of invalid JSON in config."""
         scanner = KerasZipScanner()

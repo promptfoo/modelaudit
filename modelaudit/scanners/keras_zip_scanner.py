@@ -171,6 +171,10 @@ class KerasZipScanner(BaseScanner):
 
     MAX_EMBEDDED_WEIGHTS_BYTES: ClassVar[int] = 100 * 1024 * 1024
     MAX_DUPLICATE_MEMBER_COMPARE_CANDIDATES: ClassVar[int] = 16
+    _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
+    _NESTED_LAYER_CONFIG_KEYS: ClassVar[tuple[str, ...]] = ("layer", "backward_layer", "cell", "cells")
+    _NESTED_LAYER_LIST_CONFIG_KEYS: ClassVar[frozenset[str]] = frozenset({"cell", "cells"})
+    _WRAPPED_LAYER_SCAN_MODEL: ClassVar[dict[str, Any]] = {"class_name": "Sequential", "config": {"layers": []}}
 
     name = "keras_zip"
     description = "Scans ZIP-based Keras model files for suspicious configurations and Lambda layers"
@@ -897,7 +901,7 @@ class KerasZipScanner(BaseScanner):
                 )
 
             # Recursively check nested models
-            if layer_class in ["Model", "Functional", "Sequential"] and "config" in layer:
+            if layer_class in self._MODEL_CONTAINER_CLASSES and "config" in layer:
                 nested_config = layer["config"]
                 if isinstance(nested_config, dict):
                     self._scan_model_config(layer, result)
@@ -913,8 +917,72 @@ class KerasZipScanner(BaseScanner):
                         details={"actual_type": type(nested_config).__name__, "expected_type": "dict"},
                     )
 
+            self._scan_wrapped_layer_config(layer_config, result, layer_name)
+
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
+
+    def _scan_wrapped_layer_config(self, layer_config: Any, result: ScanResult, layer_name: str) -> None:
+        """Scan wrapper-owned nested layer payloads such as `TimeDistributed.config.layer`."""
+        if not isinstance(layer_config, dict):
+            return
+
+        for config_key in self._NESTED_LAYER_CONFIG_KEYS:
+            if config_key not in layer_config:
+                continue
+
+            nested_layer = layer_config.get(config_key)
+            if isinstance(nested_layer, list) and config_key in self._NESTED_LAYER_LIST_CONFIG_KEYS:
+                self._scan_wrapped_layer_list(nested_layer, result, layer_name, config_key)
+                continue
+
+            self._scan_wrapped_layer_value(nested_layer, result, layer_name, config_key)
+
+    def _scan_wrapped_layer_list(
+        self,
+        nested_layers: list[Any],
+        result: ScanResult,
+        layer_name: str,
+        config_key: str,
+    ) -> None:
+        for index, nested_layer in enumerate(nested_layers):
+            self._scan_wrapped_layer_value(nested_layer, result, layer_name, f"{config_key}[{index}]")
+
+    def _scan_wrapped_layer_value(
+        self,
+        nested_layer: Any,
+        result: ScanResult,
+        layer_name: str,
+        config_key: str,
+    ) -> None:
+        if isinstance(nested_layer, dict):
+            self._scan_wrapped_layer_dict(nested_layer, result)
+            return
+
+        self._mark_inconclusive_scan_result(result, "keras_zip_wrapped_layer_invalid_type")
+        result.add_check(
+            name="Wrapped Layer Type Validation",
+            passed=False,
+            message=f"Invalid wrapped layer type: expected dict, got {type(nested_layer).__name__}",
+            rule_code="S902",
+            severity=IssueSeverity.INFO,
+            location=f"{self.current_file_path} (layer: {layer_name}, config: {config_key})",
+            details={"config_key": config_key, "actual_type": type(nested_layer).__name__, "expected_type": "dict"},
+        )
+
+    def _scan_wrapped_layer_dict(self, nested_layer: dict[str, Any], result: ScanResult) -> None:
+        metadata_snapshot = {
+            key: result.metadata[key] for key in ("model_class", "layer_counts") if key in result.metadata
+        }
+        missing_metadata_keys = {key for key in ("model_class", "layer_counts") if key not in result.metadata}
+        synthetic_model_config = {
+            "class_name": self._WRAPPED_LAYER_SCAN_MODEL["class_name"],
+            "config": {"layers": [nested_layer]},
+        }
+        self._scan_model_config(synthetic_model_config, result)
+        for key in missing_metadata_keys:
+            result.metadata.pop(key, None)
+        result.metadata.update(metadata_snapshot)
 
     def _scan_compile_config(self, compile_config: Any, result: ScanResult) -> None:
         """Inspect compile_config for custom metrics and losses."""
