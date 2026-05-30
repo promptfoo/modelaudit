@@ -124,6 +124,66 @@ def create_external_link_weights_h5(tmp_path: Path) -> Path:
     return weights_path
 
 
+def create_external_storage_weights_h5(tmp_path: Path) -> Path:
+    """Create a weights H5 file containing an HDF5 external-storage dataset."""
+    if h5py is None:
+        pytest.skip("h5py not available")
+
+    raw_storage = tmp_path / "weights.raw"
+    raw_storage.write_bytes(b"\x00" * 8)
+
+    weights_path = tmp_path / "external_storage.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        f.create_dataset(
+            "external_kernel",
+            shape=(2,),
+            dtype="float32",
+            external=[(raw_storage.name, 0, 8)],
+        )
+
+    return weights_path
+
+
+def create_cyclic_external_link_weights_h5(tmp_path: Path) -> Path:
+    """Create weights with an ExternalLink plus a hard-link cycle."""
+    if h5py is None:
+        pytest.skip("h5py not available")
+
+    external_source = tmp_path / "external_source.h5"
+    with h5py.File(external_source, "w") as f:
+        f.create_dataset("payload", data=[1.0, 2.0])
+
+    weights_path = tmp_path / "cyclic_external_link.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        loop = f.create_group("loop")
+        loop["self"] = loop
+        f["linked_kernel"] = h5py.ExternalLink(external_source.name, "/payload")
+
+    return weights_path
+
+
+def create_cyclic_external_storage_weights_h5(tmp_path: Path) -> Path:
+    """Create weights with external storage plus a hard-link cycle."""
+    if h5py is None:
+        pytest.skip("h5py not available")
+
+    raw_storage = tmp_path / "weights.raw"
+    raw_storage.write_bytes(b"\x00" * 8)
+
+    weights_path = tmp_path / "cyclic_external_storage.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        loop = f.create_group("loop")
+        loop["self"] = loop
+        f.create_dataset(
+            "external_kernel",
+            shape=(2,),
+            dtype="float32",
+            external=[(raw_storage.name, 0, 8)],
+        )
+
+    return weights_path
+
+
 def create_regular_weights_h5(tmp_path: Path) -> Path:
     """Create a benign embedded weights H5 file."""
     if h5py is None:
@@ -169,24 +229,103 @@ class TestKerasZipScanner:
             },
         ]
 
-    def test_embedded_hdf5_external_references_are_not_warnings_on_fixed_version(self, tmp_path: Path) -> None:
-        """Fixed Keras versions should not fail for embedded external references."""
+    @pytest.mark.parametrize(
+        "weights_factory",
+        [create_external_link_weights_h5, create_external_storage_weights_h5],
+    )
+    def test_embedded_hdf5_external_references_warn_despite_fixed_metadata(
+        self,
+        tmp_path: Path,
+        weights_factory: Any,
+    ) -> None:
+        """Archive-controlled fixed-version metadata must not suppress embedded HDF5 references."""
         scanner = KerasZipScanner()
         keras_path = create_configured_keras_zip(
             tmp_path,
             {"class_name": "Sequential", "config": {"layers": []}},
             keras_version="3.12.1",
-            weights_h5_path=create_external_link_weights_h5(tmp_path),
+            weights_h5_path=weights_factory(tmp_path),
         )
 
         result = scanner.scan(str(keras_path))
+        aggregate_result = scan_model_directory_or_file(
+            str(keras_path),
+            config={"cache_scan_results": False},
+        )
 
-        assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
-        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
-        assert any(
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+        assert cve_issues[0].details["keras_version"] == "3.12.1"
+        assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
+        assert cve_issues[0].details["version_source"] == "metadata_json"
+        assert not any(
             check.name == "HDF5 External Weight Reference Version Check" and check.status == CheckStatus.PASSED
             for check in result.checks
         )
+        assert determine_exit_code(aggregate_result) == 1
+
+    def test_hdf5_link_traversal_detects_nested_external_link_without_following(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Compatibility traversal must see ExternalLink entries without relying on h5py 3.11 APIs."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        external_source = tmp_path / "external_source.h5"
+        with h5py.File(external_source, "w") as f:
+            f.create_dataset("payload", data=[1.0, 2.0])
+
+        weights_path = tmp_path / "nested_external.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            dense_group = f.create_group("layers").create_group("dense")
+            dense_group["kernel"] = h5py.ExternalLink(external_source.name, "/payload")
+
+        with h5py.File(weights_path, "r") as h5_file:
+            findings = KerasZipScanner._collect_hdf5_external_references(h5_file)
+
+        assert findings == [
+            {
+                "kind": "ExternalLink",
+                "hdf5_path": "/layers/dense/kernel",
+                "filename": "external_source.h5",
+                "path": "/payload",
+            },
+        ]
+
+    @pytest.mark.parametrize(
+        ("weights_factory", "expected_kind"),
+        [
+            (create_cyclic_external_link_weights_h5, "ExternalLink"),
+            (create_cyclic_external_storage_weights_h5, "external_storage"),
+        ],
+    )
+    def test_embedded_hdf5_external_references_warn_despite_hard_link_cycle(
+        self,
+        tmp_path: Path,
+        weights_factory: Any,
+        expected_kind: str,
+    ) -> None:
+        """Hard-link cycles must not turn embedded HDF5 external references into exit-2 scans."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.12.1",
+            weights_h5_path=weights_factory(tmp_path),
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        aggregate_result = scan_model_directory_or_file(
+            str(keras_path),
+            config={"cache_scan_results": False},
+        )
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
+        assert cve_issues[0].details["external_references"][0]["kind"] == expected_kind
+        assert determine_exit_code(aggregate_result) == 1
 
     @pytest.mark.parametrize(
         "keras_version",
@@ -213,12 +352,12 @@ class TestKerasZipScanner:
 
     @pytest.mark.parametrize(
         "keras_version",
-        ["3.12.1", "3.12.1+cpu", "3.12.1+rc1", "3.13.2", "3.13.2.post1", "3.13.2+dev0"],
+        ["3.12.1", "3.12.1+cpu", "3.12.1+rc1", "3.13.2", "3.13.2.post1", "3.13.2+dev0", "keras-3.13.2"],
     )
-    def test_embedded_hdf5_external_references_stable_fixed_versions_pass(
+    def test_embedded_hdf5_external_references_fixed_or_unparseable_metadata_still_warn(
         self, tmp_path: Path, keras_version: str
     ) -> None:
-        """Stable fixed CVE-2026-1669 versions should not emit warning noise."""
+        """Metadata.json version text is archive-controlled context, not a suppression guard."""
         scanner = KerasZipScanner()
         keras_path = create_configured_keras_zip(
             tmp_path,
@@ -229,8 +368,11 @@ class TestKerasZipScanner:
 
         result = scanner.scan(str(keras_path))
 
-        assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
-        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+        assert cve_issues[0].details["keras_version"] == keras_version
+        assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
 
     def test_benign_embedded_weights_do_not_emit_warning_noise(self, tmp_path: Path) -> None:
         """Benign embedded weights should not produce warning or critical noise."""
@@ -351,8 +493,8 @@ class TestKerasZipScanner:
         assert cve_issues[0].severity == IssueSeverity.WARNING
         assert determine_exit_code(aggregate_result) == 1
 
-    def test_invalid_config_json_list_fixed_keras_weights_stays_inconclusive_only(self, tmp_path: Path) -> None:
-        """Fixed-version metadata should prevent warning noise even when config shape is invalid."""
+    def test_invalid_config_json_list_fixed_keras_weights_preserves_external_ref_warning(self, tmp_path: Path) -> None:
+        """Independent embedded-weight findings should survive invalid config and fixed-looking metadata."""
         keras_path = create_configured_keras_zip(
             tmp_path,
             [],
@@ -374,8 +516,11 @@ class TestKerasZipScanner:
         ]
         assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
         assert "keras_zip_config_invalid_type" in metadata.get("scan_outcome_reasons")
-        assert security_issues == []
-        assert determine_exit_code(aggregate_result) == 2
+        cve_issues = [issue for issue in security_issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["keras_version"] == "3.12.1"
+        assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
+        assert determine_exit_code(aggregate_result) == 1
 
     def test_missing_config_json_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
         """A direct Keras ZIP scan without config.json cannot be security-complete."""

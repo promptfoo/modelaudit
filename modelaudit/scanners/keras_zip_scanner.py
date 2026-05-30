@@ -1602,32 +1602,23 @@ class KerasZipScanner(BaseScanner):
             "external_references": findings,
         }
 
-        if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2026_1669(keras_version):
+        if isinstance(keras_version, str):
             details["keras_version"] = keras_version
+            if not self._is_vulnerable_to_cve_2026_1669(keras_version):
+                details["parse_status"] = "untrusted_artifact_version"
+                details["version_source"] = "metadata_json"
             result.add_check(
                 name="CVE-2026-1669: HDF5 External Weight Reference",
                 passed=False,
                 message=(
-                    f"CVE-2026-1669: embedded Keras {keras_version} weights use HDF5 external references that can "
-                    "disclose arbitrary local file contents during model loading"
+                    "CVE-2026-1669: embedded Keras weights use HDF5 external references that can disclose "
+                    "arbitrary local file contents during model loading; archive-controlled metadata claims "
+                    f"Keras {keras_version}"
                 ),
                 severity=IssueSeverity.WARNING,
                 location=location,
                 details=details,
                 why=get_cve_2026_1669_explanation("hdf5_external_reference"),
-            )
-            return
-
-        if isinstance(keras_version, str):
-            result.add_check(
-                name="HDF5 External Weight Reference Version Check",
-                passed=True,
-                message=(
-                    f"Embedded HDF5 external references detected in weights, but Keras {keras_version} is outside "
-                    "the known CVE-2026-1669 vulnerable ranges"
-                ),
-                location=location,
-                details={"keras_version": keras_version, "external_references": findings},
             )
             return
 
@@ -1676,12 +1667,41 @@ class KerasZipScanner(BaseScanner):
                     },
                 )
 
-        if hasattr(h5_file, "visititems_links"):
-            h5_file.visititems_links(visit)
-        else:  # pragma: no cover - compatibility fallback for older h5py
-            h5_file.visititems(lambda name, _obj: visit(name, h5_file.get(name, getlink=True)))
+        KerasZipScanner._visit_hdf5_links(h5_file, visit)
 
         return findings
+
+    @staticmethod
+    def _visit_hdf5_links(group: Any, visit: Any, prefix: str = "", visited: set[Any] | None = None) -> None:
+        """Traverse HDF5 links without following ExternalLink or SoftLink targets."""
+        if visited is None:
+            visited = set()
+
+        group_identity = KerasZipScanner._hdf5_object_identity(group)
+        if group_identity in visited:
+            return
+        visited.add(group_identity)
+
+        for child_name in group:
+            child_key = str(child_name)
+            child_path = f"{prefix}/{child_key}" if prefix else child_key
+            link = group.get(child_name, getlink=True)
+            visit(child_path, link)
+
+            if not isinstance(link, h5py.HardLink):
+                continue
+
+            obj = group.get(child_name, getlink=False)
+            if isinstance(obj, h5py.Group):
+                KerasZipScanner._visit_hdf5_links(obj, visit, child_path, visited)
+
+    @staticmethod
+    def _hdf5_object_identity(obj: Any) -> Any:
+        """Return a stable identity for cycle-safe HDF5 hard-link traversal."""
+        try:
+            return ("h5o_addr", int(h5py.h5o.get_info(obj.id).addr))
+        except Exception:
+            return ("python_id", id(obj))
 
     @staticmethod
     def _extract_string_literals(value: Any, *, include_dict_values: bool = False) -> list[str]:
