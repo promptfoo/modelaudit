@@ -94,17 +94,31 @@ class _SandboxRenderBudgetExceeded(Exception):
     pass
 
 
+def _current_process_virtual_memory_bytes() -> int | None:
+    try:
+        with open("/proc/self/statm", encoding="ascii") as statm:
+            total_pages = int(statm.read().split()[0])
+        return total_pages * int(os.sysconf("SC_PAGE_SIZE"))
+    except Exception:
+        return None
+
+
 def _limit_sandbox_worker_memory(max_memory_bytes: int) -> None:
     if not HAS_RESOURCE_LIMITS or resource is None:
         return
 
-    for limit_name in ("RLIMIT_AS", "RLIMIT_DATA"):
+    baseline_virtual_memory_bytes = _current_process_virtual_memory_bytes()
+    for limit_name in ("RLIMIT_AS",):
         limit_id = getattr(resource, limit_name, None)
         if limit_id is None:
             continue
         try:
             _soft_limit, hard_limit = resource.getrlimit(limit_id)
-            capped_limit = max_memory_bytes
+            capped_limit = (
+                baseline_virtual_memory_bytes + max_memory_bytes
+                if baseline_virtual_memory_bytes is not None
+                else max_memory_bytes
+            )
             if hard_limit != resource.RLIM_INFINITY:
                 capped_limit = min(capped_limit, hard_limit)
             resource.setrlimit(limit_id, (capped_limit, hard_limit))
