@@ -54,11 +54,12 @@ BEARER_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)[^\s\"';&|]+"
 )
+PYTHON_STRING_PREFIX: Final[str] = r"[rubf]*"
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)([\"']).*?\3"
+    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)({PYTHON_STRING_PREFIX})([\"'])(?:\\.|(?!\4).)*\4"
 )
 QUOTED_SENSITIVE_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)([\"']{SENSITIVE_ASSIGNMENT_KEY}[\"']\s*:\s*)([\"']).*?\2"
+    rf"(?i)([\"']{SENSITIVE_ASSIGNMENT_KEY}[\"']\s*:\s*)({PYTHON_STRING_PREFIX})([\"'])(?:\\.|(?!\3).)*\3"
 )
 
 
@@ -106,13 +107,13 @@ def _redact_url(match: re.Match[str]) -> str:
 
 
 def _redact_quoted_assignment(match: re.Match[str]) -> str:
-    quote = match.group(3)
-    return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
+    quote = match.group(4)
+    return f"{match.group(1)}{match.group(3)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
 def _redact_quoted_key_value(match: re.Match[str]) -> str:
-    quote = match.group(2)
-    return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
+    quote = match.group(3)
+    return f"{match.group(1)}{match.group(2)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
 def _truncate(text: str, max_chars: int) -> str:

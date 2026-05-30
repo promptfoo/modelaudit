@@ -37,6 +37,31 @@ def test_redacts_quoted_key_credential_values() -> None:
     assert '"safe": "value"' in redacted
 
 
+def test_redacts_quoted_key_values_with_escaped_delimiters() -> None:
+    """Escaped quote delimiters should not leave credential suffixes behind."""
+    text = r'json={"api_key": "abc\"TAILSECRET", "safe": "value"}'
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "abc" not in redacted
+    assert "TAILSECRET" not in redacted
+    assert f'"api_key": "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert '"safe": "value"' in redacted
+
+
+def test_redacts_prefixed_python_string_values_for_quoted_keys() -> None:
+    """Python string prefixes should still be treated as credential values."""
+    text = "{'api_key': b'BYTESECRET123', 'private_key': rb'RAWSECRET456', 'safe': b'value'}"
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "BYTESECRET123" not in redacted
+    assert "RAWSECRET456" not in redacted
+    assert f"'api_key': b'{REDACTED_EVIDENCE_VALUE}'" in redacted
+    assert f"'private_key': rb'{REDACTED_EVIDENCE_VALUE}'" in redacted
+    assert "'safe': b'value'" in redacted
+
+
 def test_redacts_compound_sensitive_query_parameters() -> None:
     """Compound query credential keys should be redacted in URL evidence."""
     text = "url=https://example.com/callback?client_secret=CLIENTSECRET123&refresh_token=REFRESHTOKEN456&ok=1"
