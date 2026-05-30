@@ -952,8 +952,9 @@ class KerasZipScanner(BaseScanner):
     def _check_torch_module_wrapper(self, result: ScanResult, layer_name: str) -> None:
         """Check for CVE-2025-49655: TorchModuleWrapper deserialization RCE.
 
-        TorchModuleWrapper in Keras 3.11.0-3.11.2 calls torch.load(weights_only=False)
-        in from_config(), enabling arbitrary code execution via pickle deserialization.
+        TorchModuleWrapper in Keras 3.11.0-3.11.2 and prereleases before
+        final 3.11.3 calls torch.load(weights_only=False) in from_config(),
+        enabling arbitrary code execution via pickle deserialization.
         """
         keras_version = result.metadata.get("keras_version")
         vulnerability_status: bool | None = None
@@ -966,7 +967,7 @@ class KerasZipScanner(BaseScanner):
                 passed=False,
                 message=(
                     f"CVE-2025-49655: Layer '{layer_name}' is a TorchModuleWrapper in "
-                    f"Keras {keras_version} (3.11.0-3.11.2 vulnerable range) — "
+                    f"Keras {keras_version} (3.11.0-3.11.2 and prereleases before 3.11.3) — "
                     "uses torch.load(weights_only=False) enabling arbitrary code execution"
                 ),
                 severity=IssueSeverity.CRITICAL,
@@ -982,7 +983,7 @@ class KerasZipScanner(BaseScanner):
                         "TorchModuleWrapper in vulnerable Keras versions can deserialize attacker-controlled "
                         "pickles via torch.load(weights_only=False), enabling RCE."
                     ),
-                    "affected_versions": "Keras 3.11.0-3.11.2",
+                    "affected_versions": "Keras 3.11.0-3.11.2 and prereleases before final 3.11.3",
                     "remediation": "Upgrade Keras to >= 3.11.3",
                 },
                 why=get_cve_2025_49655_explanation("torch_module_wrapper"),
@@ -993,7 +994,8 @@ class KerasZipScanner(BaseScanner):
                 passed=False,
                 message=(
                     f"TorchModuleWrapper detected in Keras {keras_version}; "
-                    "version metadata is outside known CVE-2025-49655 range (3.11.0-3.11.2), "
+                    "version metadata is outside known CVE-2025-49655 range "
+                    "(3.11.0-3.11.2 and prereleases before 3.11.3), "
                     "but metadata-only assessment is inconclusive without runtime verification"
                 ),
                 severity=IssueSeverity.WARNING,
@@ -1033,7 +1035,7 @@ class KerasZipScanner(BaseScanner):
                         "TorchModuleWrapper may deserialize unsafe content, but version data was missing or "
                         "non-canonical so CVE attribution confidence is reduced."
                     ),
-                    "affected_versions": "Keras 3.11.0-3.11.2",
+                    "affected_versions": "Keras 3.11.0-3.11.2 and prereleases before final 3.11.3",
                     "remediation": "Ensure model metadata includes keras_version and upgrade to >= 3.11.3",
                 },
                 why=get_cve_2025_49655_explanation("torch_module_wrapper"),
@@ -1061,7 +1063,7 @@ class KerasZipScanner(BaseScanner):
                 return False
             if 0 <= patch <= 2:
                 return True
-            return bool(patch == 3 and is_prerelease)
+            return bool(patch == 3 and is_prerelease and not is_fixed_metadata_suffix)
         except ValueError:
             return None
 
