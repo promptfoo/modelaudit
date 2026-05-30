@@ -13,6 +13,8 @@ from contextlib import suppress
 from typing import Any, ClassVar
 from urllib.parse import unquote, urlsplit, urlunsplit
 
+from modelaudit.scanners._evidence_redaction import redact_evidence_string
+
 _REDACTED_PATH_TOKEN = "<redacted>"
 _URL_IN_TEXT_PATTERN = re.compile(
     r"(?:https?|ftp|ftps|ssh|telnet|ws|wss|s3|gs|az|wasbs?|abfss?)://[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+",
@@ -493,7 +495,8 @@ def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *
             start = min(start, url_start)
             end = max(end, url_end)
 
-    return _redact_urls_in_text(data[start:end].decode("utf-8", errors="ignore"))
+    redacted = _redact_urls_in_text(data[start:end].decode("utf-8", errors="ignore"))
+    return redact_evidence_string(redacted, max_chars=len(redacted))
 
 
 def _url_text_containing_offset(data: bytes, offset: int) -> str | None:

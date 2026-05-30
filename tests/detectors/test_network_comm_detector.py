@@ -882,6 +882,23 @@ class TestNetworkCommDetector:
         assert url_finding["url"] == "https://example.com/path/<redacted>/model.bin"
         assert path_token not in json.dumps([network_finding, url_finding], sort_keys=True)
 
+    def test_network_function_snippets_redact_adjacent_credentials(self) -> None:
+        """Surrounding snippets should not leak non-URL credentials near network calls."""
+        detector = NetworkCommDetector()
+        data = (
+            b'requests.get("https://example.com/model.bin") '
+            b"api_key=NETWORK_ADJACENT_SECRET Authorization: Bearer NETWORK_BEARER_SECRET"
+        )
+
+        findings = detector.scan(data, "hook.py")
+        network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+        serialized = json.dumps(network_finding, sort_keys=True)
+
+        assert "NETWORK_ADJACENT_SECRET" not in serialized
+        assert "NETWORK_BEARER_SECRET" not in serialized
+        assert "api_key=<redacted>" in serialized
+        assert "Authorization: Bearer <redacted>" in serialized
+
     def test_network_function_snippets_expand_forward_urls_before_redaction(self) -> None:
         """Long URL tails after the function token should be included before URL redaction."""
         detector = NetworkCommDetector()
@@ -933,6 +950,20 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == "https://example.com/download/<redacted>/malware.bin"
         assert path_token not in json.dumps([cc_finding, url_finding], sort_keys=True)
+
+    def test_cc_pattern_snippets_redact_adjacent_credentials(self) -> None:
+        """C&C snippets should not leak assignment credentials around the match."""
+        detector = NetworkCommDetector()
+        data = b"api_key=C2_ADJACENT_SECRET malware password=C2_PASSWORD_SECRET"
+
+        findings = detector.scan(data, "hook.py")
+        cc_finding = next(finding for finding in findings if finding["type"] == "cc_pattern")
+        serialized = json.dumps(cc_finding, sort_keys=True)
+
+        assert "C2_ADJACENT_SECRET" not in serialized
+        assert "C2_PASSWORD_SECRET" not in serialized
+        assert "api_key=<redacted>" in serialized
+        assert "password=<redacted>" in serialized
 
     def test_cc_pattern_snippet_url_expansion_is_bounded(self) -> None:
         """Long whitespace-free binary regions should not force unbounded URL scans."""
