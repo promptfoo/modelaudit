@@ -2,6 +2,7 @@ import hashlib
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -122,6 +123,52 @@ def test_scan_mlflow_model_splits_subpath_and_downloads_from_resolved_repo(
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_accepts_single_file_artifact_with_size_metadata(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Finite-budget MLflow scans should accept exact file artifact URIs when parent metadata is bounded."""
+    download_dir = tmp_path / "modelaudit_mlflow_test"
+    download_dir.mkdir()
+    downloaded_file = download_dir / "model.pkl"
+    downloaded_file.write_bytes(b"safe")
+    mock_mlflow = MagicMock()
+    mock_repo = MagicMock()
+    mock_repo.list_artifacts.side_effect = [
+        [],
+        [SimpleNamespace(path="model.pkl", is_dir=False, file_size=1024)],
+    ]
+    mock_repo.download_artifacts.return_value = str(downloaded_file)
+    mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
+    mock_scan.return_value = {"bytes_scanned": 1024, "issues": []}
+    mock_mkdtemp.return_value = str(download_dir)
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        scan_mlflow_model("models:/TestModel/2/model.pkl", max_file_size=2048)
+
+    assert [call.args for call in mock_repo.list_artifacts.call_args_list] == [("model.pkl",), (None,)]
+    mock_repo.download_artifacts.assert_called_once_with(
+        artifact_path="model.pkl",
+        dst_path=str(download_dir),
+    )
+    mock_mlflow.artifacts.download_artifacts.assert_not_called()
+    mock_scan.assert_called_once_with(
+        str(download_dir),
+        timeout=3600,
+        blacklist_patterns=None,
+        max_file_size=2048,
+        max_total_size=0,
+        cache_enabled=True,
+        cache_dir=None,
+    )
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
 def test_scan_mlflow_model_downloads_mutable_ref_from_preflight_repo(
     mock_scan: MagicMock,
     mock_mkdtemp: MagicMock,
@@ -233,6 +280,41 @@ def test_scan_mlflow_model_rejects_listing_budget_before_download(
     assert result.checks[0].details["reason"] == "artifact_listing_budget_exceeded"
     assert result.checks[0].details["artifact_entry_count"] == 3
     assert result.checks[0].details["max_artifact_entries"] == 2
+
+
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_bounds_generator_listing_before_download(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+) -> None:
+    """Generator-like artifact repositories should not be fully materialized before the listing cap."""
+    yielded: list[int] = []
+
+    def _artifact_infos() -> Any:
+        for index in range(100):
+            yielded.append(index)
+            yield SimpleNamespace(path=f"{index}.bin", is_dir=False, file_size=1)
+
+    mock_mlflow = MagicMock()
+    mock_repo = MagicMock()
+    mock_repo.list_artifacts.return_value = _artifact_infos()
+    mock_mlflow.artifacts.get_artifact_repository.return_value = mock_repo
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model(
+            "models:/TestModel/1",
+            max_file_size=1024,
+            max_mlflow_artifact_entries=2,
+        )
+
+    mock_mlflow.artifacts.download_artifacts.assert_not_called()
+    mock_repo.download_artifacts.assert_not_called()
+    mock_mkdtemp.assert_not_called()
+    mock_scan.assert_not_called()
+    assert yielded == [0, 1, 2]
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_listing_budget_exceeded"
 
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")

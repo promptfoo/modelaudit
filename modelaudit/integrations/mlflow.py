@@ -1,9 +1,12 @@
 import hashlib
 import logging
 import os
+import posixpath
 import shutil
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +103,42 @@ def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[st
     return result
 
 
+def _bounded_artifact_listing(
+    list_artifacts: Any,
+    artifact_path: str | None,
+    remaining_entries: int,
+) -> tuple[list[Any], bool]:
+    artifact_infos = list_artifacts(artifact_path)
+    if artifact_infos is None:
+        raise ValueError(f"Artifact listing returned no size information for {artifact_path or '<root>'}")
+
+    if isinstance(artifact_infos, Sequence):
+        return list(artifact_infos[: remaining_entries + 1]), len(artifact_infos) > remaining_entries
+
+    bounded_infos = list(islice(iter(artifact_infos), remaining_entries + 1))
+    return bounded_infos, len(bounded_infos) > remaining_entries
+
+
+def _artifact_path_matches(artifact_path: str | None, requested_path: str) -> bool:
+    if artifact_path == requested_path:
+        return True
+    return artifact_path == posixpath.basename(requested_path)
+
+
+def _find_single_file_artifact_info(
+    list_artifacts: Any,
+    requested_path: str,
+    remaining_entries: int,
+) -> tuple[Any | None, int, bool]:
+    parent_path = posixpath.dirname(requested_path) or None
+    artifact_infos, listing_exceeded = _bounded_artifact_listing(list_artifacts, parent_path, remaining_entries)
+    for artifact_info in artifact_infos:
+        artifact_path = getattr(artifact_info, "path", None)
+        if not getattr(artifact_info, "is_dir", False) and _artifact_path_matches(artifact_path, requested_path):
+            return artifact_info, len(artifact_infos), listing_exceeded
+    return None, len(artifact_infos), listing_exceeded
+
+
 def _preflight_mlflow_download_budget(
     mlflow_module: Any,
     model_uri: str,
@@ -143,17 +182,36 @@ def _preflight_mlflow_download_budget(
             if current_path in visited_dirs:
                 continue
             visited_dirs.add(current_path)
-            artifact_infos = list_artifacts(current_path)
-            if artifact_infos is None:
-                raise ValueError(f"Artifact listing returned no size information for {current_path or '<root>'}")
+            artifact_infos, listing_exceeded = _bounded_artifact_listing(
+                list_artifacts,
+                current_path,
+                max_artifact_entries - entry_count,
+            )
+            if listing_exceeded:
+                details.update(
+                    {
+                        "reason": "artifact_listing_budget_exceeded",
+                        "artifact_entry_count": max_artifact_entries + 1,
+                    }
+                )
+                return _mlflow_budget_failure_result(
+                    model_uri,
+                    f"MLflow artifact listing exceeded {max_artifact_entries} entries before download",
+                    details,
+                )
 
-            for artifact_info in artifact_infos:
-                entry_count += 1
-                if entry_count > max_artifact_entries:
+            artifact_infos_already_counted = False
+            if not artifact_infos and current_path == initial_artifact_path and current_path:
+                artifact_info, parent_entry_count, parent_listing_exceeded = _find_single_file_artifact_info(
+                    list_artifacts,
+                    current_path,
+                    max_artifact_entries - entry_count,
+                )
+                if parent_listing_exceeded:
                     details.update(
                         {
                             "reason": "artifact_listing_budget_exceeded",
-                            "artifact_entry_count": entry_count,
+                            "artifact_entry_count": max_artifact_entries + 1,
                         }
                     )
                     return _mlflow_budget_failure_result(
@@ -161,6 +219,25 @@ def _preflight_mlflow_download_budget(
                         f"MLflow artifact listing exceeded {max_artifact_entries} entries before download",
                         details,
                     )
+                entry_count += parent_entry_count
+                artifact_infos = [artifact_info] if artifact_info is not None else []
+                artifact_infos_already_counted = artifact_info is not None
+
+            for artifact_info in artifact_infos:
+                if not artifact_infos_already_counted:
+                    entry_count += 1
+                    if entry_count > max_artifact_entries:
+                        details.update(
+                            {
+                                "reason": "artifact_listing_budget_exceeded",
+                                "artifact_entry_count": entry_count,
+                            }
+                        )
+                        return _mlflow_budget_failure_result(
+                            model_uri,
+                            f"MLflow artifact listing exceeded {max_artifact_entries} entries before download",
+                            details,
+                        )
 
                 artifact_path = getattr(artifact_info, "path", None)
                 if getattr(artifact_info, "is_dir", False):
