@@ -808,6 +808,22 @@ class TestJinja2TemplateScannerEdgeCases:
         assert len(budget_checks) == 1
         assert budget_checks[0].details["budget_type"] == "timeout"
 
+    def test_sandbox_probe_range_overflow_is_inconclusive(self, tmp_path: Path) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "huge-range.jinja"
+        template_file.write_text("{% for i in range(1000000000) %}{% endfor %}", encoding="utf-8")
+
+        result = Jinja2TemplateScanner({"sandbox_render_timeout_seconds": 2}).scan(str(template_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_sandbox_render_budget_exceeded" in result.metadata["scan_outcome_reasons"]
+        budget_checks = [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+        assert len(budget_checks) == 1
+        assert budget_checks[0].details["budget_type"] == "budget_exceeded"
+        assert budget_checks[0].details["detail"] == "range"
+        assert not [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+
     def test_sandbox_budget_preserves_static_findings_and_security_exit(self, tmp_path: Path) -> None:
         pytest.importorskip("jinja2.sandbox")
         template_file = tmp_path / "static-and-amplify.jinja"

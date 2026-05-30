@@ -181,6 +181,8 @@ def _sandbox_render_probe_worker(
         result_queue.put(("budget_exceeded", "output"))
     except MemoryError:
         result_queue.put(("budget_exceeded", "memory"))
+    except OverflowError:
+        result_queue.put(("budget_exceeded", "range"))
     except Exception as exc:
         result_queue.put(("render_error", type(exc).__name__))
 
