@@ -855,6 +855,25 @@ class TestJinja2TemplateScannerEdgeCases:
         )
         assert determine_exit_code(aggregate_result) == 1
 
+    def test_sandbox_budget_does_not_hide_static_sandbox_risk(self, tmp_path: Path) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "amplify-and-dunder.jinja"
+        template_file.write_text("{{ 'A' * 1000000 }}{{ messages.__class__ }}", encoding="utf-8")
+
+        result = Jinja2TemplateScanner(
+            {
+                "sandbox_render_max_output_chars": 16,
+                "sandbox_render_timeout_seconds": 2,
+            }
+        ).scan(str(template_file))
+
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        budget_checks = [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+        assert len(budget_checks) == 1
+        assert budget_checks[0].details["budget_type"] == "budget_exceeded"
+        failed_checks = [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+        assert any(c.details.get("pattern_type") == "sandbox_violation" for c in failed_checks)
+
     def test_benign_template_below_sandbox_budget_remains_clean(self, tmp_path: Path) -> None:
         pytest.importorskip("jinja2.sandbox")
         template_file = tmp_path / "benign.jinja"

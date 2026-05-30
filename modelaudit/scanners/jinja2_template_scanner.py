@@ -194,10 +194,12 @@ def _sandbox_render_probe_worker(
     max_output_chars: int,
     max_memory_bytes: int,
     result_queue: Any,
+    ready_queue: Any,
 ) -> None:
     try:
         _limit_sandbox_worker_memory(max_memory_bytes)
         env = _create_budgeted_sandbox_environment(max_output_chars)
+        ready_queue.put(("ready", None))
         template = env.from_string(template_content)
         rendered_chars = 0
         for chunk in template.generate(messages=[], config={}):
@@ -1276,7 +1278,10 @@ class Jinja2TemplateScanner(BaseScanner):
                 return True, self._sandbox_render_budget_failure(location, status, detail)
             return True, None
         if status in {"budget_exceeded", "timeout", "worker_error"}:
-            return True, self._sandbox_render_budget_failure(location, status, detail)
+            failure = self._sandbox_render_budget_failure(location, status, detail)
+            if self._template_has_static_sandbox_risk(template_content):
+                return False, failure
+            return True, failure
         return True, None
 
     def _template_has_static_render_budget_risk(self, template_content: str) -> bool:
@@ -1314,11 +1319,13 @@ class Jinja2TemplateScanner(BaseScanner):
 
     def _test_template_safety_with_budget(self, template_content: str) -> tuple[str, str | None]:
         result_queue: Any | None = None
+        ready_queue: Any | None = None
         process: Any | None = None
         try:
             start_method = _sandbox_worker_start_method()
             context = mp.get_context(start_method) if start_method else mp.get_context()
             result_queue = context.Queue(maxsize=1)
+            ready_queue = context.Queue(maxsize=1)
             process = cast(Any, context).Process(
                 target=_sandbox_render_probe_worker,
                 args=(
@@ -1326,6 +1333,7 @@ class Jinja2TemplateScanner(BaseScanner):
                     self.sandbox_render_max_output_chars,
                     self.sandbox_render_max_memory_bytes,
                     result_queue,
+                    ready_queue,
                 ),
             )
             process.daemon = True
@@ -1333,15 +1341,32 @@ class Jinja2TemplateScanner(BaseScanner):
         except Exception as exc:
             if result_queue is not None:
                 result_queue.close()
+            if ready_queue is not None:
+                ready_queue.close()
             return "worker_unavailable", type(exc).__name__
 
         assert result_queue is not None
+        assert ready_queue is not None
         assert process is not None
         try:
-            join_timeout = self.sandbox_render_timeout_seconds
             if start_method == "spawn":
-                join_timeout += _SANDBOX_RENDER_SPAWN_STARTUP_GRACE_SECONDS
-            process.join(join_timeout)
+                try:
+                    ready_queue.get(timeout=_SANDBOX_RENDER_SPAWN_STARTUP_GRACE_SECONDS)
+                except queue.Empty:
+                    if not process.is_alive():
+                        try:
+                            status, _detail = result_queue.get_nowait()
+                            return str(status), str(_detail) if _detail else None
+                        except queue.Empty:
+                            return "worker_error", f"exitcode={process.exitcode}"
+                    process.terminate()
+                    process.join(1)
+                    if process.is_alive() and hasattr(process, "kill"):
+                        process.kill()
+                        process.join(1)
+                    return "worker_error", "startup_timeout"
+
+            process.join(self.sandbox_render_timeout_seconds)
             if process.is_alive():
                 process.terminate()
                 process.join(1)
@@ -1361,6 +1386,8 @@ class Jinja2TemplateScanner(BaseScanner):
         finally:
             result_queue.close()
             result_queue.join_thread()
+            ready_queue.close()
+            ready_queue.join_thread()
             if hasattr(process, "close"):
                 with suppress(ValueError):
                     process.close()
