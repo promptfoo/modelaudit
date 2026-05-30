@@ -938,31 +938,31 @@ class TestJinja2TemplateScannerEdgeCases:
         assert "scan_outcome" not in result.metadata
         assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
 
-    def test_unavailable_sandbox_worker_uses_inline_probe_for_non_static_template(
+    def test_unavailable_sandbox_worker_fails_closed_for_ast_sandbox_probe_risk(
         self,
+        tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "private-attr.jinja"
+        template_file.write_text("{{ value._private }}", encoding="utf-8")
+
         scanner = Jinja2TemplateScanner()
-        calls: list[str] = []
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
 
-        def unavailable_probe(_template_content: str) -> tuple[str, str]:
-            return "worker_unavailable", "AssertionError"
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        budget_checks = [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+        assert len(budget_checks) == 1
+        assert budget_checks[0].details["budget_type"] == "worker_unavailable"
+        assert not [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
 
-        def inline_probe(template_content: str) -> tuple[str, None]:
-            calls.append(template_content)
-            return "security_error", None
-
-        monkeypatch.setattr(scanner, "_test_template_safety_with_budget", unavailable_probe)
-        monkeypatch.setattr(scanner, "_test_template_safety_inline_with_budget", inline_probe)
-
-        safe, failure = scanner._test_template_safety("{{ value|safe }}", "template_content")
-
-        assert calls == ["{{ value|safe }}"]
-        assert safe is False
-        assert failure is None
-
-    def test_spawn_startup_timeout_keeps_benign_template_clean_without_inline_timeout(
+    def test_spawn_startup_timeout_keeps_benign_template_clean(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -976,16 +976,56 @@ class TestJinja2TemplateScannerEdgeCases:
         def startup_timeout_probe(_template_content: str) -> tuple[str, str]:
             return "worker_unavailable", "startup_timeout"
 
-        def unavailable_inline_probe(_template_content: str) -> tuple[str, str]:
-            return "worker_unavailable", "inline_timeout_unavailable"
-
         monkeypatch.setattr(scanner, "_test_template_safety_with_budget", startup_timeout_probe)
-        monkeypatch.setattr(scanner, "_test_template_safety_inline_with_budget", unavailable_inline_probe)
         result = scanner.scan(str(template_file))
 
         assert result.success is True
         assert "scan_outcome" not in result.metadata
         assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
+    def test_spawn_worker_exit_before_result_keeps_benign_template_clean(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "benign.jinja"
+        template_file.write_text("Hello, {{ name }}! Welcome to {{ site }}.", encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner()
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_error", "exitcode=1"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
+    def test_unavailable_sandbox_worker_fails_closed_for_static_expression_range(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "range-expression.jinja"
+        template_file.write_text("{{ range(10 ** 8)|list }}", encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner()
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        budget_checks = [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+        assert len(budget_checks) == 1
+        assert budget_checks[0].details["budget_type"] == "worker_unavailable"
 
     def test_unavailable_sandbox_worker_fails_closed_for_static_render_amplification(
         self,
@@ -1066,6 +1106,30 @@ class TestJinja2TemplateScannerEdgeCases:
         jinja2_template_scanner._limit_sandbox_worker_memory(1024)
 
         assert calls == [(1, (2048 * 1024 + 1024, -1))]
+
+    def test_sandbox_worker_memory_limit_adds_configured_budget_to_baseline(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls: list[tuple[int, tuple[int, int]]] = []
+
+        class FakeResource:
+            RLIMIT_AS = 1
+            RLIM_INFINITY = -1
+
+            def getrlimit(self, _limit_id: int) -> tuple[int, int]:
+                return (-1, self.RLIM_INFINITY)
+
+            def setrlimit(self, limit_id: int, limits: tuple[int, int]) -> None:
+                calls.append((limit_id, limits))
+
+        monkeypatch.setattr(jinja2_template_scanner, "HAS_RESOURCE_LIMITS", True)
+        monkeypatch.setattr(jinja2_template_scanner, "resource", FakeResource())
+        monkeypatch.setattr(jinja2_template_scanner, "_proc_statm_virtual_memory_bytes", lambda: 1024)
+
+        jinja2_template_scanner._limit_sandbox_worker_memory(512)
+
+        assert calls == [(1, (1536, -1))]
 
     def test_sandbox_worker_prefers_spawn_when_proc_baseline_is_unavailable(
         self,

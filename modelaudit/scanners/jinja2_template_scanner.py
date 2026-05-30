@@ -24,8 +24,6 @@ import os
 import platform
 import queue
 import re
-import signal
-import threading
 import warnings
 from contextlib import suppress
 from typing import Any, ClassVar, cast
@@ -54,6 +52,7 @@ except ImportError:
 # Optional Jinja2 sandboxing support
 try:
     import jinja2.exceptions
+    import jinja2.nodes
     import jinja2.sandbox
 
     HAS_JINJA2_SANDBOX = True
@@ -95,10 +94,6 @@ _SANDBOX_RENDER_BUDGET_REASON = "jinja2_sandbox_render_budget_exceeded"
 
 
 class _SandboxRenderBudgetExceeded(Exception):
-    pass
-
-
-class _SandboxRenderTimedOut(Exception):
     pass
 
 
@@ -154,7 +149,7 @@ def _limit_sandbox_worker_memory(max_memory_bytes: int) -> None:
             continue
         try:
             _soft_limit, hard_limit = resource.getrlimit(limit_id)
-            capped_limit = max(baseline_memory_bytes + max_memory_bytes, max_memory_bytes * 4)
+            capped_limit = baseline_memory_bytes + max_memory_bytes
             if hard_limit != resource.RLIM_INFINITY:
                 capped_limit = min(capped_limit, hard_limit)
             resource.setrlimit(limit_id, (capped_limit, hard_limit))
@@ -207,8 +202,6 @@ def _run_budgeted_sandbox_render(template_content: str, max_output_chars: int) -
         return "safe", None
     except jinja2.exceptions.SecurityError:
         return "security_error", None
-    except _SandboxRenderTimedOut:
-        return "timeout", None
     except _SandboxRenderBudgetExceeded:
         return "budget_exceeded", "output"
     except MemoryError:
@@ -217,50 +210,6 @@ def _run_budgeted_sandbox_render(template_content: str, max_output_chars: int) -
         return "budget_exceeded", "range"
     except Exception as exc:
         return "render_error", type(exc).__name__
-
-
-def _inline_sandbox_timeout_primitives() -> tuple[Any, Any, Any] | None:
-    if threading.current_thread() is not threading.main_thread():
-        return None
-    setitimer = getattr(signal, "setitimer", None)
-    itimer_real = getattr(signal, "ITIMER_REAL", None)
-    sigalrm = getattr(signal, "SIGALRM", None)
-    if not callable(setitimer) or itimer_real is None or sigalrm is None:
-        return None
-    return setitimer, itimer_real, sigalrm
-
-
-def _sandbox_render_probe_inline(
-    template_content: str,
-    max_output_chars: int,
-    timeout_seconds: float,
-) -> tuple[str, str | None]:
-    primitives = _inline_sandbox_timeout_primitives()
-    if primitives is None:
-        return "worker_unavailable", "inline_timeout_unavailable"
-
-    setitimer, itimer_real, sigalrm = primitives
-    previous_handler: Any | None = None
-    previous_timer: tuple[float, float] | None = None
-
-    def _raise_timeout(_signum: int, _frame: Any) -> None:
-        raise _SandboxRenderTimedOut
-
-    try:
-        previous_handler = signal.getsignal(sigalrm)
-        previous_timer = cast(tuple[float, float], setitimer(itimer_real, 0))
-        signal.signal(sigalrm, _raise_timeout)
-        setitimer(itimer_real, max(timeout_seconds, 0.001))
-        return _run_budgeted_sandbox_render(template_content, max_output_chars)
-    finally:
-        with suppress(Exception):
-            setitimer(itimer_real, 0)
-        if previous_handler is not None:
-            with suppress(Exception):
-                signal.signal(sigalrm, previous_handler)
-        if previous_timer is not None and previous_timer[0] > 0:
-            with suppress(Exception):
-                setitimer(itimer_real, previous_timer[0], previous_timer[1])
 
 
 def _sandbox_render_probe_worker(
@@ -1330,16 +1279,12 @@ class Jinja2TemplateScanner(BaseScanner):
 
         if status == "security_error":
             return False, None
-        if status == "worker_unavailable":
-            if self._template_has_static_render_budget_risk(template_content) or self._template_has_static_sandbox_risk(
+        if self._sandbox_probe_unavailable(status, detail):
+            if self._template_has_static_render_budget_risk(
                 template_content
-            ):
-                return True, self._sandbox_render_budget_failure(location, status, detail)
-            status, detail = self._test_template_safety_inline_with_budget(template_content)
-            if status == "security_error":
-                return False, None
-            if status == "worker_unavailable":
-                return True, None
+            ) or self._template_has_static_sandbox_probe_risk(template_content):
+                return True, self._sandbox_render_budget_failure(location, "worker_unavailable", detail)
+            return True, None
         if status in {"budget_exceeded", "timeout", "worker_error"}:
             failure = self._sandbox_render_budget_failure(location, status, detail)
             if self._template_has_static_sandbox_risk(template_content):
@@ -1347,12 +1292,21 @@ class Jinja2TemplateScanner(BaseScanner):
             return True, failure
         return True, None
 
+    def _sandbox_probe_unavailable(self, status: str, detail: str | None) -> bool:
+        if status == "worker_unavailable":
+            return True
+        if status != "worker_error" or not detail:
+            return False
+        return detail == "empty_result" or detail.startswith("exitcode=")
+
     def _template_has_static_render_budget_risk(self, template_content: str) -> bool:
-        return bool(
+        if (
             re.search(r"(['\"])(?:\\.|(?!\1).){1,256}\1\s*\*\s*\d{5,}", template_content)
             or re.search(r"\d{5,}\s*\*\s*(['\"])(?:\\.|(?!\1).){1,256}\1", template_content)
             or re.search(r"\brange\(\s*\d{5,}", template_content)
-        )
+        ):
+            return True
+        return self._template_ast_has_static_render_budget_risk(template_content)
 
     def _template_has_static_sandbox_risk(self, template_content: str) -> bool:
         return bool(
@@ -1360,6 +1314,115 @@ class Jinja2TemplateScanner(BaseScanner):
             or re.search(r"\|\s*attr\s*\(\s*['\"]__\w+__", template_content)
             or re.search(r"\[\s*['\"]__\w+__['\"]\s*\]", template_content)
         )
+
+    def _template_has_static_sandbox_probe_risk(self, template_content: str) -> bool:
+        if self._template_has_static_sandbox_risk(template_content):
+            return True
+
+        parsed = self._parse_template_ast(template_content)
+        if parsed is None:
+            return False
+
+        risky_public_attrs = {"mro", "func_code", "func_globals", "gi_frame", "cr_frame"}
+        for node in parsed.find_all(jinja2.nodes.Getattr):
+            attr = node.attr
+            if attr.startswith("_") or attr in risky_public_attrs:
+                return True
+
+        for node in parsed.find_all(jinja2.nodes.Getitem):
+            arg = node.arg
+            if isinstance(arg, jinja2.nodes.Const) and isinstance(arg.value, str) and arg.value.startswith("_"):
+                return True
+
+        for node in parsed.find_all(jinja2.nodes.Filter):
+            if node.name != "attr" or not node.args:
+                continue
+            attr_arg = node.args[0]
+            if (
+                isinstance(attr_arg, jinja2.nodes.Const)
+                and isinstance(attr_arg.value, str)
+                and (attr_arg.value.startswith("_") or attr_arg.value in risky_public_attrs)
+            ):
+                return True
+
+        return False
+
+    def _template_ast_has_static_render_budget_risk(self, template_content: str) -> bool:
+        parsed = self._parse_template_ast(template_content)
+        if parsed is None:
+            return False
+
+        range_threshold = 10_000
+        for node in parsed.find_all(jinja2.nodes.Call):
+            if not isinstance(node.node, jinja2.nodes.Name) or node.node.name != "range" or not node.args:
+                continue
+            range_bound = self._constant_int_expression_value(node.args[0], range_threshold)
+            if range_bound is not None and abs(range_bound) >= range_threshold:
+                return True
+
+        for node in parsed.find_all(jinja2.nodes.Mul):
+            projected_size = self._constant_repeated_sequence_size(node.left, node.right)
+            if projected_size is not None and projected_size > self.sandbox_render_max_output_chars:
+                return True
+
+        return False
+
+    def _parse_template_ast(self, template_content: str) -> Any | None:
+        try:
+            return jinja2.Environment().parse(template_content)
+        except Exception:
+            return None
+
+    def _constant_repeated_sequence_size(self, left: Any, right: Any) -> int | None:
+        left_size = self._constant_sequence_size(left)
+        right_size = self._constant_sequence_size(right)
+        left_count = self._constant_int_expression_value(left, self.sandbox_render_max_output_chars)
+        right_count = self._constant_int_expression_value(right, self.sandbox_render_max_output_chars)
+        if left_count is not None and right_size is not None:
+            return max(left_count, 0) * right_size
+        if right_count is not None and left_size is not None:
+            return max(right_count, 0) * left_size
+        return None
+
+    def _constant_sequence_size(self, node: Any) -> int | None:
+        if isinstance(node, jinja2.nodes.Const) and isinstance(node.value, str | bytes):
+            return len(node.value)
+        if isinstance(node, jinja2.nodes.List | jinja2.nodes.Tuple):
+            return len(node.items)
+        return None
+
+    def _constant_int_expression_value(self, node: Any, cap: int) -> int | None:
+        if isinstance(node, jinja2.nodes.Const):
+            if isinstance(node.value, bool) or not isinstance(node.value, int):
+                return None
+            return node.value
+        if isinstance(node, jinja2.nodes.Neg):
+            value = self._constant_int_expression_value(node.node, cap)
+            return -value if value is not None else None
+        if isinstance(node, jinja2.nodes.Add | jinja2.nodes.Sub | jinja2.nodes.Mul):
+            left = self._constant_int_expression_value(node.left, cap)
+            right = self._constant_int_expression_value(node.right, cap)
+            if left is None or right is None:
+                return None
+            if isinstance(node, jinja2.nodes.Add):
+                return self._cap_constant_int(left + right, cap)
+            if isinstance(node, jinja2.nodes.Sub):
+                return self._cap_constant_int(left - right, cap)
+            return self._cap_constant_int(left * right, cap)
+        if isinstance(node, jinja2.nodes.Pow):
+            left = self._constant_int_expression_value(node.left, cap)
+            right = self._constant_int_expression_value(node.right, cap)
+            if left is None or right is None or right < 0:
+                return None
+            if abs(left) > 1 and right > 32:
+                return cap + 1
+            return self._cap_constant_int(left**right, cap)
+        return None
+
+    def _cap_constant_int(self, value: int, cap: int) -> int:
+        if abs(value) <= cap:
+            return value
+        return cap + 1 if value > 0 else -(cap + 1)
 
     def _sandbox_render_budget_failure(
         self,
@@ -1379,13 +1442,6 @@ class Jinja2TemplateScanner(BaseScanner):
         if detail:
             failure["detail"] = detail
         return failure
-
-    def _test_template_safety_inline_with_budget(self, template_content: str) -> tuple[str, str | None]:
-        return _sandbox_render_probe_inline(
-            template_content,
-            self.sandbox_render_max_output_chars,
-            self.sandbox_render_timeout_seconds,
-        )
 
     def _test_template_safety_with_budget(self, template_content: str) -> tuple[str, str | None]:
         result_queue: Any | None = None
