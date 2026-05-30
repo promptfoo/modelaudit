@@ -119,7 +119,6 @@ class ModelMetadataExtractor:
             "model_producer",
             "domain",
             # SafeTensors security fields
-            "custom_metadata",
             "tensor_count",
             # Common security indicators
             "has_custom_operators",
@@ -135,6 +134,12 @@ class ModelMetadataExtractor:
         for key in security_keys:
             if key in metadata:
                 filtered[key] = metadata[key]
+
+        if "custom_metadata" in metadata:
+            custom_metadata = metadata["custom_metadata"]
+            filtered["has_custom_metadata"] = True
+            if isinstance(custom_metadata, dict):
+                filtered["custom_metadata_entry_count"] = len(custom_metadata)
 
         # Add any keys containing 'security', 'suspicious', 'dangerous', etc.
         for key, value in metadata.items():

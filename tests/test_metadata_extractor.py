@@ -184,7 +184,7 @@ class TestModelMetadataExtractor:
 
         header = {
             "tensor1": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
-            "__metadata__": {"framework": "test", "version": "1.0"},
+            "__metadata__": {"framework": "test", "version": "1.0", "api_key": "SECRET_METADATA_TOKEN"},
         }
         header_json = json.dumps(header).encode("utf-8")
 
@@ -196,15 +196,21 @@ class TestModelMetadataExtractor:
 
         # Test with security_only=True
         metadata = extractor.extract(str(st_file), security_only=True)
+        full_metadata = extractor.extract(str(st_file), security_only=False)
 
         # Should contain basic info
         assert "file" in metadata
         assert "format" in metadata
         assert "file_size" in metadata
 
-        # Should contain custom metadata (potentially security relevant)
-        if "custom_metadata" in metadata:
-            assert metadata["custom_metadata"]["framework"] == "test"
+        # Should not contain raw attacker-controlled custom metadata in security-only output.
+        assert "custom_metadata" not in metadata
+        assert metadata["has_custom_metadata"] is True
+        assert metadata["custom_metadata_entry_count"] == 3
+        assert "SECRET_METADATA_TOKEN" not in json.dumps(metadata, sort_keys=True)
+
+        # Full metadata extraction remains unchanged.
+        assert full_metadata["custom_metadata"]["api_key"] == "SECRET_METADATA_TOKEN"
 
     def test_format_table_single_file(self) -> None:
         """Test table formatting for single file."""
@@ -681,7 +687,12 @@ class TestCLIMetadataCommand:
 
         from modelaudit.cli import cli
 
-        header = {"t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+        secret_token = "SAFE_METADATA_SECRET_TOKEN"
+        secret_url = "https://example.com/model.bin?token=SAFE_METADATA_URL_TOKEN"
+        header = {
+            "t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+            "__metadata__": {"api_key": secret_token, "source": secret_url},
+        }
         header_json = json.dumps(header).encode("utf-8")
 
         st_file = tmp_path / "model.safetensors"
@@ -697,6 +708,13 @@ class TestCLIMetadataCommand:
         output = json.loads(result.output)
         assert "file" in output
         assert "format" in output
+        assert "custom_metadata" not in output
+        assert output["has_custom_metadata"] is True
+        assert output["custom_metadata_entry_count"] == 2
+        serialized = json.dumps(output, sort_keys=True)
+        assert secret_token not in serialized
+        assert secret_url not in serialized
+        assert "SAFE_METADATA_URL_TOKEN" not in serialized
 
     def test_cli_metadata_table_output(self, tmp_path: Path) -> None:
         """Test CLI metadata command with default table output."""
