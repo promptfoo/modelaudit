@@ -160,6 +160,7 @@ _SUSPICIOUS_TARGET_PATTERNS = (
     "vars",
 )
 _TARGET_TOKEN_RE = re.compile(r"__import__|[A-Z]+(?=[A-Z][a-z0-9]|[0-9_]|$)|[A-Z]?[a-z0-9]+")
+_HYDRA_INTERPOLATION_RE = re.compile(r"\$\{")
 
 CVE_2025_23304_ID = "CVE-2025-23304"
 CVE_2025_23304_CVSS = 7.6
@@ -2163,6 +2164,10 @@ class NemoScanner(BaseScanner):
         target_config: dict[str, Any] | None = None,
     ) -> None:
         """Evaluate a single _target_ value for dangerous patterns."""
+        if _HYDRA_INTERPOLATION_RE.search(target):
+            self._add_interpolated_target_check(target, config_path, config_name, archive_path, result)
+            return
+
         # Check against known dangerous targets (always flag, even if safe prefix)
         if target in _DANGEROUS_TARGETS or (target == "numpy.load" and self._numpy_load_allows_pickle(target_config)):
             result.add_check(
@@ -2231,6 +2236,40 @@ class NemoScanner(BaseScanner):
                 "config_path": config_path,
                 "config_file": config_name,
             },
+        )
+
+    def _add_interpolated_target_check(
+        self,
+        target: str,
+        config_path: str,
+        config_name: str,
+        archive_path: str,
+        result: ScanResult,
+    ) -> None:
+        result.add_check(
+            name=f"{CVE_2025_23304_ID}: Interpolated Hydra _target_",
+            passed=False,
+            message=(
+                f"{CVE_2025_23304_ID}: Interpolated _target_ "
+                f"'{target}' at {config_path} in {config_name} "
+                "can resolve to a dangerous callable at load time"
+            ),
+            severity=IssueSeverity.CRITICAL,
+            location=f"{archive_path}:{config_name}",
+            details={
+                "target": target,
+                "config_path": config_path,
+                "config_file": config_name,
+                "cve_id": CVE_2025_23304_ID,
+                "cvss": CVE_2025_23304_CVSS,
+                "cwe": CVE_2025_23304_CWE,
+                "description": CVE_2025_23304_DESCRIPTION,
+                "remediation": CVE_2025_23304_REMEDIATION,
+            },
+            why=(
+                "Hydra and OmegaConf resolve interpolation expressions before instantiating _target_. "
+                "A static scan cannot prove this dynamic callable selector is safe, so the scanner fails closed."
+            ),
         )
 
     def _add_suspicious_target_check(

@@ -3453,6 +3453,74 @@ class TestCVE202523304HydraTarget:
         assert len(review_checks) == 1
         assert review_checks[0].severity == IssueSeverity.INFO
 
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"target_value": "os.system", "model": {"_target_": "${target_value}", "command": "id"}},
+            {
+                "callable": {"module": "os", "leaf": "system"},
+                "model": {"_target_": "${callable.module}.${callable.leaf}", "command": "id"},
+            },
+            {
+                "target_value": "os.system",
+                "model": {"_target_": "${oc.select:target_value,{}}", "command": "id"},
+            },
+            {
+                "leaf": "load",
+                "model": {"_target_": "numpy.${oc.select:leaf,{}}", "file": "payload.npy", "allow_pickle": True},
+            },
+            {"safe_target": "nemo.Model", "model": {"_target_": "${safe_target}"}},
+        ],
+    )
+    def test_interpolated_target_fails_closed(self, tmp_path: Path, config: dict[str, Any]) -> None:
+        """Dynamic Hydra callable selectors must not fall through to INFO-only review."""
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        cve_checks = [check for check in result.checks if check.name == "CVE-2025-23304: Interpolated Hydra _target_"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["target"] == config["model"]["_target_"]
+        assert cve_checks[0].details["cve_id"] == "CVE-2025-23304"
+        assert not any(check.name == "Hydra _target_ Review" for check in result.checks)
+
+    @pytest.mark.parametrize(
+        "target",
+        ["${target_value}", "${oc.select:target_value,{}}"],
+    )
+    def test_interpolated_target_fails_aggregate_scan(self, tmp_path: Path, target: str) -> None:
+        """A dynamic Hydra callable selector should produce aggregate exit 1."""
+        config = {"target_value": "os.system", "model": {"_target_": target, "command": "id"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False},
+        )
+
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and "Interpolated _target_" in issue.message
+            for issue in result.issues
+        )
+
+    def test_interpolated_argument_for_safe_target_remains_safe(self, tmp_path: Path) -> None:
+        """Only interpolated callable selectors are failed closed, not ordinary Hydra arguments."""
+        config = {"optimizer_name": "adam", "model": {"_target_": "nemo.Model", "name": "${optimizer_name}"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name == "CVE-2025-23304: Interpolated Hydra _target_" for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Safety Check"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("target") == "nemo.Model"
+            for check in result.checks
+        )
+
     def test_torch_load_target_fails_aggregate_scan(self, tmp_path: Path) -> None:
         """A NeMo config using torch.load should produce a security failure, not exit 0."""
         config = {"model": {"_target_": "torch.load", "f": "payload.pt"}}
