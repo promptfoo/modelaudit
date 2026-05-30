@@ -1603,13 +1603,18 @@ def _resolve_scan_source_for_path(
                 **_scanner_selection_overrides(runtime),
             )
 
-            if download_spinner:
+            audit_result.aggregate_scan_result(results.model_dump())
+            record_download_completed("mlflow", time.time() - download_start, results.bytes_scanned, path)
+            download_refused = any(getattr(issue, "type", None) == "mlflow_download_budget" for issue in results.issues)
+            if download_refused:
+                if download_spinner:
+                    download_spinner.fail(style_text("❌ Download refused", fg="red", bold=True))
+                elif runtime.show_styled_output:
+                    click.echo("Download refused by configured size budget")
+            elif download_spinner:
                 download_spinner.ok(style_text("✅ Downloaded & Scanned", fg="green", bold=True))
             elif runtime.show_styled_output:
                 click.echo("Downloaded and scanned successfully")
-
-            audit_result.aggregate_scan_result(results.model_dump())
-            record_download_completed("mlflow", time.time() - download_start, results.bytes_scanned, path)
             return _SourceDispatchResult(actual_path=path, local_scan_required=False)
         except Exception as exc:
             if download_spinner:
