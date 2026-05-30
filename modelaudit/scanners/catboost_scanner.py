@@ -10,7 +10,7 @@ import struct
 from typing import Any, ClassVar
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
-from ._evidence_redaction import REDACTED_EVIDENCE_VALUE, redact_evidence_string
+from ._evidence_redaction import REDACTED_EVIDENCE_VALUE, REDACTED_URL_CREDENTIALS, redact_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 CATBOOST_MAGIC = b"CBM1"
@@ -44,6 +44,9 @@ _SCRIPT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 _BASE64_PAYLOAD_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{100,}={0,2})")
 _BASE64_EVIDENCE_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9+/])(?:[A-Za-z0-9+/]{24,}={0,2})(?![A-Za-z0-9+/=])")
 _HEX_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2}){8,}")
+_STANDALONE_SECRET_TOKEN_PATTERN = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|[A-Za-z0-9_+/=-]{32,})\b"
+)
 _MAX_ENCODED_EVIDENCE_CHARS = 8192
 
 _SUSPICIOUS_NETWORK_KEYWORDS = (
@@ -106,11 +109,15 @@ def _redact_reversible_base64_evidence(text: str, depth: int = 0) -> str:
 
         decoded_text = _redact_reversible_base64_evidence(decoded_text, depth + 1)
         redacted_decoded = redact_evidence_string(decoded_text, max_chars=160)
-        if REDACTED_EVIDENCE_VALUE in redacted_decoded:
+        if REDACTED_EVIDENCE_VALUE in redacted_decoded or REDACTED_URL_CREDENTIALS in redacted_decoded:
             return redacted_decoded
         return match.group(0)
 
     return _BASE64_EVIDENCE_TOKEN_PATTERN.sub(replace_payload, text)
+
+
+def _redact_standalone_secret_tokens(text: str) -> str:
+    return _STANDALONE_SECRET_TOKEN_PATTERN.sub(REDACTED_EVIDENCE_VALUE, text)
 
 
 class _CatBoostParseError(ValueError):
@@ -141,7 +148,8 @@ def _redact_urls_for_display(text: str) -> str:
 
 def _redact_evidence_for_display(text: str, max_chars: int = 160) -> str:
     text = _redact_reversible_base64_evidence(text)
-    return redact_evidence_string(_redact_urls_for_display(text), max_chars=max_chars)
+    text = redact_evidence_string(_redact_urls_for_display(text), max_chars=max_chars)
+    return _redact_standalone_secret_tokens(text)
 
 
 class CatBoostScanner(BaseScanner):

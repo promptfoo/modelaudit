@@ -1352,14 +1352,20 @@ def test_catboost_sarif_reports_sanitized_decoded_encoded_payload_evidence(tmp_p
     adjacent_payload = base64.b64encode(adjacent_raw.encode()).decode()
     nested_raw = (f'os.system("id"); blob={adjacent_payload}; https://collector.evil.example/upload').ljust(100, "B")
     nested_payload = base64.b64encode(nested_raw.encode()).decode()
+    url_raw = "https://user:urlpass9@collector.evil.example/upload"
+    url_payload = base64.b64encode(url_raw.encode()).decode()
     hex_raw = 'os.system("id"); client_secret=CATBOOST_HEX_RAW_SECRET_123456;'
     hex_payload = "".join(f"\\x{byte:02x}" for byte in hex_raw.encode())
+    standalone_hex_raw = "sk-standalone-secret1234567890"
+    standalone_hex_payload = "".join(f"\\x{byte:02x}" for byte in standalone_hex_raw.encode())
     model_path = tmp_path / "sarif_encoded_secret.cbm"
     model_path.write_bytes(
         _build_cbm(
             [
                 base64_payload,
                 hex_payload,
+                url_payload,
+                standalone_hex_payload,
                 f'os.system("id"); blob={adjacent_payload}; https://collector.evil.example/upload',
                 nested_payload,
             ],
@@ -1374,15 +1380,23 @@ def test_catboost_sarif_reports_sanitized_decoded_encoded_payload_evidence(tmp_p
     assert "CATBOOST_B64_RAW_SECRET" not in failed_details
     assert "CATBOOST_HEX_RAW_SECRET" not in failed_details
     assert "adjacentpass9" not in failed_details
+    assert "urlpass9" not in failed_details
+    assert "sk-standalone-secret" not in failed_details
     assert base64_payload not in failed_details
     assert hex_payload not in failed_details
+    assert url_payload not in failed_details
+    assert standalone_hex_payload not in failed_details
     assert adjacent_payload not in failed_details
     assert nested_payload not in failed_details
     assert "CATBOOST_B64_RAW_SECRET" not in sarif
     assert "CATBOOST_HEX_RAW_SECRET" not in sarif
     assert "adjacentpass9" not in sarif
+    assert "urlpass9" not in sarif
+    assert "sk-standalone-secret" not in sarif
     assert base64_payload not in sarif
     assert hex_payload not in sarif
+    assert url_payload not in sarif
+    assert standalone_hex_payload not in sarif
     assert adjacent_payload not in sarif
     assert nested_payload not in sarif
     assert "os.system" in failed_details

@@ -92,7 +92,10 @@ SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
 )
 ASSIGNMENT_SEPARATOR: Final[str] = r"(?::=|\*\*=|//=|<<=|>>=|[+\-*/%@&|^]=|[:=](?!=))"
 ASSIGNMENT_SEPARATOR_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)\s*{ASSIGNMENT_SEPARATOR}\s*")
-AUTHORIZATION_SCHEME_PATTERN: Final[str] = r"(?:[a-z0-9!#$%&'*+.^_`|~-]+\s+)?"
+KNOWN_AUTHORIZATION_SCHEME_PATTERN: Final[str] = (
+    r"(?:bearer|basic|digest|token|negotiate|ntlm|aws4-hmac-sha256|foo\.bar)"
+)
+AUTHORIZATION_SCHEME_PATTERN: Final[str] = rf"(?:{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)?"
 SENSITIVE_ASSIGNMENT_KEY_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)^{SENSITIVE_ASSIGNMENT_KEY}$")
 AUTHORIZATION_KEY_RE: Final[re.Pattern[str]] = re.compile(r"(?i)^authorization$")
 QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
@@ -116,21 +119,9 @@ KEY_ESCAPE_RE: Final[re.Pattern[str]] = re.compile(
 UNQUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b((?:[a-z0-9_-]|{KEY_ESCAPE_TOKEN_PATTERN})+)(\s*{ASSIGNMENT_SEPARATOR}\s*)"
 )
-SUBSCRIPT_QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)(?:\b[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)*\s*)?"
-    rf"\[\s*(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"'])((?:\\.|[^\"'])*)\1\2\s*\]"
-    rf"(\s*{ASSIGNMENT_SEPARATOR}\s*)"
-)
-SUBSCRIPT_EXPRESSION_KEY_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)(?:\b[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)*\s*)?"
-    rf"\[\s*([^\]\n]{{1,{MAX_KEY_EXPRESSION_CHARS}}})\s*\](\s*{ASSIGNMENT_SEPARATOR}\s*)"
-)
 SENSITIVE_EVIDENCE_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{ASSIGNMENT_SEPARATOR}\s*|"
     rf"\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN}|\bbearer\s+)"
-)
-COMMAND_EXPRESSION_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)^\s*(?:\(\s*)*(?:(?:os\.system|subprocess\.(?:popen|run|call|check_output|check_call)|eval|exec|__import__)\s*\(|(?:bash|sh)\s+-c\b|cmd\.exe\s*/c\b|powershell(?:\.exe)?\b)"
 )
 COMMAND_EVIDENCE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)\b(?:(?:os\.system|subprocess\.(?:popen|run|call|check_output|check_call)|eval|exec|__import__)\s*\(|(?:bash|sh)\s+-c\b|cmd\.exe\s*/c\b|powershell(?:\.exe)?\b)"
@@ -157,9 +148,13 @@ COMMAND_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
 )
 HIGH_ENTROPY_TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{12,}|[A-Za-z0-9_+/=-]{24,})\b")
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN})"
+    rf"(?is)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)"
     rf"((?:(?!\b{SENSITIVE_ASSIGNMENT_KEY}\s*{ASSIGNMENT_SEPARATOR}).)*?)"
     rf"(?=[\"';&|\n]|$|\b{SENSITIVE_ASSIGNMENT_KEY}\s*{ASSIGNMENT_SEPARATOR}|\bbearer\s+)"
+)
+BARE_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*)"
+    rf"(?!{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)[^\"'\s;&|]+"
 )
 TRIPLE_QUOTED_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN}){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"'])\2\3\2\3[\s\S]*?\2\3\2\3\2\3"
@@ -1578,12 +1573,17 @@ def _redact_adjacent_string_literals(text: str) -> str:
 
 
 def _redact_residual_expression_literals(text: str) -> str:
+    def replace_residual(match: re.Match[str]) -> str:
+        if COMMAND_EVIDENCE_RE.search(match.group(0)):
+            return match.group(0)
+        return f"{match.group(1)}{REDACTED_EVIDENCE_VALUE}"
+
     for pattern in (
         RESIDUAL_LITERAL_SENSITIVE_ASSIGNMENT_RE,
         RESIDUAL_LITERAL_AUTHORIZATION_RE,
         RESIDUAL_LITERAL_BEARER_RE,
     ):
-        text = pattern.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", text)
+        text = pattern.sub(replace_residual, text)
     return text
 
 
@@ -1601,6 +1601,10 @@ def _redact_authorization_value(match: re.Match[str]) -> str:
     trailing_whitespace = re.search(r"\s*$", value)
     suffix = trailing_whitespace.group(0) if trailing_whitespace else ""
     return f"{match.group(1)}{REDACTED_EVIDENCE_VALUE}{suffix}"
+
+
+def _redact_bare_authorization_value(match: re.Match[str]) -> str:
+    return f"{match.group(1)}{REDACTED_EVIDENCE_VALUE}"
 
 
 def _redact_command_user_password(match: re.Match[str]) -> str:
@@ -1664,6 +1668,7 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = _redact_adjacent_string_literals(redacted)
     redacted = _redact_residual_expression_literals(redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, redacted)
+    redacted = BARE_AUTHORIZATION_VALUE_RE.sub(_redact_bare_authorization_value, redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_sensitive_assignment, redacted)
     return _truncate(redacted, max_chars)
