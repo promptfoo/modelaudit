@@ -21,6 +21,7 @@ Key Features:
 import json
 import multiprocessing as mp
 import os
+import platform
 import queue
 import re
 import warnings
@@ -87,6 +88,7 @@ _RAW_PARSE_FALLBACK_READ_BYTES = 256 * 1024
 _DEFAULT_SANDBOX_RENDER_TIMEOUT_SECONDS = 0.5
 _DEFAULT_SANDBOX_RENDER_MAX_OUTPUT_CHARS = 64 * 1024
 _DEFAULT_SANDBOX_RENDER_MAX_MEMORY_BYTES = 512 * 1024 * 1024
+_SANDBOX_RENDER_SPAWN_STARTUP_GRACE_SECONDS = 2.0
 _SANDBOX_RENDER_BUDGET_REASON = "jinja2_sandbox_render_budget_exceeded"
 
 
@@ -94,7 +96,7 @@ class _SandboxRenderBudgetExceeded(Exception):
     pass
 
 
-def _current_process_virtual_memory_bytes() -> int | None:
+def _proc_statm_virtual_memory_bytes() -> int | None:
     try:
         with open("/proc/self/statm", encoding="ascii") as statm:
             total_pages = int(statm.read().split()[0])
@@ -103,12 +105,41 @@ def _current_process_virtual_memory_bytes() -> int | None:
         return None
 
 
+def _resource_max_resident_set_bytes() -> int | None:
+    if not HAS_RESOURCE_LIMITS or resource is None:
+        return None
+    try:
+        max_rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except Exception:
+        return None
+    if max_rss <= 0:
+        return None
+    if platform.system() == "Darwin":
+        return max_rss
+    return max_rss * 1024
+
+
+def _current_process_memory_baseline_bytes() -> int | None:
+    return _proc_statm_virtual_memory_bytes() or _resource_max_resident_set_bytes()
+
+
+def _sandbox_worker_start_method() -> str | None:
+    start_methods = mp.get_all_start_methods()
+    if "fork" in start_methods and _proc_statm_virtual_memory_bytes() is not None:
+        return "fork"
+    if "spawn" in start_methods:
+        return "spawn"
+    if "fork" in start_methods:
+        return "fork"
+    return None
+
+
 def _limit_sandbox_worker_memory(max_memory_bytes: int) -> None:
     if not HAS_RESOURCE_LIMITS or resource is None:
         return
 
-    baseline_virtual_memory_bytes = _current_process_virtual_memory_bytes()
-    if baseline_virtual_memory_bytes is None:
+    baseline_memory_bytes = _current_process_memory_baseline_bytes()
+    if baseline_memory_bytes is None:
         return
 
     for limit_name in ("RLIMIT_AS",):
@@ -117,7 +148,7 @@ def _limit_sandbox_worker_memory(max_memory_bytes: int) -> None:
             continue
         try:
             _soft_limit, hard_limit = resource.getrlimit(limit_id)
-            capped_limit = baseline_virtual_memory_bytes + max_memory_bytes
+            capped_limit = max(baseline_memory_bytes + max_memory_bytes, max_memory_bytes * 4)
             if hard_limit != resource.RLIM_INFINITY:
                 capped_limit = min(capped_limit, hard_limit)
             resource.setrlimit(limit_id, (capped_limit, hard_limit))
@@ -1285,7 +1316,7 @@ class Jinja2TemplateScanner(BaseScanner):
         result_queue: Any | None = None
         process: Any | None = None
         try:
-            start_method = "fork" if "fork" in mp.get_all_start_methods() else None
+            start_method = _sandbox_worker_start_method()
             context = mp.get_context(start_method) if start_method else mp.get_context()
             result_queue = context.Queue(maxsize=1)
             process = cast(Any, context).Process(
@@ -1307,7 +1338,10 @@ class Jinja2TemplateScanner(BaseScanner):
         assert result_queue is not None
         assert process is not None
         try:
-            process.join(self.sandbox_render_timeout_seconds)
+            join_timeout = self.sandbox_render_timeout_seconds
+            if start_method == "spawn":
+                join_timeout += _SANDBOX_RENDER_SPAWN_STARTUP_GRACE_SECONDS
+            process.join(join_timeout)
             if process.is_alive():
                 process.terminate()
                 process.join(1)

@@ -967,29 +967,46 @@ class TestJinja2TemplateScannerEdgeCases:
         assert budget_checks[0].details["budget_type"] == "worker_unavailable"
         assert not [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
 
-    def test_sandbox_worker_memory_limit_skips_unknown_virtual_baseline(
+    def test_sandbox_worker_memory_limit_uses_resource_baseline_without_statm(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         calls: list[tuple[int, tuple[int, int]]] = []
 
+        class Usage:
+            ru_maxrss = 2048
+
         class FakeResource:
             RLIMIT_AS = 1
             RLIM_INFINITY = -1
+            RUSAGE_SELF = 0
 
             def getrlimit(self, _limit_id: int) -> tuple[int, int]:
                 return (-1, self.RLIM_INFINITY)
+
+            def getrusage(self, _who: int) -> Usage:
+                return Usage()
 
             def setrlimit(self, limit_id: int, limits: tuple[int, int]) -> None:
                 calls.append((limit_id, limits))
 
         monkeypatch.setattr(jinja2_template_scanner, "HAS_RESOURCE_LIMITS", True)
         monkeypatch.setattr(jinja2_template_scanner, "resource", FakeResource())
-        monkeypatch.setattr(jinja2_template_scanner, "_current_process_virtual_memory_bytes", lambda: None)
+        monkeypatch.setattr(jinja2_template_scanner, "_proc_statm_virtual_memory_bytes", lambda: None)
+        monkeypatch.setattr(jinja2_template_scanner.platform, "system", lambda: "Linux")
 
         jinja2_template_scanner._limit_sandbox_worker_memory(1024)
 
-        assert calls == []
+        assert calls == [(1, (2048 * 1024 + 1024, -1))]
+
+    def test_sandbox_worker_prefers_spawn_when_proc_baseline_is_unavailable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(jinja2_template_scanner.mp, "get_all_start_methods", lambda: ["fork", "spawn"])
+        monkeypatch.setattr(jinja2_template_scanner, "_proc_statm_virtual_memory_bytes", lambda: None)
+
+        assert jinja2_template_scanner._sandbox_worker_start_method() == "spawn"
 
     def test_path_traversal_suppression_does_not_hide_object_traversal_ssti(self, tmp_path: Path) -> None:
         tokenizer_file = tmp_path / "tokenizer_config.json"
