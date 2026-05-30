@@ -1610,6 +1610,12 @@ CODE_EXECUTION_PATTERNS = [
     (rb"lambda\s+.*:\s*exec", "Lambda with exec detected"),
     (rb"type\s*\(\s*['\"].*['\"],.*exec", "Dynamic type creation with exec"),
 ]
+_CODE_EXECUTION_PATTERN_BUILTINS = {
+    "exec() call detected": "exec",
+    "eval() call detected": "eval",
+    "compile() call detected": "compile",
+    "__import__() call detected": "__import__",
+}
 
 
 class JITScriptDetector:
@@ -1688,6 +1694,8 @@ class JITScriptDetector:
         """Return whether parsed Python contains modeled dangerous operations."""
         if _resolve_alias_aware_high_risk_calls(tree):
             return True
+        if JITScriptDetector._dangerous_builtin_calls_in_tree(tree):
+            return True
 
         def is_dangerous_import(module_name: str) -> bool:
             return any(
@@ -1743,11 +1751,201 @@ class JITScriptDetector:
 
     @staticmethod
     def _dangerous_builtin_calls_in_tree(tree: ast.AST) -> set[str]:
-        builtins: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in DANGEROUS_BUILTINS:
-                builtins.add(node.func.id)
-        return builtins
+        dangerous_builtins = set(DANGEROUS_BUILTINS)
+
+        class DangerousBuiltinCallVisitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.findings: set[str] = set()
+                self.alias_scopes: list[dict[str, str | None]] = [{}]
+                self.builtins_module_aliases: list[set[str]] = [set()]
+
+            def _push_scope(self, arguments: ast.arguments | None = None) -> None:
+                self.alias_scopes.append({})
+                self.builtins_module_aliases.append(set())
+                if arguments is None:
+                    return
+                for arg in [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs]:
+                    self.alias_scopes[-1][arg.arg] = None
+                if arguments.vararg is not None:
+                    self.alias_scopes[-1][arguments.vararg.arg] = None
+                if arguments.kwarg is not None:
+                    self.alias_scopes[-1][arguments.kwarg.arg] = None
+
+            def _pop_scope(self) -> None:
+                self.alias_scopes.pop()
+                self.builtins_module_aliases.pop()
+
+            def _lookup_alias(self, name: str) -> str | None:
+                for scope in reversed(self.alias_scopes):
+                    if name in scope:
+                        return scope[name]
+                return name if name in dangerous_builtins else None
+
+            def _is_builtins_module(self, node: ast.AST) -> bool:
+                return isinstance(node, ast.Name) and (
+                    node.id == "builtins" or any(node.id in scope for scope in reversed(self.builtins_module_aliases))
+                )
+
+            def _resolve_builtin(self, node: ast.AST) -> str | None:
+                if isinstance(node, ast.Name):
+                    return self._lookup_alias(node.id)
+                if (
+                    isinstance(node, ast.Attribute)
+                    and node.attr in dangerous_builtins
+                    and self._is_builtins_module(node.value)
+                ):
+                    return node.attr
+                return None
+
+            def _bind_target(self, target: ast.AST, builtin: str | None) -> None:
+                if isinstance(target, ast.Name):
+                    self.alias_scopes[-1][target.id] = builtin
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    for element in target.elts:
+                        self._bind_target(element, None)
+
+            @staticmethod
+            def _constant_truth(node: ast.AST) -> bool | None:
+                if isinstance(node, ast.Constant) and isinstance(node.value, (bool, int, str, bytes, type(None))):
+                    return bool(node.value)
+                return None
+
+            @staticmethod
+            def _copy_alias_scopes(scopes: list[dict[str, str | None]]) -> list[dict[str, str | None]]:
+                return [dict(scope) for scope in scopes]
+
+            @staticmethod
+            def _copy_builtins_module_aliases(aliases: list[set[str]]) -> list[set[str]]:
+                return [set(scope) for scope in aliases]
+
+            def _merge_branch_aliases(
+                self,
+                original_scopes: list[dict[str, str | None]],
+                body_scopes: list[dict[str, str | None]],
+                orelse_scopes: list[dict[str, str | None]],
+            ) -> list[dict[str, str | None]]:
+                merged = self._copy_alias_scopes(original_scopes)
+                for index, scope in enumerate(merged):
+                    names = set(scope) | set(body_scopes[index]) | set(orelse_scopes[index])
+                    for name in names:
+                        candidates = [body_scopes[index].get(name), orelse_scopes[index].get(name), scope.get(name)]
+                        scope[name] = next((candidate for candidate in candidates if candidate is not None), None)
+                return merged
+
+            def visit_Import(self, node: ast.Import) -> None:
+                for alias in node.names:
+                    local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                    if alias.name == "builtins":
+                        self.builtins_module_aliases[-1].add(local_name)
+                    elif local_name in self.alias_scopes[-1]:
+                        self.alias_scopes[-1][local_name] = None
+
+            def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+                if node.module == "builtins":
+                    for alias in node.names:
+                        local_name = alias.asname or alias.name
+                        self.alias_scopes[-1][local_name] = alias.name if alias.name in dangerous_builtins else None
+                else:
+                    for alias in node.names:
+                        self.alias_scopes[-1][alias.asname or alias.name] = None
+
+            def visit_Assign(self, node: ast.Assign) -> None:
+                self.visit(node.value)
+                builtin = self._resolve_builtin(node.value)
+                for target in node.targets:
+                    self._bind_target(target, builtin)
+
+            def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+                if node.value is not None:
+                    self.visit(node.value)
+                    self._bind_target(node.target, self._resolve_builtin(node.value))
+                else:
+                    self._bind_target(node.target, None)
+
+            def visit_AugAssign(self, node: ast.AugAssign) -> None:
+                self.visit(node.value)
+                self._bind_target(node.target, None)
+
+            def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+                self.visit(node.value)
+                self._bind_target(node.target, self._resolve_builtin(node.value))
+
+            def _visit_function_node(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+                self.alias_scopes[-1][node.name] = None
+                for decorator in node.decorator_list:
+                    self.visit(decorator)
+                for default in [*node.args.defaults, *node.args.kw_defaults]:
+                    if default is not None:
+                        self.visit(default)
+                self._push_scope(node.args)
+                for statement in node.body:
+                    self.visit(statement)
+                self._pop_scope()
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                self._visit_function_node(node)
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                self._visit_function_node(node)
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                self.alias_scopes[-1][node.name] = None
+                for base in node.bases:
+                    self.visit(base)
+                for keyword in node.keywords:
+                    self.visit(keyword.value)
+                for decorator in node.decorator_list:
+                    self.visit(decorator)
+                self._push_scope()
+                for statement in node.body:
+                    self.visit(statement)
+                self._pop_scope()
+
+            def visit_If(self, node: ast.If) -> None:
+                self.visit(node.test)
+                truth = self._constant_truth(node.test)
+                if truth is True:
+                    for statement in node.body:
+                        self.visit(statement)
+                    return
+                if truth is False:
+                    for statement in node.orelse:
+                        self.visit(statement)
+                    return
+
+                original_scopes = self._copy_alias_scopes(self.alias_scopes)
+                original_builtins_aliases = self._copy_builtins_module_aliases(self.builtins_module_aliases)
+
+                self.alias_scopes = self._copy_alias_scopes(original_scopes)
+                self.builtins_module_aliases = self._copy_builtins_module_aliases(original_builtins_aliases)
+                for statement in node.body:
+                    self.visit(statement)
+                body_scopes = self._copy_alias_scopes(self.alias_scopes)
+                body_builtins_aliases = self._copy_builtins_module_aliases(self.builtins_module_aliases)
+
+                self.alias_scopes = self._copy_alias_scopes(original_scopes)
+                self.builtins_module_aliases = self._copy_builtins_module_aliases(original_builtins_aliases)
+                for statement in node.orelse:
+                    self.visit(statement)
+                orelse_scopes = self._copy_alias_scopes(self.alias_scopes)
+                orelse_builtins_aliases = self._copy_builtins_module_aliases(self.builtins_module_aliases)
+
+                self.alias_scopes = self._merge_branch_aliases(original_scopes, body_scopes, orelse_scopes)
+                self.builtins_module_aliases = [
+                    body_aliases | orelse_aliases | original_aliases
+                    for body_aliases, orelse_aliases, original_aliases in zip(
+                        body_builtins_aliases, orelse_builtins_aliases, original_builtins_aliases, strict=True
+                    )
+                ]
+
+            def visit_Call(self, node: ast.Call) -> None:
+                if builtin := self._resolve_builtin(node.func):
+                    self.findings.add(builtin)
+                self.generic_visit(node)
+
+        visitor = DangerousBuiltinCallVisitor()
+        visitor.visit(tree)
+        return visitor.findings
 
     @staticmethod
     def _dangerous_imports_in_tree(tree: ast.AST) -> set[str]:
@@ -2062,15 +2260,19 @@ class JITScriptDetector:
                 )
             )
         bounded_high_risk_calls: set[tuple[str, str]] | None = None
+        bounded_builtin_calls: set[str] | None = None
         snippet_high_risk_calls: set[tuple[str, str]] = set()
+        snippet_builtin_calls: set[str] = set()
         parsed_snippet_spans: list[tuple[int, int]] = []
         try:
             bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
             bounded_high_risk_calls = _resolve_alias_aware_high_risk_calls(bounded_tree)
+            bounded_builtin_calls = self._dangerous_builtin_calls_in_tree(bounded_tree)
         except (SyntaxError, UnicodeDecodeError, ValueError):
             # Binary model blobs commonly contain non-Python framing bytes; keep
             # raw pattern detection active and fall back to extracted snippets.
             bounded_high_risk_calls = None
+            bounded_builtin_calls = None
 
         for match, span, real_ranges in selected_matches:
             try:
@@ -2150,6 +2352,7 @@ class JITScriptDetector:
                     parsed_byte_length = byte_offsets[parsed_chars]
                     parsed_snippet_spans.extend(_parsed_real_spans(real_ranges, parsed_byte_length, len(match)))
                     snippet_high_risk_calls.update(_resolve_alias_aware_high_risk_calls(tree))
+                    snippet_builtin_calls.update(self._dangerous_builtin_calls_in_tree(tree))
                     ast_findings = self._analyze_ast(tree, framework, context)
                     findings.extend(ast_findings)
 
@@ -2159,12 +2362,19 @@ class JITScriptDetector:
 
         # Check for common code execution patterns in binary
         resolved_high_risk_calls = (bounded_high_risk_calls or set()) | snippet_high_risk_calls
+        resolved_builtin_calls = (bounded_builtin_calls or set()) | snippet_builtin_calls
         for pattern, description in CODE_EXECUTION_PATTERNS:
             raw_pattern_spans = [match.span() for match in re.finditer(pattern, bounded)]
             pattern_match = len(raw_pattern_spans) > 0
             raw_match_only_in_parsed_snippets = bool(parsed_snippet_spans) and not _has_raw_match_outside_parsed_spans(
                 raw_pattern_spans, parsed_snippet_spans
             )
+            pattern_builtin = _CODE_EXECUTION_PATTERN_BUILTINS.get(description)
+            if pattern_builtin is not None:
+                if pattern_builtin in resolved_builtin_calls:
+                    pattern_match = True
+                elif bounded_builtin_calls is not None or raw_match_only_in_parsed_snippets:
+                    continue
             if description == _SUBPROCESS_CODE_EXECUTION_DESCRIPTION:
                 resolved_subprocess_call = any(code == "S103" for _, code in resolved_high_risk_calls)
                 if resolved_subprocess_call:

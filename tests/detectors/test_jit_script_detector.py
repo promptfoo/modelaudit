@@ -1759,6 +1759,22 @@ class TestJITScriptDetector:
         assert not any(finding.type == "dangerous_builtin" for finding in findings)
         assert not any(finding.severity == "CRITICAL" for finding in findings)
 
+    def test_scan_model_detects_alias_to_dangerous_builtin(self) -> None:
+        detector = JITScriptDetector()
+        data = b"\x00\xffdef payload(value):\n    sink = eval\n    return sink(value)\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    def test_scan_model_preserves_builtin_alias_across_dead_rebind_branch(self) -> None:
+        detector = JITScriptDetector()
+        data = b"\x00\xffdef payload():\n    sink = eval\n    if False:\n        sink = len\n    return sink('1+1')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
     @pytest.mark.parametrize(
         "data",
         [
@@ -1773,6 +1789,24 @@ class TestJITScriptDetector:
 
         assert not any(finding.type == "dangerous_builtin" for finding in findings)
         assert not any(finding.type == "ast_dangerous_call" for finding in findings)
+        assert not any(finding.severity == "CRITICAL" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"\x00\xffdef benign():\n    return 'eval(1)'\n",
+            b"\x00\xffdef benign():\n    # eval(1)\n    return 1\n",
+        ],
+    )
+    def test_scan_model_does_not_flag_literal_or_comment_execution_pattern(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "eval() call detected"
+            for finding in findings
+        )
         assert not any(finding.severity == "CRITICAL" for finding in findings)
 
     def test_scan_model_carries_prefix_alias_shadowing_into_tail_context(self) -> None:
