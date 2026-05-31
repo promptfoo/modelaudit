@@ -246,6 +246,53 @@ class TestJITScriptDetector:
 
         assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
 
+    def test_extract_embedded_python_marks_byte_budget_incomplete(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * ((jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT // len(b"# pad\n")) + 1)
+        data = padding + b"import os\nos.system('id')\n"
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "late_payload.pt")
+
+        incomplete = [
+            finding
+            for finding in findings
+            if finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_BYTE_LIMIT_REASON
+        ]
+        assert len(incomplete) == 1
+        assert incomplete[0].details["max_scan_bytes"] == jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+        assert not any(finding.type == "dangerous_import" and finding.import_ == "os" for finding in findings)
+
+    def test_extract_embedded_python_marks_snippet_budget_incomplete(self) -> None:
+        detector = JITScriptDetector()
+        data = b"\n".join(
+            f"import harmless_{index}".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "many_snippets.pt")
+
+        incomplete = [
+            finding
+            for finding in findings
+            if finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON
+        ]
+        assert len(incomplete) == 1
+        assert incomplete[0].details["omitted_snippets"] > 0
+        assert incomplete[0].details["candidate_snippets"] > jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS
+
+    def test_extract_embedded_python_keeps_benign_within_budgets_clean(self) -> None:
+        detector = JITScriptDetector()
+        data = b"\n".join(
+            f"import harmless_{index}".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
+        )
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "benign_snippets.pt")
+
+        assert findings == []
+
     def test_scan_model_detects_unmarked_from_import_source(self) -> None:
         detector = JITScriptDetector()
 

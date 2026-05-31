@@ -142,8 +142,11 @@ _MAX_PRIORITY_ASSIGNMENT_PROBES = 48
 # Bound nested ``:``-header recursion when extracting an embedded statement so a
 # crafted deeply-indented blob cannot exhaust the interpreter stack.
 _MAX_BODY_STATEMENT_NESTING = 100
+_EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT = 1_000_000
 _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES = 1_000_000
 _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES = 16_384
+_EMBEDDED_PYTHON_BYTE_LIMIT_REASON = "jit_embedded_python_byte_limit"
+_EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON = "jit_embedded_python_snippet_limit"
 _EMBEDDED_PYTHON_START_MARKERS = (b"def ", b"async def ", b"class ", b"import ", b"from ")
 _PRIORITY_EMBEDDED_PYTHON_MODULES = tuple(
     sorted(
@@ -969,14 +972,15 @@ def _compact_candidate_segments(candidate: bytes, segment_ranges: list[tuple[int
     return b"\n".join(candidate[start:end].rstrip(b"\n") for start, end in segment_ranges)
 
 
-def _prioritized_embedded_python_snippets(
+def _select_prioritized_embedded_python_snippets(
     candidates: list[_EmbeddedPythonCandidate],
     bounded: bytes | None = None,
-) -> list[_EmbeddedPythonCandidate]:
+) -> tuple[list[_EmbeddedPythonCandidate], int]:
     selected: list[_EmbeddedPythonCandidate] = []
     selected_spans: set[tuple[int, int]] = set()
     priority_offsets = _priority_import_offsets(bounded) if bounded is not None else []
     selected_priority_candidates = 0
+    omitted_budgeted_candidates = 0
     for index, (candidate, span, real_ranges) in enumerate(candidates):
         has_priority_marker = (
             _span_contains_priority_offset(span, priority_offsets)
@@ -985,8 +989,10 @@ def _prioritized_embedded_python_snippets(
         )
         if index >= _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:
             if not has_priority_marker:
+                omitted_budgeted_candidates += 1
                 continue
             if selected_priority_candidates >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
+                omitted_budgeted_candidates += 1
                 continue
             if bounded is not None:
                 candidate, span, real_ranges = _bounded_priority_embedded_python_candidate(
@@ -1001,6 +1007,14 @@ def _prioritized_embedded_python_snippets(
             continue
         selected_spans.add(span)
         selected.append((candidate, span, real_ranges))
+    return selected, omitted_budgeted_candidates
+
+
+def _prioritized_embedded_python_snippets(
+    candidates: list[_EmbeddedPythonCandidate],
+    bounded: bytes | None = None,
+) -> list[_EmbeddedPythonCandidate]:
+    selected, _omitted_budgeted_candidates = _select_prioritized_embedded_python_snippets(candidates, bounded)
     return selected
 
 
@@ -1364,6 +1378,44 @@ def _bounded_priority_tail_starts(tail_starts: list[int]) -> list[int]:
     head_count = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS // 2
     tail_count = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS - head_count
     return [*tail_starts[:head_count], *tail_starts[-tail_count:]]
+
+
+def _embedded_python_analysis_incomplete_finding(
+    *,
+    framework: str,
+    context: str,
+    reason: str,
+    message: str,
+    max_scan_bytes: int | None = None,
+    omitted_snippets: int | None = None,
+    candidates_count: int | None = None,
+) -> "JITScriptFinding":
+    details: dict[str, Any] = {
+        "analysis_incomplete": True,
+        "reason": reason,
+    }
+    if max_scan_bytes is not None:
+        details["max_scan_bytes"] = max_scan_bytes
+    if omitted_snippets is not None:
+        details["omitted_snippets"] = omitted_snippets
+    if candidates_count is not None:
+        details["candidate_snippets"] = candidates_count
+
+    return create_jit_finding(
+        message=message,
+        severity="INFO",
+        context=context,
+        pattern=None,
+        recommendation="Treat JIT/embedded Python coverage as inconclusive and review the model source.",
+        confidence=1.0,
+        details=details,
+        framework=framework,
+        code_snippet=None,
+        type="analysis_incomplete",
+        operation=None,
+        builtin=None,
+        import_=None,
+    )
 
 
 def _tail_starts_for_priority_alias_uses(
@@ -1894,8 +1946,35 @@ class JITScriptDetector:
         if not self.check_ast:
             return findings
 
-        bounded = data if include_full_source else data[:1000000]
+        bounded = data if include_full_source else data[:_EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT]
         matches = _candidate_embedded_python_snippets(bounded, include_full_source=include_full_source)
+        prioritized_matches, omitted_budgeted_candidates = _select_prioritized_embedded_python_snippets(
+            matches, bounded=bounded
+        )
+        if not include_full_source and len(data) > _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT:
+            findings.append(
+                _embedded_python_analysis_incomplete_finding(
+                    framework=framework,
+                    context=context,
+                    reason=_EMBEDDED_PYTHON_BYTE_LIMIT_REASON,
+                    message=("Embedded Python/JIT analysis incomplete: payload exceeds the bounded byte scan window"),
+                    max_scan_bytes=_EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT,
+                )
+            )
+        if omitted_budgeted_candidates:
+            findings.append(
+                _embedded_python_analysis_incomplete_finding(
+                    framework=framework,
+                    context=context,
+                    reason=_EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON,
+                    message=("Embedded Python/JIT analysis incomplete: candidate snippet budget was exceeded"),
+                    omitted_snippets=omitted_budgeted_candidates,
+                    candidates_count=len(matches),
+                )
+            )
+        if not prioritized_matches and omitted_budgeted_candidates:
+            return findings
+
         bounded_high_risk_calls: set[tuple[str, str]] | None = None
         snippet_high_risk_calls: set[tuple[str, str]] = set()
         parsed_snippet_spans: list[tuple[int, int]] = []
@@ -1907,7 +1986,7 @@ class JITScriptDetector:
             # raw pattern detection active and fall back to extracted snippets.
             bounded_high_risk_calls = None
 
-        for match, span, real_ranges in _prioritized_embedded_python_snippets(matches, bounded=bounded):
+        for match, span, real_ranges in prioritized_matches:
             try:
                 if _is_span_inside_parsed_spans(span, parsed_snippet_spans):
                     continue
