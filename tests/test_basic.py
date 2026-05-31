@@ -245,6 +245,33 @@ def test_merge_scan_results():
     assert any("Issue from scanner2" in issue.message for issue in result1.issues)
 
 
+def test_merge_scan_results_unions_call_graph_source_fingerprints() -> None:
+    """Test merging nested pickle source fingerprints preserves every child member."""
+    result1 = ScanResult(scanner_name="pytorch_zip")
+    result1.metadata["call_graph_source_fingerprints"] = {
+        "reusable": True,
+        "search_context": ["/tmp/src"],
+        "fingerprints": {"/tmp/src/first.py": "1111"},
+    }
+    result2 = ScanResult(scanner_name="pickle")
+    result2.metadata["call_graph_source_fingerprints"] = {
+        "reusable": True,
+        "search_context": ["/tmp/src"],
+        "fingerprints": {"/tmp/src/second.py": "2222"},
+    }
+
+    result1.merge(result2)
+
+    assert result1.metadata["call_graph_source_fingerprints"] == {
+        "reusable": True,
+        "search_context": ["/tmp/src"],
+        "fingerprints": {
+            "/tmp/src/first.py": "1111",
+            "/tmp/src/second.py": "2222",
+        },
+    }
+
+
 def test_blacklist_patterns(tmp_path):
     """Test blacklist patterns parameter."""
     test_file = tmp_path / "config.json"

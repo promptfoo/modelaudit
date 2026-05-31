@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY = "call_graph_source_fingerprints"
 _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES = 1024 * 1024
+_PICKLE_CALL_GRAPH_INPUT_KEYS = frozenset({"import_references", "callable_invocations"})
+_PICKLE_RESULT_METADATA_KEYS = frozenset({"pickle_report_status", "pickle_verdict", "pickle_source"})
 
 
 @dataclass
@@ -500,9 +502,11 @@ class ScanResultsCache:
         metadata = scan_result.get("metadata")
         if not isinstance(metadata, dict):
             return True
-        fingerprint_metadata = metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY)
+        if _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY not in metadata:
+            return not self._legacy_pickle_call_graph_metadata_requires_fingerprints(metadata)
+        fingerprint_metadata = metadata[_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY]
         if not isinstance(fingerprint_metadata, dict):
-            return True
+            return False
         if fingerprint_metadata.get("reusable") is not True:
             return False
         if fingerprint_metadata.get("search_context") != self._source_search_context():
@@ -523,6 +527,12 @@ class ScanResultsCache:
         except (OSError, ValueError):
             return False
         return True
+
+    @staticmethod
+    def _legacy_pickle_call_graph_metadata_requires_fingerprints(metadata: dict[str, Any]) -> bool:
+        return bool(_PICKLE_RESULT_METADATA_KEYS.intersection(metadata)) and any(
+            key in metadata for key in _PICKLE_CALL_GRAPH_INPUT_KEYS
+        )
 
     def _detect_file_format(self, file_path: str) -> str:
         """Detect file format for analytics."""

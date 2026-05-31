@@ -197,6 +197,55 @@ def test_scan_cache_invalidates_call_graph_missing_source_appears(
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
+def test_scan_cache_invalidates_legacy_pickle_call_graph_metadata_without_fingerprints(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "metadata": {
+            "pickle_report_status": "complete",
+            "pickle_verdict": "clean",
+            "import_references": [{"module": "helper", "name": "entrypoint"}],
+            "callable_invocations": [{"module": "helper", "name": "entrypoint"}],
+        },
+    }
+
+    assert cache.store_result(str(file_path), scan_result, version_context=version_context)
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+def test_scan_cache_accepts_empty_call_graph_source_fingerprint_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.syspath_prepend(str(tmp_path))
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "metadata": {
+            "pickle_report_status": "complete",
+            "pickle_verdict": "clean",
+            "import_references": [],
+            "callable_invocations": [],
+            "call_graph_source_fingerprints": {
+                "reusable": True,
+                "search_context": [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path],
+                "fingerprints": {},
+            },
+        },
+    }
+
+    assert cache.store_result(str(file_path), scan_result, version_context=version_context)
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) == scan_result
+
+
 def test_cached_scan_skips_persisting_operational_failures(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"

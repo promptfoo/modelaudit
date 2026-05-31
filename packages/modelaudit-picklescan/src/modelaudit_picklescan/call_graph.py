@@ -980,8 +980,6 @@ def shared_source_fingerprint_metadata() -> dict[str, Any] | None:
                 "search_context": list(snapshot.search_context),
                 "fingerprints": {},
             }
-        if not snapshot.fingerprints:
-            return None
         return {
             "reusable": True,
             "search_context": list(snapshot.search_context),

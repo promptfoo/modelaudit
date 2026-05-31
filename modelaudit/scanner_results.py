@@ -16,6 +16,29 @@ SCAN_OUTCOME_REASONS_METADATA_KEY: Final[str] = "scan_outcome_reasons"
 SCAN_OUTCOME_MESSAGE_METADATA_KEY: Final[str] = "scan_outcome_message"
 OPERATIONAL_ERROR_METADATA_KEY: Final[str] = "operational_error"
 UNCLASSIFIED_SCAN_FAILURE_REASON: Final[str] = "scanner_reported_unsuccessful_without_outcome"
+CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY: Final[str] = "call_graph_source_fingerprints"
+
+
+def _merge_call_graph_source_fingerprints_metadata(
+    existing: dict[str, Any], incoming: dict[str, Any]
+) -> dict[str, Any]:
+    merged = dict(existing)
+    existing_fingerprints = existing.get("fingerprints")
+    incoming_fingerprints = incoming.get("fingerprints")
+    fingerprints = dict(existing_fingerprints) if isinstance(existing_fingerprints, dict) else {}
+    if isinstance(incoming_fingerprints, dict):
+        fingerprints.update(incoming_fingerprints)
+    merged["fingerprints"] = fingerprints
+
+    existing_search_context = existing.get("search_context")
+    incoming_search_context = incoming.get("search_context")
+    if existing_search_context != incoming_search_context:
+        merged["reusable"] = False
+    else:
+        merged["reusable"] = existing.get("reusable") is True and incoming.get("reusable") is True
+        merged["search_context"] = existing_search_context
+
+    return merged
 
 
 def scan_result_has_inconclusive_outcome(scan_result: "ScanResult") -> bool:
@@ -324,6 +347,13 @@ class ScanResult:
         # Merge metadata dictionaries
         list_union_metadata_keys = {SCAN_OUTCOME_REASONS_METADATA_KEY, "skipped_scanner_ids"}
         for key, value in other.metadata.items():
+            if (
+                key == CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY
+                and isinstance(self.metadata.get(key), dict)
+                and isinstance(value, dict)
+            ):
+                self.metadata[key] = _merge_call_graph_source_fingerprints_metadata(self.metadata[key], value)
+                continue
             if key in list_union_metadata_keys and isinstance(self.metadata.get(key), list) and isinstance(value, list):
                 existing_values = self.metadata[key]
                 for item in value:
