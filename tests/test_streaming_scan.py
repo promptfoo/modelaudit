@@ -754,6 +754,32 @@ def test_scan_model_streaming_oversized_renamed_safetensors_fails_before_hashing
     assert any(check.name == "Header Size Limit" for check in result.checks)
 
 
+def test_scan_model_streaming_does_not_hash_files_over_max_file_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = tmp_path / "oversized.pkl"
+    payload.write_bytes(b"X" * 128)
+
+    monkeypatch.setattr(
+        "modelaudit.utils.helpers.file_hash.compute_sha256_hash",
+        lambda _path: pytest.fail("streaming oversized file must not be hashed before rejection"),
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(payload, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        max_file_size=64,
+        cache_enabled=False,
+    )
+
+    assert result.files_scanned == 1
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
+
+
 def test_scan_model_streaming_content_hash_deterministic():
     """Test that content hash is deterministic for same files."""
     # Create two files with same content

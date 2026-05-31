@@ -1352,7 +1352,9 @@ def scan_model_directory_or_file(
                 # Hash the top-level target before scanning. Archive scanners merge
                 # nested member results into their metadata, so scanner-emitted
                 # hashes are not always the bytes of this target.
-                if not _should_defer_hash_for_safetensors_header_limit(target, config):
+                if not _should_defer_hash_for_safetensors_header_limit(
+                    target, config
+                ) and not _should_defer_hash_for_max_file_size(target, config):
                     try:
                         top_level_hashing_started_at = _start_phase_timing(phase_timings)
                         file_hash = _calculate_file_hash(target)
@@ -2290,7 +2292,9 @@ def scan_model_streaming(
                 }
 
                 file_hash: str | None = None
-                if not _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config):
+                if not _should_defer_hash_for_safetensors_header_limit(
+                    str(scan_path), scan_config
+                ) and not _should_defer_hash_for_max_file_size(str(scan_path), scan_config):
                     if progress_callback:
                         progress_callback(
                             f"Hashing {source_path.name}",

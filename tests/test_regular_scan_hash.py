@@ -302,6 +302,31 @@ class TestHashGenerationEdgeCases:
         assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
         assert result.has_errors is True
 
+    def test_single_file_scan_does_not_hash_files_over_max_file_size(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Single-file hashing should honor the same regular scan size budget."""
+        from modelaudit import core
+
+        oversized = tmp_path / "oversized.pkl"
+        oversized.write_bytes(b"X" * 128)
+
+        monkeypatch.setattr(
+            core,
+            "_calculate_file_hash",
+            lambda _path: pytest.fail("oversized file was hashed before max_file_size rejection"),
+        )
+
+        result = scan_model_directory_or_file(
+            str(oversized),
+            max_file_size=64,
+            cache_scan_results=False,
+        )
+
+        assert determine_exit_code(result) == 2
+        assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
+        assert result.has_errors is True
+
     def test_unhashable_files_excluded_from_hash(self, tmp_path, monkeypatch):
         """Test that files failing to hash are excluded from aggregate hash."""
         # Create a valid file
