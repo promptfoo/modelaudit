@@ -5,7 +5,7 @@ import pytest
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.text_scanner import TextScanner
 from modelaudit.utils.helpers import cache_decorator
 
@@ -18,6 +18,63 @@ def test_text_scanner_handles_routable_vocabulary_file(tmp_path: Path) -> None:
 
     assert result.success is True
     assert not result.issues
+    assert any(
+        check.name == "Embedded Secrets Detection" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+    assert any(
+        check.name == "Network Communication Detection" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+
+
+def test_text_scanner_runs_content_security_detectors_for_ml_sidecars(tmp_path: Path) -> None:
+    text_path = tmp_path / "vocab.txt"
+    aws_key = "AKIAABCDEFGHIJKLMNOP"
+    text_path.write_text(
+        f"safe-token\naws_access_key_id={aws_key}\ncallback=https://evil.example/payload\n",
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(text_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "text"
+    assert any(
+        check.name == "Embedded Secrets Detection" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Text Content Security Coverage" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+
+
+def test_text_scanner_fails_closed_when_content_detector_coverage_is_truncated(tmp_path: Path) -> None:
+    text_path = tmp_path / "tokens.txt"
+    text_path.write_text("token\n" + ("safe\n" * 20), encoding="utf-8")
+
+    direct = TextScanner(config={"text_content_scan_bytes": 16}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        cache_enabled=False,
+        text_content_scan_bytes=16,
+    )
+
+    assert direct.success is False
+    assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata.get("operational_error_reason") == "text_content_security_scan_incomplete"
+    assert "text_content_security_scan_incomplete" in direct.metadata.get("scan_outcome_reasons", [])
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("scan_outcome_reason") == "text_content_security_scan_incomplete"
+        for check in direct.checks
+    )
+    assert aggregate.file_metadata[str(text_path)].get("operational_error_reason") == (
+        "text_content_security_scan_incomplete"
+    )
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_text_metadata_read_failure_is_inconclusive_not_security_finding(

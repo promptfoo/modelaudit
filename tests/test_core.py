@@ -1126,6 +1126,38 @@ def test_scan_file_does_not_let_invalid_flax_prefix_mask_malicious_lightgbm(
     )
 
 
+@pytest.mark.parametrize("suffix", [".flax", ".orbax", ".jax", ".msgpack"])
+def test_scan_file_routes_native_flax_suffix_lightgbm_content(tmp_path: Path, suffix: str) -> None:
+    disguised_lightgbm = tmp_path / f"payload{suffix}"
+    _write_malicious_lightgbm(disguised_lightgbm)
+
+    assert file_detection.detect_file_format(str(disguised_lightgbm)) == "lightgbm"
+    assert file_detection.detect_file_format_from_magic(str(disguised_lightgbm)) == "lightgbm"
+    assert file_detection.detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
+
+    result = scan_file(str(disguised_lightgbm), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "lightgbm"
+    assert any(
+        check.name == "Command/Network Correlation Check" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_does_not_route_native_flax_suffix_lightgbm_near_match(tmp_path: Path) -> None:
+    near_match = tmp_path / "payload.flax"
+    _write_malicious_lightgbm(near_match, valid=False)
+
+    assert file_detection.detect_file_format(str(near_match)) == "flax_msgpack"
+    assert file_detection.detect_file_format_from_magic(str(near_match)) == "unknown"
+    assert file_detection.detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+
+    result = scan_file(str(near_match), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert not any(check.name == "Command/Network Correlation Check" for check in result.checks)
+
+
 @pytest.mark.parametrize("foreign_format", ["rknn", "torch7", "cntk", "lightgbm"])
 def test_scan_file_preserves_foreign_findings_in_flax_content_overlap(tmp_path: Path, foreign_format: str) -> None:
     if not flax_msgpack_scanner.HAS_MSGPACK:

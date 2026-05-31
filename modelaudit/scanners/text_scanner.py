@@ -4,8 +4,12 @@ import os
 from typing import Any, ClassVar
 
 from modelaudit.core_results import mark_operational_scan_error
-from modelaudit.scanner_results import mark_inconclusive_scan_result
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
+
+TEXT_CONTENT_SECURITY_SCAN_INCOMPLETE_REASON = "text_content_security_scan_incomplete"
+TEXT_CONTENT_SECURITY_DETECTOR_FAILED_REASON = "text_content_security_detector_failed"
+DEFAULT_TEXT_CONTENT_SECURITY_SCAN_BYTES = 100 * 1024 * 1024
 
 
 class TextScanner(BaseScanner):
@@ -13,6 +17,7 @@ class TextScanner(BaseScanner):
 
     name = "text"
     supported_extensions: ClassVar[list[str]] = [".txt", ".md", ".markdown", ".rst"]
+    default_max_file_read_size = DEFAULT_TEXT_CONTENT_SECURITY_SCAN_BYTES
 
     def __init__(self, config: dict[str, Any] | None = None):
         """Initialize the scanner with optional configuration."""
@@ -50,6 +55,12 @@ class TextScanner(BaseScanner):
         """Return file size for bounded text classification."""
         return os.path.getsize(path)
 
+    def _get_content_security_scan_bytes(self) -> int:
+        return self._normalize_positive_int_config(
+            self.config.get("text_content_scan_bytes", self.max_file_read_size),
+            DEFAULT_TEXT_CONTENT_SECURITY_SCAN_BYTES,
+        )
+
     @staticmethod
     def _is_unreadable_path_result(result: ScanResult) -> bool:
         return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
@@ -73,6 +84,124 @@ class TextScanner(BaseScanner):
         )
         result.finish(success=False)
         return result
+
+    @staticmethod
+    def _mark_content_security_scan_incomplete(
+        result: ScanResult,
+        path: str,
+        *,
+        reason: str,
+        message: str,
+        details: dict[str, Any],
+    ) -> None:
+        mark_inconclusive_scan_result(result, reason)
+        mark_operational_scan_error(result, reason)
+        result.add_check(
+            name="Text Content Security Coverage",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                **details,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+        )
+
+    def _run_content_security_checks(self, path: str, result: ScanResult, file_size: int) -> int:
+        read_limit = self._get_content_security_scan_bytes()
+        try:
+            with open(path, "rb") as file_obj:
+                payload = file_obj.read(read_limit + 1)
+        except OSError as error:
+            self._mark_content_security_scan_incomplete(
+                result,
+                path,
+                reason="text_content_read_failed",
+                message=f"Unable to read text content for security detectors: {error!s}",
+                details={
+                    "exception": str(error),
+                    "exception_type": type(error).__name__,
+                    "file_size": file_size,
+                    "read_limit": read_limit,
+                },
+            )
+            return 0
+
+        truncated = len(payload) > read_limit
+        inspected_payload = payload[:read_limit]
+        inspected_bytes = len(inspected_payload)
+
+        detector_failed = False
+        try:
+            secret_findings = self.collect_embedded_secret_findings(
+                inspected_payload,
+                path,
+                raise_on_error=True,
+            )
+            self.add_embedded_secret_findings(secret_findings, result, context=path)
+        except Exception as error:
+            detector_failed = True
+            self._mark_content_security_scan_incomplete(
+                result,
+                path,
+                reason=TEXT_CONTENT_SECURITY_DETECTOR_FAILED_REASON,
+                message=f"Embedded secret detector failed for text content: {error!s}",
+                details={
+                    "detector": "secrets",
+                    "exception": str(error),
+                    "exception_type": type(error).__name__,
+                },
+            )
+
+        try:
+            network_findings = self.collect_network_communication_findings(
+                inspected_payload,
+                path,
+                raise_on_error=True,
+            )
+            self.add_network_communication_findings(network_findings, result, context=path)
+        except Exception as error:
+            detector_failed = True
+            self._mark_content_security_scan_incomplete(
+                result,
+                path,
+                reason=TEXT_CONTENT_SECURITY_DETECTOR_FAILED_REASON,
+                message=f"Network communication detector failed for text content: {error!s}",
+                details={
+                    "detector": "network_communication",
+                    "exception": str(error),
+                    "exception_type": type(error).__name__,
+                },
+            )
+
+        if truncated:
+            self._mark_content_security_scan_incomplete(
+                result,
+                path,
+                reason=TEXT_CONTENT_SECURITY_SCAN_INCOMPLETE_REASON,
+                message=f"Text content security scan truncated at configured limit ({read_limit} bytes)",
+                details={
+                    "file_size": file_size,
+                    "read_limit": read_limit,
+                    "inspected_bytes": inspected_bytes,
+                },
+            )
+        elif not detector_failed:
+            result.add_check(
+                name="Text Content Security Coverage",
+                passed=True,
+                message="Text content security detectors completed",
+                location=path,
+                details={
+                    "file_size": file_size,
+                    "read_limit": read_limit,
+                    "inspected_bytes": inspected_bytes,
+                },
+            )
+
+        return inspected_bytes
 
     def scan(self, path: str) -> ScanResult:
         """Scan a text file for security issues."""
@@ -171,8 +300,10 @@ class TextScanner(BaseScanner):
                     rule_code=None,  # Passing check
                 )
 
-            result.bytes_scanned = file_size
-            result.finish(success=True)
+            result.bytes_scanned = self._run_content_security_checks(path, result, file_size)
+            result.finish(
+                success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
+            )
 
         except OSError as e:
             self._finish_metadata_read_failure(result, path, e)

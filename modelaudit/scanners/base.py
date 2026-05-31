@@ -573,56 +573,78 @@ class BaseScanner(ABC):
         Returns:
             Number of secrets detected
         """
+        findings = self.collect_embedded_secret_findings(data, context, enable_check=enable_check)
+        return self.add_embedded_secret_findings(findings, result, context=context)
+
+    def collect_embedded_secret_findings(
+        self,
+        data: Any,
+        context: str = "",
+        enable_check: bool = True,
+        raise_on_error: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Collect embedded secret findings without creating checks."""
         if not enable_check or not self.config.get("check_secrets", True):
-            return 0
+            return []
 
         try:
             from modelaudit.detectors.secrets import SecretsDetector
 
             detector = SecretsDetector(self.config.get("secrets_config"))
             findings = detector.scan_model_weights(data, context)
-
-            for finding in findings:
-                severity_map = {
-                    "CRITICAL": IssueSeverity.CRITICAL,
-                    "WARNING": IssueSeverity.WARNING,
-                    "INFO": IssueSeverity.INFO,
-                }
-                severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
-                secret_descriptor = str(
-                    finding.get("secret_type") or finding.get("type") or finding.get("message") or "embedded_secret"
-                )
-                secret_rule_code = get_secret_rule_code(secret_descriptor)
-
-                result.add_check(
-                    name="Embedded Secrets Detection",
-                    passed=False,
-                    message=finding.get("message", "Secret detected"),
-                    rule_code=secret_rule_code,
-                    severity=severity,
-                    location=finding.get("context", context),
-                    details=finding,
-                    why=finding.get("recommendation", "Remove sensitive data from model"),
-                )
-
-            # Add a passing check if no secrets were found
-            if not findings and context:
-                result.add_check(
-                    name="Embedded Secrets Detection",
-                    passed=True,
-                    message="No embedded secrets detected",
-                    location=context,
-                )
-
-            return len(findings)
+            return [dict(finding) for finding in findings]
 
         except ImportError:
+            if raise_on_error:
+                raise
             # SecretsDetector not available, log as debug
             logger.debug("SecretsDetector not available, skipping secrets check")
-            return 0
+            return []
         except Exception as e:
+            if raise_on_error:
+                raise
             logger.warning(f"Error checking for embedded secrets: {e}")
-            return 0
+            return []
+
+    def add_embedded_secret_findings(
+        self,
+        findings: list[dict[str, Any]],
+        result: ScanResult,
+        context: str = "",
+    ) -> int:
+        """Emit explicit embedded secret checks from detector findings and return the count."""
+        for finding in findings:
+            severity_map = {
+                "CRITICAL": IssueSeverity.CRITICAL,
+                "WARNING": IssueSeverity.WARNING,
+                "INFO": IssueSeverity.INFO,
+            }
+            severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+            secret_descriptor = str(
+                finding.get("secret_type") or finding.get("type") or finding.get("message") or "embedded_secret"
+            )
+            secret_rule_code = get_secret_rule_code(secret_descriptor)
+
+            result.add_check(
+                name="Embedded Secrets Detection",
+                passed=False,
+                message=finding.get("message", "Secret detected"),
+                rule_code=secret_rule_code,
+                severity=severity,
+                location=finding.get("context", context),
+                details=finding,
+                why=finding.get("recommendation", "Remove sensitive data from model"),
+            )
+
+        if not findings and context:
+            result.add_check(
+                name="Embedded Secrets Detection",
+                passed=True,
+                message="No embedded secrets detected",
+                location=context,
+            )
+
+        return len(findings)
 
     def collect_jit_script_findings(
         self,
