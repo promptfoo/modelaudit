@@ -117,6 +117,32 @@ def test_orbax_dangerous_restore_fn_is_flagged_as_critical(tmp_path: Path) -> No
     )
 
 
+def test_orbax_restore_fn_redacts_secret_assignments_in_details(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_checkpoint"
+    secret = "SECRETKEY1234567890"
+    _write_orbax_metadata(
+        checkpoint_dir,
+        {
+            "version": "0.1.0",
+            "type": "orbax_checkpoint",
+            "restore_fn": f"lambda x: eval(x.decode()); AWS_SECRET_ACCESS_KEY='{secret}'",
+        },
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    check = next(
+        check
+        for check in result.checks
+        if check.name == "Orbax Restore Function Check" and check.status == CheckStatus.FAILED
+    )
+    serialized = result.to_json()
+    assert check.severity == IssueSeverity.CRITICAL
+    assert secret not in serialized
+    assert "eval(x.decode())" in check.details["restore_fn"]
+    assert "AWS_SECRET_ACCESS_KEY='<redacted>'" in check.details["restore_fn"]
+
+
 def test_orbax_benign_restore_fn_is_flagged_as_warning(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "orbax_checkpoint"
     _write_orbax_metadata(

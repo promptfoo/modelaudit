@@ -1,6 +1,7 @@
 """Tests for JIT/Script code execution detection."""
 
 import ast
+import json
 from pathlib import Path
 from typing import Any
 
@@ -162,6 +163,27 @@ class TestJITScriptDetector:
         assert any("eval" in getattr(f, "builtin", "") for f in findings)
         assert any("exec" in getattr(f, "builtin", "") for f in findings)
         assert any("__import__" in getattr(f, "builtin", "") for f in findings)
+
+    def test_embedded_python_code_snippets_redact_secret_assignments(self) -> None:
+        detector = JITScriptDetector()
+        secret = "SECRETKEY1234567890"
+        data = f"""
+        def payload():
+            AWS_SECRET_ACCESS_KEY = "{secret}"
+            return eval("1 + 1")
+        """.encode()
+
+        findings = detector._extract_and_check_python_code(data, "Test", "payload.pt")
+
+        serialized = json.dumps([finding.model_dump() for finding in findings], sort_keys=True)
+        builtin_finding = next(
+            finding for finding in findings if finding.type == "dangerous_builtin" and finding.builtin == "eval"
+        )
+        assert secret not in serialized
+        assert builtin_finding.code_snippet is not None
+        assert "AWS_SECRET_ACCESS_KEY" in builtin_finding.code_snippet
+        assert 'AWS_SECRET_ACCESS_KEY = "<redacted>"' in builtin_finding.code_snippet
+        assert 'eval("1 + 1")' in builtin_finding.code_snippet
 
     def test_detect_code_execution_patterns(self):
         """Test detection of code execution patterns in binary data."""

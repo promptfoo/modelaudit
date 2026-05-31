@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES, is_jax_json_checkpoint_file
+from ._evidence_redaction import redact_evidence_string
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 try:
@@ -1017,7 +1018,7 @@ class JaxCheckpointScanner(BaseScanner):
                 ),
                 severity=IssueSeverity.CRITICAL if restore_fn_is_dangerous else IssueSeverity.WARNING,
                 location=path,
-                details={"restore_fn": restore_fn_value[:200]},
+                details={"restore_fn": redact_evidence_string(restore_fn_value, max_chars=200)},
                 rule_code="S302",
             )
 
