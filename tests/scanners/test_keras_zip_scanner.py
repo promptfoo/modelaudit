@@ -195,7 +195,7 @@ class TestKerasZipScanner:
 
     @pytest.mark.parametrize(
         "keras_version",
-        ["3.12.1rc1", "3.12.1a0", "3.12.1.dev0", "3.13.2rc1", "3.13.2dev0"],
+        ["3.12.1rc1", "3.12.1c1", "3.12.1a0", "3.12.1.dev0", "3.13.2rc1", "3.13.2_c1", "3.13.2dev0"],
     )
     def test_embedded_hdf5_external_references_prerelease_fixes_are_vulnerable(
         self, tmp_path: Path, keras_version: str
@@ -239,6 +239,25 @@ class TestKerasZipScanner:
         assert cve_issues[0].severity == IssueSeverity.WARNING
         assert cve_issues[0].details["keras_version"] == keras_version
         assert cve_issues[0].details["metadata_only_assessment"] is True
+
+    def test_embedded_hdf5_external_references_noncanonical_version_warns_unknown(self, tmp_path: Path) -> None:
+        """Malformed archive version metadata must not claim a confidently fixed runtime."""
+        scanner = KerasZipScanner()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.13.x",
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+        assert cve_issues[0].details["keras_version"] == "3.13.x"
+        assert cve_issues[0].details["parse_status"] == "unknown"
+        assert "is non-canonical" in cve_issues[0].message
 
     def test_benign_embedded_weights_do_not_emit_warning_noise(self, tmp_path: Path) -> None:
         """Benign embedded weights should not produce warning or critical noise."""
@@ -708,6 +727,51 @@ class TestKerasZipScanner:
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "keras_zip_embedded_weights_too_large" in result.metadata["scan_outcome_reasons"]
+
+    def test_embedded_weights_without_h5py_marks_scan_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Embedded HDF5 weights cannot be reported clean when h5py is unavailable."""
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+
+        keras_path = tmp_path / "weights_without_h5py.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.13.2"}))
+            zf.write(create_regular_weights_h5(tmp_path), "model.weights.h5")
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        availability_checks = [
+            check for check in result.checks if check.name == "Embedded Weights HDF5 Scanner Availability"
+        ]
+        assert len(availability_checks) == 1
+        assert availability_checks[0].status == CheckStatus.FAILED
+        assert "h5py is unavailable" in availability_checks[0].message
+        assert availability_checks[0].details["required_package"] == "h5py"
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_embedded_weights_h5py_unavailable" in result.metadata["scan_outcome_reasons"]
+
+    def test_embedded_weights_without_h5py_returns_exit2_and_skips_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Missing h5py must remain explicit at aggregate and cache boundaries."""
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+
+        keras_path = tmp_path / "cached_weights_without_h5py.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.13.2"}))
+            zf.write(create_regular_weights_h5(tmp_path), "model.weights.h5")
+
+        reason = "keras_zip_embedded_weights_h5py_unavailable"
+        _assert_inconclusive_keras_zip_scan(keras_path, reason, "Embedded Weights HDF5 Scanner Availability")
+        _assert_inconclusive_keras_zip_scan_not_cached(keras_path, reason, tmp_path / "cache")
 
     def test_embedded_weights_size_limit_returns_exit2_and_skips_cache(
         self,

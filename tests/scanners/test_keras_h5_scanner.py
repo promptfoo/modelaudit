@@ -237,17 +237,21 @@ def test_keras_h5_scanner_detects_cve_2026_1669_external_storage(tmp_path: Path)
     ]
 
 
-def test_keras_h5_scanner_skips_cve_2026_1669_on_fixed_version(tmp_path: Path) -> None:
-    """Fixed Keras versions should not emit warning-level CVE-2026-1669 findings."""
+def test_keras_h5_scanner_warns_on_fixed_metadata_with_external_reference(tmp_path: Path) -> None:
+    """File-claimed fixed metadata should not suppress structural external-reference evidence."""
     model_path = create_h5_with_external_link(tmp_path, keras_version="3.13.2")
 
     scanner = KerasH5Scanner()
     result = scanner.scan(str(model_path))
 
-    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
-    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].severity == IssueSeverity.WARNING
+    assert cve_issues[0].details["keras_version"] == "3.13.2"
+    assert cve_issues[0].details["metadata_only_assessment"] is True
+    assert cve_issues[0].details["parse_status"] == "metadata_non_vulnerable"
     assert any(
-        check.name == "HDF5 External Weight Reference Version Check" and check.status == CheckStatus.PASSED
+        check.name == "HDF5 External Weight Reference Metadata Check" and check.status == CheckStatus.FAILED
         for check in result.checks
     )
 
