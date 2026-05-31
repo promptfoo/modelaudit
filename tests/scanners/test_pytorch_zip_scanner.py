@@ -1446,7 +1446,7 @@ def test_pytorch_zip_redacts_secret_bearing_jit_code_snippets(tmp_path: Path) ->
     secret = "SECRETKEY1234567890"
     payload = f"""
     def payload():
-        AWS_SECRET_ACCESS_KEY = "{secret}"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "{secret}"
         return eval("1 + 1")
     """.encode()
     with zipfile.ZipFile(zip_path, "w") as zipf:
@@ -1465,7 +1465,7 @@ def test_pytorch_zip_redacts_secret_bearing_jit_code_snippets(tmp_path: Path) ->
     assert secret not in serialized
     assert any(
         check.details.get("code_snippet")
-        and 'AWS_SECRET_ACCESS_KEY = "<redacted>"' in check.details["code_snippet"]
+        and 'os.environ["AWS_SECRET_ACCESS_KEY"] = "<redacted>"' in check.details["code_snippet"]
         and 'eval("1 + 1")' in check.details["code_snippet"]
         for check in jit_failures
     )

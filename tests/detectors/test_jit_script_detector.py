@@ -169,7 +169,7 @@ class TestJITScriptDetector:
         secret = "SECRETKEY1234567890"
         data = f"""
         def payload():
-            AWS_SECRET_ACCESS_KEY = "{secret}"
+            os.environ["AWS_SECRET_ACCESS_KEY"] = "{secret}"
             return eval("1 + 1")
         """.encode()
 
@@ -182,7 +182,7 @@ class TestJITScriptDetector:
         assert secret not in serialized
         assert builtin_finding.code_snippet is not None
         assert "AWS_SECRET_ACCESS_KEY" in builtin_finding.code_snippet
-        assert 'AWS_SECRET_ACCESS_KEY = "<redacted>"' in builtin_finding.code_snippet
+        assert 'os.environ["AWS_SECRET_ACCESS_KEY"] = "<redacted>"' in builtin_finding.code_snippet
         assert 'eval("1 + 1")' in builtin_finding.code_snippet
 
     def test_detect_code_execution_patterns(self):

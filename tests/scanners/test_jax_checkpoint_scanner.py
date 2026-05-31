@@ -125,7 +125,7 @@ def test_orbax_restore_fn_redacts_secret_assignments_in_details(tmp_path: Path) 
         {
             "version": "0.1.0",
             "type": "orbax_checkpoint",
-            "restore_fn": f"lambda x: eval(x.decode()); AWS_SECRET_ACCESS_KEY='{secret}'",
+            "restore_fn": f"lambda x: eval(x.decode()); credentials={{'client_secret': '{secret}'}}",
         },
     )
 
@@ -140,7 +140,7 @@ def test_orbax_restore_fn_redacts_secret_assignments_in_details(tmp_path: Path) 
     assert check.severity == IssueSeverity.CRITICAL
     assert secret not in serialized
     assert "eval(x.decode())" in check.details["restore_fn"]
-    assert "AWS_SECRET_ACCESS_KEY='<redacted>'" in check.details["restore_fn"]
+    assert "'client_secret': '<redacted>'" in check.details["restore_fn"]
 
 
 def test_orbax_benign_restore_fn_is_flagged_as_warning(tmp_path: Path) -> None:
