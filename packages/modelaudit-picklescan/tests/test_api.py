@@ -982,6 +982,62 @@ def test_scan_bytes_ignores_unicode_scalar_raw_nested_near_matches(payload: byte
     assert all(finding.rule_code not in {"S213", "DANGEROUS_CALL"} for finding in report.findings)
 
 
+def test_scan_bytes_scans_unicode_raw_nested_dangerous_globals_without_execution_opcodes() -> None:
+    report = scan_bytes(
+        b"\x80\x02" + _binunicode(b"AAAAAAcos\nsystem\n.BBBB") + b".",
+        source="unicode-raw-nested-dangerous-global.pkl",
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_GLOBAL" and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_fails_closed_for_unicode_raw_nested_payload_over_byte_limit() -> None:
+    nested_payload = b"\x80\x04]K\x01aK\x02aK\x03aK\x04a"
+    report = scan_bytes(
+        b"\x80\x02" + _binunicode(nested_payload) + b".",
+        source="unicode-raw-nested-oversized.pkl",
+        options=ScanOptions(max_nested_pickle_bytes=8),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("analysis_incomplete") is True
+        and finding.details.get("payload_size") == len(nested_payload)
+        for finding in report.findings
+    )
+    assert any(
+        notice.code == "nested_payload_truncated"
+        and notice.details.get("encoding") == "raw"
+        and notice.details.get("analysis_incomplete") is True
+        for notice in report.notices
+    )
+
+
+def test_scan_bytes_fails_closed_when_unicode_raw_nested_probe_limit_is_exceeded() -> None:
+    decoys = b"\x80\x04}." * 65
+    report = scan_bytes(
+        b"\x80\x02" + _binunicode(decoys + b"cos\nsystem\n)R.") + b".",
+        source="unicode-raw-nested-probe-limit.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("encoding") == "raw"
+        and finding.details.get("analysis_incomplete") is True
+        and finding.details.get("max_nested_payload_probes") == 64
+        for finding in report.findings
+    )
+    assert any(notice.code == "nested_probe_limit" for notice in report.notices)
+
+
 def test_scan_bytes_fails_closed_on_malformed_nested_persid_payload() -> None:
     inner = b"\x80\x04cos\nsystem\nP\nfake_id\n."
     outer = pickle.dumps({"inner": inner}, protocol=4)
