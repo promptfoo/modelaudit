@@ -2961,6 +2961,10 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
         # Directory summary
         output.append(f"Directory: {metadata['directory']}")
         output.append(f"Total Files: {metadata['summary']['total_files']}")
+        if metadata.get("analysis_incomplete"):
+            output.append("\nWarning: Metadata extraction is incomplete")
+            for event in metadata.get("budget_events", []):
+                output.append(f"  Budget exceeded: {event.get('limit', 'unknown')}")
         output.append("\nFormats:")
         for fmt, count in metadata["summary"]["formats"].items():
             output.append(f"  {fmt}: {count}")

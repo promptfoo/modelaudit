@@ -15,6 +15,7 @@ logger = logging.getLogger("modelaudit.metadata_extractor")
 MAX_METADATA_DIRECTORY_FILES = 10_000
 MAX_METADATA_DIRECTORY_BYTES = 1024 * 1024 * 1024
 MAX_METADATA_DIRECTORY_DEPTH = 64
+MAX_METADATA_DIRECTORY_ENTRIES = 20_000
 METADATA_DIRECTORY_BUDGET_REASON = "metadata_directory_extraction_budget_exceeded"
 
 
@@ -75,11 +76,22 @@ class ModelMetadataExtractor:
         base_depth = len(base_path.parts)
         files_considered = 0
         bytes_considered = 0
+        entries_considered = 0
         stop_traversal = False
 
         for root, dir_names, files in os.walk(directory):
-            dir_names.sort()
-            files.sort()
+            if entries_considered >= MAX_METADATA_DIRECTORY_ENTRIES:
+                self._mark_directory_budget_exceeded(
+                    results,
+                    limit="max_entries",
+                    max_entries=MAX_METADATA_DIRECTORY_ENTRIES,
+                    entries_considered=entries_considered,
+                    path=root,
+                )
+                dir_names[:] = []
+                break
+
+            entries_considered += 1
             current_depth = max(len(Path(root).resolve().parts) - base_depth, 0)
             if current_depth > MAX_METADATA_DIRECTORY_DEPTH:
                 self._mark_directory_budget_exceeded(
@@ -92,6 +104,26 @@ class ModelMetadataExtractor:
                 dir_names[:] = []
                 continue
 
+            remaining_directory_entries = max(MAX_METADATA_DIRECTORY_ENTRIES - entries_considered, 0)
+            if len(dir_names) > remaining_directory_entries:
+                self._mark_directory_budget_exceeded(
+                    results,
+                    limit="max_entries",
+                    max_entries=MAX_METADATA_DIRECTORY_ENTRIES,
+                    entries_considered=entries_considered,
+                    discovered_directories=len(dir_names),
+                    path=root,
+                )
+                dir_names[:] = []
+                stop_traversal = True
+            else:
+                dir_names[:] = sorted(dir_names[:remaining_directory_entries])
+
+            file_sort_limit = min(
+                MAX_METADATA_DIRECTORY_FILES - files_considered + 1,
+                MAX_METADATA_DIRECTORY_ENTRIES - entries_considered + 1,
+            )
+            files = sorted(files[: max(file_sort_limit, 0)])
             for file in files:
                 if files_considered >= MAX_METADATA_DIRECTORY_FILES:
                     self._mark_directory_budget_exceeded(
@@ -104,6 +136,19 @@ class ModelMetadataExtractor:
                     stop_traversal = True
                     break
 
+                if entries_considered >= MAX_METADATA_DIRECTORY_ENTRIES:
+                    self._mark_directory_budget_exceeded(
+                        results,
+                        limit="max_entries",
+                        max_entries=MAX_METADATA_DIRECTORY_ENTRIES,
+                        entries_considered=entries_considered,
+                        path=os.path.join(root, file),
+                    )
+                    stop_traversal = True
+                    break
+
+                files_considered += 1
+                entries_considered += 1
                 file_path = os.path.join(root, file)
                 try:
                     if not is_within_directory(base_dir, file_path):
@@ -134,7 +179,6 @@ class ModelMetadataExtractor:
                         stop_traversal = True
                         break
 
-                    files_considered += 1
                     bytes_considered += file_size
                     file_metadata = self._extract_file_metadata(file_path, security_only, allow_deserialization)
                     if file_metadata.get("format") != "unknown":

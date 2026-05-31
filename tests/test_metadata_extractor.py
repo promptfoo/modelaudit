@@ -255,6 +255,27 @@ class TestModelMetadataExtractor:
         assert metadata["budget_events"][0]["bytes_considered"] == 3
         assert metadata["budget_events"][0]["next_file_size"] == 4
 
+    def test_extract_directory_metadata_counts_unstatable_entries_against_file_budget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Broken links should not bypass the aggregate file budget."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        for index in range(3):
+            (scan_dir / f"broken-{index}.fake").symlink_to(scan_dir / f"missing-{index}.fake")
+
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_FILES", 2)
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert metadata["analysis_incomplete"] is True
+        assert metadata["budget_events"][0]["limit"] == "max_files"
+        assert metadata["budget_events"][0]["files_considered"] == 2
+        assert len(metadata["files"]) == 2
+
     def test_extract_directory_metadata_stops_at_depth_budget(
         self,
         tmp_path: Path,
@@ -291,6 +312,56 @@ class TestModelMetadataExtractor:
         assert metadata["budget_events"][0]["limit"] == "max_depth"
         assert metadata["budget_events"][0]["max_depth"] == 1
         assert metadata["budget_events"][0]["observed_depth"] == 2
+
+    def test_extract_directory_metadata_stops_at_empty_directory_entry_budget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Empty directory trees should remain bounded."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        for index in range(3):
+            (scan_dir / f"empty-{index}").mkdir()
+
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_ENTRIES", 2)
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert metadata["analysis_incomplete"] is True
+        assert metadata["budget_events"][0]["limit"] == "max_entries"
+        assert metadata["budget_events"][0]["entries_considered"] == 1
+        assert metadata["budget_events"][0]["discovered_directories"] == 3
+
+    def test_extract_directory_metadata_caps_file_names_before_sorting(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Flat directories should only sort the bounded file-name prefix."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        sorted_input_sizes: list[int] = []
+
+        def bounded_sorted(values: list[str]) -> list[str]:
+            sorted_input_sizes.append(len(values))
+            return sorted(values)
+
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_FILES", 2)
+        monkeypatch.setattr(metadata_extractor_module, "sorted", bounded_sorted, raising=False)
+        monkeypatch.setattr(
+            metadata_extractor_module.os,
+            "walk",
+            lambda _directory: [(str(scan_dir), [], [f"file-{index}.fake" for index in range(100)])],
+        )
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert max(sorted_input_sizes) == 3
+        assert metadata["analysis_incomplete"] is True
+        assert metadata["budget_events"][0]["limit"] == "max_files"
 
     def test_extract_directory_metadata_in_budget_preserves_success(
         self,
@@ -398,6 +469,23 @@ class TestModelMetadataExtractor:
         assert "pickle: 1" in output
         assert "model1.safetensors (safetensors)" in output
         assert "model2.pkl (pickle)" in output
+
+    def test_format_table_directory_surfaces_incomplete_budget_warning(self) -> None:
+        """Default table output should disclose partial metadata extraction."""
+        from modelaudit.cli import _format_metadata_table
+
+        metadata = {
+            "directory": "/test/path",
+            "summary": {"total_files": 1, "formats": {"safetensors": 1}},
+            "files": [{"file": "model.safetensors", "format": "safetensors"}],
+            "analysis_incomplete": True,
+            "budget_events": [{"limit": "max_files"}],
+        }
+
+        output = _format_metadata_table(metadata)
+
+        assert "Warning: Metadata extraction is incomplete" in output
+        assert "Budget exceeded: max_files" in output
 
     def test_pickle_metadata_no_deserialization(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Ensure pickle metadata extraction does not deserialize by default."""
