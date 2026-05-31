@@ -3,6 +3,7 @@
 import json
 import os
 import re
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, ClassVar
@@ -446,6 +447,9 @@ class KerasH5Scanner(BaseScanner):
                 )
                 return
 
+            if not isinstance(link, h5py.HardLink):
+                return
+
             obj = h5_file.get(name, getlink=False)
             if isinstance(obj, h5py.Dataset):
                 external_storage = obj.external
@@ -461,10 +465,7 @@ class KerasH5Scanner(BaseScanner):
                         },
                     )
 
-        if hasattr(h5_file, "visititems_links"):
-            h5_file.visititems_links(visit)
-        else:  # pragma: no cover - compatibility fallback for older h5py
-            h5_file.visititems(lambda name, _obj: visit(name, h5_file.get(name, getlink=True)))
+        self._visit_hdf5_links(h5_file, visit)
 
         if not findings:
             return
@@ -539,6 +540,32 @@ class KerasH5Scanner(BaseScanner):
                 "parse_status": "unknown",
             },
         )
+
+    @staticmethod
+    def _visit_hdf5_links(h5_file: Any, visit: Callable[[str, Any], None]) -> None:
+        """Visit links without resolving external targets on every supported h5py version."""
+        if hasattr(h5_file, "visititems_links"):
+            h5_file.visititems_links(visit)
+            return
+
+        visited_group_ids = {h5_file.id}
+
+        def walk(group: Any, prefix: str = "") -> None:
+            for child_name in group:
+                path = f"{prefix}/{child_name}" if prefix else str(child_name)
+                link = group.get(child_name, getlink=True)
+                visit(path, link)
+                if not isinstance(link, h5py.HardLink):
+                    continue
+
+                obj = group.get(child_name, getlink=False)
+                if not isinstance(obj, h5py.Group) or obj.id in visited_group_ids:
+                    continue
+
+                visited_group_ids.add(obj.id)
+                walk(obj, path)
+
+        walk(h5_file)
 
     def _scan_training_config(self, training_config: Any, result: ScanResult) -> None:
         """Inspect training_config for custom metrics and losses."""

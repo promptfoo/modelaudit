@@ -795,6 +795,72 @@ def test_keras_h5_scanner_flags_keras3_weights_external_link_without_resolving_i
     ]
 
 
+def test_keras_h5_scanner_legacy_h5py_traversal_flags_dangling_external_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """h5py before 3.11 must still inspect external links without resolving them."""
+    weights_path = tmp_path / "legacy.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        layers = f.create_group("layers")
+        layers["dense"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+
+    monkeypatch.delattr(h5py.Group, "visititems_links")
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/layers/dense",
+            "filename": "missing_external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
+def test_keras_h5_scanner_external_reference_collection_does_not_resolve_soft_links(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SoftLink aliases must not be dereferenced while collecting external references."""
+    weights_path = tmp_path / "soft_alias.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        vars_group = f.create_group("layers").create_group("dense").create_group("vars")
+        vars_group["external_kernel"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+        vars_group["soft_alias"] = h5py.SoftLink("/layers/dense/vars/external_kernel")
+
+    original_get = h5py.Group.get
+
+    def guarded_get(
+        self: Any,
+        name: Any,
+        default: Any = None,
+        getclass: bool = False,
+        getlink: bool = False,
+    ) -> Any:
+        if str(name).endswith("soft_alias") and not getlink:
+            raise AssertionError("SoftLink target was followed")
+        return original_get(self, name, default=default, getclass=getclass, getlink=getlink)
+
+    monkeypatch.setattr(h5py.Group, "get", guarded_get)
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/layers/dense/vars/external_kernel",
+            "filename": "missing_external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
 def test_keras_h5_scanner_malicious_model(tmp_path):
     """Test scanning a malicious Keras H5 model."""
     model_path = create_mock_h5_file(tmp_path, malicious=True)
