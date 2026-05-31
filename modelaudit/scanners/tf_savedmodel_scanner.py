@@ -51,6 +51,10 @@ _ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
 _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
 _MAX_PROTOBUF_PARSE_BYTES = 20 * 1024 * 1024
+_MAX_SAVEDMODEL_META_GRAPHS = 64
+_MAX_SAVEDMODEL_GRAPH_NODES = 200_000
+_MAX_SAVEDMODEL_FUNCTIONS = 50_000
+_MAX_SAVEDMODEL_FUNCTION_NODES = 100_000
 _MAX_COLLECTION_VALUE_BYTES = 256 * 1024
 _CORE_ROOT_MODEL_FILES = frozenset({"saved_model.pb", "keras_metadata.pb", "fingerprint.pb"})
 _CORE_ROOT_MODEL_DIRS = frozenset({"assets", "assets.extra", "variables"})
@@ -171,6 +175,22 @@ class SavedModelNodeContext:
     function_name: str | None = None
 
 
+@dataclass(frozen=True)
+class SavedModelGraphBudget:
+    """Bounded structure summary collected before graph traversal."""
+
+    meta_graph_count: int
+    graph_node_count: int
+    function_count: int
+    function_node_count: int
+    limit_reason: str | None = None
+    limit_name: str | None = None
+
+    @property
+    def exceeded(self) -> bool:
+        return self.limit_reason is not None
+
+
 class TensorFlowSavedModelScanner(BaseScanner):
     """Scanner for TensorFlow SavedModel format"""
 
@@ -221,6 +241,100 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 "exception_type": type(error).__name__,
                 "analysis_incomplete": True,
                 "scan_outcome_reason": "savedmodel_read_failed",
+            },
+        )
+        result.finish(success=False)
+        return result
+
+    @staticmethod
+    def _collect_graph_budget(saved_model: Any) -> SavedModelGraphBudget:
+        meta_graphs = getattr(saved_model, "meta_graphs", [])
+        meta_graph_count = len(meta_graphs)
+        graph_node_count = 0
+        function_count = 0
+        function_node_count = 0
+
+        def budget(
+            limit_reason: str | None = None,
+            limit_name: str | None = None,
+        ) -> SavedModelGraphBudget:
+            return SavedModelGraphBudget(
+                meta_graph_count=meta_graph_count,
+                graph_node_count=graph_node_count,
+                function_count=function_count,
+                function_node_count=function_node_count,
+                limit_reason=limit_reason,
+                limit_name=limit_name,
+            )
+
+        if meta_graph_count > _MAX_SAVEDMODEL_META_GRAPHS:
+            return budget("meta_graph_limit_exceeded", "meta_graph_count")
+
+        for meta_graph in meta_graphs:
+            graph_def = meta_graph.graph_def
+            graph_node_count += len(graph_def.node)
+            if graph_node_count > _MAX_SAVEDMODEL_GRAPH_NODES:
+                return budget("graph_node_limit_exceeded", "graph_node_count")
+
+            function_library = getattr(graph_def, "library", None)
+            if function_library is None:
+                continue
+
+            functions = getattr(function_library, "function", [])
+            function_count += len(functions)
+            if function_count > _MAX_SAVEDMODEL_FUNCTIONS:
+                return budget("function_limit_exceeded", "function_count")
+
+            for function_def in functions:
+                function_node_count += len(function_def.node_def)
+                if function_node_count > _MAX_SAVEDMODEL_FUNCTION_NODES:
+                    return budget("function_node_limit_exceeded", "function_node_count")
+
+        return budget()
+
+    def _record_graph_budget_metadata(self, result: ScanResult, budget: SavedModelGraphBudget) -> None:
+        result.metadata.update(
+            {
+                "meta_graph_count": budget.meta_graph_count,
+                "graph_node_count": budget.graph_node_count,
+                "function_count": budget.function_count,
+                "function_node_count": budget.function_node_count,
+                "max_meta_graphs": _MAX_SAVEDMODEL_META_GRAPHS,
+                "max_graph_nodes": _MAX_SAVEDMODEL_GRAPH_NODES,
+                "max_functions": _MAX_SAVEDMODEL_FUNCTIONS,
+                "max_function_nodes": _MAX_SAVEDMODEL_FUNCTION_NODES,
+            }
+        )
+
+    def _finish_graph_budget_failure(
+        self,
+        result: ScanResult,
+        path: str,
+        budget: SavedModelGraphBudget,
+    ) -> ScanResult:
+        reason = "savedmodel_graph_traversal_budget_exceeded"
+        mark_inconclusive_scan_result(result, reason)
+        mark_operational_scan_error(result, reason)
+        self._record_graph_budget_metadata(result, budget)
+        result.add_check(
+            name="SavedModel Graph Traversal Budget",
+            passed=False,
+            message="SavedModel graph structure exceeds bounded traversal budget",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "limit_reason": budget.limit_reason,
+                "limit_name": budget.limit_name,
+                "meta_graph_count": budget.meta_graph_count,
+                "graph_node_count": budget.graph_node_count,
+                "function_count": budget.function_count,
+                "function_node_count": budget.function_node_count,
+                "max_meta_graphs": _MAX_SAVEDMODEL_META_GRAPHS,
+                "max_graph_nodes": _MAX_SAVEDMODEL_GRAPH_NODES,
+                "max_functions": _MAX_SAVEDMODEL_FUNCTIONS,
+                "max_function_nodes": _MAX_SAVEDMODEL_FUNCTION_NODES,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
             },
         )
         result.finish(success=False)
@@ -331,6 +445,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
                 saved_model = SavedModel()
                 saved_model.ParseFromString(content)
+                graph_budget = self._collect_graph_budget(saved_model)
+                if graph_budget.exceeded:
+                    return self._finish_graph_budget_failure(result, path, graph_budget)
+                self._record_graph_budget_metadata(result, graph_budget)
+
                 for op_info in self._scan_tf_operations(saved_model):
                     result.add_check(
                         name="TensorFlow Operation Security Check",

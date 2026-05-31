@@ -602,6 +602,137 @@ def test_safe_function_definition_ops_do_not_trigger_findings(tmp_path: Path) ->
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_graph_node_budget_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_GRAPH_NODES", 2)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            graph_nodes=[
+                {"op": "Const", "name": "node_0"},
+                {"op": "Const", "name": "node_1"},
+                {"op": "Const", "name": "node_2"},
+            ],
+            model_name="oversized_graph_node_budget",
+        )
+    )
+
+    direct = TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    budget_checks = [check for check in direct.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "savedmodel_graph_traversal_budget_exceeded"
+    assert direct.metadata["graph_node_count"] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == "graph_node_limit_exceeded"
+    assert budget_checks[0].details["limit_name"] == "graph_node_count"
+    assert budget_checks[0].details["analysis_incomplete"] is True
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_function_node_budget_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_FUNCTION_NODES", 2)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            function_nodes={
+                "__inference_many_nodes_1": [
+                    {"op": "Const", "name": "fn_node_0"},
+                    {"op": "Const", "name": "fn_node_1"},
+                    {"op": "Const", "name": "fn_node_2"},
+                ]
+            },
+            model_name="oversized_function_node_budget",
+        )
+    )
+
+    result = TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["function_node_count"] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == "function_node_limit_exceeded"
+    assert budget_checks[0].details["limit_name"] == "function_node_count"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_function_count_budget_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_FUNCTIONS", 2)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            function_nodes={
+                "__inference_empty_0": [],
+                "__inference_empty_1": [],
+                "__inference_empty_2": [],
+            },
+            model_name="oversized_function_count_budget",
+        )
+    )
+
+    result = TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["function_count"] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == "function_limit_exceeded"
+    assert budget_checks[0].details["limit_name"] == "function_count"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_graph_budget_allows_benign_graph_at_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_META_GRAPHS", 1)
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_GRAPH_NODES", 2)
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_FUNCTIONS", 1)
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_FUNCTION_NODES", 2)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            graph_nodes=[
+                {"op": "Const", "name": "graph_node_0"},
+                {"op": "Identity", "name": "graph_node_1"},
+            ],
+            function_nodes={
+                "__inference_safe_budget_1": [
+                    {"op": "Const", "name": "function_node_0"},
+                    {"op": "Identity", "name": "function_node_1"},
+                ]
+            },
+            model_name="benign_graph_at_budget",
+        )
+    )
+
+    result = TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+
+    assert result.success is True
+    assert result.issues == []
+    assert result.metadata["meta_graph_count"] == 1
+    assert result.metadata["graph_node_count"] == 2
+    assert result.metadata["function_count"] == 1
+    assert result.metadata["function_node_count"] == 2
+    assert result.metadata["op_counts"]["Const"] == 2
+    assert not any(check.name == "SavedModel Graph Traversal Budget" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_tf_savedmodel_scanner_with_blacklist(tmp_path: Path) -> None:
     """Test TensorFlow SavedModel scanner with custom blacklist patterns."""
     model_dir = create_tf_savedmodel(tmp_path)
