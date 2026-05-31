@@ -60,6 +60,17 @@ def test_redacts_quoted_authorization_key_values() -> None:
     assert '"safe": "value"' in redacted
 
 
+def test_redacts_bare_quoted_authorization_values() -> None:
+    """Bare Authorization assignments with quoted values should be redacted."""
+    text = 'Authorization: "Bearer AUTHSECRET123" safe="value"'
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "AUTHSECRET123" not in redacted
+    assert f'Authorization: "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert 'safe="value"' in redacted
+
+
 def test_redacts_triple_quoted_key_values_atomically() -> None:
     """Triple-quoted Python credential values should be redacted as one value."""
     text = "{'api_key': '''TRIPLESECRET123''', 'safe': 'value'}"
@@ -95,6 +106,17 @@ def test_redacts_prefixed_quoted_assignments_without_second_pass_corruption() ->
     assert f'api_key = f"{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert f'client_secret=b"{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert 'safe=f"value"' in redacted
+
+
+def test_redacts_unterminated_prefixed_quoted_assignments() -> None:
+    """Truncated snippets should still fail closed for prefixed quoted credentials."""
+    text = 'api_key=f"TRUNCATEDSECRET123 requests.get'
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "TRUNCATEDSECRET123" not in redacted
+    assert f'api_key=f"{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert "requests.get" in redacted
 
 
 def test_redacts_compound_sensitive_query_parameters() -> None:

@@ -903,6 +903,19 @@ class TestNetworkCommDetector:
         assert "Authorization: Bearer <redacted>" in serialized
         assert '"api_key": "<redacted>"' in snippet
 
+    def test_network_function_snippet_redaction_preserves_matched_context(self) -> None:
+        """Credential redaction expansion should not truncate away the network-function match."""
+        detector = NetworkCommDetector()
+        data = (b"api_key=x " * 8) + b"requests.get(1)"
+
+        findings = detector.scan(data, "hook.py")
+        network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+        snippet = str(network_finding["snippet"])
+
+        assert "api_key=x" not in snippet
+        assert "api_key=<redacted>" in snippet
+        assert "requests.get" in snippet
+
     def test_network_function_snippets_expand_forward_urls_before_redaction(self) -> None:
         """Long URL tails after the function token should be included before URL redaction."""
         detector = NetworkCommDetector()

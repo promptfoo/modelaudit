@@ -71,6 +71,7 @@ _PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
 _MATRIX_PARAMETER_SEPARATOR_PATTERN = re.compile(r"(?<!&amp);", re.IGNORECASE)
 _MAX_URL_TEXT_LOOKUP_BYTES = 4096
 _MAX_SNIPPET_URL_EXPANSION_BYTES = 4096
+_SNIPPET_REDACTION_EXPANSION_SLACK = 1024
 _MIN_CAPABILITY_TOKEN_ENTROPY = 3.5
 _MIN_URLSAFE_FILENAME_STEM_ENTROPY = 4.0
 _PUBLIC_MODEL_REPOSITORY_HOSTS = frozenset({"huggingface.co", "hf.co"})
@@ -496,7 +497,7 @@ def _redacted_snippet_for_match(data: bytes, match_start: int, match_end: int, *
             end = max(end, url_end)
 
     redacted = _redact_urls_in_text(data[start:end].decode("utf-8", errors="ignore"))
-    return redact_evidence_string(redacted, max_chars=len(redacted))
+    return redact_evidence_string(redacted, max_chars=len(redacted) + _SNIPPET_REDACTION_EXPANSION_SLACK)
 
 
 def _url_text_containing_offset(data: bytes, offset: int) -> str | None:

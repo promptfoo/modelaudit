@@ -48,6 +48,12 @@ SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"password|passwd|private[_-]?key|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
 )
 QUOTED_SENSITIVE_KEY: Final[str] = rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|authorization)"
+PYTHON_STRING_PREFIX: Final[str] = r"[rubf]*"
+PYTHON_QUOTE_DELIMITER: Final[str] = r"(?:'''|\"\"\"|[\"'])"
+QUOTED_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(\bauthorization\s*[:=]\s*)({PYTHON_STRING_PREFIX})"
+    rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\3)[\s\S])*\3"
+)
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?)" r"[^\s\"';&|]+"
 )
@@ -55,8 +61,6 @@ BEARER_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)(?![rubf]*[\"'])[^\s\"';&|]+"
 )
-PYTHON_STRING_PREFIX: Final[str] = r"[rubf]*"
-PYTHON_QUOTE_DELIMITER: Final[str] = r"(?:'''|\"\"\"|[\"'])"
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)({PYTHON_STRING_PREFIX})"
     rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\4)[\s\S])*\4"
@@ -64,6 +68,10 @@ QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
 QUOTED_SENSITIVE_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)([\"']{QUOTED_SENSITIVE_KEY}[\"']\s*:\s*)({PYTHON_STRING_PREFIX})"
     rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\3)[\s\S])*\3"
+)
+UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)({PYTHON_STRING_PREFIX})"
+    rf"({PYTHON_QUOTE_DELIMITER})(?:(?!\4)[^\s;&|])*(?=$|\s|[;&|])"
 )
 
 
@@ -120,6 +128,11 @@ def _redact_quoted_key_value(match: re.Match[str]) -> str:
     return f"{match.group(1)}{match.group(2)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
+def _redact_quoted_authorization(match: re.Match[str]) -> str:
+    quote = match.group(3)
+    return f"{match.group(1)}{match.group(2)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
+
+
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
@@ -133,7 +146,9 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = URL_RE.sub(_redact_url, text)
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = QUOTED_SENSITIVE_KEY_VALUE_RE.sub(_redact_quoted_key_value, redacted)
+    redacted = QUOTED_AUTHORIZATION_VALUE_RE.sub(_redact_quoted_authorization, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+    redacted = UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     return _truncate(redacted, max_chars)
