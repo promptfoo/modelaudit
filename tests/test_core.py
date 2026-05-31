@@ -172,14 +172,27 @@ def _require_tf_protos() -> None:
 def test_tensorflow_protobuf_bootstrap_avoids_shadow_package(tmp_path: Path) -> None:
     shadow_root = tmp_path / "shadow"
     shadow_tensorflow = shadow_root / "tensorflow"
+    shadow_google = shadow_root / "google"
     shadow_tensorflow.mkdir(parents=True)
-    sentinel = tmp_path / "shadow_tensorflow_imported.txt"
+    shadow_google.mkdir()
+    tensorflow_sentinel = tmp_path / "shadow_tensorflow_imported.txt"
+    google_sentinel = tmp_path / "shadow_google_imported.txt"
     (shadow_tensorflow / "__init__.py").write_text(
         "\n".join(
             [
                 "import os",
                 "from pathlib import Path",
                 "Path(os.environ['SHADOW_TENSORFLOW_SENTINEL']).write_text('imported', encoding='utf-8')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (shadow_google / "__init__.py").write_text(
+        "\n".join(
+            [
+                "import os",
+                "from pathlib import Path",
+                "Path(os.environ['SHADOW_GOOGLE_SENTINEL']).write_text('imported', encoding='utf-8')",
             ]
         ),
         encoding="utf-8",
@@ -192,7 +205,8 @@ def test_tensorflow_protobuf_bootstrap_avoids_shadow_package(tmp_path: Path) -> 
     if existing_pythonpath:
         pythonpath_entries.append(existing_pythonpath)
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
-    env["SHADOW_TENSORFLOW_SENTINEL"] = str(sentinel)
+    env["SHADOW_TENSORFLOW_SENTINEL"] = str(tensorflow_sentinel)
+    env["SHADOW_GOOGLE_SENTINEL"] = str(google_sentinel)
 
     script = """
 import importlib
@@ -218,7 +232,8 @@ print(json.dumps({
     )
 
     assert result.returncode == 0, result.stderr
-    assert not sentinel.exists()
+    assert not tensorflow_sentinel.exists()
+    assert not google_sentinel.exists()
     payload = json.loads(result.stdout)
     assert payload["available"] is True
     assert payload["saved_model_class"] == "SavedModel"

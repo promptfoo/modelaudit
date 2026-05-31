@@ -67,13 +67,33 @@ def _trusted_tensorflow_roots() -> list[Path]:
     return roots
 
 
-def _module_is_under_root(module: types.ModuleType, root: Path) -> bool:
-    module_file = getattr(module, "__file__", None)
-    if module_file and _path_is_relative_to(Path(module_file).resolve(), root):
-        return True
+def _trusted_import_roots() -> list[Path]:
+    roots = _trusted_tensorflow_roots()
+    seen = set(roots)
+    for key in ("stdlib", "platstdlib"):
+        path_value = sysconfig.get_paths().get(key)
+        if path_value:
+            root = Path(path_value).resolve()
+            if root not in seen:
+                roots.append(root)
+                seen.add(root)
+    return roots
 
-    module_paths = getattr(module, "__path__", ())
-    return any(_path_is_relative_to(Path(module_path).resolve(), root) for module_path in module_paths)
+
+def _safe_import_paths(*preferred_roots: Path) -> list[str]:
+    roots = [*preferred_roots, *_trusted_import_roots()]
+    return list(dict.fromkeys(str(root) for root in roots))
+
+
+def _module_is_under_root(module: types.ModuleType, root: Path) -> bool:
+    with suppress(OSError, RuntimeError, TypeError, ValueError):
+        module_file = getattr(module, "__file__", None)
+        if module_file and _path_is_relative_to(Path(module_file).resolve(), root):
+            return True
+
+        module_paths = getattr(module, "__path__", ())
+        return any(_path_is_relative_to(Path(module_path).resolve(), root) for module_path in module_paths)
+    return False
 
 
 def _remove_tensorflow_modules_outside(root: Path) -> None:
@@ -110,14 +130,19 @@ def _setup_vendored_protos() -> bool:
     _USING_VENDORED = True
     logger.debug("Using vendored TensorFlow protos")
 
+    original_sys_path = list(sys.path)
     try:
+        sys.path[:] = _safe_import_paths(_PROTOS_PATH)
         from tensorflow.core.framework.graph_pb2 import GraphDef
         from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
         return True
-    except ImportError as e:
-        logger.debug("Vendored TensorFlow protos failed to load: %s", e)
+    except Exception:
+        logger.debug("Vendored TensorFlow protos failed to load")
+        _USING_VENDORED = False
         return False
+    finally:
+        sys.path[:] = original_sys_path
 
 
 def _setup_trusted_tensorflow_protos() -> bool:
@@ -131,15 +156,15 @@ def _setup_trusted_tensorflow_protos() -> bool:
     original_sys_path = list(sys.path)
     _remove_tensorflow_modules_outside(trusted_root)
     try:
-        sys.path[:] = [str(trusted_root), *[entry for entry in sys.path if entry != str(trusted_root)]]
+        sys.path[:] = _safe_import_paths(trusted_root)
         from tensorflow.core.framework.graph_pb2 import GraphDef
         from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
         _USING_VENDORED = False
-        logger.debug("Using TensorFlow protos from trusted installation root %s", trusted_root)
+        logger.debug("Using TensorFlow protos from a trusted installation root")
         return True
-    except ImportError as e:
-        logger.debug("Trusted TensorFlow protobuf import failed: %s", e)
+    except Exception:
+        logger.debug("Trusted TensorFlow protobuf import failed")
         return False
     finally:
         sys.path[:] = original_sys_path
