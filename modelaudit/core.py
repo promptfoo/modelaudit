@@ -1877,6 +1877,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         detect_pytorch_binary_supplemental_format(path) if ext == ".bin" and header_format == "pytorch_binary" else None
     )
     skipped_preferred_scanner_id: str | None = None
+    unavailable_preferred_scanner_id: str | None = None
     trusted_flax_overlap_scanner_id: str | None = None
     if scanner_id == "flax_msgpack" and not scanner_selection.allows(scanner_id):
         skipped_preferred_scanner_id = scanner_id
@@ -1895,6 +1896,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         or (scanner_id == "protobuf_model_candidate" and allows_protobuf_model_candidate_analysis(scanner_selection))
     ):
         preferred_scanner = _registry.load_scanner_by_id(scanner_id)
+        if preferred_scanner is None:
+            unavailable_preferred_scanner_id = scanner_id
     elif scanner_id:
         skipped_preferred_scanner_id = scanner_id
 
@@ -1972,7 +1975,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             and scanner_selection.allows(pytorch_binary_supplemental_scanner_id)
         ):
             scanner_class = _registry.load_scanner_by_id(pytorch_binary_supplemental_scanner_id)
-        if scanner_class is None:
+        if scanner_class is None and unavailable_preferred_scanner_id is None:
             scanner_class = _registry.get_scanner_for_path(
                 path,
                 scanner_selection=scanner_selection if scanner_selection.active else None,
@@ -2028,48 +2031,56 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     kind=SCANNER_SELECTION_PREFERRED_KIND,
                 )
         else:
-            if scanner_selection.active:
-                candidate_scanner_id = skipped_preferred_scanner_id
-                if candidate_scanner_id is None:
-                    candidate_scanner_class = _registry.get_scanner_for_path(path)
-                    if candidate_scanner_class:
-                        candidate_scanner_id = (
-                            _registry.get_scanner_id_for_class(candidate_scanner_class.__name__)
-                            or candidate_scanner_class.name
-                        )
-                if candidate_scanner_id and not scanner_selection.allows(candidate_scanner_id):
-                    result = make_scanner_selection_skip_result(path, candidate_scanner_id, scanner_selection)
-                    if result.bytes_scanned == 0 and file_size > 0:
-                        result.bytes_scanned = file_size
-                    return result
-
-            if format_probe_error is not None and magic_format == "unknown":
-                sr = _make_incomplete_format_detection_read_result(path, format_probe_error)
-            elif magic_format == XML_MODEL_INCONCLUSIVE_FORMAT:
-                sr = _make_incomplete_xml_model_result(path)
-            elif header_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
-                sr = _make_incomplete_protobuf_model_result(path)
-            elif magic_format == PROTOBUF_MODEL_CANDIDATE_FORMAT and header_format != "unknown":
-                sr = _make_unavailable_recognized_format_result(path, header_format, scanner_id)
-            elif magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
-                sr = _make_incomplete_llamafile_routing_result(path, config)
-            elif magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
-                sr = _make_incomplete_nemo_routing_result(path)
-            elif magic_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
-                sr = _make_incomplete_mxnet_symbol_routing_result(path, config)
-            elif magic_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
-                sr = _make_incomplete_xgboost_ubjson_routing_result(path)
-            elif magic_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
-                sr = _make_incomplete_onnx_routing_result(path)
-            elif magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
-                sr = _make_incomplete_tensorflow_protobuf_routing_result(path)
-            elif magic_format == "unknown":
-                # Not a recognized model format — skip silently
-                sr = ScanResult(scanner_name="unknown")
-                logger.debug(f"Skipping unrecognized format file: {path}")
+            if unavailable_preferred_scanner_id is not None:
+                sr = _make_unavailable_recognized_format_result(
+                    path,
+                    unavailable_preferred_scanner_id,
+                    unavailable_preferred_scanner_id,
+                )
+                result = sr
             else:
-                sr = _make_unavailable_recognized_format_result(path, magic_format, scanner_id)
-            result = sr
+                if scanner_selection.active:
+                    candidate_scanner_id = skipped_preferred_scanner_id
+                    if candidate_scanner_id is None:
+                        candidate_scanner_class = _registry.get_scanner_for_path(path)
+                        if candidate_scanner_class:
+                            candidate_scanner_id = (
+                                _registry.get_scanner_id_for_class(candidate_scanner_class.__name__)
+                                or candidate_scanner_class.name
+                            )
+                    if candidate_scanner_id and not scanner_selection.allows(candidate_scanner_id):
+                        result = make_scanner_selection_skip_result(path, candidate_scanner_id, scanner_selection)
+                        if result.bytes_scanned == 0 and file_size > 0:
+                            result.bytes_scanned = file_size
+                        return result
+
+                if format_probe_error is not None and magic_format == "unknown":
+                    sr = _make_incomplete_format_detection_read_result(path, format_probe_error)
+                elif magic_format == XML_MODEL_INCONCLUSIVE_FORMAT:
+                    sr = _make_incomplete_xml_model_result(path)
+                elif header_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
+                    sr = _make_incomplete_protobuf_model_result(path)
+                elif magic_format == PROTOBUF_MODEL_CANDIDATE_FORMAT and header_format != "unknown":
+                    sr = _make_unavailable_recognized_format_result(path, header_format, scanner_id)
+                elif magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
+                    sr = _make_incomplete_llamafile_routing_result(path, config)
+                elif magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
+                    sr = _make_incomplete_nemo_routing_result(path)
+                elif magic_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
+                    sr = _make_incomplete_mxnet_symbol_routing_result(path, config)
+                elif magic_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
+                    sr = _make_incomplete_xgboost_ubjson_routing_result(path)
+                elif magic_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
+                    sr = _make_incomplete_onnx_routing_result(path)
+                elif magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
+                    sr = _make_incomplete_tensorflow_protobuf_routing_result(path)
+                elif magic_format == "unknown":
+                    # Not a recognized model format — skip silently
+                    sr = ScanResult(scanner_name="unknown")
+                    logger.debug(f"Skipping unrecognized format file: {path}")
+                else:
+                    sr = _make_unavailable_recognized_format_result(path, magic_format, scanner_id)
+                result = sr
 
     if skipped_overlap_scanner_id:
         add_scanner_selection_skip_check(

@@ -2879,6 +2879,46 @@ def test_scan_file_routes_misnamed_config_only_keras_zip_by_content(tmp_path: Pa
     assert any("lambda" in issue.message.lower() for issue in result.issues)
 
 
+def test_scan_file_fails_closed_when_content_routed_keras_zip_scanner_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disguised_keras = tmp_path / "model.jpg"
+    _create_misnamed_zip(
+        disguised_keras,
+        {
+            "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
+            "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
+        },
+    )
+    original_load_scanner = core_module._registry._load_scanner
+
+    def load_scanner(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "keras_zip":
+            return None
+        return original_load_scanner(scanner_id)
+
+    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+
+    result = scan_file(str(disguised_keras), config={"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    assert "recognized_format_scanner_unavailable" in result.metadata["scan_outcome_reasons"]
+    assert not any(check.name == "Generic ZIP Security Check" for check in result.checks)
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.details["format"] == "keras_zip"
+    assert check.details["preferred_scanner_id"] == "keras_zip"
+
+    aggregate = scan_model_directory_or_file(str(disguised_keras), cache_scan_results=False)
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
 def test_scan_file_routes_misnamed_oversized_config_only_keras_zip_by_content(tmp_path: Path) -> None:
     disguised_keras = tmp_path / "model.jpg"
     malicious_code = "exec(\"print('Malicious!')\")"
