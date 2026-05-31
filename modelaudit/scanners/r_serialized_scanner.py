@@ -14,6 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
+from ._evidence_redaction import redact_evidence_string
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 _DECODE_INCONCLUSIVE_REASON = "r_serialized_decode_incomplete"
@@ -38,6 +39,10 @@ def _redact_url_for_display(url: str) -> str:
 
     netloc = f"{hostname}:{port}" if port is not None else hostname
     return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def _redact_sample_for_display(text: str) -> str:
+    return redact_evidence_string(text, max_chars=200)
 
 
 @dataclass(frozen=True)
@@ -463,7 +468,7 @@ class RSerializedScanner(BaseScanner):
             if has_exec_symbol:
                 match = self._EXECUTABLE_SYMBOL_RE.search(lowered)
                 assert match is not None
-                hit = {"symbol": match.group(0), "offset": extracted.offset, "sample": text[:200]}
+                hit = {"symbol": match.group(0), "offset": extracted.offset, "sample": _redact_sample_for_display(text)}
                 if has_exec_call or has_code_context:
                     if not documentation_only or has_exec_call:
                         critical_symbol_hits.append(hit)
@@ -472,7 +477,11 @@ class RSerializedScanner(BaseScanner):
 
             command_match = self._COMMAND_RE.search(text)
             if command_match:
-                hit = {"pattern": command_match.group(0), "offset": extracted.offset, "sample": text[:200]}
+                hit = {
+                    "pattern": command_match.group(0),
+                    "offset": extracted.offset,
+                    "sample": _redact_sample_for_display(text),
+                }
                 if has_exec_call or has_code_context or has_exec_symbol:
                     critical_payload_hits.append(hit)
                 elif not documentation_only:
