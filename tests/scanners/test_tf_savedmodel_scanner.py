@@ -26,6 +26,7 @@ class _RequiredNodeSpec(TypedDict):
 class _NodeSpec(_RequiredNodeSpec, total=False):
     name: str
     string_attrs: dict[str, str]
+    string_list_attrs: dict[str, list[str]]
     function_ref: str
 
 
@@ -695,6 +696,82 @@ def test_savedmodel_function_count_budget_marks_scan_inconclusive(
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_attribute_string_value_budget_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES", 2)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            graph_nodes=[
+                {
+                    "op": "Const",
+                    "string_list_attrs": {"labels": ["safe_0", "safe_1", "safe_2"]},
+                }
+            ],
+            model_name="oversized_attribute_string_values",
+        )
+    )
+
+    result = TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["attribute_string_value_count"] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == "attribute_string_value_limit_exceeded"
+    assert budget_checks[0].details["limit_name"] == "attribute_string_value_count"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_collection_value_budget_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_COLLECTION_VALUES", 2)
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            collection_values={"runtime_scripts": [b"safe_0", b"safe_1", b"safe_2"]},
+            model_name="oversized_collection_values",
+        )
+    )
+
+    result = TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["collection_value_count"] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == "collection_value_limit_exceeded"
+    assert budget_checks[0].details["limit_name"] == "collection_value_count"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_protobuf_string_injection_detected_in_list_attribute(tmp_path: Path) -> None:
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "string_list_attrs": {"labels": ["safe", "os.system('echo list-value')"]},
+            }
+        ],
+        model_name="list_attribute_string_injection",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    injection_checks = [check for check in result.checks if check.name == "Protobuf String Injection Check"]
+
+    assert injection_checks
+    assert any(check.details.get("attribute_name") == "labels" for check in injection_checks)
+    assert any(check.details.get("attack_type") == "system_command" for check in injection_checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_graph_budget_allows_benign_graph_at_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -703,11 +780,19 @@ def test_savedmodel_graph_budget_allows_benign_graph_at_limit(
     monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_GRAPH_NODES", 2)
     monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_FUNCTIONS", 1)
     monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_FUNCTION_NODES", 2)
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_NODE_ATTRIBUTES", 1)
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES", 2)
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_COLLECTIONS", 1)
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_COLLECTION_VALUES", 2)
     model_path = Path(
         _create_test_savedmodel_with_scoped_nodes(
             tmp_path,
             graph_nodes=[
-                {"op": "Const", "name": "graph_node_0"},
+                {
+                    "op": "Const",
+                    "name": "graph_node_0",
+                    "string_list_attrs": {"labels": ["safe_0", "safe_1"]},
+                },
                 {"op": "Identity", "name": "graph_node_1"},
             ],
             function_nodes={
@@ -716,6 +801,7 @@ def test_savedmodel_graph_budget_allows_benign_graph_at_limit(
                     {"op": "Identity", "name": "function_node_1"},
                 ]
             },
+            collection_values={"runtime_scripts": [b"safe_0", b"safe_1"]},
             model_name="benign_graph_at_budget",
         )
     )
@@ -728,6 +814,10 @@ def test_savedmodel_graph_budget_allows_benign_graph_at_limit(
     assert result.metadata["graph_node_count"] == 2
     assert result.metadata["function_count"] == 1
     assert result.metadata["function_node_count"] == 2
+    assert result.metadata["node_attribute_count"] == 1
+    assert result.metadata["attribute_string_value_count"] == 2
+    assert result.metadata["collection_count"] == 1
+    assert result.metadata["collection_value_count"] == 2
     assert result.metadata["op_counts"]["Const"] == 2
     assert not any(check.name == "SavedModel Graph Traversal Budget" for check in result.checks)
 
@@ -1376,6 +1466,7 @@ def _create_test_savedmodel_with_scoped_nodes(
     *,
     graph_nodes: list[_NodeSpec] | None = None,
     function_nodes: dict[str, list[_NodeSpec]] | None = None,
+    collection_values: dict[str, list[bytes]] | None = None,
     model_name: str | None = None,
 ) -> str:
     """Create a SavedModel with top-level and function-definition graph nodes."""
@@ -1404,6 +1495,8 @@ def _create_test_savedmodel_with_scoped_nodes(
 
         for attr_name, attr_value in spec.get("string_attrs", {}).items():
             node.attr[attr_name].s = attr_value.encode("utf-8")
+        for attr_name, attr_values in spec.get("string_list_attrs", {}).items():
+            node.attr[attr_name].list.s.extend(value.encode("utf-8") for value in attr_values)
 
         function_ref = spec.get("function_ref")
         if function_ref is not None:
@@ -1417,6 +1510,9 @@ def _create_test_savedmodel_with_scoped_nodes(
         function_def.signature.name = function_name
         for index, spec in enumerate(node_specs):
             add_node(function_def.node_def, spec, f"function_node_{index}_{str(spec['op']).lower()}")
+
+    for collection_name, values in (collection_values or {}).items():
+        meta_graph.collection_def[collection_name].bytes_list.value.extend(values)
 
     # Save the model
     saved_model_path = model_dir / "saved_model.pb"

@@ -55,6 +55,10 @@ _MAX_SAVEDMODEL_META_GRAPHS = 64
 _MAX_SAVEDMODEL_GRAPH_NODES = 200_000
 _MAX_SAVEDMODEL_FUNCTIONS = 50_000
 _MAX_SAVEDMODEL_FUNCTION_NODES = 100_000
+_MAX_SAVEDMODEL_NODE_ATTRIBUTES = 1_000_000
+_MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES = 100_000
+_MAX_SAVEDMODEL_COLLECTIONS = 50_000
+_MAX_SAVEDMODEL_COLLECTION_VALUES = 100_000
 _MAX_COLLECTION_VALUE_BYTES = 256 * 1024
 _CORE_ROOT_MODEL_FILES = frozenset({"saved_model.pb", "keras_metadata.pb", "fingerprint.pb"})
 _CORE_ROOT_MODEL_DIRS = frozenset({"assets", "assets.extra", "variables"})
@@ -183,6 +187,10 @@ class SavedModelGraphBudget:
     graph_node_count: int
     function_count: int
     function_node_count: int
+    node_attribute_count: int
+    attribute_string_value_count: int
+    collection_count: int
+    collection_value_count: int
     limit_reason: str | None = None
     limit_name: str | None = None
 
@@ -253,6 +261,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
         graph_node_count = 0
         function_count = 0
         function_node_count = 0
+        node_attribute_count = 0
+        attribute_string_value_count = 0
+        collection_count = 0
+        collection_value_count = 0
 
         def budget(
             limit_reason: str | None = None,
@@ -263,9 +275,30 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 graph_node_count=graph_node_count,
                 function_count=function_count,
                 function_node_count=function_node_count,
+                node_attribute_count=node_attribute_count,
+                attribute_string_value_count=attribute_string_value_count,
+                collection_count=collection_count,
+                collection_value_count=collection_value_count,
                 limit_reason=limit_reason,
                 limit_name=limit_name,
             )
+
+        def collect_node_attributes(nodes: Any) -> SavedModelGraphBudget | None:
+            nonlocal node_attribute_count, attribute_string_value_count
+
+            for node in nodes:
+                attributes = getattr(node, "attr", {})
+                node_attribute_count += len(attributes)
+                if node_attribute_count > _MAX_SAVEDMODEL_NODE_ATTRIBUTES:
+                    return budget("node_attribute_limit_exceeded", "node_attribute_count")
+
+                for attribute in attributes.values():
+                    attribute_list = getattr(attribute, "list", None)
+                    attribute_string_value_count += len(getattr(attribute_list, "s", []))
+                    if attribute_string_value_count > _MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES:
+                        return budget("attribute_string_value_limit_exceeded", "attribute_string_value_count")
+
+            return None
 
         if meta_graph_count > _MAX_SAVEDMODEL_META_GRAPHS:
             return budget("meta_graph_limit_exceeded", "meta_graph_count")
@@ -275,6 +308,17 @@ class TensorFlowSavedModelScanner(BaseScanner):
             graph_node_count += len(graph_def.node)
             if graph_node_count > _MAX_SAVEDMODEL_GRAPH_NODES:
                 return budget("graph_node_limit_exceeded", "graph_node_count")
+            if node_budget := collect_node_attributes(graph_def.node):
+                return node_budget
+
+            collections = getattr(meta_graph, "collection_def", {})
+            collection_count += len(collections)
+            if collection_count > _MAX_SAVEDMODEL_COLLECTIONS:
+                return budget("collection_limit_exceeded", "collection_count")
+            for collection in collections.values():
+                collection_value_count += len(collection.bytes_list.value)
+                if collection_value_count > _MAX_SAVEDMODEL_COLLECTION_VALUES:
+                    return budget("collection_value_limit_exceeded", "collection_value_count")
 
             function_library = getattr(graph_def, "library", None)
             if function_library is None:
@@ -289,6 +333,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 function_node_count += len(function_def.node_def)
                 if function_node_count > _MAX_SAVEDMODEL_FUNCTION_NODES:
                     return budget("function_node_limit_exceeded", "function_node_count")
+                if node_budget := collect_node_attributes(function_def.node_def):
+                    return node_budget
 
         return budget()
 
@@ -299,10 +345,18 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 "graph_node_count": budget.graph_node_count,
                 "function_count": budget.function_count,
                 "function_node_count": budget.function_node_count,
+                "node_attribute_count": budget.node_attribute_count,
+                "attribute_string_value_count": budget.attribute_string_value_count,
+                "collection_count": budget.collection_count,
+                "collection_value_count": budget.collection_value_count,
                 "max_meta_graphs": _MAX_SAVEDMODEL_META_GRAPHS,
                 "max_graph_nodes": _MAX_SAVEDMODEL_GRAPH_NODES,
                 "max_functions": _MAX_SAVEDMODEL_FUNCTIONS,
                 "max_function_nodes": _MAX_SAVEDMODEL_FUNCTION_NODES,
+                "max_node_attributes": _MAX_SAVEDMODEL_NODE_ATTRIBUTES,
+                "max_attribute_string_values": _MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES,
+                "max_collections": _MAX_SAVEDMODEL_COLLECTIONS,
+                "max_collection_values": _MAX_SAVEDMODEL_COLLECTION_VALUES,
             }
         )
 
@@ -329,10 +383,18 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 "graph_node_count": budget.graph_node_count,
                 "function_count": budget.function_count,
                 "function_node_count": budget.function_node_count,
+                "node_attribute_count": budget.node_attribute_count,
+                "attribute_string_value_count": budget.attribute_string_value_count,
+                "collection_count": budget.collection_count,
+                "collection_value_count": budget.collection_value_count,
                 "max_meta_graphs": _MAX_SAVEDMODEL_META_GRAPHS,
                 "max_graph_nodes": _MAX_SAVEDMODEL_GRAPH_NODES,
                 "max_functions": _MAX_SAVEDMODEL_FUNCTIONS,
                 "max_function_nodes": _MAX_SAVEDMODEL_FUNCTION_NODES,
+                "max_node_attributes": _MAX_SAVEDMODEL_NODE_ATTRIBUTES,
+                "max_attribute_string_values": _MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES,
+                "max_collections": _MAX_SAVEDMODEL_COLLECTIONS,
+                "max_collection_values": _MAX_SAVEDMODEL_COLLECTION_VALUES,
                 "analysis_incomplete": True,
                 "scan_outcome_reason": reason,
             },
@@ -1592,18 +1654,15 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     string_vals_to_check = []
 
                     # Extract string values from different attribute types
-                    if hasattr(attr_value, "s"):  # String attribute
-                        try:
+                    if getattr(attr_value, "s", b""):  # String attribute
+                        with contextlib.suppress(UnicodeDecodeError, AttributeError):
                             string_vals_to_check.append(attr_value.s.decode("utf-8", errors="ignore"))
+
+                    for s_val in getattr(getattr(attr_value, "list", None), "s", []):  # String list
+                        try:
+                            string_vals_to_check.append(s_val.decode("utf-8", errors="ignore"))
                         except (UnicodeDecodeError, AttributeError):
                             continue
-
-                    elif hasattr(attr_value, "list") and hasattr(attr_value.list, "s"):  # String list
-                        for s_val in attr_value.list.s:
-                            try:
-                                string_vals_to_check.append(s_val.decode("utf-8", errors="ignore"))
-                            except (UnicodeDecodeError, AttributeError):
-                                continue
 
                     # Check each string value against injection patterns
                     for string_val in string_vals_to_check:
