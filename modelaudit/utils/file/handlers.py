@@ -39,6 +39,20 @@ SHARD_SCAN_TIMEOUT = 600  # 10 minutes per shard
 MAX_RECORDED_MISSING_SHARD_INDICES = 1000
 
 
+def _is_resolved_path_within_directory(base_dir: Path, resolved_target: str) -> bool:
+    """Return True when a resolved target remains inside the shard directory."""
+    base_path = base_dir.resolve()
+    target_path = Path(resolved_target).resolve()
+    if os.name == "nt":
+        base_norm = os.path.normcase(os.path.normpath(str(base_path)))
+        target_norm = os.path.normcase(os.path.normpath(str(target_path)))
+        try:
+            return os.path.commonpath([target_norm, base_norm]) == base_norm
+        except ValueError:
+            return False
+    return target_path.is_relative_to(base_path)
+
+
 def _mark_inconclusive_scan_outcome(result: "ScanResult", reason: str) -> None:
     """Mark a scan result as incomplete while preserving existing reasons."""
     from ...scanner_results import INCONCLUSIVE_SCAN_OUTCOME
@@ -145,13 +159,21 @@ class ShardedModelDetector:
                 expected_totals: set[int] = set()
                 present_indices: set[int] = set()
                 unreadable_shards: list[str] = []
+                out_of_scope_shards: list[str] = []
                 total_size = 0
 
                 # Find all related shards
                 for file in dir_path.glob("*"):
                     file_match = re.fullmatch(pattern, file.name)
                     if file_match:
-                        if allowed_path_set is not None and str(file.resolve()) not in allowed_path_set:
+                        resolved_file = str(file.resolve())
+                        if allowed_path_set is not None and resolved_file not in allowed_path_set:
+                            continue
+                        if allowed_path_set is None and not _is_resolved_path_within_directory(
+                            dir_path,
+                            resolved_file,
+                        ):
+                            out_of_scope_shards.append(str(file))
                             continue
                         try:
                             shard_size = os.path.getsize(file)
@@ -175,6 +197,9 @@ class ShardedModelDetector:
                 if unreadable_shards:
                     shard_info["unreadable_shards"] = sorted(unreadable_shards)
                     shard_info["unreadable_shard_count"] = len(unreadable_shards)
+                if out_of_scope_shards:
+                    shard_info["out_of_scope_shards"] = sorted(out_of_scope_shards)
+                    shard_info["out_of_scope_shard_count"] = len(out_of_scope_shards)
                 if expected_totals:
                     expected_total = max(expected_totals)
                     shard_info["expected_total_shards"] = expected_total
@@ -599,6 +624,7 @@ class AdvancedFileHandler:
             result.merge(shard_results)
             missing_count = self.shard_info.get("missing_shard_count")
             unreadable_count = self.shard_info.get("unreadable_shard_count")
+            out_of_scope_count = self.shard_info.get("out_of_scope_shard_count")
             if isinstance(missing_count, int) and missing_count > 0:
                 _mark_inconclusive_scan_outcome(result, "missing_model_shards")
                 result.add_check(
@@ -616,9 +642,30 @@ class AdvancedFileHandler:
                         ),
                         "unreadable_shard_count": self.shard_info.get("unreadable_shard_count", 0),
                         "unreadable_shards": self.shard_info.get("unreadable_shards", []),
+                        "out_of_scope_shard_count": self.shard_info.get("out_of_scope_shard_count", 0),
+                        "out_of_scope_shards": self.shard_info.get("out_of_scope_shards", []),
                         "analysis_incomplete": True,
                         "scan_outcome": "inconclusive",
                         "scan_outcome_reason": "missing_model_shards",
+                    },
+                )
+            elif isinstance(out_of_scope_count, int) and out_of_scope_count > 0:
+                _mark_inconclusive_scan_outcome(result, "out_of_scope_model_shards")
+                result.add_check(
+                    name="Sharded Model Coverage Check",
+                    passed=False,
+                    message=(
+                        f"Skipped {out_of_scope_count} model shard(s) resolving outside the direct scan directory; "
+                        "scan coverage is incomplete."
+                    ),
+                    severity=IssueSeverity.INFO,
+                    details={
+                        "present_total_shards": self.shard_info.get("total_shards"),
+                        "out_of_scope_shard_count": out_of_scope_count,
+                        "out_of_scope_shards": self.shard_info.get("out_of_scope_shards", []),
+                        "analysis_incomplete": True,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": "out_of_scope_model_shards",
                     },
                 )
             elif isinstance(unreadable_count, int) and unreadable_count > 0:

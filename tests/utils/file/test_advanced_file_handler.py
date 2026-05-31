@@ -180,6 +180,59 @@ class TestShardedModelDetector:
         assert shard_info["shards"] == [str(shard_one)]
         assert shard_info["total_shards"] == 1
 
+    def test_detect_shards_rejects_direct_sibling_symlink_outside_scan_directory(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Direct file scans must not expand sibling shard symlinks outside the scan directory."""
+        outside_dir = tmp_path / "outside"
+        scan_dir = tmp_path / "scan"
+        outside_dir.mkdir()
+        scan_dir.mkdir()
+        shard_one = scan_dir / "checkpoint_1.pt"
+        shard_two = scan_dir / "checkpoint_2.pt"
+        outside_target = outside_dir / "outside-shard.pt"
+        shard_one.write_bytes(b"one")
+        outside_target.write_bytes(b"outside")
+        shard_two.symlink_to(outside_target)
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_one))
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shard_one)]
+        assert shard_info["total_shards"] == 1
+        assert shard_info["total_size"] == shard_one.stat().st_size
+        assert shard_info["out_of_scope_shard_count"] == 1
+        assert shard_info["out_of_scope_shards"] == [str(shard_two)]
+
+    def test_detect_shards_allows_validated_symlink_target_from_allowlist(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Directory scans may include a symlinked shard once the resolved target is validated."""
+        outside_dir = tmp_path / "outside"
+        scan_dir = tmp_path / "scan"
+        outside_dir.mkdir()
+        scan_dir.mkdir()
+        shard_one = scan_dir / "checkpoint_1.pt"
+        shard_two = scan_dir / "checkpoint_2.pt"
+        outside_target = outside_dir / "outside-shard.pt"
+        shard_one.write_bytes(b"one")
+        outside_target.write_bytes(b"outside")
+        shard_two.symlink_to(outside_target)
+
+        shard_info = ShardedModelDetector.detect_shards(
+            str(shard_one),
+            allowed_paths=[str(shard_one.resolve()), str(outside_target.resolve())],
+        )
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shard_one), str(shard_two)]
+        assert shard_info["total_shards"] == 2
+        assert "out_of_scope_shard_count" not in shard_info
+
     def test_no_shards_detected(self) -> None:
         """Test when file is not sharded."""
         with tempfile.NamedTemporaryFile(suffix=".bin") as f:
@@ -400,6 +453,34 @@ class TestAdvancedFileHandler:
         assert len(coverage_checks) == 1
         assert coverage_checks[0].details["unreadable_shard_count"] == 1
         assert coverage_checks[0].details["unreadable_shards"] == [str(shard_two)]
+
+    def test_sharded_model_out_of_scope_symlink_marks_scan_inconclusive(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Sibling symlink shards outside a direct scan directory cannot be treated as covered."""
+        outside_dir = tmp_path / "outside"
+        scan_dir = tmp_path / "scan"
+        outside_dir.mkdir()
+        scan_dir.mkdir()
+        shard_one = scan_dir / "checkpoint_1.pt"
+        shard_two = scan_dir / "checkpoint_2.pt"
+        outside_target = outside_dir / "outside-shard.pt"
+        shard_one.write_bytes(b"safe")
+        outside_target.write_bytes(b"malicious shard outside direct scan")
+        shard_two.symlink_to(outside_target)
+
+        handler = AdvancedFileHandler(str(shard_one), CompletingShardScanner())
+        result = handler.scan()
+
+        coverage_checks = [check for check in result.checks if check.name == "Sharded Model Coverage Check"]
+        assert result.success is False
+        assert result.bytes_scanned == shard_one.stat().st_size
+        assert "out_of_scope_model_shards" in result.metadata["scan_outcome_reasons"]
+        assert len(coverage_checks) == 1
+        assert coverage_checks[0].details["out_of_scope_shard_count"] == 1
+        assert coverage_checks[0].details["out_of_scope_shards"] == [str(shard_two)]
 
     def test_sharded_model_honors_allowed_shard_paths(self, tmp_path: Path) -> None:
         """Restricted shard scans must not expand beyond the validated allowlist."""
