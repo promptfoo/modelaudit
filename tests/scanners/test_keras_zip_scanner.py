@@ -1639,6 +1639,98 @@ __import__('pickle').loads(data)
             if "opaque_lambda" in issue.message and issue.severity == IssueSeverity.CRITICAL
         ]
 
+    @pytest.mark.parametrize("function_format", ["list", "dict"])
+    @pytest.mark.parametrize("module_name", ["os", "socket"])
+    def test_encoded_lambda_still_checks_dangerous_sibling_module(
+        self,
+        tmp_path: Path,
+        function_format: str,
+        module_name: str,
+    ) -> None:
+        """Encoded Lambda payloads must not suppress dangerous sibling metadata."""
+        encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
+        function_data: Any = [encoded_code, None, None]
+        if function_format == "dict":
+            function_data = {"class_name": "__lambda__", "config": {"code": encoded_code}}
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "mixed_module_lambda",
+                        "config": {
+                            "function": function_data,
+                            "module": module_name,
+                            "function_name": "system",
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        assert any(
+            check.name == "Lambda Layer Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("module") == module_name
+            and check.details.get("function") == "system"
+            for check in result.checks
+        )
+
+    def test_lambda_module_reference_uses_token_boundaries_for_benign_module(self, tmp_path: Path) -> None:
+        """Benign module identifiers containing suspicious substrings should remain quiet."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "benign_module_lambda",
+                        "config": {
+                            "module": "custom_package.systematic_math",
+                            "function_name": "normalize",
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        assert not any(check.name == "Lambda Layer Module Reference Check" for check in result.checks)
+
+    def test_lambda_function_name_escalates_without_dangerous_module(self, tmp_path: Path) -> None:
+        """A dangerous Lambda function name remains actionable even with a benign module."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "dangerous_function_lambda",
+                        "config": {
+                            "module": "custom_package.math",
+                            "function_name": "system",
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        assert any(
+            check.name == "Lambda Layer Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("module") == "custom_package.math"
+            and check.details.get("function") == "system"
+            for check in result.checks
+        )
+
     def test_stringlookup_external_vocabulary_path_triggers_cve_2025_12058(self, tmp_path: Path) -> None:
         """Absolute StringLookup vocabulary paths should be attributed to CVE-2025-12058 on vulnerable Keras."""
         scanner = KerasZipScanner()

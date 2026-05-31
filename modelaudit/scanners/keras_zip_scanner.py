@@ -85,6 +85,28 @@ _DANGEROUS_CONFIG_MODULES = frozenset(
         "distutils",
     }
 )
+_DANGEROUS_LAMBDA_MODULE_TOKENS = frozenset(
+    {
+        "__builtin__",
+        "__builtins__",
+        "builtins",
+        "ctypes",
+        "importlib",
+        "marshal",
+        "nt",
+        "operator",
+        "os",
+        "pickle",
+        "posix",
+        "runpy",
+        "socket",
+        "subprocess",
+        "sys",
+    }
+)
+_DANGEROUS_LAMBDA_FUNCTION_NAMES = frozenset(
+    {"__import__", "attrgetter", "compile", "eval", "exec", "open", "popen", "spawn", "system"}
+)
 
 # CVE-2025-8747: keras.utils.get_file used as gadget to download + execute files
 _GET_FILE_PATTERN = re.compile(r"get_file", re.IGNORECASE)
@@ -1967,28 +1989,34 @@ class KerasZipScanner(BaseScanner):
             check_lambda_dict_function(
                 function_data, result, f"{self.current_file_path} (layer: {layer_name})", layer_name
             )
-        else:
-            # Lambda layer without encoded function - check other fields
-            module_name = layer_config.get("module")
-            function_name = layer_config.get("function_name")
 
-            if module_name or function_name:
-                # Module/function reference - check for dangerous imports
-                dangerous_modules = ["os", "sys", "subprocess", "eval", "exec", "__builtins__"]
-                if module_name and any(dangerous in module_name for dangerous in dangerous_modules):
-                    result.add_check(
-                        name="Lambda Layer Module Reference Check",
-                        passed=False,
-                        message=f"Lambda layer '{layer_name}' references potentially dangerous module: {module_name}",
-                        severity=IssueSeverity.CRITICAL,
-                        location=f"{self.current_file_path} (layer: {layer_name})",
-                        details={
-                            "layer_name": layer_name,
-                            "module": module_name,
-                            "function": function_name,
-                        },
-                        why=get_pattern_explanation("lambda_layer"),
-                    )
+        module_name = layer_config.get("module")
+        function_name = layer_config.get("function_name")
+        if self._is_lambda_module_reference_dangerous(module_name, function_name):
+            result.add_check(
+                name="Lambda Layer Module Reference Check",
+                passed=False,
+                message=f"Lambda layer '{layer_name}' references potentially dangerous module: {module_name}",
+                severity=IssueSeverity.CRITICAL,
+                location=f"{self.current_file_path} (layer: {layer_name})",
+                details={
+                    "layer_name": layer_name,
+                    "module": module_name,
+                    "function": function_name,
+                },
+                why=get_pattern_explanation("lambda_layer"),
+            )
+
+    @staticmethod
+    def _is_lambda_module_reference_dangerous(module_name: Any, function_name: Any) -> bool:
+        """Return True when Lambda sibling metadata names a risky symbol."""
+        if isinstance(function_name, str) and function_name.strip().lower() in _DANGEROUS_LAMBDA_FUNCTION_NAMES:
+            return True
+        if not isinstance(module_name, str):
+            return False
+
+        module_tokens = {token.strip().lower() for token in re.split(r"[^0-9A-Za-z_]+", module_name) if token.strip()}
+        return bool(module_tokens & _DANGEROUS_LAMBDA_MODULE_TOKENS)
 
     @staticmethod
     def _is_vulnerable_to_cve_2024_3660(version: str) -> bool:
