@@ -21,7 +21,7 @@ def is_pytorch_hub_url(url: str) -> bool:
 def _extract_weight_urls(html: str) -> list[str]:
     """Extract weight file URLs from a PyTorch Hub page."""
     pattern = r"https://download\.pytorch\.org/models/[\w\-_.]+(?:\.pt|\.pth(?:\.tar\.gz|\.zip)?)(?![\w.])"
-    return re.findall(pattern, html)
+    return list(dict.fromkeys(re.findall(pattern, html)))
 
 
 def _get_total_size(urls: list[str]) -> int:
@@ -84,14 +84,17 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None, max_size
     dest_dir = cache_dir or Path(tempfile.mkdtemp(prefix="modelaudit_pth_"))
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    total_size = _get_total_size(weight_urls)
-    if total_size > 0:
-        _enforce_max_size(total_size, max_size)
-        has_space, message = check_disk_space(dest_dir, total_size)
-        if not has_space:
-            if cache_dir is None:
-                shutil.rmtree(dest_dir, ignore_errors=True)
-            raise Exception(f"Cannot download model from {url}: {message}")
+    try:
+        total_size = _get_total_size(weight_urls)
+        if total_size > 0:
+            _enforce_max_size(total_size, max_size)
+            has_space, message = check_disk_space(dest_dir, total_size)
+            if not has_space:
+                raise Exception(f"Cannot download model from {url}: {message}")
+    except Exception:
+        if cache_dir is None:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+        raise
 
     downloaded_size = 0
     for weight_url in weight_urls:
@@ -124,7 +127,11 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None, max_size
     return dest_dir
 
 
-def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -> Iterator[tuple[Path, bool]]:
+def download_pytorch_hub_model_streaming(
+    url: str,
+    show_progress: bool = True,
+    max_size: int | None = None,
+) -> Iterator[tuple[Path, bool]]:
     """
     Download model weights from PyTorch Hub one at a time (streaming mode).
 
@@ -133,6 +140,7 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
     Args:
         url: PyTorch Hub model page URL
         show_progress: Whether to show progress messages
+        max_size: Maximum total download size in bytes
 
     Yields:
         Tuples of (file_path, is_last) for each weight file
@@ -153,11 +161,16 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
     if show_progress:
         click.echo(f"Found {len(weight_urls)} model weight files")
 
+    total_size = _get_total_size(weight_urls)
+    if total_size > 0:
+        _enforce_max_size(total_size, max_size)
+
     # Create temp directory for downloads
     temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_pth_stream_"))
 
     try:
         total_files = len(weight_urls)
+        downloaded_size = 0
         for i, weight_url in enumerate(weight_urls):
             is_last = i == total_files - 1
             filename = weight_url.split("/")[-1]
@@ -169,10 +182,18 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
             try:
                 with requests.get(weight_url, stream=True, timeout=30) as resp:
                     resp.raise_for_status()
+                    content_length = _response_content_length(resp)
+                    if content_length is not None:
+                        _enforce_max_size(downloaded_size + content_length, max_size)
+
                     with open(dest_file, "wb") as f:
                         for chunk in resp.iter_content(chunk_size=8192):
                             if chunk:
+                                _enforce_max_size(downloaded_size + len(chunk), max_size)
                                 f.write(chunk)
+                                downloaded_size += len(chunk)
+            except ValueError:
+                raise
             except Exception as e:
                 raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
 

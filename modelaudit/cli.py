@@ -1358,6 +1358,7 @@ def _resolve_scan_source_for_path(
                 file_generator = download_pytorch_hub_model_streaming(
                     path,
                     show_progress=runtime.show_progress,
+                    max_size=runtime.max_download_bytes,
                 )
                 streaming_result = scan_model_streaming(
                     file_generator=file_generator,

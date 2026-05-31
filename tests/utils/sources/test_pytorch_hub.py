@@ -6,6 +6,7 @@ import pytest
 from modelaudit.utils.sources.pytorch_hub import (
     _extract_weight_urls,
     download_pytorch_hub_model,
+    download_pytorch_hub_model_streaming,
     is_pytorch_hub_url,
 )
 
@@ -87,6 +88,40 @@ def test_download_pytorch_hub_model_rejects_known_total_over_max_size(
     assert not (tmp_path / "resnet50.pth").exists()
 
 
+@patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_cleans_temp_dir_after_preflight_size_rejection(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    mock_mkdtemp: MagicMock,
+    tmp_path: Path,
+) -> None:
+    html_resp = MagicMock()
+    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
+    html_resp.raise_for_status = lambda: None
+    mock_get.return_value = html_resp
+
+    head_resp = MagicMock()
+    head_resp.ok = True
+    head_resp.headers = {"content-length": "4"}
+    mock_head.return_value = head_resp
+
+    temp_dir = tmp_path / "modelaudit_pth_test"
+    mock_mkdtemp.return_value = str(temp_dir)
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            max_size=3,
+        )
+
+    mock_check.assert_not_called()
+    assert not temp_dir.exists()
+
+
 @patch("modelaudit.utils.sources.pytorch_hub.requests.head")
 @patch("modelaudit.utils.sources.pytorch_hub.requests.get")
 def test_download_pytorch_hub_model_enforces_max_size_while_streaming(
@@ -118,6 +153,45 @@ def test_download_pytorch_hub_model_enforces_max_size_while_streaming(
     assert not (tmp_path / "resnet50.pth").exists()
 
 
+@patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_streaming_enforces_max_size_and_cleans_temp_dir(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_mkdtemp: MagicMock,
+    tmp_path: Path,
+) -> None:
+    html_resp = MagicMock()
+    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
+    html_resp.raise_for_status = lambda: None
+    file_resp = MagicMock()
+    file_resp.__enter__.return_value = file_resp
+    file_resp.iter_content.return_value = [b"abc", b"def"]
+    file_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, file_resp]
+
+    head_resp = MagicMock()
+    head_resp.ok = False
+    head_resp.headers = {}
+    mock_head.return_value = head_resp
+
+    temp_dir = tmp_path / "modelaudit_pth_stream_test"
+    temp_dir.mkdir()
+    mock_mkdtemp.return_value = str(temp_dir)
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        list(
+            download_pytorch_hub_model_streaming(
+                "https://pytorch.org/hub/pytorch_vision_resnet/",
+                show_progress=False,
+                max_size=4,
+            )
+        )
+
+    assert not temp_dir.exists()
+
+
 def test_download_pytorch_hub_model_invalid_url():
     with pytest.raises(ValueError):
         download_pytorch_hub_model("https://example.com/model")
@@ -132,3 +206,8 @@ def test_extract_weight_urls_multi_part_extensions():
         "https://download.pytorch.org/models/resnet50.pth.tar.gz",
         "https://download.pytorch.org/models/resnet50.pth.zip",
     ]
+
+
+def test_extract_weight_urls_deduplicates_repeated_links() -> None:
+    url = "https://download.pytorch.org/models/resnet50.pth"
+    assert _extract_weight_urls(f'<a href="{url}">first</a><a href="{url}">second</a>') == [url]

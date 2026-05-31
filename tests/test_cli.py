@@ -1281,6 +1281,34 @@ def test_scan_pytorchhub_url_passes_max_download_bytes(
 
 
 @patch("modelaudit.cli.is_pytorch_hub_url")
+@patch("modelaudit.utils.sources.pytorch_hub.download_pytorch_hub_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_pytorchhub_stream_passes_max_download_bytes(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_ph_url: MagicMock,
+) -> None:
+    mock_is_ph_url.return_value = True
+    mock_scan_streaming.return_value = create_mock_scan_result(
+        bytes_scanned=1,
+        issues=[],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["test"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", "https://pytorch.org/hub/pytorch_vision_resnet/", "--stream", "--max-size", "5KB"],
+    )
+
+    assert result.exit_code == 0
+    assert mock_download_streaming.call_args.kwargs["max_size"] == 5 * 1024
+
+
+@patch("modelaudit.cli.is_pytorch_hub_url")
 @patch("modelaudit.cli.download_pytorch_hub_model")
 def test_scan_pytorchhub_url_download_failure(mock_download, mock_is_ph_url):
     """Test download failure for PyTorch Hub URL."""
