@@ -4,8 +4,12 @@ import os
 from typing import Any, ClassVar
 
 from modelaudit.core_results import mark_operational_scan_error
+from modelaudit.detectors.secrets import SecretsDetector
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.rule_mapper import get_secret_rule_code
+
+MAX_TEXT_SECURITY_SCAN_BYTES = 100 * 1024 * 1024
 
 
 class TextScanner(BaseScanner):
@@ -73,6 +77,136 @@ class TextScanner(BaseScanner):
         )
         result.finish(success=False)
         return result
+
+    @staticmethod
+    def _finish_content_read_failure(result: ScanResult, path: str, error: OSError) -> ScanResult:
+        mark_inconclusive_scan_result(result, "text_content_read_failed")
+        mark_operational_scan_error(result, "text_content_read_failed")
+        result.add_check(
+            name="Text File Content Read",
+            passed=False,
+            message=f"Unable to inspect text file content: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "text_content_read_failed",
+            },
+        )
+        result.finish(success=False)
+        return result
+
+    @staticmethod
+    def _mark_security_detector_failure(
+        result: ScanResult,
+        path: str,
+        detector_name: str,
+        error: Exception,
+    ) -> None:
+        reason = f"text_{detector_name}_detector_failed"
+        mark_inconclusive_scan_result(result, reason)
+        mark_operational_scan_error(result, reason)
+        result.add_check(
+            name="Text Security Detector Coverage",
+            passed=False,
+            message=f"Unable to inspect text file with {detector_name} detector: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "detector": detector_name,
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+        )
+
+    @staticmethod
+    def _mark_security_scan_size_limit(result: ScanResult, path: str, file_size: int) -> None:
+        reason = "text_security_scan_size_limit_exceeded"
+        mark_inconclusive_scan_result(result, reason)
+        mark_operational_scan_error(result, reason)
+        result.add_check(
+            name="Text Security Content Scan",
+            passed=False,
+            message=(
+                "Text file content security analysis skipped because the file exceeds "
+                f"{MAX_TEXT_SECURITY_SCAN_BYTES // (1024 * 1024)}MB"
+            ),
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "file_size": file_size,
+                "max_security_scan_bytes": MAX_TEXT_SECURITY_SCAN_BYTES,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+        )
+
+    def _add_embedded_secret_findings(
+        self,
+        findings: list[dict[str, Any]],
+        result: ScanResult,
+        context: str,
+    ) -> int:
+        for finding in findings:
+            severity_map = {
+                "CRITICAL": IssueSeverity.CRITICAL,
+                "WARNING": IssueSeverity.WARNING,
+                "INFO": IssueSeverity.INFO,
+            }
+            severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+            secret_descriptor = str(
+                finding.get("secret_type") or finding.get("type") or finding.get("message") or "embedded_secret"
+            )
+            result.add_check(
+                name="Embedded Secrets Detection",
+                passed=False,
+                message=finding.get("message", "Secret detected"),
+                rule_code=get_secret_rule_code(secret_descriptor),
+                severity=severity,
+                location=finding.get("context", context),
+                details=finding,
+                why=finding.get("recommendation", "Remove sensitive data from model"),
+            )
+
+        if not findings and context:
+            result.add_check(
+                name="Embedded Secrets Detection",
+                passed=True,
+                message="No embedded secrets detected",
+                location=context,
+            )
+
+        return len(findings)
+
+    def _run_text_security_detectors(self, content: bytes, result: ScanResult, path: str) -> bool:
+        analysis_complete = True
+
+        if self.config.get("check_secrets", True):
+            try:
+                text = content.decode("utf-8", errors="replace")
+                secret_findings = SecretsDetector(self.config.get("secrets_config")).scan_text(text, path)
+                self._add_embedded_secret_findings(secret_findings, result, path)
+            except Exception as e:
+                self._mark_security_detector_failure(result, path, "secrets", e)
+                analysis_complete = False
+
+        if self.config.get("check_network_comm", True):
+            try:
+                network_findings = self.collect_network_communication_findings(
+                    content,
+                    context=path,
+                    raise_on_error=True,
+                )
+                self.add_network_communication_findings(network_findings, result, context=path)
+            except Exception as e:
+                self._mark_security_detector_failure(result, path, "network", e)
+                analysis_complete = False
+
+        return analysis_complete
 
     def scan(self, path: str) -> ScanResult:
         """Scan a text file for security issues."""
@@ -172,7 +306,18 @@ class TextScanner(BaseScanner):
                 )
 
             result.bytes_scanned = file_size
-            result.finish(success=True)
+            if file_size > MAX_TEXT_SECURITY_SCAN_BYTES:
+                self._mark_security_scan_size_limit(result, path, file_size)
+                result.finish(success=False)
+            else:
+                try:
+                    with open(path, "rb") as text_file:
+                        content = text_file.read()
+                except OSError as e:
+                    return self._finish_content_read_failure(result, path, e)
+
+                analysis_complete = self._run_text_security_detectors(content, result, path)
+                result.finish(success=analysis_complete and not result.has_errors)
 
         except OSError as e:
             self._finish_metadata_read_failure(result, path, e)

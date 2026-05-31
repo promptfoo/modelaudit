@@ -1,12 +1,14 @@
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
-from modelaudit.scanners.text_scanner import TextScanner
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.text_scanner import MAX_TEXT_SECURITY_SCAN_BYTES, TextScanner
 from modelaudit.utils.helpers import cache_decorator
 
 
@@ -18,6 +20,135 @@ def test_text_scanner_handles_routable_vocabulary_file(tmp_path: Path) -> None:
 
     assert result.success is True
     assert not result.issues
+    assert any(
+        check.name == "Embedded Secrets Detection" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+    assert any(
+        check.name == "Network Communication Detection" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+
+
+def test_text_scanner_detects_secret_and_network_indicators(tmp_path: Path) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text(
+        "\n".join(
+            [
+                "token",
+                "client_secret = Z9Y8X7W6V5U4T3S2R1Q0P9O8",
+                "callback = https://evil.example/callback",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    direct = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Client Secret"
+        for check in direct.checks
+    )
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("type") == "url_detected"
+        for check in direct.checks
+    )
+    assert direct.success is False
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_ignores_benign_secret_and_network_near_matches(tmp_path: Path) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text(
+        "\n".join(
+            [
+                "token",
+                "literal token prefix client_secret is intentionally missing a value",
+                "callback host is written as hxxps colon slash slash example dot invalid slash callback",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is True
+    assert not result.issues
+    assert all(
+        check.status == CheckStatus.PASSED
+        for check in result.checks
+        if check.name in {"Embedded Secrets Detection", "Network Communication Detection"}
+    )
+
+
+def test_text_network_detector_failure_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text("token\n", encoding="utf-8")
+
+    def raise_network_error(
+        self: NetworkCommDetector,
+        data: bytes,
+        context: str = "",
+    ) -> list[dict[str, Any]]:
+        raise RuntimeError("simulated network detector failure")
+
+    monkeypatch.setattr(NetworkCommDetector, "scan", raise_network_error)
+
+    direct = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert direct.success is False
+    assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata.get("operational_error_reason") == "text_network_detector_failed"
+    assert "text_network_detector_failed" in direct.metadata.get("scan_outcome_reasons", [])
+    assert any(
+        check.name == "Text Security Detector Coverage"
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("analysis_incomplete") is True
+        and check.details.get("scan_outcome_reason") == "text_network_detector_failed"
+        for check in direct.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+    assert aggregate.file_metadata[str(text_path)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_text_security_size_limit_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text("token\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        TextScanner,
+        "_get_file_size",
+        staticmethod(lambda _path: MAX_TEXT_SECURITY_SCAN_BYTES + 1),
+    )
+
+    direct = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert direct.success is False
+    assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata.get("operational_error_reason") == "text_security_scan_size_limit_exceeded"
+    assert "text_security_scan_size_limit_exceeded" in direct.metadata.get("scan_outcome_reasons", [])
+    assert any(
+        check.name == "Text Security Content Scan"
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("analysis_incomplete") is True
+        and check.details.get("scan_outcome_reason") == "text_security_scan_size_limit_exceeded"
+        for check in direct.checks
+    )
+    assert aggregate.file_metadata[str(text_path)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_text_metadata_read_failure_is_inconclusive_not_security_finding(
