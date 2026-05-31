@@ -1767,6 +1767,14 @@ class TestJITScriptDetector:
 
         assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
 
+    def test_scan_model_detects_alias_to_builtins_module(self) -> None:
+        detector = JITScriptDetector()
+        data = b"\x00\xffdef payload(value):\n    import builtins as b\n    module = b\n    return module.eval(value)\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
     def test_scan_model_preserves_builtin_alias_across_dead_rebind_branch(self) -> None:
         detector = JITScriptDetector()
         data = b"\x00\xffdef payload():\n    sink = eval\n    if False:\n        sink = len\n    return sink('1+1')\n"
@@ -1774,6 +1782,30 @@ class TestJITScriptDetector:
         findings = detector.scan_model(data, "pytorch", "payload.bin")
 
         assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            (b"\x00\xffdef benign():\n    import builtins as b\n    b = object()\n    return b.eval('1')\n"),
+            b"\x00\xffdef benign(builtins):\n    return builtins.eval('1')\n",
+            (
+                b"\x00\xffdef benign(condition):\n"
+                b"    sink = eval\n"
+                b"    if condition:\n"
+                b"        sink = len\n"
+                b"    else:\n"
+                b"        sink = str\n"
+                b"    return sink('1')\n"
+            ),
+        ],
+    )
+    def test_scan_model_does_not_retain_shadowed_builtin_aliases(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+        assert not any(finding.severity == "CRITICAL" for finding in findings)
 
     @pytest.mark.parametrize(
         "data",

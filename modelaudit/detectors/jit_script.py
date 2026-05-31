@@ -1781,10 +1781,18 @@ class JITScriptDetector:
                         return scope[name]
                 return name if name in dangerous_builtins else None
 
+            def _is_builtins_module_name(self, name: str) -> bool:
+                for scope, module_aliases in zip(
+                    reversed(self.alias_scopes),
+                    reversed(self.builtins_module_aliases),
+                    strict=True,
+                ):
+                    if name in scope:
+                        return name in module_aliases
+                return name == "builtins"
+
             def _is_builtins_module(self, node: ast.AST) -> bool:
-                return isinstance(node, ast.Name) and (
-                    node.id == "builtins" or any(node.id in scope for scope in reversed(self.builtins_module_aliases))
-                )
+                return isinstance(node, ast.Name) and self._is_builtins_module_name(node.id)
 
             def _resolve_builtin(self, node: ast.AST) -> str | None:
                 if isinstance(node, ast.Name):
@@ -1797,9 +1805,16 @@ class JITScriptDetector:
                     return node.attr
                 return None
 
-            def _bind_target(self, target: ast.AST, builtin: str | None) -> None:
+            def _bind_name(self, name: str, builtin: str | None, *, builtins_module: bool = False) -> None:
+                self.alias_scopes[-1][name] = builtin
+                if builtins_module:
+                    self.builtins_module_aliases[-1].add(name)
+                else:
+                    self.builtins_module_aliases[-1].discard(name)
+
+            def _bind_target(self, target: ast.AST, builtin: str | None, *, builtins_module: bool = False) -> None:
                 if isinstance(target, ast.Name):
-                    self.alias_scopes[-1][target.id] = builtin
+                    self._bind_name(target.id, builtin, builtins_module=builtins_module)
                 elif isinstance(target, (ast.Tuple, ast.List)):
                     for element in target.elts:
                         self._bind_target(element, None)
@@ -1828,37 +1843,52 @@ class JITScriptDetector:
                 for index, scope in enumerate(merged):
                     names = set(scope) | set(body_scopes[index]) | set(orelse_scopes[index])
                     for name in names:
-                        candidates = [body_scopes[index].get(name), orelse_scopes[index].get(name), scope.get(name)]
+                        candidates = [
+                            body_scopes[index].get(name, scope.get(name)),
+                            orelse_scopes[index].get(name, scope.get(name)),
+                        ]
                         scope[name] = next((candidate for candidate in candidates if candidate is not None), None)
                 return merged
+
+            @staticmethod
+            def _merge_branch_builtins_module_aliases(
+                body_aliases: list[set[str]],
+                orelse_aliases: list[set[str]],
+            ) -> list[set[str]]:
+                return [
+                    body_scope | orelse_scope
+                    for body_scope, orelse_scope in zip(body_aliases, orelse_aliases, strict=True)
+                ]
 
             def visit_Import(self, node: ast.Import) -> None:
                 for alias in node.names:
                     local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
-                    if alias.name == "builtins":
-                        self.builtins_module_aliases[-1].add(local_name)
-                    elif local_name in self.alias_scopes[-1]:
-                        self.alias_scopes[-1][local_name] = None
+                    self._bind_name(local_name, None, builtins_module=alias.name == "builtins")
 
             def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
                 if node.module == "builtins":
                     for alias in node.names:
                         local_name = alias.asname or alias.name
-                        self.alias_scopes[-1][local_name] = alias.name if alias.name in dangerous_builtins else None
+                        self._bind_name(local_name, alias.name if alias.name in dangerous_builtins else None)
                 else:
                     for alias in node.names:
-                        self.alias_scopes[-1][alias.asname or alias.name] = None
+                        self._bind_name(alias.asname or alias.name, None)
 
             def visit_Assign(self, node: ast.Assign) -> None:
                 self.visit(node.value)
                 builtin = self._resolve_builtin(node.value)
+                builtins_module = self._is_builtins_module(node.value)
                 for target in node.targets:
-                    self._bind_target(target, builtin)
+                    self._bind_target(target, builtin, builtins_module=builtins_module)
 
             def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
                 if node.value is not None:
                     self.visit(node.value)
-                    self._bind_target(node.target, self._resolve_builtin(node.value))
+                    self._bind_target(
+                        node.target,
+                        self._resolve_builtin(node.value),
+                        builtins_module=self._is_builtins_module(node.value),
+                    )
                 else:
                     self._bind_target(node.target, None)
 
@@ -1868,10 +1898,14 @@ class JITScriptDetector:
 
             def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
                 self.visit(node.value)
-                self._bind_target(node.target, self._resolve_builtin(node.value))
+                self._bind_target(
+                    node.target,
+                    self._resolve_builtin(node.value),
+                    builtins_module=self._is_builtins_module(node.value),
+                )
 
             def _visit_function_node(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-                self.alias_scopes[-1][node.name] = None
+                self._bind_name(node.name, None)
                 for decorator in node.decorator_list:
                     self.visit(decorator)
                 for default in [*node.args.defaults, *node.args.kw_defaults]:
@@ -1889,7 +1923,7 @@ class JITScriptDetector:
                 self._visit_function_node(node)
 
             def visit_ClassDef(self, node: ast.ClassDef) -> None:
-                self.alias_scopes[-1][node.name] = None
+                self._bind_name(node.name, None)
                 for base in node.bases:
                     self.visit(base)
                 for keyword in node.keywords:
@@ -1931,12 +1965,10 @@ class JITScriptDetector:
                 orelse_builtins_aliases = self._copy_builtins_module_aliases(self.builtins_module_aliases)
 
                 self.alias_scopes = self._merge_branch_aliases(original_scopes, body_scopes, orelse_scopes)
-                self.builtins_module_aliases = [
-                    body_aliases | orelse_aliases | original_aliases
-                    for body_aliases, orelse_aliases, original_aliases in zip(
-                        body_builtins_aliases, orelse_builtins_aliases, original_builtins_aliases, strict=True
-                    )
-                ]
+                self.builtins_module_aliases = self._merge_branch_builtins_module_aliases(
+                    body_builtins_aliases,
+                    orelse_builtins_aliases,
+                )
 
             def visit_Call(self, node: ast.Call) -> None:
                 if builtin := self._resolve_builtin(node.func):
