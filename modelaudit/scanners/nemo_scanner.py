@@ -160,7 +160,7 @@ _SUSPICIOUS_TARGET_PATTERNS = (
     "vars",
 )
 _TARGET_TOKEN_RE = re.compile(r"__import__|[A-Z]+(?=[A-Z][a-z0-9]|[0-9_]|$)|[A-Z]?[a-z0-9]+")
-_HYDRA_INTERPOLATION_RE = re.compile(r"\$\{")
+_UNESCAPED_HYDRA_INTERPOLATION_RE = re.compile(r"(?<!\\)(?:\\\\)*\$\{")
 
 CVE_2025_23304_ID = "CVE-2025-23304"
 CVE_2025_23304_CVSS = 7.6
@@ -2164,7 +2164,7 @@ class NemoScanner(BaseScanner):
         target_config: dict[str, Any] | None = None,
     ) -> None:
         """Evaluate a single _target_ value for dangerous patterns."""
-        if _HYDRA_INTERPOLATION_RE.search(target):
+        if _UNESCAPED_HYDRA_INTERPOLATION_RE.search(target):
             self._add_interpolated_target_check(target, config_path, config_name, archive_path, result)
             return
 

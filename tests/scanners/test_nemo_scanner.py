@@ -3470,6 +3470,7 @@ class TestCVE202523304HydraTarget:
                 "model": {"_target_": "numpy.${oc.select:leaf,{}}", "file": "payload.npy", "allow_pickle": True},
             },
             {"safe_target": "nemo.Model", "model": {"_target_": "${safe_target}"}},
+            {"safe_target": "nemo.Model", "model": {"_target_": r"\\${safe_target}"}},
         ],
     )
     def test_interpolated_target_fails_closed(self, tmp_path: Path, config: dict[str, Any]) -> None:
@@ -3518,6 +3519,23 @@ class TestCVE202523304HydraTarget:
             check.name == "Hydra _target_ Safety Check"
             and check.status == CheckStatus.PASSED
             and check.details.get("target") == "nemo.Model"
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize("target", [r"\${safe_target}", r"prefix\\\${safe_target}"])
+    def test_escaped_interpolation_like_target_remains_review_only(self, tmp_path: Path, target: str) -> None:
+        """Odd-backslash OmegaConf escapes are literals rather than dynamic callable selectors."""
+        config = {"safe_target": "nemo.Model", "model": {"_target_": target}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name == "CVE-2025-23304: Interpolated Hydra _target_" for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Review"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.INFO
+            and check.details.get("target") == target
             for check in result.checks
         )
 
