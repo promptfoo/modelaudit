@@ -5523,8 +5523,7 @@ impl<'a> ScanState<'a> {
             return;
         };
         let remaining_bytes = self.payload.len().saturating_sub(opcode.next);
-        let oversized_threshold = remaining_bytes.saturating_add(remaining_bytes / 2);
-        if *frame_len <= oversized_threshold {
+        if *frame_len <= remaining_bytes {
             return;
         }
 
@@ -7665,6 +7664,44 @@ mod tests {
             detail_usize(&finding.details, "frame_length"),
             Some(usize::MAX - 1)
         );
+        assert_eq!(detail_usize(&finding.details, "remaining_bytes"), Some(2));
+        assert_eq!(scan.status, ScanStatus::Complete);
+        assert_eq!(scan.verdict, "suspicious");
+    }
+
+    #[test]
+    fn slightly_oversized_frame_lengths_emit_structural_tamper_finding() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04\x95\x03\x00\x00\x00\x00\x00\x00\x00}.";
+        let mut scan = ScanState::new(
+            "slightly-oversized-frame.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let finding = scan
+            .findings
+            .iter()
+            .find(|finding| finding.rule_code == Some("STRUCTURAL_TAMPER"))
+            .expect("slightly oversized FRAME finding");
+        assert_eq!(
+            detail_string(&finding.details, "tamper_type").as_deref(),
+            Some("oversized_frame")
+        );
+        assert_eq!(detail_usize(&finding.details, "frame_length"), Some(3));
         assert_eq!(detail_usize(&finding.details, "remaining_bytes"), Some(2));
         assert_eq!(scan.status, ScanStatus::Complete);
         assert_eq!(scan.verdict, "suspicious");
