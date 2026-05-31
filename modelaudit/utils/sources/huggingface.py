@@ -3,6 +3,7 @@
 import logging
 import os
 from collections.abc import Iterator
+from glob import escape as escape_glob
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,29 @@ def _build_extension_allow_patterns() -> list[str]:
     return sorted(patterns)
 
 
+def _build_literal_allow_patterns(filenames: list[str]) -> list[str]:
+    """Escape repository filenames before passing them to the Hub glob filter."""
+    return [escape_glob(filename) for filename in filenames]
+
+
+def _extract_huggingface_repo_files(repo_info: Any) -> list[str] | None:
+    """Extract repository filenames from a Hugging Face repository response."""
+    siblings = getattr(repo_info, "siblings", None)
+    if siblings is None:
+        return None
+
+    files: list[str] = []
+    for sibling in siblings:
+        if isinstance(sibling, dict):
+            file_name = sibling.get("rfilename") or sibling.get("path")
+        else:
+            file_name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
+
+        if isinstance(file_name, str) and file_name:
+            files.append(file_name)
+    return files
+
+
 def _get_hf_cache_root() -> Path:
     """Return the HuggingFace hub cache root."""
     try:
@@ -101,24 +125,35 @@ def _list_repo_files_with_timeout(repo_id: str, timeout_seconds: float = 30) -> 
     except Exception as exc:
         return None, str(exc)
 
-    siblings = getattr(repo_info, "siblings", None)
-    if siblings is None:
+    files = _extract_huggingface_repo_files(repo_info)
+    if files is None:
         return None, "repository listing unavailable"
-
-    files: list[str] = []
-    for sibling in siblings:
-        if isinstance(sibling, dict):
-            file_name = sibling.get("rfilename") or sibling.get("path")
-        else:
-            file_name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
-
-        if isinstance(file_name, str) and file_name:
-            files.append(file_name)
 
     return files, None
 
 
-def _get_huggingface_path_sizes(repo_id: str, filenames: list[str]) -> tuple[dict[str, int | None], str]:
+def _list_huggingface_repo_files_at_revision(repo_id: str, timeout_seconds: float = 30) -> tuple[list[str], str]:
+    """Return repository filenames and the revision that produced the listing."""
+    from huggingface_hub import HfApi
+
+    repo_info = HfApi().repo_info(repo_id, timeout=timeout_seconds, files_metadata=False)
+    raw_revision = getattr(repo_info, "sha", None)
+    if not isinstance(raw_revision, str) or not raw_revision:
+        raise Exception(f"Cannot enforce max-size for {repo_id}: repository revision unavailable")
+
+    files = _extract_huggingface_repo_files(repo_info)
+    if files is None:
+        raise Exception(f"Cannot enforce max-size for {repo_id}: repository listing unavailable")
+    return files, raw_revision
+
+
+def _get_huggingface_path_sizes(
+    repo_id: str,
+    filenames: list[str],
+    *,
+    requested_revision: str | None = None,
+    resolved_revision: str | None = None,
+) -> tuple[dict[str, int | None], str]:
     """Return exact Hugging Face sizes for selected files and the checked revision."""
     if not filenames:
         return {}, ""
@@ -126,12 +161,17 @@ def _get_huggingface_path_sizes(repo_id: str, filenames: list[str]) -> tuple[dic
     from huggingface_hub import HfApi
 
     api = HfApi()
-    repo_info = api.repo_info(repo_id, files_metadata=False)
-    raw_revision = getattr(repo_info, "sha", None)
-    if not isinstance(raw_revision, str) or not raw_revision:
-        raise Exception(f"Cannot enforce max-size for {repo_id}: repository revision unavailable")
+    if resolved_revision is None:
+        repo_info_kwargs: dict[str, Any] = {"files_metadata": False}
+        if requested_revision is not None:
+            repo_info_kwargs["revision"] = requested_revision
+        repo_info = api.repo_info(repo_id, **repo_info_kwargs)
+        raw_revision = getattr(repo_info, "sha", None)
+        if not isinstance(raw_revision, str) or not raw_revision:
+            raise Exception(f"Cannot enforce max-size for {repo_id}: repository revision unavailable")
+        resolved_revision = raw_revision
 
-    path_info = api.get_paths_info(repo_id, filenames, revision=raw_revision)
+    path_info = api.get_paths_info(repo_id, filenames, revision=resolved_revision)
     sizes: dict[str, int | None] = {}
     for item in path_info:
         path = getattr(item, "path", None)
@@ -139,19 +179,27 @@ def _get_huggingface_path_sizes(repo_id: str, filenames: list[str]) -> tuple[dic
             continue
         raw_size = getattr(item, "size", None)
         sizes[path] = raw_size if isinstance(raw_size, int) and raw_size >= 0 else None
-    return sizes, raw_revision
+    return sizes, resolved_revision
 
 
 def _ensure_huggingface_selection_within_max_size(
     repo_id: str,
     filenames: list[str],
     max_size: int | None,
+    *,
+    requested_revision: str | None = None,
+    resolved_revision: str | None = None,
 ) -> str | None:
     """Fail before transfer when selected Hugging Face files exceed the download budget."""
     if max_size is None or not filenames:
         return None
 
-    sizes, revision = _get_huggingface_path_sizes(repo_id, filenames)
+    sizes, revision = _get_huggingface_path_sizes(
+        repo_id,
+        filenames,
+        requested_revision=requested_revision,
+        resolved_revision=resolved_revision,
+    )
     total_size = 0
     for filename in filenames:
         size = sizes.get(filename)
@@ -323,14 +371,24 @@ def download_model(
             # Force progress bar to show even in non-TTY environments
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
-        # List files in the repository to identify model files
-        repo_files, repo_listing_error = _list_repo_files_with_timeout(repo_id)
-        if repo_files is None:
-            repo_listing_failed = True
-            logger.debug("Hugging Face repo listing failed for %s: %s", repo_id, repo_listing_error)
-            repo_files = []
-        else:
+        # Resolve capped listings and transfers against one immutable revision.
+        budget_revision = None
+        if max_size is not None:
+            try:
+                repo_files, budget_revision = _list_huggingface_repo_files_at_revision(repo_id)
+            except Exception as exc:
+                raise Exception(f"Cannot enforce max-size for {repo_id}: repository listing failed: {exc}") from exc
             repo_listing_failed = False
+            repo_listing_error = None
+        else:
+            listed_repo_files, repo_listing_error = _list_repo_files_with_timeout(repo_id)
+            if listed_repo_files is None:
+                repo_listing_failed = True
+                logger.debug("Hugging Face repo listing failed for %s: %s", repo_id, repo_listing_error)
+                repo_files = []
+            else:
+                repo_listing_failed = False
+                repo_files = listed_repo_files
 
         # Find model files in the repository (using centralized model extensions)
         model_extensions = _get_model_extensions()
@@ -355,8 +413,13 @@ def download_model(
 
         # If we found specific model files, download them
         if model_files:
-            revision = _ensure_huggingface_selection_within_max_size(repo_id, model_files, max_size)
-            download_kwargs["allow_patterns"] = model_files
+            revision = _ensure_huggingface_selection_within_max_size(
+                repo_id,
+                model_files,
+                max_size,
+                resolved_revision=budget_revision,
+            )
+            download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
             if revision is not None:
                 download_kwargs["revision"] = revision
         elif repo_listing_failed:
@@ -371,9 +434,17 @@ def download_model(
                 )
             download_kwargs["allow_patterns"] = extension_allow_patterns
         else:
-            revision = _ensure_huggingface_selection_within_max_size(repo_id, repo_files, max_size)
+            if max_size is not None and not repo_files:
+                raise Exception(f"Cannot download {repo_id}: repository contains no files")
+            revision = _ensure_huggingface_selection_within_max_size(
+                repo_id,
+                repo_files,
+                max_size,
+                resolved_revision=budget_revision,
+            )
             if revision is not None:
                 download_kwargs["revision"] = revision
+                download_kwargs["allow_patterns"] = _build_literal_allow_patterns(repo_files)
 
         if "allow_patterns" in download_kwargs:
             local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
@@ -465,12 +536,20 @@ def download_model_streaming(
             enable_progress_bars()
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
-        # List files with timeout without leaking a blocking worker thread.
-        repo_files, repo_listing_error = _list_repo_files_with_timeout(repo_id)
-        if repo_files is None:
-            if repo_listing_error and repo_listing_error.startswith("timed out after"):
-                raise Exception(f"Timeout listing files in repository {repo_id}")
-            raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
+        # Resolve capped listings and transfers against one immutable revision.
+        budget_revision = None
+        if max_size is not None:
+            try:
+                repo_files, budget_revision = _list_huggingface_repo_files_at_revision(repo_id)
+            except Exception as exc:
+                raise Exception(f"Cannot enforce max-size for {repo_id}: repository listing failed: {exc}") from exc
+        else:
+            listed_repo_files, repo_listing_error = _list_repo_files_with_timeout(repo_id)
+            if listed_repo_files is None:
+                if repo_listing_error and repo_listing_error.startswith("timed out after"):
+                    raise Exception(f"Timeout listing files in repository {repo_id}")
+                raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
+            repo_files = listed_repo_files
 
         # Filter for model files
         model_extensions = _get_model_extensions()
@@ -480,7 +559,12 @@ def download_model_streaming(
             # Fallback: download all files if no recognized extensions found
             # This maintains parity with download_model() behavior
             model_files = repo_files
-        revision = _ensure_huggingface_selection_within_max_size(repo_id, model_files, max_size)
+        revision = _ensure_huggingface_selection_within_max_size(
+            repo_id,
+            model_files,
+            max_size,
+            resolved_revision=budget_revision,
+        )
 
         # Setup cache directory
         download_path = None
@@ -517,12 +601,13 @@ def download_model_streaming(
         ) from e
 
 
-def download_file_from_hf(url: str, cache_dir: Path | None = None) -> Path:
+def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int | None = None) -> Path:
     """Download a single file from HuggingFace using direct file URL.
 
     Args:
         url: Direct HuggingFace file URL (e.g., https://huggingface.co/user/repo/resolve/main/file.bin)
         cache_dir: Optional cache directory for downloads
+        max_size: Optional maximum download size in bytes
 
     Returns:
         Path to the downloaded file
@@ -543,11 +628,17 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None) -> Path:
     display_url = redact_huggingface_url_for_display(url)
 
     try:
+        resolved_revision = _ensure_huggingface_selection_within_max_size(
+            repo_id,
+            [filename],
+            max_size,
+            requested_revision=branch,
+        )
         # Use hf_hub_download for single file downloads
         local_path = hf_hub_download(
             repo_id=repo_id,
             filename=filename,
-            revision=branch,
+            revision=resolved_revision or branch,
             cache_dir=str(cache_dir) if cache_dir else None,
         )
         return Path(local_path)

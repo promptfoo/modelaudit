@@ -1027,6 +1027,39 @@ def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
 
 
 @patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_file_passes_max_size_to_download(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download_file: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Direct HuggingFace file downloads should receive the parsed acquisition budget."""
+    downloaded_file = tmp_path / "model.bin"
+    downloaded_file.write_bytes(b"weights")
+    mock_download_file.return_value = downloaded_file
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "--quiet",
+            "--no-cache",
+            "--max-size",
+            "2KB",
+            "https://huggingface.co/test/model/resolve/main/model.bin",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert mock_download_file.call_args.kwargs["max_size"] == 2048
+    mock_rmtree.assert_called()
+
+
+@patch("modelaudit.cli.download_file_from_hf")
 def test_scan_huggingface_file_download_failure_redacts_url(mock_download_file):
     """Redact direct-file URL secrets from CLI download failures."""
     mock_download_file.side_effect = Exception(
