@@ -237,19 +237,51 @@ def test_keras_h5_scanner_detects_cve_2026_1669_external_storage(tmp_path: Path)
     ]
 
 
-def test_keras_h5_scanner_skips_cve_2026_1669_on_fixed_version(tmp_path: Path) -> None:
-    """Fixed Keras versions should not emit warning-level CVE-2026-1669 findings."""
+def test_keras_h5_scanner_warns_on_fixed_metadata_external_reference(tmp_path: Path) -> None:
+    """Model-supplied fixed versions cannot suppress structural external references."""
     model_path = create_h5_with_external_link(tmp_path, keras_version="3.13.2")
 
     scanner = KerasH5Scanner()
     result = scanner.scan(str(model_path))
 
-    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
-    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
-    assert any(
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].severity == IssueSeverity.WARNING
+    assert cve_issues[0].details["keras_version"] == "3.13.2"
+    assert cve_issues[0].details["metadata_only_assessment"] is True
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/model_weights/linked_kernel",
+            "filename": "external_source.h5",
+            "path": "/payload",
+        },
+    ]
+    assert not any(
         check.name == "HDF5 External Weight Reference Version Check" and check.status == CheckStatus.PASSED
         for check in result.checks
     )
+
+
+def test_keras_h5_scanner_fixed_metadata_without_external_refs_stays_quiet(tmp_path: Path) -> None:
+    """Fixed-looking metadata alone should not produce external-reference noise."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "sequential",
+                "layers": [{"class_name": "Dense", "config": {"units": 1}}],
+            },
+        },
+        keras_version="3.13.2",
+        file_name="fixed_no_external_refs.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(check.name.startswith("HDF5 External Weight Reference") for check in result.checks)
 
 
 @pytest.mark.parametrize("keras_version", ["3.13.x", "2.12.0-gpu"])

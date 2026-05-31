@@ -505,15 +505,20 @@ class KerasH5Scanner(BaseScanner):
             return
 
         if vuln_status is False and isinstance(keras_version, str):
+            details["keras_version"] = keras_version
+            details["metadata_only_assessment"] = True
             result.add_check(
-                name="HDF5 External Weight Reference Version Check",
-                passed=True,
+                name="HDF5 External Weight Reference Metadata Check",
+                passed=False,
                 message=(
-                    f"HDF5 external references detected in weights, but Keras {keras_version} is outside the known "
-                    "CVE-2026-1669 vulnerable ranges"
+                    f"HDF5 external references detected in weights and model metadata reports Keras {keras_version} "
+                    "outside the known CVE-2026-1669 vulnerable ranges, but model-supplied metadata cannot verify "
+                    "runtime loader safety"
                 ),
+                severity=IssueSeverity.WARNING,
                 location=location,
-                details={"keras_version": keras_version, "external_references": findings},
+                details=details,
+                why=get_cve_2026_1669_explanation("hdf5_external_reference"),
             )
             return
 
