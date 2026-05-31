@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
-from importlib.machinery import EXTENSION_SUFFIXES, ModuleSpec, PathFinder
+from importlib.machinery import EXTENSION_SUFFIXES, FrozenImporter, ModuleSpec
 from pathlib import Path
 from typing import Any, Protocol, TypeVar, cast
 
@@ -1029,20 +1029,24 @@ def _find_module_spec_without_imports(module_name: str) -> ModuleSpec | None:
     if not parts or any(not part or "/" in part or "\\" in part for part in parts):
         return None
 
-    search_path: list[str] | None = None
-    spec: ModuleSpec | None = None
-    for index in range(len(parts)):
-        qualified_name = ".".join(parts[: index + 1])
-        spec = PathFinder.find_spec(qualified_name, search_path)
-        if spec is None:
-            return None
-        if index == len(parts) - 1:
-            return spec
-        locations = spec.submodule_search_locations
-        if locations is None:
-            return None
-        search_path = list(locations)
-    return spec
+    frozen_spec = FrozenImporter.find_spec(module_name)
+    if frozen_spec is not None:
+        return frozen_spec
+
+    for entry in sys.path:
+        current = Path(entry or os.getcwd())
+        for index, part in enumerate(parts):
+            if index == len(parts) - 1:
+                for suffix in EXTENSION_SUFFIXES:
+                    for candidate in (current / f"{part}{suffix}", current / part / f"__init__{suffix}"):
+                        if candidate.is_file():
+                            return ModuleSpec(module_name, loader=None, origin=str(candidate))
+                break
+
+            current /= part
+            if not current.is_dir():
+                break
+    return None
 
 
 @_register_source_sensitive_cache

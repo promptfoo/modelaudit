@@ -13,7 +13,7 @@ import sys
 import threading
 import zipfile
 from contextvars import copy_context
-from importlib.machinery import ModuleSpec
+from importlib.machinery import EXTENSION_SUFFIXES, ModuleSpec
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
@@ -2085,6 +2085,60 @@ def test_scan_bytes_analyzes_stdlib_source_modules_without_custom_meta_path_find
     assert not marker.exists()
 
 
+def test_scan_bytes_keeps_frozen_stdlib_globals_clean_without_custom_meta_path_finders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "_frozen_importlib"
+    marker = tmp_path / "meta_path_called"
+
+    class CustomMetaPathFinder:
+        @staticmethod
+        def find_spec(
+            fullname: str,
+            path: object | None = None,
+            target: object | None = None,
+        ) -> ModuleSpec | None:
+            del path, target
+            if fullname == module_name:
+                marker.write_text(fullname, encoding="utf-8")
+                return ModuleSpec(fullname, loader=None, origin="custom://module")
+            return None
+
+    monkeypatch.setattr(sys, "meta_path", [CustomMetaPathFinder(), *sys.meta_path])
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            pickle.dumps(importlib.machinery.ModuleSpec("x", None), protocol=4),
+            source="frozen-stdlib-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not _has_call_graph_source_unavailable_notice(report, module_name, "ModuleSpec", "source_unavailable")
+    assert not marker.exists()
+
+
+def test_call_graph_keeps_path_extension_modules_analyzable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_extension_module_probe"
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    (module_dir / f"{module_name}{EXTENSION_SUFFIXES[0]}").write_bytes(b"not imported")
+    monkeypatch.syspath_prepend(str(module_dir))
+    _clear_call_graph_caches()
+
+    try:
+        assert call_graph._call_graph_source_unavailable_reason(module_name) is None
+    finally:
+        _clear_call_graph_caches()
+
+
 def test_scan_bytes_marks_custom_meta_path_specs_as_unanalyzable_without_invoking_finder(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2112,6 +2166,41 @@ def test_scan_bytes_marks_custom_meta_path_specs_as_unanalyzable_without_invokin
         report = scan_bytes(
             _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
             source="meta-path-spec-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+    assert not marker.exists()
+
+
+def test_scan_bytes_marks_custom_path_entry_specs_as_unanalyzable_without_invoking_finder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_path_entry_spec_probe"
+    marker = tmp_path / "path_entry_finder_called"
+    path_entry = str(tmp_path / "custom-path-entry")
+
+    class CustomPathEntryFinder:
+        @staticmethod
+        def find_spec(fullname: str, target: object | None = None) -> ModuleSpec | None:
+            del target
+            if fullname == module_name:
+                marker.write_text(fullname, encoding="utf-8")
+                return ModuleSpec(fullname, loader=None, origin="custom://module")
+            return None
+
+    monkeypatch.syspath_prepend(path_entry)
+    monkeypatch.setitem(sys.path_importer_cache, path_entry, CustomPathEntryFinder())
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
+            source="path-entry-spec-call-graph-source.pkl",
         )
     finally:
         _clear_call_graph_caches()

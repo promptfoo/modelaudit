@@ -25,6 +25,7 @@ from typing import cast
 import pytest
 
 import modelaudit_picklescan.api as package_api
+import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import (
     Finding,
     PickleReport,
@@ -3085,9 +3086,20 @@ def test_scan_bytes_does_not_flag_dill_dump_as_dangerous() -> None:
 
     report = scan_bytes(payload, source="dill-dump.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
     assert report.findings == ()
+    source_reason = call_graph._call_graph_source_unavailable_reason("dill")
+    if source_reason is None:
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.CLEAN
+    else:
+        assert report.status == ScanStatus.INCONCLUSIVE
+        assert report.verdict == SafetyVerdict.UNKNOWN
+        assert any(
+            notice.code == "call_graph_source_unavailable"
+            and notice.details.get("import_reference") == "dill.dump"
+            and notice.details.get("reason") == source_reason
+            for notice in report.notices
+        )
 
 
 def test_scan_bytes_flags_dill_loads_as_dangerous() -> None:
