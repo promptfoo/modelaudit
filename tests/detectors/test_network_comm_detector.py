@@ -883,12 +883,12 @@ class TestNetworkCommDetector:
         assert path_token not in json.dumps([network_finding, url_finding], sort_keys=True)
 
     def test_network_function_snippets_redact_adjacent_credentials(self) -> None:
-        """Surrounding snippets should not leak non-URL credentials near network calls."""
+        """Network findings should not preserve surrounding credential-bearing bytes."""
         detector = NetworkCommDetector()
         data = (
             b"requests.get(1) "
             b'json={"api_key": "JSONSECRET123"} '
-            b"api_key=ADJACENTSECRET123 Authorization: Bearer BEARERSECRET123"
+            b"api_key=ADJACENTSECRET123 Authorization: Bearer BEARERSECRET123 STANDALONESECRET123"
         )
 
         findings = detector.scan(data, "hook.py")
@@ -899,12 +899,11 @@ class TestNetworkCommDetector:
         assert "ADJACENTSECRET123" not in serialized
         assert "BEARERSECRET123" not in serialized
         assert "JSONSECRET123" not in serialized
-        assert "api_key=<redacted>" in serialized
-        assert "Authorization: Bearer <redacted>" in serialized
-        assert '"api_key": "<redacted>"' in snippet
+        assert "STANDALONESECRET123" not in serialized
+        assert snippet == "requests.get"
 
     def test_network_function_snippet_redaction_preserves_matched_context(self) -> None:
-        """Credential redaction expansion should not truncate away the network-function match."""
+        """Omitting surrounding context should preserve the network-function match."""
         detector = NetworkCommDetector()
         data = (b"api_key=x " * 8) + b"requests.get(1)"
 
@@ -913,8 +912,7 @@ class TestNetworkCommDetector:
         snippet = str(network_finding["snippet"])
 
         assert "api_key=x" not in snippet
-        assert "api_key=<redacted>" in snippet
-        assert "requests.get" in snippet
+        assert snippet == "requests.get"
 
     def test_network_function_snippets_expand_forward_urls_before_redaction(self) -> None:
         """Long URL tails after the function token should be included before URL redaction."""
@@ -969,9 +967,9 @@ class TestNetworkCommDetector:
         assert path_token not in json.dumps([cc_finding, url_finding], sort_keys=True)
 
     def test_cc_pattern_snippets_redact_adjacent_credentials(self) -> None:
-        """C&C snippets should not leak assignment credentials around the match."""
+        """C&C findings should not preserve surrounding credential-bearing bytes."""
         detector = NetworkCommDetector()
-        data = b"api_key=C2_ADJACENT_SECRET malware password=C2_PASSWORD_SECRET"
+        data = b"api_key=C2_ADJACENT_SECRET malware password=C2_PASSWORD_SECRET C2_STANDALONE_SECRET"
 
         findings = detector.scan(data, "hook.py")
         cc_finding = next(finding for finding in findings if finding["type"] == "cc_pattern")
@@ -979,8 +977,8 @@ class TestNetworkCommDetector:
 
         assert "C2_ADJACENT_SECRET" not in serialized
         assert "C2_PASSWORD_SECRET" not in serialized
-        assert "api_key=<redacted>" in serialized
-        assert "password=<redacted>" in serialized
+        assert "C2_STANDALONE_SECRET" not in serialized
+        assert cc_finding["snippet"] == "malware"
 
     def test_cc_pattern_snippet_url_expansion_is_bounded(self) -> None:
         """Long whitespace-free binary regions should not force unbounded URL scans."""
@@ -1396,9 +1394,9 @@ class TestNetworkCommDetector:
 
         assert len(func_findings) > 0
 
-        # Check that snippet contains surrounding context
+        # Keep the matched token without preserving arbitrary surrounding bytes.
         snippet = func_findings[0].get("snippet", "")
-        assert "context before" in snippet or "context after" in snippet
+        assert snippet == "socket.connect"
 
 
 class TestDetectNetworkCommunication:
