@@ -777,6 +777,8 @@ class TestWeightDistributionScanner:
             "2.6.0+cpu",
             "2.6.0.post1",
             "2.6.0.post1+cpu",
+            "2.6.0_post1",
+            "2.6.0+cu124.gitabcdef",
             "2.6.1",
         ],
     )
@@ -849,7 +851,20 @@ class TestWeightDistributionScanner:
         assert scanner.extraction_unsafe
         assert load_called is False
 
-    @pytest.mark.parametrize("torch_version", ["2.6.0-custom", "2.6.0-unknown", "2.10.0-custom"])
+    @pytest.mark.parametrize(
+        "torch_version",
+        [
+            "2.6",
+            "3",
+            "2.6.0-custom",
+            "2.6.0-unknown",
+            "2.6.0+",
+            "2.6.0+cpu+extra",
+            "2.6.0.post",
+            "2.6.0+cpu dev",
+            "2.10.0-custom",
+        ],
+    )
     def test_blocks_torch_load_for_unknown_patched_version_suffixes(
         self,
         monkeypatch: pytest.MonkeyPatch,
