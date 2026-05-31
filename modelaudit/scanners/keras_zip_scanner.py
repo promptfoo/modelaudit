@@ -117,7 +117,26 @@ _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
 _KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+_-]*)\s*$")
-_KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(r"(?i)^(?:a|alpha|b|beta|c|rc|pre|preview|dev)")
+_KERAS_LOCAL_SUFFIX = r"\+[a-z0-9]+(?:[._-][a-z0-9]+)*"
+_KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(
+    rf"(?i)^[._-]?(?:(?:a|alpha|b|beta|c|rc|pre|preview)\d*"
+    rf"(?:[._-]?(?:post|rev|r)\d*)?(?:[._-]?dev\d*)?|dev\d*)(?:{_KERAS_LOCAL_SUFFIX})?$"
+)
+_KERAS_POST_OR_LOCAL_SUFFIX_PATTERN = re.compile(
+    rf"(?i)^(?:{_KERAS_LOCAL_SUFFIX}|[._-]?(?:post|rev|r)\d*(?:[._-]?dev\d*)?(?:{_KERAS_LOCAL_SUFFIX})?)$"
+)
+_CVE_2025_49655_AFFECTED_VERSION_RANGE = "3.11.0-3.11.2 and prereleases of 3.11.3"
+
+
+def _classify_keras_version_suffix(suffix: str) -> bool | None:
+    """Return whether a validated Keras suffix is prerelease, final-like, or unknown."""
+    if not suffix:
+        return False
+    if _KERAS_PRERELEASE_SUFFIX_PATTERN.fullmatch(suffix):
+        return True
+    if _KERAS_POST_OR_LOCAL_SUFFIX_PATTERN.fullmatch(suffix):
+        return False
+    return None
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -952,8 +971,9 @@ class KerasZipScanner(BaseScanner):
     def _check_torch_module_wrapper(self, result: ScanResult, layer_name: str) -> None:
         """Check for CVE-2025-49655: TorchModuleWrapper deserialization RCE.
 
-        TorchModuleWrapper in Keras 3.11.0-3.11.2 calls torch.load(weights_only=False)
-        in from_config(), enabling arbitrary code execution via pickle deserialization.
+        TorchModuleWrapper layers in Keras 3.11.0-3.11.2 and prereleases of 3.11.3 call
+        torch.load(weights_only=False) in from_config(), enabling arbitrary code execution
+        via pickle deserialization.
         """
         keras_version = result.metadata.get("keras_version")
         vulnerability_status: bool | None = None
@@ -966,7 +986,7 @@ class KerasZipScanner(BaseScanner):
                 passed=False,
                 message=(
                     f"CVE-2025-49655: Layer '{layer_name}' is a TorchModuleWrapper in "
-                    f"Keras {keras_version} (3.11.0-3.11.2 vulnerable range) — "
+                    f"Keras {keras_version} ({_CVE_2025_49655_AFFECTED_VERSION_RANGE} vulnerable range) — "
                     "uses torch.load(weights_only=False) enabling arbitrary code execution"
                 ),
                 severity=IssueSeverity.CRITICAL,
@@ -982,7 +1002,7 @@ class KerasZipScanner(BaseScanner):
                         "TorchModuleWrapper in vulnerable Keras versions can deserialize attacker-controlled "
                         "pickles via torch.load(weights_only=False), enabling RCE."
                     ),
-                    "affected_versions": "Keras 3.11.0-3.11.2",
+                    "affected_versions": f"Keras {_CVE_2025_49655_AFFECTED_VERSION_RANGE}",
                     "remediation": "Upgrade Keras to >= 3.11.3",
                 },
                 why=get_cve_2025_49655_explanation("torch_module_wrapper"),
@@ -993,7 +1013,8 @@ class KerasZipScanner(BaseScanner):
                 passed=False,
                 message=(
                     f"TorchModuleWrapper detected in Keras {keras_version}; "
-                    "version metadata is outside known CVE-2025-49655 range (3.11.0-3.11.2), "
+                    f"version metadata is outside known CVE-2025-49655 range "
+                    f"({_CVE_2025_49655_AFFECTED_VERSION_RANGE}), "
                     "but metadata-only assessment is inconclusive without runtime verification"
                 ),
                 severity=IssueSeverity.WARNING,
@@ -1033,7 +1054,7 @@ class KerasZipScanner(BaseScanner):
                         "TorchModuleWrapper may deserialize unsafe content, but version data was missing or "
                         "non-canonical so CVE attribution confidence is reduced."
                     ),
-                    "affected_versions": "Keras 3.11.0-3.11.2",
+                    "affected_versions": f"Keras {_CVE_2025_49655_AFFECTED_VERSION_RANGE}",
                     "remediation": "Ensure model metadata includes keras_version and upgrade to >= 3.11.3",
                 },
                 why=get_cve_2025_49655_explanation("torch_module_wrapper"),
@@ -1041,8 +1062,8 @@ class KerasZipScanner(BaseScanner):
 
     @staticmethod
     def _is_vulnerable_keras_3_11_x(version: str) -> bool | None:
-        """Return True for Keras 3.11.0-3.11.2 (including prerelease/dev), else False/None."""
-        version_match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+-]*)$", version.strip())
+        """Return True for affected Keras 3.11 versions, else False/None."""
+        version_match = _KERAS_RELEASE_VERSION_PATTERN.match(version)
         if not version_match:
             return None
 
@@ -1051,12 +1072,8 @@ class KerasZipScanner(BaseScanner):
             minor = int(version_match.group(2))
             patch = int(version_match.group(3) or 0)
             suffix = (version_match.group(4) or "").strip().lower()
-            is_post_or_local = suffix.startswith(("+", ".post", "post"))
-            is_prerelease = not is_post_or_local and bool(
-                re.search(r"(?:^|[.\-])(dev|rc|a|b|alpha|beta|pre|preview)\d*", suffix)
-            )
-
-            if suffix and not (is_prerelease or is_post_or_local):
+            is_prerelease = _classify_keras_version_suffix(suffix)
+            if is_prerelease is None:
                 return None
 
             return major == 3 and minor == 11 and (0 <= patch <= 2 or (patch == 3 and is_prerelease))
@@ -1990,7 +2007,7 @@ class KerasZipScanner(BaseScanner):
     @staticmethod
     def _is_vulnerable_to_cve_2025_12058(version: str) -> bool:
         """Return True for Keras versions lower than 3.12.0, including prereleases of 3.12.0."""
-        version_match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+-]*)$", version.strip())
+        version_match = _KERAS_RELEASE_VERSION_PATTERN.match(version)
         if not version_match:
             return False
 
@@ -2006,7 +2023,7 @@ class KerasZipScanner(BaseScanner):
             if parsed > (3, 12, 0):
                 return False
 
-            return bool(re.search(r"(?:^|[.\-])(dev|rc|a|b|alpha|beta|pre|preview)\d*", suffix))
+            return _classify_keras_version_suffix(suffix) is True
         except ValueError:
             return False
 
@@ -2025,8 +2042,7 @@ class KerasZipScanner(BaseScanner):
             return False
 
         suffix = (version_match.group(4) or "").strip().lower()
-        public_suffix = suffix.lstrip("._-")
-        is_prerelease = not suffix.startswith("+") and bool(_KERAS_PRERELEASE_SUFFIX_PATTERN.match(public_suffix))
+        is_prerelease = _classify_keras_version_suffix(suffix) is True
         parsed = (major, minor, patch)
         if (3, 0, 0) <= parsed < (3, 12, 1) or (3, 13, 0) <= parsed < (3, 13, 2):
             return True

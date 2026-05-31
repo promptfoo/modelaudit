@@ -1000,14 +1000,14 @@ def get_cve_2025_9906_explanation(issue_type: str) -> str:
 def get_cve_2025_49655_explanation(issue_type: str) -> str:
     """Get explanation for CVE-2025-49655: Keras TorchModuleWrapper deserialization RCE.
 
-    CVE-2025-49655 (CVSS 9.8 CRITICAL): TorchModuleWrapper layer in Keras 3.11.0-3.11.2
-    calls torch.load(weights_only=False) in from_config(), enabling arbitrary code execution
-    via pickle deserialization. Fixed in Keras 3.11.3.
+    CVE-2025-49655 (CVSS 9.8 CRITICAL): TorchModuleWrapper layers in Keras 3.11.0-3.11.2
+    and prereleases of 3.11.3 call torch.load(weights_only=False) in from_config(), enabling
+    arbitrary code execution via pickle deserialization. Fixed in Keras 3.11.3.
     """
     explanations = {
         "torch_module_wrapper": (
-            "CVE-2025-49655: The TorchModuleWrapper layer in Keras 3.11.0-3.11.2 calls "
-            "torch.load(weights_only=False) during from_config() deserialization, which allows "
+            "CVE-2025-49655: TorchModuleWrapper layers in Keras 3.11.0-3.11.2 and prereleases "
+            "of 3.11.3 call torch.load(weights_only=False) during from_config() deserialization, which allows "
             "arbitrary code execution via crafted pickle payloads in the model weights. "
             "Any .keras model containing a TorchModuleWrapper layer is potentially exploitable. "
             "Upgrade to Keras >= 3.11.3 where weights_only=True is enforced."
