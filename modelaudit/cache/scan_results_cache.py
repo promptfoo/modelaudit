@@ -64,6 +64,8 @@ class ScanResultsCache:
         self,
         file_path: str,
         version_context: dict[str, Any] | None = None,
+        *,
+        include_private_metadata: bool = False,
     ) -> dict[str, Any] | None:
         """
         Get cached scan result if available and valid with optimized file system calls.
@@ -81,13 +83,20 @@ class ScanResultsCache:
             self._record_cache_miss("error")
             return None
 
-        return self._get_cached_result_with_known_stat(file_path, file_stat, version_context)
+        return self._get_cached_result_with_known_stat(
+            file_path,
+            file_stat,
+            version_context,
+            include_private_metadata=include_private_metadata,
+        )
 
     def get_cached_result_with_stat(
         self,
         file_path: str,
         file_stat: os.stat_result,
         version_context: dict[str, Any] | None = None,
+        *,
+        include_private_metadata: bool = False,
     ) -> dict[str, Any] | None:
         """
         Get a cached scan result while reusing an existing stat result.
@@ -100,13 +109,20 @@ class ScanResultsCache:
         Returns:
             Cached scan result dictionary if found and valid, None otherwise
         """
-        return self._get_cached_result_with_known_stat(file_path, file_stat, version_context)
+        return self._get_cached_result_with_known_stat(
+            file_path,
+            file_stat,
+            version_context,
+            include_private_metadata=include_private_metadata,
+        )
 
     def _get_cached_result_with_known_stat(
         self,
         file_path: str,
         file_stat: os.stat_result,
         version_context: dict[str, Any] | None = None,
+        *,
+        include_private_metadata: bool = False,
     ) -> dict[str, Any] | None:
         """Load and validate a cache entry using a caller-provided stat result."""
         try:
@@ -135,7 +151,7 @@ class ScanResultsCache:
 
             self._record_cache_hit()
             logger.debug(f"Cache hit for {os.path.basename(file_path)}")
-            return cache_entry["scan_result"]  # type: ignore[no-any-return]
+            return self._result_from_cache_entry(cache_entry, include_private_metadata=include_private_metadata)
 
         except Exception as e:
             logger.debug(f"Cache lookup failed for {file_path}: {e}")
@@ -148,6 +164,7 @@ class ScanResultsCache:
         *,
         file_path: str | None = None,
         file_stat: os.stat_result | None = None,
+        include_private_metadata: bool = False,
     ) -> dict[str, Any] | None:
         """
         Get cached scan result by pre-generated cache key (for performance optimization).
@@ -158,13 +175,20 @@ class ScanResultsCache:
         Returns:
             Cached scan result dictionary if found, None otherwise
         """
-        return self._get_cached_result_by_key(cache_key, file_path=file_path, file_stat=file_stat)
+        return self._get_cached_result_by_key(
+            cache_key,
+            file_path=file_path,
+            file_stat=file_stat,
+            include_private_metadata=include_private_metadata,
+        )
 
     def _get_cached_result_by_key(
         self,
         cache_key: str,
         file_path: str | None = None,
         file_stat: os.stat_result | None = None,
+        *,
+        include_private_metadata: bool = False,
     ) -> dict[str, Any] | None:
         """Get a cached result using a precomputed key, optionally validating with caller-provided stat data."""
         try:
@@ -197,12 +221,32 @@ class ScanResultsCache:
 
             self._record_cache_hit()
             logger.debug(f"Cache hit for key {cache_key[:8]}...")
-            return cache_entry["scan_result"]  # type: ignore[no-any-return]
+            return self._result_from_cache_entry(cache_entry, include_private_metadata=include_private_metadata)
 
         except Exception as e:
             logger.debug(f"Cache lookup failed for key {cache_key[:8]}...: {e}")
             self._record_cache_miss("error")
             return None
+
+    @staticmethod
+    def _result_from_cache_entry(
+        cache_entry: dict[str, Any],
+        *,
+        include_private_metadata: bool,
+    ) -> dict[str, Any]:
+        scan_result = cache_entry["scan_result"]
+        if not include_private_metadata or not isinstance(scan_result, dict):
+            return scan_result  # type: ignore[no-any-return]
+        cache_metadata = cache_entry.get("cache_metadata")
+        fingerprint_metadata = (
+            cache_metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY) if isinstance(cache_metadata, dict) else None
+        )
+        if fingerprint_metadata is None:
+            return scan_result
+        return {
+            **scan_result,
+            "_private_metadata": {_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY: fingerprint_metadata},
+        }
 
     def store_result(
         self,

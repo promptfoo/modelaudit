@@ -37,6 +37,8 @@ class CacheManager:
         self,
         file_path: str,
         version_context: dict[str, Any] | None = None,
+        *,
+        include_private_metadata: bool = False,
     ) -> dict[str, Any] | None:
         """
         Get cached scan result if available.
@@ -50,13 +52,19 @@ class CacheManager:
         if not self.enabled or not self.cache:
             return None
 
-        return self.cache.get_cached_result(file_path, version_context=version_context)
+        return self.cache.get_cached_result(
+            file_path,
+            version_context=version_context,
+            include_private_metadata=include_private_metadata,
+        )
 
     def get_cached_result_with_stat(
         self,
         file_path: str,
         stat_result: os.stat_result,
         version_context: dict[str, Any] | None = None,
+        *,
+        include_private_metadata: bool = False,
     ) -> dict[str, Any] | None:
         """
         Get cached scan result using existing stat result for optimized performance.
@@ -71,7 +79,12 @@ class CacheManager:
         if not self.enabled or not self.cache:
             return None
 
-        return self.cache.get_cached_result_with_stat(file_path, stat_result, version_context=version_context)
+        return self.cache.get_cached_result_with_stat(
+            file_path,
+            stat_result,
+            version_context=version_context,
+            include_private_metadata=include_private_metadata,
+        )
 
     def store_result(
         self,
@@ -99,6 +112,7 @@ class CacheManager:
         scanner_func: Any,
         *args: Any,
         version_context: dict[str, Any] | None = None,
+        include_private_metadata: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """
@@ -115,7 +129,11 @@ class CacheManager:
         """
         # Try cache first
         start_time = time.time()
-        cached_result = self.get_cached_result(file_path, version_context=version_context)
+        cached_result = self.get_cached_result(
+            file_path,
+            version_context=version_context,
+            include_private_metadata=include_private_metadata,
+        )
 
         if cached_result is not None:
             cache_lookup_time = (time.time() - start_time) * 1000
@@ -146,6 +164,8 @@ class CacheManager:
                 self.store_result(file_path, scan_result, int(scan_duration), version_context=version_context)
             else:
                 logger.debug(f"Skipping cache store for operational result from {Path(file_path).name}")
+            if isinstance(scan_result, dict) and not include_private_metadata:
+                scan_result.pop("_private_metadata", None)
 
             return scan_result  # type: ignore[no-any-return]
 

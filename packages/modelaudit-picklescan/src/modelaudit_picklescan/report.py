@@ -173,8 +173,8 @@ class PickleReport:
     errors: tuple[ScanError, ...] = ()
     coverage: CoverageSummary = field(default_factory=CoverageSummary)
     metadata: Mapping[str, Any] = field(default_factory=dict)
-    private_metadata: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
     duration_s: float = 0.0
+    private_metadata: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", _immutable_mapping(self.metadata))

@@ -70,6 +70,35 @@ def test_cached_scan_persists_miss_and_hits_on_second_call(tmp_path: Path) -> No
     assert cache_manager.get_stats()["total_entries"] == 1
 
 
+def test_cached_scan_restores_private_metadata_for_internal_scan_results(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+    fingerprint_metadata = {
+        "reusable": True,
+        "search_context": [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path],
+        "fingerprints": {},
+    }
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        assert config is not None
+        calls["count"] += 1
+        result = ScanResult(scanner_name="pickle")
+        result._private_metadata["call_graph_source_fingerprints"] = fingerprint_metadata
+        result.finish()
+        return result
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert calls["count"] == 1
+    assert first._private_metadata["call_graph_source_fingerprints"] == fingerprint_metadata
+    assert second._private_metadata["call_graph_source_fingerprints"] == fingerprint_metadata
+    assert "_private_metadata" not in second.to_dict()
+
+
 def test_cached_scan_invalidates_on_material_scan_config_change(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"

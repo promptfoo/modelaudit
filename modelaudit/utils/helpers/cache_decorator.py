@@ -218,6 +218,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     file_path,
                     file_stat,
                     version_context=version_context,
+                    include_private_metadata=True,
                 )
 
                 if cached_result is not None:
@@ -243,7 +244,6 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                         )
                     else:
                         logger.debug(f"Skipping cache store for operational result from {os.path.basename(file_path)}")
-                    result_dict.pop("_private_metadata", None)
 
                 # Convert back to original type if needed
                 if isinstance(result_dict, dict) and "scanner" in result_dict:
@@ -253,6 +253,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     logger.debug(f"Converting cached result back to ScanResult for {file_path}")
                     return scan_result_from_dict(result_dict)
 
+                result_dict.pop("_private_metadata", None)
                 return result_dict
 
             except Exception as e:

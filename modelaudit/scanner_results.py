@@ -3,6 +3,8 @@
 import json
 import logging
 import time
+from collections.abc import Mapping
+from copy import deepcopy
 from enum import Enum
 from typing import Any, Final
 
@@ -19,20 +21,30 @@ UNCLASSIFIED_SCAN_FAILURE_REASON: Final[str] = "scanner_reported_unsuccessful_wi
 CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY: Final[str] = "call_graph_source_fingerprints"
 
 
+def _deep_mutable_copy(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _deep_mutable_copy(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_deep_mutable_copy(item) for item in value]
+    if isinstance(value, set | frozenset):
+        return [_deep_mutable_copy(item) for item in value]
+    return deepcopy(value)
+
+
 def _merge_call_graph_source_fingerprints_metadata(
-    existing: dict[str, Any], incoming: dict[str, Any]
+    existing: Mapping[str, Any], incoming: Mapping[str, Any]
 ) -> dict[str, Any]:
-    merged = dict(existing)
+    merged: dict[str, Any] = _deep_mutable_copy(existing)
     existing_fingerprints = existing.get("fingerprints")
     incoming_fingerprints = incoming.get("fingerprints")
-    fingerprints = dict(existing_fingerprints) if isinstance(existing_fingerprints, dict) else {}
+    fingerprints = _deep_mutable_copy(existing_fingerprints) if isinstance(existing_fingerprints, Mapping) else {}
     fingerprint_conflict = False
-    if isinstance(incoming_fingerprints, dict):
+    if isinstance(incoming_fingerprints, Mapping):
         for path, fingerprint in incoming_fingerprints.items():
             if path in fingerprints and fingerprints[path] != fingerprint:
                 fingerprint_conflict = True
                 continue
-            fingerprints[path] = fingerprint
+            fingerprints[path] = _deep_mutable_copy(fingerprint)
     merged["fingerprints"] = fingerprints
 
     existing_search_context = existing.get("search_context")
@@ -359,15 +371,15 @@ class ScanResult:
         for key, value in other.metadata.items():
             if (
                 key == CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY
-                and isinstance(self._private_metadata.get(key), dict)
-                and isinstance(value, dict)
+                and isinstance(self._private_metadata.get(key), Mapping)
+                and isinstance(value, Mapping)
             ):
                 self._private_metadata[key] = _merge_call_graph_source_fingerprints_metadata(
                     self._private_metadata[key], value
                 )
                 continue
-            if key == CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY and isinstance(value, dict):
-                self._private_metadata[key] = value
+            if key == CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY and isinstance(value, Mapping):
+                self._private_metadata[key] = _deep_mutable_copy(value)
                 continue
             if key in list_union_metadata_keys and isinstance(self.metadata.get(key), list) and isinstance(value, list):
                 existing_values = self.metadata[key]
@@ -382,14 +394,14 @@ class ScanResult:
         for key, value in other._private_metadata.items():
             if (
                 key == CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY
-                and isinstance(self._private_metadata.get(key), dict)
-                and isinstance(value, dict)
+                and isinstance(self._private_metadata.get(key), Mapping)
+                and isinstance(value, Mapping)
             ):
                 self._private_metadata[key] = _merge_call_graph_source_fingerprints_metadata(
                     self._private_metadata[key], value
                 )
             else:
-                self._private_metadata[key] = value
+                self._private_metadata[key] = _deep_mutable_copy(value)
 
     def trust_merged_child_failures(self) -> None:
         """Allow a parent scanner to explicitly accept child failures it has reclassified as benign."""
@@ -494,7 +506,7 @@ class ScanResult:
             "failed_checks": failed_checks_count,
         }
         if include_private_metadata and self._private_metadata:
-            result["_private_metadata"] = self._private_metadata
+            result["_private_metadata"] = _deep_mutable_copy(self._private_metadata)
         return result
 
     def to_json(self, indent: int = 2) -> str:
