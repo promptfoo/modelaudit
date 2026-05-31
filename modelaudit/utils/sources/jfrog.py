@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import tempfile
 from collections.abc import Collection
 from pathlib import Path, PurePosixPath
@@ -178,15 +179,26 @@ def _is_local_jfrog_host(hostname: str) -> bool:
     if not hostname:
         return False
 
-    if hostname == "localhost":
+    if hostname == "localhost" or hostname.endswith(".localhost"):
         return True
 
     try:
         parsed_ip = ipaddress.ip_address(hostname)
     except ValueError:
-        parsed_ip = None
+        try:
+            parsed_ip = ipaddress.ip_address(socket.inet_aton(hostname))
+        except OSError:
+            parsed_ip = None
 
-    return parsed_ip is not None and parsed_ip.is_loopback
+    return parsed_ip is not None and (parsed_ip.is_loopback or parsed_ip.is_unspecified)
+
+
+def _raise_for_jfrog_redirect(response: requests.Response, source_url: str) -> None:
+    """Reject redirects so JFrog credentials never cross origin boundaries."""
+    if response.status_code in {301, 302, 303, 307, 308}:
+        raise requests.exceptions.RequestException(
+            f"Refusing redirect from JFrog URL {redact_jfrog_url_for_display(source_url)}"
+        )
 
 
 def _is_jfrog_service_host(hostname: str) -> bool:
@@ -300,8 +312,10 @@ def download_artifact(
             headers=headers,
             timeout=timeout,
             stream=True,  # Stream for large files
+            allow_redirects=False,
         )
 
+        _raise_for_jfrog_redirect(response, url)
         # Raise an exception for HTTP error responses
         response.raise_for_status()
 
@@ -438,7 +452,8 @@ def detect_jfrog_target_type(
     headers = _build_jfrog_auth_headers(storage_api_url, api_token=api_token, access_token=access_token)
 
     try:
-        response = requests.get(storage_api_url, headers=headers, timeout=timeout)
+        response = requests.get(storage_api_url, headers=headers, timeout=timeout, allow_redirects=False)
+        _raise_for_jfrog_redirect(response, storage_api_url)
         response.raise_for_status()
 
         data = response.json()
