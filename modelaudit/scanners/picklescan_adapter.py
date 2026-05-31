@@ -175,14 +175,18 @@ def pickle_report_to_scan_result(
     if suppress_parse_failure_escalation:
         result.metadata["trusted_incomplete_tail"] = True
     has_only_parse_errors = bool(report.errors) and all(error.category == "parse_error" for error in report.errors)
+    incomplete_notice_reasons = [
+        _legacy_scan_outcome_reason(notice.code)
+        for notice in report.notices
+        if notice.code in _INCONCLUSIVE_NOTICE_CODES
+    ]
+    has_incomplete_coverage = report.status == ScanStatus.INCONCLUSIVE or (
+        report.status == ScanStatus.COMPLETE and bool(incomplete_notice_reasons)
+    )
 
-    if report.status == ScanStatus.INCONCLUSIVE:
+    if has_incomplete_coverage:
         result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-        result.metadata["scan_outcome_reasons"] = [
-            _legacy_scan_outcome_reason(notice.code)
-            for notice in report.notices
-            if notice.code in _INCONCLUSIVE_NOTICE_CODES
-        ] or ["pickle_analysis_incomplete"]
+        result.metadata["scan_outcome_reasons"] = incomplete_notice_reasons or ["pickle_analysis_incomplete"]
         result.metadata["analysis_incomplete"] = True
     elif report.status == ScanStatus.ERROR and any(error.category == "parse_error" for error in report.errors):
         result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
@@ -347,8 +351,8 @@ def pickle_report_to_scan_result(
         )
 
     scan_success = (
-        report.status == ScanStatus.COMPLETE
-        or (report.status == ScanStatus.INCONCLUSIVE and report.has_security_findings)
+        (report.status == ScanStatus.COMPLETE and not has_incomplete_coverage)
+        or (has_incomplete_coverage and report.has_security_findings)
         or (report.status == ScanStatus.ERROR and has_only_parse_errors)
     )
     result.finish(success=scan_success)

@@ -534,11 +534,22 @@ def test_pickle_report_to_scan_result_fails_closed_for_inconclusive_report_witho
     )
 
 
-def test_pickle_report_to_scan_result_fails_closed_for_protocol5_buffer_notice() -> None:
+@pytest.mark.parametrize(
+    ("report_status", "report_verdict"),
+    [
+        (ScanStatus.INCONCLUSIVE, SafetyVerdict.UNKNOWN),
+        (ScanStatus.COMPLETE, SafetyVerdict.CLEAN),
+    ],
+    ids=["native-inconclusive", "legacy-complete"],
+)
+def test_pickle_report_to_scan_result_fails_closed_for_protocol5_buffer_notice(
+    report_status: ScanStatus,
+    report_verdict: SafetyVerdict,
+) -> None:
     report = PickleReport(
         source="buffer.pkl",
-        status=ScanStatus.INCONCLUSIVE,
-        verdict=SafetyVerdict.UNKNOWN,
+        status=report_status,
+        verdict=report_verdict,
         notices=(
             Notice(
                 message="Encountered 1 protocol 5 buffer opcode(s); external buffer context is opaque",
