@@ -35,6 +35,31 @@ def _get_total_size(urls: list[str]) -> int:
     return total
 
 
+def _format_size(size_bytes: int) -> str:
+    size = float(size_bytes)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PB"
+
+
+def _enforce_max_size(size_bytes: int, max_size: int | None) -> None:
+    if max_size is not None and max_size > 0 and size_bytes > max_size:
+        raise ValueError(
+            f"PyTorch Hub model size ({_format_size(size_bytes)}) "
+            f"exceeds maximum allowed size ({_format_size(max_size)})"
+        )
+
+
+def _response_content_length(resp: requests.Response) -> int | None:
+    try:
+        content_length = resp.headers.get("content-length")
+        return int(content_length) if content_length is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
     """Download model weights referenced from a PyTorch Hub page."""
     if not is_pytorch_hub_url(url):
@@ -79,7 +104,11 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
     return dest_dir
 
 
-def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -> Iterator[tuple[Path, bool]]:
+def download_pytorch_hub_model_streaming(
+    url: str,
+    show_progress: bool = True,
+    max_size: int | None = None,
+) -> Iterator[tuple[Path, bool]]:
     """
     Download model weights from PyTorch Hub one at a time (streaming mode).
 
@@ -105,6 +134,11 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
     if not weight_urls:
         raise Exception(f"No model files found at {url}")
 
+    if max_size is not None and max_size > 0:
+        total_size = _get_total_size(weight_urls)
+        if total_size > 0:
+            _enforce_max_size(total_size, max_size)
+
     if show_progress:
         click.echo(f"Found {len(weight_urls)} model weight files")
 
@@ -113,6 +147,7 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
 
     try:
         total_files = len(weight_urls)
+        downloaded_size = 0
         for i, weight_url in enumerate(weight_urls):
             is_last = i == total_files - 1
             filename = weight_url.split("/")[-1]
@@ -124,10 +159,18 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
             try:
                 with requests.get(weight_url, stream=True, timeout=30) as resp:
                     resp.raise_for_status()
+                    content_length = _response_content_length(resp)
+                    if content_length is not None:
+                        _enforce_max_size(downloaded_size + content_length, max_size)
+
                     with open(dest_file, "wb") as f:
                         for chunk in resp.iter_content(chunk_size=8192):
                             if chunk:
+                                _enforce_max_size(downloaded_size + len(chunk), max_size)
                                 f.write(chunk)
+                                downloaded_size += len(chunk)
+            except ValueError:
+                raise
             except Exception as e:
                 raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
 
