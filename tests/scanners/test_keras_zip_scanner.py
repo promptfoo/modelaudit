@@ -3550,6 +3550,61 @@ class TestCVE20243660LambdaAttribution:
         cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
         assert len(cve_issues) == 0
 
+    @pytest.mark.parametrize("prerelease_version", ["2.13.0a0", "2.13.0rc1", "2.13.0.dev0"])
+    def test_lambda_cve_for_fixed_boundary_prereleases(self, tmp_path: Path, prerelease_version: str) -> None:
+        """Prereleases of the fixed 2.13.0 boundary should remain CVE-attributed."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"lambda x: x * 2").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "my_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+
+        result = scanner.scan(self._make_keras_zip(config, tmp_path, keras_version=prerelease_version))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2024-3660"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["keras_version"] == prerelease_version
+
+    @pytest.mark.parametrize("fixed_version", ["2.13.0", "2.13.0+local", "2.13.0.post1"])
+    def test_lambda_no_cve_for_fixed_boundary_final_local_or_post(
+        self,
+        tmp_path: Path,
+        fixed_version: str,
+    ) -> None:
+        """Final, local, and post fixed-boundary versions should not get CVE attribution."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"lambda x: x * 2").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "my_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+
+        result = scanner.scan(self._make_keras_zip(config, tmp_path, keras_version=fixed_version))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2024-3660"]
+        assert cve_issues == []
+        version_checks = [check for check in result.checks if check.name == "Lambda Version Risk Check"]
+        assert len(version_checks) == 1
+        assert version_checks[0].status == CheckStatus.PASSED
+
     def test_cve_for_two_part_keras_version(self, tmp_path: Path) -> None:
         """Lambda in Keras 2.10 (two-part version) should be CVE-attributed."""
         scanner = KerasZipScanner()
