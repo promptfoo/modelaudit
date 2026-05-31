@@ -523,7 +523,13 @@ fn call_like_has_prose_suffix(rest_after_name: &str) -> bool {
             ')' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    let suffix = trimmed[index + ch.len_utf8()..].trim_start();
+                    let raw_suffix = &trimmed[index + ch.len_utf8()..];
+                    let suffix = raw_suffix.trim_start();
+                    if leading_whitespace_has_line_break(raw_suffix)
+                        && suffix_starts_with_call_expression(suffix)
+                    {
+                        return false;
+                    }
                     return suffix
                         .chars()
                         .next()
@@ -535,6 +541,55 @@ fn call_like_has_prose_suffix(rest_after_name: &str) -> bool {
         }
     }
     false
+}
+
+fn leading_whitespace_has_line_break(value: &str) -> bool {
+    value
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .any(|ch| matches!(ch, '\n' | '\r'))
+}
+
+fn suffix_starts_with_call_expression(value: &str) -> bool {
+    let mut chars = value.chars().peekable();
+    if !consume_python_identifier(&mut chars) {
+        return false;
+    }
+    loop {
+        while chars.peek().is_some_and(|ch| ch.is_whitespace()) {
+            chars.next();
+        }
+        match chars.peek() {
+            Some('(') => return true,
+            Some('.') => {
+                chars.next();
+                while chars.peek().is_some_and(|ch| ch.is_whitespace()) {
+                    chars.next();
+                }
+                if !consume_python_identifier(&mut chars) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn consume_python_identifier<I>(chars: &mut std::iter::Peekable<I>) -> bool
+where
+    I: Iterator<Item = char>,
+{
+    let Some(first) = chars.peek().copied() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.next();
+    while chars.peek().is_some_and(|ch| is_python_word_char(*ch)) {
+        chars.next();
+    }
+    true
 }
 
 fn find_module_attr(lower: &str, module: &str, attr: &str, prefix: bool) -> bool {
@@ -999,8 +1054,15 @@ mod tests {
         assert!(suspicious_string_matches("Use eval() function to compute results").is_empty());
         assert!(suspicious_string_matches("eval(x + 2) where x is input").is_empty());
         assert!(suspicious_string_matches("eval(x); exec(y)").contains(&"eval(".to_string()));
+        assert!(suspicious_string_matches("eval(payload)\nfoo()").contains(&"eval(".to_string()));
+        assert!(suspicious_string_matches("eval(payload)\nos.system('id')")
+            .contains(&"eval(".to_string()));
+        assert!(suspicious_string_matches("eval(x)\nwhere x is input").is_empty());
         assert!(
             suspicious_string_matches("Do not call os.system(command) from loaders").is_empty()
+        );
+        assert!(
+            suspicious_string_matches("Do not call os.system(command)\nfrom loaders").is_empty()
         );
         assert!(suspicious_string_matches("subprocess.run(args) is documented here").is_empty());
         assert!(suspicious_string_matches("base64.b64decode(data) decodes text").is_empty());
