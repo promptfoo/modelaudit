@@ -24,6 +24,7 @@ from ..scanner_results import (
     mark_inconclusive_scan_result,
 )
 from ..utils.helpers.interrupt_handler import check_interrupted
+from ._evidence_redaction import redact_evidence_string
 from .rule_mapper import get_embedded_code_rule_code, get_network_rule_code, get_secret_rule_code
 
 # Progress tracking imports with circular dependency detection
@@ -577,7 +578,7 @@ class BaseScanner(ABC):
         }
         if error is not None:
             failure_details["exception_type"] = type(error).__name__
-            failure_details["exception"] = str(error)[:500]
+            failure_details["exception"] = redact_evidence_string(str(error), max_chars=500)
 
         failures = result.metadata.setdefault(RAW_DETECTOR_FAILURES_METADATA_KEY, [])
         if isinstance(failures, list) and len(failures) < 20:
@@ -680,7 +681,7 @@ class BaseScanner(ABC):
             )
             return 0
         except Exception as e:
-            logger.warning(f"Error checking for embedded secrets: {e}")
+            logger.warning("Error checking for embedded secrets: %s", redact_evidence_string(str(e), max_chars=500))
             self._mark_raw_detector_analysis_incomplete(
                 result,
                 detector="embedded_secrets",
@@ -748,7 +749,7 @@ class BaseScanner(ABC):
         except Exception as e:
             if raise_on_error:
                 raise
-            logger.warning(f"Error checking for JIT/Script code: {e}")
+            logger.warning("Error checking for JIT/Script code: %s", redact_evidence_string(str(e), max_chars=500))
             if result is not None:
                 self._mark_raw_detector_analysis_incomplete(
                     result,
@@ -869,7 +870,7 @@ class BaseScanner(ABC):
             )
             return 0
         except Exception as e:
-            logger.warning(f"Error checking for JIT/Script code: {e}")
+            logger.warning("Error checking for JIT/Script code: %s", redact_evidence_string(str(e), max_chars=500))
             self._mark_raw_detector_analysis_incomplete(
                 result,
                 detector="jit_script",
@@ -986,7 +987,9 @@ class BaseScanner(ABC):
         except Exception as e:
             if raise_on_error:
                 raise
-            logger.warning(f"Error checking for network communication: {e}")
+            logger.warning(
+                "Error checking for network communication: %s", redact_evidence_string(str(e), max_chars=500)
+            )
             if result is not None:
                 self._mark_raw_detector_analysis_incomplete(
                     result,
@@ -1118,7 +1121,9 @@ class BaseScanner(ABC):
             )
             return 0
         except Exception as e:
-            logger.warning(f"Error checking for network communication: {e}")
+            logger.warning(
+                "Error checking for network communication: %s", redact_evidence_string(str(e), max_chars=500)
+            )
             self._mark_raw_detector_analysis_incomplete(
                 result,
                 detector="network_communication",

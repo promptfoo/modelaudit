@@ -327,12 +327,14 @@ def test_expensive_raw_prefilters_preserve_bare_alpha_domain_findings(tmp_path: 
 def test_pickle_raw_secret_detector_exception_marks_scan_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     path = tmp_path / "secret-detector-error.pkl"
     path.write_bytes(pickle.dumps({"api_key": "sk-" + ("A" * 48)}, protocol=4))
+    leaked_secret = "SUPER_SECRET_123456"
 
     def raise_detector_error(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
-        raise RuntimeError("secret detector failed")
+        raise RuntimeError(f"secret detector failed: token={leaked_secret}")
 
     monkeypatch.setattr("modelaudit.detectors.secrets.SecretsDetector.scan_model_weights", raise_detector_error)
 
@@ -349,6 +351,10 @@ def test_pickle_raw_secret_detector_exception_marks_scan_inconclusive(
     assert len(coverage_checks) == 1
     assert coverage_checks[0].severity == IssueSeverity.INFO
     assert coverage_checks[0].details["analysis_incomplete"] is True
+    assert leaked_secret not in str(result.metadata)
+    assert leaked_secret not in str(coverage_checks[0].details)
+    assert leaked_secret not in caplog.text
+    assert "<redacted>" in str(result.metadata)
 
 
 def test_pickle_raw_jit_detector_exception_marks_scan_inconclusive(
