@@ -116,6 +116,9 @@ def _has_get_file_reference(values: list[str]) -> bool:
 _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
+_KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON = (
+    "keras_zip_stringlookup_external_vocabulary_metadata_inconclusive"
+)
 _KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+_-]*)\s*$")
 _KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(r"(?i)^(?:a|alpha|b|beta|c|rc|pre|preview|dev)")
 
@@ -1456,6 +1459,14 @@ class KerasZipScanner(BaseScanner):
 
         if isinstance(keras_version, str):
             details["keras_version"] = keras_version
+            details["metadata_only_assessment"] = True
+            details["parse_status"] = "metadata_non_vulnerable"
+            details["analysis_incomplete"] = True
+            details["scan_outcome_reason"] = _KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON
+            self._mark_inconclusive_scan_result(
+                result,
+                _KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON,
+            )
             result.add_check(
                 name="StringLookup External Vocabulary Metadata Check",
                 passed=False,

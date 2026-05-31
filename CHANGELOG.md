@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
+- fail closed when fixed-version Keras ZIP metadata cannot verify external `StringLookup` vocabulary paths
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
 - detect external references in weights-only Keras HDF5 layouts without Keras metadata
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
