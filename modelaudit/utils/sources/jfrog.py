@@ -310,6 +310,8 @@ def download_artifact(
     access_token: str | None = None,
     timeout: int = 30,
     max_size: int | None = None,
+    *,
+    _enforce_zero_max_size: bool = False,
 ) -> Path:
     """
     Download an artifact from JFrog Artifactory with proper authentication.
@@ -339,7 +341,9 @@ def download_artifact(
     display_url = redact_jfrog_url_for_display(url)
     if not is_jfrog_url(url):
         raise ValueError(f"Not a JFrog URL: {display_url}")
-    max_download_size = max_size if max_size is not None and max_size >= 0 else None
+    max_download_size = (
+        max_size if max_size is not None and (max_size > 0 or (_enforce_zero_max_size and max_size == 0)) else None
+    )
 
     filename = os.path.basename(urlparse(url).path)
     temp_dir: Path | None = None
@@ -397,8 +401,7 @@ def download_artifact(
             delete=False,
         ) as f:
             partial_path = Path(f.name)
-            chunk_size = 1 if max_download_size is not None else JFROG_DOWNLOAD_CHUNK_SIZE
-            for chunk in response.iter_content(chunk_size=chunk_size):
+            for chunk in response.iter_content(chunk_size=JFROG_DOWNLOAD_CHUNK_SIZE):
                 if chunk:  # Filter out keep-alive chunks
                     bytes_written += len(chunk)
                     _require_size_within_limit(
@@ -410,7 +413,6 @@ def download_artifact(
                     f.write(chunk)
 
         partial_path.replace(dest_path)
-        partial_path = None
         return dest_path
 
     except requests.exceptions.HTTPError as e:  # type: ignore[attr-defined]
@@ -871,6 +873,7 @@ def download_jfrog_folder(
                     access_token=access_token,
                     timeout=timeout,
                     max_size=file_download_limit,
+                    _enforce_zero_max_size=file_download_limit == 0,
                 )
 
                 # Move to correct location if needed

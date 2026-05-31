@@ -10,6 +10,7 @@ import pytest
 import requests
 
 from modelaudit.utils.sources.jfrog import (
+    JFROG_DOWNLOAD_CHUNK_SIZE,
     detect_jfrog_target_type,
     download_artifact,
     download_jfrog_folder,
@@ -150,7 +151,7 @@ class TestJFrogDownload:
 
         assert not (tmp_path / "model.bin").exists()
         assert not any(tmp_path.iterdir())
-        mock_response.iter_content.assert_called_once_with(chunk_size=1)
+        mock_response.iter_content.assert_called_once_with(chunk_size=JFROG_DOWNLOAD_CHUNK_SIZE)
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_download_allows_unknown_content_length_under_max_size(
@@ -171,7 +172,49 @@ class TestJFrogDownload:
         )
 
         assert result.read_bytes() == b"12345"
-        mock_response.iter_content.assert_called_once_with(chunk_size=1)
+        mock_response.iter_content.assert_called_once_with(chunk_size=JFROG_DOWNLOAD_CHUNK_SIZE)
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_treats_zero_max_size_as_unlimited(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """User-facing zero download budgets should preserve the unlimited convention."""
+        mock_response = mock_get.return_value
+        mock_response.raise_for_status.return_value = None
+        mock_response.headers = {}
+        mock_response.iter_content.return_value = [b"data"]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        result = download_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            cache_dir=tmp_path,
+            api_token="test-token",
+            max_size=0,
+        )
+
+        assert result.read_bytes() == b"data"
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_enforces_internal_zero_remaining_budget(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An exhausted folder budget must not turn into an unlimited artifact download."""
+        mock_response = mock_get.return_value
+        mock_response.raise_for_status.return_value = None
+        mock_response.headers = {}
+        mock_response.iter_content.return_value = [b"x"]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        with pytest.raises(Exception, match="exceeds maximum allowed size"):
+            download_artifact(
+                "https://company.jfrog.io/artifactory/repo/model.bin",
+                cache_dir=tmp_path,
+                api_token="test-token",
+                max_size=0,
+                _enforce_zero_max_size=True,
+            )
+
+        assert not any(tmp_path.iterdir())
 
     def test_invalid_url(self):
         with pytest.raises(ValueError):
@@ -867,6 +910,53 @@ class TestJFrogFolderDownload:
         assert seen_limits == [9, 5]
         assert (tmp_path / "model1.pt").stat().st_size == 4
         assert (tmp_path / "model2.pt").stat().st_size == 5
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_preserves_exhausted_total_budget(
+        self, mock_list: MagicMock, mock_download: MagicMock, tmp_path: Path
+    ) -> None:
+        """A zero remaining total must stay enforceable for a declared empty artifact."""
+        mock_list.return_value = [
+            {
+                "name": "model1.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model1.pt",
+                "size": 4,
+                "size_known": True,
+                "human_size": "4.0 B",
+            },
+            {
+                "name": "model2.pt",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model2.pt",
+                "size": 0,
+                "size_known": True,
+                "human_size": "Unknown",
+            },
+        ]
+        seen_limits: list[tuple[int | None, bool]] = []
+
+        def mock_download_side_effect(url: str, cache_dir: Path, **kwargs: object) -> Path:
+            max_size = kwargs.get("max_size")
+            enforce_zero = kwargs.get("_enforce_zero_max_size")
+            assert max_size is None or isinstance(max_size, int)
+            assert isinstance(enforce_zero, bool)
+            seen_limits.append((max_size, enforce_zero))
+            path = cache_dir / Path(url).name
+            path.write_bytes(b"x" * (4 if path.name == "model1.pt" else 0))
+            return path
+
+        mock_download.side_effect = mock_download_side_effect
+
+        result = download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            api_token="test-token",
+            show_progress=False,
+            max_size=4,
+        )
+
+        assert result == tmp_path
+        assert seen_limits == [(4, False), (0, True)]
 
     @patch("modelaudit.utils.sources.jfrog.download_artifact")
     @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
