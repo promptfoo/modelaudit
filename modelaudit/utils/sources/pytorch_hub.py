@@ -1,9 +1,10 @@
+import posixpath
 import re
 import shutil
 import tempfile
 from collections.abc import Iterator
-from pathlib import Path
-from urllib.parse import urlsplit
+from pathlib import Path, PurePosixPath
+from urllib.parse import unquote, urlsplit
 
 import click
 import requests
@@ -20,6 +21,25 @@ def _get_model_extensions() -> set[str]:
     return get_model_extensions()
 
 
+def _normalized_model_path(url: str) -> str | None:
+    """Return a decoded path that remains within download.pytorch.org/models."""
+    path = unquote(urlsplit(url).path)
+    if "\\" in path or "\x00" in path:
+        return None
+    normalized_path = posixpath.normpath(path)
+    if not normalized_path.startswith("/models/"):
+        return None
+    return normalized_path
+
+
+def _weight_filename(url: str) -> str:
+    """Return a safe local basename for an extracted PyTorch Hub weight URL."""
+    normalized_path = _normalized_model_path(url)
+    if normalized_path is None:
+        raise ValueError(f"Unsafe PyTorch Hub model URL: {url}")
+    return PurePosixPath(normalized_path).name
+
+
 def is_pytorch_hub_url(url: str) -> bool:
     """Return True if the URL points to a PyTorch Hub model page."""
     return bool(re.match(_PYTORCH_HUB_PATTERN, url))
@@ -33,8 +53,12 @@ def _extract_weight_urls(html: str) -> list[str]:
 
     for raw_url in re.findall(_PYTORCH_MODEL_URL_PATTERN, html):
         url = raw_url.rstrip(".,;:")
-        path = urlsplit(url).path.lower()
-        if url not in seen and any(path.endswith(extension) for extension in model_extensions):
+        normalized_path = _normalized_model_path(url)
+        if (
+            normalized_path is not None
+            and url not in seen
+            and any(normalized_path.lower().endswith(extension) for extension in model_extensions)
+        ):
             weight_urls.append(url)
             seen.add(url)
 
@@ -80,7 +104,7 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
             raise Exception(f"Cannot download model from {url}: {message}")
 
     for weight_url in weight_urls:
-        filename = weight_url.split("/")[-1]
+        filename = _weight_filename(weight_url)
         dest_file = dest_dir / filename
         try:
             with requests.get(weight_url, stream=True, timeout=30) as resp:
@@ -133,7 +157,7 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
         total_files = len(weight_urls)
         for i, weight_url in enumerate(weight_urls):
             is_last = i == total_files - 1
-            filename = weight_url.split("/")[-1]
+            filename = _weight_filename(weight_url)
             dest_file = temp_dir / filename
 
             if show_progress:
