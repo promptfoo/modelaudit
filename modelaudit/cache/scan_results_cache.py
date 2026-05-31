@@ -319,11 +319,16 @@ class ScanResultsCache:
     ) -> tuple[str | None, str | None]:
         """Generate a cache key and surface any secure content hash already computed for it."""
         try:
-            if file_stat is not None:
-                file_key, content_hash = self.key_generator.generate_key_material_with_stat_reuse(file_path, file_stat)
-            else:
-                file_key = self.key_generator.generate_key(file_path)
-                content_hash = None
+            if file_stat is None:
+                file_stat = os.stat(file_path)
+
+            file_key, content_hash = self.key_generator.generate_key_material_with_stat_reuse(file_path, file_stat)
+            if content_hash is not None and content_hash.startswith("fingerprint:"):
+                logger.debug(
+                    "Skipping scan-result cache key for %s: sampled large-file fingerprints are not cacheable",
+                    file_path,
+                )
+                return None, None
 
             resolved_version_info = (
                 version_info if version_info is not None else self._get_version_info(version_context)

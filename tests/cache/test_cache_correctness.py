@@ -662,6 +662,27 @@ def test_large_file_store_reuses_cache_key_content_hash(tmp_path: Path, monkeypa
     assert cache_entry["file_info"]["hash"] == expected_hash
 
 
+def test_sampled_large_file_fingerprint_result_is_not_cached(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="sampled-large.cache")
+    file_path.write_bytes(b"x" * (16 * 1024 * 1024))
+    original_stat = file_path.stat()
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    cache.key_generator.hasher.full_hash_threshold = 1024
+    version_context = build_cache_version_context({"timeout": 30})
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    assert cache.key_generator.hasher.hash_file(str(file_path)).startswith("fingerprint:")
+    assert cache.store_result(str(file_path), expected, 10, version_context=version_context) is False
+
+    with file_path.open("r+b") as f:
+        f.seek(6 * 1024 * 1024)
+        f.write(b"evil")
+    os.utime(file_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    assert cache.generate_cache_key(str(file_path), version_context=version_context) is None
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
 def test_same_size_rewrite_with_high_resolution_mtime_invalidates_cache(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path, name="medium.cache")
     cache = ScanResultsCache(str(tmp_path / "scan-cache"))
