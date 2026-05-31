@@ -1,3 +1,4 @@
+import contextlib
 import re
 import shutil
 import tempfile
@@ -35,7 +36,37 @@ def _get_total_size(urls: list[str]) -> int:
     return total
 
 
-def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
+def _format_size(size_bytes: int) -> str:
+    size = float(size_bytes)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PB"
+
+
+def _enforce_max_size(size_bytes: int, max_size: int | None) -> None:
+    if max_size is not None and max_size > 0 and size_bytes > max_size:
+        raise ValueError(
+            f"PyTorch Hub model size ({_format_size(size_bytes)}) "
+            f"exceeds maximum allowed size ({_format_size(max_size)})"
+        )
+
+
+def _response_content_length(resp: requests.Response) -> int | None:
+    try:
+        content_length = resp.headers.get("content-length")
+        return int(content_length) if content_length is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _remove_partial_file(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        path.unlink()
+
+
+def download_pytorch_hub_model(url: str, cache_dir: Path | None = None, max_size: int | None = None) -> Path:
     """Download model weights referenced from a PyTorch Hub page."""
     if not is_pytorch_hub_url(url):
         raise ValueError(f"Not a PyTorch Hub URL: {url}")
@@ -55,23 +86,37 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
 
     total_size = _get_total_size(weight_urls)
     if total_size > 0:
+        _enforce_max_size(total_size, max_size)
         has_space, message = check_disk_space(dest_dir, total_size)
         if not has_space:
             if cache_dir is None:
                 shutil.rmtree(dest_dir, ignore_errors=True)
             raise Exception(f"Cannot download model from {url}: {message}")
 
+    downloaded_size = 0
     for weight_url in weight_urls:
         filename = weight_url.split("/")[-1]
         dest_file = dest_dir / filename
         try:
             with requests.get(weight_url, stream=True, timeout=30) as resp:
                 resp.raise_for_status()
+                content_length = _response_content_length(resp)
+                if content_length is not None:
+                    _enforce_max_size(downloaded_size + content_length, max_size)
+
                 with open(dest_file, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=8192):
                         if chunk:
+                            _enforce_max_size(downloaded_size + len(chunk), max_size)
                             f.write(chunk)
+                            downloaded_size += len(chunk)
+        except ValueError:
+            _remove_partial_file(dest_file)
+            if cache_dir is None:
+                shutil.rmtree(dest_dir, ignore_errors=True)
+            raise
         except Exception as e:
+            _remove_partial_file(dest_file)
             if cache_dir is None:
                 shutil.rmtree(dest_dir, ignore_errors=True)
             raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e

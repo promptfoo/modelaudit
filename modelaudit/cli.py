@@ -1392,6 +1392,7 @@ def _resolve_scan_source_for_path(
             download_path = download_pytorch_hub_model(
                 path,
                 cache_dir=Path(runtime.cache_dir) if runtime.cache_dir else None,
+                max_size=runtime.max_download_bytes,
             )
             download_duration = time.time() - download_start
             try:

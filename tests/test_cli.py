@@ -1252,6 +1252,36 @@ def test_scan_pytorchhub_url_success(mock_rmtree, mock_scan, mock_download, mock
 
 @patch("modelaudit.cli.is_pytorch_hub_url")
 @patch("modelaudit.cli.download_pytorch_hub_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_pytorchhub_url_passes_max_download_bytes(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_ph_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    mock_is_ph_url.return_value = True
+    test_dir = tmp_path / "hub"
+    test_dir.mkdir()
+    (test_dir / "model.pt").write_text("dummy")
+    mock_download.return_value = test_dir
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=1,
+        issues=[],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["test"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "https://pytorch.org/hub/pytorch_vision_resnet/", "--max-size", "5KB"])
+
+    assert result.exit_code == 0
+    assert mock_download.call_args.kwargs["max_size"] == 5 * 1024
+
+
+@patch("modelaudit.cli.is_pytorch_hub_url")
+@patch("modelaudit.cli.download_pytorch_hub_model")
 def test_scan_pytorchhub_url_download_failure(mock_download, mock_is_ph_url):
     """Test download failure for PyTorch Hub URL."""
     mock_is_ph_url.return_value = True
