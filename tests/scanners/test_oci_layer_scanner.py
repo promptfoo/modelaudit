@@ -1,3 +1,5 @@
+import gzip
+import hashlib
 import json
 import os
 import shutil
@@ -991,6 +993,83 @@ class TestOciLayerScanner:
         assert len(checks) == 1
         assert checks[0].details["compressed_size"] < layer_path.stat().st_size
         assert checks[0].details["actual_ratio"] > 2.0
+
+    def test_scan_layer_sizes_concatenated_gzip_members_for_ratio(self, tmp_path: Path) -> None:
+        """Concatenated gzip members should be included in the compressed budget denominator."""
+        payload = tmp_path / "payload.bin"
+        payload.write_bytes(b"".join(hashlib.sha256(str(index).encode()).digest() for index in range(8192)))
+
+        layer_path = tmp_path / "concatenated.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(payload, arcname="payload.bin")
+        layer_path.write_bytes(gzip.compress(b"") + layer_path.read_bytes())
+
+        manifest_path = tmp_path / "concatenated.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["concatenated.tar.gz"]}))
+
+        result = OciLayerScanner({"compressed_max_decompression_ratio": 100.0}).scan(str(manifest_path))
+
+        assert result.success is True
+        assert "oci_layer_decompression_ratio_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+    def test_scan_layer_reports_gzip_tail_decompressed_size_after_tar_eof(self, tmp_path: Path) -> None:
+        """Gzip bytes after TAR EOF should still count toward the decompressed-byte budget."""
+        payload = tmp_path / "payload.bin"
+        payload.write_bytes(b"safe")
+
+        raw_tar_path = tmp_path / "raw-tail.tar"
+        with tarfile.open(raw_tar_path, "w") as tar:
+            tar.add(payload, arcname="payload.bin")
+        raw_tar = raw_tar_path.read_bytes()
+
+        layer_path = tmp_path / "tail-size.tar.gz"
+        layer_path.write_bytes(gzip.compress(raw_tar + (b"\x00" * 8192)))
+
+        manifest_path = tmp_path / "tail-size.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["tail-size.tar.gz"]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner({"compressed_max_decompressed_bytes": len(raw_tar) + 1024}).scan(
+                str(manifest_path)
+            )
+
+        assert result.success is False
+        assert mock_copy.call_count == 1
+        assert "oci_layer_decompressed_size_exceeded" in result.metadata["scan_outcome_reasons"]
+        checks = [check for check in result.checks if check.name == "Layer Decompression Budget Check"]
+        assert len(checks) == 1
+        assert checks[0].details["decompressed_size"] > checks[0].details["max_decompressed_size"]
+
+    def test_scan_layer_checks_gzip_tail_ratio_after_tar_eof(self, tmp_path: Path) -> None:
+        """Highly-compressible gzip data after TAR EOF should still count toward ratio limits."""
+        payload = tmp_path / "payload.bin"
+        payload.write_bytes(b"safe")
+
+        raw_tar_path = tmp_path / "raw-ratio.tar"
+        with tarfile.open(raw_tar_path, "w") as tar:
+            tar.add(payload, arcname="payload.bin")
+        raw_tar = raw_tar_path.read_bytes()
+
+        layer_path = tmp_path / "tail-ratio.tar.gz"
+        layer_path.write_bytes(gzip.compress(raw_tar + (b"\x00" * 1024 * 1024)))
+
+        manifest_path = tmp_path / "tail-ratio.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["tail-ratio.tar.gz"]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner(
+                {
+                    "compressed_max_decompressed_bytes": len(raw_tar) + (2 * 1024 * 1024),
+                    "compressed_max_decompression_ratio": 100.0,
+                }
+            ).scan(str(manifest_path))
+
+        assert result.success is False
+        assert mock_copy.call_count == 1
+        assert "oci_layer_decompression_ratio_exceeded" in result.metadata["scan_outcome_reasons"]
+        checks = [check for check in result.checks if check.name == "Layer Decompression Budget Check"]
+        assert len(checks) == 1
+        assert checks[0].details["actual_ratio"] > 100.0
 
     def test_scan_layer_scans_in_budget_members_before_entry_count_exhaustion(self, tmp_path: Path) -> None:
         """Layer entry exhaustion should preserve findings from members already within budget."""

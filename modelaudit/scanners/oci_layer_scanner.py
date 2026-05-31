@@ -136,31 +136,45 @@ class OciLayerScanner(BaseScanner):
             rule_code="S902",
         )
 
-    def _gzip_stream_consumed_size(self, layer_path: str) -> int | None:
+    def _gzip_stream_metrics(self, layer_path: str) -> tuple[int | None, int, bool]:
         decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        compressed_read = 0
+        compressed_consumed = 0
         decompressed_seen = 0
         with open(layer_path, "rb") as layer_file:
+            data = b""
             while True:
-                chunk = layer_file.read(self._GZIP_CHUNK_BYTES)
-                if not chunk:
-                    break
-                compressed_read += len(chunk)
-                data = chunk
+                if not data:
+                    data = layer_file.read(self._GZIP_CHUNK_BYTES)
+                    if not data:
+                        break
+
                 while data:
                     try:
+                        before_len = len(data)
                         output = decompressor.decompress(data, self._GZIP_OUTPUT_CHUNK_BYTES)
                     except zlib.error:
-                        return None
+                        return None, decompressed_seen, False
+                    compressed_consumed += (
+                        before_len - len(decompressor.unconsumed_tail) - len(decompressor.unused_data)
+                    )
                     decompressed_seen += len(output)
                     if decompressed_seen > self.max_decompressed_bytes:
-                        return None
+                        return compressed_consumed, decompressed_seen, True
                     if decompressor.eof:
-                        return compressed_read - len(decompressor.unused_data)
+                        data = decompressor.unused_data
+                        while len(data) < 2:
+                            chunk = layer_file.read(self._GZIP_CHUNK_BYTES)
+                            if not chunk:
+                                return compressed_consumed, decompressed_seen, False
+                            data += chunk
+                        if not data.startswith(b"\x1f\x8b"):
+                            return compressed_consumed, decompressed_seen, False
+                        decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                        continue
                     data = decompressor.unconsumed_tail
         if decompressor.eof:
-            return compressed_read - len(decompressor.unused_data)
-        return None
+            return compressed_consumed, decompressed_seen, False
+        return None, decompressed_seen, False
 
     @staticmethod
     def _get_scannable_extension(member_name: str) -> str | None:
@@ -463,14 +477,19 @@ class OciLayerScanner(BaseScanner):
                     )
                     continue
 
-                compressed_budget_size = self._gzip_stream_consumed_size(layer_path) or layer_size
+                gzip_compressed_size, gzip_decompressed_size, gzip_decompressed_size_exceeded = (
+                    self._gzip_stream_metrics(layer_path)
+                )
+                compressed_budget_size = gzip_compressed_size or layer_size
                 layer_entry_count = 0
                 layer_payload_size = 0
+                layer_budget_exhausted = False
                 with tarfile.open(layer_path, "r:gz") as tar:
                     for member in tar:
                         layer_entry_count += 1
                         if layer_entry_count > self.max_layer_entries:
                             scan_complete = False
+                            layer_budget_exhausted = True
                             self._add_layer_budget_check(
                                 result,
                                 manifest_path=path,
@@ -489,6 +508,7 @@ class OciLayerScanner(BaseScanner):
                         ratio = (decompressed_size / compressed_budget_size) if compressed_budget_size > 0 else 0.0
                         if decompressed_size > self.max_decompressed_bytes:
                             scan_complete = False
+                            layer_budget_exhausted = True
                             self._add_layer_budget_check(
                                 result,
                                 manifest_path=path,
@@ -509,6 +529,7 @@ class OciLayerScanner(BaseScanner):
 
                         if compressed_budget_size > 0 and ratio > self.max_decompression_ratio:
                             scan_complete = False
+                            layer_budget_exhausted = True
                             self._add_layer_budget_check(
                                 result,
                                 manifest_path=path,
@@ -638,6 +659,46 @@ class OciLayerScanner(BaseScanner):
                             fileobj.close()
                             if tmp_path and os.path.exists(tmp_path):
                                 os.unlink(tmp_path)
+                if not layer_budget_exhausted:
+                    if gzip_decompressed_size_exceeded or gzip_decompressed_size > self.max_decompressed_bytes:
+                        scan_complete = False
+                        self._add_layer_budget_check(
+                            result,
+                            manifest_path=path,
+                            layer_ref=layer_ref,
+                            reason="oci_layer_decompressed_size_exceeded",
+                            message=(
+                                f"Layer {self._normalize_layer_ref(layer_ref)} decompressed size exceeded limit "
+                                f"({gzip_decompressed_size} > {self.max_decompressed_bytes})"
+                            ),
+                            details={
+                                "decompressed_size": gzip_decompressed_size,
+                                "compressed_size": compressed_budget_size,
+                                "max_decompressed_size": self.max_decompressed_bytes,
+                                "entries": layer_entry_count,
+                            },
+                        )
+                    elif compressed_budget_size > 0:
+                        final_ratio = gzip_decompressed_size / compressed_budget_size
+                        if final_ratio > self.max_decompression_ratio:
+                            scan_complete = False
+                            self._add_layer_budget_check(
+                                result,
+                                manifest_path=path,
+                                layer_ref=layer_ref,
+                                reason="oci_layer_decompression_ratio_exceeded",
+                                message=(
+                                    f"Layer {self._normalize_layer_ref(layer_ref)} decompression ratio exceeded limit "
+                                    f"({final_ratio:.1f}x > {self.max_decompression_ratio:.1f}x)"
+                                ),
+                                details={
+                                    "decompressed_size": gzip_decompressed_size,
+                                    "compressed_size": compressed_budget_size,
+                                    "max_ratio": self.max_decompression_ratio,
+                                    "actual_ratio": final_ratio,
+                                    "entries": layer_entry_count,
+                                },
+                            )
             except Exception as e:
                 scan_complete = False
                 self._mark_incomplete_coverage(result, "oci_layer_processing_failed")
