@@ -1964,6 +1964,42 @@ __import__('pickle').loads(data)
         )
         assert determine_exit_code(audit_result) == 2
 
+    def test_wrapped_layer_config_depth_budget_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
+        """Excessive wrapper nesting must fail closed before exhausting the Python stack."""
+        nested_layer: dict[str, Any] = {
+            "class_name": "Dense",
+            "name": "leaf",
+            "config": {"units": 1},
+        }
+        for index in range(KerasZipScanner.MAX_NESTED_LAYER_DEPTH + 1):
+            nested_layer = {
+                "class_name": "TimeDistributed",
+                "name": f"wrapper_{index}",
+                "config": {"layer": nested_layer},
+            }
+
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {"layers": [nested_layer]},
+            },
+            file_name="deep_wrapped_layer.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        audit_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_nested_layer_depth_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Nested Layer Depth Validation"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("max_nested_layer_depth") == KerasZipScanner.MAX_NESTED_LAYER_DEPTH
+            for check in result.checks
+        )
+        assert determine_exit_code(audit_result) == 2
+
     def test_invalid_json_config(self, tmp_path: Path) -> None:
         """Test handling of invalid JSON in config."""
         scanner = KerasZipScanner()

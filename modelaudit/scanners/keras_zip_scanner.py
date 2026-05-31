@@ -171,6 +171,7 @@ class KerasZipScanner(BaseScanner):
 
     MAX_EMBEDDED_WEIGHTS_BYTES: ClassVar[int] = 100 * 1024 * 1024
     MAX_DUPLICATE_MEMBER_COMPARE_CANDIDATES: ClassVar[int] = 16
+    MAX_NESTED_LAYER_DEPTH: ClassVar[int] = 64
     _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
     _NESTED_LAYER_CONFIG_KEYS: ClassVar[tuple[str, ...]] = ("layer", "backward_layer", "cell", "cells")
     _NESTED_LAYER_LIST_CONFIG_KEYS: ClassVar[frozenset[str]] = frozenset({"cell", "cells"})
@@ -677,8 +678,29 @@ class KerasZipScanner(BaseScanner):
 
         result.finish(success=result.success and not result.has_errors)
 
-    def _scan_model_config(self, model_config: dict[str, Any], result: ScanResult) -> None:
+    def _scan_model_config(
+        self,
+        model_config: dict[str, Any],
+        result: ScanResult,
+        nested_layer_depth: int = 0,
+    ) -> None:
         """Scan the model configuration for suspicious elements"""
+        if nested_layer_depth > self.MAX_NESTED_LAYER_DEPTH:
+            self._mark_inconclusive_scan_result(result, "keras_zip_nested_layer_depth_exceeded")
+            result.add_check(
+                name="Nested Layer Depth Validation",
+                passed=False,
+                message=f"Nested Keras layer depth exceeds maximum of {self.MAX_NESTED_LAYER_DEPTH}",
+                rule_code="S902",
+                severity=IssueSeverity.INFO,
+                location=f"{self.current_file_path}/config.json",
+                details={
+                    "actual_depth": nested_layer_depth,
+                    "max_nested_layer_depth": self.MAX_NESTED_LAYER_DEPTH,
+                },
+            )
+            return
+
         # Check model class name
         model_class = model_config.get("class_name", "")
         result.metadata["model_class"] = model_class
@@ -904,7 +926,7 @@ class KerasZipScanner(BaseScanner):
             if layer_class in self._MODEL_CONTAINER_CLASSES and "config" in layer:
                 nested_config = layer["config"]
                 if isinstance(nested_config, dict):
-                    self._scan_model_config(layer, result)
+                    self._scan_model_config(layer, result, nested_layer_depth + 1)
                 else:
                     self._mark_inconclusive_scan_result(result, "keras_zip_nested_model_config_invalid_type")
                     result.add_check(
@@ -917,12 +939,18 @@ class KerasZipScanner(BaseScanner):
                         details={"actual_type": type(nested_config).__name__, "expected_type": "dict"},
                     )
 
-            self._scan_wrapped_layer_config(layer_config, result, layer_name)
+            self._scan_wrapped_layer_config(layer_config, result, layer_name, nested_layer_depth)
 
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
 
-    def _scan_wrapped_layer_config(self, layer_config: Any, result: ScanResult, layer_name: str) -> None:
+    def _scan_wrapped_layer_config(
+        self,
+        layer_config: Any,
+        result: ScanResult,
+        layer_name: str,
+        nested_layer_depth: int,
+    ) -> None:
         """Scan wrapper-owned nested layer payloads such as `TimeDistributed.config.layer`."""
         if not isinstance(layer_config, dict):
             return
@@ -933,10 +961,10 @@ class KerasZipScanner(BaseScanner):
 
             nested_layer = layer_config.get(config_key)
             if isinstance(nested_layer, list) and config_key in self._NESTED_LAYER_LIST_CONFIG_KEYS:
-                self._scan_wrapped_layer_list(nested_layer, result, layer_name, config_key)
+                self._scan_wrapped_layer_list(nested_layer, result, layer_name, config_key, nested_layer_depth)
                 continue
 
-            self._scan_wrapped_layer_value(nested_layer, result, layer_name, config_key)
+            self._scan_wrapped_layer_value(nested_layer, result, layer_name, config_key, nested_layer_depth)
 
     def _scan_wrapped_layer_list(
         self,
@@ -944,9 +972,16 @@ class KerasZipScanner(BaseScanner):
         result: ScanResult,
         layer_name: str,
         config_key: str,
+        nested_layer_depth: int,
     ) -> None:
         for index, nested_layer in enumerate(nested_layers):
-            self._scan_wrapped_layer_value(nested_layer, result, layer_name, f"{config_key}[{index}]")
+            self._scan_wrapped_layer_value(
+                nested_layer,
+                result,
+                layer_name,
+                f"{config_key}[{index}]",
+                nested_layer_depth,
+            )
 
     def _scan_wrapped_layer_value(
         self,
@@ -954,9 +989,10 @@ class KerasZipScanner(BaseScanner):
         result: ScanResult,
         layer_name: str,
         config_key: str,
+        nested_layer_depth: int,
     ) -> None:
         if isinstance(nested_layer, dict):
-            self._scan_wrapped_layer_dict(nested_layer, result)
+            self._scan_wrapped_layer_dict(nested_layer, result, nested_layer_depth)
             return
 
         self._mark_inconclusive_scan_result(result, "keras_zip_wrapped_layer_invalid_type")
@@ -970,7 +1006,12 @@ class KerasZipScanner(BaseScanner):
             details={"config_key": config_key, "actual_type": type(nested_layer).__name__, "expected_type": "dict"},
         )
 
-    def _scan_wrapped_layer_dict(self, nested_layer: dict[str, Any], result: ScanResult) -> None:
+    def _scan_wrapped_layer_dict(
+        self,
+        nested_layer: dict[str, Any],
+        result: ScanResult,
+        nested_layer_depth: int,
+    ) -> None:
         metadata_snapshot = {
             key: result.metadata[key] for key in ("model_class", "layer_counts") if key in result.metadata
         }
@@ -979,7 +1020,7 @@ class KerasZipScanner(BaseScanner):
             "class_name": self._WRAPPED_LAYER_SCAN_MODEL["class_name"],
             "config": {"layers": [nested_layer]},
         }
-        self._scan_model_config(synthetic_model_config, result)
+        self._scan_model_config(synthetic_model_config, result, nested_layer_depth + 1)
         for key in missing_metadata_keys:
             result.metadata.pop(key, None)
         result.metadata.update(metadata_snapshot)
