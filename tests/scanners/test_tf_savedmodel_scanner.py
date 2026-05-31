@@ -559,6 +559,102 @@ def test_protobuf_string_injection_detected_in_function_definition(tmp_path: Pat
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_padded_protobuf_string_injection_past_length_threshold_is_detected(tmp_path: Path) -> None:
+    payload = "A" * 12_000 + "os.system('/bin/echo padded exploit')"
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "padded_payload_node",
+                "string_attrs": {"payload": payload},
+            }
+        ],
+        model_name="padded_string_injection",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    injection_issues = [
+        issue
+        for issue in result.issues
+        if "protobuf string" in issue.message.lower() and issue.details.get("attack_type") == "system_command"
+    ]
+    assert result.success is False
+    assert determine_exit_code(aggregate) == 1
+    assert injection_issues, "Expected padded protobuf string injection detection past the old 10 KB cutoff"
+    assert any(issue.details.get("attribute_name") == "payload" for issue in injection_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_benign_long_protobuf_string_is_scanned_without_security_finding(tmp_path: Path) -> None:
+    benign_value = "safe-metadata-" + ("A" * 12_000)
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "benign_long_node",
+                "string_attrs": {"description": benign_value},
+            }
+        ],
+        model_name="benign_long_string",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    assert result.success is True
+    assert determine_exit_code(aggregate) == 0
+    assert not [
+        issue
+        for issue in result.issues
+        if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        and "protobuf string" in issue.message.lower()
+    ]
+    assert any(check.name == "Protobuf String Length Check" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_oversized_protobuf_string_without_full_coverage_fails_closed(tmp_path: Path) -> None:
+    oversized_value = "safe-metadata-" + ("A" * 300_000)
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "oversized_benign_node",
+                "string_attrs": {"description": oversized_value},
+            }
+        ],
+        model_name="oversized_long_string",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    assert result.success is False
+    assert determine_exit_code(aggregate) == 2
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "savedmodel_protobuf_string_scan_incomplete"
+    incomplete_checks = [
+        check
+        for check in result.checks
+        if check.name == "Protobuf String Length Check"
+        and check.details.get("scan_outcome_reason") == "savedmodel_protobuf_string_scan_incomplete"
+    ]
+    assert incomplete_checks
+    assert incomplete_checks[0].details["analysis_incomplete"] is True
+    assert not [
+        issue
+        for issue in result.issues
+        if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        and "protobuf string" in issue.message.lower()
+    ]
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_function_definition_ops_are_counted_in_metadata(tmp_path: Path) -> None:
     model_path = _create_test_savedmodel_with_scoped_nodes(
         tmp_path,

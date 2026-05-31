@@ -52,6 +52,10 @@ _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 
 _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
 _MAX_PROTOBUF_PARSE_BYTES = 20 * 1024 * 1024
 _MAX_COLLECTION_VALUE_BYTES = 256 * 1024
+_PROTOBUF_STRING_LENGTH_CHECK_THRESHOLD = 10_000
+_MAX_PROTOBUF_STRING_FULL_SCAN_CHARS = 32 * 1024
+_PROTOBUF_STRING_SCAN_WINDOW_CHARS = 16 * 1024
+_PROTOBUF_STRING_INCOMPLETE_REASON = "savedmodel_protobuf_string_scan_incomplete"
 _CORE_ROOT_MODEL_FILES = frozenset({"saved_model.pb", "keras_metadata.pb", "fingerprint.pb"})
 _CORE_ROOT_MODEL_DIRS = frozenset({"assets", "assets.extra", "variables"})
 _CORE_ROOT_ASSET_DIRS = frozenset({"assets", "assets.extra"})
@@ -1432,6 +1436,32 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # coverage, so wiring them in would expand SavedModel findings beyond
         # the narrowly-scoped function-definition fix until they are validated.
 
+    @staticmethod
+    def _protobuf_string_scan_windows(string_val: str) -> tuple[list[tuple[int, int, str]], bool]:
+        """Return bounded scan windows and whether they cover the whole string."""
+        string_length = len(string_val)
+        if string_length <= _MAX_PROTOBUF_STRING_FULL_SCAN_CHARS:
+            return [(0, string_length, string_val)], True
+
+        window_size = min(_PROTOBUF_STRING_SCAN_WINDOW_CHARS, string_length)
+        starts = [
+            0,
+            max(0, _PROTOBUF_STRING_LENGTH_CHECK_THRESHOLD - window_size // 4),
+            min(_PROTOBUF_STRING_LENGTH_CHECK_THRESHOLD, max(0, string_length - window_size)),
+            max(0, string_length // 2 - window_size // 2),
+            max(0, string_length - window_size),
+        ]
+        windows: list[tuple[int, int, str]] = []
+        seen: set[tuple[int, int]] = set()
+        for start in starts:
+            end = min(string_length, start + window_size)
+            key = (start, end)
+            if key in seen:
+                continue
+            seen.add(key)
+            windows.append((start, end, string_val[start:end]))
+        return windows, False
+
     def _check_protobuf_string_injection(self, saved_model: Any, result: ScanResult) -> None:
         """Check for string injection attacks in protobuf fields"""
 
@@ -1488,48 +1518,83 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
                     # Check each string value against injection patterns
                     for string_val in string_vals_to_check:
-                        if len(string_val) > 10000:  # Skip extremely long strings to avoid performance issues
+                        scan_windows, scanned_entire_string = self._protobuf_string_scan_windows(string_val)
+                        matched_injection: tuple[str, str, str, list[Any], int, int] | None = None
+                        for pattern, attack_type, description in injection_patterns:
+                            for window_start, window_end, scan_text in scan_windows:
+                                matches = re.findall(pattern, scan_text, re.IGNORECASE)
+                                if matches:
+                                    matched_injection = (
+                                        pattern,
+                                        attack_type,
+                                        description,
+                                        matches,
+                                        window_start,
+                                        window_end,
+                                    )
+                                    break
+                            if matched_injection is not None:
+                                break
+
+                        if len(string_val) > _PROTOBUF_STRING_LENGTH_CHECK_THRESHOLD:
+                            string_details = self._build_node_details(
+                                node_context,
+                                {
+                                    "attribute_name": attr_name,
+                                    "string_length": len(string_val),
+                                    "attack_type": "protobuf_string_bomb",
+                                    "string_scan_strategy": "full" if scanned_entire_string else "windowed",
+                                    "string_scan_window_count": len(scan_windows),
+                                    "max_full_scan_chars": _MAX_PROTOBUF_STRING_FULL_SCAN_CHARS,
+                                },
+                            )
+                            if not scanned_entire_string and matched_injection is None:
+                                mark_inconclusive_scan_result(result, _PROTOBUF_STRING_INCOMPLETE_REASON)
+                                mark_operational_scan_error(result, _PROTOBUF_STRING_INCOMPLETE_REASON)
+                                string_details.update(
+                                    {
+                                        "analysis_incomplete": True,
+                                        "scan_outcome_reason": _PROTOBUF_STRING_INCOMPLETE_REASON,
+                                        "window_size_chars": _PROTOBUF_STRING_SCAN_WINDOW_CHARS,
+                                    }
+                                )
                             result.add_check(
                                 name="Protobuf String Length Check",
                                 passed=False,
                                 message=f"Abnormally long string in node attribute (length: {len(string_val)})",
                                 severity=IssueSeverity.INFO,
                                 location=self._build_node_location(node_context, attr_name=attr_name),
-                                details=self._build_node_details(
-                                    node_context,
-                                    {
-                                        "attribute_name": attr_name,
-                                        "string_length": len(string_val),
-                                        "attack_type": "protobuf_string_bomb",
-                                    },
-                                ),
+                                details=string_details,
                             )
+
+                        if matched_injection is None:
                             continue
 
-                        for pattern, attack_type, description in injection_patterns:
-                            matches = re.findall(pattern, string_val, re.IGNORECASE)
-                            if matches:
-                                result.add_check(
-                                    name="Protobuf String Injection Check",
-                                    passed=False,
-                                    message=f"Potential {description} detected in protobuf string",
-                                    severity=IssueSeverity.CRITICAL
-                                    if attack_type in ["code_injection", "system_command"]
-                                    else IssueSeverity.WARNING,
-                                    location=self._build_node_location(node_context, attr_name=attr_name),
-                                    details=self._build_node_details(
-                                        node_context,
-                                        {
-                                            "attribute_name": attr_name,
-                                            "pattern_matched": pattern,
-                                            "matches": matches[:5],  # Limit to first 5 matches
-                                            "attack_type": attack_type,
-                                            "description": description,
-                                            "total_matches": len(matches),
-                                        },
-                                    ),
-                                )
-                                break  # Only report first match per string to avoid spam
+                        pattern, attack_type, description, matches, window_start, window_end = matched_injection
+                        result.add_check(
+                            name="Protobuf String Injection Check",
+                            passed=False,
+                            message=f"Potential {description} detected in protobuf string",
+                            severity=IssueSeverity.CRITICAL
+                            if attack_type in ["code_injection", "system_command"]
+                            else IssueSeverity.WARNING,
+                            location=self._build_node_location(node_context, attr_name=attr_name),
+                            details=self._build_node_details(
+                                node_context,
+                                {
+                                    "attribute_name": attr_name,
+                                    "pattern_matched": pattern,
+                                    "matches": matches[:5],  # Limit to first 5 matches
+                                    "attack_type": attack_type,
+                                    "description": description,
+                                    "total_matches": len(matches),
+                                    "string_length": len(string_val),
+                                    "string_scan_strategy": "full" if scanned_entire_string else "windowed",
+                                    "matched_window_start": window_start,
+                                    "matched_window_end": window_end,
+                                },
+                            ),
+                        )
 
     def _check_protobuf_buffer_overflow(self, saved_model: Any, result: ScanResult) -> None:
         """Check for potential buffer overflow patterns in protobuf data"""
