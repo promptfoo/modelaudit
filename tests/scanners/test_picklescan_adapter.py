@@ -534,6 +534,44 @@ def test_pickle_report_to_scan_result_fails_closed_for_inconclusive_report_witho
     )
 
 
+def test_pickle_report_to_scan_result_fails_closed_for_protocol5_buffer_notice() -> None:
+    report = PickleReport(
+        source="buffer.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message="Encountered 1 protocol 5 buffer opcode(s); external buffer context is opaque",
+                severity=Severity.INFO,
+                location="buffer.pkl (pos 2)",
+                code="buffer_opcode",
+                details={
+                    "buffer_opcode_count": 1,
+                    "next_buffer_count": 1,
+                    "readonly_buffer_count": 0,
+                    "requires_external_buffer_context": True,
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["protocol5_external_buffer_context"]
+    assert result.metadata["analysis_incomplete"] is True
+    assert any(
+        check.name == "Standalone Pickle Notice"
+        and check.status.value == "failed"
+        and check.rule_code == "S902"
+        and check.details["pickle_notice_code"] == "buffer_opcode"
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+
+
 def test_pickle_report_to_scan_result_fails_closed_for_truncated_literal_scan_notice() -> None:
     report = PickleReport(
         source="large-string.pkl",

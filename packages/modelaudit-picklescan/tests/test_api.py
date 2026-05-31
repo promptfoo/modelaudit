@@ -4537,12 +4537,17 @@ def test_scan_bytes_fails_closed_for_encoded_nested_payload_over_byte_limit(
 def test_scan_bytes_collapses_protocol5_buffer_opcode_notices() -> None:
     report = scan_bytes(b"\x80\x05\x97\x97\x98\x97\x98.", source="many-buffer-opcodes.pkl")
 
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not report.is_clean
     buffer_notices = [notice for notice in report.notices if notice.code == "buffer_opcode"]
     assert len(buffer_notices) == 1
     assert buffer_notices[0].details["buffer_opcode_count"] == 5
     assert buffer_notices[0].details["next_buffer_count"] == 3
     assert buffer_notices[0].details["readonly_buffer_count"] == 2
     assert buffer_notices[0].details["readonly_buffer_empty_stack_count"] == 0
+    assert buffer_notices[0].details["requires_external_buffer_context"] is True
+    assert buffer_notices[0].details["analysis_incomplete"] is True
 
 
 def test_scan_bytes_preserves_readonly_buffer_empty_stack_parity() -> None:

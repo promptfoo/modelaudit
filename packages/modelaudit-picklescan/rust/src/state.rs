@@ -1220,6 +1220,9 @@ impl<'a> ScanState<'a> {
         if buffer_opcode_count == 0 {
             return;
         }
+        if self.status.is_complete() {
+            self.status = ScanStatus::Inconclusive;
+        }
         let position = self.first_buffer_opcode_position.unwrap_or(0);
         self.add_notice(Notice {
             message: format!(
@@ -1249,6 +1252,7 @@ impl<'a> ScanState<'a> {
                     "requires_external_buffer_context".to_string(),
                     DetailValue::Bool(true),
                 ),
+                ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
             ],
         });
     }
@@ -6920,6 +6924,13 @@ mod tests {
             detail_usize(&notice.details, "readonly_buffer_count"),
             Some(2)
         );
+        assert!(notice
+            .details
+            .iter()
+            .any(|(key, value)| key == "analysis_incomplete"
+                && matches!(value, DetailValue::Bool(true))));
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.verdict, "unknown");
     }
 
     #[test]

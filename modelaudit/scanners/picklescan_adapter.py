@@ -26,6 +26,7 @@ _INCONCLUSIVE_NOTICE_CODES = frozenset(
         "opcode_budget",
         "parse_incomplete",
         "known_stream_truncated",
+        "buffer_opcode",
         "timeout",
         "unbounded_stream_truncated",
     }
@@ -49,6 +50,7 @@ _LEGACY_SCAN_OUTCOME_REASONS = {
     "opcode_budget": "opcode_budget_exceeded",
     "parse_incomplete": "pickle_analysis_incomplete",
     "known_stream_truncated": "known_stream_truncated",
+    "buffer_opcode": "protocol5_external_buffer_context",
     "timeout": "scan_timeout",
     "unbounded_stream_truncated": "unbounded_stream_truncated",
 }
@@ -498,6 +500,8 @@ def _legacy_why_for_notice(notice_code: str | None) -> str | None:
         return "Nested pickle payloads can hide code execution paths from shallow scanners."
     if notice_code == "encoded_nested_payload_detected":
         return "Encoded nested pickle payloads can hide deserialization gadgets inside metadata strings."
+    if notice_code == "buffer_opcode":
+        return "Protocol 5 out-of-band buffer opcodes depend on external bytes that were not available to the scanner."
     return None
 
 
