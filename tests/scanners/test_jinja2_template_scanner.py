@@ -789,6 +789,23 @@ class TestJinja2TemplateScannerEdgeCases:
         assert budget_checks[0].details["budget_type"] == "budget_exceeded"
         assert budget_checks[0].details["detail"] == "output"
 
+    def test_sandbox_probe_preflights_static_range_list_before_starting_worker(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+
+        def fail_get_context(_method: str | None = None) -> None:
+            pytest.fail("static range list should fail closed before starting a worker")
+
+        monkeypatch.setattr(jinja2_template_scanner.mp, "get_context", fail_get_context)
+
+        assert scanner._test_template_safety_with_budget("{{ range(10 ** 8)|list }}") == (
+            "budget_exceeded",
+            "output",
+        )
+
     def test_sandbox_probe_timeout_bounds_low_output_execution(self, tmp_path: Path) -> None:
         pytest.importorskip("jinja2.sandbox")
         template_file = tmp_path / "cpu.jinja"

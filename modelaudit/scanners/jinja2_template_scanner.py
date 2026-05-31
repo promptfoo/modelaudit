@@ -1309,6 +1309,10 @@ class Jinja2TemplateScanner(BaseScanner):
             return True
         return self._template_ast_has_static_render_budget_risk(template_content)
 
+    def _template_has_static_preflight_render_budget_risk(self, template_content: str) -> bool:
+        parsed = self._parse_template_ast(template_content)
+        return parsed is not None and self._template_ast_has_static_range_list_budget_risk(parsed)
+
     def _template_has_static_sandbox_risk(self, template_content: str) -> bool:
         return bool(
             re.search(r"\.\s*__\w+__", template_content)
@@ -1353,14 +1357,10 @@ class Jinja2TemplateScanner(BaseScanner):
         if parsed is None:
             return False
 
-        range_threshold = max(1, self.sandbox_render_max_output_chars)
-        for node in parsed.find_all(jinja2.nodes.Filter):
-            if node.name != "list" or not self._is_range_call(node.node):
-                continue
-            projected_size = self._constant_range_rendered_list_size(node.node.args, range_threshold)
-            if projected_size is not None and projected_size > self.sandbox_render_max_output_chars:
-                return True
+        if self._template_ast_has_static_range_list_budget_risk(parsed):
+            return True
 
+        range_threshold = max(1, self.sandbox_render_max_output_chars)
         for node in parsed.find_all(jinja2.nodes.Call):
             if not self._is_range_call(node):
                 continue
@@ -1377,6 +1377,17 @@ class Jinja2TemplateScanner(BaseScanner):
 
         for node in parsed.find_all(jinja2.nodes.Mul):
             projected_size = self._constant_repeated_sequence_size(node.left, node.right)
+            if projected_size is not None and projected_size > self.sandbox_render_max_output_chars:
+                return True
+
+        return False
+
+    def _template_ast_has_static_range_list_budget_risk(self, parsed: Any) -> bool:
+        range_threshold = max(1, self.sandbox_render_max_output_chars)
+        for node in parsed.find_all(jinja2.nodes.Filter):
+            if node.name != "list" or not self._is_range_call(node.node):
+                continue
+            projected_size = self._constant_range_rendered_list_size(node.node.args, range_threshold)
             if projected_size is not None and projected_size > self.sandbox_render_max_output_chars:
                 return True
 
@@ -1566,6 +1577,9 @@ class Jinja2TemplateScanner(BaseScanner):
         return failure
 
     def _test_template_safety_with_budget(self, template_content: str) -> tuple[str, str | None]:
+        if self._template_has_static_preflight_render_budget_risk(template_content):
+            return "budget_exceeded", "output"
+
         result_queue: Any | None = None
         ready_queue: Any | None = None
         process: Any | None = None
