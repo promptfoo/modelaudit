@@ -52,7 +52,7 @@ def _redact_url_for_display(url: str) -> str:
 
 def _redact_secret_match_preview(matched_text: str) -> str:
     redacted = redact_evidence_string(matched_text, max_chars=80)
-    if redacted != matched_text:
+    if REDACTED_EVIDENCE_VALUE in redacted:
         return redacted
     return REDACTED_EVIDENCE_VALUE
 

@@ -13,7 +13,7 @@ from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners import metadata_scanner
 from modelaudit.scanners._evidence_redaction import REDACTED_EVIDENCE_VALUE
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
-from modelaudit.scanners.metadata_scanner import MetadataScanner
+from modelaudit.scanners.metadata_scanner import MetadataScanner, _redact_secret_match_preview
 from modelaudit.utils.helpers import cache_decorator
 
 
@@ -401,6 +401,12 @@ class TestMetadataScanner:
         assert REDACTED_EVIDENCE_VALUE in previews
         assert f"Bearer {REDACTED_EVIDENCE_VALUE}" in previews
         assert f'api_key="{REDACTED_EVIDENCE_VALUE}"' in previews
+
+    def test_secret_match_preview_does_not_treat_truncation_as_redaction(self) -> None:
+        """Long unrecognized match shapes must fail closed instead of leaking a truncated prefix."""
+        raw_secret = "unrecognized-" + ("A" * 100)
+
+        assert _redact_secret_match_preview(raw_secret) == REDACTED_EVIDENCE_VALUE
 
     def test_scan_ignores_placeholder_secrets(self) -> None:
         """Test that obvious placeholders are not flagged as secrets."""
