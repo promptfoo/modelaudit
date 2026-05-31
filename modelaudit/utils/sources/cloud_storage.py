@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tempfile
+import zipfile
 from collections.abc import Callable, Collection, Coroutine, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -608,10 +609,12 @@ def filter_scannable_files(
 def _detect_cloud_content_route_format(fs: Any, file_info: dict[str, Any]) -> str | None:
     """Return a content-routed model format for a remote object, if cheaply identifiable."""
     file_url = str(file_info["path"])
+    size_is_known = "size" in file_info
     try:
         size = _parse_size_value(file_info.get("size", _CLOUD_CONTENT_SNIFF_BYTES))
     except (TypeError, ValueError):
         size = _CLOUD_CONTENT_SNIFF_BYTES
+        size_is_known = False
     if size <= 0:
         return None
 
@@ -627,7 +630,33 @@ def _detect_cloud_content_route_format(fs: Any, file_info: dict[str, Any]) -> st
     if not prefix:
         return None
 
-    from modelaudit.utils.file.detection import detect_format_from_magic_bytes
+    from modelaudit.utils.file.detection import (
+        PROTO0_1_MAX_PROBE_BYTES,
+        _could_start_proto0_or_1_pickle,
+        _looks_like_proto0_or_1_pickle,
+        _looks_like_uncompressed_tar_header,
+        detect_format_from_magic_bytes,
+    )
+    from modelaudit.utils.file.filtering import _zip_archive_has_scannable_content
+
+    if _looks_like_uncompressed_tar_header(prefix):
+        return "tar"
+
+    if _could_start_proto0_or_1_pickle(prefix):
+        max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES) if size_is_known else PROTO0_1_MAX_PROBE_BYTES
+        try:
+            with fs.open(file_url, "rb") as remote_file:
+                pickle_probe = remote_file.read(max_probe_size)
+        except Exception as exc:
+            raise ValueError(
+                "Cloud directory selective filtering incomplete: unable to inspect skipped object "
+                f"{redact_url_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+            ) from exc
+        if _looks_like_proto0_or_1_pickle(
+            pickle_probe,
+            sample_is_prefix=(not size_is_known and len(pickle_probe) >= max_probe_size) or size > len(pickle_probe),
+        ):
+            return "pickle"
 
     detected_format = detect_format_from_magic_bytes(
         prefix[:4],
@@ -641,6 +670,15 @@ def _detect_cloud_content_route_format(fs: Any, file_info: dict[str, Any]) -> st
         and prefix[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + len(_TFLITE_MAGIC_BYTES)] == _TFLITE_MAGIC_BYTES
     ):
         return "tflite"
+    if detected_format == "zip":
+        try:
+            with fs.open(file_url, "rb") as remote_file, zipfile.ZipFile(remote_file, "r") as archive:
+                return "zip" if _zip_archive_has_scannable_content(archive) else None
+        except Exception as exc:
+            raise ValueError(
+                "Cloud directory selective filtering incomplete: unable to classify skipped ZIP object "
+                f"{redact_url_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+            ) from exc
     return None if detected_format == "unknown" else detected_format
 
 

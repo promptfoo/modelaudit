@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import stat
+import tarfile
+import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,6 +15,7 @@ from modelaudit.utils.helpers.retry import RetryError
 from modelaudit.utils.sources.cloud_storage import (
     GCSCache,
     _build_safe_local_path,
+    _filter_scannable_cloud_files,
     _run_coroutine_sync,
     analyze_cloud_target,
     download_from_cloud,
@@ -43,6 +46,25 @@ def configure_remote_open_payloads(fs: MagicMock, payloads: dict[str, bytes]) ->
         return io.BytesIO(payloads[path])
 
     fs.open.side_effect = open_side_effect
+
+
+def make_tar_payload() -> bytes:
+    payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w") as archive:
+        info = tarfile.TarInfo("evil.pkl")
+        info.size = len(payload)
+        info.mtime = 0
+        archive.addfile(info, io.BytesIO(payload))
+    return output.getvalue()
+
+
+def make_zip_payload(entries: dict[str, bytes]) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        for name, payload in entries.items():
+            archive.writestr(zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0)), payload)
+    return output.getvalue()
 
 
 def test_run_coroutine_sync_without_running_loop() -> None:
@@ -163,6 +185,44 @@ def test_filter_scannable_files_handles_signed_cloud_urls() -> None:
     files = [{"path": "s3://bucket/model.pkl?X-Amz-Signature=secret"}]
 
     assert filter_scannable_files(files) == files
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload", "expected_format"),
+    [
+        pytest.param("evil.payload", b'cos\nsystem\n(S"echo pwned"\ntR.', "pickle", id="protocol0-pickle"),
+        pytest.param("archive.payload", make_tar_payload(), "tar", id="tar"),
+        pytest.param(
+            "model.payload",
+            make_zip_payload({"archive/data.pkl": b"payload", "archive/version": b"1"}),
+            "zip",
+            id="model-zip",
+        ),
+    ],
+)
+def test_filter_scannable_cloud_files_includes_content_routed_objects(
+    filename: str,
+    payload: bytes,
+    expected_format: str,
+) -> None:
+    url = f"s3://bucket/models/{filename}"
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+
+    files = [{"path": url, "name": filename, "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": expected_format}]
+
+
+def test_filter_scannable_cloud_files_skips_benign_zip_content() -> None:
+    url = "s3://bucket/models/document.payload"
+    payload = make_zip_payload({"[Content_Types].xml": b"<Types />", "word/document.xml": b"<document />"})
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+
+    files = [{"path": url, "name": "document.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == []
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
