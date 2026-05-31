@@ -160,6 +160,10 @@ _SUSPICIOUS_TARGET_PATTERNS = (
     "vars",
 )
 _TARGET_TOKEN_RE = re.compile(r"__import__|[A-Z]+(?=[A-Z][a-z0-9]|[0-9_]|$)|[A-Z]?[a-z0-9]+")
+_HYDRA_INTERPOLATION_RE = re.compile(r"\$\{([^{}]+)\}")
+_HYDRA_PATH_TOKEN_RE = re.compile(r"([^\.\[\]]+)|\[(\d+)\]")
+_HYDRA_INTERPOLATION_MAX_DEPTH = 8
+_HYDRA_REFERENCE_MISSING = object()
 
 CVE_2025_23304_ID = "CVE-2025-23304"
 CVE_2025_23304_CVSS = 7.6
@@ -211,6 +215,111 @@ def _find_suspicious_safe_prefixed_target_pattern(target: str) -> str | None:
         if leaf.startswith(pattern) and leaf[len(pattern) :].isdigit():
             return pattern
     return None
+
+
+def _hydra_reference_path(container_path: str, reference: str) -> str | None:
+    reference = reference.strip()
+    if not reference or ":" in reference:
+        return None
+    if not reference.startswith("."):
+        return reference
+
+    base_parts = [part for part in container_path.split(".") if part]
+    relative = reference
+    while relative.startswith(".."):
+        if base_parts:
+            base_parts.pop()
+        relative = relative[2:]
+        if relative.startswith("."):
+            relative = relative[1:]
+    if relative.startswith("."):
+        relative = relative[1:]
+    if relative:
+        base_parts.append(relative)
+    return ".".join(base_parts)
+
+
+def _hydra_path_tokens(path: str) -> list[str | int] | None:
+    tokens: list[str | int] = []
+    cursor = 0
+    while cursor < len(path):
+        if path[cursor] == ".":
+            cursor += 1
+            continue
+        match = _HYDRA_PATH_TOKEN_RE.match(path, cursor)
+        if match is None:
+            return None
+        if match.group(2) is not None:
+            tokens.append(int(match.group(2)))
+        else:
+            tokens.append(match.group(1))
+        cursor = match.end()
+    return tokens
+
+
+def _lookup_hydra_path(root_config: Any, path: str) -> Any:
+    tokens = _hydra_path_tokens(path)
+    if tokens is None:
+        return _HYDRA_REFERENCE_MISSING
+
+    value = root_config
+    for token in tokens:
+        if isinstance(token, int):
+            if not isinstance(value, list) or token >= len(value):
+                return _HYDRA_REFERENCE_MISSING
+            value = value[token]
+            continue
+        if not isinstance(value, dict) or token not in value:
+            return _HYDRA_REFERENCE_MISSING
+        value = value[token]
+    return value
+
+
+def _resolve_hydra_target_interpolation(
+    target: str,
+    root_config: Any,
+    container_path: str,
+) -> tuple[str, tuple[str, ...]]:
+    """Resolve simple OmegaConf-style references inside a Hydra target."""
+    if _HYDRA_INTERPOLATION_RE.search(target) is None:
+        return target, ()
+
+    current = target
+    seen = {current}
+    for _ in range(_HYDRA_INTERPOLATION_MAX_DEPTH):
+        matches = list(_HYDRA_INTERPOLATION_RE.finditer(current))
+        if not matches:
+            return current, ()
+
+        unresolved_references: list[str] = []
+        parts: list[str] = []
+        last_end = 0
+        for match in matches:
+            parts.append(current[last_end : match.start()])
+            reference = match.group(1).strip()
+            reference_path = _hydra_reference_path(container_path, reference)
+            value = (
+                _HYDRA_REFERENCE_MISSING if reference_path is None else _lookup_hydra_path(root_config, reference_path)
+            )
+            if value is _HYDRA_REFERENCE_MISSING or value is None or isinstance(value, dict | list):
+                unresolved_references.append(reference)
+                parts.append(match.group(0))
+            else:
+                parts.append(str(value))
+            last_end = match.end()
+
+        if unresolved_references:
+            return current, tuple(unresolved_references)
+
+        parts.append(current[last_end:])
+        current = "".join(parts)
+        if current in seen:
+            cycle_refs = tuple(match.group(1).strip() for match in _HYDRA_INTERPOLATION_RE.finditer(current))
+            return current, cycle_refs or ("<cycle>",)
+        seen.add(current)
+
+    unresolved = tuple(match.group(1).strip() for match in _HYDRA_INTERPOLATION_RE.finditer(current))
+    return current, unresolved or ("<max-depth>",)
 
 
 def _is_runtime_truthy(value: Any) -> bool:
@@ -2128,8 +2237,12 @@ class NemoScanner(BaseScanner):
         archive_path: str,
         result: ScanResult,
         path_prefix: str = "",
+        root_config: Any | None = None,
     ) -> None:
         """Recursively check _target_ values in Hydra config."""
+        if root_config is None:
+            root_config = config
+
         if isinstance(config, list):
             for index, item in enumerate(config):
                 if isinstance(item, dict | list):
@@ -2139,6 +2252,7 @@ class NemoScanner(BaseScanner):
                         archive_path,
                         result,
                         f"{path_prefix}[{index}]" if path_prefix else f"[{index}]",
+                        root_config,
                     )
             return
 
@@ -2149,9 +2263,18 @@ class NemoScanner(BaseScanner):
             current_path = f"{path_prefix}.{key}" if path_prefix else key
 
             if key == "_target_" and isinstance(value, str):
-                self._evaluate_target(value, current_path, config_name, archive_path, result, config)
+                self._evaluate_target(
+                    value,
+                    current_path,
+                    config_name,
+                    archive_path,
+                    result,
+                    config,
+                    root_config,
+                    path_prefix,
+                )
             elif isinstance(value, dict | list):
-                self._check_hydra_targets(value, config_name, archive_path, result, current_path)
+                self._check_hydra_targets(value, config_name, archive_path, result, current_path, root_config)
 
     def _evaluate_target(
         self,
@@ -2161,26 +2284,46 @@ class NemoScanner(BaseScanner):
         archive_path: str,
         result: ScanResult,
         target_config: dict[str, Any] | None = None,
+        root_config: Any | None = None,
+        container_path: str = "",
     ) -> None:
         """Evaluate a single _target_ value for dangerous patterns."""
+        raw_target = target
+        if root_config is not None and _HYDRA_INTERPOLATION_RE.search(target) is not None:
+            target, unresolved_references = _resolve_hydra_target_interpolation(target, root_config, container_path)
+            if unresolved_references:
+                self._add_unresolved_interpolated_target_check(
+                    raw_target,
+                    unresolved_references,
+                    config_path,
+                    config_name,
+                    archive_path,
+                    result,
+                )
+                return
+
         # Check against known dangerous targets (always flag, even if safe prefix)
         if target in _DANGEROUS_TARGETS or (target == "numpy.load" and self._numpy_load_allows_pickle(target_config)):
+            details: dict[str, Any] = {
+                "target": target,
+                "config_path": config_path,
+                "config_file": config_name,
+                "cve_id": CVE_2025_23304_ID,
+                "cvss": CVE_2025_23304_CVSS,
+                "cwe": CVE_2025_23304_CWE,
+                "description": CVE_2025_23304_DESCRIPTION,
+                "remediation": CVE_2025_23304_REMEDIATION,
+            }
+            if raw_target != target:
+                details["raw_target"] = raw_target
+                details["target_resolution"] = "hydra_interpolation"
             result.add_check(
                 name=f"{CVE_2025_23304_ID}: Dangerous Hydra _target_",
                 passed=False,
                 message=(f"{CVE_2025_23304_ID}: Dangerous _target_ '{target}' at {config_path} in {config_name}"),
                 severity=IssueSeverity.CRITICAL,
                 location=f"{archive_path}:{config_name}",
-                details={
-                    "target": target,
-                    "config_path": config_path,
-                    "config_file": config_name,
-                    "cve_id": CVE_2025_23304_ID,
-                    "cvss": CVE_2025_23304_CVSS,
-                    "cwe": CVE_2025_23304_CWE,
-                    "description": CVE_2025_23304_DESCRIPTION,
-                    "remediation": CVE_2025_23304_REMEDIATION,
-                },
+                details=details,
                 why=(
                     f"The _target_ field '{target}' in this NeMo "
                     f"config specifies a dangerous Python callable. "
@@ -2202,35 +2345,86 @@ class NemoScanner(BaseScanner):
                     config_name,
                     archive_path,
                     result,
+                    raw_target=raw_target if raw_target != target else None,
                 )
                 return
+            details = {"target": target, "config_path": config_path}
+            if raw_target != target:
+                details["raw_target"] = raw_target
+                details["target_resolution"] = "hydra_interpolation"
             result.add_check(
                 name="Hydra _target_ Safety Check",
                 passed=True,
                 message=(f"Safe _target_ '{target}' at {config_path} in {config_name}"),
                 location=f"{archive_path}:{config_name}",
-                details={"target": target, "config_path": config_path},
+                details=details,
             )
             return
 
         # Check for suspicious patterns in target (only for non-safe targets)
         pattern = _find_suspicious_target_pattern(target)
         if pattern is not None:
-            self._add_suspicious_target_check(target, pattern, config_path, config_name, archive_path, result)
+            self._add_suspicious_target_check(
+                target,
+                pattern,
+                config_path,
+                config_name,
+                archive_path,
+                result,
+                raw_target=raw_target if raw_target != target else None,
+            )
             return
 
         # Unknown target - flag for review
+        details = {
+            "target": target,
+            "config_path": config_path,
+            "config_file": config_name,
+        }
+        if raw_target != target:
+            details["raw_target"] = raw_target
+            details["target_resolution"] = "hydra_interpolation"
         result.add_check(
             name="Hydra _target_ Review",
             passed=False,
             message=(f"Unknown _target_ '{target}' at {config_path} in {config_name} - requires manual review"),
             severity=IssueSeverity.INFO,
             location=f"{archive_path}:{config_name}",
+            details=details,
+        )
+
+    def _add_unresolved_interpolated_target_check(
+        self,
+        target: str,
+        unresolved_references: tuple[str, ...],
+        config_path: str,
+        config_name: str,
+        archive_path: str,
+        result: ScanResult,
+    ) -> None:
+        result.add_check(
+            name=f"{CVE_2025_23304_ID}: Unresolved Hydra _target_ Interpolation",
+            passed=False,
+            message=(
+                f"{CVE_2025_23304_ID}: Unresolved interpolated _target_ '{target}' at {config_path} in {config_name}"
+            ),
+            severity=IssueSeverity.CRITICAL,
+            location=f"{archive_path}:{config_name}",
             details={
                 "target": target,
+                "unresolved_references": list(unresolved_references),
                 "config_path": config_path,
                 "config_file": config_name,
+                "cve_id": CVE_2025_23304_ID,
+                "cvss": CVE_2025_23304_CVSS,
+                "cwe": CVE_2025_23304_CWE,
+                "description": CVE_2025_23304_DESCRIPTION,
+                "remediation": CVE_2025_23304_REMEDIATION,
             },
+            why=(
+                "Hydra and OmegaConf resolve _target_ interpolation before instantiation. "
+                "ModelAudit could not resolve this dynamic callable selector statically, so it fails closed."
+            ),
         )
 
     def _add_suspicious_target_check(
@@ -2241,7 +2435,22 @@ class NemoScanner(BaseScanner):
         config_name: str,
         archive_path: str,
         result: ScanResult,
+        raw_target: str | None = None,
     ) -> None:
+        details: dict[str, Any] = {
+            "target": target,
+            "pattern": pattern,
+            "config_path": config_path,
+            "config_file": config_name,
+            "cve_id": CVE_2025_23304_ID,
+            "cvss": CVE_2025_23304_CVSS,
+            "cwe": CVE_2025_23304_CWE,
+            "description": CVE_2025_23304_DESCRIPTION,
+            "remediation": CVE_2025_23304_REMEDIATION,
+        }
+        if raw_target is not None:
+            details["raw_target"] = raw_target
+            details["target_resolution"] = "hydra_interpolation"
         result.add_check(
             name=f"{CVE_2025_23304_ID}: Suspicious Hydra _target_",
             passed=False,
@@ -2252,17 +2461,7 @@ class NemoScanner(BaseScanner):
             ),
             severity=IssueSeverity.CRITICAL,
             location=f"{archive_path}:{config_name}",
-            details={
-                "target": target,
-                "pattern": pattern,
-                "config_path": config_path,
-                "config_file": config_name,
-                "cve_id": CVE_2025_23304_ID,
-                "cvss": CVE_2025_23304_CVSS,
-                "cwe": CVE_2025_23304_CWE,
-                "description": CVE_2025_23304_DESCRIPTION,
-                "remediation": CVE_2025_23304_REMEDIATION,
-            },
+            details=details,
         )
 
     @staticmethod

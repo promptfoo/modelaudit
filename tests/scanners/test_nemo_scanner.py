@@ -3453,6 +3453,156 @@ class TestCVE202523304HydraTarget:
         assert len(review_checks) == 1
         assert review_checks[0].severity == IssueSeverity.INFO
 
+    @pytest.mark.parametrize(
+        ("config", "raw_target"),
+        [
+            (
+                {
+                    "callable_module": "os",
+                    "callable_leaf": "system",
+                    "model": {"_target_": "${callable_module}.${callable_leaf}", "command": "id"},
+                },
+                "${callable_module}.${callable_leaf}",
+            ),
+            (
+                {
+                    "model": {
+                        "callable_module": "os",
+                        "callable_leaf": "system",
+                        "_target_": "${.callable_module}.${.callable_leaf}",
+                        "command": "id",
+                    },
+                },
+                "${.callable_module}.${.callable_leaf}",
+            ),
+        ],
+    )
+    def test_interpolated_target_resolves_before_dangerous_check(
+        self,
+        tmp_path: Path,
+        config: dict[str, Any],
+        raw_target: str,
+    ) -> None:
+        """Hydra interpolation that resolves to a dangerous callable must not fall through to INFO review."""
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        cve_checks = [
+            check
+            for check in result.checks
+            if check.name == "CVE-2025-23304: Dangerous Hydra _target_" and check.details.get("target") == "os.system"
+        ]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["raw_target"] == raw_target
+        assert cve_checks[0].details["target_resolution"] == "hydra_interpolation"
+        assert not any(
+            check.name == "Hydra _target_ Review" and check.details.get("target") == raw_target
+            for check in result.checks
+        )
+
+    def test_interpolated_dangerous_target_fails_aggregate_scan(self, tmp_path: Path) -> None:
+        """The MA-DSS-C191 payload should produce aggregate exit 1 instead of a clean scan."""
+        config = {
+            "callable_module": "os",
+            "callable_leaf": "system",
+            "model": {"_target_": "${callable_module}.${callable_leaf}", "command": "id"},
+        }
+        path = _create_nemo_file(tmp_path, config)
+
+        result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("target") == "os.system"
+            and issue.details.get("raw_target") == "${callable_module}.${callable_leaf}"
+            for issue in result.issues
+        )
+
+    def test_unresolved_interpolated_target_fails_closed(self, tmp_path: Path) -> None:
+        """Unsupported Hydra resolvers are dynamic callable selectors, not safe unknown targets."""
+        config = {"model": {"_target_": "${oc.env:NEMO_TARGET}", "command": "id"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        unresolved_checks = [
+            check for check in result.checks if check.name == "CVE-2025-23304: Unresolved Hydra _target_ Interpolation"
+        ]
+        assert len(unresolved_checks) == 1
+        assert unresolved_checks[0].status == CheckStatus.FAILED
+        assert unresolved_checks[0].severity == IssueSeverity.CRITICAL
+        assert unresolved_checks[0].details["target"] == "${oc.env:NEMO_TARGET}"
+        assert unresolved_checks[0].details["unresolved_references"] == ["oc.env:NEMO_TARGET"]
+        assert not any(check.name == "Hydra _target_ Review" for check in result.checks)
+
+    @pytest.mark.parametrize(
+        ("config", "expected_target"),
+        [
+            (
+                {
+                    "safe_target": "nemo.collections.nlp.models.TextClassification",
+                    "model": {"_target_": "${safe_target}"},
+                },
+                "nemo.collections.nlp.models.TextClassification",
+            ),
+            (
+                {
+                    "loader_target": "torch.utils.data.DataLoader",
+                    "loader": {"_target_": "${loader_target}", "batch_size": 4},
+                },
+                "torch.utils.data.DataLoader",
+            ),
+        ],
+    )
+    def test_interpolated_safe_target_remains_safe(
+        self,
+        tmp_path: Path,
+        config: dict[str, Any],
+        expected_target: str,
+    ) -> None:
+        """Simple interpolation should not create false positives when it resolves to an allowlisted target."""
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Safety Check"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("target") == expected_target
+            and check.details.get("target_resolution") == "hydra_interpolation"
+            for check in result.checks
+        )
+
+    def test_torch_cpp_extension_load_inline_fails_aggregate_scan(self, tmp_path: Path) -> None:
+        """The MA-DSS-C194 target should not be accepted through a broad torch.utils prefix."""
+        target = "torch.utils.cpp_extension.load_inline"
+        config = {
+            "model": {
+                "_target_": target,
+                "name": "audit_inline_ext",
+                "cpp_sources": ["#include <torch/extension.h>\nint answer() { return 42; }"],
+                "functions": ["answer"],
+            },
+        }
+        path = _create_nemo_file(tmp_path, config)
+
+        result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and issue.details.get("target") == target
+            for issue in result.issues
+        )
+        assert not any(
+            check.name == "Hydra _target_ Safety Check" and check.details.get("target") == target
+            for check in result.checks
+        )
+
     def test_torch_load_target_fails_aggregate_scan(self, tmp_path: Path) -> None:
         """A NeMo config using torch.load should produce a security failure, not exit 0."""
         config = {"model": {"_target_": "torch.load", "f": "payload.pt"}}

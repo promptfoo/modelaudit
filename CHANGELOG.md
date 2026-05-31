@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- resolve simple NeMo Hydra `_target_` interpolations before callable classification and fail closed on unresolved dynamic selectors
 - scan ONNX external data references in sparse initializers, tensor-valued attributes, and function defaults
 - avoid false-positive process-launch findings for parsed framed Python string literals
 - detect dangerous Python calls retrieved through module namespace dictionaries in ZIP and TAR members
