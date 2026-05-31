@@ -25,6 +25,7 @@ ComparableLiteral: TypeAlias = bool | int | EvaluatedStringValue
 MembershipContainer: TypeAlias = str | list[object] | tuple[object, ...] | frozenset[object]
 
 URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://[^\s\"'<>]+")
+COMMAND_URL_CONTEXT_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://[^\s\"']+")
 PYTHON_STRING_PREFIX_RE: Final[str] = r"[rubf]{0,3}"
 PYTHON_LITERAL_OPEN_RE: Final[str] = r"(?:\s*\(\s*)*"
 PYTHON_STRING_LITERAL_FRAGMENT_RE: Final[str] = (
@@ -1663,7 +1664,7 @@ def _find_command_context_end(text: str, start: int) -> int:
 def _command_context_spans(text: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     for match in COMMAND_EVIDENCE_RE.finditer(text):
-        end = _find_command_context_end(text, match.start()) if "(" in match.group(0) else match.end()
+        end = _find_command_context_end(text, match.start())
         if spans and match.start() <= spans[-1][1]:
             spans[-1] = (spans[-1][0], max(spans[-1][1], end))
         else:
@@ -1711,13 +1712,31 @@ def _redact_command_string_literals(text: str) -> str:
 
 
 def _redact_command_evidence_text(text: str) -> str:
-    redacted = URL_RE.sub(_redact_url, text)
-    redacted = AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, redacted)
+    redacted = AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, text)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = COMMAND_SECRET_OPTION_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = COMMAND_USER_PASSWORD_RE.sub(_redact_command_user_password, redacted)
-    redacted = HIGH_ENTROPY_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, redacted)
-    return COMMAND_LITERAL_SENSITIVE_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, redacted)
+    pieces: list[str] = []
+    cursor = 0
+    for match in COMMAND_URL_CONTEXT_RE.finditer(redacted):
+        chunk = HIGH_ENTROPY_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, redacted[cursor : match.start()])
+        pieces.append(COMMAND_LITERAL_SENSITIVE_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, chunk))
+        pieces.append(match.group(0))
+        cursor = match.end()
+    chunk = HIGH_ENTROPY_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, redacted[cursor:])
+    pieces.append(COMMAND_LITERAL_SENSITIVE_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, chunk))
+    return "".join(pieces)
+
+
+def _redact_command_context_tokens(text: str) -> str:
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in _command_context_spans(text):
+        pieces.append(text[cursor:start])
+        pieces.append(_redact_command_evidence_text(text[start:end]))
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
 
 
 def _redact_sensitive_command_literal(match: re.Match[str]) -> str:
@@ -1737,7 +1756,8 @@ def _truncate(text: str, max_chars: int) -> str:
 
 def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
-    redacted = URL_RE.sub(_redact_url, text)
+    redacted = _redact_command_context_tokens(text)
+    redacted = URL_RE.sub(_redact_url, redacted)
     redaction_budget = max(0, max_chars) + EVIDENCE_REDACTION_LOOKAHEAD_CHARS
     redacted = redacted[:redaction_budget]
     redacted = _normalize_serialized_quote_escapes(redacted)

