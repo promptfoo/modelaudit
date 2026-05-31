@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
-from importlib.machinery import EXTENSION_SUFFIXES, BuiltinImporter, FrozenImporter, ModuleSpec, PathFinder
+from importlib.machinery import EXTENSION_SUFFIXES, ModuleSpec, PathFinder
 from pathlib import Path
 from typing import Any, Protocol, TypeVar, cast
 
@@ -1015,12 +1015,8 @@ def _call_graph_source_unavailable_reason(module_name: str) -> str | None:
     except Exception:
         return "source_unavailable"
     if spec is None:
-        try:
-            spec = _find_meta_path_module_spec_without_imports(module_name)
-        except Exception:
-            return "source_unavailable"
-        if spec is None:
-            return None
+        # Module names come from pickle metadata; do not consult executable custom meta-path finders.
+        return "source_unavailable"
     if spec.origin in {"built-in", "frozen"}:
         return None
     if spec.origin is not None and any(spec.origin.endswith(suffix) for suffix in EXTENSION_SUFFIXES):
@@ -1047,20 +1043,6 @@ def _find_module_spec_without_imports(module_name: str) -> ModuleSpec | None:
             return None
         search_path = list(locations)
     return spec
-
-
-def _find_meta_path_module_spec_without_imports(module_name: str) -> ModuleSpec | None:
-    """Consult non-standard meta path finders without importing parent packages."""
-    for finder in sys.meta_path:
-        if finder is BuiltinImporter or finder is FrozenImporter or finder is PathFinder:
-            continue
-        find_spec = getattr(finder, "find_spec", None)
-        if find_spec is None:
-            continue
-        spec = find_spec(module_name, None)
-        if isinstance(spec, ModuleSpec):
-            return spec
-    return None
 
 
 @_register_source_sensitive_cache

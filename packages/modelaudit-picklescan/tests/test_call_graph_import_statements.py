@@ -2006,16 +2006,102 @@ def test_scan_bytes_marks_lookup_failures_as_unanalyzable(
     assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
 
 
-def test_scan_bytes_marks_custom_meta_path_specs_as_unanalyzable(
+def test_scan_bytes_analyzes_source_available_modules_without_custom_meta_path_finders(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_name = "modelaudit_tp_meta_path_spec_probe"
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_source_available_meta_path_probe"
+    (module_dir / f"{module_name}.py").write_text("def invoke(command):\n    return command\n", encoding="utf-8")
+    marker = tmp_path / "meta_path_called"
 
     class CustomMetaPathFinder:
         @staticmethod
-        def find_spec(fullname: str, path: object | None = None) -> ModuleSpec | None:
-            del path
+        def find_spec(
+            fullname: str,
+            path: object | None = None,
+            target: object | None = None,
+        ) -> ModuleSpec | None:
+            del path, target
             if fullname == module_name:
+                marker.write_text(fullname, encoding="utf-8")
+                return ModuleSpec(fullname, loader=None, origin="custom://module")
+            return None
+
+    monkeypatch.syspath_prepend(str(module_dir))
+    monkeypatch.setattr(sys, "meta_path", [CustomMetaPathFinder(), *sys.meta_path])
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "invoke", _unicode_operand("echo benign")),
+            source="source-available-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+    assert not marker.exists()
+
+
+def test_scan_bytes_analyzes_stdlib_source_modules_without_custom_meta_path_finders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "statistics"
+    marker = tmp_path / "meta_path_called"
+
+    class CustomMetaPathFinder:
+        @staticmethod
+        def find_spec(
+            fullname: str,
+            path: object | None = None,
+            target: object | None = None,
+        ) -> ModuleSpec | None:
+            del path, target
+            if fullname == module_name:
+                marker.write_text(fullname, encoding="utf-8")
+                return ModuleSpec(fullname, loader=None, origin="custom://module")
+            return None
+
+    monkeypatch.setattr(sys, "meta_path", [CustomMetaPathFinder(), *sys.meta_path])
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "mean", b"]"),
+            source="stdlib-source-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not _has_call_graph_source_unavailable_notice(report, module_name, "mean", "source_unavailable")
+    assert not marker.exists()
+
+
+def test_scan_bytes_marks_custom_meta_path_specs_as_unanalyzable_without_invoking_finder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_meta_path_spec_probe"
+    marker = tmp_path / "meta_path_called"
+
+    class CustomMetaPathFinder:
+        @staticmethod
+        def find_spec(
+            fullname: str,
+            path: object | None = None,
+            target: object | None = None,
+        ) -> ModuleSpec | None:
+            del path, target
+            if fullname == module_name:
+                marker.write_text(fullname, encoding="utf-8")
                 return ModuleSpec(fullname, loader=None, origin="custom://module")
             return None
 
@@ -2033,6 +2119,7 @@ def test_scan_bytes_marks_custom_meta_path_specs_as_unanalyzable(
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.UNKNOWN
     assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+    assert not marker.exists()
 
 
 def test_scan_bytes_marks_bytecode_only_invoked_call_graph_source_unavailable(
