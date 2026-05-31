@@ -376,6 +376,36 @@ def test_oversized_orbax_metadata_preserves_visible_nested_restore_fn_detection(
     )
 
 
+def test_oversized_orbax_metadata_reports_strongest_visible_nested_restore_fn(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "oversized_orbax_strongest_restore_fn"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "type": "orbax_checkpoint",
+                "restore_fn": ["custom_deserialize", "eval"],
+                "padding": "x" * JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    restore_checks = [
+        check
+        for check in result.checks
+        if check.name == "Orbax Restore Function Check" and check.status == CheckStatus.FAILED
+    ]
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_orbax_metadata_analysis_size_limit" in result.metadata["scan_outcome_reasons"]
+    assert len(restore_checks) == 1
+    assert restore_checks[0].severity == IssueSeverity.CRITICAL
+    assert restore_checks[0].details["restore_fn"] == "eval"
+
+
 def test_oversized_orbax_metadata_duplicate_restore_fn_reports_once(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "oversized_orbax_duplicate_restore_fn"
     checkpoint_dir.mkdir()

@@ -706,19 +706,18 @@ class JaxCheckpointScanner(BaseScanner):
 
         finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
         orbax_restore_context = f"{root_context}.restore_fn"
-        orbax_restore_fn_reported = False
+        first_orbax_restore_fn: str | None = None
+        dangerous_orbax_restore_fn: str | None = None
         for context, text_value in string_values:
-            if (
-                detect_orbax_restore_fn
-                and not orbax_restore_fn_reported
-                and (
-                    context == orbax_restore_context
-                    or context.startswith(f"{orbax_restore_context}.")
-                    or context.startswith(f"{orbax_restore_context}[")
-                )
+            if detect_orbax_restore_fn and (
+                context == orbax_restore_context
+                or context.startswith(f"{orbax_restore_context}.")
+                or context.startswith(f"{orbax_restore_context}[")
             ):
-                self._add_orbax_restore_fn_check(text_value, path, result)
-                orbax_restore_fn_reported = True
+                if first_orbax_restore_fn is None:
+                    first_orbax_restore_fn = text_value
+                if dangerous_orbax_restore_fn is None and self._DANGEROUS_RESTORE_FN_PATTERN.search(text_value):
+                    dangerous_orbax_restore_fn = text_value
             self._add_suspicious_pattern_checks(
                 text_value,
                 context=context,
@@ -728,6 +727,10 @@ class JaxCheckpointScanner(BaseScanner):
                 result=result,
                 finding_budget=finding_budget,
             )
+        if dangerous_orbax_restore_fn is not None:
+            self._add_orbax_restore_fn_check(dangerous_orbax_restore_fn, path, result)
+        elif first_orbax_restore_fn is not None:
+            self._add_orbax_restore_fn_check(first_orbax_restore_fn, path, result)
         self._add_metadata_traversal_depth_limit_checks(
             contexts=depth_cap_contexts,
             check_name=depth_limit_check_name,
