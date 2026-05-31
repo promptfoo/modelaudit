@@ -4559,7 +4559,11 @@ def test_scan_bytes_records_oversized_frame_notice() -> None:
     report = scan_bytes(b"\x80\x04\x95\xfe\xff\xff\xff\xff\xff\xff\xff}.", source="oversized-frame.pkl")
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    finding = next(finding for finding in report.findings if finding.rule_code == "STRUCTURAL_TAMPER")
+    assert finding.details["tamper_type"] == "oversized_frame"
+    assert finding.details["frame_length"] == 0xFFFFFFFFFFFFFFFE
+    assert finding.details["remaining_bytes"] == 2
     notice = next(notice for notice in report.notices if notice.code == "oversized_frame")
     assert notice.details["frame_length"] == 0xFFFFFFFFFFFFFFFE
     assert notice.details["remaining_bytes"] == 2

@@ -5528,26 +5528,46 @@ impl<'a> ScanState<'a> {
             return;
         }
 
+        let details = vec![
+            ("position".to_string(), DetailValue::UInt(position as u64)),
+            (
+                "stream_offset".to_string(),
+                DetailValue::UInt(self.stream_start_offset as u64),
+            ),
+            (
+                "frame_length".to_string(),
+                DetailValue::UInt(*frame_len as u64),
+            ),
+            (
+                "remaining_bytes".to_string(),
+                DetailValue::UInt(remaining_bytes as u64),
+            ),
+        ];
+
+        self.add_finding(Finding {
+            message: "Pickle FRAME length exceeds remaining stream bytes".to_string(),
+            severity: "warning",
+            location: Some(format!("{} (pos {})", self.source, position)),
+            rule_code: Some("STRUCTURAL_TAMPER"),
+            details: {
+                let mut finding_details = vec![(
+                    "tamper_type".to_string(),
+                    DetailValue::String("oversized_frame".to_string()),
+                )];
+                finding_details.extend(details.clone());
+                finding_details
+            },
+            why: Some(
+                "A FRAME length that extends past the available pickle bytes indicates malformed or tampered serialization and can expose parser-differential behavior.",
+            ),
+        });
+
         self.add_notice(Notice {
             message: "Pickle FRAME declares more bytes than remain in the stream".to_string(),
             severity: "info",
             location: Some(format!("{} (pos {})", self.source, position)),
             code: Some("oversized_frame"),
-            details: vec![
-                ("position".to_string(), DetailValue::UInt(position as u64)),
-                (
-                    "stream_offset".to_string(),
-                    DetailValue::UInt(self.stream_start_offset as u64),
-                ),
-                (
-                    "frame_length".to_string(),
-                    DetailValue::UInt(*frame_len as u64),
-                ),
-                (
-                    "remaining_bytes".to_string(),
-                    DetailValue::UInt(remaining_bytes as u64),
-                ),
-            ],
+            details,
         });
     }
 
@@ -7602,7 +7622,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_frame_lengths_emit_structural_notice() {
+    fn oversized_frame_lengths_emit_structural_tamper_finding() {
         let options = ScanOptions {
             timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: DEFAULT_MAX_OPCODES,
@@ -7631,7 +7651,23 @@ mod tests {
             .expect("oversized FRAME notice");
         assert_eq!(detail_usize(&notice.details, "position"), Some(2));
         assert_eq!(detail_usize(&notice.details, "remaining_bytes"), Some(2));
-        assert_eq!(scan.verdict, "clean");
+
+        let finding = scan
+            .findings
+            .iter()
+            .find(|finding| finding.rule_code == Some("STRUCTURAL_TAMPER"))
+            .expect("oversized FRAME finding");
+        assert_eq!(
+            detail_string(&finding.details, "tamper_type").as_deref(),
+            Some("oversized_frame")
+        );
+        assert_eq!(
+            detail_usize(&finding.details, "frame_length"),
+            Some(usize::MAX - 1)
+        );
+        assert_eq!(detail_usize(&finding.details, "remaining_bytes"), Some(2));
+        assert_eq!(scan.status, ScanStatus::Complete);
+        assert_eq!(scan.verdict, "suspicious");
     }
 
     #[test]
