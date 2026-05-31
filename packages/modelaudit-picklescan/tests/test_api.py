@@ -1225,6 +1225,35 @@ def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     assert report.coverage.bytes_scanned > 0
 
 
+def test_scan_file_combines_pytorch_zip_private_source_fingerprints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "src"
+    source_root.mkdir()
+    helper_path = source_root / "helper.py"
+    helper_path.write_text("def entrypoint():\n    return 1\n")
+    other_path = source_root / "other.py"
+    other_path.write_text("def entrypoint():\n    return 2\n")
+    monkeypatch.syspath_prepend(str(source_root))
+
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", b"\x80\x04" + _global(b"helper", b"entrypoint") + b")R.")
+        archive.writestr("archive/extra.pkl", b"\x80\x04" + _global(b"other", b"entrypoint") + b")R.")
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+
+    report = scan_file(archive_path)
+
+    assert "call_graph_source_fingerprints" not in report.metadata
+    assert "call_graph_source_fingerprints" not in report.to_dict()["metadata"]
+    source_fingerprints = report.private_metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["reusable"] is True
+    assert str(helper_path.absolute()) in source_fingerprints["fingerprints"]
+    assert str(other_path.absolute()) in source_fingerprints["fingerprints"]
+
+
 def test_scan_file_detects_hidden_pytorch_zip_pickle_member_with_data_pickle(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     hidden_payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
@@ -3495,7 +3524,9 @@ def test_with_call_graph_findings_records_source_fingerprint_metadata(
 
     updated = package_api._with_call_graph_findings(report)
 
-    source_fingerprints = updated.metadata["call_graph_source_fingerprints"]
+    assert "call_graph_source_fingerprints" not in updated.metadata
+    assert "call_graph_source_fingerprints" not in updated.to_dict()["metadata"]
+    source_fingerprints = updated.private_metadata["call_graph_source_fingerprints"]
     assert source_fingerprints["reusable"] is True
     assert str(module_path.absolute()) in source_fingerprints["fingerprints"]
 
@@ -3519,7 +3550,8 @@ def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -
 
     assert updated.verdict == SafetyVerdict.CLEAN
     assert updated.findings == ()
-    assert updated.metadata["call_graph_source_fingerprints"]["reusable"] is True
+    assert "call_graph_source_fingerprints" not in updated.metadata
+    assert updated.private_metadata["call_graph_source_fingerprints"]["reusable"] is True
 
 
 def test_scan_bytes_marks_call_graph_enrichment_failures_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3723,7 +3755,7 @@ def test_with_call_graph_findings_ignores_click_startup_hook_paths_when_invocati
 
     updated = package_api._with_call_graph_findings(report)
 
-    assert updated is report
+    assert updated.status == report.status
     assert updated.verdict == SafetyVerdict.UNKNOWN
     assert updated.findings == ()
 
@@ -3772,7 +3804,7 @@ def test_with_call_graph_findings_ignores_click_startup_hook_paths_when_scan_is_
 
     updated = package_api._with_call_graph_findings(report)
 
-    assert updated is report
+    assert updated.status == report.status
     assert updated.verdict == SafetyVerdict.UNKNOWN
     assert updated.findings == ()
 
@@ -3869,7 +3901,8 @@ def test_with_call_graph_findings_dedupes_click_startup_hook_write_when_writer_i
 
     updated = package_api._with_call_graph_findings(report)
 
-    assert updated is report
+    assert updated.status == report.status
+    assert updated.verdict == report.verdict
     assert updated.findings == (existing_finding,)
 
 
@@ -3902,7 +3935,8 @@ def test_with_call_graph_findings_dedupes_click_startup_hook_write_when_opener_i
 
     updated = package_api._with_call_graph_findings(report)
 
-    assert updated is report
+    assert updated.status == report.status
+    assert updated.verdict == report.verdict
     assert updated.findings == (existing_finding,)
 
 

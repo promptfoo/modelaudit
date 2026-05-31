@@ -246,6 +246,52 @@ def test_scan_cache_accepts_empty_call_graph_source_fingerprint_metadata(
     assert cache.get_cached_result(str(file_path), version_context=version_context) == scan_result
 
 
+def test_scan_cache_uses_private_call_graph_source_fingerprints_without_returning_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "src"
+    source_root.mkdir()
+    source_path = source_root / "helper.py"
+    source_path.write_text("def entrypoint():\n    return 1\n")
+    monkeypatch.syspath_prepend(str(source_root))
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    source_fingerprint = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "metadata": {
+            "pickle_report_status": "complete",
+            "pickle_verdict": "clean",
+            "import_references": [{"module": "helper", "name": "entrypoint"}],
+            "callable_invocations": [{"module": "helper", "name": "entrypoint"}],
+        },
+        "_private_metadata": {
+            "call_graph_source_fingerprints": {
+                "reusable": True,
+                "search_context": [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path],
+                "fingerprints": {str(source_path.absolute()): source_fingerprint},
+            }
+        },
+    }
+    expected_cached_result = {key: value for key, value in scan_result.items() if key != "_private_metadata"}
+
+    assert cache.store_result(str(file_path), scan_result, version_context=version_context)
+
+    cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
+    assert cached_result is not None
+    assert cached_result == expected_cached_result
+    assert "_private_metadata" not in cached_result
+    assert "call_graph_source_fingerprints" not in cached_result["metadata"]
+
+    source_path.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
 def test_cached_scan_skips_persisting_operational_failures(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
@@ -391,7 +437,7 @@ def test_cached_scan_does_not_serialize_known_uncacheable_scan_result(tmp_path: 
     config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
 
     class UnserializableFailedResult(ScanResult):
-        def to_dict(self) -> dict[str, Any]:
+        def to_dict(self, *, include_private_metadata: bool = False) -> dict[str, Any]:
             raise AssertionError("known uncacheable results should not be serialized")
 
     @cached_scan()

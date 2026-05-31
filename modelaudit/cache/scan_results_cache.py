@@ -241,6 +241,10 @@ class ScanResultsCache:
             # Large-file cache keys already require this exact secure content hash.
             file_hash = content_hash or self.hasher.hash_file_with_stat(file_path, file_stat)
             mtime_ns = getattr(file_stat, "st_mtime_ns", int(file_stat.st_mtime * 1_000_000_000))
+            private_metadata = scan_result.get("_private_metadata") if isinstance(scan_result, dict) else None
+            cache_private_metadata = dict(private_metadata) if isinstance(private_metadata, dict) else {}
+            persisted_scan_result = dict(scan_result)
+            persisted_scan_result.pop("_private_metadata", None)
 
             cache_entry = CacheEntry(
                 cache_key=cache_key,
@@ -252,13 +256,14 @@ class ScanResultsCache:
                     "mtime_ns": mtime_ns,
                 },
                 version_info=version_info,
-                scan_result=scan_result,
+                scan_result=persisted_scan_result,
                 cache_metadata={
                     "scanned_at": time.time(),
                     "last_access": time.time(),
                     "access_count": 1,
                     "scan_duration_ms": scan_duration_ms,
                     "file_format": self._detect_file_format(file_path),
+                    **cache_private_metadata,
                 },
             )
 
@@ -502,9 +507,14 @@ class ScanResultsCache:
         metadata = scan_result.get("metadata")
         if not isinstance(metadata, dict):
             return True
-        if _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY not in metadata:
-            return not self._legacy_pickle_call_graph_metadata_requires_fingerprints(metadata)
-        fingerprint_metadata = metadata[_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY]
+        cache_metadata = cache_entry.get("cache_metadata")
+        fingerprint_metadata = (
+            cache_metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY) if isinstance(cache_metadata, dict) else None
+        )
+        if fingerprint_metadata is None:
+            if _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY not in metadata:
+                return not self._legacy_pickle_call_graph_metadata_requires_fingerprints(metadata)
+            fingerprint_metadata = metadata[_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY]
         if not isinstance(fingerprint_metadata, dict):
             return False
         if fingerprint_metadata.get("reusable") is not True:

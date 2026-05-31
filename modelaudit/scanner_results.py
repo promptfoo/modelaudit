@@ -26,8 +26,13 @@ def _merge_call_graph_source_fingerprints_metadata(
     existing_fingerprints = existing.get("fingerprints")
     incoming_fingerprints = incoming.get("fingerprints")
     fingerprints = dict(existing_fingerprints) if isinstance(existing_fingerprints, dict) else {}
+    fingerprint_conflict = False
     if isinstance(incoming_fingerprints, dict):
-        fingerprints.update(incoming_fingerprints)
+        for path, fingerprint in incoming_fingerprints.items():
+            if path in fingerprints and fingerprints[path] != fingerprint:
+                fingerprint_conflict = True
+                continue
+            fingerprints[path] = fingerprint
     merged["fingerprints"] = fingerprints
 
     existing_search_context = existing.get("search_context")
@@ -35,8 +40,12 @@ def _merge_call_graph_source_fingerprints_metadata(
     if existing_search_context != incoming_search_context:
         merged["reusable"] = False
     else:
-        merged["reusable"] = existing.get("reusable") is True and incoming.get("reusable") is True
+        merged["reusable"] = (
+            existing.get("reusable") is True and incoming.get("reusable") is True and not fingerprint_conflict
+        )
         merged["search_context"] = existing_search_context
+    if fingerprint_conflict:
+        merged["reusable"] = False
 
     return merged
 
@@ -184,6 +193,7 @@ class ScanResult:
         self.bytes_scanned: int = 0
         self.success: bool = True
         self.metadata: dict[str, Any] = {}
+        self._private_metadata: dict[str, Any] = {}
         self._metadata_restored_critical: bool = False
         self._merged_children_success: bool = True
 
@@ -349,10 +359,15 @@ class ScanResult:
         for key, value in other.metadata.items():
             if (
                 key == CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY
-                and isinstance(self.metadata.get(key), dict)
+                and isinstance(self._private_metadata.get(key), dict)
                 and isinstance(value, dict)
             ):
-                self.metadata[key] = _merge_call_graph_source_fingerprints_metadata(self.metadata[key], value)
+                self._private_metadata[key] = _merge_call_graph_source_fingerprints_metadata(
+                    self._private_metadata[key], value
+                )
+                continue
+            if key == CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY and isinstance(value, dict):
+                self._private_metadata[key] = value
                 continue
             if key in list_union_metadata_keys and isinstance(self.metadata.get(key), list) and isinstance(value, list):
                 existing_values = self.metadata[key]
@@ -364,6 +379,17 @@ class ScanResult:
                 self.metadata[key].update(value)
             else:
                 self.metadata[key] = value
+        for key, value in other._private_metadata.items():
+            if (
+                key == CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY
+                and isinstance(self._private_metadata.get(key), dict)
+                and isinstance(value, dict)
+            ):
+                self._private_metadata[key] = _merge_call_graph_source_fingerprints_metadata(
+                    self._private_metadata[key], value
+                )
+            else:
+                self._private_metadata[key] = value
 
     def trust_merged_child_failures(self) -> None:
         """Allow a parent scanner to explicitly accept child failures it has reclassified as benign."""
@@ -443,7 +469,7 @@ class ScanResult:
         """Return True if there are any warning-level issues"""
         return any(issue.severity == IssueSeverity.WARNING for issue in self.issues)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, include_private_metadata: bool = False) -> dict[str, Any]:
         """Convert the scan result to a dictionary for serialization"""
         # Only count WARNING and CRITICAL severity checks as failures
         # INFO and DEBUG are informational - they should not count as failures
@@ -453,7 +479,7 @@ class ScanResult:
             if c.status == CheckStatus.FAILED and c.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
         )
 
-        return {
+        result = {
             "scanner": self.scanner_name,
             "success": self.success,
             "duration": self.duration,
@@ -467,6 +493,9 @@ class ScanResult:
             "passed_checks": sum(1 for c in self.checks if c.status == CheckStatus.PASSED),
             "failed_checks": failed_checks_count,
         }
+        if include_private_metadata and self._private_metadata:
+            result["_private_metadata"] = self._private_metadata
+        return result
 
     def to_json(self, indent: int = 2) -> str:
         """Convert the scan result to a JSON string"""

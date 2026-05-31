@@ -248,13 +248,13 @@ def test_merge_scan_results():
 def test_merge_scan_results_unions_call_graph_source_fingerprints() -> None:
     """Test merging nested pickle source fingerprints preserves every child member."""
     result1 = ScanResult(scanner_name="pytorch_zip")
-    result1.metadata["call_graph_source_fingerprints"] = {
+    result1._private_metadata["call_graph_source_fingerprints"] = {
         "reusable": True,
         "search_context": ["/tmp/src"],
         "fingerprints": {"/tmp/src/first.py": "1111"},
     }
     result2 = ScanResult(scanner_name="pickle")
-    result2.metadata["call_graph_source_fingerprints"] = {
+    result2._private_metadata["call_graph_source_fingerprints"] = {
         "reusable": True,
         "search_context": ["/tmp/src"],
         "fingerprints": {"/tmp/src/second.py": "2222"},
@@ -262,7 +262,9 @@ def test_merge_scan_results_unions_call_graph_source_fingerprints() -> None:
 
     result1.merge(result2)
 
-    assert result1.metadata["call_graph_source_fingerprints"] == {
+    assert "call_graph_source_fingerprints" not in result1.metadata
+    assert result1.to_dict().get("_private_metadata") is None
+    assert result1.to_dict(include_private_metadata=True)["_private_metadata"]["call_graph_source_fingerprints"] == {
         "reusable": True,
         "search_context": ["/tmp/src"],
         "fingerprints": {
@@ -270,6 +272,30 @@ def test_merge_scan_results_unions_call_graph_source_fingerprints() -> None:
             "/tmp/src/second.py": "2222",
         },
     }
+
+
+def test_merge_scan_results_marks_conflicting_call_graph_source_fingerprints_unreusable() -> None:
+    """Test merging changed source fingerprints fails closed instead of overwriting."""
+    result1 = ScanResult(scanner_name="pytorch_zip")
+    result1._private_metadata["call_graph_source_fingerprints"] = {
+        "reusable": True,
+        "search_context": ["/tmp/src"],
+        "fingerprints": {"/tmp/src/helper.py": "1111"},
+    }
+    result2 = ScanResult(scanner_name="pickle")
+    result2._private_metadata["call_graph_source_fingerprints"] = {
+        "reusable": True,
+        "search_context": ["/tmp/src"],
+        "fingerprints": {"/tmp/src/helper.py": "2222"},
+    }
+
+    result1.merge(result2)
+
+    source_fingerprints = result1.to_dict(include_private_metadata=True)["_private_metadata"][
+        "call_graph_source_fingerprints"
+    ]
+    assert source_fingerprints["reusable"] is False
+    assert source_fingerprints["fingerprints"]["/tmp/src/helper.py"] == "1111"
 
 
 def test_blacklist_patterns(tmp_path):

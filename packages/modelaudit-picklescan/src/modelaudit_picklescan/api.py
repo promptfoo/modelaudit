@@ -28,6 +28,7 @@ from .options import ScanOptions
 from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
 
 _RUST_STREAM_READ_CHUNK_SIZE = 1024 * 1024
+_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY = "call_graph_source_fingerprints"
 _PYTORCH_ZIP_METADATA_BASENAMES = frozenset({"version", "byteorder"})
 _PYTORCH_CHECKPOINT_SUFFIXES = frozenset({".pt", ".pth", ".ckpt"})
 _PICKLE_MEMBER_SUFFIXES = (".pkl", ".pickle")
@@ -684,6 +685,7 @@ def _combine_pytorch_zip_reports(
     opcode_counts = [
         report.coverage.opcode_count for report in member_reports if report.coverage.opcode_count is not None
     ]
+    private_metadata = _combine_call_graph_source_fingerprint_private_metadata(member_reports)
     return PickleReport(
         source=source,
         status=status,
@@ -717,8 +719,52 @@ def _combine_pytorch_zip_reports(
                 for report in member_reports
             ],
         },
+        private_metadata=private_metadata,
         duration_s=sum(report.duration_s for report in member_reports),
     )
+
+
+def _combine_call_graph_source_fingerprint_private_metadata(
+    member_reports: list[PickleReport],
+) -> dict[str, Any]:
+    combined: dict[str, Any] | None = None
+    for report in member_reports:
+        fingerprint_metadata = report.private_metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY)
+        if not isinstance(fingerprint_metadata, Mapping):
+            continue
+        combined = _merge_call_graph_source_fingerprint_metadata(combined, fingerprint_metadata)
+    return {_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY: combined} if combined is not None else {}
+
+
+def _merge_call_graph_source_fingerprint_metadata(
+    existing: Mapping[str, Any] | None,
+    incoming: Mapping[str, Any],
+) -> dict[str, Any]:
+    merged = dict(existing or {})
+    existing_fingerprints = existing.get("fingerprints") if existing is not None else None
+    incoming_fingerprints = incoming.get("fingerprints")
+    fingerprints = dict(existing_fingerprints) if isinstance(existing_fingerprints, Mapping) else {}
+    fingerprint_conflict = False
+    if isinstance(incoming_fingerprints, Mapping):
+        for path, fingerprint in incoming_fingerprints.items():
+            if path in fingerprints and fingerprints[path] != fingerprint:
+                fingerprint_conflict = True
+                continue
+            fingerprints[path] = fingerprint
+    merged["fingerprints"] = fingerprints
+
+    existing_search_context = existing.get("search_context") if existing is not None else incoming.get("search_context")
+    incoming_search_context = incoming.get("search_context")
+    if existing is not None and existing_search_context != incoming_search_context:
+        merged["reusable"] = False
+    else:
+        merged["search_context"] = incoming_search_context
+        merged["reusable"] = incoming.get("reusable") is True and not fingerprint_conflict
+        if existing is not None:
+            merged["reusable"] = merged["reusable"] and existing.get("reusable") is True
+    if fingerprint_conflict:
+        merged["reusable"] = False
+    return merged
 
 
 def _combine_status(member_reports: list[PickleReport], notices: tuple[Notice, ...]) -> ScanStatus:
@@ -1092,6 +1138,7 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
             errors=updated_report.errors,
             coverage=updated_report.coverage,
             metadata=updated_report.to_dict()["metadata"],
+            private_metadata=updated_report.private_metadata,
             duration_s=updated_report.duration_s,
         )
         if additional_findings
@@ -1131,6 +1178,7 @@ def _with_call_graph_enrichment_errors(
         errors=errors,
         coverage=report.coverage,
         metadata=metadata,
+        private_metadata=report.private_metadata,
         duration_s=report.duration_s,
     )
 
@@ -1141,8 +1189,8 @@ def _with_call_graph_source_fingerprint_metadata(
 ) -> PickleReport:
     if source_fingerprints is None:
         return report
-    metadata = report.to_dict()["metadata"]
-    metadata["call_graph_source_fingerprints"] = dict(source_fingerprints)
+    private_metadata = dict(report.private_metadata)
+    private_metadata[_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY] = dict(source_fingerprints)
     return PickleReport(
         source=report.source,
         status=report.status,
@@ -1151,7 +1199,8 @@ def _with_call_graph_source_fingerprint_metadata(
         notices=report.notices,
         errors=report.errors,
         coverage=report.coverage,
-        metadata=metadata,
+        metadata=report.to_dict()["metadata"],
+        private_metadata=private_metadata,
         duration_s=report.duration_s,
     )
 
@@ -1193,6 +1242,7 @@ def _with_unanalyzed_call_graph_notices(
         errors=report.errors,
         coverage=report.coverage,
         metadata=metadata,
+        private_metadata=report.private_metadata,
         duration_s=report.duration_s,
     )
 

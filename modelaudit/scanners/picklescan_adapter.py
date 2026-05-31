@@ -32,6 +32,7 @@ _INCONCLUSIVE_NOTICE_CODES = frozenset(
 )
 _NESTED_PAYLOAD_NOTICE_CODES = frozenset({"nested_payload_detected", "encoded_nested_payload_detected"})
 _DEFAULT_SCAN_OPTIONS = ScanOptions()
+_CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY = "call_graph_source_fingerprints"
 _IMPORT_MODULE_ALIASES = {
     "nt": "os",
     "posix": "os",
@@ -163,6 +164,9 @@ def pickle_report_to_scan_result(
     report_dict = report.to_dict()
     report_metadata = report_dict["metadata"]
     result = ScanResult(scanner_name=scanner_name, scanner=scanner)
+    fingerprint_metadata = report.private_metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY)
+    if isinstance(fingerprint_metadata, Mapping):
+        result._private_metadata[_CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY] = dict(fingerprint_metadata)
     result.bytes_scanned = report.coverage.bytes_scanned
     result.metadata.update(report_metadata)
     result.metadata["pickle_report_status"] = report.status.value

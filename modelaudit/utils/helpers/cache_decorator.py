@@ -202,7 +202,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                         if isinstance(result, ScanResult):
                             normalize_unclassified_scan_failure(result)
-                        return result.to_dict()  # type: ignore[no-any-return]
+                        return result.to_dict(include_private_metadata=True)  # type: ignore[no-any-return]
                     elif isinstance(result, dict):
                         return result
                     else:
@@ -243,6 +243,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                         )
                     else:
                         logger.debug(f"Skipping cache store for operational result from {os.path.basename(file_path)}")
+                    result_dict.pop("_private_metadata", None)
 
                 # Convert back to original type if needed
                 if isinstance(result_dict, dict) and "scanner" in result_dict:
