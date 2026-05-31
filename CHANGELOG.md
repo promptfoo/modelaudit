@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- bound Flax MessagePack decoding/traversal and Orbax metadata JSON parsing so oversized JAX/Flax checkpoints fail closed
 - scan ONNX external data references in sparse initializers, tensor-valued attributes, and function defaults
 - avoid false-positive process-launch findings for parsed framed Python string literals
 - detect dangerous Python calls retrieved through module namespace dictionaries in ZIP and TAR members

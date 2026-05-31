@@ -226,6 +226,7 @@ class JaxCheckpointScanner(BaseScanner):
     _JSON_PREFIX_PATTERN_READ_FAILED_REASON: ClassVar[str] = "jax_json_checkpoint_prefix_pattern_read_failed"
     _METADATA_TRAVERSAL_LIMIT_REASON: ClassVar[str] = "jax_metadata_traversal_depth_limit"
     _PICKLE_SCAN_LIMIT_REASON: ClassVar[str] = "jax_pickle_scan_limit_exceeded"
+    _ORBAX_METADATA_SIZE_LIMIT_REASON: ClassVar[str] = "jax_orbax_metadata_analysis_size_limit"
     _LEGACY_PICKLE_INITIAL_OPCODES: ClassVar[bytes] = (
         b"()BCcFGIJKLMNPSTUVX]}\x82\x83\x84\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x95\x96\x97"
     )
@@ -520,6 +521,7 @@ class JaxCheckpointScanner(BaseScanner):
         cls,
         prefix_text: str,
         *,
+        root_context: str = "json_checkpoint_bounded_prefix",
         depth_cap_contexts: set[str] | None = None,
     ) -> Iterator[tuple[str, str]]:
         """Yield decoded visible JSON strings with bounded ancestor context."""
@@ -554,7 +556,7 @@ class JaxCheckpointScanner(BaseScanner):
                     return
                 kind = "object" if prefix_text[offset] == "{" else "array"
                 state = "key" if kind == "object" else "value"
-                frames.append(_BoundedJsonPrefixFrame(kind, "json_checkpoint_bounded_prefix", state))
+                frames.append(_BoundedJsonPrefixFrame(kind, root_context, state))
                 offset += 1
                 continue
 
@@ -647,7 +649,16 @@ class JaxCheckpointScanner(BaseScanner):
             frame.state = "key" if frame.kind == "object" else "value"
             offset += 1
 
-    def _scan_bounded_json_prefix_patterns(self, path: str, result: ScanResult) -> None:
+    def _scan_bounded_json_prefix_patterns(
+        self,
+        path: str,
+        result: ScanResult,
+        *,
+        context_root: str = "json_checkpoint_bounded_prefix",
+        check_name: str = "JSON Pattern Security Check",
+        message_prefix: str = "Suspicious pattern in bounded JSON checkpoint prefix",
+        depth_check_name: str = "JSON Metadata Traversal Depth Limit",
+    ) -> None:
         """Scan decoded JSON string content visible inside the bounded prefix."""
         with open(path, "rb") as source:
             prefix_text = source.read(JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES).decode("utf-8-sig", errors="ignore")
@@ -659,12 +670,13 @@ class JaxCheckpointScanner(BaseScanner):
         except (json.JSONDecodeError, RecursionError):
             string_values = self._iter_bounded_json_prefix_strings(
                 prefix_text,
+                root_context=context_root,
                 depth_cap_contexts=depth_cap_contexts,
             )
         else:
             string_values = self._iter_string_metadata(
                 parsed_root,
-                "json_checkpoint_bounded_prefix",
+                context_root,
                 depth_cap_contexts=depth_cap_contexts,
             )
 
@@ -673,15 +685,15 @@ class JaxCheckpointScanner(BaseScanner):
             self._add_suspicious_pattern_checks(
                 text_value,
                 context=context,
-                check_name="JSON Pattern Security Check",
-                message_prefix="Suspicious pattern in bounded JSON checkpoint prefix",
+                check_name=check_name,
+                message_prefix=message_prefix,
                 location=path,
                 result=result,
                 finding_budget=finding_budget,
             )
         self._add_metadata_traversal_depth_limit_checks(
             contexts=depth_cap_contexts,
-            check_name="JSON Metadata Traversal Depth Limit",
+            check_name=depth_check_name,
             location=path,
             result=result,
         )
@@ -952,6 +964,36 @@ class JaxCheckpointScanner(BaseScanner):
             metadata_path = path_obj / metadata_file
             if metadata_path.exists():
                 try:
+                    metadata_size = metadata_path.stat().st_size
+                    if metadata_size > JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+                        mark_inconclusive_scan_result(result, self._ORBAX_METADATA_SIZE_LIMIT_REASON)
+                        result.add_check(
+                            name="Orbax Metadata Analysis Limit",
+                            passed=False,
+                            message=(
+                                "Orbax metadata analysis incomplete because the file exceeds the bounded parsing limit"
+                            ),
+                            severity=IssueSeverity.INFO,
+                            location=str(metadata_path),
+                            rule_code="S902",
+                            details={
+                                "file": metadata_file,
+                                "file_size": metadata_size,
+                                "max_json_analysis_bytes": JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+                                "analysis_incomplete": True,
+                                "scan_outcome_reason": self._ORBAX_METADATA_SIZE_LIMIT_REASON,
+                            },
+                        )
+                        self._scan_bounded_json_prefix_patterns(
+                            str(metadata_path),
+                            result,
+                            context_root="orbax_metadata_bounded_prefix",
+                            check_name="Orbax Pattern Security Check",
+                            message_prefix="Suspicious pattern in bounded Orbax metadata prefix",
+                            depth_check_name="Orbax Metadata Traversal Depth Limit",
+                        )
+                        continue
+
                     with open(metadata_path, encoding="utf-8") as f:
                         metadata = json.load(f)
 

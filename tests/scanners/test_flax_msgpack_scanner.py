@@ -142,8 +142,8 @@ def test_flax_scan_reuses_ml_structure_analysis(
     assert analyze_calls == 1
 
 
-def test_flax_ml_structure_reuses_lowered_object_text() -> None:
-    """Layer-keyword analysis should stringify the checkpoint object once."""
+def test_flax_ml_structure_uses_bounded_text_without_whole_object_stringification() -> None:
+    """Layer-keyword analysis should not stringify the whole checkpoint object."""
 
     class StringCountingDict(dict[str, Any]):
         stringify_calls = 0
@@ -157,7 +157,7 @@ def test_flax_ml_structure_reuses_lowered_object_text() -> None:
 
     scanner._analyze_ml_structure(obj, scanner._create_result())
 
-    assert obj.stringify_calls == 1
+    assert obj.stringify_calls == 0
 
 
 def test_flax_msgpack_suspicious_content(tmp_path):
@@ -396,6 +396,43 @@ def test_flax_msgpack_caps_trailing_stream_object_count(tmp_path: Path) -> None:
     assert object_limit_checks[0].details["max_msgpack_stream_objects"] == 4
 
 
+def test_flax_msgpack_streaming_decode_does_not_call_unpackb(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native scans should stream through Unpacker instead of full-buffer unpackb."""
+    path = tmp_path / "streamed.msgpack"
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}})
+
+    def fail_unpackb(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("scan should not full-buffer decode through msgpack.unpackb")
+
+    monkeypatch.setattr(msgpack, "unpackb", fail_unpackb)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata.get("top_level_type") == "dict"
+
+
+def test_flax_msgpack_decode_limit_is_inconclusive(tmp_path: Path) -> None:
+    """Oversized MessagePack members should fail closed before materializing content."""
+    path = tmp_path / "oversized_blob.msgpack"
+    create_msgpack_file(path, {"params": {"blob": b"x" * 512}})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.DECODE_LIMIT_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Msgpack Decode Budget"
+        and check.status == CheckStatus.FAILED
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+
+
 def test_flax_msgpack_large_containers(tmp_path):
     """Test detection of containers with excessive items."""
     path = tmp_path / "large.msgpack"
@@ -414,11 +451,10 @@ def test_flax_msgpack_large_containers(tmp_path):
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
-    assert len(info_issues) >= 2  # Should report both large containers at INFO level
-
-    issue_messages = [issue.message for issue in info_issues]
-    assert any("excessive items" in msg for msg in issue_messages)
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.DECODE_LIMIT_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "Msgpack Decode Budget" for check in result.checks)
 
 
 def test_flax_msgpack_deep_nesting_is_inconclusive(tmp_path: Path) -> None:
@@ -473,6 +509,32 @@ def test_flax_msgpack_renamed_hidden_pattern_beyond_recursion_limit_is_inconclus
         tmp_path / "hidden-payload-cache",
         max_recursion_depth=2,
     )
+
+
+def test_flax_msgpack_preanalysis_depth_limit_skips_unbounded_ml_helpers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deep structures should fail closed before ML metadata helpers recurse over them."""
+    path = tmp_path / "preanalysis_deep.msgpack"
+    nested: object = "benign"
+    for _ in range(6):
+        nested = {"nested": nested}
+    create_msgpack_file(path, {"params": nested})
+
+    scanner = FlaxMsgpackScanner(config={"max_recursion_depth": 2})
+
+    def fail_analyze(_obj: Any, _result: ScanResult) -> dict[str, Any]:
+        raise AssertionError("ML structure helper should be skipped once preanalysis depth is exhausted")
+
+    monkeypatch.setattr(scanner, "_analyze_ml_structure", fail_analyze)
+
+    result = scanner.scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.RECURSION_LIMIT_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "Flax MessagePack Preanalysis Depth Limit" for check in result.checks)
 
 
 def test_flax_msgpack_pattern_within_recursion_limit_remains_security_finding(tmp_path: Path) -> None:
