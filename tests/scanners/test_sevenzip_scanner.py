@@ -1428,6 +1428,66 @@ class TestSevenZipScannerHardening:
             assert symlink_checks[0].severity == IssueSeverity.CRITICAL
             assert symlink_checks[0].details["symlink_target"] == str(symlink_target)
 
+    def test_declared_symlink_member_is_blocked_before_extraction(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
+        """7z symlink metadata must be rejected before py7zr materializes the member."""
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["link.pkl"]
+            mock_archive.getinfo.return_value = MagicMock(
+                is_directory=False,
+                is_symlink=True,
+                linkname="../outside.pkl",
+                uncompressed=16,
+            )
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+        symlink_checks = [c for c in result.checks if c.name == "7z Symlink Protection"]
+        assert result.success is False
+        assert len(symlink_checks) == 1
+        assert symlink_checks[0].severity == IssueSeverity.CRITICAL
+        assert symlink_checks[0].details["checked_before_extraction"] is True
+        assert symlink_checks[0].details["symlink_target"] == "../outside.pkl"
+        mock_archive.extract.assert_not_called()
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_real_symlink_member_is_blocked_before_extraction(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """End-to-end: symlink metadata in a real 7z archive must stop before extraction."""
+        import py7zr  # type: ignore[import-untyped]
+
+        symlink_target = tmp_path / "outside" / "target.pkl"
+        symlink_target.parent.mkdir()
+        self._write_pickle(symlink_target, {"secret": True})
+        symlink_path = tmp_path / "link.pkl"
+        symlink_path.symlink_to(symlink_target)
+
+        with py7zr.SevenZipFile(temp_7z_file, "w") as archive:
+            archive.write(str(symlink_path), "model.pkl")
+
+        with patch.object(py7zr.SevenZipFile, "extract", side_effect=AssertionError("extract should not run")):
+            result = scanner.scan(temp_7z_file)
+
+        symlink_issues = [c for c in result.checks if "Symlink" in c.name]
+        assert result.success is False
+        assert len(symlink_issues) == 1
+        assert symlink_issues[0].severity == IssueSeverity.CRITICAL
+        assert symlink_issues[0].details["checked_before_extraction"] is True
+
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_real_symlink_blocked_after_extraction(
         self,

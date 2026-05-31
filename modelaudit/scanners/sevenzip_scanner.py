@@ -1001,6 +1001,22 @@ class SevenZipScanner(BaseScanner):
             if getattr(member_info, "is_directory", False) is True:
                 continue
 
+            if getattr(member_info, "is_symlink", False) is True:
+                scan_complete = False
+                result.add_check(
+                    name="7z Symlink Protection",
+                    passed=False,
+                    message=f"Symlink detected in 7z archive before extraction: {file_name}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{archive_path}:{file_name}",
+                    details={
+                        "threat_type": "symlink_traversal",
+                        "symlink_target": getattr(member_info, "linkname", None),
+                        "checked_before_extraction": True,
+                    },
+                )
+                continue
+
             member_size = self._get_archive_member_size(archive, file_name)
             if member_size is not None and member_size > self.max_extract_size:
                 scan_complete = False
