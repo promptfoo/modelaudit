@@ -641,6 +641,31 @@ def _clear_directory_contents(path: Path) -> None:
             child.unlink()
 
 
+def _selected_cloud_download_size(fs: Any, files: list[dict[str, Any]], max_size: int) -> int:
+    """Return the late-bound size of selected objects, failing closed on unknown sizes."""
+    total_size = 0
+    for file_info in files:
+        file_url = str(file_info["path"])
+        try:
+            file_size = get_cloud_object_size(fs, file_url, strict=True)
+        except ValueError as exc:
+            raise ValueError(
+                "Unable to enforce maximum cloud download size for selected object "
+                f"{redact_url_for_display(file_url)} because its size could not be determined"
+            ) from exc
+        if file_size is None:
+            raise ValueError(
+                "Unable to enforce maximum cloud download size for selected object "
+                f"{redact_url_for_display(file_url)} because its size could not be determined"
+            )
+        total_size += file_size
+        if total_size > max_size:
+            raise ValueError(
+                f"File size ({format_size(total_size)}) exceeds maximum allowed size ({format_size(max_size)})"
+            )
+    return total_size
+
+
 def download_from_cloud(
     url: str,
     cache_dir: Path | None = None,
@@ -703,13 +728,13 @@ def download_from_cloud(
     try:
         size = _parse_size_value(metadata.get("total_size", metadata.get("size", 0)))
     except (TypeError, ValueError) as exc:
-        if max_size:
+        if max_size and not (metadata["type"] == "directory" and selective):
             raise ValueError(
                 "Unable to enforce maximum cloud download size for "
                 f"{redact_url_for_display(url)}: invalid size metadata"
             ) from exc
         size = 0
-    if max_size and size > max_size:
+    if max_size and size > max_size and not (metadata["type"] == "directory" and selective):
         raise ValueError(f"File size ({format_size(size)}) exceeds maximum allowed size ({format_size(max_size)})")
 
     # Show warning for large files
@@ -738,24 +763,55 @@ def download_from_cloud(
         # fsspec filesystems don't need explicit cleanup - use directly without 'with' statement
         fs = fsspec.filesystem(fs_protocol, **fs_args)
 
+        files: list[dict[str, Any]] | None = None
+        if metadata["type"] == "directory":
+            raw_files = metadata.get("files")
+            if raw_files is None:
+                files = []
+            elif isinstance(raw_files, list):
+                files = raw_files
+            else:
+                raise ValueError(f"Invalid metadata for 'files': expected list, got {type(raw_files).__name__}")
+
+            if selective:
+                # Filter to only scannable files before enforcing acquisition budgets.
+                files = filter_scannable_files(files, scannable_extensions=scannable_extensions)
+                if show_progress:
+                    total = metadata.get("file_count", 0)
+                    if files:
+                        click.echo(f"Found {len(files)} scannable files out of {total} total files")
+                    else:
+                        click.echo(f"No scannable files found out of {total} total files")
+
+            if not files:
+                raise ValueError("No scannable model files found in directory")
+
         # Check available disk space before downloading
         object_size: int | None
-        try:
-            object_size = get_cloud_object_size(fs, url, strict=True)
-        except ValueError as exc:
-            # Fall back to metadata-derived size when available. If no reliable size is
-            # available, continue without a pre-download disk check (legacy behavior).
-            if size > 0:
-                object_size = int(size)
-                if show_progress:
-                    click.echo(f"⚠️  Falling back to metadata size estimate for disk check: {exc}")
-            else:
-                object_size = None
-                if show_progress:
-                    click.echo(
-                        "⚠️  Unable to determine download size for "
-                        f"{redact_url_for_display(url)}; continuing without disk check: {exc}"
-                    )
+        if max_size and files is not None:
+            object_size = _selected_cloud_download_size(fs, files, max_size)
+        else:
+            try:
+                object_size = get_cloud_object_size(fs, url, strict=True)
+            except ValueError as exc:
+                if max_size:
+                    raise ValueError(
+                        "Unable to enforce maximum cloud download size for "
+                        f"{redact_url_for_display(url)} because the object size could not be determined"
+                    ) from exc
+                # Fall back to metadata-derived size when available. If no reliable size is
+                # available, continue without a pre-download disk check (legacy behavior).
+                if size > 0:
+                    object_size = int(size)
+                    if show_progress:
+                        click.echo(f"⚠️  Falling back to metadata size estimate for disk check: {exc}")
+                else:
+                    object_size = None
+                    if show_progress:
+                        click.echo(
+                            "⚠️  Unable to determine download size for "
+                            f"{redact_url_for_display(url)}; continuing without disk check: {exc}"
+                        )
 
         if object_size is not None:
             if max_size and object_size > max_size:
@@ -776,27 +832,7 @@ def download_from_cloud(
             if cache:
                 _clear_directory_contents(download_path)
 
-            # Handle directory download
-            raw_files = metadata.get("files")
-            if raw_files is None:
-                files = []
-            elif isinstance(raw_files, list):
-                files = raw_files
-            else:
-                raise ValueError(f"Invalid metadata for 'files': expected list, got {type(raw_files).__name__}")
-
-            if selective:
-                # Filter to only scannable files
-                files = filter_scannable_files(files, scannable_extensions=scannable_extensions)
-                if show_progress:
-                    total = metadata.get("file_count", 0)
-                    if files:
-                        click.echo(f"Found {len(files)} scannable files out of {total} total files")
-                    else:
-                        click.echo(f"No scannable files found out of {total} total files")
-
-            if not files:
-                raise ValueError("No scannable model files found in directory")
+            assert files is not None
 
             # Download files
             for file_info in files:
@@ -891,9 +927,18 @@ def download_from_cloud_streaming(
         error_msg = metadata.get("error", "Unknown cloud target type")
         raise ValueError(f"Failed to analyze cloud target {redact_url_for_display(url)}: {error_msg}")
 
-    # Check size limits
-    size = metadata.get("total_size", metadata.get("size", 0))
-    if max_size and size > max_size:
+    # Check size limits. Selective directory downloads are capped after filtering
+    # so unrelated prefix contents do not reject a bounded acquisition.
+    try:
+        size = _parse_size_value(metadata.get("total_size", metadata.get("size", 0)))
+    except (TypeError, ValueError) as exc:
+        if max_size and not (metadata["type"] == "directory" and selective):
+            raise ValueError(
+                "Unable to enforce maximum cloud download size for "
+                f"{redact_url_for_display(url)}: invalid size metadata"
+            ) from exc
+        size = 0
+    if max_size and size > max_size and not (metadata["type"] == "directory" and selective):
         raise ValueError(f"Total size ({format_size(size)}) exceeds maximum allowed size ({format_size(max_size)})")
 
     # Get filesystem
@@ -921,6 +966,9 @@ def download_from_cloud_streaming(
     else:
         # Single file
         files = [{"path": url, "name": _cloud_url_basename(url), "size": metadata.get("size", 0)}]
+
+    if max_size:
+        _selected_cloud_download_size(fs, files, max_size)
 
     # Create temp directory for downloads
     temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_stream_"))

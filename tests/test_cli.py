@@ -778,9 +778,20 @@ def test_scan_max_file_size(tmp_path):
     assert "500" in result.output or "File too large" in result.output  # Should mention the max file size or error
 
 
-def test_cloud_auto_size_limit_applies_to_download_budget(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "cloud_url",
+    [
+        "s3://bucket/model.bin",
+        "r2://bucket/model.bin",
+        "gcs://bucket/model.bin",
+        "https://bucket.s3.amazonaws.com/model.bin",
+        "https://storage.googleapis.com/bucket/model.bin",
+        "https://account.r2.cloudflarestorage.com/bucket/model.bin",
+    ],
+)
+def test_cloud_auto_size_limit_applies_to_download_budget(tmp_path: Path, cloud_url: str) -> None:
     runtime = _resolve_scan_runtime_config(
-        ["s3://bucket/model.bin"],
+        [cloud_url],
         format="json",
         output=None,
         timeout=None,

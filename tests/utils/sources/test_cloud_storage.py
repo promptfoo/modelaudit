@@ -751,10 +751,12 @@ class TestCloudPathSecurity:
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
+    @pytest.mark.parametrize("metadata_size", [0, 1])
     def test_download_with_max_size_fails_when_size_cannot_be_determined(
         self,
         mock_fs_class: MagicMock,
         mock_analyze: AsyncMock,
+        metadata_size: int,
     ) -> None:
         fs = make_fs_mock()
         fs.info.side_effect = RuntimeError("permission denied")
@@ -762,15 +764,89 @@ class TestCloudPathSecurity:
 
         mock_analyze.return_value = {
             "type": "file",
-            "size": 0,
+            "size": metadata_size,
             "name": "model.bin",
-            "human_size": "0 B",
+            "human_size": f"{metadata_size} B",
             "estimated_time": "instant",
         }
 
         with pytest.raises(ValueError, match="Unable to enforce maximum cloud download size"):
             download_from_cloud(
                 "s3://bucket/model.bin",
+                max_size=1024,
+                use_cache=False,
+                show_progress=False,
+            )
+
+        fs.get.assert_not_called()
+
+    @pytest.mark.parametrize("prefix_size", [2048, "unknown"])
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_with_max_size_applies_to_selected_directory_files(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+        prefix_size: int | str,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 512}
+        mock_fs_class.return_value = fs
+
+        model_url = "s3://bucket/models/model.pkl"
+        mock_analyze.return_value = {
+            "type": "directory",
+            "file_count": 2,
+            "total_size": prefix_size,
+            "human_size": "2.0 KB",
+            "estimated_time": "instant",
+            "files": [
+                {"path": model_url, "name": "model.pkl", "size": 512, "human_size": "512 B"},
+                {"path": "s3://bucket/models/preview.png", "name": "preview.png", "size": 1536, "human_size": "1.5 KB"},
+            ],
+        }
+
+        result = download_from_cloud(
+            "s3://bucket/models",
+            cache_dir=tmp_path,
+            max_size=1024,
+            use_cache=False,
+            show_progress=False,
+        )
+
+        assert result == tmp_path
+        fs.info.assert_called_once_with(model_url)
+        fs.get.assert_called_once()
+        assert fs.get.call_args.args[0] == model_url
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_with_max_size_rejects_selected_directory_total_over_limit(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 600}
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "directory",
+            "file_count": 2,
+            "total_size": 1200,
+            "human_size": "1.2 KB",
+            "estimated_time": "instant",
+            "files": [
+                {"path": "s3://bucket/models/model-1.pkl", "name": "model-1.pkl", "size": 600, "human_size": "600 B"},
+                {"path": "s3://bucket/models/model-2.pkl", "name": "model-2.pkl", "size": 600, "human_size": "600 B"},
+            ],
+        }
+
+        with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+            download_from_cloud(
+                "s3://bucket/models",
+                cache_dir=tmp_path,
                 max_size=1024,
                 use_cache=False,
                 show_progress=False,
@@ -843,6 +919,68 @@ class TestCloudPathSecurity:
             )
 
         fs.get.assert_not_called()
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_streaming_download_with_max_size_fails_when_size_cannot_be_determined(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.side_effect = RuntimeError("permission denied")
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 0,
+            "name": "model.bin",
+            "human_size": "0 B",
+            "estimated_time": "instant",
+        }
+
+        with pytest.raises(ValueError, match="Unable to enforce maximum cloud download size"):
+            list(download_from_cloud_streaming("s3://bucket/model.bin", max_size=1024, show_progress=False))
+
+        fs.get.assert_not_called()
+
+    @pytest.mark.parametrize("prefix_size", [2048, "unknown"])
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_streaming_download_with_max_size_applies_to_selected_directory_files(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        prefix_size: int | str,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 512}
+        mock_fs_class.return_value = fs
+
+        model_url = "s3://bucket/models/model.pkl"
+        mock_analyze.return_value = {
+            "type": "directory",
+            "file_count": 2,
+            "total_size": prefix_size,
+            "human_size": "2.0 KB",
+            "estimated_time": "instant",
+            "files": [
+                {"path": model_url, "name": "model.pkl", "size": 512, "human_size": "512 B"},
+                {"path": "s3://bucket/models/preview.png", "name": "preview.png", "size": 1536, "human_size": "1.5 KB"},
+            ],
+        }
+
+        streamed = list(
+            download_from_cloud_streaming(
+                "s3://bucket/models",
+                max_size=1024,
+                show_progress=False,
+            )
+        )
+
+        assert len(streamed) == 1
+        fs.info.assert_called_once_with(model_url)
+        fs.get.assert_called_once()
+        assert fs.get.call_args.args[0] == model_url
 
 
 class TestCloudCacheSafety:
