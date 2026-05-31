@@ -8,6 +8,7 @@ from typing import Any, ClassVar
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import _is_torch7_signature as is_torch7_signature
+from ._evidence_redaction import redact_evidence_string
 from ._string_extraction import extract_bounded_printable_strings
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -27,14 +28,6 @@ NETWORK_OR_SHELL_PATTERN = re.compile(
     r"https?://|ftp://|socket\.|luasocket|curl|wget|powershell(?:\.exe)?|cmd(?:\.exe)?\s+/c|"
     r"/bin/sh|/bin/bash|bash\s+-c|sh\s+-c|netcat|nc\s+"
     r")"
-)
-SENSITIVE_URL_PARAM_PATTERN = re.compile(
-    r"(?i)([?&;][^=\s&;]*(?:token|secret|api[_-]?key|apikey|credential|signature|sig|password)[^=\s&;]*=)"
-    r"[^'\"\s&;)]+"
-)
-SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
-    r"(?i)(\b(?:token|secret|password|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret)\b\s*[:=]\s*['\"]?)"
-    r"[^'\"\s;,)]+"
 )
 _LUA_GAP_PATTERN = r"(?:\s|--[^\r\n]*(?:\r?\n|$))*"
 REQUIRE_PATTERN = re.compile(
@@ -221,16 +214,7 @@ class Torch7Scanner(BaseScanner):
 
     @staticmethod
     def _snippet(text: str, max_chars: int = 180) -> str:
-        text = Torch7Scanner._redact_sensitive_evidence(text)
-        if len(text) <= max_chars:
-            return text
-        return text[: max_chars - 3] + "..."
-
-    @staticmethod
-    def _redact_sensitive_evidence(text: str) -> str:
-        """Redact credential-shaped material before storing examples in scan output."""
-        redacted = SENSITIVE_URL_PARAM_PATTERN.sub(r"\1<redacted>", text)
-        return SENSITIVE_ASSIGNMENT_PATTERN.sub(r"\1<redacted>", redacted)
+        return redact_evidence_string(text, max_chars=max_chars)
 
     def _analyze_execution_primitives(self, path: str, strings: list[str], result: ScanResult) -> None:
         critical_hits: list[str] = []

