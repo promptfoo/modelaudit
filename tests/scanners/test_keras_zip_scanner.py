@@ -21,6 +21,7 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners import keras_h5_scanner as keras_h5_scanner_module
 from modelaudit.scanners import keras_zip_scanner as keras_zip_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner, _has_get_file_reference
@@ -253,6 +254,7 @@ class TestKerasZipScanner:
     ) -> None:
         """Embedded HDF5 weights cannot be considered fully scanned without h5py."""
         monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
         reason = "keras_zip_embedded_weights_h5py_unavailable"
         keras_path = create_configured_keras_zip(
             tmp_path,

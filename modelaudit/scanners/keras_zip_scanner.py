@@ -385,7 +385,8 @@ class KerasZipScanner(BaseScanner):
         from .zip_scanner import ZipScanner
 
         has_embedded_weights_limit = self._has_embedded_weights_limit_reason(result)
-        zip_scanner = ZipScanner(self._get_recursive_archive_scan_config(skip_weights_entry=has_embedded_weights_limit))
+        skip_owned_weights_entry = self._has_embedded_weights_incomplete_reason(result)
+        zip_scanner = ZipScanner(self._get_recursive_archive_scan_config(skip_weights_entry=skip_owned_weights_entry))
         nested_result = zip_scanner._scan_zip_file(
             path,
             depth=max(zip_scanner._get_archive_depth(), zip_scanner._get_zip_depth()),
@@ -640,6 +641,17 @@ class KerasZipScanner(BaseScanner):
     def _has_embedded_weights_limit_reason(result: ScanResult) -> bool:
         reasons = result.metadata.get("scan_outcome_reasons")
         return isinstance(reasons, list) and "keras_zip_embedded_weights_too_large" in reasons
+
+    @staticmethod
+    def _has_embedded_weights_incomplete_reason(result: ScanResult) -> bool:
+        reasons = result.metadata.get("scan_outcome_reasons")
+        return isinstance(reasons, list) and any(
+            reason in reasons
+            for reason in (
+                "keras_zip_embedded_weights_too_large",
+                "keras_zip_embedded_weights_h5py_unavailable",
+            )
+        )
 
     @staticmethod
     def _is_expected_recursive_weights_limit_noise(entry: Any) -> bool:
