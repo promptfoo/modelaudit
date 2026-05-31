@@ -155,7 +155,7 @@ _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES = (
     | _CTYPES_LIBRARY_LOADER_CONSTRUCTORS
 )
 _STATIC_TRUTHY_BUILTIN_REFERENCES = frozenset({"builtins.print", "builtins.len"})
-_STATIC_SIDE_EFFECT_FREE_BUILTIN_REFERENCES = frozenset({"builtins.object"})
+_STATIC_SIDE_EFFECT_FREE_BUILTIN_REFERENCES = frozenset({"builtins.object", "builtins.type"})
 _STATIC_DISPATCH_DECORATOR_REFERENCES = frozenset({"builtins.staticmethod", "builtins.classmethod"})
 _STATIC_CLASS_CREATION_REFERENCES = frozenset({"builtins.__build_class__"})
 _STATIC_MODULE_REGISTRY_REFERENCES = frozenset({"sys.modules"})
@@ -1046,6 +1046,15 @@ def _resolve_getattr_call_names(
     if not isinstance(node, ast.Call):
         return None
 
+    unbound_getattribute_names = _resolve_unbound_getattribute_call_names(
+        node,
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if unbound_getattribute_names is not None:
+        return unbound_getattribute_names
+
     helper_name = _resolve_call_name(node.func)
     if helper_name is not None:
         resolved_helper_names = _apply_aliases(helper_name, alias_scopes)
@@ -1187,6 +1196,82 @@ def _resolve_getattr_call_names(
         attr_name,
         alias_scopes,
     )
+
+
+def _resolve_unbound_getattribute_call_names(
+    node: ast.Call,
+    alias_scopes: _AliasScopes,
+    *,
+    allow_module_locals_mapping: bool = False,
+    allow_local_namespace_mapping: bool = False,
+) -> frozenset[str] | None:
+    if (
+        not isinstance(node.func, ast.Attribute)
+        or node.func.attr != "__getattribute__"
+        or len(node.args) != 2
+        or node.keywords
+    ):
+        return None
+    attr_name = _resolve_static_string(node.args[1])
+    if attr_name is None:
+        return None
+    target_roots = _resolve_static_reference_names(
+        node.args[0],
+        alias_scopes,
+        allow_module_locals_mapping=allow_module_locals_mapping,
+        allow_local_namespace_mapping=allow_local_namespace_mapping,
+    )
+    if target_roots is None:
+        return None
+
+    class_owner = node.func.value
+    owner_roots: frozenset[str] | None = None
+    if isinstance(class_owner, ast.Attribute) and class_owner.attr == "__class__":
+        owner_roots = _resolve_static_reference_names(
+            class_owner.value,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+    elif isinstance(class_owner, ast.Call) and _canonical_type_call_argument(class_owner, alias_scopes) is not None:
+        owner_roots = _resolve_static_reference_names(
+            class_owner.args[0],
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+    else:
+        resolved_class_names = _resolve_static_reference_names(
+            class_owner,
+            alias_scopes,
+            allow_module_locals_mapping=allow_module_locals_mapping,
+            allow_local_namespace_mapping=allow_local_namespace_mapping,
+        )
+        if resolved_class_names and resolved_class_names & _CTYPES_LIBRARY_LOADER_CONSTRUCTORS:
+            owner_roots = target_roots
+    if owner_roots is None:
+        return None
+    compatible_roots = frozenset(
+        root
+        for root in target_roots & owner_roots
+        if root in _TRACKED_STATIC_MODULE_ROOTS or _is_ctypes_library_loader_object_root(root)
+    )
+    if not compatible_roots:
+        return None
+    return _apply_aliases_to_names(frozenset(f"{root}.{attr_name}" for root in compatible_roots), alias_scopes)
+
+
+def _canonical_type_call_argument(node: ast.Call, alias_scopes: _AliasScopes) -> ast.AST | None:
+    if len(node.args) != 1 or node.keywords:
+        return None
+    helper_name = _resolve_call_name(node.func)
+    if helper_name is None:
+        return None
+    if helper_name == "type" and not _lookup_bound_alias("type", alias_scopes)[1]:
+        resolved_helper_names = _resolve_aliases("builtins.type", alias_scopes)
+    else:
+        resolved_helper_names = _apply_aliases(helper_name, alias_scopes)
+    return node.args[0] if resolved_helper_names == frozenset({"builtins.type"}) else None
 
 
 def _augment_noncanonical_module_member_names(
@@ -4626,7 +4711,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self._invalidate_unknown_callable_side_effects()
         if not inert_roots or self._statically_inert_loader_write_is_safe(member_name, value, resolved_value):
             return roots
-        self._invalidate_statically_inert_values(inert_roots)
+        class_roots = frozenset(root for root in inert_roots if root.endswith(".__class__"))
+        self._invalidate_statically_inert_values(
+            None if class_roots else frozenset(root.removesuffix(".__class__") for root in inert_roots)
+        )
         return frozenset(
             self._promoted_statically_inert_loader_root(root) if root in inert_roots else root for root in roots
         )

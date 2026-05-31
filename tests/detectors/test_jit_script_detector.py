@@ -6743,6 +6743,30 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    def test_scan_model_detects_late_ctypes_subscript_alias_after_priority_window(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xfffrom ctypes import cdll\n" + padding + b"cdll['payload']\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_late_ctypes_subscript_after_safe_rebind(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xfffrom ctypes import cdll\n" + padding + b"cdll = {}\ncdll['payload']\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
+            for finding in findings
+        )
+
     def test_scan_model_ignores_shadowed_delattr_before_safe_late_runpy_call(self) -> None:
         detector = JITScriptDetector()
         padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)

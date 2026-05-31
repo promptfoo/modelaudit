@@ -558,6 +558,8 @@ def test_scan_zip_flags_asyncio_subprocess_python_member(tmp_path: Path, source:
         ("import runpy\nrunpy._run_module_as_main('payload')\n", "runpy._run_module_as_main"),
         ("import runpy\nrunpy.run_module('payload')\n", "runpy.run_module"),
         ("from runpy import run_path as run\nrun('payload.py')\n", "runpy.run_path"),
+        ("import runpy\nrunpy.__class__.__getattribute__(runpy, 'run_path')('payload.py')\n", "runpy.run_path"),
+        ("import runpy\ntype(runpy).__getattribute__(runpy, 'run_path')('payload.py')\n", "runpy.run_path"),
     ],
 )
 def test_scan_zip_flags_runpy_execution_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
@@ -777,6 +779,68 @@ def test_scan_zip_handles_final_dynamic_accessor_edges(tmp_path: Path) -> None:
     assert "ctypes.LibraryLoader.hasattrpayload" in s110_reason
     assert "ctypes.LibraryLoader.hasattremptykwargs" in s110_reason
     assert "ctypes.cdll.unboundgetattr" in s110_reason
+
+
+def test_scan_zip_flags_class_rebound_inert_libraryloader(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "loader = ctypes.LibraryLoader(len)\n"
+        "loader.__class__._dlltype = ctypes.CDLL\n"
+        "del loader._dlltype\n"
+        "loader.payload\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S110"
+    assert python_checks[0].details["reason"] == "high-risk calls: ctypes.LibraryLoader.payload"
+
+
+def test_scan_zip_ignores_safe_class_rebound_inert_libraryloader(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "loader = ctypes.LibraryLoader(len)\n"
+        "loader.__class__._dlltype = len\n"
+        "del loader._dlltype\n"
+        "loader.payload\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S110"
+        for check in result.checks
+    )
+
+
+def test_scan_zip_ignores_shadowed_type_module_class_accessor(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import runpy\ntype = len\ntype(runpy).__getattribute__(runpy, 'run_path')('payload.py')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S108"
+        for check in result.checks
+    )
 
 
 def test_scan_zip_honors_safe_dynamic_member_aliases_and_method_overwrites(tmp_path: Path) -> None:

@@ -420,7 +420,7 @@ def _bounded_priority_embedded_python_candidate_at_offset(
 
     retained_context = _compact_candidate_segments(candidate, segment_ranges)
     aliases = _priority_import_aliases(retained_context)
-    has_late_reference_syntax = b"(" in candidate[bounded_end:] or b"." in candidate[bounded_end:]
+    has_late_reference_syntax = any(token in candidate[bounded_end:] for token in (b"(", b".", b"["))
     usage_lines, proved_rule_codes = (
         _priority_alias_usage_lines(candidate, aliases, bounded_end)
         if aliases and has_late_reference_syntax
@@ -3525,7 +3525,9 @@ def _priority_alias_usage_lines(
                 multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
                 line_start = line_end
                 continue
-        has_priority_reference_syntax = not is_simple_forwarding_binding and (b"(" in code_line or b"." in code_line)
+        has_priority_reference_syntax = not is_simple_forwarding_binding and any(
+            token in code_line for token in (b"(", b".", b"[")
+        )
         priority_aliases = (
             frozenset(name.encode("utf-8") for name in relevant_binding_names)
             if has_priority_reference_syntax
@@ -3637,7 +3639,8 @@ def _priority_alias_usage_lines(
                     usage_lines,
                     proof_rule_codes(root_names, conservative=True) if needs_proof else frozenset(),
                 )
-            root_names = _attribute_load_root_names(code_line).intersection(
+            member_load_line = line[code_start:]
+            root_names = _member_load_root_names(member_load_line).intersection(
                 relevant_binding_names | definite_shadowed_names
             )
             if root_names:
@@ -3659,9 +3662,9 @@ def _priority_alias_usage_lines(
                     usage_lines.append(usage_span)
                     return usage_lines, frozenset({"S110"})
                 resolved_context = b"\n".join(
-                    [priority_context, *(candidate[start:end] for start, end in state_spans), code_line]
+                    [priority_context, *(candidate[start:end] for start, end in state_spans), member_load_line]
                 )
-                if "S110" not in attribute_rule_codes and not _snippet_loads_native_library_attribute(resolved_context):
+                if "S110" not in attribute_rule_codes and not _snippet_loads_native_library_member(resolved_context):
                     multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
                     line_start = line_end
                     continue
@@ -6465,7 +6468,7 @@ def _callable_root_names(fragment: bytes) -> set[str]:
     return root_names
 
 
-def _attribute_load_root_names(fragment: bytes) -> set[str]:
+def _member_load_root_names(fragment: bytes) -> set[str]:
     source, _byte_offsets = _decode_utf8_with_byte_offsets(fragment)
     try:
         tree = ast.parse(textwrap.dedent(source))
@@ -6473,17 +6476,17 @@ def _attribute_load_root_names(fragment: bytes) -> set[str]:
         return set()
     root_names: set[str] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Attribute) or not isinstance(node.ctx, ast.Load):
+        if not isinstance(node, (ast.Attribute, ast.Subscript)) or not isinstance(node.ctx, ast.Load):
             continue
         root: ast.AST = node
-        while isinstance(root, ast.Attribute):
+        while isinstance(root, (ast.Attribute, ast.Subscript)):
             root = root.value
         if isinstance(root, ast.Name):
             root_names.add(root.id)
     return root_names
 
 
-def _snippet_loads_native_library_attribute(source_bytes: bytes) -> bool:
+def _snippet_loads_native_library_member(source_bytes: bytes) -> bool:
     if not any(loader_name in source_bytes for loader_name in (b"cdll", b"oledll", b"pydll", b"windll")):
         return False
     source, _byte_offsets = _decode_utf8_with_byte_offsets(source_bytes)
@@ -7400,7 +7403,7 @@ def _line_starts_continued_priority_getattr(
 def _line_uses_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bool:
     aliases = _referenced_priority_aliases(code_line, aliases)
     return _fragment_has_continued_priority_alias_call(code_line, aliases) or any(
-        re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\()", code_line)
+        re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*(?:\.|\(|\[)", code_line)
         or re.search(
             rb"(?<![A-Za-z0-9_.])(?:builtins\.)?getattr\s*\(\s*" + re.escape(alias) + rb"\s*,",
             code_line,
