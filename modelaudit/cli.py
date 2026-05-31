@@ -1244,10 +1244,14 @@ def _resolve_scan_source_for_path(
                 if runtime.show_styled_output:
                     click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
 
+                hf_stream_kwargs: dict[str, Any] = {}
+                if runtime.scannable_extensions is not None:
+                    hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
                 file_generator = download_model_streaming(
                     path,
                     cache_dir=hf_cache_dir,
                     show_progress=runtime.show_progress,
+                    **hf_stream_kwargs,
                 )
 
                 streaming_kwargs: dict[str, Any] = {}

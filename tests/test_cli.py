@@ -1316,6 +1316,26 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_passes_selected_scanner_extensions(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
+    """Selected scanners should constrain HuggingFace streaming prefilters."""
+    mock_is_hf_url.return_value = True
+    mock_download_streaming.return_value = iter(())
+    mock_scan_streaming.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream", "--scanners", "llamafile", "--quiet", "hf://test/model"])
+
+    assert result.exit_code == 0
+    assert mock_download_streaming.call_args.kwargs["scannable_extensions"] == frozenset({"", ".exe", ".llamafile"})
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
 @patch("shutil.rmtree")
 def test_scan_huggingface_strict_streaming_uses_ephemeral_cache_dir(
     mock_rmtree: MagicMock,

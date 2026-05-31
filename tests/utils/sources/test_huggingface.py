@@ -447,7 +447,7 @@ class TestModelDownloadStreaming:
         mock_hf_hub_download: MagicMock,
         _mock_get_extensions: MagicMock,
     ) -> None:
-        """Streaming mode must not download a large repo when no scannable filenames are listed."""
+        """Streaming mode must fail closed when extensionless candidates exceed the bounded limit."""
         repo_files = [f"payloads/chunk-{idx:04d}" for idx in range(1000)]
         repo_files.extend(["README.md", "config", "tokenizer"])
 
@@ -458,8 +458,8 @@ class TestModelDownloadStreaming:
             ),
             pytest.raises(
                 Exception,
-                match="Refusing to stream-download every file from test/model: "
-                "repository listing contains no recognized ModelAudit-scannable files",
+                match="Refusing to stream-download extensionless files from test/model: "
+                "repository listing exceeds the bounded extensionless candidate limit",
             ),
         ):
             list(download_model_streaming("https://huggingface.co/test/model"))
@@ -475,8 +475,8 @@ class TestModelDownloadStreaming:
         tmp_path: Path,
     ) -> None:
         """A large repo with recognized model files should stream only those model files."""
-        repo_files = [f"payloads/chunk-{idx:04d}" for idx in range(1000)]
-        repo_files.extend(["README.md", "pytorch_model.bin", "nested/adapter.bin", "config"])
+        repo_files = [f"payloads/chunk-{idx:04d}.blob" for idx in range(1000)]
+        repo_files.extend(["README.md", "pytorch_model.bin", "nested/adapter.bin", "config.blob"])
         model_path = tmp_path / "huggingface" / "test" / "model" / "pytorch_model.bin"
         adapter_path = tmp_path / "huggingface" / "test" / "model" / "nested" / "adapter.bin"
         mock_hf_hub_download.side_effect = [str(model_path), str(adapter_path)]
@@ -492,6 +492,73 @@ class TestModelDownloadStreaming:
             "pytorch_model.bin",
             "nested/adapter.bin",
         ]
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["MODEL.SAFETENSORS", "README.md"], None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_matches_supported_suffixes_case_insensitively(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Mixed-case supported suffixes should not be refused before scanning."""
+        model_path = tmp_path / "MODEL.SAFETENSORS"
+        mock_hf_hub_download.return_value = str(model_path)
+
+        results = list(download_model_streaming("https://huggingface.co/test/model"))
+
+        assert results == [(model_path, True)]
+        mock_hf_hub_download.assert_called_once_with(repo_id="test/model", filename="MODEL.SAFETENSORS")
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["llama"], None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_preserves_supported_extensionless_candidate(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A bounded extensionless listing should still reach content-routed scanners."""
+        model_path = tmp_path / "llama"
+        mock_hf_hub_download.return_value = str(model_path)
+
+        results = list(download_model_streaming("https://huggingface.co/test/model"))
+
+        assert results == [(model_path, True)]
+        mock_hf_hub_download.assert_called_once_with(repo_id="test/model", filename="llama")
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_known_suffix_does_not_hide_extensionless_overflow(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_get_extensions: MagicMock,
+    ) -> None:
+        """Known suffixes must not suppress incomplete extensionless candidate coverage."""
+        repo_files = ["model.bin", *(f"payloads/chunk-{idx:04d}" for idx in range(1000))]
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, None),
+            ),
+            pytest.raises(
+                Exception,
+                match="Refusing to stream-download extensionless files from test/model: "
+                "repository listing exceeds the bounded extensionless candidate limit",
+            ),
+        ):
+            list(download_model_streaming("https://huggingface.co/test/model"))
+
+        mock_hf_hub_download.assert_not_called()
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
