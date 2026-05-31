@@ -5339,6 +5339,10 @@ impl<'a> ScanState<'a> {
             self.import_references.push(details);
             return;
         }
+        self.record_import_references_truncated_notice();
+    }
+
+    fn record_import_references_truncated_notice(&mut self) {
         if self.import_references_truncated {
             return;
         }
@@ -5970,9 +5974,10 @@ impl<'a> ScanState<'a> {
             for finding in follow_on_scan.findings {
                 self.add_finding(finding);
             }
-            for reference in follow_on_scan.import_references {
-                self.push_import_reference(reference);
-            }
+            self.merge_follow_on_import_references(
+                follow_on_scan.import_references,
+                follow_on_scan.import_references_truncated,
+            );
             self.merge_follow_on_callable_invocations(
                 follow_on_scan.callable_invocations,
                 follow_on_scan.callable_invocations_truncated,
@@ -5997,6 +6002,19 @@ impl<'a> ScanState<'a> {
                 });
                 return;
             }
+        }
+    }
+
+    fn merge_follow_on_import_references(
+        &mut self,
+        follow_on_references: Vec<Vec<(String, DetailValue)>>,
+        follow_on_references_truncated: bool,
+    ) {
+        if follow_on_references_truncated {
+            self.record_import_references_truncated_notice();
+        }
+        for reference in follow_on_references {
+            self.push_import_reference(reference);
         }
     }
 
@@ -7310,6 +7328,36 @@ mod tests {
             .notices
             .iter()
             .any(|notice| notice.code == Some("callable_invocations_truncated")));
+    }
+
+    #[test]
+    fn follow_on_import_reference_truncation_is_propagated() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "follow-on-truncated-imports.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        scan.merge_follow_on_import_references(Vec::new(), true);
+
+        assert!(scan.import_references_truncated);
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert!(scan
+            .notices
+            .iter()
+            .any(|notice| notice.code == Some("import_references_truncated")));
     }
 
     #[test]
