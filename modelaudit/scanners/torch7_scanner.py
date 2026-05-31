@@ -28,6 +28,14 @@ NETWORK_OR_SHELL_PATTERN = re.compile(
     r"/bin/sh|/bin/bash|bash\s+-c|sh\s+-c|netcat|nc\s+"
     r")"
 )
+SENSITIVE_URL_PARAM_PATTERN = re.compile(
+    r"(?i)([?&;][^=\s&;]*(?:token|secret|api[_-]?key|apikey|credential|signature|sig|password)[^=\s&;]*=)"
+    r"[^'\"\s&;)]+"
+)
+SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)(\b(?:token|secret|password|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret)\b\s*[:=]\s*['\"]?)"
+    r"[^'\"\s;,)]+"
+)
 _LUA_GAP_PATTERN = r"(?:\s|--[^\r\n]*(?:\r?\n|$))*"
 REQUIRE_PATTERN = re.compile(
     rf"(?is)\brequire{_LUA_GAP_PATTERN}"
@@ -213,9 +221,16 @@ class Torch7Scanner(BaseScanner):
 
     @staticmethod
     def _snippet(text: str, max_chars: int = 180) -> str:
+        text = Torch7Scanner._redact_sensitive_evidence(text)
         if len(text) <= max_chars:
             return text
         return text[: max_chars - 3] + "..."
+
+    @staticmethod
+    def _redact_sensitive_evidence(text: str) -> str:
+        """Redact credential-shaped material before storing examples in scan output."""
+        redacted = SENSITIVE_URL_PARAM_PATTERN.sub(r"\1<redacted>", text)
+        return SENSITIVE_ASSIGNMENT_PATTERN.sub(r"\1<redacted>", redacted)
 
     def _analyze_execution_primitives(self, path: str, strings: list[str], result: ScanResult) -> None:
         critical_hits: list[str] = []

