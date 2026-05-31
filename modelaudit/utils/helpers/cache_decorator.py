@@ -188,6 +188,8 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                 from ...cache.cache_policy import should_cache_scan_result
 
                 cache_manager = get_cache_manager(cache_config.cache_dir, enabled=True)
+                if cache_manager.cache is None:
+                    return func(*args, **kwargs)
                 version_context = cache_config.get_version_context()
 
                 def cached_func_wrapper(fpath: str) -> Any:
@@ -227,6 +229,8 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     # Cache miss - perform scan
                     logger.debug(f"Cache miss for {os.path.basename(file_path)}, performing scan")
                     scan_start = time.perf_counter()
+                    pre_scan_stat = os.stat(file_path)
+                    pre_scan_hash = cache_manager.cache.hasher.hash_file_with_stat(file_path, pre_scan_stat)
                     result_dict = cached_func_wrapper(file_path)
                     if not isinstance(result_dict, dict):
                         logger.debug(
@@ -240,6 +244,8 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                             result_dict,
                             scan_duration_ms,
                             version_context=version_context,
+                            expected_file_stat=pre_scan_stat,
+                            expected_file_hash=pre_scan_hash,
                         )
                     else:
                         logger.debug(f"Skipping cache store for operational result from {os.path.basename(file_path)}")

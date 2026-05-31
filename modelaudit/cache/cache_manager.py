@@ -79,6 +79,8 @@ class CacheManager:
         scan_result: dict[str, Any],
         scan_duration_ms: int | None = None,
         version_context: dict[str, Any] | None = None,
+        expected_file_stat: os.stat_result | None = None,
+        expected_file_hash: str | None = None,
     ) -> bool:
         """
         Store scan result in cache.
@@ -91,7 +93,14 @@ class CacheManager:
         if not self.enabled or not self.cache:
             return False
 
-        return self.cache.store_result(file_path, scan_result, scan_duration_ms, version_context=version_context)
+        return self.cache.store_result(
+            file_path,
+            scan_result,
+            scan_duration_ms,
+            version_context=version_context,
+            expected_file_stat=expected_file_stat,
+            expected_file_hash=expected_file_hash,
+        )
 
     def cached_scan(
         self,
@@ -135,6 +144,8 @@ class CacheManager:
         scan_start = time.time()
 
         try:
+            pre_scan_stat = os.stat(file_path)
+            pre_scan_hash = self.cache.hasher.hash_file_with_stat(file_path, pre_scan_stat) if self.cache else None
             scan_result = scanner_func(file_path, *args, **kwargs)
             scan_duration = (time.time() - scan_start) * 1000
 
@@ -143,7 +154,14 @@ class CacheManager:
                 scan_result["_cache_info"] = {"cache_hit": False, "scan_duration_ms": scan_duration}
 
             if should_cache_scan_result(scan_result):
-                self.store_result(file_path, scan_result, int(scan_duration), version_context=version_context)
+                self.store_result(
+                    file_path,
+                    scan_result,
+                    int(scan_duration),
+                    version_context=version_context,
+                    expected_file_stat=pre_scan_stat,
+                    expected_file_hash=pre_scan_hash,
+                )
             else:
                 logger.debug(f"Skipping cache store for operational result from {Path(file_path).name}")
 

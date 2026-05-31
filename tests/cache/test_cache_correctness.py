@@ -68,6 +68,64 @@ def test_cached_scan_persists_miss_and_hits_on_second_call(tmp_path: Path) -> No
     assert cache_manager.get_stats()["total_entries"] == 1
 
 
+def test_cached_scan_does_not_store_result_after_post_scan_replacement(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="race.dat")
+    clean_payload = b"clean:" + (b"x" * 2042)
+    malicious_payload = b"evil!:" + (b"y" * 2042)
+    file_path.write_bytes(clean_payload)
+    original_stat = file_path.stat()
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir), "timeout": 30}
+    calls = {"count": 0}
+    replaced = {"done": False}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        assert config is not None
+        calls["count"] += 1
+        prefix = Path(path).read_bytes()[:6].decode("utf-8")
+        if not replaced["done"]:
+            Path(path).write_bytes(malicious_payload)
+            os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            replaced["done"] = True
+        return {"payload_prefix": prefix}
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["payload_prefix"] == "clean:"
+    assert second["payload_prefix"] == "evil!:"
+    assert calls["count"] == 2
+
+
+def test_cache_manager_cached_scan_does_not_store_result_after_post_scan_replacement(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="manager-race.dat")
+    clean_payload = b"clean:" + (b"x" * 2042)
+    malicious_payload = b"evil!:" + (b"y" * 2042)
+    file_path.write_bytes(clean_payload)
+    original_stat = file_path.stat()
+    cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    version_context = build_cache_version_context({"timeout": 30})
+    calls = {"count": 0}
+    replaced = {"done": False}
+
+    def scan(path: str) -> dict[str, Any]:
+        calls["count"] += 1
+        prefix = Path(path).read_bytes()[:6].decode("utf-8")
+        if not replaced["done"]:
+            Path(path).write_bytes(malicious_payload)
+            os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            replaced["done"] = True
+        return {"payload_prefix": prefix}
+
+    first = cache_manager.cached_scan(str(file_path), scan, version_context=version_context)
+    second = cache_manager.cached_scan(str(file_path), scan, version_context=version_context)
+
+    assert first["payload_prefix"] == "clean:"
+    assert second["payload_prefix"] == "evil!:"
+    assert calls["count"] == 2
+
+
 def test_cached_scan_invalidates_on_material_scan_config_change(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"

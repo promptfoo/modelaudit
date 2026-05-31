@@ -204,6 +204,8 @@ class ScanResultsCache:
         scan_result: dict[str, Any],
         scan_duration_ms: int | None = None,
         version_context: dict[str, Any] | None = None,
+        expected_file_stat: os.stat_result | None = None,
+        expected_file_hash: str | None = None,
     ) -> bool:
         """
         Store scan result in cache with optimized file system calls.
@@ -218,6 +220,16 @@ class ScanResultsCache:
         try:
             # Get file stats ONCE and reuse
             file_stat = os.stat(file_path)
+            verified_current_hash: str | None = None
+            if expected_file_stat is not None and not self._stat_matches(file_stat, expected_file_stat):
+                logger.debug("Skipping cache store for %s: file metadata changed during scan", file_path)
+                return False
+            if expected_file_hash is not None:
+                verified_current_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
+                if verified_current_hash != expected_file_hash:
+                    logger.debug("Skipping cache store for %s: file hash changed during scan", file_path)
+                    return False
+
             version_info = self._get_version_info(version_context)
             if version_info is None:
                 return False
@@ -233,7 +245,7 @@ class ScanResultsCache:
                 return False
 
             # Large-file cache keys already require this exact secure content hash.
-            file_hash = content_hash or self.hasher.hash_file_with_stat(file_path, file_stat)
+            file_hash = content_hash or verified_current_hash or self.hasher.hash_file_with_stat(file_path, file_stat)
             mtime_ns = getattr(file_stat, "st_mtime_ns", int(file_stat.st_mtime * 1_000_000_000))
 
             cache_entry = CacheEntry(
@@ -269,6 +281,15 @@ class ScanResultsCache:
         except Exception as e:
             logger.debug(f"Failed to cache result for {file_path}: {e}")
             return False
+
+    @staticmethod
+    def _stat_matches(left: os.stat_result, right: os.stat_result) -> bool:
+        return (
+            left.st_size == right.st_size
+            and getattr(left, "st_mtime_ns", int(left.st_mtime * 1_000_000_000))
+            == getattr(right, "st_mtime_ns", int(right.st_mtime * 1_000_000_000))
+            and left.st_ino == right.st_ino
+        )
 
     def generate_cache_key(
         self,
