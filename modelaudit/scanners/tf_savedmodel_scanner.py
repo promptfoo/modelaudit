@@ -309,6 +309,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result.metadata["file_size"] = file_size
         result.metadata["scan_byte_limit"] = _MAX_PROTOBUF_PARSE_BYTES
 
+        if path.endswith("keras_metadata.pb") and file_size > _MAX_KERAS_METADATA_PARSE_BYTES:
+            self._mark_keras_metadata_parse_budget_exceeded(result, path)
+            result.finish(success=False)
+            return result
+
         # Add file integrity check for compliance
         self.add_file_integrity_check(path, result)
         self.current_file_path = path
