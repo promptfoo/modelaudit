@@ -242,7 +242,7 @@ class PyTorchBinaryScanner(BaseScanner):
                     passed=False,
                     message=f"Suspicious code pattern found: {pattern.decode('ascii', errors='ignore')}",
                     rule_code="S902",
-                    severity=IssueSeverity.INFO,
+                    severity=IssueSeverity.WARNING,
                     location=f"{self.current_file_path} (offset: {offset + pos})",
                     details={
                         "pattern": pattern.decode("ascii", errors="ignore"),

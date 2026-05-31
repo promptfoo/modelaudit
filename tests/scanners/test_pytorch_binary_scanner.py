@@ -220,6 +220,39 @@ def test_pytorch_binary_scanner_code_patterns(tmp_path):
     assert found_system
 
 
+def test_pytorch_binary_code_patterns_affect_security_exit(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "active-code-pattern.bin"
+    binary_file.write_bytes(b"\x00" * 128 + b"eval('1 + 1')" + b"\x00" * 128)
+
+    direct = scanner.scan(str(binary_file))
+    aggregate = scan_model_directory_or_file(str(binary_file), cache_scan_results=False)
+
+    code_issues = [issue for issue in direct.issues if "Suspicious code pattern found" in issue.message]
+    code_checks = [check for check in direct.checks if check.name == "Embedded Code Pattern Detection"]
+
+    assert direct.success is True
+    assert code_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in code_issues)
+    assert any(check.status == CheckStatus.FAILED and check.severity == IssueSeverity.WARNING for check in code_checks)
+    assert any(issue.severity == IssueSeverity.WARNING for issue in aggregate.issues)
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_pytorch_binary_benign_tensor_data_stays_clean(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "benign-weights.bin"
+    tensor_like_data = struct.pack("f" * 16, *[float(i) / 16 for i in range(16)])
+    binary_file.write_bytes(tensor_like_data * 16)
+
+    direct = scanner.scan(str(binary_file))
+    aggregate = scan_model_directory_or_file(str(binary_file), cache_scan_results=False)
+
+    assert direct.success is True
+    assert not [issue for issue in direct.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
+    assert determine_exit_code(aggregate) == 0
+
+
 def test_pytorch_binary_scanner_detects_code_pattern_split_across_chunk_boundary(tmp_path: Path) -> None:
     """Suspicious code tokens split at a chunk boundary should still be detected."""
     scanner = PyTorchBinaryScanner()
