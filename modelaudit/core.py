@@ -54,7 +54,7 @@ from modelaudit.scanners.xgboost_scanner import (
     configure_content_routed_json_scan,
 )
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
-from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
+from modelaudit.utils import DvcResolution, is_within_directory, resolve_dvc_file_with_metadata, should_skip_file
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
@@ -138,6 +138,38 @@ determine_exit_code = core_results.determine_exit_code
 merge_scan_result = core_results.merge_scan_result
 
 HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
+
+
+def _record_dvc_output_limit_incomplete(
+    results: ModelAuditResultModel,
+    scan_metadata: dict[str, Any],
+    dvc_path: str,
+    resolution: DvcResolution,
+) -> None:
+    """Fail closed when DVC output expansion was capped."""
+    if not resolution.analysis_incomplete:
+        return
+
+    scan_metadata["success"] = False
+    scan_metadata["has_operational_errors"] = True
+    _add_issue_to_model(
+        results,
+        "DVC output limit exceeded - not all declared outputs were scanned",
+        severity=IssueSeverity.INFO.value,
+        location=dvc_path,
+        details={
+            "analysis_incomplete": True,
+            "scan_outcome": "inconclusive",
+            "reason": "dvc_output_limit_exceeded",
+            "declared_output_count": resolution.declared_output_count,
+            "output_limit": resolution.output_limit,
+            "resolved_output_count": len(resolution.targets),
+            "omitted_output_count": resolution.omitted_output_count,
+        },
+        issue_type="dvc_output_limit_exceeded",
+    )
+
+
 _COMPRESSED_HEADER_FORMATS = frozenset({"compressed", "gzip", "bzip2", "xz", "lz4", "zlib"})
 _R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
 _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
@@ -981,9 +1013,10 @@ def scan_model_directory_or_file(
                     # Handle DVC files and get target paths
                     target_paths = [scan_source]
                     if file.endswith(".dvc"):
-                        dvc_targets = resolve_dvc_file(file_path)
-                        if dvc_targets:
-                            target_paths = [Path(t).resolve() for t in dvc_targets]
+                        dvc_resolution = resolve_dvc_file_with_metadata(file_path)
+                        _record_dvc_output_limit_incomplete(results, scan_metadata, file_path, dvc_resolution)
+                        if dvc_resolution.targets:
+                            target_paths = [Path(t).resolve() for t in dvc_resolution.targets]
 
                     for target_path in target_paths:
                         target_str = str(target_path)
@@ -1315,9 +1348,10 @@ def scan_model_directory_or_file(
             # Scan a single file or DVC pointer
             target_files = [path]
             if path.endswith(".dvc"):
-                dvc_targets = resolve_dvc_file(path)
-                if dvc_targets:
-                    target_files = dvc_targets
+                dvc_resolution = resolve_dvc_file_with_metadata(path)
+                _record_dvc_output_limit_incomplete(results, scan_metadata, path, dvc_resolution)
+                if dvc_resolution.targets:
+                    target_files = dvc_resolution.targets
 
             for _idx, target in enumerate(target_files):
                 # Check for interrupts

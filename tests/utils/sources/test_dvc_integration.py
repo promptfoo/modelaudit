@@ -1,8 +1,15 @@
+import os
 import pickle
+from collections.abc import Callable
 from pathlib import Path
 
 from modelaudit.core import scan_model_directory_or_file
-from modelaudit.utils.sources.dvc import resolve_dvc_file
+from modelaudit.utils.sources.dvc import resolve_dvc_file, resolve_dvc_file_with_metadata
+
+
+class _LateMaliciousPayload:
+    def __reduce__(self) -> tuple[Callable[[str], int], tuple[str]]:
+        return (os.system, ("echo c085",))
 
 
 class TestDvcIntegration:
@@ -198,6 +205,84 @@ class TestDvcSecurity:
         resolved = resolve_dvc_file(str(dvc_file))
         # Should be limited to MAX_OUTPUTS (100)
         assert len(resolved) <= 100
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        assert resolution.declared_output_count == 150
+        assert resolution.output_limit == 100
+        assert resolution.omitted_output_count == 50
+        assert resolution.analysis_incomplete is True
+
+    def test_over_limit_dvc_scan_fails_closed_for_omitted_late_output(self, tmp_path: Path) -> None:
+        """A malicious output past the DVC cap must not look like complete clean coverage."""
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        late_malicious = tmp_path / "late_malicious.pkl"
+        with late_malicious.open("wb") as f:
+            pickle.dump(_LateMaliciousPayload(), f)
+        dvc_lines.append(f"- path: {late_malicious.name}")
+
+        dvc_file = tmp_path / "over_limit.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(dvc_file))
+
+        assert result.files_scanned == 100
+        assert result.success is False
+        assert result.has_errors is True
+        asset_paths = {asset.path for asset in result.assets}
+        assert str(late_malicious) not in asset_paths
+        output_limit_issues = [issue for issue in result.issues if issue.type == "dvc_output_limit_exceeded"]
+        assert len(output_limit_issues) == 1
+        details = output_limit_issues[0].details
+        assert details["analysis_incomplete"] is True
+        assert details["scan_outcome"] == "inconclusive"
+        assert details["declared_output_count"] == 101
+        assert details["output_limit"] == 100
+        assert details["resolved_output_count"] == 100
+        assert details["omitted_output_count"] == 1
+
+    def test_in_limit_dvc_scan_remains_complete_for_benign_outputs(self, tmp_path: Path) -> None:
+        """Normal DVC pointers under the cap still expand and scan cleanly."""
+        targets = []
+        for index in range(2):
+            target = tmp_path / f"benign_{index}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            targets.append(target)
+
+        dvc_file = tmp_path / "in_limit.dvc"
+        dvc_file.write_text("outs:\n" + "".join(f"- path: {target.name}\n" for target in targets))
+
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+        assert resolution.analysis_incomplete is False
+        assert resolution.omitted_output_count == 0
+
+        result = scan_model_directory_or_file(str(dvc_file))
+
+        assert result.files_scanned == len(targets)
+        assert result.success is True
+        assert result.has_errors is False
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_cli_preserves_over_limit_dvc_pointer_for_core_fail_closed(self, tmp_path: Path) -> None:
+        """CLI pre-expansion should not discard DVC cap metadata before core sees it."""
+        from modelaudit.cli import _resolve_scan_paths
+
+        dvc_lines = ["outs:"]
+        for index in range(101):
+            target = tmp_path / f"model_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        dvc_file = tmp_path / "cli_over_limit.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        assert _resolve_scan_paths((str(dvc_file),), 0.0) == [str(dvc_file)]
 
     def test_malformed_dvc_file_handling(self, tmp_path):
         """Test handling of malformed DVC files."""

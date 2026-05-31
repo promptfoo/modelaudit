@@ -1,10 +1,32 @@
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+MAX_DVC_OUTPUTS = 100
+
+
+@dataclass(frozen=True)
+class DvcResolution:
+    """Resolved DVC pointer targets plus coverage metadata."""
+
+    targets: list[str]
+    declared_output_count: int = 0
+    output_limit: int = MAX_DVC_OUTPUTS
+    omitted_output_count: int = 0
+
+    @property
+    def analysis_incomplete(self) -> bool:
+        return self.omitted_output_count > 0
+
 
 def resolve_dvc_file(file_path: str) -> list[str]:
+    """Return local paths of artifacts tracked by a DVC pointer file."""
+    return resolve_dvc_file_with_metadata(file_path).targets
+
+
+def resolve_dvc_file_with_metadata(file_path: str) -> DvcResolution:
     """Return local paths of artifacts tracked by a DVC pointer file.
 
     Security considerations:
@@ -16,28 +38,31 @@ def resolve_dvc_file(file_path: str) -> list[str]:
         import yaml
     except Exception:
         logger.debug("pyyaml not installed, cannot parse DVC file")
-        return []
+        return DvcResolution(targets=[])
 
     path = Path(file_path)
     if not path.is_file() or path.suffix != ".dvc":
-        return []
+        return DvcResolution(targets=[])
 
     try:
         data = yaml.safe_load(path.read_text()) or {}
     except Exception as exc:  # pragma: no cover - YAML errors are rare
         logger.warning(f"Failed to parse DVC file {file_path}: {exc}")
-        return []
+        return DvcResolution(targets=[])
 
     outs = data.get("outs", [])
     if not isinstance(outs, list):
         logger.warning(f"DVC file {file_path} has invalid 'outs' structure")
-        return []
+        return DvcResolution(targets=[])
 
     # Limit number of outputs to prevent resource exhaustion
-    MAX_OUTPUTS = 100
-    if len(outs) > MAX_OUTPUTS:
-        logger.warning(f"DVC file {file_path} has too many outputs ({len(outs)}), limiting to {MAX_OUTPUTS}")
-        outs = outs[:MAX_OUTPUTS]
+    declared_output_count = len(outs)
+    omitted_output_count = max(declared_output_count - MAX_DVC_OUTPUTS, 0)
+    if omitted_output_count:
+        logger.warning(
+            f"DVC file {file_path} has too many outputs ({declared_output_count}), limiting to {MAX_DVC_OUTPUTS}"
+        )
+        outs = outs[:MAX_DVC_OUTPUTS]
 
     resolved: list[str] = []
     dvc_dir = path.parent.resolve()
@@ -81,4 +106,9 @@ def resolve_dvc_file(file_path: str) -> list[str]:
             logger.warning(f"Error resolving DVC target path {out_path}: {e}")
             continue
 
-    return resolved
+    return DvcResolution(
+        targets=resolved,
+        declared_output_count=declared_output_count,
+        output_limit=MAX_DVC_OUTPUTS,
+        omitted_output_count=omitted_output_count,
+    )

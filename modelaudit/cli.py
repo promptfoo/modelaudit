@@ -55,7 +55,7 @@ from .telemetry import (
     record_scan_failed,
     record_scan_started,
 )
-from .utils import resolve_dvc_file, should_skip_file
+from .utils import resolve_dvc_file_with_metadata, should_skip_file
 from .utils.helpers.auto_defaults import (
     apply_auto_overrides,
     detect_ci_environment,
@@ -354,9 +354,11 @@ def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float) -> list[
     dvc_expanded_paths: list[str] = []
     for path in expanded_paths:
         if os.path.isfile(path) and path.endswith(".dvc"):
-            targets = resolve_dvc_file(path)
-            if targets:
-                dvc_expanded_paths.extend(targets)
+            dvc_resolution = resolve_dvc_file_with_metadata(path)
+            if dvc_resolution.analysis_incomplete:
+                dvc_expanded_paths.append(path)
+            elif dvc_resolution.targets:
+                dvc_expanded_paths.extend(dvc_resolution.targets)
             else:
                 dvc_expanded_paths.append(path)
         else:
