@@ -328,6 +328,32 @@ def test_pytorch_binary_scanner_detects_embedded_pe_across_chunk_boundary(tmp_pa
     )
 
 
+def test_pytorch_binary_scanner_detects_executable_signature_after_first_chunk(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "late_elf.bin"
+    chunk_size = 1024 * 1024
+    elf_offset = chunk_size + 10
+    binary_file.write_bytes(b"\x00" * elf_offset + b"\x7fELF" + b"\x00" * 128)
+
+    result = scanner.scan(str(binary_file))
+
+    assert any(
+        issue.rule_code == "S501" and "Linux executable" in issue.message and issue.details.get("offset") == elf_offset
+        for issue in result.issues
+    )
+
+
+def test_pytorch_binary_scanner_ignores_invalid_mz_after_first_chunk(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "late_invalid_mz.bin"
+    chunk_size = 1024 * 1024
+    binary_file.write_bytes(b"\x00" * (chunk_size + 512) + b"MZ" + b"\x00" * 128)
+
+    result = scanner.scan(str(binary_file))
+
+    assert not any(issue.rule_code == "S501" and "Windows executable" in issue.message for issue in result.issues)
+
+
 @pytest.mark.skip(
     reason="ML context filtering now ignores executable signatures in weight-like data to reduce false positives"
 )

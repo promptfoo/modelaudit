@@ -393,10 +393,6 @@ class PyTorchBinaryScanner(BaseScanner):
             should_ignore_executable_signature,
         )
 
-        # RULE 1: Only scan first 64KB - real executables have signatures at start
-        if offset > 65536:
-            return
-
         # Analyze ML context for this chunk
         ml_context = analyze_binary_for_ml_context(chunk, self.get_file_size(self.current_file_path))
 
