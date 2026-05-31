@@ -2476,7 +2476,7 @@ def test_pytorch_zip_scanner_scopes_storage_persistent_id_trust_by_prefix(tmp_pa
     assert any(check.details.get("pickle_filename") == "good/data.pkl" for check in trusted_checks)
 
 
-def test_pytorch_zip_scanner_entry_limit(tmp_path):
+def test_pytorch_zip_scanner_entry_limit(tmp_path: Path) -> None:
     """Test that scanner enforces archive entry count limits."""
     zip_path = tmp_path / "model.pt"
 
@@ -2499,9 +2499,44 @@ def test_pytorch_zip_scanner_entry_limit(tmp_path):
     ]
     assert len(entry_issues) > 0
     assert entry_issues[0].severity == IssueSeverity.WARNING
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_entry_limit" in result.metadata["scan_outcome_reasons"]
+    assert entry_issues[0].details["analysis_incomplete"] is True
 
 
-def test_pytorch_zip_scanner_entry_limit_passes(tmp_path):
+def test_pytorch_zip_scanner_entry_limit_skips_late_entries(tmp_path: Path) -> None:
+    """Entries after the configured archive-entry cap should not be processed as covered."""
+    zip_path = tmp_path / "late_symlink_after_entry_limit.pt"
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("entry_0.txt", "data")
+        zipf.writestr("entry_1.txt", "data")
+        symlink_info = zipfile.ZipInfo("late_symlink")
+        symlink_info.external_attr = 0o120777 << 16
+        symlink_info.compress_type = zipfile.ZIP_STORED
+        zipf.writestr(symlink_info, "/etc/shadow")
+
+    scanner = PyTorchZipScanner(config={"max_archive_entries": 3})
+    result = scanner.scan(str(zip_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_entry_limit" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Archive Entry Limit"
+        and check.status == CheckStatus.FAILED
+        and check.details["processed_entries"] == 3
+        and check.details["dropped_entry_count"] == 1
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Symlink Safety Validation" and "late_symlink" in check.message for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_entry_limit_passes(tmp_path: Path) -> None:
     """Test that scanner passes when entry count is within limits."""
     zip_path = tmp_path / "model.pt"
 
@@ -2791,14 +2826,13 @@ def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
 
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("version", "3")
-        # Generate enough entries to exceed a low limit
-        for i in range(12):
-            zipf.writestr(f"entry_{i}.txt", "data")
-        # Add a symlink entry
+        # Add a symlink entry before the entry cap, then enough entries to exceed a low limit.
         symlink_info = zipfile.ZipInfo("evil_link")
         symlink_info.external_attr = 0o120777 << 16
         symlink_info.compress_type = zipfile.ZIP_STORED
         zipf.writestr(symlink_info, "/etc/shadow")
+        for i in range(12):
+            zipf.writestr(f"entry_{i}.txt", "data")
 
     scanner = PyTorchZipScanner(config={"max_archive_entries": 10})
     result = scanner.scan(str(zip_path))

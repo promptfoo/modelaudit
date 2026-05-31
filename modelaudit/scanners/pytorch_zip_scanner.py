@@ -732,19 +732,42 @@ class PyTorchZipScanner(BaseScanner):
 
         # Check entry count limit (decompression bomb indicator)
         entry_count = len(archive_entries)
+        entry_limit_exceeded = entry_count > self.max_archive_entries
+        entries_to_process = archive_entries
+        entry_summary_details: dict[str, int | bool] = {"entries_checked": entry_count}
+        entry_scope = "archive entries"
         if entry_count > self.max_archive_entries:
+            entries_to_process = archive_entries[: self.max_archive_entries]
+            dropped_entry_count = entry_count - len(entries_to_process)
+            mark_inconclusive_scan_result(result, "pytorch_zip_entry_limit")
+            entry_summary_details = {
+                "entries_checked": len(entries_to_process),
+                "total_entries": entry_count,
+                "analysis_incomplete": True,
+            }
+            entry_scope = "processed archive entries"
             result.add_check(
                 name="Archive Entry Limit",
                 passed=False,
-                message=f"Archive contains {entry_count} entries (max: {self.max_archive_entries})",
+                message=(
+                    f"Archive contains {entry_count} entries (max processed: {self.max_archive_entries}); "
+                    f"{dropped_entry_count} entries were skipped and scan coverage is incomplete"
+                ),
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={
                     "entry_count": entry_count,
                     "max_entries": self.max_archive_entries,
+                    "processed_entries": len(entries_to_process),
+                    "dropped_entry_count": dropped_entry_count,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "pytorch_zip_entry_limit",
                     "risk": "Excessive entries may indicate a decompression bomb attack",
                 },
-                why="Archives with excessive entries can exhaust system resources during extraction",
+                why=(
+                    "Archives with excessive entries can exhaust system resources during extraction; "
+                    "entries beyond the processing cap are not inspected."
+                ),
             )
         else:
             result.add_check(
@@ -755,7 +778,7 @@ class PyTorchZipScanner(BaseScanner):
                 details={"entry_count": entry_count, "max_entries": self.max_archive_entries},
             )
 
-        for info in archive_entries:
+        for info in entries_to_process:
             name = info.filename
             previous_info = seen_entries.get(name)
             if previous_info is None:
@@ -892,26 +915,28 @@ class PyTorchZipScanner(BaseScanner):
             result.add_check(
                 name="Path Traversal Protection",
                 passed=True,
-                message="All archive entries have safe paths",
+                message=f"All {entry_scope} have safe paths",
                 location=path,
-                details={"entries_checked": len(archive_entries)},
+                details=dict(entry_summary_details),
             )
 
         if not symlink_issues_found and archive_entries:
             result.add_check(
                 name="Symlink Safety Validation",
                 passed=True,
-                message="No symlinks detected in archive",
+                message=f"No symlinks detected in {entry_scope}",
                 location=path,
+                details=dict(entry_summary_details) if entry_limit_exceeded else {},
             )
 
         if not compression_issues_found and archive_entries:
             result.add_check(
                 name="Compression Ratio Check",
                 passed=True,
-                message="All entries have safe compression ratios",
+                message=f"All {entry_scope} have safe compression ratios",
                 location=path,
                 details={
+                    **entry_summary_details,
                     "threshold": self.max_compression_ratio,
                     "min_uncompressed_size": self.min_compression_bomb_uncompressed_size,
                 },
@@ -921,9 +946,9 @@ class PyTorchZipScanner(BaseScanner):
             result.add_check(
                 name="Duplicate ZIP Entry Collision",
                 passed=True,
-                message="No conflicting duplicate archive entries found",
+                message=f"No conflicting duplicate ZIP entries found in {entry_scope}",
                 location=path,
-                details={"entries_checked": len(archive_entries)},
+                details=dict(entry_summary_details),
             )
 
         return safe_entries
