@@ -77,11 +77,31 @@ def _get_component_type(path: str, metadata: dict[str, Any] | None) -> Component
     return ComponentType.FILE
 
 
+def _is_path_within_directory(path: str, directory: str) -> bool:
+    try:
+        normalized_path = os.path.normcase(os.path.realpath(path))
+        normalized_directory = os.path.normcase(os.path.realpath(directory))
+        return os.path.commonpath([normalized_path, normalized_directory]) == normalized_directory
+    except (OSError, ValueError):
+        return False
+
+
+def _symlink_size(path: str) -> int:
+    try:
+        return os.lstat(path).st_size
+    except OSError:
+        return 0
+
+
 def _resolve_component_size_and_sha256(
     path: str,
     metadata: FileMetadataModel | dict[str, Any] | None,
+    scan_root: str | None = None,
 ) -> tuple[int, str]:
     """Resolve component size/hash from disk, falling back to recorded metadata."""
+    if scan_root is not None and os.path.islink(path) and not _is_path_within_directory(path, scan_root):
+        return _symlink_size(path), ""
+
     if os.path.exists(path):
         return os.path.getsize(path), _file_sha256(path)
 
@@ -220,9 +240,10 @@ def _component_for_file_pydantic(
     path: str,
     metadata: FileMetadataModel | None,
     issues: list[Issue],
+    scan_root: str | None = None,
 ) -> Component:
     """Create a CycloneDX component from Pydantic models (type-safe version)."""
-    size, sha256 = _resolve_component_size_and_sha256(path, metadata)
+    size, sha256 = _resolve_component_size_and_sha256(path, metadata, scan_root)
 
     # Start with basic properties
     props = [Property(name="size", value=str(size))]
@@ -260,8 +281,9 @@ def _component_for_file(
     path: str,
     metadata: dict[str, Any],
     issues: Iterable[dict[str, Any]],
+    scan_root: str | None = None,
 ) -> Component:
-    size, sha256 = _resolve_component_size_and_sha256(path, metadata)
+    size, sha256 = _resolve_component_size_and_sha256(path, metadata, scan_root)
     props = [Property(name="size", value=str(size))]
 
     # Compute risk score based on issues related to this file
@@ -388,6 +410,7 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
 
     for input_path in paths:
         if os.path.isdir(input_path):
+            scan_root = os.path.realpath(input_path)
             for root, _, files in os.walk(input_path):
                 for f in files:
                     fp = os.path.join(root, f)
@@ -399,16 +422,17 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
                         meta = meta_model.model_dump()
                     else:
                         meta = meta_model or {}
-                    component = _component_for_file(fp, meta, issues_dicts)
+                    component = _component_for_file(fp, meta, issues_dicts, scan_root)
                     bom.components.add(component)
         else:
+            scan_root = os.path.realpath(os.path.dirname(input_path) or ".")
             meta_model = file_meta.get(input_path)
             # Convert Pydantic model to dict if needed
             if meta_model is not None and hasattr(meta_model, "model_dump"):
                 meta = meta_model.model_dump()
             else:
                 meta = meta_model or {}
-            component = _component_for_file(input_path, meta, issues_dicts)
+            component = _component_for_file(input_path, meta, issues_dicts, scan_root)
             bom.components.add(component)
 
     outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_6)
@@ -430,17 +454,19 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
 
     for input_path in paths:
         if os.path.isdir(input_path):
+            scan_root = os.path.realpath(input_path)
             for root, _, files in os.walk(input_path):
                 for f in files:
                     fp = os.path.join(root, f)
                     if _should_skip_sbom_file(fp):
                         continue
                     metadata = file_metadata.get(fp)
-                    component = _component_for_file_pydantic(fp, metadata, issues)
+                    component = _component_for_file_pydantic(fp, metadata, issues, scan_root)
                     bom.components.add(component)
         else:
+            scan_root = os.path.realpath(os.path.dirname(input_path) or ".")
             metadata = file_metadata.get(input_path)
-            component = _component_for_file_pydantic(input_path, metadata, issues)
+            component = _component_for_file_pydantic(input_path, metadata, issues, scan_root)
             bom.components.add(component)
 
     outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_6)
