@@ -118,6 +118,55 @@ _COLLECTION_COMMAND_RE = re.compile(
 _COLLECTION_NETWORK_RE = re.compile(
     r"(?i)(?:https?://|wss?://|ftp://|tcp://|udp://|\bsocket\b|\b(?:\d{1,3}\.){3}\d{1,3}\b)"
 )
+_PREVIEW_REDACTION_TOKEN = "<redacted>"
+_SENSITIVE_KEY_FRAGMENT_RE = (
+    r"(?:api[_-]?key|access[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|credential|"
+    r"password|passwd|pwd|secret|token)"
+)
+_QUOTED_SECRET_ASSIGNMENT_RE = re.compile(
+    rf"(?i)\b(?P<key>[a-z0-9_.-]*{_SENSITIVE_KEY_FRAGMENT_RE}[a-z0-9_.-]*)"
+    r"(?P<sep>\s*[:=]\s*)(?P<quote>['\"])(?P<value>[^'\"]{4,})(?P=quote)"
+)
+_UNQUOTED_SECRET_ASSIGNMENT_RE = re.compile(
+    rf"(?i)\b(?P<key>[a-z0-9_.-]*{_SENSITIVE_KEY_FRAGMENT_RE}[a-z0-9_.-]*)"
+    r"(?P<sep>\s*[:=]\s*)(?P<value>[^\s,;&)}\]'\"<>]{4,})"
+)
+_SENSITIVE_URL_QUERY_PARAM_RE = re.compile(
+    rf"(?i)([?&][^=\s&#]*(?:{_SENSITIVE_KEY_FRAGMENT_RE}|signature|sig)[^=\s&#]*=)[^\s&#'\"<>]+"
+)
+_URL_USERINFO_RE = re.compile(r"(?i)(https?://)[^/\s:@]+:[^/\s@]+@")
+_AUTH_HEADER_SECRET_RE = re.compile(r"(?i)\b(?P<scheme>bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}")
+_STANDALONE_KEY_SECRET_RE = re.compile(r"\b(?:AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{8,})\b")
+
+
+def _redact_sensitive_preview_text(text: str) -> str:
+    """Redact secret-shaped values from attacker-controlled evidence previews."""
+    redacted = _URL_USERINFO_RE.sub(r"\1<credentials-redacted>@", text)
+    redacted = _SENSITIVE_URL_QUERY_PARAM_RE.sub(rf"\1{_PREVIEW_REDACTION_TOKEN}", redacted)
+    redacted = _QUOTED_SECRET_ASSIGNMENT_RE.sub(
+        lambda match: (
+            f"{match.group('key')}{match.group('sep')}{match.group('quote')}"
+            f"{_PREVIEW_REDACTION_TOKEN}{match.group('quote')}"
+        ),
+        redacted,
+    )
+    redacted = _UNQUOTED_SECRET_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group('key')}{match.group('sep')}{_PREVIEW_REDACTION_TOKEN}",
+        redacted,
+    )
+    redacted = _AUTH_HEADER_SECRET_RE.sub(
+        lambda match: f"{match.group('scheme')} {_PREVIEW_REDACTION_TOKEN}",
+        redacted,
+    )
+    return _STANDALONE_KEY_SECRET_RE.sub(_PREVIEW_REDACTION_TOKEN, redacted)
+
+
+def _safe_decoded_preview(text: str, limit: int) -> str:
+    """Return a bounded decoded preview safe for serialized findings."""
+    redacted = _redact_sensitive_preview_text(text)
+    if len(redacted) <= limit:
+        return redacted
+    return f"{redacted[:limit]}..."
 
 
 def _looks_like_pe_executable(content_head: bytes) -> bool:
@@ -928,7 +977,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             details={
                                 "collection_key": key,
                                 "index": index,
-                                "value_preview": decoded[:200],
+                                "value_preview": _safe_decoded_preview(decoded, 200),
                                 "meta_graph": meta_graph_tag,
                             },
                         )
@@ -1214,7 +1263,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         {
                             "op_type": node.op,
                             "code_analysis": risk_desc if is_dangerous else "Contains executable code",
-                            "code_preview": python_code[:200] + "..." if len(python_code) > 200 else python_code,
+                            "code_preview": _safe_decoded_preview(python_code, 200),
                             "validation_status": "valid_python",
                         },
                     ),
@@ -1234,7 +1283,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         {
                             "op_type": node.op,
                             "validation_error": error,
-                            "data_preview": python_code[:100] + "..." if len(python_code) > 100 else python_code,
+                            "data_preview": _safe_decoded_preview(python_code, 100),
                         },
                     ),
                     why=get_tf_op_explanation(node.op),
@@ -1320,9 +1369,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     details={
                                         "layer_type": "Lambda",
                                         "dangerous_patterns": found_patterns,
-                                        "code_preview": decoded_str[:200] + "..."
-                                        if len(decoded_str) > 200
-                                        else decoded_str,
+                                        "code_preview": _safe_decoded_preview(decoded_str, 200),
                                         "encoding": "base64",
                                     },
                                     why=(
@@ -1340,9 +1387,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     location=path,
                                     details={
                                         "layer_type": "Lambda",
-                                        "code_preview": decoded_str[:100] + "..."
-                                        if len(decoded_str) > 100
-                                        else decoded_str,
+                                        "code_preview": _safe_decoded_preview(decoded_str, 100),
                                     },
                                     why=(
                                         "Lambda layers can execute arbitrary Python code. "
