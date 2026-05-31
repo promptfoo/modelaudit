@@ -1295,6 +1295,12 @@ class TorchServeMarScanner(BaseScanner):
             return resolved_head
         return ".".join([resolved_head, *tail])
 
+    def _apply_unshadowed_alias(self, call_name: str, aliases: dict[str, str], shadowed_names: set[str]) -> str:
+        """Apply a file-level import alias unless the current scope has rebound its root name."""
+        if call_name.split(".", maxsplit=1)[0] in shadowed_names:
+            return call_name
+        return self._apply_alias(call_name, aliases)
+
     def _resolve_getattr_call_name(self, node: ast.AST, aliases: dict[str, str]) -> str | None:
         if isinstance(node, ast.Attribute) and node.attr == "__call__":
             return self._resolve_getattr_call_name(node.value, aliases)
@@ -1365,6 +1371,7 @@ class TorchServeMarScanner(BaseScanner):
         node: ast.AST,
         aliases: dict[str, str],
         import_loader_aliases: dict[str, str],
+        shadowed_names: set[str],
     ) -> str | None:
         if not isinstance(node, ast.Call):
             return None
@@ -1373,7 +1380,10 @@ class TorchServeMarScanner(BaseScanner):
         if helper_name is None:
             return None
 
-        resolved_helper_name = import_loader_aliases.get(helper_name, self._apply_alias(helper_name, aliases))
+        resolved_helper_name = import_loader_aliases.get(
+            helper_name,
+            self._apply_unshadowed_alias(helper_name, aliases, shadowed_names),
+        )
         if resolved_helper_name not in {"__import__", "builtins.__import__", "importlib.import_module"}:
             return None
 
@@ -1397,10 +1407,21 @@ class TorchServeMarScanner(BaseScanner):
         aliases: dict[str, str],
         module_aliases: dict[str, str],
         import_loader_aliases: dict[str, str],
+        shadowed_names: set[str],
     ) -> str | None:
         if isinstance(node, ast.Name):
             return module_aliases.get(node.id)
-        return self._dynamic_import_module_name(node, aliases, import_loader_aliases)
+        if isinstance(node, ast.Attribute):
+            parent = self._resolve_dynamic_import_root(
+                node.value,
+                aliases,
+                module_aliases,
+                import_loader_aliases,
+                shadowed_names,
+            )
+            if parent is not None:
+                return f"{parent}.{node.attr}"
+        return self._dynamic_import_module_name(node, aliases, import_loader_aliases, shadowed_names)
 
     def _resolve_dynamic_import_getattr_call(
         self,
@@ -1408,12 +1429,13 @@ class TorchServeMarScanner(BaseScanner):
         aliases: dict[str, str],
         module_aliases: dict[str, str],
         import_loader_aliases: dict[str, str],
+        shadowed_names: set[str],
     ) -> str | None:
         helper_name = self._resolve_call_name(node.func)
         if helper_name is None:
             return None
 
-        resolved_helper_name = self._apply_alias(helper_name, aliases)
+        resolved_helper_name = self._apply_unshadowed_alias(helper_name, aliases, shadowed_names)
         if resolved_helper_name not in {"getattr", "builtins.getattr"}:
             return None
 
@@ -1427,7 +1449,13 @@ class TorchServeMarScanner(BaseScanner):
         if target_node is None or attr_node is None:
             return None
 
-        module_name = self._resolve_dynamic_import_root(target_node, aliases, module_aliases, import_loader_aliases)
+        module_name = self._resolve_dynamic_import_root(
+            target_node,
+            aliases,
+            module_aliases,
+            import_loader_aliases,
+            shadowed_names,
+        )
         attr_name = self._static_string_value(attr_node)
         if module_name is None or attr_name is None:
             return None
@@ -1441,6 +1469,7 @@ class TorchServeMarScanner(BaseScanner):
         module_aliases: dict[str, str],
         callable_aliases: dict[str, str],
         import_loader_aliases: dict[str, str],
+        shadowed_names: set[str],
     ) -> str | None:
         if isinstance(node, ast.Name):
             return callable_aliases.get(node.id)
@@ -1451,13 +1480,20 @@ class TorchServeMarScanner(BaseScanner):
                 aliases,
                 module_aliases,
                 import_loader_aliases,
+                shadowed_names,
             )
             if module_name is None:
                 return None
             return _normalized_high_risk_python_call_name(f"{module_name}.{node.attr}")
 
         if isinstance(node, ast.Call):
-            return self._resolve_dynamic_import_getattr_call(node, aliases, module_aliases, import_loader_aliases)
+            return self._resolve_dynamic_import_getattr_call(
+                node,
+                aliases,
+                module_aliases,
+                import_loader_aliases,
+                shadowed_names,
+            )
 
         return None
 
@@ -1470,6 +1506,7 @@ class TorchServeMarScanner(BaseScanner):
                 self.module_alias_stack: list[dict[str, str]] = [{}]
                 self.callable_alias_stack: list[dict[str, str]] = [{}]
                 self.import_loader_alias_stack: list[dict[str, str]] = [{}]
+                self.shadowed_name_stack: list[set[str]] = [set()]
                 self.risky_calls: set[str] = set()
 
             @property
@@ -1484,19 +1521,23 @@ class TorchServeMarScanner(BaseScanner):
             def import_loader_aliases(self) -> dict[str, str]:
                 return self.import_loader_alias_stack[-1]
 
+            @property
+            def shadowed_names(self) -> set[str]:
+                return self.shadowed_name_stack[-1]
+
             def _push_scope(self, parameters: set[str]) -> None:
                 self.module_alias_stack.append(dict(self.module_aliases))
                 self.callable_alias_stack.append(dict(self.callable_aliases))
                 self.import_loader_alias_stack.append(dict(self.import_loader_aliases))
+                self.shadowed_name_stack.append(set(self.shadowed_names))
                 for parameter in parameters:
-                    self.module_aliases.pop(parameter, None)
-                    self.callable_aliases.pop(parameter, None)
-                    self.import_loader_aliases.pop(parameter, None)
+                    self._invalidate_name(parameter)
 
             def _pop_scope(self) -> None:
                 self.module_alias_stack.pop()
                 self.callable_alias_stack.pop()
                 self.import_loader_alias_stack.pop()
+                self.shadowed_name_stack.pop()
 
             @staticmethod
             def _parameter_names(args: ast.arguments) -> set[str]:
@@ -1509,12 +1550,27 @@ class TorchServeMarScanner(BaseScanner):
                     parameters.add(args.kwarg.arg)
                 return parameters
 
-            def _record_name_assignment(self, name: str, value: ast.AST) -> None:
+            def _invalidate_name(self, name: str) -> None:
                 self.module_aliases.pop(name, None)
                 self.callable_aliases.pop(name, None)
                 self.import_loader_aliases.pop(name, None)
+                self.shadowed_names.add(name)
 
-                module_name = scanner._dynamic_import_module_name(value, aliases, self.import_loader_aliases)
+            def _record_import_binding(self, name: str) -> None:
+                self.module_aliases.pop(name, None)
+                self.callable_aliases.pop(name, None)
+                self.import_loader_aliases.pop(name, None)
+                self.shadowed_names.discard(name)
+
+            def _record_name_assignment(self, name: str, value: ast.AST) -> None:
+                self._invalidate_name(name)
+
+                module_name = scanner._dynamic_import_module_name(
+                    value,
+                    aliases,
+                    self.import_loader_aliases,
+                    self.shadowed_names,
+                )
                 if module_name is not None:
                     self.module_aliases[name] = module_name
                     return
@@ -1525,6 +1581,7 @@ class TorchServeMarScanner(BaseScanner):
                     self.module_aliases,
                     self.callable_aliases,
                     self.import_loader_aliases,
+                    self.shadowed_names,
                 )
                 if callable_name is not None:
                     self.callable_aliases[name] = callable_name
@@ -1534,10 +1591,34 @@ class TorchServeMarScanner(BaseScanner):
                 if value_name is None:
                     return
                 resolved_value_name = self.import_loader_aliases.get(
-                    value_name, scanner._apply_alias(value_name, aliases)
+                    value_name,
+                    scanner._apply_unshadowed_alias(value_name, aliases, self.shadowed_names),
                 )
                 if resolved_value_name in {"__import__", "builtins.__import__", "importlib.import_module"}:
                     self.import_loader_aliases[name] = resolved_value_name
+
+            def _record_target_assignment(self, target: ast.AST, value: ast.AST) -> None:
+                if isinstance(target, ast.Name):
+                    self._record_name_assignment(target.id, value)
+                    return
+                if isinstance(target, ast.Starred):
+                    self._invalidate_target(target.value)
+                    return
+                if isinstance(target, ast.Tuple | ast.List):
+                    if isinstance(value, ast.Tuple | ast.List) and len(target.elts) == len(value.elts):
+                        for child_target, child_value in zip(target.elts, value.elts, strict=True):
+                            self._record_target_assignment(child_target, child_value)
+                    else:
+                        self._invalidate_target(target)
+
+            def _invalidate_target(self, target: ast.AST) -> None:
+                if isinstance(target, ast.Name):
+                    self._invalidate_name(target.id)
+                elif isinstance(target, ast.Starred):
+                    self._invalidate_target(target.value)
+                elif isinstance(target, ast.Tuple | ast.List):
+                    for child_target in target.elts:
+                        self._invalidate_target(child_target)
 
             def _visit_function_definition(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
                 for decorator in node.decorator_list:
@@ -1545,6 +1626,7 @@ class TorchServeMarScanner(BaseScanner):
                 for default in [*node.args.defaults, *node.args.kw_defaults]:
                     if default is not None:
                         self.visit(default)
+                self._invalidate_name(node.name)
                 self._push_scope(self._parameter_names(node.args))
                 for statement in node.body:
                     self.visit(statement)
@@ -1556,11 +1638,20 @@ class TorchServeMarScanner(BaseScanner):
             def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
                 self._visit_function_definition(node)
 
+            def visit_Import(self, node: ast.Import) -> None:
+                for alias in node.names:
+                    self._record_import_binding(alias.asname or alias.name.split(".", maxsplit=1)[0])
+
+            def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+                for alias in node.names:
+                    self._record_import_binding(alias.asname or alias.name)
+
             def visit_ClassDef(self, node: ast.ClassDef) -> None:
                 for decorator in node.decorator_list:
                     self.visit(decorator)
                 for base in node.bases:
                     self.visit(base)
+                self._invalidate_name(node.name)
                 self._push_scope(set())
                 for statement in node.body:
                     self.visit(statement)
@@ -1569,19 +1660,66 @@ class TorchServeMarScanner(BaseScanner):
             def visit_Assign(self, node: ast.Assign) -> None:
                 self.visit(node.value)
                 for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        self._record_name_assignment(target.id, node.value)
+                    self._record_target_assignment(target, node.value)
 
             def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
                 if node.value is not None:
                     self.visit(node.value)
-                    if isinstance(node.target, ast.Name):
-                        self._record_name_assignment(node.target.id, node.value)
+                    self._record_target_assignment(node.target, node.value)
 
             def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
                 self.visit(node.value)
-                if isinstance(node.target, ast.Name):
-                    self._record_name_assignment(node.target.id, node.value)
+                self._record_target_assignment(node.target, node.value)
+
+            def _visit_for(self, node: ast.For | ast.AsyncFor) -> None:
+                self.visit(node.iter)
+                if isinstance(node.iter, ast.List | ast.Tuple | ast.Set) and len(node.iter.elts) == 1:
+                    self._record_target_assignment(node.target, node.iter.elts[0])
+                else:
+                    self._invalidate_target(node.target)
+                for statement in node.body:
+                    self.visit(statement)
+                for statement in node.orelse:
+                    self.visit(statement)
+
+            def visit_For(self, node: ast.For) -> None:
+                self._visit_for(node)
+
+            def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+                self._visit_for(node)
+
+            @staticmethod
+            def _nullcontext_enter_result(call: ast.Call) -> ast.expr | None:
+                if len(call.args) == 1 and not call.keywords:
+                    return call.args[0]
+                if not call.args and len(call.keywords) == 1 and call.keywords[0].arg == "enter_result":
+                    return call.keywords[0].value
+                return None
+
+            def _visit_with(self, node: ast.With | ast.AsyncWith) -> None:
+                for item in node.items:
+                    self.visit(item.context_expr)
+                    if item.optional_vars is not None:
+                        bound_value = item.context_expr
+                        if isinstance(bound_value, ast.Call):
+                            helper_name = scanner._resolve_call_name(bound_value.func)
+                            if (
+                                helper_name is not None
+                                and scanner._apply_unshadowed_alias(helper_name, aliases, self.shadowed_names)
+                                == "contextlib.nullcontext"
+                            ):
+                                enter_result = self._nullcontext_enter_result(bound_value)
+                                if enter_result is not None:
+                                    bound_value = enter_result
+                        self._record_target_assignment(item.optional_vars, bound_value)
+                for statement in node.body:
+                    self.visit(statement)
+
+            def visit_With(self, node: ast.With) -> None:
+                self._visit_with(node)
+
+            def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+                self._visit_with(node)
 
             def visit_Call(self, node: ast.Call) -> None:
                 call_name = scanner._resolve_dynamic_import_execution_call(
@@ -1590,6 +1728,7 @@ class TorchServeMarScanner(BaseScanner):
                     self.module_aliases,
                     self.callable_aliases,
                     self.import_loader_aliases,
+                    self.shadowed_names,
                 )
                 if call_name is not None:
                     self.risky_calls.add(call_name)
