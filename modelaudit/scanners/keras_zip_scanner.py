@@ -31,7 +31,7 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
-from ._evidence_redaction import redact_evidence_string, redact_evidence_value
+from ._evidence_redaction import redact_evidence_value
 from .archive_dispatch import SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY
 from .archive_member_security import is_executable_archive_member_name
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
@@ -1863,7 +1863,7 @@ class KerasZipScanner(BaseScanner):
                                 "layer_name": layer_name,
                                 "layer_class": "Lambda",
                                 "dangerous_patterns": found_patterns,
-                                "code_preview": redact_evidence_string(decoded_str, max_chars=200),
+                                "code_preview_omitted": "encoded_lambda_may_contain_sensitive_constants",
                                 "encoding": "base64",
                             },
                             why=(
@@ -1888,7 +1888,7 @@ class KerasZipScanner(BaseScanner):
                                         "layer_name": layer_name,
                                         "layer_class": "Lambda",
                                         "code_analysis": risk_desc,
-                                        "code_preview": redact_evidence_string(decoded_str, max_chars=200),
+                                        "code_preview_omitted": "encoded_lambda_may_contain_sensitive_constants",
                                     },
                                     why=get_pattern_explanation("lambda_layer"),
                                 )

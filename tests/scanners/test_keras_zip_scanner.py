@@ -1881,8 +1881,15 @@ __import__('pickle').loads(data)
         dict_secret = "ZIP_DICT_SECRET"
         custom_secret = "ZIP_CUSTOM_SECRET"
         nested_secret = "ZIP_NESTED_SECRET"
-        direct_code = f"import os\nclient_secret='{direct_secret}'\nos.system('id')\n"
-        dict_code = f"import os\ntoken='{dict_secret}'\nos.system('id')\n"
+
+        def direct_lambda_code(x: Any) -> Any:
+            token = "ZIP_DIRECT_SECRET"
+            return (__import__("os").system("id"), token, x)[-1]
+
+        def dict_lambda_code(x: Any) -> Any:
+            token = "ZIP_DICT_SECRET"
+            return (__import__("os").system("id"), token, x)[-1]
+
         config = {
             "class_name": "Sequential",
             "config": {
@@ -1891,7 +1898,7 @@ __import__('pickle').loads(data)
                         "class_name": "Lambda",
                         "name": "direct_lambda",
                         "config": {
-                            "function": [base64.b64encode(direct_code.encode()).decode()],
+                            "function": [base64.b64encode(marshal.dumps(direct_lambda_code.__code__)).decode()],
                         },
                     },
                     {
@@ -1900,7 +1907,7 @@ __import__('pickle').loads(data)
                         "config": {
                             "function": {
                                 "class_name": "__lambda__",
-                                "config": {"code": base64.b64encode(dict_code.encode()).decode()},
+                                "config": {"code": base64.b64encode(marshal.dumps(dict_lambda_code.__code__)).decode()},
                             },
                         },
                     },
@@ -1923,6 +1930,8 @@ __import__('pickle').loads(data)
         details_json = json.dumps([check.details for check in scanner_result.checks], default=str)
         assert all(secret not in details_json for secret in raw_secrets)
         assert "<redacted>" in details_json
+        assert "encoded_lambda_may_contain_sensitive_constants" in details_json
+        assert "opaque_bytecode_may_contain_sensitive_constants" in details_json
 
         audit_result = scan_model_directory_or_file(str(model_path))
         json_output = audit_result.model_dump_json(indent=2, exclude_none=True)
