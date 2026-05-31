@@ -51,6 +51,7 @@ _ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
 _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
 _MAX_PROTOBUF_PARSE_BYTES = 20 * 1024 * 1024
+_MAX_KERAS_METADATA_PARSE_BYTES = _MAX_PROTOBUF_PARSE_BYTES
 _MAX_COLLECTION_VALUE_BYTES = 256 * 1024
 _CORE_ROOT_MODEL_FILES = frozenset({"saved_model.pb", "keras_metadata.pb", "fingerprint.pb"})
 _CORE_ROOT_MODEL_DIRS = frozenset({"assets", "assets.extra", "variables"})
@@ -226,6 +227,24 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result.finish(success=False)
         return result
 
+    @staticmethod
+    def _mark_keras_metadata_parse_budget_exceeded(result: ScanResult, path: str) -> None:
+        reason = "keras_metadata_parse_budget_exceeded"
+        mark_inconclusive_scan_result(result, reason)
+        mark_operational_scan_error(result, reason)
+        result.add_check(
+            name="Keras Metadata Parse Budget",
+            passed=False,
+            message="keras_metadata.pb exceeds bounded parse budget",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "max_parse_bytes": _MAX_KERAS_METADATA_PARSE_BYTES,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+        )
+
     def scan(self, path: str) -> ScanResult:
         """Scan a TensorFlow SavedModel file or directory"""
         # Check if path is valid
@@ -301,7 +320,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 self._scan_keras_metadata(path, result)
             except OSError as e:
                 return self._finish_read_failure(result, path, e)
-            result.finish(success=not result.has_errors)
+            result.finish(
+                success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
+            )
             return result
 
         try:
@@ -1259,8 +1280,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
         """Scan keras_metadata.pb for Lambda layers and unsafe patterns"""
         try:
             with open(path, "rb") as f:
-                content = f.read()
-                result.bytes_scanned += len(content)
+                content = f.read(_MAX_KERAS_METADATA_PARSE_BYTES + 1)
+                result.bytes_scanned += min(len(content), _MAX_KERAS_METADATA_PARSE_BYTES)
+                if len(content) > _MAX_KERAS_METADATA_PARSE_BYTES:
+                    self._mark_keras_metadata_parse_budget_exceeded(result, path)
+                    return
 
                 # Convert to string for pattern matching
                 content_str = content.decode("utf-8", errors="ignore")

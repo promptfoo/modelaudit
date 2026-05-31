@@ -7,6 +7,7 @@ from typing import Any, Protocol, TypedDict
 
 import pytest
 
+import modelaudit.scanners.tf_savedmodel_scanner as tf_savedmodel_module
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import _ASSET_PROBE_BYTES, TensorFlowSavedModelScanner
@@ -173,6 +174,79 @@ def test_tf_savedmodel_directory_keeps_keras_metadata_read_failure_operational(
     assert result.metadata["operational_error_reason"] == "savedmodel_read_failed"
     assert result.metadata["scan_outcome_reasons"] == ["savedmodel_read_failed"]
     assert any(check.name == "SavedModel File Read" and check.location == str(metadata_path) for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_directory_oversized_keras_metadata_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    metadata_path = model_dir / "keras_metadata.pb"
+    metadata_path.write_bytes(b"A" * 33)
+    monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", 32)
+
+    direct = TensorFlowSavedModelScanner().scan(str(model_dir))
+    aggregate = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    budget_checks = [
+        check
+        for check in direct.checks
+        if check.name == "Keras Metadata Parse Budget" and check.location == str(metadata_path)
+    ]
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "keras_metadata_parse_budget_exceeded"
+    assert direct.metadata["scan_outcome_reasons"] == ["keras_metadata_parse_budget_exceeded"]
+    assert len(budget_checks) == 1
+    assert budget_checks[0].status == CheckStatus.FAILED
+    assert budget_checks[0].severity == IssueSeverity.INFO
+    assert budget_checks[0].details["analysis_incomplete"] is True
+    assert budget_checks[0].details["max_parse_bytes"] == 32
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_oversized_keras_metadata_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(b"A" * 33)
+    monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", 32)
+
+    direct = TensorFlowSavedModelScanner().scan(str(metadata_path))
+    aggregate = scan_model_directory_or_file(str(metadata_path), cache_scan_results=False)
+
+    assert direct.success is False
+    assert direct.bytes_scanned == 32
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "keras_metadata_parse_budget_exceeded"
+    assert direct.metadata["scan_outcome_reasons"] == ["keras_metadata_parse_budget_exceeded"]
+    assert any(
+        check.name == "Keras Metadata Parse Budget"
+        and check.location == str(metadata_path)
+        and check.details["max_parse_bytes"] == 32
+        for check in direct.checks
+    )
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_in_budget_keras_metadata_preserves_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    metadata_path = model_dir / "keras_metadata.pb"
+    metadata_path.write_bytes(b'{"class_name": "Dense"}')
+    monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", 64)
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert not any(check.name == "Keras Metadata Parse Budget" for check in result.checks)
 
 
 def test_suspicious_function_name_reuses_precompiled_patterns(monkeypatch: pytest.MonkeyPatch) -> None:
