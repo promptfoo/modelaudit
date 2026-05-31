@@ -343,6 +343,21 @@ def test_pytorch_binary_scanner_detects_executable_signature_after_first_chunk(t
     )
 
 
+def test_pytorch_binary_scanner_detects_late_executable_signature_across_chunk_boundary(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "late_boundary_elf.bin"
+    chunk_size = 1024 * 1024
+    elf_offset = 2 * chunk_size - 2
+    binary_file.write_bytes(b"\x00" * elf_offset + b"\x7fELF" + b"\x00" * 128)
+
+    result = scanner.scan(str(binary_file))
+
+    assert any(
+        issue.rule_code == "S501" and "Linux executable" in issue.message and issue.details.get("offset") == elf_offset
+        for issue in result.issues
+    )
+
+
 def test_pytorch_binary_scanner_ignores_invalid_mz_after_first_chunk(tmp_path: Path) -> None:
     scanner = PyTorchBinaryScanner()
     binary_file = tmp_path / "late_invalid_mz.bin"
@@ -352,6 +367,31 @@ def test_pytorch_binary_scanner_ignores_invalid_mz_after_first_chunk(tmp_path: P
     result = scanner.scan(str(binary_file))
 
     assert not any(issue.rule_code == "S501" and "Windows executable" in issue.message for issue in result.issues)
+
+
+def test_pytorch_binary_scanner_rejects_out_of_bounds_embedded_pe_without_opening_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scanner = PyTorchBinaryScanner()
+    pe_payload = b"MZ" + b"\x00" * 0x3A + (2048).to_bytes(4, "little")
+
+    def fail_open(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("out-of-range PE offsets must not open the file")
+
+    monkeypatch.setattr(builtins, "open", fail_open)
+
+    assert scanner._is_valid_embedded_pe(pe_payload, 0, 1024, file_size=2048) is False
+
+
+def test_pytorch_binary_scanner_ignores_invalid_late_shebang_alias(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "late_invalid_shebang.bin"
+    chunk_size = 1024 * 1024
+    binary_file.write_bytes(b"\x00" * (chunk_size + 512) + b"#!/bin/not-an-interpreter\n" + b"\x00" * 128)
+
+    result = scanner.scan(str(binary_file))
+
+    assert not any(issue.rule_code == "S501" and "Shell script shebang" in issue.message for issue in result.issues)
 
 
 @pytest.mark.skip(

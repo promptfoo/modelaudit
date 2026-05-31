@@ -177,9 +177,10 @@ class PyTorchBinaryScanner(BaseScanner):
 
                     # Check for executable file signatures
                     self._check_for_executable_signatures(
-                        chunk,
+                        scan_window,
                         result,
-                        chunk_offset,
+                        window_offset,
+                        overlap_prefix_len=overlap_prefix_len,
                     )
                     previous_chunk_tail = chunk[-chunk_overlap:] if chunk_overlap else b""
 
@@ -354,8 +355,20 @@ class PyTorchBinaryScanner(BaseScanner):
 
         return False
 
-    def _is_valid_embedded_pe(self, data: bytes, offset_in_chunk: int, absolute_offset: int) -> bool:
+    def _is_valid_embedded_pe(
+        self,
+        data: bytes,
+        offset_in_chunk: int,
+        absolute_offset: int,
+        *,
+        file_size: int | None = None,
+    ) -> bool:
         """Validate a non-leading DOS header before reporting embedded PE content."""
+        if file_size is None:
+            file_size = self.get_file_size(self.current_file_path)
+        if absolute_offset < 0 or absolute_offset + 0x40 > file_size:
+            return False
+
         pointer_offset = offset_in_chunk + 0x3C
         if pointer_offset + 4 <= len(data):
             pe_pointer = data[pointer_offset : pointer_offset + 4]
@@ -370,6 +383,8 @@ class PyTorchBinaryScanner(BaseScanner):
             return False
         pe_offset = int.from_bytes(pe_pointer, "little")
         if pe_offset < 0x40:
+            return False
+        if absolute_offset + pe_offset + 4 > file_size:
             return False
         signature_offset = offset_in_chunk + pe_offset
         if signature_offset + 4 <= len(data):
@@ -386,6 +401,8 @@ class PyTorchBinaryScanner(BaseScanner):
         chunk: bytes,
         result: ScanResult,
         offset: int,
+        *,
+        overlap_prefix_len: int = 0,
     ) -> None:
         """Check for executable file signatures with context-aware detection"""
         from modelaudit.utils.helpers.ml_context import (
@@ -394,7 +411,8 @@ class PyTorchBinaryScanner(BaseScanner):
         )
 
         # Analyze ML context for this chunk
-        ml_context = analyze_binary_for_ml_context(chunk, self.get_file_size(self.current_file_path))
+        file_size = self.get_file_size(self.current_file_path)
+        ml_context = analyze_binary_for_ml_context(chunk, file_size)
 
         # Count patterns for density analysis
         pattern_counts = {}
@@ -409,7 +427,8 @@ class PyTorchBinaryScanner(BaseScanner):
                     pos = chunk.find(sig, pos)
                     if pos == -1:
                         break
-                    positions.append(offset + pos)
+                    if pos + len(sig) > overlap_prefix_len:
+                        positions.append(offset + pos)
                     pos += len(sig)
 
                 if positions:
@@ -418,7 +437,7 @@ class PyTorchBinaryScanner(BaseScanner):
         # Process findings with context-aware filtering
         for sig, (positions, description) in pattern_counts.items():
             # Calculate pattern density more reasonably for small files
-            file_size_mb = self.get_file_size(self.current_file_path) / (1024 * 1024)
+            file_size_mb = file_size / (1024 * 1024)
             # Use at least 1MB for density calculation to avoid inflated densities in small files
             effective_size_mb = max(file_size_mb, 1.0)
             pattern_density = len(positions) / effective_size_mb
@@ -429,7 +448,7 @@ class PyTorchBinaryScanner(BaseScanner):
 
             for pos in positions:
                 # For shell shebangs, verify they have valid interpreter context
-                if sig == b"#!/":
+                if sig.startswith(b"#!/"):
                     # Calculate position within chunk
                     pos_in_chunk = pos - offset
                     if not self._verify_shebang_context(chunk, pos_in_chunk):
@@ -438,7 +457,16 @@ class PyTorchBinaryScanner(BaseScanner):
 
                 # Middle-of-file MZ pairs are common in weights; retain only
                 # structurally validated embedded PE images.
-                if sig == b"MZ" and pos != 0 and not self._is_valid_embedded_pe(chunk, pos - offset, pos):
+                if (
+                    sig == b"MZ"
+                    and pos != 0
+                    and not self._is_valid_embedded_pe(
+                        chunk,
+                        pos - offset,
+                        pos,
+                        file_size=file_size,
+                    )
+                ):
                     ignored_count += 1
                     continue
 
