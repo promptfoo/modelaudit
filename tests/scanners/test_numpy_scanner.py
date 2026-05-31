@@ -526,6 +526,33 @@ def test_numpy_object_dtype_pickle_selection_control_detects_exec(tmp_path: Path
     )
 
 
+def test_numpy_object_npz_pickle_selection_skip_is_inconclusive(tmp_path: Path) -> None:
+    path = tmp_path / "malicious_object_numpy_only.npz"
+    np.savez(path, payload=np.array([_ExecPayload()], dtype=object))
+
+    result = scan_model_directory_or_file(
+        str(path),
+        scanners=["zip", "numpy"],
+        cache_scan_results=False,
+    )
+    metadata = result.file_metadata[str(path)]
+    reasons = metadata.get("scan_outcome_reasons", [])
+    selection_checks = [
+        check
+        for check in result.checks
+        if check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pickle"
+    ]
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert "zip_analysis_incomplete" in reasons
+    assert selection_checks
+    assert selection_checks[0].details["analysis_incomplete"] is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert not any("exec" in issue.message.lower() for issue in result.issues)
+
+
 def test_benign_object_dtype_npz_no_nested_critical(tmp_path: Path) -> None:
     npz_path = tmp_path / "benign_object.npz"
     np.savez(npz_path, safe=np.array([{"x": 1}], dtype=object))
