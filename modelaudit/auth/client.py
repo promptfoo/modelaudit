@@ -6,7 +6,7 @@ from typing import Any, cast
 
 import requests
 
-from .config import cloud_config, get_user_email
+from .config import cloud_config, get_user_email, validate_api_host_for_bearer_auth
 
 logger = logging.getLogger("modelaudit.auth")
 
@@ -75,7 +75,7 @@ class AuthClient:
         Raises:
             Exception: If token validation fails
         """
-        host = api_host or cloud_config.get_api_host()
+        host = validate_api_host_for_bearer_auth(api_host or cloud_config.get_api_host())
 
         try:
             response = fetch_with_proxy(
@@ -124,7 +124,7 @@ class AuthClient:
         if not email or not api_key:
             raise Exception("Not logged in. Run 'modelaudit auth login' to login.")
 
-        api_host = cloud_config.get_api_host()
+        api_host = validate_api_host_for_bearer_auth(cloud_config.get_api_host())
 
         try:
             response = fetch_with_proxy(

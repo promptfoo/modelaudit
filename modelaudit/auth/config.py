@@ -4,6 +4,7 @@ import os
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import yaml
@@ -18,6 +19,38 @@ from ..utils._path_hardening import (
 
 # Environment variable for API host (matches promptfoo)
 API_HOST = os.getenv("API_HOST", "https://api.promptfoo.app")
+TRUSTED_BEARER_API_HOSTS = frozenset({"api.promptfoo.app"})
+TRUSTED_BEARER_API_PORTS = frozenset({None, 443})
+
+
+def validate_api_host_for_bearer_auth(api_host: str) -> str:
+    """Return a normalized API host that may receive bearer tokens."""
+    stripped_host = api_host.strip()
+    parsed = urlparse(stripped_host)
+
+    if parsed.scheme.lower() != "https":
+        raise ValueError("API host for bearer-token authentication must use HTTPS")
+
+    if parsed.username or parsed.password:
+        raise ValueError("API host for bearer-token authentication must not include credentials")
+
+    if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
+        raise ValueError("API host for bearer-token authentication must be a base API URL")
+
+    hostname = parsed.hostname.lower() if parsed.hostname else None
+    if hostname not in TRUSTED_BEARER_API_HOSTS:
+        trusted_hosts = ", ".join(f"https://{host}" for host in sorted(TRUSTED_BEARER_API_HOSTS))
+        raise ValueError(f"API host for bearer-token authentication must be one of: {trusted_hosts}")
+
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("API host for bearer-token authentication must include a valid port") from error
+
+    if port not in TRUSTED_BEARER_API_PORTS:
+        raise ValueError("API host for bearer-token authentication must use the default HTTPS port")
+
+    return f"https://{hostname}"
 
 
 class GlobalConfig:
@@ -61,7 +94,7 @@ class CloudConfig:
 
     def set_api_host(self, api_host: str) -> None:
         """Set API host."""
-        self.config["apiHost"] = api_host
+        self.config["apiHost"] = validate_api_host_for_bearer_auth(api_host)
         self._save_config()
 
     def set_api_key(self, api_key: str) -> None:
