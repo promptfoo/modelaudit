@@ -177,6 +177,7 @@ def pytest_runtest_setup(item):
             "test_file_filter.py",  # Directory file prefilter tests
             "test_huggingface.py",  # HuggingFace provenance and cache path tests
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
+            "tests/utils/sources/test_dvc_integration.py",  # DVC output-cap fail-closed regressions
             "test_jfrog.py",  # JFrog utility tests
             "test_jfrog_integration.py",  # JFrog integration tests
             "test_mlflow_integration.py",  # MLflow integration tests
