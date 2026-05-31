@@ -55,7 +55,7 @@ def create_mock_scan_result(**kwargs: Any) -> ModelAuditResultModel:
                 timestamp=time.time(),
                 details=issue_dict.get("details", {}),
                 why=None,
-                type=None,
+                type=issue_dict.get("type"),
             )
             issues.append(issue)
         result.issues = issues
@@ -2071,6 +2071,36 @@ def test_scan_mlflow_uri_with_options(
         cache_dir=default_remote_cache_dir(),
         use_hf_whitelist=True,
     )
+
+
+@patch("modelaudit.cli.record_download_completed")
+@patch("modelaudit.integrations.mlflow.scan_mlflow_model")
+def test_scan_mlflow_uri_budget_refusal_is_not_recorded_as_completed(
+    mock_scan_mlflow: MagicMock,
+    mock_record_download_completed: MagicMock,
+) -> None:
+    """Budget refusals should not emit successful-download telemetry."""
+    mock_scan_mlflow.return_value = create_mock_scan_result(
+        bytes_scanned=0,
+        issues=[
+            {
+                "message": "Unable to determine MLflow artifact size before download",
+                "severity": "info",
+                "type": "mlflow_download_budget",
+            }
+        ],
+        files_scanned=0,
+        has_errors=True,
+        success=False,
+        scanners=["mlflow"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "models:/TestModel/1"])
+
+    assert result.exit_code == 2
+    assert "Download refused by configured size budget" in result.output
+    mock_record_download_completed.assert_not_called()
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
