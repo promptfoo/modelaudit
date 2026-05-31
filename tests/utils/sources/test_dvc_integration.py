@@ -3,7 +3,12 @@ import pickle
 from pathlib import Path
 
 from modelaudit.core import scan_model_directory_or_file
-from modelaudit.utils.sources.dvc import DVC_ANALYSIS_INCOMPLETE_REASON, resolve_dvc_file
+from modelaudit.utils.sources.dvc import (
+    DVC_ANALYSIS_INCOMPLETE_REASON,
+    DVC_OUTPUT_LIMIT_EXCEEDED_REASON,
+    resolve_dvc_file,
+    resolve_dvc_file_status,
+)
 
 
 class TestDvcIntegration:
@@ -206,6 +211,38 @@ class TestDvcIntegration:
         )
         assert any(Path(asset.path).name == target.name for asset in results.assets)
 
+    def test_partial_dvc_directory_output_scans_nested_payload(self, tmp_path: Path) -> None:
+        """Resolved directories should still be traversed when another output is missing."""
+
+        class MaliciousClass:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os
+
+                return (os.system, ("echo dvc-directory-malicious",))
+
+        output_dir = tmp_path / "model"
+        output_dir.mkdir()
+        nested_payload = output_dir / "nested.pkl"
+        with nested_payload.open("wb") as f:
+            pickle.dump(MaliciousClass(), f)
+
+        dvc_file = tmp_path / "partial-directory.dvc"
+        dvc_file.write_text("""outs:
+- path: model
+- path: missing.pkl
+""")
+
+        results = scan_model_directory_or_file(str(dvc_file))
+
+        assert results.files_scanned == 1
+        assert results.has_errors is True
+        assert results.success is False
+        assert any(Path(asset.path).name == nested_payload.name for asset in results.assets)
+        assert any("nested.pkl" in (issue.location or "") for issue in results.issues)
+        assert any(
+            issue.details.get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON for issue in results.issues
+        )
+
 
 class TestDvcSecurity:
     """Test security aspects of DVC integration."""
@@ -301,6 +338,42 @@ class TestDvcSecurity:
         resolved = resolve_dvc_file(str(dvc_file))
         # Should be limited to MAX_OUTPUTS (100)
         assert len(resolved) <= 100
+
+    def test_output_limit_marks_resolution_incomplete(self, tmp_path: Path) -> None:
+        """Declarations beyond the output cap should remain an explicit coverage gap."""
+        target = tmp_path / "model.pkl"
+        with target.open("wb") as f:
+            pickle.dump({"safe": True}, f)
+
+        dvc_file = tmp_path / "excessive.dvc"
+        dvc_file.write_text("outs:\n" + "- path: model.pkl\n" * 101)
+
+        resolution = resolve_dvc_file_status(str(dvc_file))
+
+        assert len(resolution.resolved_paths) == 100
+        assert resolution.analysis_incomplete is True
+        assert resolution.incomplete_reason == DVC_OUTPUT_LIMIT_EXCEEDED_REASON
+
+        results = scan_model_directory_or_file(str(dvc_file))
+
+        assert results.has_errors is True
+        assert results.success is False
+        assert any(
+            issue.details.get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON
+            and issue.details.get("incomplete_reason") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON
+            for issue in results.issues
+        )
+
+    def test_non_mapping_dvc_document_marks_resolution_incomplete(self, tmp_path: Path) -> None:
+        """Valid YAML with an invalid top-level shape should fail closed."""
+        dvc_file = tmp_path / "sequence.dvc"
+        dvc_file.write_text("- outs\n")
+
+        resolution = resolve_dvc_file_status(str(dvc_file))
+
+        assert resolution.resolved_paths == ()
+        assert resolution.analysis_incomplete is True
+        assert resolution.incomplete_reason == "dvc_invalid_structure"
 
     def test_malformed_dvc_file_handling(self, tmp_path):
         """Test handling of malformed DVC files."""
@@ -459,3 +532,36 @@ class TestDvcCliIntegration:
             and any("hidden_payload.pkl" in path for path in issue["details"]["unresolved_outputs"])
             for issue in output_data["issues"]
         )
+
+    def test_cli_partial_dvc_directory_output_scans_nested_payload(self, tmp_path: Path) -> None:
+        """CLI partial DVC scans should traverse resolved directory outputs."""
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        class MaliciousClass:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os
+
+                return (os.system, ("echo dvc-cli-directory-malicious",))
+
+        output_dir = tmp_path / "model"
+        output_dir.mkdir()
+        nested_payload = output_dir / "nested.pkl"
+        with nested_payload.open("wb") as f:
+            pickle.dump(MaliciousClass(), f)
+
+        dvc_file = tmp_path / "partial-directory.dvc"
+        dvc_file.write_text("""outs:
+- path: model
+- path: missing.pkl
+""")
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["scan", str(dvc_file), "--format", "json"])
+
+        assert result.exit_code == 2
+        output_data = json.loads(result.output)
+        assert output_data["files_scanned"] == 1
+        assert any(Path(asset["path"]).name == nested_payload.name for asset in output_data["assets"])
+        assert any("nested.pkl" in (issue.get("location") or "") for issue in output_data["issues"])

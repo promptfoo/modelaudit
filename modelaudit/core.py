@@ -181,7 +181,7 @@ def _record_incomplete_dvc_resolution(
 
     _add_issue_to_model(
         results,
-        "DVC output resolution incomplete - declared outputs were not scanned",
+        "DVC output resolution incomplete - declared outputs could not be fully scanned",
         severity=IssueSeverity.INFO.value,
         location=dvc_file,
         details=details,
@@ -1029,6 +1029,11 @@ def scan_model_directory_or_file(
                             continue
 
                     for target_path in target_paths:
+                        # The root walk already discovers files below resolved DVC
+                        # directory outputs. Do not queue the directory as a file.
+                        if target_path.is_dir():
+                            continue
+
                         target_str = str(target_path)
                         shard_family_key = _shard_family_key_for_path(target_str)
                         is_hf_shard_alias = route_hf_shard_alias and target_path == scan_source
@@ -1365,6 +1370,23 @@ def scan_model_directory_or_file(
             for _idx, target in enumerate(target_files):
                 # Check for interrupts
                 check_interrupted()
+
+                if os.path.isdir(target):
+                    nested_result = scan_model_directory_or_file(
+                        target,
+                        blacklist_patterns=blacklist_patterns,
+                        timeout=timeout,
+                        max_file_size=max_file_size,
+                        max_total_size=max_total_size,
+                        strict_license=strict_license,
+                        progress_callback=progress_callback,
+                        skip_file_types=skip_file_types,
+                        **kwargs,
+                    )
+                    results.aggregate_scan_result(nested_result)
+                    if nested_result.has_errors:
+                        scan_metadata["has_operational_errors"] = True
+                    continue
 
                 if progress_callback:
                     progress_callback(f"Scanning file: {target}", 0.0)

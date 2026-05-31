@@ -5,6 +5,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 DVC_ANALYSIS_INCOMPLETE_REASON = "dvc_outputs_unresolved"
+DVC_OUTPUT_LIMIT_EXCEEDED_REASON = "dvc_output_limit_exceeded"
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,10 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
         logger.warning(f"Failed to parse DVC file {file_path}: {exc}")
         return DvcResolution(incomplete_reason="dvc_parse_failed")
 
+    if not isinstance(data, dict):
+        logger.warning(f"DVC file {file_path} has invalid top-level structure")
+        return DvcResolution(incomplete_reason="dvc_invalid_structure")
+
     outs = data.get("outs", [])
     if not isinstance(outs, list):
         logger.warning(f"DVC file {file_path} has invalid 'outs' structure")
@@ -57,7 +62,8 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
 
     # Limit number of outputs to prevent resource exhaustion
     MAX_OUTPUTS = 100
-    if len(outs) > MAX_OUTPUTS:
+    output_limit_exceeded = len(outs) > MAX_OUTPUTS
+    if output_limit_exceeded:
         logger.warning(f"DVC file {file_path} has too many outputs ({len(outs)}), limiting to {MAX_OUTPUTS}")
         outs = outs[:MAX_OUTPUTS]
 
@@ -109,7 +115,9 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
             unresolved.append(out_path)
             continue
 
-    incomplete_reason = DVC_ANALYSIS_INCOMPLETE_REASON if unresolved else None
+    incomplete_reason = DVC_OUTPUT_LIMIT_EXCEEDED_REASON if output_limit_exceeded else None
+    if unresolved and incomplete_reason is None:
+        incomplete_reason = DVC_ANALYSIS_INCOMPLETE_REASON
     if not outs:
         incomplete_reason = "dvc_no_outputs"
 
