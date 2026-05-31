@@ -440,6 +440,59 @@ class TestModelDownloadStreaming:
             local_dir=str(tmp_path / "huggingface" / "test" / "model"),
         )
 
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_large_extensionless_listing_fails_closed(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_get_extensions: MagicMock,
+    ) -> None:
+        """Streaming mode must not download a large repo when no scannable filenames are listed."""
+        repo_files = [f"payloads/chunk-{idx:04d}" for idx in range(1000)]
+        repo_files.extend(["README.md", "config", "tokenizer"])
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, None),
+            ),
+            pytest.raises(
+                Exception,
+                match="Refusing to stream-download every file from test/model: "
+                "repository listing contains no recognized ModelAudit-scannable files",
+            ),
+        ):
+            list(download_model_streaming("https://huggingface.co/test/model"))
+
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_large_listing_keeps_known_model_extensions(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A large repo with recognized model files should stream only those model files."""
+        repo_files = [f"payloads/chunk-{idx:04d}" for idx in range(1000)]
+        repo_files.extend(["README.md", "pytorch_model.bin", "nested/adapter.bin", "config"])
+        model_path = tmp_path / "huggingface" / "test" / "model" / "pytorch_model.bin"
+        adapter_path = tmp_path / "huggingface" / "test" / "model" / "nested" / "adapter.bin"
+        mock_hf_hub_download.side_effect = [str(model_path), str(adapter_path)]
+
+        with patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(repo_files, None),
+        ):
+            results = list(download_model_streaming("https://huggingface.co/test/model", cache_dir=tmp_path))
+
+        assert results == [(model_path, False), (adapter_path, True)]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "pytorch_model.bin",
+            "nested/adapter.bin",
+        ]
+
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
         return_value=(None, "timed out after 30 seconds"),
