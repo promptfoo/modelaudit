@@ -41,13 +41,24 @@ def _matching_jax_transforms(key_str: str, value_str: str) -> list[str]:
     return [transform for transform in _DANGEROUS_JAX_TRANSFORMS if transform in key_str or transform in value_lower]
 
 
-def _redact_evidence_location(location: str) -> str:
-    return redact_evidence_string(location, max_chars=_EVIDENCE_LOCATION_CHARS)
+def _stringify_evidence_fragment(value: Any) -> str:
+    if isinstance(value, bytes | bytearray):
+        return bytes(value).decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _join_evidence_path(path: str, key: Any) -> str:
+    key_str = _stringify_evidence_fragment(key)
+    return f"{path}/{key_str}" if path else key_str
+
+
+def _redact_evidence_location(location: Any) -> str:
+    return redact_evidence_string(_stringify_evidence_fragment(location), max_chars=_EVIDENCE_LOCATION_CHARS)
 
 
 def _redact_evidence_key(key: Any) -> Any:
-    if isinstance(key, str):
-        return redact_evidence_string(key, max_chars=_EVIDENCE_LOCATION_CHARS)
+    if isinstance(key, str | bytes | bytearray):
+        return _redact_evidence_location(key)
     return key
 
 
@@ -365,8 +376,9 @@ class FlaxMsgpackScanner(BaseScanner):
             """Check for potentially dangerous JAX transform usage."""
             if isinstance(data, dict):
                 for key, value in data.items():
-                    key_str = str(key).lower()
+                    key_str = _stringify_evidence_fragment(key).lower()
                     value_str = str(value)
+                    child_path = _join_evidence_path(path, key)
 
                     for transform in _matching_jax_transforms(key_str, value_str):
                         result.add_check(
@@ -374,7 +386,7 @@ class FlaxMsgpackScanner(BaseScanner):
                             passed=False,
                             message=f"Suspicious JAX transform detected: {transform}",
                             severity=IssueSeverity.CRITICAL,
-                            location=_redact_evidence_location(f"{path}/{key}"),
+                            location=_redact_evidence_location(child_path),
                             details={
                                 "transform": transform,
                                 "context": redact_evidence_string(value_str, max_chars=_EVIDENCE_SAMPLE_CHARS),
@@ -382,7 +394,7 @@ class FlaxMsgpackScanner(BaseScanner):
                             rule_code="S1105",  # JAX compilation risks
                         )
 
-                    check_jax_transforms(value, f"{path}/{key}" if path else key)
+                    check_jax_transforms(value, child_path)
             elif isinstance(data, list | tuple):
                 for i, value in enumerate(data):
                     check_jax_transforms(value, f"{path}[{i}]")
@@ -430,7 +442,7 @@ class FlaxMsgpackScanner(BaseScanner):
                         )
 
                 for key, value in data.items():
-                    check_array_metadata(value, f"{path}/{key}" if path else key)
+                    check_array_metadata(value, _join_evidence_path(path, key))
 
         check_array_metadata(obj)
 
@@ -594,7 +606,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 )
 
             for k, v in value.items():
-                key_str = str(k)
+                key_str = _stringify_evidence_fragment(k)
                 self._check_suspicious_keys(key_str, v, f"{location}/{key_str}", result)
 
                 # Check if key itself contains suspicious patterns
@@ -656,7 +668,7 @@ class FlaxMsgpackScanner(BaseScanner):
             tensors: list[dict[str, Any]] = []
             if isinstance(data, dict):
                 for key, value in data.items():
-                    tensors.extend(collect_tensors(value, f"{path}/{key}" if path else key))
+                    tensors.extend(collect_tensors(value, _join_evidence_path(path, key)))
             elif isinstance(data, list | tuple):
                 for i, value in enumerate(data):
                     tensors.extend(collect_tensors(value, f"{path}[{i}]"))

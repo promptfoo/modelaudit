@@ -752,6 +752,37 @@ def test_flax_msgpack_redacts_model_controlled_key_locations(tmp_path: Path) -> 
     assert secret not in sarif_results
 
 
+def test_flax_msgpack_redacts_bytes_keys_without_breaking_tensor_analysis(tmp_path: Path) -> None:
+    path = tmp_path / "bytes_key.msgpack"
+    secret = "BYTESKEYSECRET123456789"
+    data = {
+        f"token={secret}".encode(): b"0" * 4096,
+        7: {"__jax_array__": True},
+    }
+    create_msgpack_file(path, data)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+    serialized = result.to_json()
+
+    assert not any(check.name == "Flax Msgpack Processing" for check in result.checks)
+    assert result.metadata["top_level_keys"] == ["token=<redacted>", 7]
+    assert any(check.name == "JAX Array Metadata Check" and check.location == "7" for check in result.checks)
+    assert secret not in serialized
+
+
+def test_flax_msgpack_detects_suspicious_bytes_keys(tmp_path: Path) -> None:
+    path = tmp_path / "bytes_reduce.msgpack"
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, b"__reduce__": "os.system"})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert any(
+        check.name == "Object Attribute Security Check"
+        and check.message == "Suspicious object attribute detected: __reduce__"
+        for check in result.checks
+    )
+
+
 def test_flax_msgpack_redaction_preserves_non_secret_suspicious_evidence(tmp_path: Path) -> None:
     path = tmp_path / "non_secret_evidence.msgpack"
     data = {
