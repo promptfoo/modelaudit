@@ -53,6 +53,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - detect dynamic `type()` namespaces that can hide callable protocol hooks
 - fail closed when encoded nested-pickle probe candidates exhaust the analysis cap
+- warn on import-only pickle globals that reference non-allowlisted custom modules
 - prevent call-graph alias cycles from hanging scans
 - detect nested brace-format lookups that reach tracked `defaultdict` factories
 - avoid `str.format` false positives when a `ChainMap` shadows a `defaultdict`

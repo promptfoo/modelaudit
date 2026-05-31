@@ -24,7 +24,7 @@ use crate::nested_surface::{
 };
 use crate::opcode::{parse_opcode, ArgValue, ParseError, ParsedOpcode};
 use crate::options::{deadline_from_timeout, ScanOptions};
-use crate::policy::{callable_severity, global_severity};
+use crate::policy::{callable_severity, global_import_requires_review, global_severity};
 use crate::post_budget::{post_budget_absolute_position, post_budget_global_matches};
 use crate::report::{
     detail_string, detail_usize, notice_to_detail_value, scan_error_to_detail_value, DetailValue,
@@ -446,6 +446,7 @@ fn global_ref_details(
 
 type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
 type CallableInvocationDedupeKey = (String, String, Option<usize>);
+type PendingGlobalImportFinding = (String, usize, Vec<(String, DetailValue)>);
 
 #[derive(Clone)]
 struct CallableInvocation {
@@ -484,6 +485,7 @@ pub(crate) struct ScanState<'a> {
     import_references: Vec<Vec<(String, DetailValue)>>,
     callable_invocations: Vec<Vec<(String, DetailValue)>>,
     callable_invocation_keys: HashSet<CallableInvocationDedupeKey>,
+    non_allowlisted_global_imports: Vec<PendingGlobalImportFinding>,
     opcode_count: usize,
     opcode_counts: HashMap<&'static str, usize>,
     global_count: usize,
@@ -542,6 +544,7 @@ impl<'a> ScanState<'a> {
             import_references: Vec::new(),
             callable_invocations: Vec::new(),
             callable_invocation_keys: HashSet::new(),
+            non_allowlisted_global_imports: Vec::new(),
             opcode_count: 0,
             opcode_counts: HashMap::new(),
             global_count: 0,
@@ -5218,6 +5221,12 @@ impl<'a> ScanState<'a> {
                     "Pickles that instantiate classes from __main__ depend on arbitrary application code and deserve manual review before loading.",
                 ),
             });
+            return;
+        }
+
+        if global_import_requires_review(&reference.module) {
+            self.non_allowlisted_global_imports
+                .push((symbol, reference.position, details));
         }
     }
 
@@ -5565,8 +5574,43 @@ impl<'a> ScanState<'a> {
         self.emit_buffer_opcode_notice();
         self.emit_persistent_id_notice();
         self.rebuild_seen_notice_keys();
+        self.emit_non_allowlisted_import_only_global_findings();
         self.coalesce_redundant_global_findings();
         self.finalize_verdict();
+    }
+
+    fn emit_non_allowlisted_import_only_global_findings(&mut self) {
+        if self.non_allowlisted_global_imports.is_empty() {
+            return;
+        }
+
+        let mut invoked_global_keys = HashSet::new();
+        for invocation in &self.callable_invocations {
+            let import_reference = detail_string(invocation, "import_reference");
+            let global_position = detail_usize(invocation, "global_position");
+            if let (Some(import_reference), Some(global_position)) =
+                (import_reference, global_position)
+            {
+                invoked_global_keys.insert((import_reference, global_position));
+            }
+        }
+
+        for (symbol, position, details) in std::mem::take(&mut self.non_allowlisted_global_imports)
+        {
+            if invoked_global_keys.contains(&(symbol.clone(), position)) {
+                continue;
+            }
+            self.add_finding(Finding {
+                message: format!("Found non-allowlisted import-only global reference: {symbol}"),
+                severity: "warning",
+                location: Some(format!("{} (pos {})", self.source, position)),
+                rule_code: Some("NON_ALLOWLISTED_GLOBAL"),
+                details,
+                why: Some(
+                    "Unpickling import-only GLOBAL opcodes imports the referenced module, so non-allowlisted custom modules can execute import-time initialization code.",
+                ),
+            });
+        }
     }
 
     fn emit_collected_expansion_finding(&mut self) {

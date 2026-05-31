@@ -13,6 +13,7 @@ import io
 import logging
 import os
 import pickle
+import py_compile
 import re
 import sys
 import tarfile
@@ -3430,6 +3431,51 @@ def test_scan_bytes_resolves_short_binstring_stack_global_operands() -> None:
             "is_dangerous": False,
         }
     ]
+
+
+def test_scan_bytes_warns_on_import_only_custom_global_that_executes_module_initialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_payload_{uuid.uuid4().hex}"
+    marker = tmp_path / "import_only_global_marker"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    py_compile.compile(str(source_path), cfile=str(tmp_path / f"{module_name}.pyc"), doraise=True)
+    source_path.unlink()
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.severity == Severity.WARNING
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+    pickle.loads(payload)
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_scan_bytes_keeps_allowlisted_import_only_global_clean() -> None:
+    payload = b"ccollections\nOrderedDict\n."
+
+    report = scan_bytes(payload, source="ordered-dict-global.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert any(
+        ref["import_reference"] == "collections.OrderedDict" and ref["is_dangerous"] is False
+        for ref in report.metadata["import_references"]
+    )
 
 
 def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> None:

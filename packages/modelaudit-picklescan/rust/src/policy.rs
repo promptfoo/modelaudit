@@ -6,6 +6,13 @@ pub(crate) fn callable_severity(module: &str, name: &str) -> Option<&'static str
     global_severity(module, name).or_else(|| pathlib_callable_severity(module, name))
 }
 
+pub(crate) fn global_import_requires_review(module: &str) -> bool {
+    let top_level_module = module.split('.').next().unwrap_or(module);
+    !IMPORT_ONLY_GLOBAL_ALLOWLIST_MODULES.contains(&module)
+        && !IMPORT_ONLY_GLOBAL_ALLOWLIST_MODULES.contains(&top_level_module)
+        && !dangerous_global_module_is_listed(module)
+}
+
 fn pathlib_callable_severity(module: &str, name: &str) -> Option<&'static str> {
     let mut candidate = name;
     loop {
@@ -157,6 +164,12 @@ fn dangerous_global_is_listed(module: &str, name: &str) -> bool {
         .is_ok()
 }
 
+fn dangerous_global_module_is_listed(module: &str) -> bool {
+    DANGEROUS_GLOBALS
+        .binary_search_by(|&(candidate_module, _)| candidate_module.cmp(module))
+        .is_ok()
+}
+
 fn warning_globals(module: &str) -> Option<WarningGlobalMatch> {
     match module {
         "functools" => Some(WarningGlobalMatch::OneOf(&["partial", "partialmethod"])),
@@ -205,6 +218,37 @@ fn name_contains_component(name: &str, blocked_components: &[&str]) -> bool {
 }
 
 const BUILTIN_MODULES: &[&str] = &["builtins", "__builtin__", "__builtins__"];
+const IMPORT_ONLY_GLOBAL_ALLOWLIST_MODULES: &[&str] = &[
+    "__builtin__",
+    "__builtins__",
+    "_operator",
+    "_pytest",
+    "_tkinter",
+    "array",
+    "builtins",
+    "click",
+    "collections",
+    "copyreg",
+    "datetime",
+    "decimal",
+    "enum",
+    "fractions",
+    "functools",
+    "heapq",
+    "itertools",
+    "joblib",
+    "logging",
+    "mailbox",
+    "math",
+    "numpy",
+    "operator",
+    "pathlib",
+    "random",
+    "re",
+    "torch",
+    "types",
+    "uuid",
+];
 const BUILTIN_DANGEROUS_NAMES: &[&str] = &[
     "__import__",
     "breakpoint",
@@ -1135,6 +1179,26 @@ mod tests {
         assert_eq!(global_severity("configparser", "ConfigParser.get"), None);
         assert_eq!(global_severity("logging", "getLogger"), None);
         assert_eq!(global_severity("tempfile", "gettempdir"), None);
+    }
+
+    #[test]
+    fn import_only_global_review_policy_preserves_allowlisted_modules() {
+        assert!(!global_import_requires_review("builtins"));
+        assert!(!global_import_requires_review("click"));
+        assert!(!global_import_requires_review("collections"));
+        assert!(!global_import_requires_review("collections.abc"));
+        assert!(!global_import_requires_review("numpy._core.multiarray"));
+        assert!(!global_import_requires_review("joblib.numpy_pickle"));
+        assert!(!global_import_requires_review("torch._utils"));
+        assert!(!global_import_requires_review("logging"));
+        assert!(!global_import_requires_review("mailbox"));
+        assert!(!global_import_requires_review("_pytest._py.path"));
+        assert!(!global_import_requires_review("_tkinter"));
+        assert!(!global_import_requires_review("_xxsubinterpreters"));
+        assert!(!global_import_requires_review("dotenv.main"));
+        assert!(!global_import_requires_review("random"));
+        assert!(global_import_requires_review("modelaudit_custom_payload"));
+        assert!(global_import_requires_review("vendor.package"));
     }
 
     #[test]

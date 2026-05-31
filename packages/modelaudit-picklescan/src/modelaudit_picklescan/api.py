@@ -15,6 +15,7 @@ from .call_graph import (
     StartupHookWriteFinding,
     UnanalyzedCallGraphReference,
     _begin_shared_source_report,
+    _call_graph_source_unavailable_reason,
     _CallGraphAnalysisLimitError,
     _ensure_shared_source_snapshot_stable,
     find_dangerous_call_graphs,
@@ -1008,6 +1009,7 @@ def _report_from_native_dict(raw_report: Mapping[str, Any]) -> PickleReport:
 
 
 def _with_call_graph_findings(report: PickleReport) -> PickleReport:
+    report = _with_source_available_import_only_global_warnings_suppressed(report)
     import_references = report.metadata.get("import_references")
     callable_invocations = report.metadata.get("callable_invocations", ())
     enrichment_errors: list[tuple[str, Exception]] = []
@@ -1096,6 +1098,53 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         if enrichment_errors
         else updated_report
     )
+
+
+def _with_source_available_import_only_global_warnings_suppressed(report: PickleReport) -> PickleReport:
+    filtered_findings: list[Finding] = []
+    changed = False
+    for finding in report.findings:
+        if finding.rule_code != "NON_ALLOWLISTED_GLOBAL":
+            filtered_findings.append(finding)
+            continue
+        module = finding.details.get("module")
+        if not isinstance(module, str):
+            filtered_findings.append(finding)
+            continue
+        try:
+            source_unavailable_reason = _call_graph_source_unavailable_reason(module)
+        except Exception:
+            source_unavailable_reason = "source_unavailable"
+        if source_unavailable_reason is None:
+            changed = True
+            continue
+        filtered_findings.append(finding)
+
+    if not changed:
+        return report
+
+    findings = tuple(filtered_findings)
+    return PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=_verdict_from_findings_and_status(findings, report.status),
+        findings=findings,
+        notices=report.notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=report.to_dict()["metadata"],
+        duration_s=report.duration_s,
+    )
+
+
+def _verdict_from_findings_and_status(findings: tuple[Finding, ...], status: ScanStatus) -> SafetyVerdict:
+    if any(finding.severity == Severity.CRITICAL for finding in findings):
+        return SafetyVerdict.MALICIOUS
+    if any(finding.severity == Severity.WARNING for finding in findings):
+        return SafetyVerdict.SUSPICIOUS
+    if status == ScanStatus.COMPLETE:
+        return SafetyVerdict.CLEAN
+    return SafetyVerdict.UNKNOWN
 
 
 def _with_call_graph_enrichment_errors(
