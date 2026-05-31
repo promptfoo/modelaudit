@@ -1085,9 +1085,12 @@ def test_lambda_dict_bytecode_with_dangerous_pattern_still_critical(tmp_path: Pa
 def test_lambda_code_previews_redact_credentials_in_json_and_sarif(tmp_path: Path) -> None:
     direct_secret = "H5_DIRECT_SECRET"
     dict_secret = "H5_DICT_SECRET"
-    encoded_code = base64.b64encode(
-        f"import os\nclient_secret='{dict_secret}'\nos.system('id')\n".encode(),
-    ).decode()
+
+    def dangerous_lambda_code(x: Any) -> Any:
+        client_secret = dict_secret
+        return (__import__("os").system("id"), client_secret, x)[-1]
+
+    encoded_code = base64.b64encode(marshal.dumps(dangerous_lambda_code.__code__)).decode()
     model_path = create_custom_h5_file(
         tmp_path,
         {
@@ -1125,6 +1128,13 @@ def test_lambda_code_previews_redact_credentials_in_json_and_sarif(tmp_path: Pat
     assert len(string_previews) == len(previews)
     assert all(direct_secret not in preview and dict_secret not in preview for preview in string_previews)
     assert any("<redacted>" in preview for preview in string_previews)
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.details.get("function_format") == "dict_bytecode"
+        and check.details.get("code_preview_omitted") == "opaque_bytecode_may_contain_sensitive_constants"
+        and "code_preview" not in check.details
+        for check in scanner_result.checks
+    )
 
     audit_result = scan_model_directory_or_file(str(model_path))
     json_output = audit_result.model_dump_json(indent=2, exclude_none=True)
