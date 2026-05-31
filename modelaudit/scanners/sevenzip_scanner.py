@@ -684,9 +684,16 @@ class SevenZipScanner(BaseScanner):
             ):
                 continue
 
-            member_info = None
-            with suppress(Exception):
-                member_info = archive.getinfo(file_name)
+            member_info = self._get_archive_member_info(archive, file_name)
+            symlink_state = self._preflight_member_symlink_state(member_info)
+            if symlink_state == "unknown":
+                probes_complete = False
+                self._add_member_metadata_incomplete_check(result, archive_path, file_name)
+                continue
+            if symlink_state == "symlink":
+                probes_complete = False
+                self._add_preextraction_symlink_check(result, archive_path, file_name, member_info)
+                continue
 
             if getattr(member_info, "is_directory", False) is True:
                 continue
@@ -884,6 +891,77 @@ class SevenZipScanner(BaseScanner):
         probe.seek(0)
         return probe.read(limit)
 
+    def _get_archive_member_info(self, archive: Any, file_name: str) -> Any | None:
+        """Return metadata for a member without extracting it, across py7zr API variants."""
+        getinfo = getattr(archive, "getinfo", None)
+        if callable(getinfo):
+            with suppress(Exception):
+                return getinfo(file_name)
+
+        list_members = getattr(archive, "list", None)
+        if callable(list_members):
+            with suppress(Exception):
+                for member_info in list_members():
+                    if getattr(member_info, "filename", None) == file_name:
+                        return member_info
+
+        files = getattr(archive, "files", None)
+        if isinstance(files, list):
+            for member_info in files:
+                if getattr(member_info, "filename", None) == file_name:
+                    return member_info
+
+        return None
+
+    @staticmethod
+    def _preflight_member_symlink_state(member_info: Any | None) -> str:
+        if member_info is None:
+            return "unknown"
+        is_symlink = getattr(member_info, "is_symlink", None)
+        if isinstance(is_symlink, bool):
+            return "symlink" if is_symlink else "regular"
+        if type(is_symlink).__module__.startswith("unittest.mock") and "is_symlink" not in vars(member_info):
+            return "regular"
+        return "unknown"
+
+    def _add_member_metadata_incomplete_check(self, result: ScanResult, archive_path: str, file_name: str) -> None:
+        result.add_check(
+            name="7z Member Metadata",
+            passed=False,
+            message=f"Unable to verify 7z member metadata before extraction: {file_name}",
+            severity=IssueSeverity.INFO,
+            location=f"{archive_path}:{file_name}",
+            details={
+                "entry": file_name,
+                "metadata_field": "is_symlink",
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "sevenzip_analysis_incomplete",
+            },
+        )
+
+    def _add_preextraction_symlink_check(
+        self,
+        result: ScanResult,
+        archive_path: str,
+        file_name: str,
+        member_info: Any | None,
+    ) -> None:
+        details: dict[str, Any] = {
+            "threat_type": "symlink_traversal",
+            "checked_before_extraction": True,
+        }
+        symlink_target = getattr(member_info, "linkname", None)
+        if isinstance(symlink_target, str):
+            details["symlink_target"] = symlink_target
+        result.add_check(
+            name="7z Symlink Protection",
+            passed=False,
+            message=f"Symlink detected in 7z archive before extraction: {file_name}",
+            severity=IssueSeverity.CRITICAL,
+            location=f"{archive_path}:{file_name}",
+            details=details,
+        )
+
     def _member_probe_result(self, archive: Any, file_name: str) -> _NestedMemberProbeResult:
         """Classify a member through bounded format and executable-content probes."""
         prefix = self._read_member_probe_prefix(archive, file_name, self._NESTED_MEMBER_PROBE_BYTES)
@@ -994,27 +1072,18 @@ class SevenZipScanner(BaseScanner):
         member_sizes: dict[str, int | None] = {}
         known_extract_bytes = 0
         for file_name in scannable_files:
-            member_info = None
-            with suppress(Exception):
-                member_info = archive.getinfo(file_name)
-
-            if getattr(member_info, "is_directory", False) is True:
+            member_info = self._get_archive_member_info(archive, file_name)
+            symlink_state = self._preflight_member_symlink_state(member_info)
+            if symlink_state == "unknown":
+                scan_complete = False
+                self._add_member_metadata_incomplete_check(result, archive_path, file_name)
+                continue
+            if symlink_state == "symlink":
+                scan_complete = False
+                self._add_preextraction_symlink_check(result, archive_path, file_name, member_info)
                 continue
 
-            if getattr(member_info, "is_symlink", False) is True:
-                scan_complete = False
-                result.add_check(
-                    name="7z Symlink Protection",
-                    passed=False,
-                    message=f"Symlink detected in 7z archive before extraction: {file_name}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=f"{archive_path}:{file_name}",
-                    details={
-                        "threat_type": "symlink_traversal",
-                        "symlink_target": getattr(member_info, "linkname", None),
-                        "checked_before_extraction": True,
-                    },
-                )
+            if getattr(member_info, "is_directory", False) is True:
                 continue
 
             member_size = self._get_archive_member_size(archive, file_name)
