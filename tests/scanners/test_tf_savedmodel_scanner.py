@@ -40,6 +40,19 @@ def has_tensorflow():
         return False
 
 
+def _protobuf_varint(value: int) -> bytes:
+    chunks: list[int] = []
+    while value > 0x7F:
+        chunks.append((value & 0x7F) | 0x80)
+        value >>= 7
+    chunks.append(value)
+    return bytes(chunks)
+
+
+def _protobuf_unknown_bytes_field(payload: bytes) -> bytes:
+    return b"\x0a" + _protobuf_varint(len(payload)) + payload
+
+
 def test_tf_savedmodel_scanner_can_handle(tmp_path: Path) -> None:
     """Test the can_handle method of TensorFlowSavedModelScanner."""
     # Create a directory with saved_model.pb
@@ -173,6 +186,72 @@ def test_tf_savedmodel_directory_keeps_keras_metadata_read_failure_operational(
     assert result.metadata["operational_error_reason"] == "savedmodel_read_failed"
     assert result.metadata["scan_outcome_reasons"] == ["savedmodel_read_failed"]
     assert any(check.name == "SavedModel File Read" and check.location == str(metadata_path) for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_directory_malformed_keras_metadata_is_inconclusive(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    metadata_path = model_dir / "keras_metadata.pb"
+    metadata_path.write_bytes(b"\x0a\x05abc")
+
+    direct = TensorFlowSavedModelScanner().scan(str(model_dir))
+    aggregate = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    parse_checks = [
+        check
+        for check in direct.checks
+        if check.name == "Keras Metadata Parsing" and check.location == str(metadata_path)
+    ]
+    assert direct.success is False
+    assert aggregate.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "keras_metadata_parse_failed"
+    assert direct.metadata["scan_outcome_reasons"] == ["keras_metadata_parse_failed"]
+    assert len(parse_checks) == 1
+    assert parse_checks[0].status == CheckStatus.FAILED
+    assert parse_checks[0].severity == IssueSeverity.INFO
+    assert parse_checks[0].details["analysis_incomplete"] is True
+    assert parse_checks[0].details["scan_outcome_reason"] == "keras_metadata_parse_failed"
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_malformed_keras_metadata_is_inconclusive(tmp_path: Path) -> None:
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(b"\x0a\x05abc")
+
+    direct = TensorFlowSavedModelScanner().scan(str(metadata_path))
+    aggregate = scan_model_directory_or_file(str(metadata_path), cache_scan_results=False)
+
+    parse_checks = [
+        check
+        for check in direct.checks
+        if check.name == "Keras Metadata Parsing" and check.location == str(metadata_path)
+    ]
+    assert direct.success is False
+    assert aggregate.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "keras_metadata_parse_failed"
+    assert direct.metadata["scan_outcome_reasons"] == ["keras_metadata_parse_failed"]
+    assert len(parse_checks) == 1
+    assert parse_checks[0].status == CheckStatus.FAILED
+    assert parse_checks[0].severity == IssueSeverity.INFO
+    assert parse_checks[0].details["analysis_incomplete"] is True
+    assert parse_checks[0].details["scan_outcome_reason"] == "keras_metadata_parse_failed"
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_directory_valid_keras_metadata_preserves_success(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    metadata_path = model_dir / "keras_metadata.pb"
+    metadata_path.write_bytes(_protobuf_unknown_bytes_field(b'{"class_name": "Dense"}'))
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert not any(check.name == "Keras Metadata Parsing" for check in result.checks)
 
 
 def test_suspicious_function_name_reuses_precompiled_patterns(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -696,7 +775,9 @@ def test_scan_keras_metadata_pb_lambda_exec_sets_success_false(tmp_path: Path) -
     """Standalone `keras_metadata.pb` scans should propagate CRITICAL Lambda findings to success=False."""
     encoded_code = base64.b64encode(b'exec("print(1)")').decode()
     metadata_path = tmp_path / "keras_metadata.pb"
-    metadata_path.write_bytes(f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode())
+    metadata_path.write_bytes(
+        _protobuf_unknown_bytes_field(f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode())
+    )
 
     result = TensorFlowSavedModelScanner().scan(str(metadata_path))
 

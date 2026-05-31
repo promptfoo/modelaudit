@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
+from google.protobuf.empty_pb2 import Empty
+from google.protobuf.message import DecodeError
+
 from modelaudit.config.explanations import get_tf_op_explanation
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, _looks_like_proto0_or_1_pickle
@@ -226,6 +229,25 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result.finish(success=False)
         return result
 
+    @staticmethod
+    def _mark_keras_metadata_scan_failure(result: ScanResult, path: str, error: Exception) -> None:
+        reason = "keras_metadata_parse_failed"
+        mark_inconclusive_scan_result(result, reason)
+        mark_operational_scan_error(result, reason)
+        result.add_check(
+            name="Keras Metadata Parsing",
+            passed=False,
+            message=f"Unable to parse keras_metadata.pb: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+        )
+
     def scan(self, path: str) -> ScanResult:
         """Scan a TensorFlow SavedModel file or directory"""
         # Check if path is valid
@@ -301,7 +323,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 self._scan_keras_metadata(path, result)
             except OSError as e:
                 return self._finish_read_failure(result, path, e)
-            result.finish(success=not result.has_errors)
+            result.finish(
+                success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
+            )
             return result
 
         try:
@@ -1261,6 +1285,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
             with open(path, "rb") as f:
                 content = f.read()
                 result.bytes_scanned += len(content)
+                try:
+                    Empty().ParseFromString(content)
+                except DecodeError as e:
+                    self._mark_keras_metadata_scan_failure(result, path, e)
+                    return
 
                 # Convert to string for pattern matching
                 content_str = content.decode("utf-8", errors="ignore")
@@ -1412,14 +1441,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         except OSError:
             raise
         except Exception as e:
-            result.add_check(
-                name="Keras Metadata Scan",
-                passed=False,
-                message=f"Error scanning keras_metadata.pb: {e!s}",
-                severity=IssueSeverity.DEBUG,
-                location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
-            )
+            self._mark_keras_metadata_scan_failure(result, path, e)
 
     def _scan_protobuf_vulnerabilities(self, saved_model: Any, result: ScanResult) -> None:
         """Enhanced protobuf vulnerability scanning for TensorFlow SavedModels"""
