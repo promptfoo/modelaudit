@@ -229,6 +229,21 @@ def _allowed_shard_paths_from_config(config: dict[str, Any]) -> list[str] | None
     return allowed_paths or None
 
 
+def _allowed_hf_shard_alias_paths(shard_path: str, base_dir: Path, hf_cache_root: Path) -> list[str]:
+    """Return shard siblings resolving inside the scan root or the same HF cache blobs directory."""
+    allowed_paths: list[str] = []
+    blobs_root = hf_cache_root / "blobs"
+    for candidate_path in Path(shard_path).parent.glob("*"):
+        with suppress(OSError, RuntimeError):
+            resolved_candidate_path = str(candidate_path.resolve())
+            if is_within_directory(str(base_dir), resolved_candidate_path) or is_within_directory(
+                str(blobs_root),
+                resolved_candidate_path,
+            ):
+                allowed_paths.append(resolved_candidate_path)
+    return allowed_paths
+
+
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
     """Select a scanner by trusted file structure, not just suffix."""
     if header_format == "zip":
@@ -1016,7 +1031,15 @@ def scan_model_directory_or_file(
                             family_paths.add(target_str)
                             if shard_family_key not in shard_family_representatives:
                                 shard_family_representatives[shard_family_key] = target_str
-                                shard_info = ShardedModelDetector.detect_shards(target_str)
+                                allowed_hf_shard_paths = (
+                                    _allowed_hf_shard_alias_paths(target_str, base_dir, hf_cache_root)
+                                    if is_hf_cache_symlink and hf_cache_root is not None
+                                    else None
+                                )
+                                shard_info = ShardedModelDetector.detect_shards(
+                                    target_str,
+                                    allowed_paths=allowed_hf_shard_paths,
+                                )
                                 if shard_info is not None:
                                     expected_total_shards = shard_info.get("expected_total_shards")
                                     if (
@@ -1044,6 +1067,17 @@ def scan_model_directory_or_file(
                                             elif shard_in_base_dir:
                                                 family_paths.add(resolved_shard_path)
                                             else:
+                                                _add_issue_to_model(
+                                                    results,
+                                                    "Path traversal outside scanned directory",
+                                                    severity=IssueSeverity.CRITICAL.value,
+                                                    location=resolved_shard_path,
+                                                    details={"resolved_path": resolved_shard_path},
+                                                )
+                                    for shard_path in shard_info.get("out_of_scope_shards", []):
+                                        if isinstance(shard_path, str):
+                                            resolved_shard_path = str(Path(shard_path).resolve())
+                                            if not is_within_directory(str(base_dir), resolved_shard_path):
                                                 _add_issue_to_model(
                                                     results,
                                                     "Path traversal outside scanned directory",
