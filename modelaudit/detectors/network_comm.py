@@ -565,6 +565,16 @@ _DOC_CONTEXT_NAME_PREFIXES: tuple[str, ...] = (
     "readme",
     "model_card",
 )
+_DOCUMENTATION_CONTEXT_EXTENSIONS: tuple[str, ...] = (
+    ".md",
+    ".markdown",
+    ".rst",
+)
+_DOCUMENTATION_CONTEXT_NAME_PREFIXES: tuple[str, ...] = (
+    "readme",
+    "model_card",
+    "license",
+)
 _PROSE_MARKERS: tuple[str, ...] = (
     " example",
     " examples",
@@ -628,6 +638,15 @@ def _is_metadata_context(context: str) -> bool:
     if stem in _DOC_CONTEXT_NAMES or stem.startswith(_DOC_CONTEXT_NAME_PREFIXES):
         return True
     return any(segment in _DOC_CONTEXT_SEGMENTS for segment in context_segments[:-1])
+
+
+def _is_documentation_context(context: str) -> bool:
+    """Return whether a scan context names a prose-oriented sidecar."""
+    context_lower = context.lower()
+    context_segments = [segment for segment in context_lower.replace("\\", "/").split("/") if segment]
+    filename = context_segments[-1] if context_segments else context_lower
+    stem = filename.rsplit(".", 1)[0]
+    return filename.endswith(_DOCUMENTATION_CONTEXT_EXTENSIONS) or stem.startswith(_DOCUMENTATION_CONTEXT_NAME_PREFIXES)
 
 
 def _extract_line(data: bytes, match_index: int) -> bytes:
@@ -700,6 +719,22 @@ def _is_doc_only_network_reference(
     if not has_prose_marker:
         return False
     return (metadata_context and word_count >= 4) or word_count >= 6
+
+
+def _is_doc_only_url_reference(data: bytes, *, match_index: int, token_len: int, context: str) -> bool:
+    """Return whether a URL or domain is ordinary prose in a documentation sidecar."""
+    if not _is_documentation_context(context):
+        return False
+
+    line_lower = _extract_line(data, match_index).lower()
+    stripped = line_lower.lstrip()
+    if any(stripped.startswith(prefix) for prefix in _CODE_LINE_PREFIXES):
+        return False
+    if _INLINE_COMPOUND_STATEMENT_PATTERN.match(line_lower):
+        return False
+    if any(marker in line_lower for marker in _CODE_LINE_MARKERS):
+        return False
+    return not _has_call_syntax(data, match_index, token_len)
 
 
 class NetworkCommDetector:
@@ -1005,11 +1040,22 @@ class NetworkCommDetector:
         for match in self.URL_PATTERN.finditer(data):
             url = match.group().decode("utf-8", errors="ignore")
             safe_url = _redact_url_for_finding(url)
+            url_lower = url.lower()
+            has_elevated_indicator = any(pattern in url_lower for pattern in ["eval", "exec", "cmd", "shell"]) or any(
+                port in url for port in [":1337", ":4444", ":31337"]
+            )
+            if not has_elevated_indicator and _is_doc_only_url_reference(
+                data,
+                match_index=match.start(),
+                token_len=len(match.group()),
+                context=context,
+            ):
+                continue
 
             # Calculate confidence based on URL characteristics
             confidence = 0.5
             severity = "MEDIUM"
-            if any(pattern in url.lower() for pattern in ["eval", "exec", "cmd", "shell"]):
+            if any(pattern in url_lower for pattern in ["eval", "exec", "cmd", "shell"]):
                 confidence = 0.9
                 severity = "HIGH"
             elif any(port in url for port in [":1337", ":4444", ":31337"]):
@@ -1201,6 +1247,13 @@ class NetworkCommDetector:
 
             # Skip common false positives
             if domain in seen_domains:
+                continue
+            if _is_doc_only_url_reference(
+                data,
+                match_index=match.start(),
+                token_len=len(match.group()),
+                context=context,
+            ):
                 continue
             if _is_domain_match_redacted_from_url_path(data, match.start(), domain):
                 continue

@@ -135,6 +135,15 @@ COMMON_ML_WORDS = frozenset(
 FALSE_POSITIVE_SECRET_CONTEXTS = ("key", "token", "secret", "password", "auth")
 UUID_LIKE_PATTERN = re.compile(r"^[a-f0-9]{8}-?[a-f0-9]{4}-?[a-f0-9]{4}-?[a-f0-9]{4}-?[a-f0-9]{12}$")
 ML_PARAMETER_VALUE_PATTERN = re.compile(r"^[\d\.\-e]+$")
+OBVIOUS_PLACEHOLDER_SECRET_PATTERN = re.compile(
+    r"^(?:"
+    r"<[^<>]+>"
+    r"|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?"
+    r"|(?:your|example|sample|placeholder|dummy|fake|changeme|replace_me|redacted)(?:[_-][A-Za-z0-9]+)*"
+    r"|[x*]{8,}"
+    r")$",
+    re.IGNORECASE,
+)
 
 HIGH_CONFIDENCE_PATTERN_HINTS = (
     "AWS Access Key",
@@ -273,6 +282,8 @@ class SecretsDetector:
 
         # Check if it's a common word or phrase (not a secret)
         text_lower = text.lower()
+        if OBVIOUS_PLACEHOLDER_SECRET_PATTERN.fullmatch(text):
+            return True
         if text_lower in COMMON_ML_WORDS:
             return True
 

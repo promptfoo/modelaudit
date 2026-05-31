@@ -85,6 +85,56 @@ def test_text_scanner_ignores_benign_secret_and_network_near_matches(tmp_path: P
     )
 
 
+def test_text_scanner_ignores_documentation_urls_and_placeholder_secrets(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "\n".join(
+            [
+                "# Model Card",
+                "Project documentation: https://docs.example.com/models/demo",
+                "client_secret = YOUR_CLIENT_SECRET",
+                "secret = <CLIENT_SECRET>",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is True
+    assert not result.issues
+
+
+def test_text_scanner_keeps_documentation_secret_and_callback_assignments_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "\n".join(
+            [
+                "# Model Card",
+                "client_secret = Z9Y8X7W6V5U4T3S2R1Q0P9O8",
+                "callback = https://evil.example/callback",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Client Secret"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("type") == "url_detected"
+        for check in result.checks
+    )
+
+
 def test_text_network_detector_failure_is_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
