@@ -1051,16 +1051,15 @@ class KerasZipScanner(BaseScanner):
             minor = int(version_match.group(2))
             patch = int(version_match.group(3) or 0)
             suffix = (version_match.group(4) or "").strip().lower()
-
-            if suffix and not (
+            is_post_or_local = suffix.startswith(("+", ".post", "post"))
+            is_prerelease = not is_post_or_local and bool(
                 re.search(r"(?:^|[.\-])(dev|rc|a|b|alpha|beta|pre|preview)\d*", suffix)
-                or suffix.startswith("+")
-                or suffix.startswith(".post")
-                or suffix.startswith("post")
-            ):
+            )
+
+            if suffix and not (is_prerelease or is_post_or_local):
                 return None
 
-            return major == 3 and minor == 11 and 0 <= patch <= 2
+            return major == 3 and minor == 11 and (0 <= patch <= 2 or (patch == 3 and is_prerelease))
         except ValueError:
             return None
 

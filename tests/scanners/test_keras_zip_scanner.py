@@ -2368,6 +2368,46 @@ class TestCVE202549655TorchModuleWrapper:
             assert len(cve_issues) >= 1, f"Prerelease {prerelease_version} should be treated as vulnerable"
             assert cve_issues[0].severity == IssueSeverity.CRITICAL
 
+    @pytest.mark.parametrize("prerelease_version", ["3.11.3a0", "3.11.3rc1", "3.11.3.dev0"])
+    def test_fixed_boundary_prereleases_are_treated_as_vulnerable(
+        self,
+        tmp_path: Path,
+        prerelease_version: str,
+    ) -> None:
+        """Prereleases of the fixed 3.11.3 boundary still precede the final patched release."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
+        }
+
+        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, prerelease_version))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-49655"]
+        assert len(cve_issues) >= 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    @pytest.mark.parametrize("fixed_version", ["3.11.3", "3.11.3+local", "3.11.3.post1"])
+    def test_fixed_boundary_final_local_and_post_releases_are_not_cve_attributed(
+        self,
+        tmp_path: Path,
+        fixed_version: str,
+    ) -> None:
+        """Final, local, and post releases at the fixed boundary stay on the metadata-risk warning path."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
+        }
+
+        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, fixed_version))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-49655"]
+        assert cve_issues == []
+        risk_checks = [check for check in result.checks if check.name == "TorchModuleWrapper Version Risk Check"]
+        assert len(risk_checks) >= 1
+        assert risk_checks[0].severity == IssueSeverity.WARNING
+
     def test_torch_module_wrapper_version_unknown(self, tmp_path: Path) -> None:
         """Missing or non-canonical version should emit warning, not pass."""
         scanner = KerasZipScanner()
