@@ -22,7 +22,6 @@ from ..config.explanations import (
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
-from ._evidence_redaction import redact_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
@@ -953,7 +952,7 @@ class KerasH5Scanner(BaseScanner):
                         details={
                             "layer_class": "Lambda",
                             "code_analysis": risk_desc,
-                            "code_preview": redact_evidence_string(function_str, max_chars=200),
+                            "code_preview_omitted": "lambda_code_may_contain_sensitive_literals",
                         },
                         rule_code="S507",  # Python embedded code
                     )
