@@ -2554,6 +2554,14 @@ def test_pytorch_zip_scanner_entry_limit_passes(tmp_path: Path) -> None:
     assert all(c.status == CheckStatus.PASSED for c in entry_checks)
 
 
+@pytest.mark.parametrize("invalid_limit", [0, -1, False, "10"])
+def test_pytorch_zip_scanner_entry_limit_rejects_invalid_overrides(invalid_limit: object) -> None:
+    """Invalid entry limits should fall back to the bounded default."""
+    scanner = PyTorchZipScanner(config={"max_archive_entries": invalid_limit})
+
+    assert scanner.max_archive_entries == scanner.MAX_ARCHIVE_ENTRIES
+
+
 def test_pytorch_zip_scanner_compression_ratio_check(tmp_path):
     """Test that scanner detects suspicious compression ratios."""
 

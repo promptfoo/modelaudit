@@ -268,7 +268,10 @@ class PyTorchZipScanner(BaseScanner):
             self.config.get("min_compression_bomb_uncompressed_size"),
             self.MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE,
         )
-        self.max_archive_entries = self.config.get("max_archive_entries", self.MAX_ARCHIVE_ENTRIES)
+        self.max_archive_entries = self._normalize_positive_int_config(
+            self.config.get("max_archive_entries"),
+            self.MAX_ARCHIVE_ENTRIES,
+        )
         # ``max_jit_scan_member_bytes`` caps per-member reads during the JIT /
         # network pattern pass to avoid unbounded memory blowup. Non-positive
         # or non-integer values fall back to the default; there is *no*
