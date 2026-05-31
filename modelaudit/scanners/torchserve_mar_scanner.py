@@ -22,6 +22,7 @@ from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
 from .archive_member_security import (
+    _normalized_high_risk_python_call_name,
     executable_archive_member_name_rule_code,
     executable_archive_member_rule_code,
     high_risk_python_calls_in_tree,
@@ -1344,7 +1345,259 @@ class TorchServeMarScanner(BaseScanner):
         return tree, None
 
     def _find_high_risk_calls_from_tree(self, tree: ast.AST) -> set[str]:
-        return {call.name for call in high_risk_python_calls_in_tree(tree)}
+        risky_calls = {call.name for call in high_risk_python_calls_in_tree(tree)}
+        risky_calls.update(self._find_dynamic_import_execution_calls(tree))
+        return risky_calls
+
+    @staticmethod
+    def _static_string_value(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left = TorchServeMarScanner._static_string_value(node.left)
+            right = TorchServeMarScanner._static_string_value(node.right)
+            if left is not None and right is not None:
+                return f"{left}{right}"
+        return None
+
+    def _dynamic_import_module_name(
+        self,
+        node: ast.AST,
+        aliases: dict[str, str],
+        import_loader_aliases: dict[str, str],
+    ) -> str | None:
+        if not isinstance(node, ast.Call):
+            return None
+
+        helper_name = self._resolve_call_name(node.func)
+        if helper_name is None:
+            return None
+
+        resolved_helper_name = import_loader_aliases.get(helper_name, self._apply_alias(helper_name, aliases))
+        if resolved_helper_name not in {"__import__", "builtins.__import__", "importlib.import_module"}:
+            return None
+
+        module_arg = node.args[0] if node.args else None
+        for keyword in node.keywords:
+            if keyword.arg in {"name", "module"} and module_arg is None:
+                module_arg = keyword.value
+        if module_arg is None:
+            return None
+
+        module_name = self._static_string_value(module_arg)
+        if not module_name:
+            return None
+        if resolved_helper_name in {"__import__", "builtins.__import__"}:
+            return module_name.split(".", maxsplit=1)[0]
+        return module_name
+
+    def _resolve_dynamic_import_root(
+        self,
+        node: ast.AST,
+        aliases: dict[str, str],
+        module_aliases: dict[str, str],
+        import_loader_aliases: dict[str, str],
+    ) -> str | None:
+        if isinstance(node, ast.Name):
+            return module_aliases.get(node.id)
+        return self._dynamic_import_module_name(node, aliases, import_loader_aliases)
+
+    def _resolve_dynamic_import_getattr_call(
+        self,
+        node: ast.Call,
+        aliases: dict[str, str],
+        module_aliases: dict[str, str],
+        import_loader_aliases: dict[str, str],
+    ) -> str | None:
+        helper_name = self._resolve_call_name(node.func)
+        if helper_name is None:
+            return None
+
+        resolved_helper_name = self._apply_alias(helper_name, aliases)
+        if resolved_helper_name not in {"getattr", "builtins.getattr"}:
+            return None
+
+        target_node: ast.AST | None = node.args[0] if node.args else None
+        attr_node: ast.AST | None = node.args[1] if len(node.args) >= 2 else None
+        for keyword in node.keywords:
+            if keyword.arg == "object" and target_node is None:
+                target_node = keyword.value
+            elif keyword.arg == "name" and attr_node is None:
+                attr_node = keyword.value
+        if target_node is None or attr_node is None:
+            return None
+
+        module_name = self._resolve_dynamic_import_root(target_node, aliases, module_aliases, import_loader_aliases)
+        attr_name = self._static_string_value(attr_node)
+        if module_name is None or attr_name is None:
+            return None
+
+        return _normalized_high_risk_python_call_name(f"{module_name}.{attr_name}")
+
+    def _resolve_dynamic_import_execution_call(
+        self,
+        node: ast.AST,
+        aliases: dict[str, str],
+        module_aliases: dict[str, str],
+        callable_aliases: dict[str, str],
+        import_loader_aliases: dict[str, str],
+    ) -> str | None:
+        if isinstance(node, ast.Name):
+            return callable_aliases.get(node.id)
+
+        if isinstance(node, ast.Attribute):
+            module_name = self._resolve_dynamic_import_root(
+                node.value,
+                aliases,
+                module_aliases,
+                import_loader_aliases,
+            )
+            if module_name is None:
+                return None
+            return _normalized_high_risk_python_call_name(f"{module_name}.{node.attr}")
+
+        if isinstance(node, ast.Call):
+            return self._resolve_dynamic_import_getattr_call(node, aliases, module_aliases, import_loader_aliases)
+
+        return None
+
+    def _find_dynamic_import_execution_calls(self, tree: ast.AST) -> set[str]:
+        aliases = self._collect_import_aliases(tree)
+        scanner = self
+
+        class DynamicImportExecutionVisitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.module_alias_stack: list[dict[str, str]] = [{}]
+                self.callable_alias_stack: list[dict[str, str]] = [{}]
+                self.import_loader_alias_stack: list[dict[str, str]] = [{}]
+                self.risky_calls: set[str] = set()
+
+            @property
+            def module_aliases(self) -> dict[str, str]:
+                return self.module_alias_stack[-1]
+
+            @property
+            def callable_aliases(self) -> dict[str, str]:
+                return self.callable_alias_stack[-1]
+
+            @property
+            def import_loader_aliases(self) -> dict[str, str]:
+                return self.import_loader_alias_stack[-1]
+
+            def _push_scope(self, parameters: set[str]) -> None:
+                self.module_alias_stack.append(dict(self.module_aliases))
+                self.callable_alias_stack.append(dict(self.callable_aliases))
+                self.import_loader_alias_stack.append(dict(self.import_loader_aliases))
+                for parameter in parameters:
+                    self.module_aliases.pop(parameter, None)
+                    self.callable_aliases.pop(parameter, None)
+                    self.import_loader_aliases.pop(parameter, None)
+
+            def _pop_scope(self) -> None:
+                self.module_alias_stack.pop()
+                self.callable_alias_stack.pop()
+                self.import_loader_alias_stack.pop()
+
+            @staticmethod
+            def _parameter_names(args: ast.arguments) -> set[str]:
+                parameters: set[str] = set()
+                positional_args = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+                parameters.update(arg.arg for arg in positional_args)
+                if args.vararg is not None:
+                    parameters.add(args.vararg.arg)
+                if args.kwarg is not None:
+                    parameters.add(args.kwarg.arg)
+                return parameters
+
+            def _record_name_assignment(self, name: str, value: ast.AST) -> None:
+                self.module_aliases.pop(name, None)
+                self.callable_aliases.pop(name, None)
+                self.import_loader_aliases.pop(name, None)
+
+                module_name = scanner._dynamic_import_module_name(value, aliases, self.import_loader_aliases)
+                if module_name is not None:
+                    self.module_aliases[name] = module_name
+                    return
+
+                callable_name = scanner._resolve_dynamic_import_execution_call(
+                    value,
+                    aliases,
+                    self.module_aliases,
+                    self.callable_aliases,
+                    self.import_loader_aliases,
+                )
+                if callable_name is not None:
+                    self.callable_aliases[name] = callable_name
+                    return
+
+                value_name = scanner._resolve_call_name(value)
+                if value_name is None:
+                    return
+                resolved_value_name = self.import_loader_aliases.get(
+                    value_name, scanner._apply_alias(value_name, aliases)
+                )
+                if resolved_value_name in {"__import__", "builtins.__import__", "importlib.import_module"}:
+                    self.import_loader_aliases[name] = resolved_value_name
+
+            def _visit_function_definition(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+                for decorator in node.decorator_list:
+                    self.visit(decorator)
+                for default in [*node.args.defaults, *node.args.kw_defaults]:
+                    if default is not None:
+                        self.visit(default)
+                self._push_scope(self._parameter_names(node.args))
+                for statement in node.body:
+                    self.visit(statement)
+                self._pop_scope()
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                self._visit_function_definition(node)
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                self._visit_function_definition(node)
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                for decorator in node.decorator_list:
+                    self.visit(decorator)
+                for base in node.bases:
+                    self.visit(base)
+                self._push_scope(set())
+                for statement in node.body:
+                    self.visit(statement)
+                self._pop_scope()
+
+            def visit_Assign(self, node: ast.Assign) -> None:
+                self.visit(node.value)
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self._record_name_assignment(target.id, node.value)
+
+            def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+                if node.value is not None:
+                    self.visit(node.value)
+                    if isinstance(node.target, ast.Name):
+                        self._record_name_assignment(node.target.id, node.value)
+
+            def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+                self.visit(node.value)
+                if isinstance(node.target, ast.Name):
+                    self._record_name_assignment(node.target.id, node.value)
+
+            def visit_Call(self, node: ast.Call) -> None:
+                call_name = scanner._resolve_dynamic_import_execution_call(
+                    node.func,
+                    aliases,
+                    self.module_aliases,
+                    self.callable_aliases,
+                    self.import_loader_aliases,
+                )
+                if call_name is not None:
+                    self.risky_calls.add(call_name)
+                self.generic_visit(node)
+
+        visitor = DynamicImportExecutionVisitor()
+        visitor.visit(tree)
+        return visitor.risky_calls
 
     def _find_high_risk_calls(self, source_bytes: bytes) -> tuple[set[str], str | None]:
         tree, parse_error = self._parse_python_source(source_bytes)

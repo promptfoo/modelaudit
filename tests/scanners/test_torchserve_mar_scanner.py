@@ -732,6 +732,64 @@ def test_scan_detects_aliased_getattr_wrapped_handler_execution_primitive(
 @pytest.mark.parametrize(
     ("handler_source", "dangerous_name"),
     [
+        (
+            b"def handle(data, context):\n    module = __import__('os')\n    return getattr(module, 'system')('id')\n",
+            "os.system",
+        ),
+        (
+            b"from importlib import import_module as load\n"
+            b"\n"
+            b"def handle(data, context):\n"
+            b"    runner = getattr(load('os'), 'system')\n"
+            b"    return runner('id')\n",
+            "os.system",
+        ),
+        (
+            b"def handle(data, context):\n    return __import__('sub' + 'process').Popen(['id'])\n",
+            "subprocess.Popen",
+        ),
+    ],
+)
+def test_scan_detects_dynamic_import_getattr_handler_execution_primitive(
+    tmp_path: Path,
+    handler_source: bytes,
+    dangerous_name: str,
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="dynamic_import_getattr_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert dangerous_name in handler_failures[0].message
+    assert dangerous_name in handler_failures[0].details["risky_calls"]
+
+
+def test_dynamic_import_getattr_handler_analysis_ignores_safe_attributes() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('math')\n"
+        b"    sqrt = getattr(module, 'sqrt')\n"
+        b"    return sqrt(4)\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "math.sqrt" not in risky_calls
+    assert risky_calls == {"__import__"}
+
+
+@pytest.mark.parametrize(
+    ("handler_source", "dangerous_name"),
+    [
         (b"import os\ndef handle(data, context):\n    return os.execvpe('/bin/sh', ['sh'], {})\n", "os.execvpe"),
         (
             b"from os import spawnv as run\ndef handle(data, context):\n"
