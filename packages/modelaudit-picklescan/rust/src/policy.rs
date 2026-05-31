@@ -1,3 +1,6 @@
+const MAX_DOTTED_GLOBAL_BYTES: usize = 4096;
+const MAX_DOTTED_GLOBAL_SEGMENTS: usize = 64;
+
 pub(crate) fn global_severity(module: &str, name: &str) -> Option<&'static str> {
     direct_global_severity(module, name).or_else(|| dotted_global_tail_severity(name))
 }
@@ -20,7 +23,13 @@ fn pathlib_callable_severity(module: &str, name: &str) -> Option<&'static str> {
 fn direct_global_severity(module: &str, name: &str) -> Option<&'static str> {
     direct_global_severity_without_wrapper_alias(module, name)
         .or_else(|| wrapper_global_alias_severity(module, name))
-        .or_else(|| dangerous_global_prefix_severity(module, name))
+        .or_else(|| {
+            if dotted_global_policy_budget_exceeded(name) {
+                Some("warning")
+            } else {
+                dangerous_global_prefix_severity(module, name)
+            }
+        })
 }
 
 fn wrapper_global_alias_severity(module: &str, name: &str) -> Option<&'static str> {
@@ -44,7 +53,7 @@ fn strip_wrapper_global_suffix(name: &str) -> Option<&str> {
 }
 
 fn dangerous_global_prefix_severity(module: &str, name: &str) -> Option<&'static str> {
-    let parts = name.split('.').collect::<Vec<_>>();
+    let parts = bounded_dotted_parts(name)?;
     for split in 1..parts.len() {
         if is_inert_global_metadata_tail(&parts[split..]) {
             continue;
@@ -118,7 +127,10 @@ fn dotted_global_tail_severity(name: &str) -> Option<&'static str> {
         return None;
     }
 
-    let parts = name.split('.').collect::<Vec<_>>();
+    if dotted_global_policy_budget_exceeded(name) {
+        return Some("warning");
+    }
+    let parts = bounded_dotted_parts(name)?;
     for start in 0..parts.len().saturating_sub(1) {
         for split in start + 1..parts.len() {
             let candidate_module = parts[start..split].join(".");
@@ -129,6 +141,19 @@ fn dotted_global_tail_severity(name: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+fn dotted_global_policy_budget_exceeded(name: &str) -> bool {
+    name.len() > MAX_DOTTED_GLOBAL_BYTES
+        || name.split('.').take(MAX_DOTTED_GLOBAL_SEGMENTS + 1).count() > MAX_DOTTED_GLOBAL_SEGMENTS
+}
+
+fn bounded_dotted_parts(name: &str) -> Option<Vec<&str>> {
+    if dotted_global_policy_budget_exceeded(name) {
+        None
+    } else {
+        Some(name.split('.').collect())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1143,6 +1168,21 @@ mod tests {
         assert_eq!(global_severity("functools", "partial"), Some("warning"));
         assert_eq!(global_severity("functools", "reduce"), Some("critical"));
         assert_eq!(global_severity("linecache", "clearcache"), None);
+    }
+
+    #[test]
+    fn dotted_global_lookup_is_segment_bounded() {
+        let long_dotted_name = (0..(MAX_DOTTED_GLOBAL_SEGMENTS + 4))
+            .map(|index| format!("part{index}"))
+            .collect::<Vec<_>>()
+            .join(".");
+
+        assert_eq!(global_severity("safe", &long_dotted_name), Some("warning"));
+        assert_eq!(
+            global_severity("safe", "wrapper.os.system"),
+            Some("critical")
+        );
+        assert_eq!(global_severity("safe", "wrapper.custom.loader"), None);
     }
 
     #[test]
