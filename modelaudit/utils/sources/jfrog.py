@@ -136,7 +136,7 @@ def is_jfrog_url(url: str) -> bool:
     """Check if a URL points to a JFrog Artifactory file or folder."""
     parsed = urlparse(url)
     hostname = _normalize_hostname(parsed.hostname or "")
-    if parsed.scheme != "https" and not (parsed.scheme == "http" and _is_local_jfrog_host(hostname)):
+    if parsed.scheme != "https":
         return False
     if "/artifactory/" not in parsed.path:
         return False
@@ -166,7 +166,11 @@ def _get_trusted_jfrog_hosts() -> set[str]:
     instances while rejecting arbitrary lookalike URLs.
     """
     raw_hosts = os.getenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "")
-    return {host for host in (_host_from_config_value(value) for value in raw_hosts.split(",")) if host}
+    return {
+        host
+        for host in (_host_from_config_value(value) for value in raw_hosts.split(","))
+        if host and not _is_local_jfrog_host(host)
+    }
 
 
 def _is_local_jfrog_host(hostname: str) -> bool:
@@ -186,7 +190,7 @@ def _is_local_jfrog_host(hostname: str) -> bool:
 
 
 def _is_jfrog_service_host(hostname: str) -> bool:
-    return hostname == "jfrog.io" or hostname.endswith(".jfrog.io") or _is_local_jfrog_host(hostname)
+    return hostname == "jfrog.io" or hostname.endswith(".jfrog.io")
 
 
 def _is_trusted_jfrog_auth_target(url: str) -> bool:
@@ -196,7 +200,7 @@ def _is_trusted_jfrog_auth_target(url: str) -> bool:
         return False
 
     hostname = _normalize_hostname(parsed.hostname or "")
-    return bool(hostname and hostname in _get_trusted_jfrog_hosts())
+    return bool(hostname and not _is_local_jfrog_host(hostname) and hostname in _get_trusted_jfrog_hosts())
 
 
 def _build_jfrog_auth_headers(

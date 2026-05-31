@@ -25,8 +25,6 @@ class TestJFrogURLDetection:
     def test_valid_jfrog_urls(self):
         valid_urls = [
             "https://company.jfrog.io/artifactory/repo/model.bin",
-            "http://localhost/artifactory/libs-release/model.pt",
-            "http://127.0.0.1/artifactory/libs-release/model.pt",
         ]
         for url in valid_urls:
             assert is_jfrog_url(url)
@@ -37,6 +35,10 @@ class TestJFrogURLDetection:
             "https://evil.example/artifactory/repo/model.bin",
             "https://my-jfrog.com/artifactory/libs-release/model.pt",
             "http://attacker.jfrog.io/artifactory/repo/model.bin",
+            "http://localhost/artifactory/libs-release/model.pt",
+            "https://localhost/artifactory/libs-release/model.pt",
+            "https://127.0.0.1/artifactory/libs-release/model.pt",
+            "https://[::1]/artifactory/libs-release/model.pt",
             "hf://model",
             "",
         ]
@@ -48,6 +50,14 @@ class TestJFrogURLDetection:
 
         assert is_jfrog_url("https://my-jfrog.com/artifactory/libs-release/model.pt")
         assert is_jfrog_url("https://artifacts.internal/artifactory/ml/model.pkl")
+        assert not is_jfrog_url("http://my-jfrog.com/artifactory/libs-release/model.pt")
+
+    def test_loopback_hosts_are_not_trusted_even_when_allowlisted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "localhost,127.0.0.1,https://[::1]")
+
+        assert not is_jfrog_url("https://localhost/artifactory/libs-release/model.pt")
+        assert not is_jfrog_url("https://127.0.0.1/artifactory/libs-release/model.pt")
+        assert not is_jfrog_url("https://[::1]/artifactory/libs-release/model.pt")
 
 
 class TestJFrogDownload:
@@ -195,6 +205,32 @@ class TestJFrogDownload:
 
         mock_get.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://localhost/artifactory/repo/model.bin",
+            "https://localhost/artifactory/repo/model.bin",
+            "https://127.0.0.1/artifactory/repo/model.bin",
+            "https://[::1]/artifactory/repo/model.bin",
+        ],
+    )
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_loopback_jfrog_url_is_rejected_before_credentials(
+        self,
+        mock_get: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        url: str,
+    ) -> None:
+        """Loopback URLs must not receive operator JFrog credentials."""
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "localhost,127.0.0.1,https://[::1]")
+        monkeypatch.setenv("JFROG_API_TOKEN", "env-api-token")
+
+        with pytest.raises(ValueError, match="Not a JFrog URL"):
+            download_artifact(url, cache_dir=tmp_path, api_token="explicit-api-token")
+
+        mock_get.assert_not_called()
+
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_storage_api_skips_credentials_for_unconfigured_host(
         self, mock_get: MagicMock, monkeypatch: pytest.MonkeyPatch
@@ -212,6 +248,22 @@ class TestJFrogDownload:
 
         assert result["type"] == "file"
         assert mock_get.call_args[1]["headers"] == {}
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_storage_api_rejects_loopback_before_credentials(
+        self, mock_get: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Storage API probing must not send credentials to loopback hosts."""
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "localhost")
+        monkeypatch.setenv("JFROG_ACCESS_TOKEN", "env-access-token")
+
+        with pytest.raises(ValueError, match="Not a JFrog URL"):
+            detect_jfrog_target_type(
+                "https://localhost/artifactory/repo/model.bin",
+                access_token="explicit-access-token",
+            )
+
+        mock_get.assert_not_called()
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_storage_api_explicit_access_token_precedes_environment_api_token(
