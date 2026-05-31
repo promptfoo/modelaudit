@@ -5860,6 +5860,7 @@ impl<'a> ScanState<'a> {
         let tail_end = tail_start
             .saturating_add(self.options.post_budget_scan_bytes)
             .min(self.payload.len());
+        self.scan_post_budget_structural_opcodes(tail_start, tail_end);
         let tail_prefix_len = 0;
         let tail = &self.payload[tail_start..tail_end];
         self.bytes_scanned = self
@@ -5938,6 +5939,23 @@ impl<'a> ScanState<'a> {
         );
         if !expansion_findings.is_empty() {
             self.add_expansion_finding(&expansion_findings, true);
+        }
+    }
+
+    fn scan_post_budget_structural_opcodes(&mut self, read_offset: usize, scan_end: usize) {
+        let mut index = read_offset.min(scan_end);
+        while index < scan_end {
+            let Ok(opcode) = parse_opcode(self.payload, index, scan_end) else {
+                break;
+            };
+            let position = self.position_offset + opcode.pos;
+            if opcode.name == "FRAME" {
+                self.record_oversized_frame_notice(&opcode, position);
+            }
+            index = opcode.next;
+            if opcode.name == "STOP" {
+                break;
+            }
         }
     }
 
@@ -7704,6 +7722,44 @@ mod tests {
         assert_eq!(detail_usize(&finding.details, "frame_length"), Some(3));
         assert_eq!(detail_usize(&finding.details, "remaining_bytes"), Some(2));
         assert_eq!(scan.status, ScanStatus::Complete);
+        assert_eq!(scan.verdict, "suspicious");
+    }
+
+    #[test]
+    fn post_budget_tail_reports_oversized_frame_tamper() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: 2,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04N\x95\x03\x00\x00\x00\x00\x00\x00\x00}.";
+        let mut scan = ScanState::new(
+            "post-budget-oversized-frame.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let finding = scan
+            .findings
+            .iter()
+            .find(|finding| finding.rule_code == Some("STRUCTURAL_TAMPER"))
+            .expect("post-budget oversized FRAME finding");
+        assert_eq!(
+            detail_string(&finding.details, "tamper_type").as_deref(),
+            Some("oversized_frame")
+        );
+        assert_eq!(detail_usize(&finding.details, "frame_length"), Some(3));
+        assert_eq!(detail_usize(&finding.details, "remaining_bytes"), Some(2));
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
         assert_eq!(scan.verdict, "suspicious");
     }
 

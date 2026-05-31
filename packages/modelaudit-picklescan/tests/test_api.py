@@ -1852,6 +1852,19 @@ def test_scan_bytes_post_budget_tail_starts_at_budget_boundary() -> None:
     assert any(finding.rule_code == "POST_BUDGET_GLOBAL" for finding in report.findings)
 
 
+def test_scan_bytes_post_budget_tail_records_oversized_frame_tamper() -> None:
+    payload = b"\x80\x04N\x95\x03\x00\x00\x00\x00\x00\x00\x00}."
+
+    report = scan_bytes(payload, source="budget-frame.pkl", options=ScanOptions(max_opcodes=2))
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    finding = next(finding for finding in report.findings if finding.rule_code == "STRUCTURAL_TAMPER")
+    assert finding.details["tamper_type"] == "oversized_frame"
+    assert finding.details["frame_length"] == 3
+    assert finding.details["remaining_bytes"] == 2
+
+
 def test_scan_bytes_post_budget_tail_handles_stack_global_at_boundary() -> None:
     payload = b"\x80\x04\x8c\x05posix\x94\x8c\x06system\x94\x93."
 
