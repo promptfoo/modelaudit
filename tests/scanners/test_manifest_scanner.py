@@ -748,6 +748,22 @@ def test_manifest_scanner_delegates_nested_chat_template_containers_to_jinja_ana
     )
 
 
+def test_manifest_scanner_nested_chat_template_collection_enforces_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    scanner = ManifestScanner()
+    timeout_calls = 0
+
+    def raise_during_nested_collection() -> None:
+        nonlocal timeout_calls
+        timeout_calls += 1
+        if timeout_calls == 4:
+            raise TimeoutError("embedded Jinja collection timed out")
+
+    monkeypatch.setattr(scanner, "_check_timeout", raise_during_nested_collection)
+
+    with pytest.raises(TimeoutError, match="embedded Jinja collection timed out"):
+        scanner._collect_jinja_template_fields({"chat_template": {"default": "{{ harmless }}"}})
+
+
 def test_manifest_scanner_nested_oversized_chat_template_fails_closed(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     payload = "{{ message['content'] }}" + (" safe" * 32)
