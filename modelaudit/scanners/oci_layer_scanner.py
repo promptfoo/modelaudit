@@ -211,7 +211,11 @@ class OciLayerScanner(BaseScanner):
         normalized_target = target.replace("\\", os.sep).replace("/", os.sep)
         target_base = os.path.dirname(resolved_member_name)
         target_resolved = os.path.normpath(os.path.join(target_base, normalized_target))
-        return target_resolved, is_within_directory(extraction_root, target_resolved)
+        try:
+            target_from_root = os.path.relpath(target_resolved, extraction_root)
+        except ValueError:
+            return target_resolved, False
+        return sanitize_archive_path(target_from_root, extraction_root)
 
     @classmethod
     def can_handle(cls, path: str) -> bool:

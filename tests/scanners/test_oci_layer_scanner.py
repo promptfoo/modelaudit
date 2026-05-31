@@ -1161,6 +1161,48 @@ class TestOciLayerScanner:
         assert len(checks) == 1
         assert checks[0].status.value == "passed"
 
+    def test_resolve_symlink_target_does_not_follow_host_symlinks(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Layer metadata validation should not depend on host filesystem symlinks."""
+        extraction_root = tmp_path / "extract"
+        extraction_root.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (extraction_root / "usr").symlink_to(outside, target_is_directory=True)
+
+        resolved, is_safe = OciLayerScanner._resolve_link_target(
+            "../lib/tool",
+            resolved_member_name=str(extraction_root / "usr/bin/tool"),
+            extraction_root=str(extraction_root),
+            is_symlink=True,
+        )
+
+        assert resolved == str(extraction_root / "usr/lib/tool")
+        assert is_safe is True
+
+    def test_resolve_symlink_target_rejects_host_alias_back_into_layer_root(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Host aliases must not make lexically escaping layer links appear safe."""
+        extraction_root = tmp_path / "extract"
+        extraction_root.mkdir()
+        (tmp_path / "alias").symlink_to(extraction_root, target_is_directory=True)
+
+        resolved, is_safe = OciLayerScanner._resolve_link_target(
+            "../../../alias/etc/passwd",
+            resolved_member_name=str(extraction_root / "usr/bin/tool"),
+            extraction_root=str(extraction_root),
+            is_symlink=True,
+        )
+
+        assert resolved == str(tmp_path / "alias/etc/passwd")
+        assert is_safe is False
+
     def test_scan_layer_reports_symlink_target_traversal_outside_layer_root(self, tmp_path: Path) -> None:
         """Symlink targets that escape the layer root should still be rejected."""
         layer_path = tmp_path / "unsafe-relative-link.tar.gz"
