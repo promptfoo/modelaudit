@@ -1,11 +1,14 @@
+import io
 import logging
 import os
 import struct
 import subprocess
 import sys
+import tarfile
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 
 import pytest
 import requests
@@ -22,6 +25,7 @@ from modelaudit.utils.sources.jfrog import (
     list_jfrog_folder_contents,
     redact_jfrog_url_for_display,
 )
+from tests.helpers import create_mock_coreml, create_mock_onnx
 
 
 class _FakeStreamingResponse:
@@ -105,6 +109,51 @@ class TestJFrogDownload:
         call_args = mock_get.call_args
         assert "X-JFrog-Art-Api" in call_args[1]["headers"]
         assert call_args[1]["headers"]["X-JFrog-Art-Api"] == "test-token"
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_rejects_cross_origin_redirect(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Full artifact downloads must not follow an off-origin redirect."""
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        redirect_response = _FakeStreamingResponse(
+            b"",
+            status_code=302,
+            headers={"Location": "https://evil.example/artifacts/model.bin"},
+        )
+        mock_get.return_value = redirect_response
+
+        with pytest.raises(Exception, match="Refusing cross-origin JFrog redirect"):
+            download_artifact(
+                "https://company.jfrog.io/artifactory/repo/model.bin",
+                cache_dir=tmp_path,
+                api_token="test-token",
+            )
+
+        assert mock_get.call_count == 1
+        assert redirect_response.closed is True
+        assert not any(tmp_path.iterdir())
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_follows_same_origin_redirect(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Full artifact downloads may follow a bounded same-origin redirect."""
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        redirect_response = _FakeStreamingResponse(b"", status_code=307, headers={"Location": "model.bin?download=1"})
+        final_response = _FakeStreamingResponse(b"data")
+        mock_get.side_effect = [redirect_response, final_response]
+
+        result = download_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            cache_dir=tmp_path,
+            api_token="test-token",
+        )
+
+        assert result.read_bytes() == b"data"
+        assert mock_get.call_args_list[1].args[0] == ("https://company.jfrog.io/artifactory/repo/model.bin?download=1")
+        assert mock_get.call_args_list[1].kwargs["headers"]["X-JFrog-Art-Api"] == "test-token"
+        assert redirect_response.closed is True
 
     def test_invalid_url(self):
         with pytest.raises(ValueError):
@@ -822,7 +871,7 @@ class TestJFrogFolderDownload:
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     @patch("modelaudit.utils.sources.jfrog.download_artifact")
     @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
-    def test_download_jfrog_folder_probe_strips_credentials_on_untrusted_redirect(
+    def test_download_jfrog_folder_probe_fails_closed_on_untrusted_redirect(
         self,
         mock_list: MagicMock,
         mock_download: MagicMock,
@@ -830,45 +879,36 @@ class TestJFrogFolderDownload:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Content probes must not forward JFrog API tokens across untrusted redirects."""
+        """Content probes must not route artifacts using an untrusted redirect body."""
         monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
         hidden_url = "https://company.jfrog.io/artifactory/repo/models/evil.payload"
         redirected_url = "https://evil.example/artifacts/evil.payload"
         payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
         redirect_response = _FakeStreamingResponse(b"", status_code=302, headers={"Location": redirected_url})
-        final_response = _FakeStreamingResponse(payload)
-        mock_get.side_effect = [redirect_response, final_response]
+        mock_get.return_value = redirect_response
         mock_list.return_value = [
             {"name": "evil.payload", "path": hidden_url, "size": len(payload), "human_size": "24 B"}
         ]
 
-        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
-            downloaded_file = cache_dir / Path(url).name
-            downloaded_file.write_bytes(b"mock file content")
-            return downloaded_file
-
-        mock_download.side_effect = download_side_effect
-
-        download_jfrog_folder(
-            "https://company.jfrog.io/artifactory/repo/models/",
-            cache_dir=tmp_path,
-            api_token="test-token",
-            show_progress=False,
-        )
+        with pytest.raises(ValueError, match="selective filtering incomplete"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                api_token="test-token",
+                show_progress=False,
+            )
 
         assert mock_get.call_args_list[0].args[0] == hidden_url
         assert mock_get.call_args_list[0].kwargs["headers"]["X-JFrog-Art-Api"] == "test-token"
-        assert mock_get.call_args_list[1].args[0] == redirected_url
-        assert "X-JFrog-Art-Api" not in mock_get.call_args_list[1].kwargs["headers"]
-        assert mock_get.call_args_list[1].kwargs["headers"]["Range"] == "bytes=0-65535"
-        assert all(call.kwargs["allow_redirects"] is False for call in mock_get.call_args_list)
+        assert mock_get.call_count == 1
         assert redirect_response.closed is True
-        assert (tmp_path / "evil.payload").exists()
+        mock_download.assert_not_called()
+        assert not any(tmp_path.iterdir())
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     @patch("modelaudit.utils.sources.jfrog.download_artifact")
     @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
-    def test_download_jfrog_folder_probe_strips_credentials_on_parser_confused_redirect(
+    def test_download_jfrog_folder_probe_fails_closed_on_parser_confused_redirect(
         self,
         mock_list: MagicMock,
         mock_download: MagicMock,
@@ -876,39 +916,30 @@ class TestJFrogFolderDownload:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Redirect auth trust must use the host Requests will actually contact."""
+        """Redirect routing trust must use the host Requests will actually contact."""
         monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
         hidden_url = "https://company.jfrog.io/artifactory/repo/models/evil.payload"
         redirected_url = "https://evil.example\\@company.jfrog.io/artifacts/evil.payload"
         payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
         redirect_response = _FakeStreamingResponse(b"", status_code=302, headers={"Location": redirected_url})
-        final_response = _FakeStreamingResponse(payload)
-        mock_get.side_effect = [redirect_response, final_response]
+        mock_get.return_value = redirect_response
         mock_list.return_value = [
             {"name": "evil.payload", "path": hidden_url, "size": len(payload), "human_size": "24 B"}
         ]
 
-        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
-            downloaded_file = cache_dir / Path(url).name
-            downloaded_file.write_bytes(b"mock file content")
-            return downloaded_file
-
-        mock_download.side_effect = download_side_effect
-
-        download_jfrog_folder(
-            "https://company.jfrog.io/artifactory/repo/models/",
-            cache_dir=tmp_path,
-            api_token="test-token",
-            show_progress=False,
-        )
+        with pytest.raises(ValueError, match="selective filtering incomplete"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                api_token="test-token",
+                show_progress=False,
+            )
 
         assert mock_get.call_args_list[0].kwargs["headers"]["X-JFrog-Art-Api"] == "test-token"
-        assert mock_get.call_args_list[1].args[0] == redirected_url
-        assert "X-JFrog-Art-Api" not in mock_get.call_args_list[1].kwargs["headers"]
-        assert mock_get.call_args_list[1].kwargs["headers"]["Range"] == "bytes=0-65535"
-        assert all(call.kwargs["allow_redirects"] is False for call in mock_get.call_args_list)
+        assert mock_get.call_count == 1
         assert redirect_response.closed is True
-        assert (tmp_path / "evil.payload").exists()
+        mock_download.assert_not_called()
+        assert not any(tmp_path.iterdir())
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     @patch("modelaudit.utils.sources.jfrog.download_artifact")
@@ -935,7 +966,7 @@ class TestJFrogFolderDownload:
         ]
 
         def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
-            downloaded_file = cache_dir / Path(url).name
+            downloaded_file = cache_dir / Path(urlparse(url).path).name
             downloaded_file.write_bytes(b"mock file content")
             return downloaded_file
 
@@ -954,7 +985,122 @@ class TestJFrogFolderDownload:
         assert mock_get.call_args_list[1].kwargs["headers"]["X-JFrog-Art-Api"] == "test-token"
         assert mock_get.call_args_list[1].kwargs["headers"]["Range"] == "bytes=0-65535"
         assert redirect_response.closed is True
+        mock_download.assert_called_once_with(
+            "https://company.jfrog.io/artifactory/repo/models/evil.payload?download=1",
+            cache_dir=tmp_path,
+            api_token="test-token",
+            access_token=None,
+            timeout=30,
+        )
         assert (tmp_path / "evil.payload").exists()
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_selective_includes_structured_remote_routes(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Selective remote probes should preserve ONNX, CoreML, and TAR payloads with renamed suffixes."""
+        onnx_payload = create_mock_onnx(tmp_path / "fixture.onnx").read_bytes()
+        coreml_payload = create_mock_coreml(tmp_path / "fixture.mlmodel").read_bytes()
+        tar_buffer = io.BytesIO()
+        with tarfile.open(fileobj=tar_buffer, mode="w") as archive:
+            member_payload = b"payload"
+            member = tarfile.TarInfo("model.pkl")
+            member.size = len(member_payload)
+            archive.addfile(member, io.BytesIO(member_payload))
+        tar_payload = tar_buffer.getvalue()
+        payloads = {
+            "https://company.jfrog.io/artifactory/repo/models/model.payload": onnx_payload,
+            "https://company.jfrog.io/artifactory/repo/models/network.payload": coreml_payload,
+            "https://company.jfrog.io/artifactory/repo/models/archive.payload": tar_payload,
+        }
+        mock_list.return_value = [
+            {"name": Path(url).name, "path": url, "size": len(payload), "human_size": "Unknown"}
+            for url, payload in payloads.items()
+        ]
+        mock_get.side_effect = lambda url, **_kwargs: _FakeStreamingResponse(payloads[url])
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(urlparse(url).path).name
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        result_dir = download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path / "downloads",
+            show_progress=False,
+        )
+
+        assert result_dir == tmp_path / "downloads"
+        assert {call.args[0] for call in mock_download.call_args_list} == set(payloads)
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_scanner_selection_preserves_structure_routed_zip(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """ZIP-backed scanner selection should retain renamed archives for local structure routing."""
+        zip_url = "https://company.jfrog.io/artifactory/repo/models/model.payload"
+        mock_list.return_value = [{"name": "model.payload", "path": zip_url, "size": 8, "human_size": "8 B"}]
+        mock_get.return_value = _FakeStreamingResponse(b"PK\x03\x04data")
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(urlparse(url).path).name
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            show_progress=False,
+            scanner_selection=scanner_selection_config_from_inputs(scanners=["pytorch_zip"]),
+        )
+
+        mock_download.assert_called_once()
+        assert (tmp_path / "model.payload").exists()
+
+    @patch("modelaudit.utils.sources.jfrog._detect_jfrog_content_route_format")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_selective_caps_skipped_content_probes(
+        self,
+        mock_list: MagicMock,
+        mock_detect: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Selective routing should abort instead of probing an unbounded skipped-file listing."""
+        mock_list.return_value = [
+            {
+                "name": f"artifact-{index}.payload",
+                "path": f"https://company.jfrog.io/artifactory/repo/models/artifact-{index}.payload",
+                "size": 8,
+                "human_size": "8 B",
+            }
+            for index in range(257)
+        ]
+        mock_detect.return_value = (None, "")
+
+        with pytest.raises(ValueError, match="content probe limit"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                show_progress=False,
+            )
+
+        assert mock_detect.call_count == 256
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     @patch("modelaudit.utils.sources.jfrog.download_artifact")

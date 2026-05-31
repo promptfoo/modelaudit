@@ -9,6 +9,7 @@ import shutil
 import struct
 import tempfile
 from collections.abc import Collection, Mapping
+from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TypedDict
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 # Constants
 MAX_RECURSION_DEPTH = 64  # Prevent runaway recursion in folder traversal
 _MAX_JFROG_PROBE_REDIRECTS = 5
+_MAX_JFROG_CONTENT_PROBES = 256
 _JFROG_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
     r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|secret|api-key|api_key|apikey|sig)[^=\s&]*=)[^\s&#]+",
@@ -30,9 +32,11 @@ _SENSITIVE_QUERY_PARAM_RE = re.compile(
 )
 _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
 _JFROG_CONTENT_SNIFF_BYTES = 64 * 1024
-_JFROG_AUTH_HEADER_NAMES = frozenset({"authorization", "x-jfrog-art-api"})
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
+_JFROG_ZIP_STRUCTURE_ROUTED_SCANNER_IDS = frozenset(
+    {"executorch", "keras_zip", "pytorch_zip", "skops", "torchserve_mar", "zip"}
+)
 
 
 def redact_jfrog_url_for_display(url: str) -> str:
@@ -210,6 +214,22 @@ def _get_requests_prepared_hostname(url: str) -> str:
     return _normalize_hostname(urlparse(prepared_url).hostname or "")
 
 
+def _get_jfrog_probe_origin(url: str) -> tuple[str, str, int | None] | None:
+    """Return one unambiguous effective origin for a probe URL."""
+    try:
+        parsed = urlparse(url)
+        prepared_url = requests.Request("GET", url).prepare().url
+        if not prepared_url:
+            return None
+        prepared = urlparse(prepared_url)
+        parsed_origin = (parsed.scheme.lower(), _normalize_hostname(parsed.hostname or ""), parsed.port)
+        prepared_origin = (prepared.scheme.lower(), _normalize_hostname(prepared.hostname or ""), prepared.port)
+    except (requests.exceptions.RequestException, ValueError):
+        return None
+
+    return parsed_origin if parsed_origin == prepared_origin and parsed_origin[1] else None
+
+
 def _is_trusted_jfrog_auth_target(url: str) -> bool:
     """Return True when credentials may be sent to this JFrog URL."""
     parsed = urlparse(url)
@@ -322,12 +342,10 @@ def download_artifact(
             logger.warning(message)
 
     try:
-        # Use requests for proper authentication and error handling
-        response = requests.get(
+        response, _download_url = _get_jfrog_response_with_redirect_policy(
             url,
             headers=headers,
             timeout=timeout,
-            stream=True,  # Stream for large files
         )
 
         # Raise an exception for HTTP error responses
@@ -438,11 +456,6 @@ def filter_scannable_files(
     return scannable
 
 
-def _strip_jfrog_auth_headers(headers: Mapping[str, str]) -> dict[str, str]:
-    """Remove credential-bearing JFrog headers while keeping bounded probe headers."""
-    return {name: value for name, value in headers.items() if name.lower() not in _JFROG_AUTH_HEADER_NAMES}
-
-
 def _build_jfrog_probe_auth_headers(
     url: str,
     *,
@@ -460,27 +473,30 @@ def _build_jfrog_probe_auth_headers(
     return {}
 
 
-def _get_jfrog_probe_response_with_redirect_policy(
+def _get_jfrog_response_with_redirect_policy(
     url: str,
     *,
     headers: dict[str, str],
     timeout: int,
-) -> requests.Response:
-    """GET a JFrog probe URL while stripping credentials from untrusted redirects."""
+) -> tuple[requests.Response, str]:
+    """GET a JFrog URL while refusing ambiguous or cross-origin redirects."""
     current_url = url
-    current_headers = headers
-    unauthenticated_headers = _strip_jfrog_auth_headers(headers)
+    original_origin = _get_jfrog_probe_origin(url)
+    if original_origin is None:
+        raise requests.exceptions.RequestException(
+            f"Refusing parser-confused JFrog URL {redact_jfrog_url_for_display(url)}"
+        )
 
     for _redirect_count in range(_MAX_JFROG_PROBE_REDIRECTS + 1):
         response = requests.get(
             current_url,
-            headers=current_headers,
+            headers=headers,
             stream=True,
             timeout=timeout,
             allow_redirects=False,
         )
         if response.status_code not in _JFROG_REDIRECT_STATUS_CODES:
-            return response
+            return response, current_url
 
         location = response.headers.get("Location")
         if not location:
@@ -490,9 +506,14 @@ def _get_jfrog_probe_response_with_redirect_policy(
                 f"{redact_jfrog_url_for_display(current_url)} did not include a Location header"
             )
 
-        current_url = urljoin(current_url, location)
+        redirected_url = urljoin(current_url, location)
         response.close()
-        current_headers = headers if _is_trusted_jfrog_probe_auth_target(current_url) else unauthenticated_headers
+        if _get_jfrog_probe_origin(redirected_url) != original_origin:
+            raise requests.exceptions.RequestException(
+                "Refusing cross-origin JFrog redirect from "
+                f"{redact_jfrog_url_for_display(current_url)} to {redact_jfrog_url_for_display(redirected_url)}"
+            )
+        current_url = redirected_url
 
     raise requests.exceptions.TooManyRedirects(
         f"Exceeded {_MAX_JFROG_PROBE_REDIRECTS} redirects for JFrog URL {redact_jfrog_url_for_display(url)}"
@@ -534,7 +555,7 @@ def _detect_jfrog_content_route_format(
     api_token: str | None = None,
     access_token: str | None = None,
     timeout: int = 30,
-) -> str | None:
+) -> tuple[str | None, str]:
     """Return a content-routed model format for a JFrog file, if cheaply identifiable."""
     file_url = str(file_info["path"])
     headers = _build_jfrog_probe_auth_headers(file_url, api_token=api_token, access_token=access_token)
@@ -546,7 +567,9 @@ def _detect_jfrog_content_route_format(
 
     response: requests.Response | None = None
     try:
-        response = _get_jfrog_probe_response_with_redirect_policy(file_url, headers=headers, timeout=timeout)
+        response, probe_download_url = _get_jfrog_response_with_redirect_policy(
+            file_url, headers=headers, timeout=timeout
+        )
         response.raise_for_status()
         chunks: list[bytes] = []
         total = 0
@@ -568,7 +591,7 @@ def _detect_jfrog_content_route_format(
             response.close()
 
     if not prefix:
-        return None
+        return None, probe_download_url
 
     try:
         size_hint = int(file_info.get("size", 0) or 0)
@@ -576,11 +599,15 @@ def _detect_jfrog_content_route_format(
         size_hint = 0
 
     if _looks_like_remote_safetensors(prefix, size_hint):
-        return "safetensors"
+        return "safetensors", probe_download_url
 
     from modelaudit.utils.file.detection import (
+        PROTOBUF_MODEL_CANDIDATE_FORMAT,
         _could_start_proto0_or_1_pickle,
+        _looks_like_coreml_model_proto_prefix,
+        _looks_like_onnx_model_proto_stream,
         _looks_like_proto0_or_1_pickle,
+        _looks_like_uncompressed_tar_header,
         detect_format_from_magic_bytes,
     )
 
@@ -595,7 +622,7 @@ def _detect_jfrog_content_route_format(
         detected_format == "unknown"
         and prefix[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + len(_TFLITE_MAGIC_BYTES)] == _TFLITE_MAGIC_BYTES
     ):
-        return "tflite"
+        return "tflite", probe_download_url
     if (
         detected_format == "unknown"
         and _could_start_proto0_or_1_pickle(prefix)
@@ -604,19 +631,34 @@ def _detect_jfrog_content_route_format(
             sample_is_prefix=size_hint > len(prefix) or len(prefix) >= _JFROG_CONTENT_SNIFF_BYTES,
         )
     ):
-        return "pickle"
-    return None if detected_format == "unknown" else detected_format
+        return "pickle", probe_download_url
+    if detected_format == "unknown" and _looks_like_uncompressed_tar_header(prefix):
+        return "tar", probe_download_url
+    if detected_format == "unknown":
+        sample_is_prefix = size_hint <= 0 or size_hint > len(prefix) or len(prefix) >= _JFROG_CONTENT_SNIFF_BYTES
+        coreml_status = _looks_like_coreml_model_proto_prefix(prefix, sample_is_prefix=sample_is_prefix)
+        if coreml_status is True:
+            return "coreml", probe_download_url
+        onnx_status = _looks_like_onnx_model_proto_stream(BytesIO(prefix), len(prefix))
+        if onnx_status is True:
+            return "onnx", probe_download_url
+        if sample_is_prefix and (coreml_status is None or onnx_status is None):
+            return PROTOBUF_MODEL_CANDIDATE_FORMAT, probe_download_url
+    return (None if detected_format == "unknown" else detected_format), probe_download_url
 
 
 def _scanner_ids_for_detected_jfrog_format(detected_format: str) -> set[str]:
     from modelaudit.scanner_registry_metadata import get_scanner_registry_metadata
+    from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 
     scanner_ids: set[str] = set()
     for scanner_id, scanner_info in get_scanner_registry_metadata().items():
         if detected_format == scanner_id or detected_format in scanner_info.get("header_formats", ()):
             scanner_ids.add(scanner_id)
-        if detected_format == "zip" and ".zip" in scanner_info.get("content_routed_extensions", ()):
-            scanner_ids.add(scanner_id)
+    if detected_format == "zip":
+        scanner_ids.update(_JFROG_ZIP_STRUCTURE_ROUTED_SCANNER_IDS)
+    if detected_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
+        scanner_ids.update({"coreml", "onnx"})
     return scanner_ids
 
 
@@ -649,11 +691,18 @@ def _filter_scannable_jfrog_files(
         return scannable
 
     scannable_paths = {str(file["path"]) for file in scannable}
+    probe_count = 0
     for file_info in files:
         file_path = str(file_info["path"])
         if file_path in scannable_paths:
             continue
-        detected_format = _detect_jfrog_content_route_format(
+        probe_count += 1
+        if probe_count > _MAX_JFROG_CONTENT_PROBES:
+            raise ValueError(
+                "JFrog folder selective filtering incomplete: skipped artifact content probe limit "
+                f"({_MAX_JFROG_CONTENT_PROBES}) exceeded"
+            )
+        detected_format, probe_download_url = _detect_jfrog_content_route_format(
             file_info,
             api_token=api_token,
             access_token=access_token,
@@ -665,6 +714,7 @@ def _filter_scannable_jfrog_files(
             continue
         routed_file_info = dict(file_info)
         routed_file_info["content_detected_format"] = detected_format
+        routed_file_info["content_probe_download_url"] = probe_download_url
         scannable.append(routed_file_info)
         scannable_paths.add(file_path)
 
@@ -956,8 +1006,9 @@ def download_jfrog_folder(
             local_file.parent.mkdir(parents=True, exist_ok=True)
 
             # Download the individual file
+            download_url = str(file_info.get("content_probe_download_url", file_info["path"]))
             download_artifact(
-                file_info["path"],
+                download_url,
                 cache_dir=local_file.parent,
                 api_token=api_token,
                 access_token=access_token,
@@ -965,7 +1016,7 @@ def download_jfrog_folder(
             )
 
             # Move to correct location if needed
-            downloaded_file = local_file.parent / Path(file_info["path"]).name
+            downloaded_file = local_file.parent / Path(urlparse(download_url).path).name
             if downloaded_file != local_file and downloaded_file.exists():
                 if local_file.exists():
                     local_file.unlink()
