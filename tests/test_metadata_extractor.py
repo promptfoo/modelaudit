@@ -178,6 +178,157 @@ class TestModelMetadataExtractor:
             }
         ]
 
+    def test_extract_directory_metadata_stops_at_file_budget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Directory metadata extraction should not scan beyond the aggregate file budget."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        for index in range(3):
+            (scan_dir / f"model-{index}.fake").write_bytes(b"metadata")
+        scanned_paths: list[str] = []
+
+        class FakeScanner:
+            name = "fake"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                scanned_paths.append(file_path)
+                return {"format": "fake", "file_size": Path(file_path).stat().st_size}
+
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_FILES", 2)
+        monkeypatch.setattr(
+            metadata_extractor_module,
+            "get_scanner_for_file",
+            lambda _path, _config=None: FakeScanner(),
+        )
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert len(scanned_paths) == 2
+        assert metadata["summary"]["total_files"] == 2
+        assert metadata["analysis_incomplete"] is True
+        assert metadata["scan_outcome"] == "inconclusive"
+        assert metadata["scan_outcome_reasons"] == [
+            metadata_extractor_module.METADATA_DIRECTORY_BUDGET_REASON,
+        ]
+        assert metadata["budget_events"][0]["limit"] == "max_files"
+        assert metadata["budget_events"][0]["files_considered"] == 2
+
+    def test_extract_directory_metadata_stops_at_byte_budget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Directory metadata extraction should not scan files that exceed the aggregate byte budget."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        first = scan_dir / "a.fake"
+        second = scan_dir / "b.fake"
+        first.write_bytes(b"123")
+        second.write_bytes(b"4567")
+        scanned_paths: list[str] = []
+
+        class FakeScanner:
+            name = "fake"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                scanned_paths.append(file_path)
+                return {"format": "fake", "file_size": Path(file_path).stat().st_size}
+
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_BYTES", 5)
+        monkeypatch.setattr(
+            metadata_extractor_module,
+            "get_scanner_for_file",
+            lambda _path, _config=None: FakeScanner(),
+        )
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert scanned_paths == [str(first)]
+        assert metadata["summary"]["total_files"] == 1
+        assert metadata["analysis_incomplete"] is True
+        assert metadata["budget_events"][0]["limit"] == "max_bytes"
+        assert metadata["budget_events"][0]["bytes_considered"] == 3
+        assert metadata["budget_events"][0]["next_file_size"] == 4
+
+    def test_extract_directory_metadata_stops_at_depth_budget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Directory metadata extraction should not scan files below the aggregate depth budget."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        nested_dir = scan_dir / "level1" / "level2"
+        nested_dir.mkdir(parents=True)
+        nested_file = nested_dir / "deep.fake"
+        nested_file.write_bytes(b"metadata")
+        scanned_paths: list[str] = []
+
+        class FakeScanner:
+            name = "fake"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                scanned_paths.append(file_path)
+                return {"format": "fake", "file_size": Path(file_path).stat().st_size}
+
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_DEPTH", 1)
+        monkeypatch.setattr(
+            metadata_extractor_module,
+            "get_scanner_for_file",
+            lambda _path, _config=None: FakeScanner(),
+        )
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert scanned_paths == []
+        assert metadata["summary"]["total_files"] == 0
+        assert metadata["analysis_incomplete"] is True
+        assert metadata["budget_events"][0]["limit"] == "max_depth"
+        assert metadata["budget_events"][0]["max_depth"] == 1
+        assert metadata["budget_events"][0]["observed_depth"] == 2
+
+    def test_extract_directory_metadata_in_budget_preserves_success(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """In-budget directory metadata extraction should not report incomplete coverage."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        files = [scan_dir / "a.fake", scan_dir / "b.fake"]
+        for path in files:
+            path.write_bytes(b"metadata")
+        scanned_paths: list[str] = []
+
+        class FakeScanner:
+            name = "fake"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                scanned_paths.append(file_path)
+                return {"format": "fake", "file_size": Path(file_path).stat().st_size}
+
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_FILES", 5)
+        monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_BYTES", 100)
+        monkeypatch.setattr(
+            metadata_extractor_module,
+            "get_scanner_for_file",
+            lambda _path, _config=None: FakeScanner(),
+        )
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert scanned_paths == [str(path) for path in files]
+        assert metadata["summary"]["total_files"] == 2
+        assert metadata["summary"]["formats"] == {"fake": 2}
+        assert "scan_outcome" not in metadata
+        assert "budget_events" not in metadata
+
     def test_security_only_filter(self, tmp_path: Path) -> None:
         """Test security-only metadata filtering."""
         extractor = metadata_extractor_module.ModelMetadataExtractor()

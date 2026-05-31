@@ -12,6 +12,11 @@ from .utils import is_within_directory
 
 logger = logging.getLogger("modelaudit.metadata_extractor")
 
+MAX_METADATA_DIRECTORY_FILES = 10_000
+MAX_METADATA_DIRECTORY_BYTES = 1024 * 1024 * 1024
+MAX_METADATA_DIRECTORY_DEPTH = 64
+METADATA_DIRECTORY_BUDGET_REASON = "metadata_directory_extraction_budget_exceeded"
+
 
 class ModelMetadataExtractor:
     """Extract metadata from ML model files using existing scanner infrastructure."""
@@ -65,10 +70,40 @@ class ModelMetadataExtractor:
     ) -> dict[str, Any]:
         """Extract metadata from all model files in a directory."""
         results: dict[str, Any] = {"directory": directory, "files": [], "summary": {"total_files": 0, "formats": {}}}
-        base_dir = str(Path(directory).resolve())
+        base_path = Path(directory).resolve()
+        base_dir = str(base_path)
+        base_depth = len(base_path.parts)
+        files_considered = 0
+        bytes_considered = 0
+        stop_traversal = False
 
-        for root, _, files in os.walk(directory):
+        for root, dir_names, files in os.walk(directory):
+            dir_names.sort()
+            files.sort()
+            current_depth = max(len(Path(root).resolve().parts) - base_depth, 0)
+            if current_depth > MAX_METADATA_DIRECTORY_DEPTH:
+                self._mark_directory_budget_exceeded(
+                    results,
+                    limit="max_depth",
+                    max_depth=MAX_METADATA_DIRECTORY_DEPTH,
+                    observed_depth=current_depth,
+                    path=root,
+                )
+                dir_names[:] = []
+                continue
+
             for file in files:
+                if files_considered >= MAX_METADATA_DIRECTORY_FILES:
+                    self._mark_directory_budget_exceeded(
+                        results,
+                        limit="max_files",
+                        max_files=MAX_METADATA_DIRECTORY_FILES,
+                        files_considered=files_considered,
+                        path=os.path.join(root, file),
+                    )
+                    stop_traversal = True
+                    break
+
                 file_path = os.path.join(root, file)
                 try:
                     if not is_within_directory(base_dir, file_path):
@@ -81,6 +116,26 @@ class ModelMetadataExtractor:
                         )
                         continue
 
+                    try:
+                        file_size = Path(file_path).stat().st_size
+                    except OSError as e:
+                        results["files"].append({"file": file, "path": file_path, "error": str(e)})
+                        continue
+
+                    if bytes_considered + file_size > MAX_METADATA_DIRECTORY_BYTES:
+                        self._mark_directory_budget_exceeded(
+                            results,
+                            limit="max_bytes",
+                            max_bytes=MAX_METADATA_DIRECTORY_BYTES,
+                            bytes_considered=bytes_considered,
+                            next_file_size=file_size,
+                            path=file_path,
+                        )
+                        stop_traversal = True
+                        break
+
+                    files_considered += 1
+                    bytes_considered += file_size
                     file_metadata = self._extract_file_metadata(file_path, security_only, allow_deserialization)
                     if file_metadata.get("format") != "unknown":
                         results["files"].append(file_metadata)
@@ -96,7 +151,31 @@ class ModelMetadataExtractor:
                     logger.debug("Metadata extraction failed for %s: %s", file_path, e, exc_info=True)
                     results["files"].append({"file": file, "path": file_path, "error": str(e)})
 
+            if stop_traversal:
+                dir_names[:] = []
+                break
+
         return results
+
+    @staticmethod
+    def _mark_directory_budget_exceeded(results: dict[str, Any], *, limit: str, **details: Any) -> None:
+        """Record incomplete directory metadata extraction once an aggregate budget is exhausted."""
+        results["analysis_incomplete"] = True
+        results["scan_outcome"] = "inconclusive"
+        reasons = results.setdefault("scan_outcome_reasons", [])
+        if METADATA_DIRECTORY_BUDGET_REASON not in reasons:
+            reasons.append(METADATA_DIRECTORY_BUDGET_REASON)
+
+        budget_event = {
+            "reason": METADATA_DIRECTORY_BUDGET_REASON,
+            "limit": limit,
+            "analysis_incomplete": True,
+            **details,
+        }
+        results.setdefault("budget_events", []).append(budget_event)
+        results["summary"]["analysis_incomplete"] = True
+        results["summary"]["scan_outcome"] = "inconclusive"
+        results["summary"]["scan_outcome_reasons"] = list(reasons)
 
     def _filter_security_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
         """Filter metadata to show only security-relevant information."""
