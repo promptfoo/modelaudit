@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -14,6 +15,9 @@ from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
 from .optimized_config import build_cache_version_context
 
 logger = logging.getLogger(__name__)
+
+_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY = "call_graph_source_fingerprints"
+_CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES = 1024 * 1024
 
 
 @dataclass
@@ -463,6 +467,9 @@ class ScanResultsCache:
                     if current_hash != cached_hash:
                         return False
 
+            if not self._call_graph_source_fingerprints_are_valid(cache_entry):
+                return False
+
             # Check entry isn't too old (30 days default)
             scanned_at = cache_entry["cache_metadata"]["scanned_at"]
             age_days = (time.time() - scanned_at) / (24 * 60 * 60)
@@ -471,6 +478,51 @@ class ScanResultsCache:
 
         except Exception:
             return False
+
+    @staticmethod
+    def _source_search_context() -> list[str]:
+        return [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path]
+
+    @staticmethod
+    def _bounded_source_fingerprint(path: Path) -> str | None:
+        if not path.is_file():
+            return None
+        with path.open("rb") as source_file:
+            source = source_file.read(_CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES + 1)
+        if len(source) > _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES:
+            raise ValueError("source fingerprint budget exceeded")
+        return hashlib.sha256(source).hexdigest()
+
+    def _call_graph_source_fingerprints_are_valid(self, cache_entry: dict[str, Any]) -> bool:
+        scan_result = cache_entry.get("scan_result")
+        if not isinstance(scan_result, dict):
+            return True
+        metadata = scan_result.get("metadata")
+        if not isinstance(metadata, dict):
+            return True
+        fingerprint_metadata = metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY)
+        if not isinstance(fingerprint_metadata, dict):
+            return True
+        if fingerprint_metadata.get("reusable") is not True:
+            return False
+        if fingerprint_metadata.get("search_context") != self._source_search_context():
+            return False
+        fingerprints = fingerprint_metadata.get("fingerprints")
+        if not isinstance(fingerprints, dict):
+            return False
+        try:
+            for raw_path, expected_fingerprint in fingerprints.items():
+                if not isinstance(raw_path, str):
+                    return False
+                current_fingerprint = self._bounded_source_fingerprint(Path(raw_path))
+                if expected_fingerprint is None:
+                    if current_fingerprint is not None:
+                        return False
+                elif not isinstance(expected_fingerprint, str) or current_fingerprint != expected_fingerprint:
+                    return False
+        except (OSError, ValueError):
+            return False
+        return True
 
     def _detect_file_format(self, file_path: str) -> str:
         """Detect file format for analytics."""

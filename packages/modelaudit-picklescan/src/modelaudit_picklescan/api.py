@@ -21,6 +21,7 @@ from .call_graph import (
     find_startup_hook_write_call_graphs,
     find_unanalyzed_callable_call_graph_references,
     has_unanalyzed_call_graph_import_references,
+    shared_source_fingerprint_metadata,
     shared_source_sensitive_caches,
 )
 from .options import ScanOptions
@@ -1011,6 +1012,7 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     import_references = report.metadata.get("import_references")
     callable_invocations = report.metadata.get("callable_invocations", ())
     enrichment_errors: list[tuple[str, Exception]] = []
+    source_fingerprints: Mapping[str, Any] | None = None
     with shared_source_sensitive_caches():
         report_generation = _begin_shared_source_report()
         call_graph_limit_exceeded = has_unanalyzed_call_graph_import_references(import_references)
@@ -1042,9 +1044,13 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
             _ensure_shared_source_snapshot_stable(report_generation)
         except _CallGraphAnalysisLimitError as error:
             enrichment_errors.append(("python_call_graph_source_stability", error))
+        source_fingerprints = shared_source_fingerprint_metadata()
 
+    updated_report = _with_call_graph_source_fingerprint_metadata(report, source_fingerprints)
     updated_report = (
-        _with_unanalyzed_call_graph_notices(report, unanalyzed_references) if unanalyzed_references else report
+        _with_unanalyzed_call_graph_notices(updated_report, unanalyzed_references)
+        if unanalyzed_references
+        else updated_report
     )
     if (
         not call_graph_findings
@@ -1123,6 +1129,27 @@ def _with_call_graph_enrichment_errors(
         findings=report.findings,
         notices=report.notices,
         errors=errors,
+        coverage=report.coverage,
+        metadata=metadata,
+        duration_s=report.duration_s,
+    )
+
+
+def _with_call_graph_source_fingerprint_metadata(
+    report: PickleReport,
+    source_fingerprints: Mapping[str, Any] | None,
+) -> PickleReport:
+    if source_fingerprints is None:
+        return report
+    metadata = report.to_dict()["metadata"]
+    metadata["call_graph_source_fingerprints"] = dict(source_fingerprints)
+    return PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=report.verdict,
+        findings=report.findings,
+        notices=report.notices,
+        errors=report.errors,
         coverage=report.coverage,
         metadata=metadata,
         duration_s=report.duration_s,

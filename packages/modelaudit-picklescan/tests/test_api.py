@@ -3475,6 +3475,31 @@ def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> N
     assert finding.details["analysis"] == "python_call_graph_startup_hook_write"
 
 
+def test_with_call_graph_findings_records_source_fingerprint_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_path = tmp_path / "safe_module.py"
+    module_path.write_text("def safe():\n    return 1\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = PickleReport(
+        source="safe-module.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": ({"module": "safe_module", "name": "safe"},),
+            "callable_invocations": ({"module": "safe_module", "name": "safe"},),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    source_fingerprints = updated.metadata["call_graph_source_fingerprints"]
+    assert source_fingerprints["reusable"] is True
+    assert str(module_path.absolute()) in source_fingerprints["fingerprints"]
+
+
 def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -> None:
     pytest.importorskip("click")
 
@@ -3492,9 +3517,9 @@ def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -
 
     updated = package_api._with_call_graph_findings(report)
 
-    assert updated is report
     assert updated.verdict == SafetyVerdict.CLEAN
     assert updated.findings == ()
+    assert updated.metadata["call_graph_source_fingerprints"]["reusable"] is True
 
 
 def test_scan_bytes_marks_call_graph_enrichment_failures_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:

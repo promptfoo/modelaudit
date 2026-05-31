@@ -969,6 +969,29 @@ def _ensure_shared_source_snapshot_stable(report_generation: int | None) -> None
     raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
 
 
+def shared_source_fingerprint_metadata() -> dict[str, Any] | None:
+    snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+    if snapshot is None:
+        return None
+    with snapshot.lock:
+        if not snapshot.reusable:
+            return {
+                "reusable": False,
+                "search_context": list(snapshot.search_context),
+                "fingerprints": {},
+            }
+        if not snapshot.fingerprints:
+            return None
+        return {
+            "reusable": True,
+            "search_context": list(snapshot.search_context),
+            "fingerprints": {
+                path: fingerprint.hex() if fingerprint is not None else None
+                for path, fingerprint in sorted(snapshot.fingerprints.items())
+            },
+        }
+
+
 def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
     snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
     if snapshot is None:

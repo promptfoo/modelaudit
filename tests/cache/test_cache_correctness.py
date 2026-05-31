@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -124,6 +126,75 @@ def test_cached_scan_invalidates_on_rule_config_change(tmp_path: Path) -> None:
     assert second == {"call_count": 2, "suppress_count": 1}
     assert third == second
     assert calls["count"] == 2
+
+
+def test_scan_cache_invalidates_call_graph_source_fingerprint_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "src"
+    source_root.mkdir()
+    source_path = source_root / "helper.py"
+    source_path.write_text("def entrypoint():\n    return 1\n")
+    monkeypatch.syspath_prepend(str(source_root))
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    source_fingerprint = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "metadata": {
+            "call_graph_source_fingerprints": {
+                "reusable": True,
+                "search_context": [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path],
+                "fingerprints": {
+                    str(source_path.absolute()): source_fingerprint,
+                    str((source_root / "missing.py").absolute()): None,
+                },
+            }
+        },
+    }
+
+    assert cache.store_result(str(file_path), scan_result, version_context=version_context)
+    assert cache.get_cached_result(str(file_path), version_context=version_context) == scan_result
+
+    source_path.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+def test_scan_cache_invalidates_call_graph_missing_source_appears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "src"
+    source_root.mkdir()
+    missing_path = source_root / "helper.py"
+    monkeypatch.syspath_prepend(str(source_root))
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "metadata": {
+            "call_graph_source_fingerprints": {
+                "reusable": True,
+                "search_context": [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path],
+                "fingerprints": {str(missing_path.absolute()): None},
+            }
+        },
+    }
+
+    assert cache.store_result(str(file_path), scan_result, version_context=version_context)
+    assert cache.get_cached_result(str(file_path), version_context=version_context) == scan_result
+
+    missing_path.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
 def test_cached_scan_skips_persisting_operational_failures(tmp_path: Path) -> None:
