@@ -5342,6 +5342,9 @@ impl<'a> ScanState<'a> {
         if self.import_references_truncated {
             return;
         }
+        if self.status.is_complete() {
+            self.status = ScanStatus::Inconclusive;
+        }
         self.import_references_truncated = true;
         self.add_notice(Notice {
             message: "Import reference metadata exceeded the scanner reporting limit".to_string(),
@@ -6147,6 +6150,10 @@ impl<'a> ScanState<'a> {
             import_references.append(DetailValue::Dict(reference.clone()).to_py_object(py)?)?;
         }
         metadata.set_item("import_references", import_references)?;
+        metadata.set_item(
+            "import_references_truncated",
+            self.import_references_truncated,
+        )?;
         let callable_invocations = PyList::empty(py);
         for invocation in &self.callable_invocations {
             callable_invocations.append(DetailValue::Dict(invocation.clone()).to_py_object(py)?)?;
@@ -6156,6 +6163,9 @@ impl<'a> ScanState<'a> {
             "callable_invocations_truncated",
             self.callable_invocations_truncated,
         )?;
+        if self.import_references_truncated || self.callable_invocations_truncated {
+            metadata.set_item("analysis_incomplete", true)?;
+        }
         if !self.protocols.is_empty() {
             metadata.set_item("protocols", &self.protocols)?;
         }
@@ -7217,6 +7227,7 @@ mod tests {
         }
 
         assert_eq!(scan.import_references.len(), MAX_IMPORT_REFERENCES);
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
         assert_eq!(
             scan.notices
                 .iter()

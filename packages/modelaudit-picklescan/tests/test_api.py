@@ -4565,6 +4565,21 @@ def test_scan_bytes_records_oversized_frame_notice() -> None:
     assert notice.details["remaining_bytes"] == 2
 
 
+def test_scan_bytes_fails_closed_when_import_references_are_truncated() -> None:
+    payload = (b"cmath\nsin\n0" * 10_001) + b"."
+
+    report = scan_bytes(payload, source="import-reference-cap.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.metadata["analysis_incomplete"] is True
+    assert report.metadata["import_references_truncated"] is True
+    assert len(report.metadata["import_references"]) == 10_000
+    notice = next(notice for notice in report.notices if notice.code == "import_references_truncated")
+    assert notice.details["analysis_incomplete"] is True
+    assert notice.details["max_import_references"] == 10_000
+
+
 def test_scan_stream_preserves_absolute_offsets_from_current_stream_position() -> None:
     prefix = b"HEADER"
     payload = pickle.dumps(MaliciousPayload())

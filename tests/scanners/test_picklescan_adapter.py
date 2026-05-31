@@ -15,6 +15,7 @@ from modelaudit_picklescan import (
     Severity,
 )
 
+from modelaudit.cache.cache_policy import should_cache_scan_result
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.executorch_scanner import ExecuTorchScanner
 from modelaudit.scanners.picklescan_adapter import (
@@ -566,6 +567,42 @@ def test_pickle_report_to_scan_result_fails_closed_for_truncated_literal_scan_no
         and check.details["pickle_notice_code"] == "literal_scan_truncated"
     )
     assert notice_check.message == "String literal scan truncated at configured limit"
+
+
+def test_pickle_report_to_scan_result_fails_closed_for_truncated_import_references() -> None:
+    report = PickleReport(
+        source="import-reference-cap.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message="Import reference metadata exceeded the scanner reporting limit",
+                severity=Severity.INFO,
+                location="import-reference-cap.pkl",
+                code="import_references_truncated",
+                details={"analysis_incomplete": True, "max_import_references": 10_000},
+            ),
+        ),
+        metadata={"analysis_incomplete": True, "import_references_truncated": True},
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["import_references_truncated"]
+    assert result.metadata["analysis_incomplete"] is True
+    assert should_cache_scan_result(result.to_dict()) is False
+    notice_check = next(
+        check
+        for check in result.checks
+        if check.name == "Standalone Pickle Notice"
+        and check.status.value == "failed"
+        and check.severity == IssueSeverity.INFO
+        and check.rule_code == "S902"
+        and check.details["pickle_notice_code"] == "import_references_truncated"
+    )
+    assert notice_check.message == "Import reference metadata exceeded the scanner reporting limit"
 
 
 def test_pickle_report_to_scan_result_fails_closed_for_encoded_nested_truncation_notice() -> None:

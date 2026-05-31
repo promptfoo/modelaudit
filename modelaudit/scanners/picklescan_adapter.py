@@ -26,6 +26,7 @@ _INCONCLUSIVE_NOTICE_CODES = frozenset(
         "opcode_budget",
         "parse_incomplete",
         "known_stream_truncated",
+        "import_references_truncated",
         "timeout",
         "unbounded_stream_truncated",
     }
@@ -49,6 +50,7 @@ _LEGACY_SCAN_OUTCOME_REASONS = {
     "opcode_budget": "opcode_budget_exceeded",
     "parse_incomplete": "pickle_analysis_incomplete",
     "known_stream_truncated": "known_stream_truncated",
+    "import_references_truncated": "import_references_truncated",
     "timeout": "scan_timeout",
     "unbounded_stream_truncated": "unbounded_stream_truncated",
 }
