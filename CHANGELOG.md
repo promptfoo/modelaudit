@@ -84,6 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - classify unavailable ZIP traversal, member, manifest-less TorchServe handler, and Keras artifact scan coverage as inconclusive while preserving archive-depth security findings
 - classify unavailable TAR traversal and member scan coverage as inconclusive while preserving depth-limit security findings
 - classify unavailable Skops member and schema coverage as inconclusive rather than security findings
+- preserve Skops nested Python-member detection for high-risk calls reached through `__getattribute__`
 - classify bounded, unreadable, or unparseable TorchServe MAR analysis gaps as inconclusive rather than security findings
 - detect manifest-declared TorchServe extra files and PyTorch ZIP members disguised with executable content
 - classify incomplete SevenZip coverage as inconclusive and avoid caching temporary extracted members
