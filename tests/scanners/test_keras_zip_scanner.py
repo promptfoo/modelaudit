@@ -2465,6 +2465,9 @@ class TestCVE20251550ModuleReferences:
             ("posix", "module", "posix"),
             ("nt", "fn_module", "nt"),
             ("_ctypes", "module", "_ctypes"),
+            ("_posixsubprocess", "module", "_posixsubprocess"),
+            ("_socket", "fn_module", "_socket"),
+            ("_winapi", "module", "_winapi"),
             ("posix.path", "fn_module", "posix"),
         ],
     )
@@ -2501,6 +2504,43 @@ class TestCVE20251550ModuleReferences:
         assert cve_issues
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
         assert cve_issues[0].details["module"].split(".")[0] == expected_root
+
+    @pytest.mark.parametrize(
+        "module_value",
+        [
+            "posixpath",
+            "ntpath",
+            "_ctypes_test",
+            "_posixsubprocess_helper",
+            "_socketio",
+            "_winapi_helper",
+        ],
+    )
+    def test_native_dangerous_module_prefix_collisions_are_not_critical(
+        self,
+        tmp_path: Path,
+        module_value: str,
+    ) -> None:
+        """Dangerous native roots should use exact root matching."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "prefix_collision",
+                        "config": {"fn_module": module_value},
+                    }
+                ]
+            },
+        }
+
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
+        assert cve_issues
+        assert all(issue.severity != IssueSeverity.CRITICAL for issue in cve_issues)
 
     def test_untrusted_module_custom_package(self, tmp_path: Path) -> None:
         """Unknown module references in callable context should be flagged as WARNING."""
