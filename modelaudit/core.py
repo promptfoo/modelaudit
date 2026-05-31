@@ -54,7 +54,13 @@ from modelaudit.scanners.xgboost_scanner import (
     configure_content_routed_json_scan,
 )
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
-from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
+from modelaudit.utils import (
+    DVC_ANALYSIS_INCOMPLETE_REASON,
+    DvcResolution,
+    is_within_directory,
+    resolve_dvc_file_status,
+    should_skip_file,
+)
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
@@ -148,6 +154,40 @@ _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
+
+
+def _record_incomplete_dvc_resolution(
+    results: ModelAuditResultModel,
+    scan_metadata: dict[str, Any],
+    dvc_file: str,
+    resolution: DvcResolution,
+) -> None:
+    """Record unresolved DVC outputs as operationally incomplete coverage."""
+    if not resolution.analysis_incomplete:
+        return
+
+    scan_metadata["success"] = False
+    scan_metadata["has_operational_errors"] = True
+    details: dict[str, Any] = {
+        "analysis_incomplete": True,
+        "scan_outcome_reason": DVC_ANALYSIS_INCOMPLETE_REASON,
+        "dvc_file": dvc_file,
+        "resolved_outputs": list(resolution.resolved_paths),
+    }
+    if resolution.unresolved_outputs:
+        details["unresolved_outputs"] = list(resolution.unresolved_outputs)
+    if resolution.incomplete_reason:
+        details["incomplete_reason"] = resolution.incomplete_reason
+
+    _add_issue_to_model(
+        results,
+        "DVC output resolution incomplete - declared outputs were not scanned",
+        severity=IssueSeverity.INFO.value,
+        location=dvc_file,
+        details=details,
+    )
+
+
 _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON = "xgboost_ubjson_routing_incomplete"
 _ONNX_ROUTING_INCOMPLETE_REASON = "onnx_routing_incomplete"
 _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_incomplete"
@@ -981,9 +1021,12 @@ def scan_model_directory_or_file(
                     # Handle DVC files and get target paths
                     target_paths = [scan_source]
                     if file.endswith(".dvc"):
-                        dvc_targets = resolve_dvc_file(file_path)
-                        if dvc_targets:
-                            target_paths = [Path(t).resolve() for t in dvc_targets]
+                        dvc_resolution = resolve_dvc_file_status(file_path)
+                        _record_incomplete_dvc_resolution(results, scan_metadata, file_path, dvc_resolution)
+                        if dvc_resolution.resolved_paths:
+                            target_paths = [Path(t).resolve() for t in dvc_resolution.resolved_paths]
+                        else:
+                            continue
 
                     for target_path in target_paths:
                         target_str = str(target_path)
@@ -1315,9 +1358,9 @@ def scan_model_directory_or_file(
             # Scan a single file or DVC pointer
             target_files = [path]
             if path.endswith(".dvc"):
-                dvc_targets = resolve_dvc_file(path)
-                if dvc_targets:
-                    target_files = dvc_targets
+                dvc_resolution = resolve_dvc_file_status(path)
+                _record_incomplete_dvc_resolution(results, scan_metadata, path, dvc_resolution)
+                target_files = list(dvc_resolution.resolved_paths)
 
             for _idx, target in enumerate(target_files):
                 # Check for interrupts

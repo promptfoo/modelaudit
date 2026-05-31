@@ -55,7 +55,7 @@ from .telemetry import (
     record_scan_failed,
     record_scan_started,
 )
-from .utils import resolve_dvc_file, should_skip_file
+from .utils import resolve_dvc_file_status, should_skip_file
 from .utils.helpers.auto_defaults import (
     apply_auto_overrides,
     detect_ci_environment,
@@ -354,10 +354,12 @@ def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float) -> list[
     dvc_expanded_paths: list[str] = []
     for path in expanded_paths:
         if os.path.isfile(path) and path.endswith(".dvc"):
-            targets = resolve_dvc_file(path)
-            if targets:
-                dvc_expanded_paths.extend(targets)
+            resolution = resolve_dvc_file_status(path)
+            if resolution.resolved_paths and not resolution.analysis_incomplete:
+                dvc_expanded_paths.extend(resolution.resolved_paths)
             else:
+                # Preserve the pointer for core routing so unresolved outputs become
+                # explicit incomplete coverage instead of clean pointer-text scans.
                 dvc_expanded_paths.append(path)
         else:
             dvc_expanded_paths.append(path)

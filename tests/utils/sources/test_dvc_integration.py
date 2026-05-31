@@ -1,8 +1,9 @@
+import json
 import pickle
 from pathlib import Path
 
 from modelaudit.core import scan_model_directory_or_file
-from modelaudit.utils.sources.dvc import resolve_dvc_file
+from modelaudit.utils.sources.dvc import DVC_ANALYSIS_INCOMPLETE_REASON, resolve_dvc_file
 
 
 class TestDvcIntegration:
@@ -102,6 +103,108 @@ class TestDvcIntegration:
 
         resolved = resolve_dvc_file(str(dvc_file))
         assert resolved == [str(existing)]
+
+    def test_missing_dvc_outputs_mark_scan_incomplete_with_resolved_target(self, tmp_path: Path) -> None:
+        """Missing declared DVC outputs should not be silently dropped."""
+
+        class MaliciousClass:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os
+
+                return (os.system, ("echo dvc-existing-malicious",))
+
+        existing = tmp_path / "existing_malicious.pkl"
+        with existing.open("wb") as f:
+            pickle.dump(MaliciousClass(), f)
+
+        missing = tmp_path / "hidden_payload.pkl"
+        dvc_file = tmp_path / "partial.dvc"
+        dvc_file.write_text(f"""outs:
+- path: {existing.name}
+- path: {missing.name}
+""")
+
+        results = scan_model_directory_or_file(str(dvc_file))
+
+        assert results.files_scanned == 1
+        assert results.has_errors is True
+        assert results.success is False
+        assert any("existing_malicious.pkl" in (issue.location or "") for issue in results.issues)
+
+        dvc_issues = [
+            issue
+            for issue in results.issues
+            if issue.details.get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON
+        ]
+        assert len(dvc_issues) == 1
+        assert dvc_issues[0].details["analysis_incomplete"] is True
+        assert any("hidden_payload.pkl" in path for path in dvc_issues[0].details["unresolved_outputs"])
+        assert any(Path(asset.path).name == existing.name for asset in results.assets)
+        assert all(Path(asset.path).name != dvc_file.name for asset in results.assets)
+
+    def test_unresolved_dvc_pointer_does_not_scan_pointer_text_as_clean(self, tmp_path: Path) -> None:
+        """A DVC pointer with no resolved outputs should fail closed instead of scanning the pointer."""
+        dvc_file = tmp_path / "missing.dvc"
+        dvc_file.write_text("""outs:
+- path: hidden_payload.pkl
+""")
+
+        results = scan_model_directory_or_file(str(dvc_file))
+
+        assert results.files_scanned == 0
+        assert results.has_errors is True
+        assert results.success is False
+        assert all(Path(asset.path).name != dvc_file.name for asset in results.assets)
+        assert any(
+            issue.details.get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON
+            and any("hidden_payload.pkl" in path for path in issue.details["unresolved_outputs"])
+            for issue in results.issues
+        )
+
+    def test_directory_scan_marks_missing_dvc_outputs_incomplete(self, tmp_path: Path) -> None:
+        """Directory DVC expansion should not hide missing declared outputs."""
+        target = tmp_path / "visible.pkl"
+        with target.open("wb") as f:
+            pickle.dump({"visible": True}, f)
+
+        dvc_file = tmp_path / "partial.dvc"
+        dvc_file.write_text("""outs:
+- path: visible.pkl
+- path: missing.pkl
+""")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results.files_scanned == 1
+        assert results.has_errors is True
+        assert results.success is False
+        assert any(Path(asset.path).name == target.name for asset in results.assets)
+        assert all(Path(asset.path).name != dvc_file.name for asset in results.assets)
+        assert any(
+            issue.location == str(dvc_file)
+            and issue.details.get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON
+            and any("missing.pkl" in path for path in issue.details["unresolved_outputs"])
+            for issue in results.issues
+        )
+
+    def test_resolved_dvc_outputs_remain_successful(self, tmp_path: Path) -> None:
+        """Fully resolved benign DVC pointers should keep the normal clean path."""
+        target = tmp_path / "benign.pkl"
+        with target.open("wb") as f:
+            pickle.dump({"benign": True}, f)
+
+        dvc_file = tmp_path / "benign.dvc"
+        dvc_file.write_text("outs:\n- path: benign.pkl\n")
+
+        results = scan_model_directory_or_file(str(dvc_file))
+
+        assert results.files_scanned == 1
+        assert results.has_errors is False
+        assert results.success is True
+        assert not any(
+            issue.details.get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON for issue in results.issues
+        )
+        assert any(Path(asset.path).name == target.name for asset in results.assets)
 
 
 class TestDvcSecurity:
@@ -329,8 +432,30 @@ class TestDvcCliIntegration:
 
         assert result.exit_code in [0, 1]  # 0 for clean, 1 for issues found
 
-        # Should contain valid JSON output
-        import json
-
         output_data = json.loads(result.output)
         assert output_data["files_scanned"] == 1
+
+    def test_cli_unresolved_dvc_output_exits_operational_error_with_json(self, tmp_path: Path) -> None:
+        """CLI scans should surface unresolved DVC outputs as incomplete coverage."""
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        dvc_file = tmp_path / "missing.dvc"
+        dvc_file.write_text("""outs:
+- path: hidden_payload.pkl
+""")
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["scan", str(dvc_file), "--format", "json"])
+
+        assert result.exit_code == 2
+        output_data = json.loads(result.output)
+        assert output_data["files_scanned"] == 0
+        assert output_data["has_errors"] is True
+        assert output_data["success"] is False
+        assert any(
+            issue["details"].get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON
+            and any("hidden_payload.pkl" in path for path in issue["details"]["unresolved_outputs"])
+            for issue in output_data["issues"]
+        )
