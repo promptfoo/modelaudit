@@ -893,6 +893,13 @@ class SevenZipScanner(BaseScanner):
 
     def _get_archive_member_info(self, archive: Any, file_name: str) -> Any | None:
         """Return metadata for a member without extracting it, across py7zr API variants."""
+        files = getattr(archive, "files", None)
+        if isinstance(files, list):
+            for member_info in files:
+                with suppress(Exception):
+                    if getattr(member_info, "filename", None) == file_name:
+                        return member_info
+
         getinfo = getattr(archive, "getinfo", None)
         if callable(getinfo):
             with suppress(Exception):
@@ -904,12 +911,6 @@ class SevenZipScanner(BaseScanner):
                 for member_info in list_members():
                     if getattr(member_info, "filename", None) == file_name:
                         return member_info
-
-        files = getattr(archive, "files", None)
-        if isinstance(files, list):
-            for member_info in files:
-                if getattr(member_info, "filename", None) == file_name:
-                    return member_info
 
         return None
 
@@ -1299,14 +1300,9 @@ class SevenZipScanner(BaseScanner):
             },
         )
 
-    @staticmethod
-    def _get_archive_member_size(archive: Any, file_name: str) -> int | None:
+    def _get_archive_member_size(self, archive: Any, file_name: str) -> int | None:
         """Return the uncompressed size for an archive member when available."""
-        try:
-            member_info = archive.getinfo(file_name)
-        except Exception:
-            return None
-
+        member_info = self._get_archive_member_info(archive, file_name)
         member_size = getattr(member_info, "uncompressed", None)
         if isinstance(member_size, int):
             return member_size

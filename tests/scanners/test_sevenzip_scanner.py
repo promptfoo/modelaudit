@@ -1485,6 +1485,40 @@ class TestSevenZipScannerHardening:
         assert symlink_checks[0].details["checked_before_extraction"] is True
         mock_archive.extract.assert_not_called()
 
+    @pytest.mark.parametrize(("is_symlink", "expected_state"), [(False, "regular"), (True, "symlink")])
+    def test_legacy_internal_member_metadata_preserves_symlink_preflight(
+        self,
+        scanner: SevenZipScanner,
+        is_symlink: bool,
+        expected_state: str,
+    ) -> None:
+        """py7zr 0.20.x exposes symlink state on archive.files but not public FileInfo."""
+
+        class LegacyPublicFileInfo:
+            filename = "model.pkl"
+            uncompressed = 16
+
+        class LegacyArchiveMember:
+            filename = "model.pkl"
+            uncompressed = 16
+
+            def __init__(self) -> None:
+                self.is_symlink = is_symlink
+
+        class LegacyArchive:
+            def __init__(self) -> None:
+                self.files = [LegacyArchiveMember()]
+
+            @staticmethod
+            def list() -> list[LegacyPublicFileInfo]:
+                return [LegacyPublicFileInfo()]
+
+        archive = LegacyArchive()
+        member_info = scanner._get_archive_member_info(archive, "model.pkl")
+
+        assert scanner._preflight_member_symlink_state(member_info) == expected_state
+        assert scanner._get_archive_member_size(archive, "model.pkl") == 16
+
     def test_missing_symlink_metadata_fails_closed_before_extraction(
         self,
         scanner: SevenZipScanner,
