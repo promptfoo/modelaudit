@@ -1,5 +1,6 @@
 """Tests for HuggingFace URL handling."""
 
+from fnmatch import fnmatch
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -321,7 +322,13 @@ class TestModelDownload:
         download_model("https://huggingface.co/test/model")
 
         allow_patterns = mock_snapshot_download.call_args.kwargs["allow_patterns"]
-        assert allow_patterns == ["**/*.bin", "**/*.json", "*.bin", "*.json"]
+        assert allow_patterns == [
+            "**/*.[bB][iI][nN]",
+            "**/*.[jJ][sS][oO][nN]",
+            "*.[bB][iI][nN]",
+            "*.[jJ][sS][oO][nN]",
+        ]
+        assert any(fnmatch("MODEL.BiN", pattern) for pattern in allow_patterns)
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch("huggingface_hub.snapshot_download")
@@ -345,7 +352,8 @@ class TestModelDownload:
             download_model("https://huggingface.co/test/model")
 
         allow_patterns = mock_snapshot_download.call_args.kwargs["allow_patterns"]
-        assert allow_patterns == ["**/*.bin", "*.bin"]
+        assert allow_patterns == ["**/*.[bB][iI][nN]", "*.[bB][iI][nN]"]
+        assert any(fnmatch("MODEL.BiN", pattern) for pattern in allow_patterns)
 
     @patch("huggingface_hub.HfApi.repo_info")
     def test_list_repo_files_timeout_uses_hfapi_timeout(self, mock_repo_info: MagicMock) -> None:
@@ -397,6 +405,30 @@ class TestModelDownload:
             download_model("https://huggingface.co/test/model")
 
         mock_snapshot_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["nested/MODEL.SaFeTeNsOrS"], None),
+    )
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_listing_accepts_mixed_case_scannable_suffix(
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Supported remote suffixes should match local case-insensitive routing."""
+        download_path = tmp_path / "download"
+        model_path = download_path / "nested" / "MODEL.SaFeTeNsOrS"
+        model_path.parent.mkdir(parents=True)
+        model_path.write_bytes(b"weights")
+        mock_snapshot_download.return_value = str(download_path)
+
+        download_model("https://huggingface.co/test/model")
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["nested/MODEL.SaFeTeNsOrS"]
 
     @patch("huggingface_hub.snapshot_download")
     @patch("shutil.rmtree")
@@ -461,6 +493,28 @@ class TestModelDownloadStreaming:
             cache_dir=str(tmp_path / "huggingface"),
             local_dir=str(tmp_path / "huggingface" / "test" / "model"),
         )
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["MODEL.SaFeTeNsOrS"], None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_accepts_mixed_case_scannable_suffix(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Streaming downloads should recognize mixed-case supported suffixes."""
+        downloaded_file = tmp_path / "MODEL.SaFeTeNsOrS"
+        mock_hf_hub_download.return_value = str(downloaded_file)
+
+        results = list(download_model_streaming("https://huggingface.co/test/model"))
+
+        assert results == [(downloaded_file, True)]
+        mock_hf_hub_download.assert_called_once_with(repo_id="test/model", filename="MODEL.SaFeTeNsOrS")
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
