@@ -467,6 +467,65 @@ def test_numpy_object_dtype_malicious_exit1(tmp_path: Path) -> None:
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_numpy_object_dtype_pickle_selection_skip_is_inconclusive(tmp_path: Path) -> None:
+    arr = np.array([_ExecPayload()], dtype=object)
+    path = tmp_path / "malicious_object_numpy_only.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    result = scan_model_directory_or_file(
+        str(path),
+        scanners=["numpy"],
+        cache_scan_results=False,
+    )
+    metadata = result.file_metadata[str(path)]
+    reasons = metadata.get("scan_outcome_reasons", [])
+    selection_checks = [
+        check
+        for check in result.checks
+        if check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pickle"
+    ]
+    dtype_checks = [
+        check
+        for check in result.checks
+        if check.name == "Data Type Safety Check" and check.details.get("handled_via") == "scanner_selection_skip"
+    ]
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert "numpy_object_embedded_pickle_scanner_selection_skip" in reasons
+    assert "numpy_object_embedded_pickle_incomplete" in reasons
+    assert selection_checks
+    assert selection_checks[0].details["analysis_incomplete"] is True
+    assert selection_checks[0].details["scan_outcome_reason"] == "numpy_object_embedded_pickle_scanner_selection_skip"
+    assert dtype_checks
+    assert dtype_checks[0].details["analysis_incomplete"] is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert not any("exec" in issue.message.lower() for issue in result.issues)
+
+
+def test_numpy_object_dtype_pickle_selection_control_detects_exec(tmp_path: Path) -> None:
+    arr = np.array([_ExecPayload()], dtype=object)
+    path = tmp_path / "malicious_object_numpy_and_pickle.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    result = scan_model_directory_or_file(
+        str(path),
+        scanners=["numpy", "pickle"],
+        cache_scan_results=False,
+    )
+    metadata = result.file_metadata[str(path)]
+
+    assert determine_exit_code(result) == 1
+    assert metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        issue.rule_code == "S104"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("associated_global") == "builtins.exec"
+        for issue in result.issues
+    )
+
+
 def test_benign_object_dtype_npz_no_nested_critical(tmp_path: Path) -> None:
     npz_path = tmp_path / "benign_object.npz"
     np.savez(npz_path, safe=np.array([{"x": 1}], dtype=object))
