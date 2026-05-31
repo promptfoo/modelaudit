@@ -1819,6 +1819,7 @@ class PickleScanner(BaseScanner):
             return
         absolute_tail_start = start_position + local_tail_start
         chunks: list[bytes] = []
+        unknown_tail_exceeds_window = False
         try:
             file_obj.seek(absolute_tail_start)
             while remaining > 0:
@@ -1830,6 +1831,10 @@ class PickleScanner(BaseScanner):
                     break
                 chunks.append(chunk)
                 remaining -= len(chunk)
+            if file_size is None and remaining == 0:
+                unknown_tail_exceeds_window = True
+                with suppress(AttributeError, OSError, ValueError):
+                    unknown_tail_exceeds_window = bool(file_obj.read(1))
         except (AttributeError, OSError, ValueError):
             return
         finally:
@@ -1843,6 +1848,7 @@ class PickleScanner(BaseScanner):
             tail_start=absolute_tail_start,
             scanned_tail_bytes=sum(len(chunk) for chunk in chunks),
             total_tail_bytes=total_tail_bytes,
+            tail_window_exceeded=unknown_tail_exceeds_window,
         )
 
     @staticmethod
@@ -1882,8 +1888,9 @@ class PickleScanner(BaseScanner):
         tail_start: int,
         scanned_tail_bytes: int,
         total_tail_bytes: int | None,
+        tail_window_exceeded: bool = False,
     ) -> None:
-        if total_tail_bytes is None or total_tail_bytes <= scanned_tail_bytes:
+        if not tail_window_exceeded and (total_tail_bytes is None or total_tail_bytes <= scanned_tail_bytes):
             return
 
         reason = "pickle_binary_tail_scan_window_exceeded"

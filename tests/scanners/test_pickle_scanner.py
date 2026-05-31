@@ -1506,6 +1506,37 @@ def test_scan_pytorch_extension_keeps_security_exit_for_detected_binary_tail_gap
     assert determine_exit_code(aggregate_result) == 1
 
 
+def test_scan_stream_unknown_size_seekable_marks_out_of_window_binary_tail_incomplete() -> None:
+    pickle_payload = pickle.dumps({"safe": True}, protocol=4)
+    filler = b"".join(pickle.dumps({"pad": b"A" * 65536}, protocol=4) for _ in range(17))
+    stream = io.BytesIO(pickle_payload + filler)
+
+    result = PickleScanner().scan_stream(stream, None, source="unknown-tail.pt")
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pickle_binary_tail_scan_window_exceeded" in result.metadata["scan_outcome_reasons"]
+    checks = [check for check in result.checks if check.name == "Pickle Binary Tail Coverage"]
+    assert len(checks) == 1
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].details["tail_bytes_scanned"] == _BINARY_TAIL_SCAN_BYTES
+    assert checks[0].details["tail_bytes_total"] is None
+    assert stream.tell() == 0
+
+
+def test_scan_stream_unknown_size_seekable_allows_exact_binary_tail_window() -> None:
+    pickle_payload = pickle.dumps({"safe": True}, protocol=4)
+    filler = pickle.dumps(b"A" * (_BINARY_TAIL_SCAN_BYTES - 9), protocol=4)
+    assert len(filler) == _BINARY_TAIL_SCAN_BYTES
+    stream = io.BytesIO(pickle_payload + filler)
+
+    result = PickleScanner().scan_stream(stream, None, source="exact-tail.pt")
+
+    assert result.success is True
+    assert not any(check.name == "Pickle Binary Tail Coverage" for check in result.checks)
+    assert stream.tell() == 0
+
+
 def test_scan_file_detects_executable_tail_past_raw_scan_window(tmp_path: Path) -> None:
     pickle_payload = pickle.dumps({"pad": b"A" * 256}, protocol=4)
     path = tmp_path / "large-tail.bin"
