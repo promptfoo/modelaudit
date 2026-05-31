@@ -1201,6 +1201,48 @@ def test_unrecognized_lambda_function_dict_still_uses_module_reference_check(tmp
     )
 
 
+def test_lambda_dict_bytecode_with_dangerous_module_fields_still_checks_module_reference(tmp_path: Path) -> None:
+    """Opaque dict bytecode must not suppress a dangerous sibling module/function reference."""
+    encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "mixed_dangerous_module_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "mixed_dangerous_module",
+                            "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                            "module": "os",
+                            "function_name": "system",
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        issue.severity == IssueSeverity.WARNING
+        and "embedded bytecode" in issue.message
+        and "mixed_dangerous_module" in issue.message
+        for issue in result.issues
+    )
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("module") == "os"
+        and check.details.get("function") == "system"
+        for check in result.checks
+    )
+
+
 def test_keras_h5_scanner_empty_file(tmp_path):
     """Test scanning an empty file."""
     empty_path = tmp_path / "empty.h5"
