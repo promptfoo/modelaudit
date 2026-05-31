@@ -100,11 +100,42 @@ def _display_error(error: object, path: str) -> str:
     return redact_cloud_error_for_display(error, path) if is_cloud_url(path) else str(error)
 
 
+def _output_path_has_symlink_component(output_path: str) -> bool:
+    """Return whether any existing component in an output path is a symlink."""
+    absolute_path = Path(os.path.abspath(output_path))
+    current_path = Path(absolute_path.anchor)
+    for part in absolute_path.parts[1:]:
+        current_path /= part
+        if current_path.is_symlink():
+            return True
+    return False
+
+
+def _open_output_file_descriptor(output_path: str, flags: int) -> int:
+    """Open an output descriptor without racing symlink swaps in parent directories."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory or os.open not in os.supports_dir_fd:
+        return os.open(output_path, flags, 0o666)
+
+    absolute_path = Path(os.path.abspath(output_path))
+    directory_flags = getattr(os, "O_PATH", os.O_RDONLY) | directory | nofollow
+    directory_fd = os.open(absolute_path.anchor, directory_flags)
+    try:
+        for part in absolute_path.parts[1:-1]:
+            next_directory_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_directory_fd
+        return os.open(absolute_path.name, flags, 0o666, dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 @contextlib.contextmanager
 def _open_output_text_file(output_path: str) -> Iterator[TextIO]:
-    """Open a CLI output file without following a symlink final component."""
+    """Open a CLI output file without following symlink path components."""
     output_display = _display_path(output_path)
-    if os.path.islink(output_path):
+    if _output_path_has_symlink_component(output_path):
         raise click.ClickException(f"Refusing to write output through symlink: {output_display}")
 
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
@@ -113,7 +144,7 @@ def _open_output_text_file(output_path: str) -> Iterator[TextIO]:
         flags |= nofollow
 
     try:
-        fd = os.open(output_path, flags, 0o666)
+        fd = _open_output_file_descriptor(output_path, flags)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise click.ClickException(f"Refusing to write output through symlink: {output_display}") from exc

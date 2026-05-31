@@ -720,6 +720,11 @@ def test_cli_report_writers_reject_symlink_outputs(tmp_path: Path, requires_syml
             model_tree / "metadata.json",
             tmp_path / "victim_metadata.txt",
         ),
+        (
+            ["scan", "--list-scanners", "--format", "json", "--output", str(model_tree / "scanners.json")],
+            model_tree / "scanners.json",
+            tmp_path / "victim_scanners.txt",
+        ),
     ]
 
     for args, symlink_path, victim_path in cases:
@@ -733,6 +738,24 @@ def test_cli_report_writers_reject_symlink_outputs(tmp_path: Path, requires_syml
         assert "Refusing to write output through symlink" in result.output
         assert victim_path.read_text() == sentinel
         assert symlink_path.is_symlink()
+
+
+def test_cli_report_writers_reject_symlinked_parent_directory(tmp_path: Path, requires_symlinks: None) -> None:
+    """CLI report outputs must not follow attacker-controlled parent directory symlinks."""
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    redirected_dir = tmp_path / "redirected"
+    redirected_dir.symlink_to(outside_dir, target_is_directory=True)
+    output_path = redirected_dir / "scanners.json"
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code != 0
+    assert "Refusing to write output through symlink" in result.output
+    assert not (outside_dir / "scanners.json").exists()
 
 
 def test_cli_report_writers_create_regular_output_files(tmp_path: Path) -> None:
@@ -756,13 +779,20 @@ def test_cli_report_writers_create_regular_output_files(tmp_path: Path) -> None:
         cli,
         ["metadata", str(test_file), "--format", "json", "--output", str(metadata_file)],
     )
+    catalog_file = model_tree / "scanners.json"
+    catalog_result = runner.invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(catalog_file)],
+    )
 
     assert scan_result.exit_code == 0, scan_result.output
     assert sbom_result.exit_code == 0, sbom_result.output
     assert metadata_result.exit_code == 0, metadata_result.output
+    assert catalog_result.exit_code == 0, catalog_result.output
     assert json.loads(report_file.read_text())["files_scanned"] == 1
     assert json.loads(sbom_file.read_text())["bomFormat"] == "CycloneDX"
     assert json.loads(metadata_file.read_text())["file"] == test_file.name
+    assert json.loads(catalog_file.read_text())["scanners"]
 
 
 def test_scan_output_utf8_locale(tmp_path):
