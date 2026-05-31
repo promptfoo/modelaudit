@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Final
+from typing import Any, Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
@@ -123,3 +123,16 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     return _truncate(redacted, max_chars)
+
+
+def redact_evidence_value(value: Any, max_chars: int = 180) -> Any:
+    """Recursively redact string leaves in structured scanner evidence."""
+    if isinstance(value, str):
+        return redact_evidence_string(value, max_chars=max_chars)
+    if isinstance(value, list):
+        return [redact_evidence_value(item, max_chars=max_chars) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_evidence_value(item, max_chars=max_chars) for item in value)
+    if isinstance(value, dict):
+        return {key: redact_evidence_value(item, max_chars=max_chars) for key, item in value.items()}
+    return value

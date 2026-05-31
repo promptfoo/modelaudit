@@ -22,6 +22,7 @@ from ..config.explanations import (
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
+from ._evidence_redaction import redact_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
@@ -444,8 +445,8 @@ class KerasH5Scanner(BaseScanner):
                     {
                         "kind": "ExternalLink",
                         "hdf5_path": f"/{name}".replace("//", "/"),
-                        "filename": link.filename,
-                        "path": link.path,
+                        "filename": redact_evidence_string(link.filename, max_chars=200),
+                        "path": redact_evidence_string(link.path, max_chars=200),
                     },
                 )
                 return
@@ -459,7 +460,11 @@ class KerasH5Scanner(BaseScanner):
                             "kind": "external_storage",
                             "hdf5_path": f"/{name}".replace("//", "/"),
                             "segments": [
-                                {"filename": filename, "offset": int(offset), "size": int(size)}
+                                {
+                                    "filename": redact_evidence_string(filename, max_chars=200),
+                                    "offset": int(offset),
+                                    "size": int(size),
+                                }
                                 for filename, offset, size in external_storage
                             ],
                         },
@@ -952,7 +957,7 @@ class KerasH5Scanner(BaseScanner):
                         details={
                             "layer_class": "Lambda",
                             "code_analysis": risk_desc,
-                            "code_preview": function_str[:200] + "..." if len(function_str) > 200 else function_str,
+                            "code_preview": redact_evidence_string(function_str, max_chars=200),
                         },
                         rule_code="S507",  # Python embedded code
                     )

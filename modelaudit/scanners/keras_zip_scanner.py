@@ -31,6 +31,7 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
+from ._evidence_redaction import redact_evidence_string
 from .archive_dispatch import SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY
 from .archive_member_security import is_executable_archive_member_name
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
@@ -1420,13 +1421,15 @@ class KerasZipScanner(BaseScanner):
         vocabulary = layer_config.get("vocabulary")
         if not self._is_external_stringlookup_vocabulary(vocabulary):
             return
+        assert isinstance(vocabulary, str)
 
+        redacted_vocabulary = redact_evidence_string(vocabulary, max_chars=200)
         keras_version = result.metadata.get("keras_version")
         location = f"{self.current_file_path} (layer: {layer_name})"
         details = {
             "layer_name": layer_name,
             "layer_class": "StringLookup",
-            "vocabulary": vocabulary,
+            "vocabulary": redacted_vocabulary,
             "cve_id": "CVE-2025-12058",
             "cvss": 5.9,
             "cwe": "CWE-502, CWE-918",
@@ -1444,7 +1447,7 @@ class KerasZipScanner(BaseScanner):
                 passed=False,
                 message=(
                     f"CVE-2025-12058: StringLookup layer '{layer_name}' in Keras {keras_version} references "
-                    f"external vocabulary path '{vocabulary}', which can expose local files or trigger SSRF "
+                    f"external vocabulary path '{redacted_vocabulary}', which can expose local files or trigger SSRF "
                     "during model loading"
                 ),
                 severity=IssueSeverity.WARNING,
@@ -1460,7 +1463,7 @@ class KerasZipScanner(BaseScanner):
                 name="StringLookup External Vocabulary Metadata Check",
                 passed=False,
                 message=(
-                    f"StringLookup layer '{layer_name}' references external vocabulary path '{vocabulary}', "
+                    f"StringLookup layer '{layer_name}' references external vocabulary path '{redacted_vocabulary}', "
                     f"and archive metadata reports Keras {keras_version} outside the known CVE-2025-12058 "
                     "vulnerable range (<3.12.0), but metadata-only assessment is inconclusive without runtime "
                     "verification"
@@ -1475,7 +1478,7 @@ class KerasZipScanner(BaseScanner):
             name="StringLookup External Vocabulary Risk (Version Unknown)",
             passed=False,
             message=(
-                f"StringLookup layer '{layer_name}' references external vocabulary path '{vocabulary}', but "
+                f"StringLookup layer '{layer_name}' references external vocabulary path '{redacted_vocabulary}', but "
                 "keras_version is unavailable; cannot confidently attribute CVE-2025-12058 without version context"
             ),
             severity=IssueSeverity.WARNING,
@@ -1657,8 +1660,8 @@ class KerasZipScanner(BaseScanner):
                     {
                         "kind": "ExternalLink",
                         "hdf5_path": f"/{name}".replace("//", "/"),
-                        "filename": link.filename,
-                        "path": link.path,
+                        "filename": redact_evidence_string(link.filename, max_chars=200),
+                        "path": redact_evidence_string(link.path, max_chars=200),
                     },
                 )
                 return
@@ -1670,7 +1673,11 @@ class KerasZipScanner(BaseScanner):
                         "kind": "external_storage",
                         "hdf5_path": f"/{name}".replace("//", "/"),
                         "segments": [
-                            {"filename": filename, "offset": int(offset), "size": int(size)}
+                            {
+                                "filename": redact_evidence_string(filename, max_chars=200),
+                                "offset": int(offset),
+                                "size": int(size),
+                            }
                             for filename, offset, size in obj.external
                         ],
                     },
@@ -1862,7 +1869,7 @@ class KerasZipScanner(BaseScanner):
                                 "layer_name": layer_name,
                                 "layer_class": "Lambda",
                                 "dangerous_patterns": found_patterns,
-                                "code_preview": (decoded_str[:200] + "..." if len(decoded_str) > 200 else decoded_str),
+                                "code_preview": redact_evidence_string(decoded_str, max_chars=200),
                                 "encoding": "base64",
                             },
                             why=(
@@ -1887,9 +1894,7 @@ class KerasZipScanner(BaseScanner):
                                         "layer_name": layer_name,
                                         "layer_class": "Lambda",
                                         "code_analysis": risk_desc,
-                                        "code_preview": (
-                                            decoded_str[:200] + "..." if len(decoded_str) > 200 else decoded_str
-                                        ),
+                                        "code_preview": redact_evidence_string(decoded_str, max_chars=200),
                                     },
                                     why=get_pattern_explanation("lambda_layer"),
                                 )

@@ -1,6 +1,10 @@
 """Tests for scanner evidence redaction helpers."""
 
-from modelaudit.scanners._evidence_redaction import REDACTED_EVIDENCE_VALUE, redact_evidence_string
+from modelaudit.scanners._evidence_redaction import (
+    REDACTED_EVIDENCE_VALUE,
+    redact_evidence_string,
+    redact_evidence_value,
+)
 
 
 def test_redacts_compound_credential_assignments() -> None:
@@ -54,3 +58,20 @@ def test_existing_token_assignment_redaction_still_applies() -> None:
 
     assert "CANONICALTOKEN123" not in redacted
     assert redacted == f"token={REDACTED_EVIDENCE_VALUE}"
+
+
+def test_redacts_nested_structured_evidence_without_flattening_context() -> None:
+    evidence = {
+        "kind": "ExternalLink",
+        "filename": "https://storage.example/model.h5?X-Amz-Signature=SIGNED123&part=1",
+        "segments": [{"filename": "weights.raw?token=RAWSECRET456", "offset": 0, "size": 8}],
+    }
+
+    redacted = redact_evidence_value(evidence, max_chars=500)
+
+    assert redacted["kind"] == "ExternalLink"
+    assert redacted["segments"][0]["offset"] == 0
+    assert redacted["segments"][0]["size"] == 8
+    assert "SIGNED123" not in str(redacted)
+    assert "RAWSECRET456" not in str(redacted)
+    assert "part=1" in redacted["filename"]
