@@ -3,6 +3,7 @@ import shutil
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import click
 import requests
@@ -10,6 +11,13 @@ import requests
 from ..helpers.disk_space import check_disk_space
 
 _PYTORCH_HUB_PATTERN = r"^https?://pytorch\.org/hub/[\w\-_.]+/?$"
+_PYTORCH_MODEL_URL_PATTERN = r"https://download\.pytorch\.org/models/[^\s\"'<>\\)\]]+"
+
+
+def _get_model_extensions() -> set[str]:
+    from ..model_extensions import get_model_extensions
+
+    return get_model_extensions()
 
 
 def is_pytorch_hub_url(url: str) -> bool:
@@ -19,8 +27,18 @@ def is_pytorch_hub_url(url: str) -> bool:
 
 def _extract_weight_urls(html: str) -> list[str]:
     """Extract weight file URLs from a PyTorch Hub page."""
-    pattern = r"https://download\.pytorch\.org/models/[\w\-_.]+(?:\.pt|\.pth(?:\.tar\.gz|\.zip)?)(?![\w.])"
-    return re.findall(pattern, html)
+    model_extensions = {extension.lower() for extension in _get_model_extensions()}
+    weight_urls: list[str] = []
+    seen: set[str] = set()
+
+    for raw_url in re.findall(_PYTORCH_MODEL_URL_PATTERN, html):
+        url = raw_url.rstrip(".,;:")
+        path = urlsplit(url).path.lower()
+        if url not in seen and any(path.endswith(extension) for extension in model_extensions):
+            weight_urls.append(url)
+            seen.add(url)
+
+    return weight_urls
 
 
 def _get_total_size(urls: list[str]) -> int:
