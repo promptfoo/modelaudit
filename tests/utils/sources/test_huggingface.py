@@ -1,6 +1,10 @@
 """Tests for HuggingFace URL handling."""
 
+import pickle
+import struct
+import tarfile
 from collections.abc import Iterator
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -39,6 +43,16 @@ class _FakeRangeResponse:
 
     def iter_content(self, chunk_size: int) -> Iterator[bytes]:
         yield self.payload[:chunk_size]
+
+
+def _make_tar_payload() -> bytes:
+    payload = BytesIO()
+    with tarfile.open(fileobj=payload, mode="w") as archive:
+        info = tarfile.TarInfo("weights.bin")
+        info.size = len(b"weights")
+        info.mtime = 0
+        archive.addfile(info, BytesIO(b"weights"))
+    return payload.getvalue()
 
 
 class TestHuggingFaceURLDetection:
@@ -410,6 +424,44 @@ class TestModelDownload:
         allow_patterns = mock_snapshot_download.call_args.kwargs["allow_patterns"]
         assert allow_patterns == ["pytorch_model.bin", "evil.payload"]
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            struct.pack("<Q", len(b'{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}'))
+            + b'{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}'
+            + b"\x00\x00\x00\x00",
+            pickle.dumps({"weights": [1, 2, 3]}, protocol=0),
+            _make_tar_payload(),
+        ],
+        ids=["safetensors", "protocol0-pickle", "tar"],
+    )
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "hidden.payload"], None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_includes_bounded_content_routed_payloads(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+        payload: bytes,
+    ) -> None:
+        """Selective downloads should preserve renamed payloads recognized by bounded probes."""
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "pytorch_model.bin").write_bytes(b"weights")
+        mock_snapshot_download.return_value = str(download_path)
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        download_model("https://huggingface.co/test/model")
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin", "hidden.payload"]
+
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -433,6 +485,28 @@ class TestModelDownload:
         assert "evil.payload" in error
         assert "hf_secret" not in error
         assert "token=" not in error
+        mock_snapshot_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._HF_CONTENT_SNIFF_MAX_FILES", 1)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "preview.png", "notes.txt"], None),
+    )
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_caps_skipped_file_content_probes(
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        mock_detect_content: MagicMock,
+        _mock_get_extensions: MagicMock,
+    ) -> None:
+        """Selective filtering should fail closed instead of issuing unbounded remote probes."""
+        with pytest.raises(Exception, match="skipped file inspection limit exceeded"):
+            download_model("https://huggingface.co/test/model")
+
+        mock_detect_content.assert_called_once_with("test/model", "preview.png")
         mock_snapshot_download.assert_not_called()
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)

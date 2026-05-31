@@ -1,7 +1,9 @@
 """Utilities for handling HuggingFace model downloads."""
 
+import json
 import logging
 import os
+import struct
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,7 @@ from .huggingface_paths import (
 logger = logging.getLogger(__name__)
 
 _HF_CONTENT_SNIFF_BYTES = 512
+_HF_CONTENT_SNIFF_MAX_FILES = 256
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
 
@@ -61,11 +64,12 @@ def _build_extension_allow_patterns() -> list[str]:
 
 
 def _has_model_extension(filename: str, model_extensions: set[str]) -> bool:
-    return any(filename.endswith(ext) for ext in model_extensions)
+    filename_lower = filename.lower()
+    return any(filename_lower.endswith(ext.lower()) for ext in model_extensions)
 
 
-def _detect_huggingface_content_route_format(repo_id: str, filename: str) -> str | None:
-    """Return a content-routed model format for a remote file, if cheaply identifiable."""
+def _read_huggingface_prefix(repo_id: str, filename: str, max_bytes: int) -> bytes:
+    """Read a bounded remote prefix for selective content routing."""
     try:
         import requests
         from huggingface_hub import hf_hub_url
@@ -74,30 +78,71 @@ def _detect_huggingface_content_route_format(repo_id: str, filename: str) -> str
         file_url = hf_hub_url(repo_id=repo_id, filename=filename)
         headers = build_hf_headers(
             token=None,
-            headers={"Range": f"bytes=0-{_HF_CONTENT_SNIFF_BYTES - 1}"},
+            headers={"Range": f"bytes=0-{max_bytes - 1}"},
         )
         with requests.get(file_url, headers=headers, stream=True, timeout=30, allow_redirects=True) as response:
             response.raise_for_status()
             chunks: list[bytes] = []
             total = 0
-            for chunk in response.iter_content(chunk_size=_HF_CONTENT_SNIFF_BYTES):
+            for chunk in response.iter_content(chunk_size=max_bytes):
                 if not chunk:
                     continue
                 chunks.append(chunk)
                 total += len(chunk)
-                if total >= _HF_CONTENT_SNIFF_BYTES:
+                if total >= max_bytes:
                     break
-        prefix = b"".join(chunks)[:_HF_CONTENT_SNIFF_BYTES]
+        return b"".join(chunks)[:max_bytes]
     except Exception as exc:
         raise ValueError(
             "Hugging Face selective filtering incomplete: unable to inspect skipped file "
             f"{repo_id}/{filename}: {redact_huggingface_urls_in_text(str(exc))}"
         ) from exc
 
+
+def _looks_like_safetensors_prefix(prefix: bytes) -> bool:
+    """Recognize bounded SafeTensors framing without requiring a local path."""
+    if len(prefix) <= 8:
+        return False
+
+    header_len = struct.unpack("<Q", prefix[:8])[0]
+    header_prefix = prefix[8:]
+    if header_len <= 0 or not header_prefix.startswith(b"{"):
+        return False
+    if header_len > len(header_prefix):
+        return True
+
+    try:
+        parsed_header = json.loads(header_prefix[:header_len].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(parsed_header, dict)
+
+
+def _detect_huggingface_content_route_format(repo_id: str, filename: str) -> str | None:
+    """Return a content-routed model format for a remote file, if cheaply identifiable."""
+    prefix = _read_huggingface_prefix(repo_id, filename, _HF_CONTENT_SNIFF_BYTES)
     if not prefix:
         return None
 
-    from modelaudit.utils.file.detection import detect_format_from_magic_bytes
+    from modelaudit.utils.file.detection import (
+        PROTO0_1_MAX_PROBE_BYTES,
+        _could_start_proto0_or_1_pickle,
+        _looks_like_proto0_or_1_pickle,
+        _looks_like_uncompressed_tar_header,
+        detect_format_from_magic_bytes,
+    )
+
+    if _looks_like_safetensors_prefix(prefix):
+        return "safetensors"
+    if _looks_like_uncompressed_tar_header(prefix):
+        return "tar"
+    if _could_start_proto0_or_1_pickle(prefix):
+        pickle_probe = _read_huggingface_prefix(repo_id, filename, PROTO0_1_MAX_PROBE_BYTES)
+        if _looks_like_proto0_or_1_pickle(
+            pickle_probe,
+            sample_is_prefix=len(pickle_probe) >= PROTO0_1_MAX_PROBE_BYTES,
+        ):
+            return "pickle"
 
     detected_format = detect_format_from_magic_bytes(
         prefix[:4],
@@ -118,10 +163,17 @@ def _select_huggingface_model_files(repo_id: str, repo_files: list[str], model_e
     """Select extension-matching files plus bounded content-routed renamed model files."""
     model_files = [filename for filename in repo_files if _has_model_extension(filename, model_extensions)]
     selected_files = set(model_files)
+    inspected_files = 0
 
     for filename in repo_files:
         if filename in selected_files:
             continue
+        if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
+                f"for {repo_id} ({_HF_CONTENT_SNIFF_MAX_FILES} files)"
+            )
+        inspected_files += 1
         detected_format = _detect_huggingface_content_route_format(repo_id, filename)
         if detected_format is None:
             continue
