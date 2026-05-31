@@ -3583,9 +3583,9 @@ class TestCVE20243660LambdaAttribution:
         assert passed_version_checks == []
         assert determine_exit_code(audit_result) == 1
 
-    @pytest.mark.parametrize("keras_version", ["2.13.0+cpu", "2.13.0.post1", "2.13.1"])
+    @pytest.mark.parametrize("keras_version", ["2.13.0+cpu", "2.13.0.post1", "2.13.0cpu", "2.13.1"])
     def test_no_cve_for_stable_keras_213_variants(self, tmp_path: Path, keras_version: str) -> None:
-        """Stable fixed Keras 2.13 variants should stay outside CVE-2024-3660 attribution."""
+        """Stable fixed and unrecognized Keras 2.13 variants should stay outside CVE-2024-3660 attribution."""
         scanner = KerasZipScanner()
         encoded = base64.b64encode(b"lambda x: x * 2").decode()
         config = {

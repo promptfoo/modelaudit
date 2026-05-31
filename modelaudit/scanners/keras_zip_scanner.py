@@ -117,7 +117,7 @@ _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
 _KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+_-]*)\s*$")
-_KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(r"(?i)^(?:a|alpha|b|beta|c|rc|pre|preview|dev)")
+_KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(r"(?i)^(?:alpha|beta|preview|pre|rc|dev|a|b|c)(?:[._-]?\d+)?(?:$|[.+_-])")
 
 
 def _redact_url_for_display(url: str) -> str:
