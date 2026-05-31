@@ -191,27 +191,19 @@ class TestJFrogDownload:
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_parser_confused_initial_jfrog_url_receives_no_credentials(
-        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Credential trust must match the host Requests will actually contact."""
-        mock_response = mock_get.return_value
-        mock_response.status_code = 200
-        mock_response.raise_for_status.return_value = None
-        mock_response.iter_content.return_value = [b"data"]
+        """Parser-confused initial URLs must be rejected before any request is sent."""
         monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
 
-        with caplog.at_level(logging.WARNING, logger="modelaudit.utils.sources.jfrog"):
-            result = download_artifact(
+        with pytest.raises(ValueError, match="Not a JFrog URL"):
+            download_artifact(
                 "https://evil.example\\@company.jfrog.io/artifactory/repo/model.bin",
                 cache_dir=tmp_path,
                 api_token="test-token",
             )
 
-        assert result.read_bytes() == b"data"
-        assert mock_get.call_args.kwargs["headers"] == {}
-        assert mock_get.call_args.kwargs["allow_redirects"] is False
-        assert "Skipping JFrog credentials" in caplog.text
-        assert "test-token" not in caplog.text
+        mock_get.assert_not_called()
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_untrusted_download_redirect_strips_credentials(
@@ -294,6 +286,26 @@ class TestJFrogDownload:
         assert result.read_bytes() == b"data"
         assert mock_get.call_args_list[1].args[0] == ("https://company.jfrog.io/artifactory/repo/model.bin?download=1")
         assert mock_get.call_args_list[1].kwargs["headers"] == {"X-JFrog-Art-Api": "test-token"}
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_redirect_without_location_fails_closed(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Redirect responses without a target must not be scanned as artifact bodies."""
+        redirect_response = MagicMock(spec=requests.Response)
+        redirect_response.status_code = 302
+        redirect_response.headers = {}
+        mock_get.return_value = redirect_response
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        with pytest.raises(Exception, match="JFrog redirect response missing Location header"):
+            download_artifact(
+                "https://company.jfrog.io/artifactory/repo/model.bin",
+                cache_dir=tmp_path,
+                api_token="test-token",
+            )
+
+        redirect_response.close.assert_called_once_with()
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_http_jfrog_saas_url_is_rejected_before_credentials(

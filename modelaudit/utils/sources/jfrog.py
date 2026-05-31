@@ -138,6 +138,8 @@ def is_jfrog_url(url: str) -> bool:
     """Check if a URL points to a JFrog Artifactory file or folder."""
     parsed = urlparse(url)
     hostname = _normalize_hostname(parsed.hostname or "")
+    if not hostname or hostname != _get_requests_prepared_hostname(url):
+        return False
     if parsed.scheme != "https" and not (parsed.scheme == "http" and _is_local_jfrog_host(hostname)):
         return False
     if "/artifactory/" not in parsed.path:
@@ -270,7 +272,10 @@ def _get_with_jfrog_redirect_policy(
 
         location = response.headers.get("Location")
         if not location:
-            return response
+            response.close()
+            raise requests.exceptions.RequestException(
+                f"JFrog redirect response missing Location header for {redact_jfrog_url_for_display(current_url)}"
+            )
 
         current_url = urljoin(current_url, location)
         response.close()
