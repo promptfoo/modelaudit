@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from modelaudit.integrations.sbom_generator import generate_sbom, generate_sbom_pydantic
 from modelaudit.models import FileHashesModel, FileMetadataModel, create_initial_audit_result
 
@@ -110,3 +112,75 @@ def test_sbom_hashes_in_root_symlink_targets(
 
     assert _sha256_values(component) == [hashlib.sha256(content).hexdigest()]
     assert _property_value(component, "size") == str(len(content))
+
+
+def test_sbom_omits_hash_when_in_root_symlink_target_changes_during_validation(
+    tmp_path: Path,
+    requires_symlinks: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    scan_root.mkdir()
+    inside_file = scan_root / "inside.bin"
+    inside_content = b"contained target selected before the symlink swap"
+    inside_file.write_bytes(inside_content)
+    outside_file = tmp_path / "outside.bin"
+    outside_content = b"outside target must never be hashed after the symlink swap"
+    outside_file.write_bytes(outside_content)
+
+    link = scan_root / "swapped.bin"
+    link.symlink_to(inside_file)
+    real_realpath = os.path.realpath
+    swapped = False
+
+    def _swap_link_after_resolution(path: str) -> str:
+        nonlocal swapped
+        resolved = real_realpath(path)
+        if path == str(link) and not swapped:
+            swapped = True
+            link.unlink()
+            link.symlink_to(outside_file)
+        return resolved
+
+    monkeypatch.setattr(os.path, "realpath", _swap_link_after_resolution)
+
+    sbom_data: dict[str, Any] = json.loads(generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}}))
+    component = _component_named(sbom_data, "swapped.bin")
+
+    assert _sha256_values(component) == []
+    assert hashlib.sha256(outside_content).hexdigest() not in _sha256_values(component)
+    assert _property_value(component, "size") == str(os.lstat(link).st_size)
+
+
+def test_sbom_omits_hash_when_regular_file_becomes_outside_root_symlink_before_open(
+    tmp_path: Path,
+    requires_symlinks: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    scan_root.mkdir()
+    model_file = scan_root / "swapped.bin"
+    model_file.write_bytes(b"ordinary file before the swap")
+    outside_file = tmp_path / "outside.bin"
+    outside_content = b"outside target must never be hashed after the file swap"
+    outside_file.write_bytes(outside_content)
+
+    real_open = os.open
+    swapped = False
+
+    def _swap_file_before_open(path: str, flags: int, mode: int = 0o777) -> int:
+        nonlocal swapped
+        if path == str(model_file) and not swapped:
+            swapped = True
+            model_file.unlink()
+            model_file.symlink_to(outside_file)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", _swap_file_before_open)
+
+    sbom_data: dict[str, Any] = json.loads(generate_sbom([str(scan_root)], {"issues": [], "file_metadata": {}}))
+    component = _component_named(sbom_data, "swapped.bin")
+
+    assert _sha256_values(component) == []
+    assert hashlib.sha256(outside_content).hexdigest() not in _sha256_values(component)
+    assert _property_value(component, "size") == str(os.lstat(model_file).st_size)

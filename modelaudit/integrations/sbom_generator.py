@@ -16,14 +16,6 @@ from ..scanner_results import Issue, IssueSeverity
 SCANNER_VERSION = f"v{_pkg_version('modelaudit')}"
 
 
-def _file_sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def _get_component_type(path: str, metadata: dict[str, Any] | None) -> ComponentType:
     """Determine the appropriate CycloneDX v1.6 component type for a file."""
     # ML model file types should use MACHINE_LEARNING_MODEL component type
@@ -86,11 +78,51 @@ def _is_path_within_directory(path: str, directory: str) -> bool:
         return False
 
 
-def _symlink_size(path: str) -> int:
+def _lstat_size(path: str) -> int:
     try:
         return os.lstat(path).st_size
     except OSError:
         return 0
+
+
+def _opened_file_size_and_sha256(path: str, scan_root: str | None) -> tuple[int, str] | None:
+    """Hash one opened file descriptor after binding it to a contained path."""
+    hash_path = os.path.realpath(path) if scan_root is not None else path
+    if scan_root is not None and not _is_path_within_directory(hash_path, scan_root):
+        return None
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    try:
+        fd = os.open(hash_path, flags)
+    except OSError:
+        return None
+
+    try:
+        opened_stat = os.fstat(fd)
+        if scan_root is not None:
+            if not _is_path_within_directory(hash_path, scan_root):
+                return None
+            try:
+                current_stat = os.stat(hash_path, follow_symlinks=False)
+            except OSError:
+                return None
+            if (opened_stat.st_dev, opened_stat.st_ino) != (current_stat.st_dev, current_stat.st_ino):
+                return None
+
+        h = hashlib.sha256()
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return opened_stat.st_size, h.hexdigest()
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _resolve_component_size_and_sha256(
@@ -99,11 +131,14 @@ def _resolve_component_size_and_sha256(
     scan_root: str | None = None,
 ) -> tuple[int, str]:
     """Resolve component size/hash from disk, falling back to recorded metadata."""
-    if scan_root is not None and os.path.islink(path) and not _is_path_within_directory(path, scan_root):
-        return _symlink_size(path), ""
+    if scan_root is not None and not _is_path_within_directory(path, scan_root):
+        return _lstat_size(path), ""
 
-    if os.path.exists(path):
-        return os.path.getsize(path), _file_sha256(path)
+    opened_file = _opened_file_size_and_sha256(path, scan_root)
+    if opened_file is not None:
+        return opened_file
+    if os.path.lexists(path):
+        return _lstat_size(path), ""
 
     file_size = 0
     sha256 = ""
