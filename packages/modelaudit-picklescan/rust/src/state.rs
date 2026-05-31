@@ -840,9 +840,25 @@ impl<'a> ScanState<'a> {
                             self.scan_raw_nested_pickle_bytes(bytes, self.position_offset + start);
                         }
                     }
+                    "BINUNICODE" | "BINUNICODE8" | "SHORT_BINUNICODE" => {
+                        if let ArgValue::TextSpan { start, end } = opcode.arg {
+                            if start <= end && end <= self.payload.len() {
+                                let bytes = &self.payload[start..end];
+                                self.scan_raw_nested_unicode_bytes(
+                                    bytes,
+                                    self.position_offset + start,
+                                );
+                            }
+                        }
+                    }
                     "STRING" => {
                         if let Some(bytes) = opcode.arg.raw_bytes(self.payload) {
                             self.scan_raw_nested_pickle_bytes(bytes.as_ref(), position);
+                        }
+                    }
+                    "UNICODE" => {
+                        if let ArgValue::Text(value) = &opcode.arg {
+                            self.scan_raw_nested_unicode_bytes(value.as_bytes(), position);
                         }
                     }
                     _ => {}
@@ -4870,6 +4886,25 @@ impl<'a> ScanState<'a> {
         }
     }
 
+    fn scan_raw_nested_unicode_bytes(&mut self, value: &[u8], position: usize) {
+        let probe_offsets = nested_pickle_probe_offsets(value);
+        for offset in probe_offsets.offsets {
+            let end = value
+                .len()
+                .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
+            let probe = &value[offset..end];
+            let Some(payload_len) =
+                pickle_payload_extent(probe, self.options.max_nested_pickle_bytes)
+            else {
+                continue;
+            };
+            let candidate = &probe[..payload_len];
+            if has_execution_opcode(candidate) {
+                self.scan_raw_nested_pickle_bytes(candidate, position + offset);
+            }
+        }
+    }
+
     fn is_data_only_encoded_nested_pickle_literal(&self, value: &str) -> bool {
         decode_possible_encoded_pickle(value, self.options.max_nested_pickle_bytes)
             .into_iter()
@@ -7577,6 +7612,71 @@ mod tests {
         for (label, payload) in payloads {
             let mut scan = ScanState::new(
                 format!("legacy-string-raw-nested-{label}.pkl"),
+                &payload,
+                &options,
+                Some(payload.len()),
+                0,
+                0,
+                None,
+            );
+
+            scan.run();
+
+            assert_eq!(scan.verdict, "malicious", "missed {label}");
+            assert!(scan.findings.iter().any(|finding| {
+                finding.rule_code == Some("S213")
+                    && detail_string(&finding.details, "encoding").as_deref() == Some("raw")
+                    && detail_usize(&finding.details, "payload_size") == Some(14)
+            }));
+            assert!(scan.findings.iter().any(|finding| {
+                finding.rule_code == Some("DANGEROUS_CALL")
+                    && detail_string(&finding.details, "import_reference").as_deref()
+                        == Some("os.system")
+            }));
+        }
+    }
+
+    #[test]
+    fn unicode_string_opcodes_scan_raw_nested_payloads() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let nested_bytes = b"AAAAAAcos\nsystem\n)R.BBBB";
+        let payloads = [
+            ("short-binunicode", {
+                let mut payload = b"\x80\x04".to_vec();
+                payload.extend_from_slice(&short_binunicode(nested_bytes));
+                payload.push(b'.');
+                payload
+            }),
+            ("binunicode", {
+                let mut payload = b"\x80\x02X".to_vec();
+                payload.extend_from_slice(&(nested_bytes.len() as u32).to_le_bytes());
+                payload.extend_from_slice(nested_bytes);
+                payload.push(b'.');
+                payload
+            }),
+            ("binunicode8", {
+                let mut payload = b"\x80\x04\x8d".to_vec();
+                payload.extend_from_slice(&(nested_bytes.len() as u64).to_le_bytes());
+                payload.extend_from_slice(nested_bytes);
+                payload.push(b'.');
+                payload
+            }),
+            (
+                "protocol0-unicode",
+                b"VAAAAAAcos\\u000asystem\\u000a)R.BBBB\n.".to_vec(),
+            ),
+        ];
+
+        for (label, payload) in payloads {
+            let mut scan = ScanState::new(
+                format!("unicode-raw-nested-{label}.pkl"),
                 &payload,
                 &options,
                 Some(payload.len()),

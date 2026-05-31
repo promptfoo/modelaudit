@@ -101,6 +101,10 @@ def _binunicode(data: bytes) -> bytes:
     return b"X" + len(data).to_bytes(4, "little") + data
 
 
+def _binunicode8(data: bytes) -> bytes:
+    return b"\x8d" + len(data).to_bytes(8, "little") + data
+
+
 def _concrete_pathlib_class_name() -> str:
     return "WindowsPath" if os.name == "nt" else "PosixPath"
 
@@ -927,6 +931,55 @@ def test_scan_bytes_scans_legacy_string_opcodes_for_raw_nested_payloads(payload:
         finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
         for finding in report.findings
     )
+
+
+RAW_NESTED_UNICODE_LITERAL = b"AAAAAAcos\nsystem\n)R.BBBB"
+RAW_NESTED_PICKLE_SIZE = len(b"cos\nsystem\n)R.")
+UNICODE_SCALAR_NEAR_MATCH = "AAAAAAco\u2603\nsafe\n)X.BBBB".encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x80\x04" + _short_binunicode(RAW_NESTED_UNICODE_LITERAL) + b".",
+        b"\x80\x02" + _binunicode(RAW_NESTED_UNICODE_LITERAL) + b".",
+        b"\x80\x04" + _binunicode8(RAW_NESTED_UNICODE_LITERAL) + b".",
+        b"VAAAAAAcos\\u000asystem\\u000a)R.BBBB\n.",
+    ],
+    ids=["short-binunicode", "binunicode", "binunicode8", "protocol0-unicode"],
+)
+def test_scan_bytes_scans_unicode_opcodes_for_raw_nested_payloads(payload: bytes) -> None:
+    report = scan_bytes(payload, source="unicode-raw-nested.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("encoding") == "raw"
+        and finding.details.get("payload_size") == RAW_NESTED_PICKLE_SIZE
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x80\x04" + _short_binunicode(UNICODE_SCALAR_NEAR_MATCH) + b".",
+        b"\x80\x02" + _binunicode(UNICODE_SCALAR_NEAR_MATCH) + b".",
+        b"\x80\x04" + _binunicode8(UNICODE_SCALAR_NEAR_MATCH) + b".",
+        b"VAAAAAAco\\u2603\\u000asafe\\u000a)X.BBBB\n.",
+    ],
+    ids=["short-binunicode", "binunicode", "binunicode8", "protocol0-unicode"],
+)
+def test_scan_bytes_ignores_unicode_scalar_raw_nested_near_matches(payload: bytes) -> None:
+    report = scan_bytes(payload, source="unicode-raw-nested-near-match.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code not in {"S213", "DANGEROUS_CALL"} for finding in report.findings)
 
 
 def test_scan_bytes_fails_closed_on_malformed_nested_persid_payload() -> None:
