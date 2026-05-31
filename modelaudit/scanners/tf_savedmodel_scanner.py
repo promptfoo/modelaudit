@@ -1460,7 +1460,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 continue
             seen.add(key)
             windows.append((start, end, string_val[start:end]))
-        return windows, False
+
+        covered_until = 0
+        for start, end, _scan_text in sorted(windows):
+            if start > covered_until:
+                break
+            covered_until = max(covered_until, end)
+        return windows, covered_until >= string_length
 
     def _check_protobuf_string_injection(self, saved_model: Any, result: ScanResult) -> None:
         """Check for string injection attacks in protobuf fields"""
@@ -1490,8 +1496,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
             # Base64 encoded payloads — require at least one trailing '=' pad
             # character to avoid matching normal TF node names that use '/'
             # as a hierarchical separator (e.g. "bidirectional/forward_lstm",
-            # "Adam/embedding/embeddings").
-            (r"[A-Za-z0-9+/]{20,}={1,2}", "encoded_payload", "potential base64 payload"),
+            # "Adam/embedding/embeddings"). Boundaries also prevent quadratic
+            # backtracking on long unpadded alphanumeric runs.
+            (
+                r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{20,}={1,2}(?![A-Za-z0-9+/=])",
+                "encoded_payload",
+                "potential base64 payload",
+            ),
         ]
 
         for node_context in self._iter_saved_model_node_contexts(saved_model):
@@ -1548,7 +1559,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     "max_full_scan_chars": _MAX_PROTOBUF_STRING_FULL_SCAN_CHARS,
                                 },
                             )
-                            if not scanned_entire_string and matched_injection is None:
+                            if not scanned_entire_string:
                                 mark_inconclusive_scan_result(result, _PROTOBUF_STRING_INCOMPLETE_REASON)
                                 mark_operational_scan_error(result, _PROTOBUF_STRING_INCOMPLETE_REASON)
                                 string_details.update(

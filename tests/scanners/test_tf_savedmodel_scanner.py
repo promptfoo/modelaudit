@@ -617,6 +617,66 @@ def test_benign_long_protobuf_string_is_scanned_without_security_finding(tmp_pat
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_fully_covered_windowed_protobuf_string_preserves_success(tmp_path: Path) -> None:
+    benign_value = "safe-metadata-" + ("A" * 33_000)
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "fully_covered_windowed_node",
+                "string_attrs": {"description": benign_value},
+            }
+        ],
+        model_name="fully_covered_windowed_string",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    assert result.success is True
+    assert determine_exit_code(aggregate) == 0
+    length_checks = [check for check in result.checks if check.name == "Protobuf String Length Check"]
+    assert length_checks
+    assert length_checks[0].details["string_scan_strategy"] == "full"
+    assert "scan_outcome" not in result.metadata
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_partial_window_match_does_not_hide_incomplete_protobuf_string_scan(tmp_path: Path) -> None:
+    oversized_value = "../" + ("A" * 99_997) + "os.system('/bin/echo hidden exploit')" + ("A" * 200_000)
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "partial_window_match_node",
+                "string_attrs": {"payload": oversized_value},
+            }
+        ],
+        model_name="partial_window_match_string",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    assert result.success is False
+    assert determine_exit_code(aggregate) == 2
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "savedmodel_protobuf_string_scan_incomplete"
+    incomplete_checks = [
+        check
+        for check in result.checks
+        if check.name == "Protobuf String Length Check"
+        and check.details.get("scan_outcome_reason") == "savedmodel_protobuf_string_scan_incomplete"
+    ]
+    injection_checks = [check for check in result.checks if check.name == "Protobuf String Injection Check"]
+    assert incomplete_checks
+    assert any(check.details["attack_type"] == "path_traversal" for check in injection_checks)
+    assert not any(check.details["attack_type"] == "system_command" for check in injection_checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_oversized_protobuf_string_without_full_coverage_fails_closed(tmp_path: Path) -> None:
     oversized_value = "safe-metadata-" + ("A" * 300_000)
     model_path = _create_test_savedmodel_with_scoped_nodes(
