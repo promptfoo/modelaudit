@@ -7,6 +7,7 @@ from urllib.parse import unquote, urlparse, urlunparse
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import mark_inconclusive_scan_result, scan_result_has_inconclusive_outcome
+from ._evidence_redaction import REDACTED_EVIDENCE_VALUE, redact_evidence_string
 from .base import BaseScanner, CheckStatus, Issue, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,13 @@ def _redact_url_for_display(url: str) -> str:
 
     netloc = f"{hostname}:{port}" if port else hostname
     return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
+
+
+def _redact_secret_match_preview(matched_text: str) -> str:
+    redacted = redact_evidence_string(matched_text, max_chars=80)
+    if redacted != matched_text:
+        return redacted
+    return REDACTED_EVIDENCE_VALUE
 
 
 class MetadataScanner(BaseScanner):
@@ -364,9 +372,7 @@ class MetadataScanner(BaseScanner):
                                 location=file_path,
                                 details={
                                     "pattern_description": description,
-                                    "match_preview": matched_text[:20] + "..."
-                                    if len(matched_text) > 20
-                                    else matched_text,
+                                    "match_preview": _redact_secret_match_preview(matched_text),
                                     "length": len(secret_part),
                                 },
                                 why="Exposed secrets in documentation can lead to unauthorized access",
@@ -388,9 +394,7 @@ class MetadataScanner(BaseScanner):
                                 location=file_path,
                                 details={
                                     "pattern_description": description,
-                                    "match_preview": matched_text[:20] + "..."
-                                    if len(matched_text) > 20
-                                    else matched_text,
+                                    "match_preview": _redact_secret_match_preview(matched_text),
                                     "entropy": round(entropy, 2),
                                     "length": len(secret_part),
                                 },

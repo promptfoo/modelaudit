@@ -11,6 +11,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners import metadata_scanner
+from modelaudit.scanners._evidence_redaction import REDACTED_EVIDENCE_VALUE
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.metadata_scanner import MetadataScanner
 from modelaudit.utils.helpers import cache_decorator
@@ -368,6 +369,38 @@ class TestMetadataScanner:
 
         assert len(result.issues) >= 1  # Should detect at least one potential secret
         assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
+
+    def test_scan_exposed_secret_previews_are_redacted(self, tmp_path: Path) -> None:
+        """Secret evidence previews should not serialize the matched credential."""
+        aws_key = "AKIA1234567890ABCDEF"
+        openai_key = "sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV"
+        github_token = "ghp_A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8"
+        bearer_token = "AbCdEfGhIjKlMnOpQrStUvWxYz123456"
+        assignment_value = "Ab3dEf4Gh5Ij6Kl7Mn8Op9Qr"
+        readme_path = tmp_path / "README.md"
+        readme_path.write_text(
+            "\n".join(
+                [
+                    "# Model Setup",
+                    f"AWS: {aws_key}",
+                    f"OpenAI: {openai_key}",
+                    f"GitHub: {github_token}",
+                    f"Authorization: Bearer {bearer_token}",
+                    f'api_key="{assignment_value}"',
+                ]
+            )
+        )
+
+        result = MetadataScanner().scan(str(readme_path))
+
+        previews = [issue.details["match_preview"] for issue in result.issues if "match_preview" in issue.details]
+        serialized = result.to_json()
+        assert len(previews) >= 5
+        for raw_secret in [aws_key, openai_key, github_token, bearer_token, assignment_value]:
+            assert raw_secret not in serialized
+        assert REDACTED_EVIDENCE_VALUE in previews
+        assert f"Bearer {REDACTED_EVIDENCE_VALUE}" in previews
+        assert f'api_key="{REDACTED_EVIDENCE_VALUE}"' in previews
 
     def test_scan_ignores_placeholder_secrets(self) -> None:
         """Test that obvious placeholders are not flagged as secrets."""
