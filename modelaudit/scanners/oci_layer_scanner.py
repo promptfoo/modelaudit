@@ -138,8 +138,10 @@ class OciLayerScanner(BaseScanner):
 
     def _gzip_stream_metrics(self, layer_path: str) -> tuple[int | None, int, bool]:
         decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        compressed_consumed = 0
-        decompressed_seen = 0
+        completed_compressed = 0
+        completed_decompressed = 0
+        member_compressed = 0
+        member_decompressed = 0
         with open(layer_path, "rb") as layer_file:
             data = b""
             while True:
@@ -153,28 +155,32 @@ class OciLayerScanner(BaseScanner):
                         before_len = len(data)
                         output = decompressor.decompress(data, self._GZIP_OUTPUT_CHUNK_BYTES)
                     except zlib.error:
-                        return None, decompressed_seen, False
-                    compressed_consumed += (
-                        before_len - len(decompressor.unconsumed_tail) - len(decompressor.unused_data)
-                    )
-                    decompressed_seen += len(output)
+                        return completed_compressed or None, completed_decompressed, False
+                    member_compressed += before_len - len(decompressor.unconsumed_tail) - len(decompressor.unused_data)
+                    member_decompressed += len(output)
+                    compressed_consumed = completed_compressed + member_compressed
+                    decompressed_seen = completed_decompressed + member_decompressed
                     if decompressed_seen > self.max_decompressed_bytes:
                         return compressed_consumed, decompressed_seen, True
                     if decompressor.eof:
+                        completed_compressed = compressed_consumed
+                        completed_decompressed = decompressed_seen
                         data = decompressor.unused_data
                         while len(data) < 2:
                             chunk = layer_file.read(self._GZIP_CHUNK_BYTES)
                             if not chunk:
-                                return compressed_consumed, decompressed_seen, False
+                                return completed_compressed, completed_decompressed, False
                             data += chunk
                         if not data.startswith(b"\x1f\x8b"):
-                            return compressed_consumed, decompressed_seen, False
+                            return completed_compressed, completed_decompressed, False
                         decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                        member_compressed = 0
+                        member_decompressed = 0
                         continue
                     data = decompressor.unconsumed_tail
         if decompressor.eof:
-            return compressed_consumed, decompressed_seen, False
-        return None, decompressed_seen, False
+            return completed_compressed, completed_decompressed, False
+        return completed_compressed or None, completed_decompressed, False
 
     @staticmethod
     def _get_scannable_extension(member_name: str) -> str | None:
