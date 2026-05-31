@@ -1887,7 +1887,7 @@ class PickleScanner(BaseScanner):
             return
 
         reason = "pickle_binary_tail_scan_window_exceeded"
-        self._mark_operational_incomplete(result, reason)
+        mark_inconclusive_scan_result(result, reason)
         result.add_check(
             name="Pickle Binary Tail Coverage",
             passed=False,

@@ -1488,6 +1488,24 @@ def test_scan_pytorch_extension_marks_out_of_window_binary_tail_incomplete(tmp_p
     assert checks[0].details["tail_bytes_total"] > _BINARY_TAIL_SCAN_BYTES
 
 
+def test_scan_pytorch_extension_keeps_security_exit_for_detected_binary_tail_gap(tmp_path: Path) -> None:
+    pickle_payload = pickle.dumps({"safe": True}, protocol=4)
+    path = tmp_path / "model.pt"
+    path.write_bytes(pickle_payload + b"\x7fELF/bin/sh\x00" + (b"A" * (_BINARY_TAIL_SCAN_BYTES + 8)))
+
+    result = PickleScanner().scan(str(path))
+    result.metadata["file_path"] = str(path)
+    aggregate_result = create_initial_audit_result()
+    merge_scan_result(aggregate_result, result)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pickle_binary_tail_scan_window_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata.get("operational_error") is not True
+    assert any(issue.rule_code == "S502" for issue in result.issues)
+    assert determine_exit_code(aggregate_result) == 1
+
+
 def test_scan_file_detects_executable_tail_past_raw_scan_window(tmp_path: Path) -> None:
     pickle_payload = pickle.dumps({"pad": b"A" * 256}, protocol=4)
     path = tmp_path / "large-tail.bin"
