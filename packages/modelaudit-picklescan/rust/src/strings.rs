@@ -556,21 +556,47 @@ fn suffix_starts_with_call_expression(value: &str) -> bool {
         return false;
     }
     loop {
-        while chars.peek().is_some_and(|ch| ch.is_whitespace()) {
-            chars.next();
+        if !skip_call_expression_spacing(&mut chars) {
+            return false;
         }
         match chars.peek() {
             Some('(') => return true,
             Some('.') => {
                 chars.next();
-                while chars.peek().is_some_and(|ch| ch.is_whitespace()) {
-                    chars.next();
+                if !skip_call_expression_spacing(&mut chars) {
+                    return false;
                 }
                 if !consume_python_identifier(&mut chars) {
                     return false;
                 }
             }
             _ => return false,
+        }
+    }
+}
+
+fn skip_call_expression_spacing<I>(chars: &mut std::iter::Peekable<I>) -> bool
+where
+    I: Iterator<Item = char>,
+{
+    loop {
+        match chars.peek().copied() {
+            Some(ch) if ch.is_whitespace() && !matches!(ch, '\n' | '\r') => {
+                chars.next();
+            }
+            Some('\\') => {
+                chars.next();
+                match chars.next() {
+                    Some('\n') => {}
+                    Some('\r') => {
+                        if chars.peek() == Some(&'\n') {
+                            chars.next();
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            _ => return true,
         }
     }
 }
@@ -1057,7 +1083,14 @@ mod tests {
         assert!(suspicious_string_matches("eval(payload)\nfoo()").contains(&"eval(".to_string()));
         assert!(suspicious_string_matches("eval(payload)\nos.system('id')")
             .contains(&"eval(".to_string()));
+        assert!(
+            suspicious_string_matches("eval(payload)\nfoo \\\n()").contains(&"eval(".to_string())
+        );
+        assert!(suspicious_string_matches("eval(payload)\nfoo \\\r\n.bar()")
+            .contains(&"eval(".to_string()));
         assert!(suspicious_string_matches("eval(x)\nwhere x is input").is_empty());
+        assert!(suspicious_string_matches("eval(x)\nexample\n(text)").is_empty());
+        assert!(suspicious_string_matches("eval(x)\nexample.\ntext()").is_empty());
         assert!(
             suspicious_string_matches("Do not call os.system(command) from loaders").is_empty()
         );
