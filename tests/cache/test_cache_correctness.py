@@ -126,6 +126,50 @@ def test_cache_manager_cached_scan_does_not_store_result_after_post_scan_replace
     assert calls["count"] == 2
 
 
+def test_cache_manager_cached_scan_runs_when_pre_scan_hashing_fails(tmp_path: Path) -> None:
+    file_path = tmp_path / "empty.dat"
+    file_path.write_bytes(b"")
+    cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    version_context = build_cache_version_context({"timeout": 30})
+    calls = {"count": 0}
+
+    def scan(path: str) -> dict[str, Any]:
+        calls["count"] += 1
+        return {"size": Path(path).stat().st_size}
+
+    result = cache_manager.cached_scan(str(file_path), scan, version_context=version_context)
+
+    assert result["size"] == 0
+    assert calls["count"] == 1
+    assert cache_manager.get_stats()["total_entries"] == 0
+
+
+def test_cached_scan_runs_when_pre_scan_hashing_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="hash-failure.dat")
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir), "timeout": 30}
+    cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+    assert cache_manager.cache is not None
+    calls = {"count": 0}
+
+    def fail_hash(_path: str, _stat: os.stat_result) -> str:
+        raise ValueError("hash unavailable")
+
+    monkeypatch.setattr(cache_manager.cache.hasher, "hash_file_with_stat", fail_hash)
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        assert config is not None
+        calls["count"] += 1
+        return {"size": Path(path).stat().st_size}
+
+    result = scan(str(file_path), config)
+
+    assert result["size"] == 2048
+    assert calls["count"] == 1
+    assert cache_manager.get_stats()["total_entries"] == 0
+
+
 def test_cached_scan_invalidates_on_material_scan_config_change(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
@@ -718,6 +762,42 @@ def test_large_file_store_reuses_cache_key_content_hash(tmp_path: Path, monkeypa
     cache_entry = json.loads(cache_file_path.read_text(encoding="utf-8"))
 
     assert cache_entry["file_info"]["hash"] == expected_hash
+
+
+def test_large_file_store_reuses_verified_post_scan_hash_for_cache_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="large-verified.cache")
+    file_path.write_bytes(b"x" * (11 * 1024 * 1024))
+    file_stat = file_path.stat()
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    version_context = build_cache_version_context({"timeout": 30})
+    expected_hash = "secure:" + ("a" * 64)
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+    hash_calls = {"count": 0}
+
+    def verified_hash(_path: str, _stat: os.stat_result) -> str:
+        hash_calls["count"] += 1
+        return expected_hash
+
+    def fail_key_hash(_path: str) -> str:
+        raise AssertionError("large-file cache key should reuse the verified post-scan hash")
+
+    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", verified_hash)
+    monkeypatch.setattr(cache.key_generator.hasher, "hash_file", fail_key_hash)
+
+    assert (
+        cache.store_result(
+            str(file_path),
+            expected,
+            10,
+            version_context=version_context,
+            expected_file_stat=file_stat,
+            expected_file_hash=expected_hash,
+        )
+        is True
+    )
+    assert hash_calls["count"] == 1
 
 
 def test_same_size_rewrite_with_high_resolution_mtime_invalidates_cache(tmp_path: Path) -> None:

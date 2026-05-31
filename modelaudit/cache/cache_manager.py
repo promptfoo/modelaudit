@@ -144,8 +144,13 @@ class CacheManager:
         scan_start = time.time()
 
         try:
-            pre_scan_stat = os.stat(file_path)
-            pre_scan_hash = self.cache.hasher.hash_file_with_stat(file_path, pre_scan_stat) if self.cache else None
+            pre_scan_stat: os.stat_result | None = None
+            pre_scan_hash: str | None = None
+            try:
+                pre_scan_stat = os.stat(file_path)
+                pre_scan_hash = self.cache.hasher.hash_file_with_stat(file_path, pre_scan_stat) if self.cache else None
+            except Exception as e:
+                logger.debug("Bypassing cache store for %s: pre-scan hashing failed: %s", file_path, e)
             scan_result = scanner_func(file_path, *args, **kwargs)
             scan_duration = (time.time() - scan_start) * 1000
 
@@ -153,7 +158,8 @@ class CacheManager:
             if isinstance(scan_result, dict):
                 scan_result["_cache_info"] = {"cache_hit": False, "scan_duration_ms": scan_duration}
 
-            if should_cache_scan_result(scan_result):
+            cacheable_result = should_cache_scan_result(scan_result)
+            if cacheable_result and pre_scan_stat is not None and pre_scan_hash is not None:
                 self.store_result(
                     file_path,
                     scan_result,
@@ -162,7 +168,7 @@ class CacheManager:
                     expected_file_stat=pre_scan_stat,
                     expected_file_hash=pre_scan_hash,
                 )
-            else:
+            elif not cacheable_result:
                 logger.debug(f"Skipping cache store for operational result from {Path(file_path).name}")
 
             return scan_result  # type: ignore[no-any-return]
