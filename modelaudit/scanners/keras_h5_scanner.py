@@ -39,6 +39,16 @@ try:
 except ImportError:
     HAS_H5PY = False
 
+_KERAS_LOCAL_VERSION_SUFFIX = r"\+[a-z0-9]+(?:[._-][a-z0-9]+)*"
+_KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(
+    rf"(?i)^[._-]?(?:(?:a|alpha|b|beta|c|rc|pre|preview)\d*"
+    rf"(?:[._-]?(?:post|rev|r)\d*)?(?:[._-]?dev\d*)?|dev\d*)(?:{_KERAS_LOCAL_VERSION_SUFFIX})?$"
+)
+_KERAS_POST_OR_LOCAL_SUFFIX_PATTERN = re.compile(
+    rf"(?i)^(?:{_KERAS_LOCAL_VERSION_SUFFIX}|"
+    rf"[._-]?(?:post|rev|r)\d*(?:[._-]?dev\d*)?(?:{_KERAS_LOCAL_VERSION_SUFFIX})?)$"
+)
+
 
 class KerasH5Scanner(BaseScanner):
     """Scanner for Keras H5 model files"""
@@ -485,6 +495,7 @@ class KerasH5Scanner(BaseScanner):
             ),
             "remediation": "Upgrade to Keras >= 3.12.1 or >= 3.13.2 and reject weights using HDF5 external references.",
             "external_references": findings,
+            "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
         }
 
         vuln_status = self._is_vulnerable_to_cve_2026_1669(keras_version) if isinstance(keras_version, str) else None
@@ -507,6 +518,7 @@ class KerasH5Scanner(BaseScanner):
         if vuln_status is False and isinstance(keras_version, str):
             details["keras_version"] = keras_version
             details["metadata_only_assessment"] = True
+            details["parse_status"] = "metadata_non_vulnerable"
             result.add_check(
                 name="HDF5 External Weight Reference Metadata Check",
                 passed=False,
@@ -537,9 +549,9 @@ class KerasH5Scanner(BaseScanner):
             location=location,
             details=details
             | {
-                "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
                 "parse_status": "unknown",
             },
+            why=get_cve_2026_1669_explanation("hdf5_external_reference"),
         )
 
     def _scan_training_config(self, training_config: Any, result: ScanResult) -> None:
@@ -1115,10 +1127,10 @@ class KerasH5Scanner(BaseScanner):
         if not suffix:
             return (major, minor, patch), False
 
-        if re.search(r"(?:^|[.\-])(dev|rc|a|b|alpha|beta|pre|preview)\d*", suffix):
+        if _KERAS_PRERELEASE_SUFFIX_PATTERN.fullmatch(suffix):
             return (major, minor, patch), True
 
-        if suffix.startswith("+") or suffix.startswith(".post") or suffix.startswith("post"):
+        if _KERAS_POST_OR_LOCAL_SUFFIX_PATTERN.fullmatch(suffix):
             return (major, minor, patch), False
 
         return None

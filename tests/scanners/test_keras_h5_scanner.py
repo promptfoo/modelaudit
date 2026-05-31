@@ -249,6 +249,8 @@ def test_keras_h5_scanner_warns_on_fixed_metadata_external_reference(tmp_path: P
     assert cve_issues[0].severity == IssueSeverity.WARNING
     assert cve_issues[0].details["keras_version"] == "3.13.2"
     assert cve_issues[0].details["metadata_only_assessment"] is True
+    assert cve_issues[0].details["parse_status"] == "metadata_non_vulnerable"
+    assert cve_issues[0].details["affected_versions"] == "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2"
     assert cve_issues[0].details["external_references"] == [
         {
             "kind": "ExternalLink",
@@ -284,7 +286,7 @@ def test_keras_h5_scanner_fixed_metadata_without_external_refs_stays_quiet(tmp_p
     assert not any(check.name.startswith("HDF5 External Weight Reference") for check in result.checks)
 
 
-@pytest.mark.parametrize("keras_version", ["3.13.x", "2.12.0-gpu"])
+@pytest.mark.parametrize("keras_version", ["3.13.x", "2.12.0-gpu", "3.13.2rc1junk", "3.13.2+"])
 def test_keras_h5_scanner_unparseable_external_reference_versions_mark_unknown_risk(
     tmp_path: Path,
     keras_version: str,
@@ -1388,7 +1390,7 @@ def test_wrapped_layer_config_layer_is_scanned_for_custom_inner_layers(tmp_path:
     )
 
 
-@pytest.mark.parametrize("keras_version", ["3.12.1rc1", "3.13.2rc1"])
+@pytest.mark.parametrize("keras_version", ["3.12.1rc1", "3.13.2rc1", "3.13.2_c1"])
 def test_keras_h5_scanner_treats_cve_2026_1669_fix_prereleases_as_vulnerable(
     tmp_path: Path,
     keras_version: str,
