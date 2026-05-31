@@ -696,6 +696,75 @@ def test_scan_sbom_output(tmp_path):
         pytest.fail("SBOM output is not valid JSON")
 
 
+def test_cli_report_writers_reject_symlink_outputs(tmp_path: Path, requires_symlinks: None) -> None:
+    """CLI report outputs must not follow attacker-controlled symlink targets."""
+    model_tree = tmp_path / "model_tree"
+    model_tree.mkdir()
+    test_file = model_tree / "test_file.dat"
+    test_file.write_bytes(b"test content")
+
+    runner = CliRunner()
+    cases = [
+        (
+            ["scan", str(test_file), "--format", "json", "--output", str(model_tree / "report.json"), "--no-cache"],
+            model_tree / "report.json",
+            tmp_path / "victim_report.txt",
+        ),
+        (
+            ["scan", str(test_file), "--sbom", str(model_tree / "sbom.json"), "--no-cache"],
+            model_tree / "sbom.json",
+            tmp_path / "victim_sbom.txt",
+        ),
+        (
+            ["metadata", str(test_file), "--format", "json", "--output", str(model_tree / "metadata.json")],
+            model_tree / "metadata.json",
+            tmp_path / "victim_metadata.txt",
+        ),
+    ]
+
+    for args, symlink_path, victim_path in cases:
+        sentinel = f"sentinel:{victim_path.name}"
+        victim_path.write_text(sentinel)
+        symlink_path.symlink_to(victim_path)
+
+        result = runner.invoke(cli, args)
+
+        assert result.exit_code != 0
+        assert "Refusing to write output through symlink" in result.output
+        assert victim_path.read_text() == sentinel
+        assert symlink_path.is_symlink()
+
+
+def test_cli_report_writers_create_regular_output_files(tmp_path: Path) -> None:
+    """Normal report output paths should still be created and overwritten."""
+    model_tree = tmp_path / "model_tree"
+    model_tree.mkdir()
+    test_file = model_tree / "test_file.dat"
+    test_file.write_bytes(b"test content")
+
+    report_file = model_tree / "report.json"
+    sbom_file = model_tree / "sbom.json"
+    metadata_file = model_tree / "metadata.json"
+
+    runner = CliRunner()
+    scan_result = runner.invoke(
+        cli,
+        ["scan", str(test_file), "--format", "json", "--output", str(report_file), "--no-cache"],
+    )
+    sbom_result = runner.invoke(cli, ["scan", str(test_file), "--sbom", str(sbom_file), "--no-cache"])
+    metadata_result = runner.invoke(
+        cli,
+        ["metadata", str(test_file), "--format", "json", "--output", str(metadata_file)],
+    )
+
+    assert scan_result.exit_code == 0, scan_result.output
+    assert sbom_result.exit_code == 0, sbom_result.output
+    assert metadata_result.exit_code == 0, metadata_result.output
+    assert json.loads(report_file.read_text())["files_scanned"] == 1
+    assert json.loads(sbom_file.read_text())["bomFormat"] == "CycloneDX"
+    assert json.loads(metadata_file.read_text())["file"] == test_file.name
+
+
 def test_scan_output_utf8_locale(tmp_path):
     """Ensure output file is valid UTF-8 even with ASCII locale."""
     test_file = tmp_path / "utf8_test.dat"

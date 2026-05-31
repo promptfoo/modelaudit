@@ -1,6 +1,7 @@
 """Command-line interface for ModelAudit security scanner."""
 
 import contextlib
+import errno
 import json
 import logging
 import os
@@ -8,9 +9,10 @@ import re
 import shutil
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, TextIO
 
 import click
 from yaspin import yaspin
@@ -96,6 +98,37 @@ def _display_path(path: str) -> str:
 def _display_error(error: object, path: str) -> str:
     """Return an error safe for user-facing CLI output."""
     return redact_cloud_error_for_display(error, path) if is_cloud_url(path) else str(error)
+
+
+@contextlib.contextmanager
+def _open_output_text_file(output_path: str) -> Iterator[TextIO]:
+    """Open a CLI output file without following a symlink final component."""
+    output_display = _display_path(output_path)
+    if os.path.islink(output_path):
+        raise click.ClickException(f"Refusing to write output through symlink: {output_display}")
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
+
+    try:
+        fd = os.open(output_path, flags, 0o666)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise click.ClickException(f"Refusing to write output through symlink: {output_display}") from exc
+        raise
+
+    with os.fdopen(fd, "w", encoding="utf-8") as output_file:
+        yield output_file
+
+
+def _write_output_text_file(output_path: str, output_text: str, *, trailing_newline: bool = False) -> None:
+    """Write CLI output while preserving normal create/truncate behavior."""
+    with _open_output_text_file(output_path) as output_file:
+        output_file.write(output_text)
+        if trailing_newline:
+            output_file.write("\n")
 
 
 @dataclass
@@ -731,8 +764,7 @@ def _write_scan_sbom(
         paths_for_sbom = path_state.scanned_paths if path_state.scanned_paths else expanded_paths
 
     sbom_text = generate_sbom_pydantic(paths_for_sbom, audit_result)
-    with open(sbom, "w", encoding="utf-8") as sbom_file:
-        sbom_file.write(sbom_text)
+    _write_output_text_file(sbom, sbom_text)
 
 
 def _format_scan_output(
@@ -765,8 +797,7 @@ def _emit_scan_output(
 ) -> None:
     """Write rendered scan output to a file or stdout and preserve text-mode UX."""
     if output:
-        with open(output, "w", encoding="utf-8") as output_file:
-            output_file.write(output_text)
+        _write_output_text_file(output, output_text)
 
         click.echo(f"Results written to {output}")
 
@@ -819,9 +850,7 @@ def _emit_scanner_catalog(*, output_format: str, output: str | None) -> None:
 
     output_text = _format_scanner_catalog(output_format)
     if output:
-        with open(output, "w", encoding="utf-8") as output_file:
-            output_file.write(output_text)
-            output_file.write("\n")
+        _write_output_text_file(output, output_text, trailing_newline=True)
         return
     click.echo(output_text)
 
@@ -2925,8 +2954,7 @@ def metadata(path: str, output_format: str, output: str | None, security_only: b
             output_text = _format_metadata_table(metadata)
 
         if output:
-            with open(output, "w", encoding="utf-8") as f:
-                f.write(output_text)
+            _write_output_text_file(output, output_text)
             click.secho(f"Metadata written to {output}", fg="green")
         else:
             click.echo(output_text)
