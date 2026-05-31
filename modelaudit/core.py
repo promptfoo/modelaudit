@@ -1896,7 +1896,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         or (scanner_id == "protobuf_model_candidate" and allows_protobuf_model_candidate_analysis(scanner_selection))
     ):
         preferred_scanner = _registry.load_scanner_by_id(scanner_id)
-        if preferred_scanner is None:
+        if preferred_scanner is None and magic_format != "unknown" and scanner_id != PROTOBUF_MODEL_CANDIDATE_FORMAT:
             unavailable_preferred_scanner_id = scanner_id
     elif scanner_id:
         skipped_preferred_scanner_id = scanner_id
