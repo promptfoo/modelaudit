@@ -1289,7 +1289,6 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     Empty().ParseFromString(content)
                 except DecodeError as e:
                     self._mark_keras_metadata_scan_failure(result, path, e)
-                    return
 
                 # Convert to string for pattern matching
                 content_str = content.decode("utf-8", errors="ignore")

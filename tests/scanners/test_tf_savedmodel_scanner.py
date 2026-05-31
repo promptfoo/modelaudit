@@ -242,6 +242,25 @@ def test_tf_savedmodel_standalone_malformed_keras_metadata_is_inconclusive(tmp_p
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_malformed_keras_metadata_preserves_lambda_detection(tmp_path: Path) -> None:
+    encoded_code = base64.b64encode(b'exec("print(1)")').decode()
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode())
+
+    result = TensorFlowSavedModelScanner().scan(str(metadata_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(check.name == "Keras Metadata Parsing" for check in result.checks)
+    assert any(
+        issue.message
+        and "Lambda layer contains dangerous code" in issue.message
+        and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_tf_savedmodel_directory_valid_keras_metadata_preserves_success(tmp_path: Path) -> None:
     model_dir = Path(create_tf_savedmodel(tmp_path))
     metadata_path = model_dir / "keras_metadata.pb"
