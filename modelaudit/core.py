@@ -1466,7 +1466,10 @@ def scan_model_directory_or_file(
     except Exception as e:
         report_path = _redacted_scan_path_for_reporting(path)
         report_error = _redacted_scan_error_for_reporting(e, path)
-        logger.exception(f"Error during scan: {report_error}")
+        if path.startswith("stream://"):
+            logger.error(f"Error during scan: {report_error}")
+        else:
+            logger.exception(f"Error during scan: {report_error}")
         scan_metadata["success"] = False
         _add_issue_to_model(
             results,

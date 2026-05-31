@@ -1477,7 +1477,8 @@ def _resolve_scan_source_for_path(
 
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
             except Exception as exc:
-                click.echo(f"Error analyzing {redact_url_for_display(path)}: {exc!s}", err=True)
+                error_msg = _display_error(exc, path)
+                click.echo(f"Error analyzing {redact_url_for_display(path)}: {error_msg}", err=True)
                 audit_result.has_errors = True
                 return None
 
@@ -1584,7 +1585,7 @@ def _resolve_scan_source_for_path(
                     err=True,
                 )
             else:
-                logger.error(f"Failed to download from {redact_url_for_display(path)}: {error_msg}", exc_info=verbose)
+                logger.error(f"Failed to download from {redact_url_for_display(path)}: {error_msg}")
                 click.echo(f"Error downloading from {redact_url_for_display(path)}: {error_msg}", err=True)
 
             audit_result.has_errors = True

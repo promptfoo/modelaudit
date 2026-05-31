@@ -1,12 +1,13 @@
 import importlib
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -1685,6 +1686,48 @@ def test_scan_cloud_url_download_failure_redacts_signed_url(mock_download: Magic
     assert "s3://bucket/model.bin" in result.output
     assert "X-Amz-Signature" not in result.output
     assert "secret" not in result.output
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
+def test_scan_cloud_url_download_failure_verbose_log_redacts_signed_url(
+    mock_download: MagicMock,
+    mock_is_cloud: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verbose cloud errors should not append raw signed URLs through tracebacks."""
+    url = "s3://bucket/model.bin?X-Amz-Signature=deadbeef&token=secret-token"
+    mock_is_cloud.return_value = True
+    mock_download.side_effect = Exception(f"Forbidden while opening {url}")
+    runner = CliRunner()
+
+    with caplog.at_level(logging.ERROR, logger="modelaudit"):
+        result = runner.invoke(cli, ["scan", "--verbose", url])
+
+    assert result.exit_code == 2
+    assert "s3://bucket/model.bin" in caplog.text
+    assert "deadbeef" not in caplog.text
+    assert "secret-token" not in caplog.text
+    assert "X-Amz-Signature" not in caplog.text
+
+
+def test_scan_cloud_url_dry_run_failure_redacts_signed_url() -> None:
+    """Cloud preview failures should redact signed URLs embedded in provider errors."""
+    url = "s3://bucket/model.bin?X-Amz-Signature=deadbeef&token=secret-token"
+    runner = CliRunner()
+
+    with (
+        patch("modelaudit.cli.is_cloud_url", return_value=True),
+        patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock) as mock_analyze,
+    ):
+        mock_analyze.side_effect = Exception(f"Forbidden while opening {url}")
+        result = runner.invoke(cli, ["scan", "--dry-run", url])
+
+    assert result.exit_code == 2
+    assert "s3://bucket/model.bin" in result.output
+    assert "deadbeef" not in result.output
+    assert "secret-token" not in result.output
+    assert "X-Amz-Signature" not in result.output
 
 
 @patch("modelaudit.cli.is_cloud_url")

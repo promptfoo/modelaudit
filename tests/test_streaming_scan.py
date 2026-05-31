@@ -1,5 +1,6 @@
 """Tests for streaming scan-and-delete functionality."""
 
+import logging
 import os
 import pickle
 import struct
@@ -246,6 +247,26 @@ def test_streaming_signed_url_analysis_none_error_is_redacted() -> None:
     assert "stream://https://bucket.s3.amazonaws.com/model.pkl" in json_text
     assert all(asset.path != f"stream://{stream_url}" for asset in result.assets)
     assert determine_exit_code(result) == 2
+
+
+def test_streaming_signed_url_routing_exception_log_is_redacted(caplog: pytest.LogCaptureFixture) -> None:
+    """stream:// routing exceptions must not leak signed URLs through tracebacks."""
+    stream_url = "https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=deadbeef&token=secret-token"
+
+    with (
+        caplog.at_level(logging.ERROR, logger="modelaudit.core"),
+        patch(
+            "modelaudit.scanners.get_scanner_for_file",
+            side_effect=RuntimeError(f"route failed for {stream_url}"),
+        ),
+    ):
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    assert determine_exit_code(result) == 2
+    assert "https://bucket.s3.amazonaws.com/model.pkl" in caplog.text
+    assert "deadbeef" not in caplog.text
+    assert "secret-token" not in caplog.text
+    assert "X-Amz-Signature" not in caplog.text
 
 
 def test_scan_model_streaming_basic(temp_test_files: list[Path]) -> None:
