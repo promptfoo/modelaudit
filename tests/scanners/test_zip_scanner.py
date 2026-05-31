@@ -2994,6 +2994,54 @@ def test_scan_nested_file_fails_closed_when_recognized_header_scanner_is_unavail
     assert check.details["preferred_scanner_id"] == "header_only_scanner"
 
 
+def test_executable_zip_composed_routing_fails_closed_when_subtype_scanner_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "skops-polyglot.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "schema.json",
+            json.dumps(
+                {
+                    "__loader__": "OperatorFuncNode",
+                    "__module__": "builtins",
+                    "__class__": "eval",
+                    "_skops_version": "0.11.0",
+                    "content": {},
+                }
+            ),
+        )
+
+    original_loader = _registry.load_scanner_by_id
+
+    def load_scanner_by_id(scanner_id: str) -> type[BaseScanner] | None:
+        if scanner_id == "skops":
+            return None
+        return original_loader(scanner_id)
+
+    monkeypatch.setattr(_registry, "load_scanner_by_id", load_scanner_by_id)
+
+    result = ScanResult(scanner_name="zip")
+    archive_dispatch.merge_executable_zip_container_findings(
+        str(archive_path),
+        result,
+        {"cache_enabled": False},
+        context="test executable ZIP polyglot",
+    )
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    assert "recognized_format_scanner_unavailable" in result.metadata["scan_outcome_reasons"]
+
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.status == CheckStatus.FAILED
+    assert check.severity == IssueSeverity.INFO
+    assert check.details["format"] == "skops"
+    assert check.details["preferred_scanner_id"] == "skops"
+
+
 def test_scan_nested_file_does_not_fail_closed_for_extension_only_member(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
