@@ -3503,6 +3503,101 @@ class TestCVE202523304HydraTarget:
             for check in result.checks
         )
 
+    @pytest.mark.parametrize("raw_target", ["${targets.0}", "${targets[0]}"])
+    def test_interpolated_safe_list_target_remains_safe(self, tmp_path: Path, raw_target: str) -> None:
+        """OmegaConf list indices support both dot and bracket notation."""
+        config = {
+            "targets": ["nemo.collections.nlp.models.TextClassification"],
+            "model": {"_target_": raw_target},
+        }
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Safety Check"
+            and check.details.get("target") == "nemo.collections.nlp.models.TextClassification"
+            for check in result.checks
+        )
+
+    def test_interpolated_target_resolves_every_parent_hop(self, tmp_path: Path) -> None:
+        """Each leading dot after the first must move one level toward the root."""
+        config = {
+            "target": "os.system",
+            "outer": {
+                "target": "nemo.Model",
+                "inner": {"_target_": "${...target}", "command": "id"},
+            },
+        }
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.details.get("target") == "os.system"
+            and check.details.get("raw_target") == "${...target}"
+            for check in result.checks
+        )
+        assert not any(
+            check.name == "Hydra _target_ Safety Check" and check.details.get("target") == "nemo.Model"
+            for check in result.checks
+        )
+
+    def test_nested_interpolated_target_uses_referenced_container(self, tmp_path: Path) -> None:
+        """Nested relative selectors resolve from the referenced node, not the _target_ node."""
+        config = {
+            "targets": {"danger": "os.system", "chosen": "${.danger}"},
+            "model": {"danger": "nemo.Model", "_target_": "${targets.chosen}", "command": "id"},
+        }
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.details.get("target") == "os.system"
+            and check.details.get("raw_target") == "${targets.chosen}"
+            for check in result.checks
+        )
+        assert not any(
+            check.name == "Hydra _target_ Safety Check" and check.details.get("target") == "nemo.Model"
+            for check in result.checks
+        )
+
+    def test_nested_interpolated_path_selects_dangerous_target(self, tmp_path: Path) -> None:
+        """Simple nested bracket selectors must retain dangerous-target classification."""
+        config = {
+            "selected_target": "dangerous",
+            "targets": {"dangerous": "os.system"},
+            "model": {"_target_": "${targets[${selected_target}]}", "command": "id"},
+        }
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.details.get("target") == "os.system"
+            and check.details.get("raw_target") == "${targets[${selected_target}]}"
+            for check in result.checks
+        )
+
+    def test_escaped_interpolated_target_is_not_resolved(self, tmp_path: Path) -> None:
+        """An escaped OmegaConf interpolation marker is literal text, not a callable selector."""
+        raw_target = r"\${callable}"
+        config = {"callable": "os.system", "model": {"_target_": raw_target}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Review" and check.details.get("target") == raw_target
+            for check in result.checks
+        )
+
     def test_interpolated_dangerous_target_fails_aggregate_scan(self, tmp_path: Path) -> None:
         """The MA-DSS-C191 payload should produce aggregate exit 1 instead of a clean scan."""
         config = {

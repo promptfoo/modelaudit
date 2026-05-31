@@ -161,7 +161,8 @@ _SUSPICIOUS_TARGET_PATTERNS = (
 )
 _TARGET_TOKEN_RE = re.compile(r"__import__|[A-Z]+(?=[A-Z][a-z0-9]|[0-9_]|$)|[A-Z]?[a-z0-9]+")
 _HYDRA_INTERPOLATION_RE = re.compile(r"\$\{([^{}]+)\}")
-_HYDRA_PATH_TOKEN_RE = re.compile(r"([^\.\[\]]+)|\[(\d+)\]")
+_HYDRA_PATH_TOKEN_RE = re.compile(r"[^\.\[\]]+")
+_HYDRA_LIST_INDEX_RE = re.compile(r"-?\d+")
 _HYDRA_INTERPOLATION_MAX_DEPTH = 8
 _HYDRA_REFERENCE_MISSING = object()
 
@@ -217,44 +218,84 @@ def _find_suspicious_safe_prefixed_target_pattern(target: str) -> str | None:
     return None
 
 
+def _hydra_interpolation_matches(value: str) -> list[re.Match[str]]:
+    matches: list[re.Match[str]] = []
+    for match in _HYDRA_INTERPOLATION_RE.finditer(value):
+        preceding_backslashes = 0
+        cursor = match.start() - 1
+        while cursor >= 0 and value[cursor] == "\\":
+            preceding_backslashes += 1
+            cursor -= 1
+        if preceding_backslashes % 2 == 0:
+            matches.append(match)
+    return matches
+
+
+def _hydra_path_tokens(path: str) -> list[str] | None:
+    tokens: list[str] = []
+    cursor = 0
+    expect_token = True
+    while cursor < len(path):
+        if path[cursor] == ".":
+            if expect_token:
+                return None
+            cursor += 1
+            expect_token = True
+            continue
+        if path[cursor] == "[":
+            close = path.find("]", cursor + 1)
+            if close < 0:
+                return None
+            token = path[cursor + 1 : close]
+            if not token or any(character in token for character in ".[]"):
+                return None
+            tokens.append(token)
+            cursor = close + 1
+            expect_token = False
+            continue
+        if not expect_token:
+            return None
+        match = _HYDRA_PATH_TOKEN_RE.match(path, cursor)
+        if match is None:
+            return None
+        tokens.append(match.group(0))
+        cursor = match.end()
+        expect_token = False
+    return None if expect_token and tokens else tokens
+
+
+def _render_hydra_path(tokens: list[str]) -> str:
+    return ".".join(tokens)
+
+
 def _hydra_reference_path(container_path: str, reference: str) -> str | None:
     reference = reference.strip()
     if not reference or ":" in reference:
         return None
     if not reference.startswith("."):
-        return reference
+        tokens = _hydra_path_tokens(reference)
+        return None if not tokens else _render_hydra_path(tokens)
 
-    base_parts = [part for part in container_path.split(".") if part]
-    relative = reference
-    while relative.startswith(".."):
-        if base_parts:
-            base_parts.pop()
-        relative = relative[2:]
-        if relative.startswith("."):
-            relative = relative[1:]
-    if relative.startswith("."):
-        relative = relative[1:]
-    if relative:
-        base_parts.append(relative)
-    return ".".join(base_parts)
+    leading_dots = len(reference) - len(reference.lstrip("."))
+    suffix = reference[leading_dots:]
+    if not suffix:
+        return None
+
+    base_tokens = _hydra_path_tokens(container_path)
+    suffix_tokens = _hydra_path_tokens(suffix)
+    parent_hops = leading_dots - 1
+    if base_tokens is None or not suffix_tokens or parent_hops > len(base_tokens):
+        return None
+    if parent_hops:
+        del base_tokens[-parent_hops:]
+    return _render_hydra_path([*base_tokens, *suffix_tokens])
 
 
-def _hydra_path_tokens(path: str) -> list[str | int] | None:
-    tokens: list[str | int] = []
-    cursor = 0
-    while cursor < len(path):
-        if path[cursor] == ".":
-            cursor += 1
-            continue
-        match = _HYDRA_PATH_TOKEN_RE.match(path, cursor)
-        if match is None:
-            return None
-        if match.group(2) is not None:
-            tokens.append(int(match.group(2)))
-        else:
-            tokens.append(match.group(1))
-        cursor = match.end()
-    return tokens
+def _hydra_reference_container_path(path: str) -> str | None:
+    tokens = _hydra_path_tokens(path)
+    if not tokens:
+        return None
+    return _render_hydra_path(tokens[:-1])
 
 
 def _lookup_hydra_path(root_config: Any, path: str) -> Any:
@@ -264,14 +305,22 @@ def _lookup_hydra_path(root_config: Any, path: str) -> Any:
 
     value = root_config
     for token in tokens:
-        if isinstance(token, int):
-            if not isinstance(value, list) or token >= len(value):
+        if isinstance(value, list):
+            if _HYDRA_LIST_INDEX_RE.fullmatch(token) is None:
                 return _HYDRA_REFERENCE_MISSING
+            index = int(token)
+            if not -len(value) <= index < len(value):
+                return _HYDRA_REFERENCE_MISSING
+            value = value[index]
+            continue
+        if not isinstance(value, dict):
+            return _HYDRA_REFERENCE_MISSING
+        if token in value:
             value = value[token]
             continue
-        if not isinstance(value, dict) or token not in value:
+        if _HYDRA_LIST_INDEX_RE.fullmatch(token) is None or int(token) not in value:
             return _HYDRA_REFERENCE_MISSING
-        value = value[token]
+        value = value[int(token)]
     return value
 
 
@@ -281,45 +330,68 @@ def _resolve_hydra_target_interpolation(
     container_path: str,
 ) -> tuple[str, tuple[str, ...]]:
     """Resolve simple OmegaConf-style references inside a Hydra target."""
-    if _HYDRA_INTERPOLATION_RE.search(target) is None:
-        return target, ()
+    return _resolve_hydra_interpolation_value(target, root_config, container_path, frozenset(), 0)
 
-    current = target
-    seen = {current}
-    for _ in range(_HYDRA_INTERPOLATION_MAX_DEPTH):
-        matches = list(_HYDRA_INTERPOLATION_RE.finditer(current))
-        if not matches:
-            return current, ()
 
-        unresolved_references: list[str] = []
-        parts: list[str] = []
-        last_end = 0
-        for match in matches:
-            parts.append(current[last_end : match.start()])
-            reference = match.group(1).strip()
-            reference_path = _hydra_reference_path(container_path, reference)
-            value = (
-                _HYDRA_REFERENCE_MISSING if reference_path is None else _lookup_hydra_path(root_config, reference_path)
-            )
-            if value is _HYDRA_REFERENCE_MISSING or value is None or isinstance(value, dict | list):
+def _resolve_hydra_interpolation_value(
+    value: str,
+    root_config: Any,
+    container_path: str,
+    resolving_paths: frozenset[str],
+    depth: int,
+) -> tuple[str, tuple[str, ...]]:
+    matches = _hydra_interpolation_matches(value)
+    if not matches:
+        return value, ()
+    if depth >= _HYDRA_INTERPOLATION_MAX_DEPTH:
+        return value, ("<max-depth>",)
+
+    unresolved_references: list[str] = []
+    parts: list[str] = []
+    last_end = 0
+    for match in matches:
+        parts.append(value[last_end : match.start()])
+        reference = match.group(1).strip()
+        reference_path = _hydra_reference_path(container_path, reference)
+        resolved = (
+            _HYDRA_REFERENCE_MISSING if reference_path is None else _lookup_hydra_path(root_config, reference_path)
+        )
+        if (
+            resolved is _HYDRA_REFERENCE_MISSING
+            or resolved is None
+            or isinstance(resolved, dict | list)
+            or reference_path in resolving_paths
+        ):
+            unresolved_references.append(reference)
+            parts.append(match.group(0))
+        elif isinstance(resolved, str):
+            assert reference_path is not None
+            referenced_container = _hydra_reference_container_path(reference_path)
+            if referenced_container is None:
                 unresolved_references.append(reference)
                 parts.append(match.group(0))
             else:
-                parts.append(str(value))
-            last_end = match.end()
+                nested_value, nested_unresolved = _resolve_hydra_interpolation_value(
+                    resolved,
+                    root_config,
+                    referenced_container,
+                    resolving_paths | {reference_path},
+                    depth + 1,
+                )
+                unresolved_references.extend(nested_unresolved)
+                parts.append(nested_value)
+        else:
+            parts.append(str(resolved))
+        last_end = match.end()
 
-        if unresolved_references:
-            return current, tuple(unresolved_references)
+    if unresolved_references:
+        return value, tuple(unresolved_references)
 
-        parts.append(current[last_end:])
-        current = "".join(parts)
-        if current in seen:
-            cycle_refs = tuple(match.group(1).strip() for match in _HYDRA_INTERPOLATION_RE.finditer(current))
-            return current, cycle_refs or ("<cycle>",)
-        seen.add(current)
-
-    unresolved = tuple(match.group(1).strip() for match in _HYDRA_INTERPOLATION_RE.finditer(current))
-    return current, unresolved or ("<max-depth>",)
+    parts.append(value[last_end:])
+    resolved_value = "".join(parts)
+    if resolved_value == value:
+        return value, ()
+    return _resolve_hydra_interpolation_value(resolved_value, root_config, container_path, resolving_paths, depth + 1)
 
 
 def _is_runtime_truthy(value: Any) -> bool:
@@ -2289,7 +2361,7 @@ class NemoScanner(BaseScanner):
     ) -> None:
         """Evaluate a single _target_ value for dangerous patterns."""
         raw_target = target
-        if root_config is not None and _HYDRA_INTERPOLATION_RE.search(target) is not None:
+        if root_config is not None and _hydra_interpolation_matches(target):
             target, unresolved_references = _resolve_hydra_target_interpolation(target, root_config, container_path)
             if unresolved_references:
                 self._add_unresolved_interpolated_target_check(
