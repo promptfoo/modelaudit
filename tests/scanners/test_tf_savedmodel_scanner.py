@@ -712,6 +712,17 @@ def test_savedmodel_preview_redaction_preserves_benign_context() -> None:
     assert "<redacted>" not in preview
 
 
+def test_savedmodel_preview_redaction_removes_generic_url_userinfo() -> None:
+    preview = _safe_decoded_preview(
+        "wss://WEBSOCKETTOKEN@socket.example/stream ftp://user:FTPPASSWORD@files.example/model.bin",
+        200,
+    )
+
+    assert "WEBSOCKETTOKEN" not in preview
+    assert "user:FTPPASSWORD" not in preview
+    assert preview.count("<credentials-redacted>@") == 2
+
+
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_collection_preview_redacts_sensitive_values(tmp_path: Path) -> None:
     raw_secret = "c081-collection-secret-value-00000000"

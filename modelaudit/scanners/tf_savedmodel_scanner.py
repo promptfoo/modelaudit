@@ -22,6 +22,7 @@ from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
+from ._evidence_redaction import redact_evidence_string
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .keras_utils import find_case_insensitive_substrings, find_lambda_dangerous_patterns
 
@@ -118,47 +119,13 @@ _COLLECTION_COMMAND_RE = re.compile(
 _COLLECTION_NETWORK_RE = re.compile(
     r"(?i)(?:https?://|wss?://|ftp://|tcp://|udp://|\bsocket\b|\b(?:\d{1,3}\.){3}\d{1,3}\b)"
 )
-_PREVIEW_REDACTION_TOKEN = "<redacted>"
-_SENSITIVE_KEY_FRAGMENT_RE = (
-    r"(?:api[_-]?key|access[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|credential|"
-    r"password|passwd|pwd|secret|token)"
-)
-_QUOTED_SECRET_ASSIGNMENT_RE = re.compile(
-    rf"(?i)\b(?P<key>[a-z0-9_.-]*{_SENSITIVE_KEY_FRAGMENT_RE}[a-z0-9_.-]*)"
-    r"(?P<sep>\s*[:=]\s*)(?P<quote>['\"])(?P<value>[^'\"]{4,})(?P=quote)"
-)
-_UNQUOTED_SECRET_ASSIGNMENT_RE = re.compile(
-    rf"(?i)\b(?P<key>[a-z0-9_.-]*{_SENSITIVE_KEY_FRAGMENT_RE}[a-z0-9_.-]*)"
-    r"(?P<sep>\s*[:=]\s*)(?P<value>[^\s,;&)}\]'\"<>]{4,})"
-)
-_SENSITIVE_URL_QUERY_PARAM_RE = re.compile(
-    rf"(?i)([?&][^=\s&#]*(?:{_SENSITIVE_KEY_FRAGMENT_RE}|signature|sig)[^=\s&#]*=)[^\s&#'\"<>]+"
-)
-_URL_USERINFO_RE = re.compile(r"(?i)(https?://)[^/\s:@]+:[^/\s@]+@")
-_AUTH_HEADER_SECRET_RE = re.compile(r"(?i)\b(?P<scheme>bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}")
 _STANDALONE_KEY_SECRET_RE = re.compile(r"\b(?:AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{8,})\b")
 
 
 def _redact_sensitive_preview_text(text: str) -> str:
     """Redact secret-shaped values from attacker-controlled evidence previews."""
-    redacted = _URL_USERINFO_RE.sub(r"\1<credentials-redacted>@", text)
-    redacted = _SENSITIVE_URL_QUERY_PARAM_RE.sub(rf"\1{_PREVIEW_REDACTION_TOKEN}", redacted)
-    redacted = _QUOTED_SECRET_ASSIGNMENT_RE.sub(
-        lambda match: (
-            f"{match.group('key')}{match.group('sep')}{match.group('quote')}"
-            f"{_PREVIEW_REDACTION_TOKEN}{match.group('quote')}"
-        ),
-        redacted,
-    )
-    redacted = _UNQUOTED_SECRET_ASSIGNMENT_RE.sub(
-        lambda match: f"{match.group('key')}{match.group('sep')}{_PREVIEW_REDACTION_TOKEN}",
-        redacted,
-    )
-    redacted = _AUTH_HEADER_SECRET_RE.sub(
-        lambda match: f"{match.group('scheme')} {_PREVIEW_REDACTION_TOKEN}",
-        redacted,
-    )
-    return _STANDALONE_KEY_SECRET_RE.sub(_PREVIEW_REDACTION_TOKEN, redacted)
+    redacted = redact_evidence_string(text, max_chars=None)
+    return _STANDALONE_KEY_SECRET_RE.sub("<redacted>", redacted)
 
 
 def _safe_decoded_preview(text: str, limit: int) -> str:

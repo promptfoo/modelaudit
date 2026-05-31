@@ -9,7 +9,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 
-URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://[^\s\"'<>]+")
+URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|wss?|ftp|tcp|udp|s3|gs|file)://[^\s\"'<>]+")
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "access_key",
@@ -26,6 +26,7 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "credential",
         "password",
         "passwd",
+        "pwd",
         "private_key",
         "private-key",
         "refresh_token",
@@ -40,17 +41,20 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "x-amz-credential",
         "x-amz-security-token",
         "x-amz-signature",
+        "x-goog-credential",
+        "x-goog-signature",
     }
 )
 SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
-    r"(?:[a-z0-9]+[_-])*"
+    r"(?:[a-z0-9]+[_.-])*"
     r"(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|credential|"
-    r"password|passwd|private[_-]?key|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
+    r"password|passwd|private[_-]?key|pwd|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
+    r"(?:[_.-][a-z0-9]+)*"
 )
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?)" r"[^\s\"';&|]+"
+    r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?)" r"[^\s\"';&|]+"
 )
-BEARER_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+AUTH_SCHEME_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\b(?:bearer|basic|token)\s+)[A-Za-z0-9._~+/=-]{8,}")
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)[^\s\"';&|]+"
 )
@@ -115,11 +119,11 @@ def _truncate(text: str, max_chars: int) -> str:
     return f"{text[: max_chars - 3]}..."
 
 
-def redact_evidence_string(text: str, max_chars: int = 180) -> str:
+def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
     redacted = URL_RE.sub(_redact_url, text)
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
-    redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+    redacted = AUTH_SCHEME_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
-    return _truncate(redacted, max_chars)
+    return redacted if max_chars is None else _truncate(redacted, max_chars)

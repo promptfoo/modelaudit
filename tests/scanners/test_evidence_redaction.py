@@ -24,6 +24,20 @@ def test_redacts_compound_credential_assignments() -> None:
     assert f"service-private-key={REDACTED_EVIDENCE_VALUE}" in redacted
 
 
+def test_redacts_structured_secret_suffixes_pwd_and_token_auth() -> None:
+    """Structured secret labels and token auth schemes should be sanitized."""
+    text = "token_value=TOKENVALUE123 pwd=PASSWORD123 Authorization: Token AUTHTOKEN123"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "TOKENVALUE123" not in redacted
+    assert "PASSWORD123" not in redacted
+    assert "AUTHTOKEN123" not in redacted
+    assert f"token_value={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f"pwd={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f"Authorization: Token {REDACTED_EVIDENCE_VALUE}" in redacted
+
+
 def test_redacts_compound_sensitive_query_parameters() -> None:
     """Compound query credential keys should be redacted in URL evidence."""
     text = "url=https://example.com/callback?client_secret=CLIENTSECRET123&refresh_token=REFRESHTOKEN456&ok=1"
@@ -46,6 +60,22 @@ def test_redacts_malformed_userinfo_url() -> None:
     assert "user:LEAKY-PASS" not in redacted
     assert "QUERYSECRET" not in redacted
     assert "https://<credentials-redacted>@[::1/path" in redacted
+
+
+def test_redacts_token_only_userinfo_across_network_url_schemes() -> None:
+    """Network URL previews should not preserve token-only userinfo."""
+    text = (
+        "wss://WEBSOCKETTOKEN@socket.example/stream "
+        "ftp://user:FTPPASSWORD@files.example/model.bin "
+        "tcp://TCPTOKEN@callback.example:4444"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "WEBSOCKETTOKEN" not in redacted
+    assert "user:FTPPASSWORD" not in redacted
+    assert "TCPTOKEN" not in redacted
+    assert redacted.count("<credentials-redacted>@") == 3
 
 
 def test_existing_token_assignment_redaction_still_applies() -> None:
