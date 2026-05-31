@@ -169,8 +169,8 @@ class TestKerasZipScanner:
             },
         ]
 
-    def test_embedded_hdf5_external_references_are_not_warnings_on_fixed_version(self, tmp_path: Path) -> None:
-        """Fixed Keras versions should not fail for embedded external references."""
+    def test_embedded_hdf5_external_references_warn_on_fixed_archive_metadata(self, tmp_path: Path) -> None:
+        """Archive-claimed fixed metadata should not suppress embedded external-reference evidence."""
         scanner = KerasZipScanner()
         keras_path = create_configured_keras_zip(
             tmp_path,
@@ -181,12 +181,17 @@ class TestKerasZipScanner:
 
         result = scanner.scan(str(keras_path))
 
-        assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
-        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
-        assert any(
-            check.name == "HDF5 External Weight Reference Version Check" and check.status == CheckStatus.PASSED
-            for check in result.checks
-        )
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+        assert cve_issues[0].details["keras_version"] == "3.12.1"
+        assert cve_issues[0].details["metadata_only_assessment"] is True
+        assert cve_issues[0].details["parse_status"] == "metadata_non_vulnerable"
+        metadata_checks = [
+            check for check in result.checks if check.name == "HDF5 External Weight Reference Metadata Check"
+        ]
+        assert len(metadata_checks) == 1
+        assert metadata_checks[0].status == CheckStatus.FAILED
 
     @pytest.mark.parametrize(
         "keras_version",
@@ -215,10 +220,10 @@ class TestKerasZipScanner:
         "keras_version",
         ["3.12.1", "3.12.1+cpu", "3.12.1+rc1", "3.13.2", "3.13.2.post1", "3.13.2+dev0"],
     )
-    def test_embedded_hdf5_external_references_stable_fixed_versions_pass(
+    def test_embedded_hdf5_external_references_stable_fixed_versions_warn_metadata_only(
         self, tmp_path: Path, keras_version: str
     ) -> None:
-        """Stable fixed CVE-2026-1669 versions should not emit warning noise."""
+        """Stable fixed metadata still cannot suppress structural external-reference evidence."""
         scanner = KerasZipScanner()
         keras_path = create_configured_keras_zip(
             tmp_path,
@@ -229,8 +234,11 @@ class TestKerasZipScanner:
 
         result = scanner.scan(str(keras_path))
 
-        assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
-        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+        assert cve_issues[0].details["keras_version"] == keras_version
+        assert cve_issues[0].details["metadata_only_assessment"] is True
 
     def test_benign_embedded_weights_do_not_emit_warning_noise(self, tmp_path: Path) -> None:
         """Benign embedded weights should not produce warning or critical noise."""
@@ -351,8 +359,11 @@ class TestKerasZipScanner:
         assert cve_issues[0].severity == IssueSeverity.WARNING
         assert determine_exit_code(aggregate_result) == 1
 
-    def test_invalid_config_json_list_fixed_keras_weights_stays_inconclusive_only(self, tmp_path: Path) -> None:
-        """Fixed-version metadata should prevent warning noise even when config shape is invalid."""
+    def test_invalid_config_json_list_fixed_keras_weights_still_reports_external_reference(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Fixed-version metadata should not suppress independent embedded-weight findings."""
         keras_path = create_configured_keras_zip(
             tmp_path,
             [],
@@ -374,8 +385,10 @@ class TestKerasZipScanner:
         ]
         assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
         assert "keras_zip_config_invalid_type" in metadata.get("scan_outcome_reasons")
-        assert security_issues == []
-        assert determine_exit_code(aggregate_result) == 2
+        assert len(security_issues) == 1
+        assert security_issues[0].details.get("cve_id") == "CVE-2026-1669"
+        assert security_issues[0].details["metadata_only_assessment"] is True
+        assert determine_exit_code(aggregate_result) == 1
 
     def test_missing_config_json_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
         """A direct Keras ZIP scan without config.json cannot be security-complete."""

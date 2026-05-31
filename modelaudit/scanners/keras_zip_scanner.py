@@ -1620,14 +1620,23 @@ class KerasZipScanner(BaseScanner):
 
         if isinstance(keras_version, str):
             result.add_check(
-                name="HDF5 External Weight Reference Version Check",
-                passed=True,
+                name="HDF5 External Weight Reference Metadata Check",
+                passed=False,
                 message=(
-                    f"Embedded HDF5 external references detected in weights, but Keras {keras_version} is outside "
-                    "the known CVE-2026-1669 vulnerable ranges"
+                    f"Embedded HDF5 external references detected in weights, and archive metadata claims "
+                    f"Keras {keras_version} outside the known CVE-2026-1669 vulnerable ranges; "
+                    "metadata-only assessment is inconclusive without runtime verification"
                 ),
+                severity=IssueSeverity.WARNING,
                 location=location,
-                details={"keras_version": keras_version, "external_references": findings},
+                details=details
+                | {
+                    "keras_version": keras_version,
+                    "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
+                    "metadata_only_assessment": True,
+                    "parse_status": "metadata_non_vulnerable",
+                },
+                why=get_cve_2026_1669_explanation("hdf5_external_reference"),
             )
             return
 
