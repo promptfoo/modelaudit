@@ -54,3 +54,16 @@ def test_existing_token_assignment_redaction_still_applies() -> None:
 
     assert "CANONICALTOKEN123" not in redacted
     assert redacted == f"token={REDACTED_EVIDENCE_VALUE}"
+
+
+def test_redacts_r_assignment_operators() -> None:
+    """Native R assignment operators should not preserve raw credential values."""
+    redacted = redact_evidence_string(
+        "token <- 'R_TOKEN_SECRET' password <<- R_PASSWORD_SECRET",
+        max_chars=500,
+    )
+
+    assert "R_TOKEN_SECRET" not in redacted
+    assert "R_PASSWORD_SECRET" not in redacted
+    assert f"token <- '{REDACTED_EVIDENCE_VALUE}'" in redacted
+    assert f"password <<- {REDACTED_EVIDENCE_VALUE}" in redacted

