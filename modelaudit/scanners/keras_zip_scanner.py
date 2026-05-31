@@ -1054,7 +1054,12 @@ class KerasZipScanner(BaseScanner):
             patch = int(version_match.group(3) or 0)
             suffix = (version_match.group(4) or "").strip().lower()
 
-            is_prerelease = bool(re.search(r"(?:^|[.\-])(dev|rc|a|b|alpha|beta|pre|preview)\d*", suffix))
+            is_prerelease = bool(
+                re.search(
+                    r"(?:^|[.\-])(?:alpha|beta|preview|pre|rc|dev|a|b)(?:\d+)?(?:$|[.+-])",
+                    suffix,
+                )
+            )
             is_fixed_metadata_suffix = suffix.startswith("+") or suffix.startswith(".post") or suffix.startswith("post")
             if suffix and not (is_prerelease or is_fixed_metadata_suffix):
                 return None

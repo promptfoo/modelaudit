@@ -2393,6 +2393,28 @@ class TestCVE202549655TorchModuleWrapper:
         assert cve_issues[0].details["keras_version"] == keras_version
         assert "prereleases before final 3.11.3" in cve_issues[0].details["affected_versions"]
 
+    @pytest.mark.parametrize(
+        ("keras_version", "expected"),
+        [
+            ("3.11.3rc1", True),
+            ("3.11.3.dev0", True),
+            ("3.11.3rc1.post1", True),
+            ("3.11.3.post1.dev0", False),
+            ("3.11.3+rc1", False),
+            ("3.11.3rcpu", None),
+            ("3.11.3devops", None),
+            ("3.11.3alphafoo", None),
+            ("3.11.3previewbuild", None),
+        ],
+    )
+    def test_version_parser_requires_bounded_prerelease_qualifiers(
+        self,
+        keras_version: str,
+        expected: bool | None,
+    ) -> None:
+        """Malformed qualifier lookalikes should not receive critical CVE attribution."""
+        assert KerasZipScanner._is_vulnerable_keras_3_11_x(keras_version) is expected
+
     def test_torch_module_wrapper_version_unknown(self, tmp_path: Path) -> None:
         """Missing or non-canonical version should emit warning, not pass."""
         scanner = KerasZipScanner()
