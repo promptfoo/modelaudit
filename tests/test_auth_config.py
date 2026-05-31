@@ -232,9 +232,12 @@ def test_write_global_config_uses_private_file_permissions(
         ("https://api.promptfoo.app", "https://api.promptfoo.app"),
         (" https://API.PROMPTFOO.APP/ ", "https://api.promptfoo.app"),
         ("https://api.promptfoo.app:443", "https://api.promptfoo.app"),
+        ("https://your-company.promptfoo.app", "https://your-company.promptfoo.app"),
+        ("https://enterprise.example:8443", "https://enterprise.example:8443"),
+        ("https://[::1]:8443", "https://[::1]:8443"),
     ],
 )
-def test_validate_api_host_for_bearer_auth_accepts_trusted_https_hosts(api_host: str, expected: str) -> None:
+def test_validate_api_host_for_bearer_auth_accepts_configured_https_hosts(api_host: str, expected: str) -> None:
     assert auth_config.validate_api_host_for_bearer_auth(api_host) == expected
 
 
@@ -243,21 +246,24 @@ def test_validate_api_host_for_bearer_auth_accepts_trusted_https_hosts(api_host:
     [
         "http://api.promptfoo.app",
         "api.promptfoo.app",
-        "https://api.promptfoo.app.evil.example",
-        "https://localhost:3000",
         "http://127.0.0.1:3000",
         "https://user:pass@api.promptfoo.app",
+        "https://@api.promptfoo.app",
         "https://api.promptfoo.app/path",
         "https://api.promptfoo.app?token=leak",
-        "https://api.promptfoo.app:4443",
+        "https://api.promptfoo.app\\@attacker.example",
+        "https://api.promptfoo.app%5c@attacker.example",
+        "https://api.promptfoo.app\n.attacker.example",
+        "https://api.promptfoo.app:0",
+        "https://api.promptfoo.app:65536",
     ],
 )
-def test_validate_api_host_for_bearer_auth_rejects_untrusted_hosts(api_host: str) -> None:
+def test_validate_api_host_for_bearer_auth_rejects_unsafe_hosts(api_host: str) -> None:
     with pytest.raises(ValueError, match="API host for bearer-token authentication"):
         auth_config.validate_api_host_for_bearer_auth(api_host)
 
 
-def test_cloud_config_set_api_host_rejects_untrusted_hosts(
+def test_cloud_config_set_api_host_rejects_non_https_hosts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -267,8 +273,22 @@ def test_cloud_config_set_api_host_rejects_untrusted_hosts(
 
     cloud_config = auth_config.CloudConfig()
 
-    with pytest.raises(ValueError, match="must be one of"):
-        cloud_config.set_api_host("https://attacker.example")
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        cloud_config.set_api_host("http://attacker.example")
+
+
+def test_cloud_config_set_api_host_accepts_enterprise_https_hosts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_dir = tmp_path / "config"
+    fallback_dir = tmp_path / "home" / ".promptfoo"
+    _patch_config_paths(auth_config, monkeypatch, config_dir, fallback_dir)
+
+    cloud_config = auth_config.CloudConfig()
+    cloud_config.set_api_host("https://ENTERPRISE.EXAMPLE:8443/")
+
+    assert cloud_config.get_api_host() == "https://enterprise.example:8443"
 
 
 def test_validate_and_set_api_token_rejects_untrusted_host_before_request(
@@ -302,7 +322,35 @@ def test_auth_login_rejects_untrusted_host_before_request(monkeypatch: pytest.Mo
     assert "Authentication failed: API host for bearer-token authentication must use HTTPS" in result.output
 
 
-def test_validate_and_set_api_token_accepts_trusted_host_and_stores_normalized_host(
+def test_auth_login_accepts_explicit_enterprise_https_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    fake_config = _FakeCloudConfig()
+    requested_urls: list[str] = []
+
+    def fake_fetch(url: str, **_kwargs: Any) -> _FakeResponse:
+        requested_urls.append(url)
+        return _FakeResponse()
+
+    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fake_fetch)
+    monkeypatch.setattr("modelaudit.cli.get_user_email", lambda: None)
+    monkeypatch.setattr("modelaudit.cli.set_user_email", lambda _email: None)
+
+    result = CliRunner().invoke(
+        cli,
+        ["auth", "login", "--api-key", "secret-token", "--host", "https://ENTERPRISE.EXAMPLE:8443/"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Successfully logged in" in result.output
+    assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]
+    assert fake_config.api_host == "https://enterprise.example:8443"
+
+
+def test_validate_and_set_api_token_accepts_configured_host_and_stores_normalized_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_config = _FakeCloudConfig()
@@ -317,17 +365,17 @@ def test_validate_and_set_api_token_accepts_trusted_host_and_stores_normalized_h
 
     result = auth_client_module.AuthClient().validate_and_set_api_token(
         "secret-token",
-        "https://API.PROMPTFOO.APP/",
+        "https://ENTERPRISE.EXAMPLE:8443/",
     )
 
     assert result["user"].email == "user@example.com"
-    assert requested_urls == ["https://api.promptfoo.app/api/v1/users/me"]
-    assert fake_config.api_host == "https://api.promptfoo.app"
+    assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]
+    assert fake_config.api_host == "https://enterprise.example:8443"
     assert fake_config.api_key == "secret-token"
 
 
-def test_get_user_info_rejects_untrusted_config_host_before_request(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_config = _FakeCloudConfig(api_host="https://attacker.example", api_key="secret-token")
+def test_get_user_info_rejects_non_https_config_host_before_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_config = _FakeCloudConfig(api_host="http://attacker.example", api_key="secret-token")
 
     def fail_fetch(_url: str, **_kwargs: Any) -> _FakeResponse:
         raise AssertionError("fetch_with_proxy must not be called for untrusted API hosts")
@@ -336,5 +384,22 @@ def test_get_user_info_rejects_untrusted_config_host_before_request(monkeypatch:
     monkeypatch.setattr(auth_client_module, "get_user_email", lambda: "user@example.com")
     monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fail_fetch)
 
-    with pytest.raises(ValueError, match="must be one of"):
+    with pytest.raises(ValueError, match="must use HTTPS"):
         auth_client_module.AuthClient().get_user_info()
+
+
+def test_get_user_info_accepts_persisted_enterprise_https_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_config = _FakeCloudConfig(api_host="https://enterprise.example:8443", api_key="secret-token")
+    requested_urls: list[str] = []
+
+    def fake_fetch(url: str, **_kwargs: Any) -> _FakeResponse:
+        requested_urls.append(url)
+        return _FakeResponse()
+
+    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
+    monkeypatch.setattr(auth_client_module, "get_user_email", lambda: "user@example.com")
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fake_fetch)
+
+    auth_client_module.AuthClient().get_user_info()
+
+    assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]

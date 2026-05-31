@@ -19,38 +19,43 @@ from ..utils._path_hardening import (
 
 # Environment variable for API host (matches promptfoo)
 API_HOST = os.getenv("API_HOST", "https://api.promptfoo.app")
-TRUSTED_BEARER_API_HOSTS = frozenset({"api.promptfoo.app"})
-TRUSTED_BEARER_API_PORTS = frozenset({None, 443})
 
 
 def validate_api_host_for_bearer_auth(api_host: str) -> str:
-    """Return a normalized API host that may receive bearer tokens."""
+    """Return a normalized caller-selected or persisted HTTPS API host."""
     stripped_host = api_host.strip()
-    parsed = urlparse(stripped_host)
+    if (
+        not stripped_host
+        or "\\" in stripped_host
+        or "%" in stripped_host
+        or any(character.isspace() or ord(character) < 32 for character in stripped_host)
+    ):
+        raise ValueError("API host for bearer-token authentication must be a valid HTTPS URL")
+
+    try:
+        parsed = urlparse(stripped_host)
+        hostname = parsed.hostname.lower() if parsed.hostname else None
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("API host for bearer-token authentication must be a valid HTTPS URL") from error
 
     if parsed.scheme.lower() != "https":
         raise ValueError("API host for bearer-token authentication must use HTTPS")
 
-    if parsed.username or parsed.password:
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
         raise ValueError("API host for bearer-token authentication must not include credentials")
 
     if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
         raise ValueError("API host for bearer-token authentication must be a base API URL")
 
-    hostname = parsed.hostname.lower() if parsed.hostname else None
-    if hostname not in TRUSTED_BEARER_API_HOSTS:
-        trusted_hosts = ", ".join(f"https://{host}" for host in sorted(TRUSTED_BEARER_API_HOSTS))
-        raise ValueError(f"API host for bearer-token authentication must be one of: {trusted_hosts}")
+    if hostname is None:
+        raise ValueError("API host for bearer-token authentication must include a hostname")
+    if port == 0:
+        raise ValueError("API host for bearer-token authentication must include a valid port")
 
-    try:
-        port = parsed.port
-    except ValueError as error:
-        raise ValueError("API host for bearer-token authentication must include a valid port") from error
-
-    if port not in TRUSTED_BEARER_API_PORTS:
-        raise ValueError("API host for bearer-token authentication must use the default HTTPS port")
-
-    return f"https://{hostname}"
+    normalized_hostname = f"[{hostname}]" if ":" in hostname else hostname
+    normalized_port = f":{port}" if port not in (None, 443) else ""
+    return f"https://{normalized_hostname}{normalized_port}"
 
 
 class GlobalConfig:
