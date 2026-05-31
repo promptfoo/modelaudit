@@ -1796,10 +1796,12 @@ class PyTorchZipScanner(BaseScanner):
                         file_data,
                         model_type="pytorch",
                         context=f"{path}:{name}",
+                        result=result,
                     )
                     network_findings = self.collect_network_communication_findings(
                         file_data,
                         context=f"{path}:{name}",
+                        result=result,
                     )
 
                     all_jit_findings.extend(jit_findings)

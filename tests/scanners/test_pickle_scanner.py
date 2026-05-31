@@ -324,6 +324,89 @@ def test_expensive_raw_prefilters_preserve_bare_alpha_domain_findings(tmp_path: 
     assert not result.metadata.get("pickle_network_raw_detector_skipped")
 
 
+def test_pickle_raw_secret_detector_exception_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "secret-detector-error.pkl"
+    path.write_bytes(pickle.dumps({"api_key": "sk-" + ("A" * 48)}, protocol=4))
+
+    def raise_detector_error(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        raise RuntimeError("secret detector failed")
+
+    monkeypatch.setattr("modelaudit.detectors.secrets.SecretsDetector.scan_model_weights", raise_detector_error)
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "raw_detector_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    coverage_checks = [
+        check
+        for check in result.checks
+        if check.name == "Raw Detector Analysis Coverage" and check.details.get("detector") == "embedded_secrets"
+    ]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].severity == IssueSeverity.INFO
+    assert coverage_checks[0].details["analysis_incomplete"] is True
+
+
+def test_pickle_raw_jit_detector_exception_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "jit-detector-error.pkl"
+    path.write_bytes(pickle.dumps({"script": "torch.jit.trace(model, inputs)"}, protocol=4))
+
+    def raise_detector_error(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        raise RuntimeError("jit detector failed")
+
+    monkeypatch.setattr("modelaudit.detectors.jit_script.JITScriptDetector.scan_model", raise_detector_error)
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "raw_detector_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    coverage_checks = [
+        check
+        for check in result.checks
+        if check.name == "Raw Detector Analysis Coverage" and check.details.get("detector") == "jit_script"
+    ]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["analysis_incomplete"] is True
+
+
+def test_pickle_raw_network_detector_exception_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "network-detector-error.pkl"
+    path.write_bytes(pickle.dumps({"endpoint": "https://attacker.example/model"}, protocol=4))
+
+    def raise_detector_error(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        raise RuntimeError("network detector failed")
+
+    monkeypatch.setattr("modelaudit.detectors.network_comm.NetworkCommDetector.scan", raise_detector_error)
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "raw_detector_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    coverage_checks = [
+        check
+        for check in result.checks
+        if check.name == "Raw Detector Analysis Coverage" and check.details.get("detector") == "network_communication"
+    ]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["analysis_incomplete"] is True
+    assert not any(
+        check.name == "Network Communication Detection" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+
+
 def test_expensive_raw_prefilters_skip_plain_key_substrings(tmp_path: Path) -> None:
     path = tmp_path / "plain-key.pkl"
     path.write_bytes(pickle.dumps({"key": "value"}, protocol=4))

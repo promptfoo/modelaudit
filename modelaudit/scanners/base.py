@@ -21,6 +21,7 @@ from ..scanner_results import (
     Issue,
     IssueSeverity,
     ScanResult,
+    mark_inconclusive_scan_result,
 )
 from ..utils.helpers.interrupt_handler import check_interrupted
 from .rule_mapper import get_embedded_code_rule_code, get_network_rule_code, get_secret_rule_code
@@ -56,6 +57,9 @@ TRUSTED_HUGGINGFACE_SOURCES = frozenset({"huggingface"})
 FORMAT_VALIDATION_CONFIG_KEY: Final[str] = "_modelaudit_format_validation"
 _TRUSTED_SOURCE_PROVENANCE_TOKEN: Final[object] = object()
 _WHITELIST_STALE_WARNING_THRESHOLD_DAYS: Final[int] = 90
+RAW_DETECTOR_ANALYSIS_INCOMPLETE_REASON: Final[str] = "raw_detector_analysis_incomplete"
+RAW_DETECTOR_FAILURES_METADATA_KEY: Final[str] = "raw_detector_analysis_failures"
+RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY: Final[str] = "raw_detector_failed_detectors"
 _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES: Final[frozenset[str]] = frozenset(
     {
         # S1xx — direct code-execution primitives (os/sys/subprocess/eval/compile/__import__/
@@ -555,6 +559,55 @@ class BaseScanner(ABC):
         result.metadata["file_hashes"] = hashes
         result.metadata["file_size"] = file_size
 
+    def _mark_raw_detector_analysis_incomplete(
+        self,
+        result: ScanResult,
+        *,
+        detector: str,
+        context: str = "",
+        error: BaseException | None = None,
+        coverage_gap: str = "analysis_failed",
+    ) -> None:
+        mark_inconclusive_scan_result(result, RAW_DETECTOR_ANALYSIS_INCOMPLETE_REASON)
+        location = context or self.current_file_path
+        failure_details: dict[str, Any] = {
+            "detector": detector,
+            "context": location,
+            "coverage_gap": coverage_gap,
+        }
+        if error is not None:
+            failure_details["exception_type"] = type(error).__name__
+            failure_details["exception"] = str(error)[:500]
+
+        failures = result.metadata.setdefault(RAW_DETECTOR_FAILURES_METADATA_KEY, [])
+        if isinstance(failures, list) and len(failures) < 20:
+            failures.append(failure_details)
+        failed_detectors = result.metadata.setdefault(RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY, [])
+        already_recorded = isinstance(failed_detectors, list) and detector in failed_detectors
+        if isinstance(failed_detectors, list) and not already_recorded:
+            failed_detectors.append(detector)
+        if already_recorded:
+            return
+
+        result.add_check(
+            name="Raw Detector Analysis Coverage",
+            passed=False,
+            message=f"{detector.replace('_', ' ').title()} raw detector analysis failed; scan coverage is incomplete",
+            severity=IssueSeverity.INFO,
+            location=location,
+            details={
+                "scan_outcome_reason": RAW_DETECTOR_ANALYSIS_INCOMPLETE_REASON,
+                "analysis_incomplete": True,
+                **failure_details,
+            },
+            rule_code="S902",
+        )
+
+    @staticmethod
+    def _raw_detector_failed(result: ScanResult, detector: str) -> bool:
+        failed_detectors = result.metadata.get(RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY)
+        return isinstance(failed_detectors, list) and detector in failed_detectors
+
     def check_for_embedded_secrets(
         self,
         data: Any,
@@ -619,9 +672,21 @@ class BaseScanner(ABC):
         except ImportError:
             # SecretsDetector not available, log as debug
             logger.debug("SecretsDetector not available, skipping secrets check")
+            self._mark_raw_detector_analysis_incomplete(
+                result,
+                detector="embedded_secrets",
+                context=context,
+                coverage_gap="detector_unavailable",
+            )
             return 0
         except Exception as e:
             logger.warning(f"Error checking for embedded secrets: {e}")
+            self._mark_raw_detector_analysis_incomplete(
+                result,
+                detector="embedded_secrets",
+                context=context,
+                error=e,
+            )
             return 0
 
     def collect_jit_script_findings(
@@ -631,6 +696,7 @@ class BaseScanner(ABC):
         context: str = "",
         enable_check: bool = True,
         raise_on_error: bool = False,
+        result: ScanResult | None = None,
     ) -> list[dict]:
         """Collect JIT/script code findings without creating checks.
 
@@ -671,11 +737,25 @@ class BaseScanner(ABC):
             if raise_on_error:
                 raise
             logger.debug("JITScriptDetector not available, skipping JIT/Script check")
+            if result is not None:
+                self._mark_raw_detector_analysis_incomplete(
+                    result,
+                    detector="jit_script",
+                    context=context,
+                    coverage_gap="detector_unavailable",
+                )
             return []
         except Exception as e:
             if raise_on_error:
                 raise
             logger.warning(f"Error checking for JIT/Script code: {e}")
+            if result is not None:
+                self._mark_raw_detector_analysis_incomplete(
+                    result,
+                    detector="jit_script",
+                    context=context,
+                    error=e,
+                )
             return []
 
     def summarize_jit_script_findings(
@@ -736,7 +816,7 @@ class BaseScanner(ABC):
                 },
                 why="JIT/Script code patterns can execute arbitrary code during model loading",
             )
-        else:
+        elif not self._raw_detector_failed(result, "jit_script"):
             result.add_check(
                 name="JIT/Script Code Execution Summary",
                 passed=True,
@@ -781,9 +861,21 @@ class BaseScanner(ABC):
         except ImportError:
             # JITScriptDetector not available, log as debug
             logger.debug("JITScriptDetector not available, skipping JIT/Script check")
+            self._mark_raw_detector_analysis_incomplete(
+                result,
+                detector="jit_script",
+                context=context,
+                coverage_gap="detector_unavailable",
+            )
             return 0
         except Exception as e:
             logger.warning(f"Error checking for JIT/Script code: {e}")
+            self._mark_raw_detector_analysis_incomplete(
+                result,
+                detector="jit_script",
+                context=context,
+                error=e,
+            )
             return 0
 
     def add_jit_script_findings(
@@ -840,7 +932,7 @@ class BaseScanner(ABC):
                 why=recommendation,
             )
 
-        if not findings and context:
+        if not findings and context and not self._raw_detector_failed(result, "jit_script"):
             result.add_check(
                 name="JIT/Script Code Execution Detection",
                 passed=True,
@@ -856,6 +948,7 @@ class BaseScanner(ABC):
         context: str = "",
         enable_check: bool = True,
         raise_on_error: bool = False,
+        result: ScanResult | None = None,
     ) -> list[dict]:
         """Collect network communication findings without creating checks.
 
@@ -882,11 +975,25 @@ class BaseScanner(ABC):
             if raise_on_error:
                 raise
             logger.debug("NetworkCommDetector not available, skipping network comm check")
+            if result is not None:
+                self._mark_raw_detector_analysis_incomplete(
+                    result,
+                    detector="network_communication",
+                    context=context,
+                    coverage_gap="detector_unavailable",
+                )
             return []
         except Exception as e:
             if raise_on_error:
                 raise
             logger.warning(f"Error checking for network communication: {e}")
+            if result is not None:
+                self._mark_raw_detector_analysis_incomplete(
+                    result,
+                    detector="network_communication",
+                    context=context,
+                    error=e,
+                )
             return []
 
     def summarize_network_communication_findings(
@@ -960,7 +1067,7 @@ class BaseScanner(ABC):
                 },
                 why="Models should not contain network communication capabilities",
             )
-        else:
+        elif not self._raw_detector_failed(result, "network_communication"):
             result.add_check(
                 name="Network Communication Summary",
                 passed=True,
@@ -1003,9 +1110,21 @@ class BaseScanner(ABC):
         except ImportError:
             # NetworkCommDetector not available, log as debug
             logger.debug("NetworkCommDetector not available, skipping network comm check")
+            self._mark_raw_detector_analysis_incomplete(
+                result,
+                detector="network_communication",
+                context=context,
+                coverage_gap="detector_unavailable",
+            )
             return 0
         except Exception as e:
             logger.warning(f"Error checking for network communication: {e}")
+            self._mark_raw_detector_analysis_incomplete(
+                result,
+                detector="network_communication",
+                context=context,
+                error=e,
+            )
             return 0
 
     def add_network_communication_findings(
@@ -1052,7 +1171,7 @@ class BaseScanner(ABC):
                 why="Models should not contain network communication capabilities",
             )
 
-        if not findings and context:
+        if not findings and context and not self._raw_detector_failed(result, "network_communication"):
             result.add_check(
                 name="Network Communication Detection",
                 passed=True,

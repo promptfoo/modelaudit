@@ -1325,6 +1325,39 @@ def test_pytorch_zip_scans_pickle_members_past_pickle_raw_window(tmp_path: Path)
     assert any(check.location == f"{model_path}:archive/data.pkl" for check in network_failures)
 
 
+def test_pytorch_zip_network_detector_exception_marks_scan_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "network-detector-error.pt", prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/code/endpoint.txt", "https://attacker.example/model")
+
+    def raise_detector_error(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        raise RuntimeError("network detector failed")
+
+    monkeypatch.setattr("modelaudit.detectors.network_comm.NetworkCommDetector.scan", raise_detector_error)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "raw_detector_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    coverage_checks = [
+        check
+        for check in result.checks
+        if check.name == "Raw Detector Analysis Coverage" and check.details.get("detector") == "network_communication"
+    ]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["analysis_incomplete"] is True
+    assert not any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.PASSED
+        and check.location == str(model_path)
+        for check in result.checks
+    )
+
+
 def test_pytorch_zip_jit_scan_uses_pickle_entry_identity_for_duplicate_names(tmp_path: Path) -> None:
     model_path = tmp_path / "duplicate_source_name.pt"
     with warnings.catch_warnings():
