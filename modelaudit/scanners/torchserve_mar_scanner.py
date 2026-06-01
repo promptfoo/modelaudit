@@ -1278,6 +1278,19 @@ class TorchServeMarScanner(BaseScanner):
                     aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
         return aliases
 
+    def _collect_module_import_aliases(self, tree: ast.AST) -> dict[str, str]:
+        """Collect imports bound directly in the current module scope."""
+        aliases: dict[str, str] = {}
+        nodes = tree.body if isinstance(tree, ast.Module) else []
+        for node in nodes:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    aliases[alias.asname or alias.name] = alias.name
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                for alias in node.names:
+                    aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+        return aliases
+
     def _resolve_call_name(self, node: ast.AST) -> str | None:
         if isinstance(node, ast.Name):
             return node.id
@@ -1366,78 +1379,98 @@ class TorchServeMarScanner(BaseScanner):
                 return f"{left}{right}"
         return None
 
-    def _dynamic_import_module_name(
+    def _dynamic_import_module_names(
         self,
         node: ast.AST,
         aliases: dict[str, str],
-        import_loader_aliases: dict[str, str],
+        import_loader_aliases: dict[str, frozenset[str]],
         shadowed_names: set[str],
-    ) -> str | None:
+    ) -> frozenset[str]:
         if not isinstance(node, ast.Call):
-            return None
+            return frozenset()
 
         helper_name = self._resolve_call_name(node.func)
         if helper_name is None:
-            return None
+            return frozenset()
 
-        resolved_helper_name = import_loader_aliases.get(
-            helper_name,
-            self._apply_unshadowed_alias(helper_name, aliases, shadowed_names),
-        )
-        if resolved_helper_name not in {"__import__", "builtins.__import__", "importlib.import_module"}:
-            return None
+        resolved_helper_names = import_loader_aliases.get(helper_name)
+        if resolved_helper_names is None:
+            if helper_name.split(".", maxsplit=1)[0] in shadowed_names:
+                return frozenset()
+            resolved_helper_names = frozenset({self._apply_alias(helper_name, aliases)})
+        import_helpers = resolved_helper_names & {"__import__", "builtins.__import__", "importlib.import_module"}
+        if not import_helpers:
+            return frozenset()
 
         module_arg = node.args[0] if node.args else None
         for keyword in node.keywords:
             if keyword.arg in {"name", "module"} and module_arg is None:
                 module_arg = keyword.value
         if module_arg is None:
-            return None
+            return frozenset()
 
         module_name = self._static_string_value(module_arg)
         if not module_name:
-            return None
-        if resolved_helper_name in {"__import__", "builtins.__import__"}:
-            return module_name.split(".", maxsplit=1)[0]
-        return module_name
+            return frozenset()
+        return frozenset(
+            module_name.split(".", maxsplit=1)[0]
+            if resolved_helper_name in {"__import__", "builtins.__import__"}
+            else module_name
+            for resolved_helper_name in import_helpers
+        )
 
-    def _resolve_dynamic_import_root(
+    def _resolve_dynamic_import_roots(
         self,
         node: ast.AST,
         aliases: dict[str, str],
-        module_aliases: dict[str, str],
-        import_loader_aliases: dict[str, str],
+        module_aliases: dict[str, frozenset[str]],
+        import_loader_aliases: dict[str, frozenset[str]],
         shadowed_names: set[str],
-    ) -> str | None:
+    ) -> frozenset[str]:
         if isinstance(node, ast.Name):
-            return module_aliases.get(node.id)
+            return module_aliases.get(node.id, frozenset())
         if isinstance(node, ast.Attribute):
-            parent = self._resolve_dynamic_import_root(
+            parents = self._resolve_dynamic_import_roots(
                 node.value,
                 aliases,
                 module_aliases,
                 import_loader_aliases,
                 shadowed_names,
             )
-            if parent is not None:
-                return f"{parent}.{node.attr}"
-        return self._dynamic_import_module_name(node, aliases, import_loader_aliases, shadowed_names)
+            if parents:
+                return frozenset(f"{parent}.{node.attr}" for parent in parents)
 
-    def _resolve_dynamic_import_getattr_call(
+        module_names = self._dynamic_import_module_names(node, aliases, import_loader_aliases, shadowed_names)
+        if module_names:
+            return module_names
+        if isinstance(node, ast.Call):
+            factory_roots = self._resolve_dynamic_import_roots(
+                node.func,
+                aliases,
+                module_aliases,
+                import_loader_aliases,
+                shadowed_names,
+            )
+            return frozenset(root for root in factory_roots if root == "webbrowser.get")
+        return frozenset()
+
+    def _resolve_dynamic_import_getattr_calls(
         self,
         node: ast.Call,
         aliases: dict[str, str],
-        module_aliases: dict[str, str],
-        import_loader_aliases: dict[str, str],
+        module_aliases: dict[str, frozenset[str]],
+        import_loader_aliases: dict[str, frozenset[str]],
         shadowed_names: set[str],
-    ) -> str | None:
+    ) -> frozenset[str]:
         helper_name = self._resolve_call_name(node.func)
         if helper_name is None:
-            return None
+            return frozenset()
 
-        resolved_helper_name = self._apply_unshadowed_alias(helper_name, aliases, shadowed_names)
+        if helper_name.split(".", maxsplit=1)[0] in shadowed_names:
+            return frozenset()
+        resolved_helper_name = self._apply_alias(helper_name, aliases)
         if resolved_helper_name not in {"getattr", "builtins.getattr"}:
-            return None
+            return frozenset()
 
         target_node: ast.AST | None = node.args[0] if node.args else None
         attr_node: ast.AST | None = node.args[1] if len(node.args) >= 2 else None
@@ -1447,9 +1480,9 @@ class TorchServeMarScanner(BaseScanner):
             elif keyword.arg == "name" and attr_node is None:
                 attr_node = keyword.value
         if target_node is None or attr_node is None:
-            return None
+            return frozenset()
 
-        module_name = self._resolve_dynamic_import_root(
+        module_names = self._resolve_dynamic_import_roots(
             target_node,
             aliases,
             module_aliases,
@@ -1457,37 +1490,57 @@ class TorchServeMarScanner(BaseScanner):
             shadowed_names,
         )
         attr_name = self._static_string_value(attr_node)
-        if module_name is None or attr_name is None:
-            return None
+        if not module_names or attr_name is None:
+            return frozenset()
 
-        return _normalized_high_risk_python_call_name(f"{module_name}.{attr_name}")
+        return frozenset(
+            call_name
+            for module_name in module_names
+            if (call_name := _normalized_high_risk_python_call_name(f"{module_name}.{attr_name}")) is not None
+        )
 
-    def _resolve_dynamic_import_execution_call(
+    def _resolve_dynamic_import_execution_calls(
         self,
         node: ast.AST,
         aliases: dict[str, str],
-        module_aliases: dict[str, str],
-        callable_aliases: dict[str, str],
-        import_loader_aliases: dict[str, str],
+        module_aliases: dict[str, frozenset[str]],
+        callable_aliases: dict[str, frozenset[str]],
+        import_loader_aliases: dict[str, frozenset[str]],
         shadowed_names: set[str],
-    ) -> str | None:
+    ) -> frozenset[str]:
         if isinstance(node, ast.Name):
-            return callable_aliases.get(node.id)
+            return callable_aliases.get(node.id, frozenset())
 
         if isinstance(node, ast.Attribute):
-            module_name = self._resolve_dynamic_import_root(
+            module_names = self._resolve_dynamic_import_roots(
                 node.value,
                 aliases,
                 module_aliases,
                 import_loader_aliases,
                 shadowed_names,
             )
-            if module_name is None:
-                return None
-            return _normalized_high_risk_python_call_name(f"{module_name}.{node.attr}")
+            return frozenset(
+                call_name
+                for module_name in module_names
+                if (call_name := _normalized_high_risk_python_call_name(f"{module_name}.{node.attr}")) is not None
+            )
+
+        if isinstance(node, ast.Subscript):
+            module_names = self._resolve_dynamic_import_roots(
+                node.value,
+                aliases,
+                module_aliases,
+                import_loader_aliases,
+                shadowed_names,
+            )
+            return frozenset(
+                call_name
+                for module_name in module_names
+                if (call_name := _normalized_high_risk_python_call_name(f"{module_name}.__getitem__")) is not None
+            )
 
         if isinstance(node, ast.Call):
-            return self._resolve_dynamic_import_getattr_call(
+            return self._resolve_dynamic_import_getattr_calls(
                 node,
                 aliases,
                 module_aliases,
@@ -1495,41 +1548,162 @@ class TorchServeMarScanner(BaseScanner):
                 shadowed_names,
             )
 
-        return None
+        return frozenset()
 
     def _find_dynamic_import_execution_calls(self, tree: ast.AST) -> set[str]:
-        aliases = self._collect_import_aliases(tree)
+        module_import_aliases = self._collect_module_import_aliases(tree)
         scanner = self
 
         class DynamicImportExecutionVisitor(ast.NodeVisitor):
             def __init__(self) -> None:
-                self.module_alias_stack: list[dict[str, str]] = [{}]
-                self.callable_alias_stack: list[dict[str, str]] = [{}]
-                self.import_loader_alias_stack: list[dict[str, str]] = [{}]
+                self.module_alias_stack: list[dict[str, frozenset[str]]] = [{}]
+                self.callable_alias_stack: list[dict[str, frozenset[str]]] = [{}]
+                self.import_loader_alias_stack: list[dict[str, frozenset[str]]] = [{}]
+                self.import_alias_stack: list[dict[str, str]] = [dict(module_import_aliases)]
                 self.shadowed_name_stack: list[set[str]] = [set()]
                 self.risky_calls: set[str] = set()
+                self.collecting_module_bindings = False
+                self.scope_depth = 0
+                self.module_binding_state: (
+                    tuple[
+                        dict[str, frozenset[str]],
+                        dict[str, frozenset[str]],
+                        dict[str, frozenset[str]],
+                        dict[str, str],
+                        set[str],
+                    ]
+                    | None
+                ) = None
 
             @property
-            def module_aliases(self) -> dict[str, str]:
+            def module_aliases(self) -> dict[str, frozenset[str]]:
                 return self.module_alias_stack[-1]
 
             @property
-            def callable_aliases(self) -> dict[str, str]:
+            def callable_aliases(self) -> dict[str, frozenset[str]]:
                 return self.callable_alias_stack[-1]
 
             @property
-            def import_loader_aliases(self) -> dict[str, str]:
+            def import_loader_aliases(self) -> dict[str, frozenset[str]]:
                 return self.import_loader_alias_stack[-1]
+
+            @property
+            def import_aliases(self) -> dict[str, str]:
+                return self.import_alias_stack[-1]
 
             @property
             def shadowed_names(self) -> set[str]:
                 return self.shadowed_name_stack[-1]
 
-            def _push_scope(self, parameters: set[str]) -> None:
-                self.module_alias_stack.append(dict(self.module_aliases))
-                self.callable_alias_stack.append(dict(self.callable_aliases))
-                self.import_loader_alias_stack.append(dict(self.import_loader_aliases))
-                self.shadowed_name_stack.append(set(self.shadowed_names))
+            def _snapshot_state(
+                self,
+            ) -> tuple[
+                dict[str, frozenset[str]],
+                dict[str, frozenset[str]],
+                dict[str, frozenset[str]],
+                dict[str, str],
+                set[str],
+            ]:
+                return (
+                    dict(self.module_aliases),
+                    dict(self.callable_aliases),
+                    dict(self.import_loader_aliases),
+                    dict(self.import_aliases),
+                    set(self.shadowed_names),
+                )
+
+            def _restore_state(
+                self,
+                state: tuple[
+                    dict[str, frozenset[str]],
+                    dict[str, frozenset[str]],
+                    dict[str, frozenset[str]],
+                    dict[str, str],
+                    set[str],
+                ],
+            ) -> None:
+                self.module_alias_stack[-1] = dict(state[0])
+                self.callable_alias_stack[-1] = dict(state[1])
+                self.import_loader_alias_stack[-1] = dict(state[2])
+                self.import_alias_stack[-1] = dict(state[3])
+                self.shadowed_name_stack[-1] = set(state[4])
+
+            @staticmethod
+            def _merge_possible_aliases(
+                left: dict[str, frozenset[str]],
+                right: dict[str, frozenset[str]],
+            ) -> dict[str, frozenset[str]]:
+                return {
+                    name: left.get(name, frozenset()) | right.get(name, frozenset())
+                    for name in left.keys() | right.keys()
+                }
+
+            @staticmethod
+            def _merge_import_aliases(left: dict[str, str], right: dict[str, str]) -> dict[str, str]:
+                merged: dict[str, str] = {}
+                for name in left.keys() | right.keys():
+                    left_value = left.get(name)
+                    right_value = right.get(name)
+                    if left_value == right_value:
+                        if left_value is not None:
+                            merged[name] = left_value
+                    elif left_value is None:
+                        if right_value is not None:
+                            merged[name] = right_value
+                    elif right_value is None:
+                        merged[name] = left_value
+                return merged
+
+            def _merge_states(
+                self,
+                left: tuple[
+                    dict[str, frozenset[str]],
+                    dict[str, frozenset[str]],
+                    dict[str, frozenset[str]],
+                    dict[str, str],
+                    set[str],
+                ],
+                right: tuple[
+                    dict[str, frozenset[str]],
+                    dict[str, frozenset[str]],
+                    dict[str, frozenset[str]],
+                    dict[str, str],
+                    set[str],
+                ],
+            ) -> tuple[
+                dict[str, frozenset[str]],
+                dict[str, frozenset[str]],
+                dict[str, frozenset[str]],
+                dict[str, str],
+                set[str],
+            ]:
+                return (
+                    self._merge_possible_aliases(left[0], right[0]),
+                    self._merge_possible_aliases(left[1], right[1]),
+                    self._merge_possible_aliases(left[2], right[2]),
+                    self._merge_import_aliases(left[3], right[3]),
+                    left[4] & right[4],
+                )
+
+            def _push_scope(
+                self,
+                parameters: set[str],
+                inherited_state: tuple[
+                    dict[str, frozenset[str]],
+                    dict[str, frozenset[str]],
+                    dict[str, frozenset[str]],
+                    dict[str, str],
+                    set[str],
+                ]
+                | None = None,
+            ) -> None:
+                state = inherited_state or self._snapshot_state()
+                self.module_alias_stack.append(dict(state[0]))
+                self.callable_alias_stack.append(dict(state[1]))
+                self.import_loader_alias_stack.append(dict(state[2]))
+                self.import_alias_stack.append(dict(state[3]))
+                self.shadowed_name_stack.append(set(state[4]))
+                self.scope_depth += 1
                 for parameter in parameters:
                     self._invalidate_name(parameter)
 
@@ -1537,7 +1711,9 @@ class TorchServeMarScanner(BaseScanner):
                 self.module_alias_stack.pop()
                 self.callable_alias_stack.pop()
                 self.import_loader_alias_stack.pop()
+                self.import_alias_stack.pop()
                 self.shadowed_name_stack.pop()
+                self.scope_depth -= 1
 
             @staticmethod
             def _parameter_names(args: ast.arguments) -> set[str]:
@@ -1554,48 +1730,67 @@ class TorchServeMarScanner(BaseScanner):
                 self.module_aliases.pop(name, None)
                 self.callable_aliases.pop(name, None)
                 self.import_loader_aliases.pop(name, None)
+                self.import_aliases.pop(name, None)
                 self.shadowed_names.add(name)
 
-            def _record_import_binding(self, name: str) -> None:
+            def _record_import_binding(self, name: str, resolved_name: str) -> None:
                 self.module_aliases.pop(name, None)
                 self.callable_aliases.pop(name, None)
-                self.import_loader_aliases.pop(name, None)
+                if resolved_name in {"__import__", "builtins.__import__", "importlib.import_module"}:
+                    self.import_loader_aliases[name] = frozenset({resolved_name})
+                else:
+                    self.import_loader_aliases.pop(name, None)
+                self.import_aliases[name] = resolved_name
                 self.shadowed_names.discard(name)
 
             def _record_name_assignment(self, name: str, value: ast.AST) -> None:
-                self._invalidate_name(name)
-
-                module_name = scanner._dynamic_import_module_name(
+                module_names = scanner._dynamic_import_module_names(
                     value,
-                    aliases,
+                    self.import_aliases,
                     self.import_loader_aliases,
                     self.shadowed_names,
                 )
-                if module_name is not None:
-                    self.module_aliases[name] = module_name
-                    return
+                if not module_names:
+                    module_names = scanner._resolve_dynamic_import_roots(
+                        value,
+                        self.import_aliases,
+                        self.module_aliases,
+                        self.import_loader_aliases,
+                        self.shadowed_names,
+                    )
 
-                callable_name = scanner._resolve_dynamic_import_execution_call(
+                callable_names = scanner._resolve_dynamic_import_execution_calls(
                     value,
-                    aliases,
+                    self.import_aliases,
                     self.module_aliases,
                     self.callable_aliases,
                     self.import_loader_aliases,
                     self.shadowed_names,
                 )
-                if callable_name is not None:
-                    self.callable_aliases[name] = callable_name
-                    return
 
                 value_name = scanner._resolve_call_name(value)
-                if value_name is None:
-                    return
-                resolved_value_name = self.import_loader_aliases.get(
-                    value_name,
-                    scanner._apply_unshadowed_alias(value_name, aliases, self.shadowed_names),
+                resolved_value_names = (
+                    self.import_loader_aliases.get(value_name, frozenset()) if value_name else frozenset()
                 )
-                if resolved_value_name in {"__import__", "builtins.__import__", "importlib.import_module"}:
-                    self.import_loader_aliases[name] = resolved_value_name
+                if (
+                    value_name
+                    and not resolved_value_names
+                    and value_name.split(".", maxsplit=1)[0] not in self.shadowed_names
+                ):
+                    resolved_value_names = frozenset({scanner._apply_alias(value_name, self.import_aliases)})
+                import_helper_names = resolved_value_names & {
+                    "__import__",
+                    "builtins.__import__",
+                    "importlib.import_module",
+                }
+
+                self._invalidate_name(name)
+                if module_names:
+                    self.module_aliases[name] = module_names
+                if callable_names:
+                    self.callable_aliases[name] = callable_names
+                if import_helper_names:
+                    self.import_loader_aliases[name] = import_helper_names
 
             def _record_target_assignment(self, target: ast.AST, value: ast.AST) -> None:
                 if isinstance(target, ast.Name):
@@ -1627,7 +1822,10 @@ class TorchServeMarScanner(BaseScanner):
                     if default is not None:
                         self.visit(default)
                 self._invalidate_name(node.name)
-                self._push_scope(self._parameter_names(node.args))
+                if self.collecting_module_bindings:
+                    return
+                inherited_state = self.module_binding_state if self.scope_depth == 0 else None
+                self._push_scope(self._parameter_names(node.args), inherited_state)
                 for statement in node.body:
                     self.visit(statement)
                 self._pop_scope()
@@ -1640,11 +1838,16 @@ class TorchServeMarScanner(BaseScanner):
 
             def visit_Import(self, node: ast.Import) -> None:
                 for alias in node.names:
-                    self._record_import_binding(alias.asname or alias.name.split(".", maxsplit=1)[0])
+                    binding_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                    resolved_name = alias.name if alias.asname else binding_name
+                    self._record_import_binding(binding_name, resolved_name)
 
             def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+                if node.module is None:
+                    return
                 for alias in node.names:
-                    self._record_import_binding(alias.asname or alias.name)
+                    if alias.name != "*":
+                        self._record_import_binding(alias.asname or alias.name, f"{node.module}.{alias.name}")
 
             def visit_ClassDef(self, node: ast.ClassDef) -> None:
                 for decorator in node.decorator_list:
@@ -1652,10 +1855,22 @@ class TorchServeMarScanner(BaseScanner):
                 for base in node.bases:
                     self.visit(base)
                 self._invalidate_name(node.name)
-                self._push_scope(set())
+                if self.collecting_module_bindings:
+                    return
+                inherited_state = self.module_binding_state if self.scope_depth == 0 else None
+                self._push_scope(set(), inherited_state)
                 for statement in node.body:
                     self.visit(statement)
                 self._pop_scope()
+
+            def visit_Module(self, node: ast.Module) -> None:
+                self.collecting_module_bindings = True
+                for statement in node.body:
+                    self.visit(statement)
+                self.collecting_module_bindings = False
+                self.module_binding_state = self._snapshot_state()
+                for statement in node.body:
+                    self.visit(statement)
 
             def visit_Assign(self, node: ast.Assign) -> None:
                 self.visit(node.value)
@@ -1688,6 +1903,18 @@ class TorchServeMarScanner(BaseScanner):
             def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
                 self._visit_for(node)
 
+            def visit_If(self, node: ast.If) -> None:
+                self.visit(node.test)
+                initial_state = self._snapshot_state()
+                for statement in node.body:
+                    self.visit(statement)
+                body_state = self._snapshot_state()
+                self._restore_state(initial_state)
+                for statement in node.orelse:
+                    self.visit(statement)
+                orelse_state = self._snapshot_state()
+                self._restore_state(self._merge_states(body_state, orelse_state))
+
             @staticmethod
             def _nullcontext_enter_result(call: ast.Call) -> ast.expr | None:
                 if len(call.args) == 1 and not call.keywords:
@@ -1705,7 +1932,11 @@ class TorchServeMarScanner(BaseScanner):
                             helper_name = scanner._resolve_call_name(bound_value.func)
                             if (
                                 helper_name is not None
-                                and scanner._apply_unshadowed_alias(helper_name, aliases, self.shadowed_names)
+                                and scanner._apply_unshadowed_alias(
+                                    helper_name,
+                                    self.import_aliases,
+                                    self.shadowed_names,
+                                )
                                 == "contextlib.nullcontext"
                             ):
                                 enter_result = self._nullcontext_enter_result(bound_value)
@@ -1722,16 +1953,15 @@ class TorchServeMarScanner(BaseScanner):
                 self._visit_with(node)
 
             def visit_Call(self, node: ast.Call) -> None:
-                call_name = scanner._resolve_dynamic_import_execution_call(
+                call_names = scanner._resolve_dynamic_import_execution_calls(
                     node.func,
-                    aliases,
+                    self.import_aliases,
                     self.module_aliases,
                     self.callable_aliases,
                     self.import_loader_aliases,
                     self.shadowed_names,
                 )
-                if call_name is not None:
-                    self.risky_calls.add(call_name)
+                self.risky_calls.update(call_names)
                 self.generic_visit(node)
 
         visitor = DynamicImportExecutionVisitor()

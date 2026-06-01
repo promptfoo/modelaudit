@@ -800,6 +800,20 @@ def test_dynamic_import_getattr_handler_analysis_ignores_safe_attributes() -> No
             b"def handle(data, context):\n    return __import__('ctypes').cdll.LoadLibrary('payload.so')\n",
             "ctypes.cdll.LoadLibrary",
         ),
+        (
+            b"def handle(data, context):\n    return __import__('ctypes').cdll['payload']()\n",
+            "ctypes.cdll.__getitem__",
+        ),
+        (
+            b"def handle(data, context):\n    return __import__('webbrowser').get().open('https://example.com')\n",
+            "webbrowser.open",
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    browser = __import__('webbrowser').get()\n"
+            b"    return browser.open('https://example.com')\n",
+            "webbrowser.open",
+        ),
     ],
 )
 def test_dynamic_import_handler_analysis_resolves_nested_attributes(
@@ -823,6 +837,7 @@ def test_dynamic_import_handler_analysis_resolves_nested_attributes(
             b"    load = len\n"
             b"    return load('os').system('id')\n"
         ),
+        (b"def helper(__import__):\n    return __import__('os').system('id')\n"),
     ],
 )
 def test_dynamic_import_handler_analysis_respects_shadowed_import_helpers(handler_source: bytes) -> None:
@@ -841,6 +856,73 @@ def test_dynamic_import_handler_analysis_restores_local_import_helper() -> None:
 
     assert parse_error is None
     assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_possible_branch_aliases() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    if context:\n"
+        b"        module = __import__('os')\n"
+        b"    else:\n"
+        b"        module = __import__('math')\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_possible_branch_loader_aliases() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    if context:\n"
+        b"        from importlib import import_module as load\n"
+        b"    else:\n"
+        b"        from math import sqrt as load\n"
+        b"    return load('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (b"def handle(data, context):\n    return module.system('id')\n\nmodule = __import__('os')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    return load('os').system('id')\n"
+            b"\n"
+            b"from importlib import import_module as load\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_resolves_late_global_aliases(handler_source: bytes) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_does_not_leak_nested_import_aliases() -> None:
+    handler_source = (
+        b"def helper():\n"
+        b"    from importlib import import_module as load\n"
+        b"    return load('math').sqrt(4)\n"
+        b"\n"
+        b"def handle(data, context):\n"
+        b"    return load('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
 
 
 @pytest.mark.parametrize(
