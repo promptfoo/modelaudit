@@ -210,6 +210,8 @@ class TestDvcSecurity:
         assert resolution.output_limit == 100
         assert resolution.omitted_output_count == 50
         assert resolution.analysis_incomplete is True
+        assert resolution.omitted_targets == []
+        assert resolution.unverified_omitted_output_count == 0
 
     def test_over_limit_dvc_scan_fails_closed_for_omitted_late_output(self, tmp_path: Path) -> None:
         """A malicious output past the DVC cap must not look like complete clean coverage."""
@@ -244,6 +246,60 @@ class TestDvcSecurity:
         assert details["output_limit"] == 100
         assert details["resolved_output_count"] == 100
         assert details["omitted_output_count"] == 1
+        assert details["unverified_omitted_output_count"] == 0
+
+    def test_directory_scan_accepts_over_limit_dvc_when_walk_covers_omitted_outputs(self, tmp_path: Path) -> None:
+        """Directory traversal should discharge the cap when it scans the omitted in-tree output."""
+        dvc_lines = ["outs:"]
+        for index in range(101):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        dvc_file = tmp_path / "directory_over_limit.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(tmp_path))
+
+        assert result.files_scanned == 101
+        assert result.success is True
+        assert result.has_errors is False
+        assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_directory_scan_over_limit_dvc_stays_incomplete_for_skipped_output(self, tmp_path: Path) -> None:
+        """A filtered omitted output is not covered merely because it lives under the walked root."""
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            with target.open("wb") as f:
+                pickle.dump({"index": index}, f)
+            dvc_lines.append(f"- path: {target.name}")
+
+        skipped_target = tmp_path / "payload.py"
+        skipped_target.write_text("print('not scanned by the ordinary directory walk')\n")
+        dvc_lines.append(f"- path: {skipped_target.name}")
+
+        dvc_file = tmp_path / "directory_over_limit_skipped.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(tmp_path))
+
+        assert result.success is False
+        assert result.has_errors is True
+        assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_over_limit_dvc_coverage_verification_is_bounded(self, tmp_path: Path) -> None:
+        """Directory coverage metadata must not resolve an unbounded omitted tail."""
+        dvc_file = tmp_path / "large_tail.dvc"
+        dvc_file.write_text("outs:\n" + "".join(f"- path: missing_{index:03}.pkl\n" for index in range(250)))
+
+        resolution = resolve_dvc_file_with_metadata(str(dvc_file))
+
+        assert resolution.declared_output_count == 250
+        assert resolution.omitted_output_count == 150
+        assert resolution.omitted_targets == []
+        assert resolution.unverified_omitted_output_count == 50
 
     def test_in_limit_dvc_scan_remains_complete_for_benign_outputs(self, tmp_path: Path) -> None:
         """Normal DVC pointers under the cap still expand and scan cleanly."""

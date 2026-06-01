@@ -165,8 +165,19 @@ def _record_dvc_output_limit_incomplete(
             "output_limit": resolution.output_limit,
             "resolved_output_count": len(resolution.targets),
             "omitted_output_count": resolution.omitted_output_count,
+            "unverified_omitted_output_count": resolution.unverified_omitted_output_count,
         },
         issue_type="dvc_output_limit_exceeded",
+    )
+
+
+def _dvc_omitted_outputs_covered_by_directory_walk(
+    resolution: DvcResolution,
+    directory_walk_covered_paths: set[str],
+) -> bool:
+    """Return whether a directory walk independently covers every bounded omitted DVC target."""
+    return resolution.unverified_omitted_output_count == 0 and all(
+        target in directory_walk_covered_paths for target in resolution.omitted_targets
     )
 
 
@@ -948,7 +959,9 @@ def scan_model_directory_or_file(
             hf_cache_root = _find_hf_cache_root(base_dir)
             is_hf_cache = hf_cache_root is not None
             scanned_paths: set[str] = set()
+            directory_walk_covered_paths: set[str] = set()
             hf_shard_blob_paths: set[str] = set()
+            pending_dvc_output_limit_checks: list[tuple[str, DvcResolution]] = []
 
             # First pass: collect all file paths that need scanning
             files_to_scan: list[str] = []
@@ -1010,11 +1023,14 @@ def scan_model_directory_or_file(
                             logger.debug(f"Skipping non-model file: {file_path}")
                         continue
 
+                    directory_walk_covered_paths.add(str(resolved_file))
+
                     # Handle DVC files and get target paths
                     target_paths = [scan_source]
                     if file.endswith(".dvc"):
                         dvc_resolution = resolve_dvc_file_with_metadata(file_path)
-                        _record_dvc_output_limit_incomplete(results, scan_metadata, file_path, dvc_resolution)
+                        if dvc_resolution.analysis_incomplete:
+                            pending_dvc_output_limit_checks.append((file_path, dvc_resolution))
                         if dvc_resolution.targets:
                             target_paths = [Path(t).resolve() for t in dvc_resolution.targets]
 
@@ -1087,6 +1103,12 @@ def scan_model_directory_or_file(
                             continue
 
                         files_to_scan.append(target_str)
+            for dvc_path, dvc_resolution in pending_dvc_output_limit_checks:
+                if not _dvc_omitted_outputs_covered_by_directory_walk(
+                    dvc_resolution,
+                    directory_walk_covered_paths,
+                ):
+                    _record_dvc_output_limit_incomplete(results, scan_metadata, dvc_path, dvc_resolution)
             _finish_phase_timing(phase_timings, "directory_discovery", directory_discovery_started_at)
 
             if hf_shard_blob_paths:

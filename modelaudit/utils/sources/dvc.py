@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -15,6 +15,8 @@ class DvcResolution:
     declared_output_count: int = 0
     output_limit: int = MAX_DVC_OUTPUTS
     omitted_output_count: int = 0
+    omitted_targets: list[str] = field(default_factory=list)
+    unverified_omitted_output_count: int = 0
 
     @property
     def analysis_incomplete(self) -> bool:
@@ -62,12 +64,15 @@ def resolve_dvc_file_with_metadata(file_path: str) -> DvcResolution:
         logger.warning(
             f"DVC file {file_path} has too many outputs ({declared_output_count}), limiting to {MAX_DVC_OUTPUTS}"
         )
-        outs = outs[:MAX_DVC_OUTPUTS]
+        # Resolve one additional bounded window for directory-walk coverage
+        # verification without expanding those omitted targets for scanning.
+        outs = outs[: MAX_DVC_OUTPUTS * 2]
 
     resolved: list[str] = []
+    omitted_targets: list[str] = []
     dvc_dir = path.parent.resolve()
 
-    for out in outs:
+    for index, out in enumerate(outs):
         if not isinstance(out, dict) or "path" not in out:
             logger.debug("Invalid output entry in DVC file %s: %s", file_path, out)
             continue
@@ -98,7 +103,8 @@ def resolve_dvc_file_with_metadata(file_path: str) -> DvcResolution:
                 continue
 
             if target.exists():
-                resolved.append(str(target))
+                target_list = resolved if index < MAX_DVC_OUTPUTS else omitted_targets
+                target_list.append(str(target))
             else:
                 logger.debug(f"DVC target missing: {target}")
 
@@ -111,4 +117,6 @@ def resolve_dvc_file_with_metadata(file_path: str) -> DvcResolution:
         declared_output_count=declared_output_count,
         output_limit=MAX_DVC_OUTPUTS,
         omitted_output_count=omitted_output_count,
+        omitted_targets=omitted_targets,
+        unverified_omitted_output_count=max(declared_output_count - MAX_DVC_OUTPUTS * 2, 0),
     )
