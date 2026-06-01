@@ -342,6 +342,35 @@ class TestMetadataScanner:
         assert "SECRET_TOKEN" not in serialized
         assert "SECRET_FRAGMENT" not in serialized
 
+    def test_scan_suspicious_urls_redacts_path_tokens_in_outputs(self, tmp_path: Path) -> None:
+        """Suspicious URL findings should not preserve credentials embedded in paths."""
+        aws_key = "AKIAABCDEFGHIJKLMNOP"
+        readme_path = tmp_path / "README.md"
+        readme_path.write_text(
+            f"Download: https://tinyurl.com/download/{aws_key}/model.bin?token=SECRET_TOKEN#SECRET_FRAGMENT\n",
+            encoding="utf-8",
+        )
+
+        direct = MetadataScanner().scan(str(readme_path))
+        aggregate = scan_model_directory_or_file(str(readme_path), cache_scan_results=False)
+        sarif_output = format_sarif_output(aggregate, [str(readme_path)])
+
+        suspicious_url_issue = next(
+            issue for issue in direct.issues if issue.details.get("suspicious_domain") == "tinyurl.com"
+        )
+        assert suspicious_url_issue.details["url"] == "https://tinyurl.com/download/<redacted>/model.bin"
+        assert "tinyurl.com/download/<redacted>/model.bin" in suspicious_url_issue.message
+
+        serialized_outputs = [
+            json.dumps([issue.model_dump() for issue in direct.issues], sort_keys=True),
+            aggregate.model_dump_json(),
+            sarif_output,
+        ]
+        for serialized in serialized_outputs:
+            assert aws_key not in serialized
+            assert "SECRET_TOKEN" not in serialized
+            assert "SECRET_FRAGMENT" not in serialized
+
     def test_scan_ignores_non_suspicious_authenticated_url(self, tmp_path: Path) -> None:
         """Authenticated URLs without suspicious domains should stay quiet."""
         scanner = MetadataScanner()
