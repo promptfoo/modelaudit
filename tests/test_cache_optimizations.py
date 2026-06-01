@@ -113,12 +113,19 @@ class TestCacheOptimizationPerformance:
             # Create test files
             test_files = []
             test_results: list[tuple[str, dict[str, Any], int | None]] = []
+            expected_file_identities: dict[str, tuple[os.stat_result, str]] = {}
+            assert cache_manager.cache is not None
 
             for i in range(10):  # Reduced number for faster test
                 file_path = Path(temp_dir) / f"test_file_{i}.bin"
                 content = f"test content {i}" * 100  # ~1.3KB each
                 file_path.write_text(content)
                 test_files.append(str(file_path))
+                file_stat = file_path.stat()
+                expected_file_identities[str(file_path)] = (
+                    file_stat,
+                    cache_manager.cache.hasher.hash_file_with_stat(str(file_path), file_stat),
+                )
 
                 # Create mock scan result
                 scan_result = {
@@ -131,7 +138,7 @@ class TestCacheOptimizationPerformance:
                 test_results.append((str(file_path), scan_result, 100))  # 100ms scan time
 
             # Test batch store operations
-            stored_count = batch_ops.batch_store(test_results)
+            stored_count = batch_ops.batch_store(test_results, expected_file_identities=expected_file_identities)
             print(f"Stored {stored_count} results out of {len(test_results)}")
             assert stored_count > 0  # Should store some results
 

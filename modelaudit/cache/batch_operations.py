@@ -146,6 +146,7 @@ class BatchCacheOperations:
         scan_results: list[tuple[str, dict[str, Any], int | None]],
         max_workers: int = 2,
         version_context: dict[str, Any] | None = None,
+        expected_file_identities: dict[str, tuple[os.stat_result, str]] | None = None,
     ) -> int:
         """
         Store multiple scan results in cache with batch optimization.
@@ -153,6 +154,7 @@ class BatchCacheOperations:
         Args:
             scan_results: List of (file_path, scan_result, scan_duration_ms) tuples
             max_workers: Maximum number of concurrent I/O operations
+            expected_file_identities: File stat and hash captured with each scan result
 
         Returns:
             Number of successfully stored results
@@ -171,6 +173,7 @@ class BatchCacheOperations:
                     scan_result,
                     scan_duration_ms,
                     version_context,
+                    expected_file_identities.get(file_path) if expected_file_identities is not None else None,
                 ): file_path
                 for file_path, scan_result, scan_duration_ms in scan_results
             }
@@ -196,18 +199,25 @@ class BatchCacheOperations:
         scan_result: dict[str, Any],
         scan_duration_ms: int | None,
         version_context: dict[str, Any] | None,
+        expected_file_identity: tuple[os.stat_result, str] | None,
     ) -> bool:
         """Store a single result and return success status."""
         try:
             if not should_cache_scan_result(scan_result):
                 logger.debug(f"Skipping batch cache store for operational result from {os.path.basename(file_path)}")
                 return False
+            if expected_file_identity is None:
+                logger.debug(f"Skipping unbound batch cache store for {os.path.basename(file_path)}")
+                return False
+            expected_file_stat, expected_file_hash = expected_file_identity
 
             return self.cache_manager.store_result(
                 file_path,
                 scan_result,
                 scan_duration_ms,
                 version_context=version_context,
+                expected_file_stat=expected_file_stat,
+                expected_file_hash=expected_file_hash,
             )
         except Exception as e:
             logger.debug(f"Failed to store result for {file_path}: {e}")

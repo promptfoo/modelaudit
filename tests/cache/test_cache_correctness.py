@@ -651,6 +651,60 @@ def test_batch_store_skips_operational_failures(tmp_path: Path) -> None:
     assert cache_manager.get_stats()["total_entries"] == 0
 
 
+def test_batch_store_skips_results_without_scanned_identity(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    batch_ops = BatchCacheOperations(cache_manager)
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    assert batch_ops.batch_store([(str(file_path), expected, 10)]) == 0
+    assert cache_manager.get_stats()["total_entries"] == 0
+
+
+def test_batch_store_persists_bound_result(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    assert cache_manager.cache is not None
+    file_stat = file_path.stat()
+    file_hash = cache_manager.cache.hasher.hash_file_with_stat(str(file_path), file_stat)
+    batch_ops = BatchCacheOperations(cache_manager)
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    assert (
+        batch_ops.batch_store(
+            [(str(file_path), expected, 10)],
+            expected_file_identities={str(file_path): (file_stat, file_hash)},
+        )
+        == 1
+    )
+    assert cache_manager.get_stats()["total_entries"] == 1
+
+
+def test_batch_store_rejects_replaced_file_identity(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="batch-race.dat")
+    clean_payload = b"clean:" + (b"x" * 2042)
+    malicious_payload = b"evil!:" + (b"y" * 2042)
+    file_path.write_bytes(clean_payload)
+    cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    assert cache_manager.cache is not None
+    file_stat = file_path.stat()
+    file_hash = cache_manager.cache.hasher.hash_file_with_stat(str(file_path), file_stat)
+    batch_ops = BatchCacheOperations(cache_manager)
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    file_path.write_bytes(malicious_payload)
+    os.utime(file_path, ns=(file_stat.st_atime_ns, file_stat.st_mtime_ns))
+
+    assert (
+        batch_ops.batch_store(
+            [(str(file_path), expected, 10)],
+            expected_file_identities={str(file_path): (file_stat, file_hash)},
+        )
+        == 0
+    )
+    assert cache_manager.get_stats()["total_entries"] == 0
+
+
 def test_batch_store_counts_only_persisted_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
@@ -658,6 +712,8 @@ def test_batch_store_counts_only_persisted_results(tmp_path: Path, monkeypatch: 
     batch_ops = BatchCacheOperations(cache_manager)
 
     assert cache_manager.cache is not None
+    file_stat = file_path.stat()
+    file_hash = cache_manager.cache.hasher.hash_file_with_stat(str(file_path), file_stat)
     monkeypatch.setattr(cache_manager.cache, "_generate_cache_key_material", lambda *args, **kwargs: (None, None))
 
     stored_count = batch_ops.batch_store(
@@ -673,7 +729,8 @@ def test_batch_store_counts_only_persisted_results(tmp_path: Path, monkeypatch: 
                 },
                 10,
             )
-        ]
+        ],
+        expected_file_identities={str(file_path): (file_stat, file_hash)},
     )
 
     assert stored_count == 0
