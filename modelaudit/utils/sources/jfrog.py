@@ -369,6 +369,7 @@ def download_artifact(
         except Exception:
             logger.warning(message)
 
+    response: requests.Response | None = None
     try:
         # Use requests for proper authentication and error handling
         response = requests.get(
@@ -436,6 +437,9 @@ def download_artifact(
         _cleanup_failed_artifact_download(temp_dir, partial_path)
         error_msg = redact_jfrog_error_for_display(e, url)
         raise Exception(f"Failed to download artifact from {display_url}: {error_msg}") from e
+    finally:
+        if response is not None:
+            response.close()
 
 
 def get_jfrog_base_url(url: str) -> str:

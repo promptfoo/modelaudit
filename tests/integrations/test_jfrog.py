@@ -105,6 +105,7 @@ class TestJFrogDownload:
 
         assert not (tmp_path / "model.bin").exists()
         assert not any(tmp_path.iterdir())
+        mock_response.close.assert_called_once_with()
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_download_rejects_content_length_over_max_size_preserves_existing_file(
@@ -152,6 +153,7 @@ class TestJFrogDownload:
         assert not (tmp_path / "model.bin").exists()
         assert not any(tmp_path.iterdir())
         mock_response.iter_content.assert_called_once_with(chunk_size=JFROG_DOWNLOAD_CHUNK_SIZE)
+        mock_response.close.assert_called_once_with()
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_download_allows_unknown_content_length_under_max_size(
