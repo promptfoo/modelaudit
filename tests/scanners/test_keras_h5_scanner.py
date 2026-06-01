@@ -861,6 +861,100 @@ def test_keras_h5_scanner_external_reference_collection_does_not_resolve_soft_li
     ]
 
 
+@pytest.mark.parametrize("legacy_h5py", [False, True])
+def test_keras_h5_scanner_external_reference_traversal_limit_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_h5py: bool,
+) -> None:
+    """External-reference traversal limits must fail closed without caching partial scans."""
+    weights_path = tmp_path / "traversal_limit.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        f.create_group("layers").create_group("dense").create_group("vars")
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_LINK_VISITS", 2)
+    if legacy_h5py:
+        monkeypatch.delattr(h5py.Group, "visititems_links")
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    reason = "keras_h5_external_reference_analysis_limit_exceeded"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in result.metadata["scan_outcome_reasons"]
+    limit_checks = [check for check in result.checks if check.name == "HDF5 External Reference Analysis Limit"]
+    assert len(limit_checks) == 1
+    assert limit_checks[0].status == CheckStatus.FAILED
+    assert limit_checks[0].message == "Keras H5 external-reference analysis reached a configured safety limit"
+    assert limit_checks[0].details["visited_link_count"] == 2
+    assert limit_checks[0].details["link_visits_truncated"] is True
+
+    audit_result = scan_model_directory_or_file(str(weights_path), cache_enabled=False)
+    assert determine_exit_code(audit_result) == 2
+    _assert_inconclusive_keras_h5_scan_not_cached(weights_path, reason, tmp_path / f"cache-{legacy_h5py}")
+
+
+def test_keras_h5_scanner_external_reference_reports_are_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reference reporting must stay bounded while preserving the security finding."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {"class_name": "Sequential", "config": {"layers": []}},
+    )
+    with h5py.File(model_path, "a") as f:
+        weights = f.require_group("model_weights")
+        for index in range(3):
+            weights[f"linked_{index}"] = h5py.ExternalLink("missing_external_source.h5", f"/payload/{index}")
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_EXTERNAL_REFERENCE_REPORTS", 2)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    reason = "keras_h5_external_reference_analysis_limit_exceeded"
+    assert reason in result.metadata["scan_outcome_reasons"]
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert len(cve_issues[0].details["external_references"]) == 2
+    assert cve_issues[0].details["external_reference_count"] == 3
+    assert cve_issues[0].details["external_references_truncated"] is True
+
+    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    assert determine_exit_code(audit_result) == 1
+
+
+def test_keras_h5_scanner_external_storage_segment_reports_are_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """External-storage diagnostics must not retain every attacker-controlled segment."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {"class_name": "Sequential", "config": {"layers": []}},
+    )
+    with h5py.File(model_path, "a") as f:
+        weights = f.require_group("model_weights")
+        weights.create_dataset(
+            "external_kernel",
+            shape=(3,),
+            dtype="float32",
+            external=[(f"weights-{index}.raw", 0, 4) for index in range(3)],
+        )
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS", 2)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    reason = "keras_h5_external_reference_analysis_limit_exceeded"
+    assert reason in result.metadata["scan_outcome_reasons"]
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    external_reference = cve_issues[0].details["external_references"][0]
+    assert len(external_reference["segments"]) == 2
+    assert external_reference["segment_count"] == 3
+    assert external_reference["segments_truncated"] is True
+
+
 def test_keras_h5_scanner_malicious_model(tmp_path):
     """Test scanning a malicious Keras H5 model."""
     model_path = create_mock_h5_file(tmp_path, malicious=True)
