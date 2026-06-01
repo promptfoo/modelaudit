@@ -49,8 +49,16 @@ def _protobuf_varint(value: int) -> bytes:
     return bytes(chunks)
 
 
+def _protobuf_bytes_field(field_number: int, payload: bytes) -> bytes:
+    return _protobuf_varint((field_number << 3) | 2) + _protobuf_varint(len(payload)) + payload
+
+
 def _protobuf_unknown_bytes_field(payload: bytes) -> bytes:
-    return b"\x0a" + _protobuf_varint(len(payload)) + payload
+    return _protobuf_bytes_field(1, payload)
+
+
+def _keras_metadata_with_json_metadata(payload: bytes) -> bytes:
+    return _protobuf_bytes_field(1, _protobuf_bytes_field(5, payload))
 
 
 def test_tf_savedmodel_scanner_can_handle(tmp_path: Path) -> None:
@@ -242,6 +250,23 @@ def test_tf_savedmodel_standalone_malformed_keras_metadata_is_inconclusive(tmp_p
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_nested_malformed_keras_metadata_is_inconclusive(tmp_path: Path) -> None:
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(_protobuf_unknown_bytes_field(b"abc"))
+
+    direct = TensorFlowSavedModelScanner().scan(str(metadata_path))
+    aggregate = scan_model_directory_or_file(str(metadata_path), cache_scan_results=False)
+
+    assert direct.success is False
+    assert aggregate.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "keras_metadata_parse_failed"
+    assert direct.metadata["scan_outcome_reasons"] == ["keras_metadata_parse_failed"]
+    assert any(check.name == "Keras Metadata Parsing" for check in direct.checks)
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_tf_savedmodel_malformed_keras_metadata_preserves_lambda_detection(tmp_path: Path) -> None:
     encoded_code = base64.b64encode(b'exec("print(1)")').decode()
     metadata_path = tmp_path / "keras_metadata.pb"
@@ -264,9 +289,21 @@ def test_tf_savedmodel_malformed_keras_metadata_preserves_lambda_detection(tmp_p
 def test_tf_savedmodel_directory_valid_keras_metadata_preserves_success(tmp_path: Path) -> None:
     model_dir = Path(create_tf_savedmodel(tmp_path))
     metadata_path = model_dir / "keras_metadata.pb"
-    metadata_path.write_bytes(_protobuf_unknown_bytes_field(b'{"class_name": "Dense"}'))
+    metadata_path.write_bytes(_keras_metadata_with_json_metadata(b'{"class_name": "Dense"}'))
 
     result = TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert not any(check.name == "Keras Metadata Parsing" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_unknown_keras_metadata_fields_preserve_success(tmp_path: Path) -> None:
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(_protobuf_bytes_field(2, b"forward-compatible"))
+
+    result = TensorFlowSavedModelScanner().scan(str(metadata_path))
 
     assert result.success is True
     assert "scan_outcome" not in result.metadata
@@ -795,7 +832,9 @@ def test_scan_keras_metadata_pb_lambda_exec_sets_success_false(tmp_path: Path) -
     encoded_code = base64.b64encode(b'exec("print(1)")').decode()
     metadata_path = tmp_path / "keras_metadata.pb"
     metadata_path.write_bytes(
-        _protobuf_unknown_bytes_field(f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode())
+        _keras_metadata_with_json_metadata(
+            f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode()
+        )
     )
 
     result = TensorFlowSavedModelScanner().scan(str(metadata_path))

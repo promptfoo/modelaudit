@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
-from google.protobuf.empty_pb2 import Empty
-from google.protobuf.message import DecodeError
+from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+from google.protobuf.message import DecodeError, Message
 
 from modelaudit.config.explanations import get_tf_op_explanation
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
@@ -29,6 +29,96 @@ from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .keras_utils import find_case_insensitive_substrings, find_lambda_dangerous_patterns
 
 logger = logging.getLogger(__name__)
+
+
+def _add_keras_metadata_field(
+    message: Any,
+    *,
+    name: str,
+    number: int,
+    field_type: int,
+    label: int = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+    type_name: str | None = None,
+) -> None:
+    field = message.field.add()
+    field.name = name
+    field.number = number
+    field.type = field_type
+    field.label = label
+    if type_name is not None:
+        field.type_name = type_name
+
+
+def _build_keras_saved_metadata_message_type() -> type[Message]:
+    """Build the small Keras metadata schema missing from the vendored TensorFlow stubs."""
+    package = "third_party.tensorflow.python.keras.protobuf"
+    file_descriptor = descriptor_pb2.FileDescriptorProto(
+        name="modelaudit/keras_saved_metadata.proto",
+        package=package,
+        syntax="proto3",
+    )
+
+    version_def = file_descriptor.message_type.add()
+    version_def.name = "VersionDef"
+    _add_keras_metadata_field(
+        version_def, name="producer", number=1, field_type=descriptor_pb2.FieldDescriptorProto.TYPE_INT32
+    )
+    _add_keras_metadata_field(
+        version_def,
+        name="min_consumer",
+        number=2,
+        field_type=descriptor_pb2.FieldDescriptorProto.TYPE_INT32,
+    )
+    _add_keras_metadata_field(
+        version_def,
+        name="bad_consumers",
+        number=3,
+        field_type=descriptor_pb2.FieldDescriptorProto.TYPE_INT32,
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED,
+    )
+
+    saved_object = file_descriptor.message_type.add()
+    saved_object.name = "SavedObject"
+    reserved_range = saved_object.reserved_range.add()
+    reserved_range.start = 1
+    reserved_range.end = 2
+    _add_keras_metadata_field(
+        saved_object, name="node_id", number=2, field_type=descriptor_pb2.FieldDescriptorProto.TYPE_INT32
+    )
+    _add_keras_metadata_field(
+        saved_object, name="node_path", number=3, field_type=descriptor_pb2.FieldDescriptorProto.TYPE_STRING
+    )
+    _add_keras_metadata_field(
+        saved_object, name="identifier", number=4, field_type=descriptor_pb2.FieldDescriptorProto.TYPE_STRING
+    )
+    _add_keras_metadata_field(
+        saved_object, name="metadata", number=5, field_type=descriptor_pb2.FieldDescriptorProto.TYPE_STRING
+    )
+    _add_keras_metadata_field(
+        saved_object,
+        name="version",
+        number=6,
+        field_type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
+        type_name=f".{package}.VersionDef",
+    )
+
+    saved_metadata = file_descriptor.message_type.add()
+    saved_metadata.name = "SavedMetadata"
+    _add_keras_metadata_field(
+        saved_metadata,
+        name="nodes",
+        number=1,
+        field_type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED,
+        type_name=f".{package}.SavedObject",
+    )
+
+    pool = descriptor_pool.DescriptorPool()
+    pool.Add(file_descriptor)
+    return message_factory.GetMessageClass(pool.FindMessageTypeByName(f"{package}.SavedMetadata"))
+
+
+_KERAS_SAVED_METADATA_MESSAGE_TYPE = _build_keras_saved_metadata_message_type()
 
 # Derive from centralized list; keep severities unified here
 # Exclude Python ops (handled elsewhere) and pure decode ops from the generic pass
@@ -1286,7 +1376,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 content = f.read()
                 result.bytes_scanned += len(content)
                 try:
-                    Empty().ParseFromString(content)
+                    _KERAS_SAVED_METADATA_MESSAGE_TYPE().ParseFromString(content)
                 except DecodeError as e:
                     self._mark_keras_metadata_scan_failure(result, path, e)
 
