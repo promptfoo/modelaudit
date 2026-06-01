@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import stat
+import struct
 import tarfile
 import zipfile
 from pathlib import Path
@@ -65,6 +66,11 @@ def make_zip_payload(entries: dict[str, bytes]) -> bytes:
         for name, payload in entries.items():
             archive.writestr(zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0)), payload)
     return output.getvalue()
+
+
+def make_safetensors_payload() -> bytes:
+    header = json.dumps({"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}).encode("utf-8")
+    return struct.pack("<Q", len(header)) + header + b"\x00" * 4
 
 
 def test_run_coroutine_sync_without_running_loop() -> None:
@@ -198,6 +204,37 @@ def test_filter_scannable_files_handles_signed_cloud_urls() -> None:
             "zip",
             id="model-zip",
         ),
+        pytest.param(
+            "keras.payload",
+            make_zip_payload(
+                {"config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode()}
+            ),
+            "zip",
+            id="config-only-keras-zip",
+        ),
+        pytest.param("weights.payload", make_safetensors_payload(), "safetensors", id="safetensors"),
+        pytest.param("cntk.payload", b"\x0a\x07version\x0a\x03uidCompositeFunction", "cntk", id="cntk"),
+        pytest.param(
+            "lightgbm.payload",
+            (
+                b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\n"
+                b"max_feature_idx=0\ntree=0\nnum_leaves=1\nsplit_feature=0\nleaf_value=0\n"
+            ),
+            "lightgbm",
+            id="lightgbm",
+        ),
+        pytest.param(
+            "mxnet.payload",
+            json.dumps(
+                {
+                    "nodes": [{"op": "Custom", "name": "load"}],
+                    "arg_nodes": [0],
+                    "heads": [[0, 0, 0]],
+                }
+            ).encode(),
+            "mxnet",
+            id="mxnet",
+        ),
     ],
 )
 def test_filter_scannable_cloud_files_includes_content_routed_objects(
@@ -221,6 +258,46 @@ def test_filter_scannable_cloud_files_skips_benign_zip_content() -> None:
     configure_remote_open_payloads(fs, {url: payload})
 
     files = [{"path": url, "name": "document.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == []
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        pytest.param(
+            "settings.payload",
+            make_zip_payload(
+                {"config.json": json.dumps({"name": "not-a-keras-model", "config": {"theme": "light"}}).encode()}
+            ),
+            id="generic-config-zip",
+        ),
+        pytest.param("framing-only.payload", struct.pack("<Q", 4) + b"\x00" * 8, id="malformed-safetensors"),
+        pytest.param("cntk-notes.payload", b"\x0a\x07version\x0a\x03uid", id="cntk-near-match"),
+        pytest.param(
+            "lightgbm-notes.payload",
+            (
+                b"tree implementation notes\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\n"
+                b"max_feature_idx=0\nnum_leaves=1\nsplit_feature=0\nleaf_value=0\n"
+            ),
+            id="lightgbm-near-match",
+        ),
+        pytest.param(
+            "mxnet-notes.payload",
+            json.dumps({"nodes": [{"op": "Custom"}], "arg_nodes": [], "heads": [[0, 0, 0]]}).encode(),
+            id="mxnet-near-match",
+        ),
+    ],
+)
+def test_filter_scannable_cloud_files_skips_benign_content_near_matches(
+    filename: str,
+    payload: bytes,
+) -> None:
+    url = f"s3://bucket/models/{filename}"
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+
+    files = [{"path": url, "name": filename, "size": len(payload), "human_size": f"{len(payload)} B"}]
 
     assert _filter_scannable_cloud_files(files, fs=fs) == []
 

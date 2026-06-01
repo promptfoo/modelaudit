@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import struct
 import tempfile
 import zipfile
 from collections.abc import Callable, Collection, Coroutine, Iterator, Mapping
@@ -33,7 +34,7 @@ _SENSITIVE_QUERY_PARAM_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
-_CLOUD_CONTENT_SNIFF_BYTES = 512
+_CLOUD_CONTENT_SNIFF_BYTES = 8 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
 
@@ -606,6 +607,87 @@ def filter_scannable_files(
     return scannable
 
 
+def _read_cloud_content_prefix(fs: Any, file_url: str, max_bytes: int) -> bytes:
+    """Read a bounded remote prefix or fail closed with a redacted error."""
+    try:
+        with fs.open(file_url, "rb") as remote_file:
+            prefix = remote_file.read(max_bytes)
+            if not isinstance(prefix, bytes):
+                raise TypeError("cloud filesystem returned non-bytes content")
+            return prefix
+    except Exception as exc:
+        raise ValueError(
+            "Cloud directory selective filtering incomplete: unable to inspect skipped object "
+            f"{redact_url_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+        ) from exc
+
+
+def _is_cloud_safetensors_routing_candidate(
+    fs: Any,
+    file_url: str,
+    prefix: bytes,
+    size: int,
+    *,
+    size_is_known: bool,
+) -> bool:
+    """Recognize bounded remote SafeTensors framing without downloading tensor data."""
+    if len(prefix) < 9:
+        return False
+    try:
+        header_len = struct.unpack("<Q", prefix[:8])[0]
+    except struct.error:
+        return False
+    if header_len <= 0 or (size_is_known and header_len > size - 8):
+        return False
+
+    from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
+
+    if header_len > SAFETENSORS_ROUTING_HEADER_PARSE_BYTES:
+        return prefix[8:9] == b"{"
+
+    header_probe = _read_cloud_content_prefix(fs, file_url, 8 + header_len)
+    if len(header_probe) != 8 + header_len or header_probe[8:9] != b"{":
+        return False
+    try:
+        parsed_header = json.loads(header_probe[8:].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(parsed_header, dict)
+
+
+def _detect_cloud_mxnet_symbol_route(
+    fs: Any,
+    file_url: str,
+    prefix: bytes,
+    size: int,
+    *,
+    size_is_known: bool,
+) -> str | None:
+    """Return a bounded MXNet JSON route for a suffix-skipped remote object."""
+    from modelaudit.utils.file.detection import MXNET_SYMBOL_SIGNATURE_READ_BYTES, _detect_mxnet_symbol_prefix_route
+
+    normalized_prefix = prefix[3:] if prefix.startswith(b"\xef\xbb\xbf") else prefix
+    if not normalized_prefix.lstrip().startswith(b"{"):
+        return None
+
+    max_probe_size = MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1
+    if size_is_known:
+        max_probe_size = min(size, max_probe_size)
+    mxnet_probe = _read_cloud_content_prefix(fs, file_url, max_probe_size)
+    mxnet_probe = mxnet_probe[3:] if mxnet_probe.startswith(b"\xef\xbb\xbf") else mxnet_probe
+    if len(mxnet_probe) > MXNET_SYMBOL_SIGNATURE_READ_BYTES:
+        return _detect_mxnet_symbol_prefix_route(
+            mxnet_probe[:MXNET_SYMBOL_SIGNATURE_READ_BYTES],
+            fail_closed_without_hint=True,
+        )
+    return _detect_mxnet_symbol_prefix_route(
+        mxnet_probe,
+        sample_is_prefix=(size_is_known and size > len(mxnet_probe))
+        or (not size_is_known and len(mxnet_probe) >= max_probe_size),
+        fail_closed_without_hint=True,
+    )
+
+
 def _detect_cloud_content_route_format(fs: Any, file_info: dict[str, Any]) -> str | None:
     """Return a content-routed model format for a remote object, if cheaply identifiable."""
     file_url = str(file_info["path"])
@@ -618,21 +700,16 @@ def _detect_cloud_content_route_format(fs: Any, file_info: dict[str, Any]) -> st
     if size <= 0:
         return None
 
-    try:
-        with fs.open(file_url, "rb") as remote_file:
-            prefix = remote_file.read(min(size, _CLOUD_CONTENT_SNIFF_BYTES))
-    except Exception as exc:
-        raise ValueError(
-            "Cloud directory selective filtering incomplete: unable to inspect skipped object "
-            f"{redact_url_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
-        ) from exc
-
+    prefix = _read_cloud_content_prefix(fs, file_url, min(size, _CLOUD_CONTENT_SNIFF_BYTES))
     if not prefix:
         return None
 
     from modelaudit.utils.file.detection import (
         PROTO0_1_MAX_PROBE_BYTES,
         _could_start_proto0_or_1_pickle,
+        _is_cntk_signature,
+        _is_content_routed_lightgbm_signature,
+        _is_keras_zip_archive_content,
         _looks_like_proto0_or_1_pickle,
         _looks_like_uncompressed_tar_header,
         detect_format_from_magic_bytes,
@@ -642,16 +719,34 @@ def _detect_cloud_content_route_format(fs: Any, file_info: dict[str, Any]) -> st
     if _looks_like_uncompressed_tar_header(prefix):
         return "tar"
 
+    if _is_cntk_signature(prefix):
+        return "cntk"
+
+    if _is_content_routed_lightgbm_signature(prefix):
+        return "lightgbm"
+
+    mxnet_route = _detect_cloud_mxnet_symbol_route(
+        fs,
+        file_url,
+        prefix,
+        size,
+        size_is_known=size_is_known,
+    )
+    if mxnet_route is not None:
+        return mxnet_route
+
+    if _is_cloud_safetensors_routing_candidate(
+        fs,
+        file_url,
+        prefix,
+        size,
+        size_is_known=size_is_known,
+    ):
+        return "safetensors"
+
     if _could_start_proto0_or_1_pickle(prefix):
         max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES) if size_is_known else PROTO0_1_MAX_PROBE_BYTES
-        try:
-            with fs.open(file_url, "rb") as remote_file:
-                pickle_probe = remote_file.read(max_probe_size)
-        except Exception as exc:
-            raise ValueError(
-                "Cloud directory selective filtering incomplete: unable to inspect skipped object "
-                f"{redact_url_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
-            ) from exc
+        pickle_probe = _read_cloud_content_prefix(fs, file_url, max_probe_size)
         if _looks_like_proto0_or_1_pickle(
             pickle_probe,
             sample_is_prefix=(not size_is_known and len(pickle_probe) >= max_probe_size) or size > len(pickle_probe),
@@ -673,7 +768,11 @@ def _detect_cloud_content_route_format(fs: Any, file_info: dict[str, Any]) -> st
     if detected_format == "zip":
         try:
             with fs.open(file_url, "rb") as remote_file, zipfile.ZipFile(remote_file, "r") as archive:
-                return "zip" if _zip_archive_has_scannable_content(archive) else None
+                return (
+                    "zip"
+                    if _is_keras_zip_archive_content(archive) or _zip_archive_has_scannable_content(archive)
+                    else None
+                )
         except Exception as exc:
             raise ValueError(
                 "Cloud directory selective filtering incomplete: unable to classify skipped ZIP object "
