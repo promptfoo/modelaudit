@@ -485,8 +485,15 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
     display_url = redact_huggingface_url_for_display(url)
 
     try:
+        download_revision = branch
         if max_size is not None:
-            path_info = HfApi().get_paths_info(repo_id, filename, revision=branch)
+            api = HfApi()
+            repo_info = api.repo_info(repo_id, revision=branch)
+            pinned_revision = getattr(repo_info, "sha", None)
+            if not isinstance(pinned_revision, str) or not pinned_revision:
+                raise ValueError(f"Unable to determine immutable revision for {display_url}; refusing capped download")
+
+            path_info = api.get_paths_info(repo_id, filename, revision=pinned_revision)
             file_metadata = path_info[0] if path_info else None
             file_size = getattr(file_metadata, "size", None)
             if file_size is None:
@@ -495,12 +502,13 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
                 raise ValueError(
                     f"File size ({_format_size(file_size)}) exceeds maximum allowed size ({_format_size(max_size)})"
                 )
+            download_revision = pinned_revision
 
         # Use hf_hub_download for single file downloads
         local_path = hf_hub_download(
             repo_id=repo_id,
             filename=filename,
-            revision=branch,
+            revision=download_revision,
             cache_dir=str(cache_dir) if cache_dir else None,
         )
         return Path(local_path)
