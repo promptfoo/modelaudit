@@ -6936,11 +6936,10 @@ class TestDetectJITScriptRisks:
         assert any("Python operator" in str(f) for f in findings)
 
 
-def test_priority_assignment_aliases_bounds_expensive_probes(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Each indirect-alias probe re-parses the whole snippet; without a bound this is
-    # quadratic in the assignment count (PR #1402 DoS follow-up). The expensive
-    # probes are capped while the cheap direct-reference fast path still resolves.
-    lines = ["import ctypes", *[f"v{index} = index + {index}" for index in range(400)], "alias = ctypes"]
+def test_priority_assignment_aliases_skips_rootless_expensive_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Rootless assignments cannot depend on a tracked alias. Replaying the whole
+    # snippet for each literal assignment makes a small framed source CPU-bound.
+    lines = ["import ctypes", *[f"v{index} = {index}" for index in range(400)], "alias = ctypes"]
     source = "\n".join(lines)
     tree = ast.parse(source)
 
@@ -6955,9 +6954,18 @@ def test_priority_assignment_aliases_bounds_expensive_probes(monkeypatch: pytest
     monkeypatch.setattr(jit_script_module.ast, "parse", counting_parse)
     aliases = jit_script_module._priority_assignment_aliases(source, tree, {"ctypes"})
 
-    assert parse_calls <= jit_script_module._MAX_PRIORITY_ASSIGNMENT_PROBES + 1
+    assert parse_calls == 0
     # The direct-reference alias is still discovered via the cheap fast path.
     assert b"alias" in aliases
+
+
+def test_priority_assignment_aliases_preserves_wrapped_tracked_references() -> None:
+    source = "import ctypes\nloader = ctypes.LibraryLoader(ctypes.CDLL)"
+    tree = ast.parse(source)
+
+    aliases = jit_script_module._priority_assignment_aliases(source, tree, {"ctypes"})
+
+    assert b"loader" in aliases
 
 
 def test_first_body_statement_segment_bounds_nested_recursion() -> None:

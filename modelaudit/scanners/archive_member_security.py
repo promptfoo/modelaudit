@@ -2304,12 +2304,17 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         registry_binding, registry_found = _lookup_bound_alias(
             f"{_SYS_MODULES_BINDING_PREFIX}{import_name}", self.alias_scopes
         )
-        reset_to_canonical = registry_found and registry_binding != frozenset({import_name})
+        known_registry_replacement = isinstance(registry_binding, frozenset) and registry_binding != frozenset(
+            {import_name}
+        )
+        reset_to_canonical = (
+            registry_found and not known_registry_replacement and registry_binding != frozenset({import_name})
+        )
         previous_names, _found = _lookup_bound_alias(local_name, self.alias_scopes)
         preserve_existing = (
             not reset_to_canonical and isinstance(previous_names, frozenset) and import_name in previous_names
         )
-        imported_binding: _AliasValue = frozenset({import_name})
+        imported_binding: _AliasValue = registry_binding if known_registry_replacement else frozenset({import_name})
         if import_name in _TRACKED_STATIC_MEMBER_REFERENCES:
             current_binding, found = _lookup_bound_alias(
                 f"{_STATIC_CANONICAL_MEMBER_PREFIX}{import_name}", self.alias_scopes
@@ -2317,6 +2322,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if found:
                 imported_binding = current_binding
         self._bind_name(local_name, imported_binding)
+        if known_registry_replacement:
+            return
         self._bind_imported_static_members(
             local_name,
             import_name,

@@ -497,7 +497,9 @@ def _priority_assignment_aliases(source: str, tree: ast.AST, priority_aliases: s
             discovered_aliases.add(target)
             continue
         reference_roots = _alias_reference_root_names(value)
-        if reference_roots and reference_roots.isdisjoint(discovered_aliases):
+        if not reference_roots and isinstance(value, ast.Call):
+            reference_roots = _alias_reference_root_names(value.func)
+        if not reference_roots or reference_roots.isdisjoint(discovered_aliases):
             continue
         if expensive_probes >= _MAX_PRIORITY_ASSIGNMENT_PROBES:
             continue
