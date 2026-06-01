@@ -325,6 +325,30 @@ class TestKerasZipScanner:
         assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
         assert not any(check.name == "Embedded Weights H5PY Library Check" for check in result.checks)
 
+    def test_missing_h5py_does_not_hide_disguised_pickle_weights(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Non-HDF5 weights still receive generic nested scanning without h5py."""
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+        keras_path = tmp_path / "disguised_pickle_weights.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.12.0"}))
+            zf.writestr("model.weights.h5", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert any(
+            issue.rule_code == "S201"
+            and issue.details.get("zip_entry") == "model.weights.h5"
+            and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system", "nt.system"))
+            for issue in result.issues
+        )
+        assert not any(check.name == "Embedded Weights H5PY Library Check" for check in result.checks)
+
     @pytest.mark.parametrize(
         ("config", "reason", "expected_check_name"),
         [

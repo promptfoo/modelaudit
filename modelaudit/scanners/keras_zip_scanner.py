@@ -30,7 +30,7 @@ from ..config.explanations import (
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
-from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
+from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded, _read_zip_member_prefix
 from .archive_dispatch import SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY
 from .archive_member_security import is_executable_archive_member_name
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
@@ -116,6 +116,7 @@ def _has_get_file_reference(values: list[str]) -> bool:
 _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
+_HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
 _KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+_-]*)\s*$")
 _KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(r"(?i)^(?:a|alpha|b|beta|c|rc|pre|preview|dev)")
 
@@ -1547,6 +1548,9 @@ class KerasZipScanner(BaseScanner):
             return
 
         if not HAS_H5PY:
+            if _read_zip_member_prefix(archive, weights_info, len(_HDF5_MAGIC)) != _HDF5_MAGIC:
+                return
+
             weights_entry = weights_info.filename
             reason = "keras_zip_embedded_weights_h5py_unavailable"
             self._mark_inconclusive_scan_result(result, reason)
