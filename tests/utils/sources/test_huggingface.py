@@ -506,7 +506,7 @@ class TestModelDownload:
         """Budgeted literal filenames must not widen into Hub glob matches."""
         download_path = tmp_path / "download"
         download_path.mkdir()
-        (download_path / "model?.bin").write_bytes(b"weights")
+        (download_path / "config.json").write_text("{}", encoding="utf-8")
         mock_snapshot_download.return_value = str(download_path)
         mock_get_paths_info.return_value = [SimpleNamespace(path="model?.bin", size=700)]
 

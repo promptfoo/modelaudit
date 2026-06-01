@@ -379,7 +379,6 @@ def download_model(
             except Exception as exc:
                 raise Exception(f"Cannot enforce max-size for {repo_id}: repository listing failed: {exc}") from exc
             repo_listing_failed = False
-            repo_listing_error = None
         else:
             listed_repo_files, repo_listing_error = _list_repo_files_with_timeout(repo_id)
             if listed_repo_files is None:
@@ -423,10 +422,6 @@ def download_model(
             if revision is not None:
                 download_kwargs["revision"] = revision
         elif repo_listing_failed:
-            if max_size is not None:
-                raise Exception(
-                    f"Cannot enforce max-size for {repo_id}: repository listing failed: {repo_listing_error}"
-                )
             extension_allow_patterns = _build_extension_allow_patterns()
             if not extension_allow_patterns:
                 raise Exception(
