@@ -894,9 +894,9 @@ class SevenZipScanner(BaseScanner):
     def _get_archive_member_info(self, archive: Any, file_name: str) -> Any | None:
         """Return metadata for a member without extracting it, across py7zr API variants."""
         files = getattr(archive, "files", None)
-        if isinstance(files, list):
-            for member_info in files:
-                with suppress(Exception):
+        if files is not None:
+            with suppress(Exception):
+                for member_info in files:
                     if getattr(member_info, "filename", None) == file_name:
                         return member_info
 

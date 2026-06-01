@@ -1505,9 +1505,13 @@ class TestSevenZipScannerHardening:
             def __init__(self) -> None:
                 self.is_symlink = is_symlink
 
+        class LegacyArchiveFileList:
+            def __iter__(self) -> Generator[LegacyArchiveMember, None, None]:
+                yield LegacyArchiveMember()
+
         class LegacyArchive:
             def __init__(self) -> None:
-                self.files = [LegacyArchiveMember()]
+                self.files = LegacyArchiveFileList()
 
             @staticmethod
             def list() -> list[LegacyPublicFileInfo]:
