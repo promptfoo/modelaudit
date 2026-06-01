@@ -57,9 +57,9 @@ def _redact_evidence_location(location: Any) -> str:
 
 
 def _redact_evidence_key(key: Any) -> Any:
-    if isinstance(key, str | bytes | bytearray):
-        return _redact_evidence_location(key)
-    return key
+    if key is None or isinstance(key, bool | int | float):
+        return key
+    return _redact_evidence_location(key)
 
 
 class FlaxMsgpackScanner(BaseScanner):

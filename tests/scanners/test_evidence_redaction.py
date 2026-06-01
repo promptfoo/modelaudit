@@ -54,3 +54,23 @@ def test_existing_token_assignment_redaction_still_applies() -> None:
 
     assert "CANONICALTOKEN123" not in redacted
     assert redacted == f"token={REDACTED_EVIDENCE_VALUE}"
+
+
+def test_redacts_capability_tokens_in_url_paths() -> None:
+    """Opaque URL path tokens should not survive evidence serialization."""
+    token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+
+    redacted = redact_evidence_string(f"https://example.com/path/{token}/model.bin", max_chars=500)
+
+    assert token not in redacted
+    assert redacted == f"https://example.com/path/{REDACTED_EVIDENCE_VALUE}/model.bin"
+
+
+def test_redacts_standalone_secret_shapes() -> None:
+    """Secret-shaped strings should be redacted even without assignment syntax."""
+    token = "ghp_" + "a" * 36
+
+    redacted = redact_evidence_string(f"metadata key: {token}", max_chars=500)
+
+    assert token not in redacted
+    assert redacted == f"metadata key: {REDACTED_EVIDENCE_VALUE}"

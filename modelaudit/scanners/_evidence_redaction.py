@@ -6,10 +6,22 @@ import re
 from typing import Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from ..detectors.network_comm import _redact_url_path_tokens
+
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 
 URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://[^\s\"'<>]+")
+STANDALONE_SECRET_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"AKIA[0-9A-Z]{16}|"
+    r"gh[ps]_[A-Za-z0-9]{36}|"
+    r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|"
+    r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_.+/=-]*|"
+    r"sk-(?:proj-)?[A-Za-z0-9]{24,}|"
+    r"xox[baprs]-[0-9A-Za-z-]{20,}"
+    r")(?![A-Za-z0-9])"
+)
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "access_key",
@@ -91,11 +103,16 @@ def _redact_url(match: re.Match[str]) -> str:
         else:
             query_items.append((key, value))
 
+    path = _redact_url_path_tokens(
+        parsed.scheme.lower(),
+        (parsed.hostname or "").lower(),
+        parsed.path,
+    )
     return urlunsplit(
         (
             parsed.scheme,
             netloc,
-            parsed.path,
+            path,
             urlencode(query_items, doseq=True, safe="<>"),
             "",
         )
@@ -118,6 +135,7 @@ def _truncate(text: str, max_chars: int) -> str:
 def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
     redacted = URL_RE.sub(_redact_url, text)
+    redacted = STANDALONE_SECRET_RE.sub(REDACTED_EVIDENCE_VALUE, redacted)
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)

@@ -770,6 +770,51 @@ def test_flax_msgpack_redacts_bytes_keys_without_breaking_tensor_analysis(tmp_pa
     assert secret not in serialized
 
 
+def test_flax_msgpack_redacts_url_path_capability_token_sample(tmp_path: Path) -> None:
+    path = tmp_path / "url_capability_token.msgpack"
+    token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+    create_msgpack_file(
+        path,
+        {
+            "params": {"w": [1, 2, 3]},
+            "code": f"eval('https://example.com/path/{token}/model.bin')",
+        },
+    )
+
+    result = FlaxMsgpackScanner().scan(str(path))
+    serialized = result.to_json()
+
+    assert token not in serialized
+    assert "https://example.com/path/<redacted>/model.bin" in serialized
+
+
+def test_flax_msgpack_redacts_standalone_secret_shaped_metadata_key(tmp_path: Path) -> None:
+    path = tmp_path / "standalone_secret_key.msgpack"
+    token = "ghp_" + "a" * 36
+    create_msgpack_file(path, {token: b"0" * 4096})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.metadata["top_level_keys"] == ["<redacted>"]
+    assert token not in result.to_json()
+
+
+def test_flax_msgpack_stringifies_extension_metadata_keys(tmp_path: Path) -> None:
+    path = tmp_path / "extension_key.msgpack"
+    secret = "EXTKEYSECRET123456789"
+    create_msgpack_file(
+        path,
+        {msgpack.ExtType(1, f"token={secret}".encode()): b"0" * 4096},
+    )
+
+    result = FlaxMsgpackScanner().scan(str(path))
+    serialized = result.to_json()
+
+    assert secret not in serialized
+    assert "token=<redacted>" in serialized
+    assert isinstance(result.metadata["top_level_keys"][0], str)
+
+
 def test_flax_msgpack_detects_suspicious_bytes_keys(tmp_path: Path) -> None:
     path = tmp_path / "bytes_reduce.msgpack"
     create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, b"__reduce__": "os.system"})
