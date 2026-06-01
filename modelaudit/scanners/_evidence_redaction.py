@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from typing import Final
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
 
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
@@ -61,6 +61,10 @@ SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)([\"']).*?\3"
 )
+HTML_QUERY_SEPARATOR_RE: Final[re.Pattern[str]] = re.compile(r"(?i)&amp;")
+NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(?:^|[?&;])(?:amp;)?{SENSITIVE_ASSIGNMENT_KEY}\s*[:=]"
+)
 
 
 def _redact_malformed_url(raw_url: str) -> str:
@@ -89,8 +93,9 @@ def _redact_url(match: re.Match[str]) -> str:
         netloc = f"{REDACTED_URL_CREDENTIALS}@{netloc.rsplit('@', 1)[1]}"
 
     query_items = []
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if key.lower() in SENSITIVE_QUERY_KEYS:
+    normalized_query = HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query).replace(";", "&")
+    for key, value in parse_qsl(normalized_query, keep_blank_values=True):
+        if key.lower() in SENSITIVE_QUERY_KEYS or _contains_nested_sensitive_query_assignment(value):
             query_items.append((key, REDACTED_EVIDENCE_VALUE))
         else:
             query_items.append((key, value))
@@ -104,6 +109,17 @@ def _redact_url(match: re.Match[str]) -> str:
             "",
         )
     )
+
+
+def _contains_nested_sensitive_query_assignment(value: str) -> bool:
+    """Recognize credential assignments nested inside encoded query values."""
+    decoded = value
+    for _ in range(3):
+        next_decoded = unquote_plus(decoded)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+    return bool(NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE.search(decoded))
 
 
 def _redact_quoted_assignment(match: re.Match[str]) -> str:

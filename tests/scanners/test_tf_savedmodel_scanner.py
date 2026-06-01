@@ -723,6 +723,20 @@ def test_savedmodel_preview_redaction_removes_generic_url_userinfo() -> None:
     assert preview.count("<credentials-redacted>@") == 2
 
 
+def test_savedmodel_preview_redaction_removes_nested_url_credentials() -> None:
+    preview = _safe_decoded_preview(
+        "https://callback.example/hook?ok=1;to%6ben=SEMICOLONSECRET123 "
+        "https://callback.example/hook?ok=token%253DNESTEDSECRET456 "
+        "https://callback.example/hook?ok=1&amp;token=HTMLSECRET789",
+        500,
+    )
+
+    assert "SEMICOLONSECRET123" not in preview
+    assert "NESTEDSECRET456" not in preview
+    assert "HTMLSECRET789" not in preview
+    assert preview.count("<redacted>") == 3
+
+
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_collection_preview_redacts_sensitive_values(tmp_path: Path) -> None:
     raw_secret = "c081-collection-secret-value-00000000"
