@@ -181,7 +181,7 @@ def _redacted_scan_error_for_reporting(error: object, path: str) -> str:
 
 def _redact_stream_value_for_reporting(value: Any, stream_url: str, report_url: str) -> Any:
     if isinstance(value, str):
-        return value.replace(stream_url, report_url)
+        return _redact_cloud_error_for_display(value.replace(stream_url, report_url))
     if isinstance(value, dict):
         return {
             _redact_stream_value_for_reporting(key, stream_url, report_url): _redact_stream_value_for_reporting(

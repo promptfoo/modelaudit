@@ -267,7 +267,7 @@ def _create_results(
 
         # Add fix suggestions if available
         if hasattr(issue, "recommendation") and issue.recommendation:
-            result["fixes"] = [{"description": {"text": issue.recommendation}}]
+            result["fixes"] = [{"description": {"text": _redact_text_for_sarif(issue.recommendation)}}]
 
         results.append(result)
 

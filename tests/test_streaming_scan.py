@@ -166,14 +166,20 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
         "X-Amz-Credential=AKIASECRET&X-Amz-Signature=deadbeef&token=secret-token"
     )
     safe_url = "https://bucket.s3.amazonaws.com/model.pkl"
+    related_url = "https://collector.example/upload?visible=yes&token=secondary-secret"
     scan_result = ScanResult(scanner_name="streaming")
     scan_result.bytes_scanned = 128
-    scan_result.metadata["source_url"] = stream_url
+    scan_result.metadata.update({"source_url": stream_url, "related_url": related_url})
     scan_result.add_issue(
         f"Dangerous payload from {stream_url}",
         severity=IssueSeverity.CRITICAL,
         location=f"{stream_url}:payload",
-        details={"source": stream_url, "nested": [stream_url], stream_url: {"source": stream_url}},
+        details={
+            "source": stream_url,
+            "nested": [stream_url],
+            stream_url: {"source": stream_url},
+            "related_url": related_url,
+        },
     )
     scan_result.add_check(
         name=f"Streaming Payload {stream_url}",
@@ -202,13 +208,14 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
     json_text = result.model_dump_json(exclude_none=True)
     sarif_text = format_sarif_output(result, [f"stream://{stream_url}"])
 
-    for leaked in ("AKIASECRET", "deadbeef", "secret-token", "X-Amz-Signature"):
+    for leaked in ("AKIASECRET", "deadbeef", "secret-token", "secondary-secret", "X-Amz-Signature"):
         assert leaked not in json_text
         assert leaked not in sarif_text
     assert stream_url not in json_text
     assert stream_url not in sarif_text
     assert safe_url in json_text
     assert safe_url in sarif_text
+    assert "visible=yes" in json_text
     assert safe_url in result.file_metadata
     assert all(asset.path != stream_url for asset in result.assets)
 

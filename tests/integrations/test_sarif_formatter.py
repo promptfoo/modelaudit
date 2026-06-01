@@ -77,6 +77,7 @@ class TestFormatSarifOutput:
                 location=raw_path,
                 details={"source": raw_path, raw_path: {"nested": [raw_path]}},
                 why=f"Why contains {raw_path}",
+                recommendation=f"Retry with {raw_path}",
                 timestamp=time.time(),
             )
         ]
