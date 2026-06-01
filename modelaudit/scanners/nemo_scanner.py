@@ -11,6 +11,7 @@ import posixpath
 import re
 import tarfile
 import tempfile
+from collections.abc import Iterator
 from typing import Any, ClassVar
 
 from ..core_results import (
@@ -22,6 +23,7 @@ from ..utils import is_absolute_archive_path, sanitize_archive_path
 from ..utils.file.detection import is_nemo_archive
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete
+from ._evidence_redaction import redact_evidence_string
 from .archive_member_security import (
     is_executable_archive_member_name,
     is_python_archive_member_name,
@@ -301,6 +303,19 @@ _DANGEROUS_TARGETS = {
     "os.readlink",
     "posix.readlink",
     "nt.readlink",
+    "os.listdir",
+    "posix.listdir",
+    "nt.listdir",
+    "os.scandir",
+    "posix.scandir",
+    "nt.scandir",
+    "os.stat",
+    "posix.stat",
+    "nt.stat",
+    "os.lstat",
+    "posix.lstat",
+    "nt.lstat",
+    "glob.glob",
     "os.mkdir",
     "posix.mkdir",
     "nt.mkdir",
@@ -323,6 +338,12 @@ _DANGEROUS_TARGETS = {
     "pathlib.Path.readlink",
     "pathlib.PosixPath.readlink",
     "pathlib.WindowsPath.readlink",
+    "pathlib.Path.stat",
+    "pathlib.PosixPath.stat",
+    "pathlib.WindowsPath.stat",
+    "pathlib.Path.lstat",
+    "pathlib.PosixPath.lstat",
+    "pathlib.WindowsPath.lstat",
     "pathlib.Path.write_bytes",
     "pathlib.PosixPath.write_bytes",
     "pathlib.WindowsPath.write_bytes",
@@ -418,6 +439,9 @@ NEMO_CHECKPOINT_MEMBER_EXTENSIONS = frozenset({".ckpt", ".pt", ".pth", ".pkl", "
 NEMO_MAX_CHECKPOINT_SCAN_BYTES = 50 * 1024 * 1024
 NEMO_MAX_PYTHON_ANALYSIS_BYTES = 10 * 1024 * 1024
 NEMO_MAX_LINK_RESOLUTION_MEMBER_VISITS = 100_000
+NEMO_MAX_CONFIG_TRAVERSAL_DEPTH = 128
+NEMO_MAX_CONFIG_TRAVERSAL_NODES = 100_000
+NEMO_MAX_CONFIG_EVIDENCE_CHARS = 256
 NEMO_EXECUTABLE_INITIAL_PROBE_BYTES = 1024
 NEMO_EXECUTABLE_PE_PROBE_BYTES = (1024 * 1024) + 4
 
@@ -431,6 +455,24 @@ _NESTED_OPERATIONAL_CHECK_NAMES = {
     "xml_model_routing_incomplete": "XML Model Routing",
 }
 _NESTED_OPERATIONAL_REASON_FALLBACK = "nemo_referenced_nested_operational_error"
+
+
+class _NemoConfigTraversalLimit(Exception):
+    """Raised when parsed YAML cannot be traversed within the safety budget."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _redact_config_evidence(value: str) -> str:
+    """Bound attacker-controlled config evidence before storing diagnostics."""
+    return redact_evidence_string(value, max_chars=NEMO_MAX_CONFIG_EVIDENCE_CHARS)
+
+
+def _append_config_path(path_prefix: str, component: str) -> str:
+    separator = "" if not path_prefix or component.startswith("[") else "."
+    return _redact_config_evidence(f"{path_prefix}{separator}{component}")
 
 
 def _find_suspicious_target_pattern(target: str) -> str | None:
@@ -1081,6 +1123,16 @@ class NemoScanner(BaseScanner):
                     details={"config_file": config_file},
                 )
                 return False
+            except RecursionError:
+                logger.debug("YAML config %s in %s exceeded parser recursion limits", config_file, archive_path)
+                self._mark_config_traversal_inconclusive(
+                    result,
+                    config_file=config_file,
+                    archive_path=archive_path,
+                    reason="nemo_config_yaml_complexity_limit",
+                    message="YAML config exceeded parser complexity limits",
+                )
+                return False
 
         if not isinstance(config, dict | list):
             self._mark_inconclusive_scan_result(
@@ -1097,8 +1149,20 @@ class NemoScanner(BaseScanner):
             )
             return False
 
-        self._check_hydra_targets(config, config_file, archive_path, result)
-        for config_path, referenced_member_name in self._collect_nemo_member_references(config):
+        try:
+            self._check_hydra_targets(config, config_file, archive_path, result)
+            referenced_members = self._collect_nemo_member_references(config)
+        except _NemoConfigTraversalLimit as exc:
+            self._mark_config_traversal_inconclusive(
+                result,
+                config_file=config_file,
+                archive_path=archive_path,
+                reason=exc.reason,
+                message=str(exc),
+            )
+            return False
+
+        for config_path, referenced_member_name in referenced_members:
             nemo_owned_entries.add(referenced_member_name)
             referenced_member_contexts.setdefault(referenced_member_name, (config_file, config_path))
             if referenced_member_name in scanned_member_entries:
@@ -1115,6 +1179,30 @@ class NemoScanner(BaseScanner):
             if referenced_member_scanned:
                 scanned_member_entries.add(referenced_member_name)
         return True
+
+    def _mark_config_traversal_inconclusive(
+        self,
+        result: ScanResult,
+        *,
+        config_file: str,
+        archive_path: str,
+        reason: str,
+        message: str,
+    ) -> None:
+        """Record bounded YAML traversal failures without retaining raw config evidence."""
+        display_config_file = _redact_config_evidence(config_file)
+        self._mark_inconclusive_scan_result(
+            result,
+            reason=reason,
+            check_name="NeMo Config Traversal",
+            message=f"{message}: {display_config_file}",
+            location=f"{archive_path}:{display_config_file}",
+            details={
+                "config_file": display_config_file,
+                "max_traversal_depth": NEMO_MAX_CONFIG_TRAVERSAL_DEPTH,
+                "max_traversal_nodes": NEMO_MAX_CONFIG_TRAVERSAL_NODES,
+            },
+        )
 
     @staticmethod
     def _is_root_config_member_name(member_name: str) -> bool:
@@ -2212,29 +2300,61 @@ class NemoScanner(BaseScanner):
     ) -> list[tuple[str, str]]:
         """Collect internal `nemo:` artifact references from a parsed config."""
         collected: list[tuple[str, str]] = []
-
-        if isinstance(config, list):
-            for index, item in enumerate(config):
-                collected.extend(
-                    cls._collect_nemo_member_references(
-                        item,
-                        f"{path_prefix}[{index}]" if path_prefix else f"[{index}]",
-                    )
-                )
-            return collected
-
-        if isinstance(config, dict):
-            for key, value in config.items():
-                current_path = f"{path_prefix}.{key}" if path_prefix else key
-                collected.extend(cls._collect_nemo_member_references(value, current_path))
-            return collected
-
-        if isinstance(config, str):
-            member_name = cls._extract_nemo_member_reference(config)
+        for config_path, value, _parent, _key in cls._iter_config_nodes(config, path_prefix=path_prefix):
+            if not isinstance(value, str):
+                continue
+            member_name = cls._extract_nemo_member_reference(value)
             if member_name is not None:
-                return [(path_prefix or "$", member_name)]
+                collected.append((config_path or "$", member_name))
 
-        return []
+        return collected
+
+    @classmethod
+    def _iter_config_nodes(
+        cls,
+        config: Any,
+        *,
+        path_prefix: str = "",
+    ) -> Iterator[tuple[str, Any, dict[Any, Any] | None, Any]]:
+        """Yield parsed config nodes while bounding depth, work, and YAML alias cycles."""
+        pending: list[tuple[Any, str, int, frozenset[int], dict[Any, Any] | None, Any]] = [
+            (config, path_prefix, 0, frozenset(), None, None)
+        ]
+        visited_nodes = 0
+
+        while pending:
+            value, config_path, depth, ancestors, parent, key = pending.pop()
+            visited_nodes += 1
+            if visited_nodes > NEMO_MAX_CONFIG_TRAVERSAL_NODES:
+                raise _NemoConfigTraversalLimit(
+                    "nemo_config_traversal_node_limit",
+                    "YAML config exceeded the traversal node safety limit",
+                )
+
+            if isinstance(value, dict | list):
+                identity = id(value)
+                if identity in ancestors:
+                    raise _NemoConfigTraversalLimit(
+                        "nemo_config_recursive_alias",
+                        "YAML config contains a recursive alias",
+                    )
+                if depth > NEMO_MAX_CONFIG_TRAVERSAL_DEPTH:
+                    raise _NemoConfigTraversalLimit(
+                        "nemo_config_traversal_depth_limit",
+                        "YAML config exceeded the traversal depth safety limit",
+                    )
+
+                child_ancestors = ancestors | {identity}
+                if isinstance(value, dict):
+                    for child_key, child_value in reversed(list(value.items())):
+                        child_path = _append_config_path(config_path, str(child_key))
+                        pending.append((child_value, child_path, depth + 1, child_ancestors, value, child_key))
+                else:
+                    for index, child_value in reversed(list(enumerate(value))):
+                        child_path = _append_config_path(config_path, f"[{index}]")
+                        pending.append((child_value, child_path, depth + 1, child_ancestors, None, index))
+
+            yield config_path, value, parent, key
 
     @staticmethod
     def _extract_nemo_member_reference(value: str) -> str | None:
@@ -2373,29 +2493,10 @@ class NemoScanner(BaseScanner):
         result: ScanResult,
         path_prefix: str = "",
     ) -> None:
-        """Recursively check _target_ values in Hydra config."""
-        if isinstance(config, list):
-            for index, item in enumerate(config):
-                if isinstance(item, dict | list):
-                    self._check_hydra_targets(
-                        item,
-                        config_name,
-                        archive_path,
-                        result,
-                        f"{path_prefix}[{index}]" if path_prefix else f"[{index}]",
-                    )
-            return
-
-        if not isinstance(config, dict):
-            return
-
-        for key, value in config.items():
-            current_path = f"{path_prefix}.{key}" if path_prefix else key
-
+        """Check _target_ values in Hydra config within shared traversal bounds."""
+        for config_path, value, parent, key in self._iter_config_nodes(config, path_prefix=path_prefix):
             if key == "_target_" and isinstance(value, str):
-                self._evaluate_target(value, current_path, config_name, archive_path, result, config)
-            elif isinstance(value, dict | list):
-                self._check_hydra_targets(value, config_name, archive_path, result, current_path)
+                self._evaluate_target(value, config_path, config_name, archive_path, result, parent)
 
     def _evaluate_target(
         self,
@@ -2407,18 +2508,25 @@ class NemoScanner(BaseScanner):
         target_config: dict[str, Any] | None = None,
     ) -> None:
         """Evaluate a single _target_ value for dangerous patterns."""
+        display_target = _redact_config_evidence(target)
+        display_config_path = _redact_config_evidence(config_path)
+        display_config_name = _redact_config_evidence(config_name)
+
         # Check against known dangerous targets (always flag, even if safe prefix)
         if target in _DANGEROUS_TARGETS or (target == "numpy.load" and self._numpy_load_allows_pickle(target_config)):
             result.add_check(
                 name=f"{CVE_2025_23304_ID}: Dangerous Hydra _target_",
                 passed=False,
-                message=(f"{CVE_2025_23304_ID}: Dangerous _target_ '{target}' at {config_path} in {config_name}"),
+                message=(
+                    f"{CVE_2025_23304_ID}: Dangerous _target_ "
+                    f"'{display_target}' at {display_config_path} in {display_config_name}"
+                ),
                 severity=IssueSeverity.CRITICAL,
-                location=f"{archive_path}:{config_name}",
+                location=f"{archive_path}:{display_config_name}",
                 details={
-                    "target": target,
-                    "config_path": config_path,
-                    "config_file": config_name,
+                    "target": display_target,
+                    "config_path": display_config_path,
+                    "config_file": display_config_name,
                     "cve_id": CVE_2025_23304_ID,
                     "cvss": CVE_2025_23304_CVSS,
                     "cwe": CVE_2025_23304_CWE,
@@ -2426,7 +2534,7 @@ class NemoScanner(BaseScanner):
                     "remediation": CVE_2025_23304_REMEDIATION,
                 },
                 why=(
-                    f"The _target_ field '{target}' in this NeMo "
+                    f"The _target_ field '{display_target}' in this NeMo "
                     f"config specifies a dangerous Python callable. "
                     f"When hydra.utils.instantiate() processes this "
                     f"config, it will execute arbitrary code "
@@ -2451,9 +2559,9 @@ class NemoScanner(BaseScanner):
             result.add_check(
                 name="Hydra _target_ Safety Check",
                 passed=True,
-                message=(f"Safe _target_ '{target}' at {config_path} in {config_name}"),
-                location=f"{archive_path}:{config_name}",
-                details={"target": target, "config_path": config_path},
+                message=(f"Safe _target_ '{display_target}' at {display_config_path} in {display_config_name}"),
+                location=f"{archive_path}:{display_config_name}",
+                details={"target": display_target, "config_path": display_config_path},
             )
             return
 
@@ -2467,13 +2575,16 @@ class NemoScanner(BaseScanner):
         result.add_check(
             name="Hydra _target_ Review",
             passed=False,
-            message=(f"Unknown _target_ '{target}' at {config_path} in {config_name} - requires manual review"),
+            message=(
+                f"Unknown _target_ '{display_target}' at "
+                f"{display_config_path} in {display_config_name} - requires manual review"
+            ),
             severity=IssueSeverity.INFO,
-            location=f"{archive_path}:{config_name}",
+            location=f"{archive_path}:{display_config_name}",
             details={
-                "target": target,
-                "config_path": config_path,
-                "config_file": config_name,
+                "target": display_target,
+                "config_path": display_config_path,
+                "config_file": display_config_name,
             },
         )
 
@@ -2486,21 +2597,24 @@ class NemoScanner(BaseScanner):
         archive_path: str,
         result: ScanResult,
     ) -> None:
+        display_target = _redact_config_evidence(target)
+        display_config_path = _redact_config_evidence(config_path)
+        display_config_name = _redact_config_evidence(config_name)
         result.add_check(
             name=f"{CVE_2025_23304_ID}: Suspicious Hydra _target_",
             passed=False,
             message=(
                 f"{CVE_2025_23304_ID}: Suspicious _target_ "
-                f"'{target}' (contains '{pattern}') at "
-                f"{config_path} in {config_name}"
+                f"'{display_target}' (contains '{pattern}') at "
+                f"{display_config_path} in {display_config_name}"
             ),
             severity=IssueSeverity.CRITICAL,
-            location=f"{archive_path}:{config_name}",
+            location=f"{archive_path}:{display_config_name}",
             details={
-                "target": target,
+                "target": display_target,
                 "pattern": pattern,
-                "config_path": config_path,
-                "config_file": config_name,
+                "config_path": display_config_path,
+                "config_file": display_config_name,
                 "cve_id": CVE_2025_23304_ID,
                 "cvss": CVE_2025_23304_CVSS,
                 "cwe": CVE_2025_23304_CWE,

@@ -3785,6 +3785,34 @@ class TestCVE202523304HydraTarget:
                 },
             ),
             (
+                "os.listdir",
+                {
+                    "_target_": "os.listdir",
+                    "_args_": ["/tmp"],
+                },
+            ),
+            (
+                "os.scandir",
+                {
+                    "_target_": "os.scandir",
+                    "_args_": ["/tmp"],
+                },
+            ),
+            (
+                "glob.glob",
+                {
+                    "_target_": "glob.glob",
+                    "_args_": ["/tmp/*"],
+                },
+            ),
+            (
+                "pathlib.Path.stat",
+                {
+                    "_target_": "pathlib.Path.stat",
+                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                },
+            ),
+            (
                 "pathlib.PosixPath.write_text",
                 {
                     "_target_": "pathlib.PosixPath.write_text",
@@ -4049,6 +4077,20 @@ class TestCVE202523304HydraTarget:
                 },
             ),
             (
+                "os.listdir",
+                {
+                    "_target_": "os.listdir",
+                    "_args_": ["/tmp"],
+                },
+            ),
+            (
+                "glob.glob",
+                {
+                    "_target_": "glob.glob",
+                    "_args_": ["/tmp/*"],
+                },
+            ),
+            (
                 "pathlib.PosixPath.write_text",
                 {
                     "_target_": "pathlib.PosixPath.write_text",
@@ -4139,6 +4181,10 @@ class TestCVE202523304HydraTarget:
             "httpx._client.Client.stream",
             "httpx.AsyncClient.get",
             "httpx._client.AsyncClient.request",
+            "glob.iglob",
+            "os.walk",
+            "pathlib.Path.glob",
+            "pathlib.Path.iterdir",
         ],
     )
     def test_non_io_target_invocations_remain_review_only(self, tmp_path: Path, target: str) -> None:
@@ -4202,6 +4248,75 @@ class TestCVE202523304HydraTarget:
         assert len(cve_checks) == 1
         assert cve_checks[0].details["target"] == "subprocess.Popen"
         assert cve_checks[0].details["config_path"] == "trainer.callbacks[0][0]._target_"
+
+    def test_yaml_parser_recursion_limit_returns_inconclusive_exit2_without_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Parser recursion limits should fail closed instead of escaping the scanner."""
+
+        def raise_recursion_error(_: bytes) -> Any:
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(yaml, "safe_load", raise_recursion_error)
+        path = _create_nemo_file_from_bytes(tmp_path, b"model: safe\n")
+
+        direct_result = NemoScanner().scan(str(path))
+        assert direct_result.success is False
+        assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_config_yaml_complexity_limit" in direct_result.metadata["scan_outcome_reasons"]
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            aggregate_result = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert aggregate_result.success is False
+            assert determine_exit_code(aggregate_result) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_recursive_yaml_alias_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
+        """Recursive YAML aliases should stop at a controlled incomplete outcome."""
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"model: &loop\n  children:\n    - *loop\n",
+        )
+
+        direct_result = NemoScanner().scan(str(path))
+        aggregate_result = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False},
+        )
+
+        assert direct_result.success is False
+        assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_config_recursive_alias" in direct_result.metadata["scan_outcome_reasons"]
+        assert determine_exit_code(aggregate_result) == 2
+
+    def test_recursive_yaml_alias_preserves_detected_security_exit1(self, tmp_path: Path) -> None:
+        """Findings visited before an alias cycle should retain security precedence."""
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"_target_: os.system\nmodel: &loop\n  children:\n    - *loop\n",
+        )
+
+        aggregate_result = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False},
+        )
+
+        metadata = aggregate_result.file_metadata[str(path)]
+        assert "nemo_config_recursive_alias" in metadata["scan_outcome_reasons"]
+        assert any(issue.details.get("target") == "os.system" for issue in aggregate_result.issues)
+        assert determine_exit_code(aggregate_result) == 1
 
     @pytest.mark.parametrize(
         ("payload", "expected_reason", "expected_check"),
@@ -4318,6 +4433,30 @@ class TestCVE202523304HydraTarget:
         review_checks = [c for c in result.checks if c.name == "Hydra _target_ Review"]
         assert len(review_checks) == 1
         assert review_checks[0].severity == IssueSeverity.INFO
+
+    def test_unknown_target_diagnostics_redact_and_bound_config_evidence(self, tmp_path: Path) -> None:
+        """Review diagnostics should not retain unbounded secret-bearing config strings."""
+        secret = "TARGETSECRET123"
+        path_secret = "PATHSECRET456"
+        target = f"custom_package.Builder?token={secret}" + ("A" * 400)
+        path = _create_nemo_file(
+            tmp_path,
+            {f"client_secret={path_secret}": {"_target_": target}},
+        )
+
+        result = NemoScanner().scan(str(path))
+
+        review_checks = [check for check in result.checks if check.name == "Hydra _target_ Review"]
+        assert len(review_checks) == 1
+        check = review_checks[0]
+        assert secret not in check.message
+        assert path_secret not in check.message
+        assert secret not in check.details["target"]
+        assert path_secret not in check.details["config_path"]
+        assert "<redacted>" in check.details["target"]
+        assert "<redacted>" in check.details["config_path"]
+        assert len(check.details["target"]) <= 256
+        assert len(check.details["config_path"]) <= 256
 
     def test_oversized_yaml_config_is_rejected_before_parse(
         self,
