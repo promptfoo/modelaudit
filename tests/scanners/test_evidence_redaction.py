@@ -1,6 +1,10 @@
 """Tests for scanner evidence redaction helpers."""
 
-from modelaudit.scanners._evidence_redaction import REDACTED_EVIDENCE_VALUE, redact_evidence_string
+from modelaudit.scanners._evidence_redaction import (
+    REDACTED_EVIDENCE_VALUE,
+    redact_evidence_string,
+    redact_evidence_value,
+)
 
 
 def test_redacts_compound_credential_assignments() -> None:
@@ -26,14 +30,19 @@ def test_redacts_compound_credential_assignments() -> None:
 
 def test_redacts_compound_sensitive_query_parameters() -> None:
     """Compound query credential keys should be redacted in URL evidence."""
-    text = "url=https://example.com/callback?client_secret=CLIENTSECRET123&refresh_token=REFRESHTOKEN456&ok=1"
+    text = (
+        "url=https://example.com/callback?client_secret=CLIENTSECRET123&refresh_token=REFRESHTOKEN456"
+        "&aws_access_key_id=AWSACCESSKEY789&ok=1"
+    )
 
     redacted = redact_evidence_string(text, max_chars=500)
 
     assert "CLIENTSECRET123" not in redacted
     assert "REFRESHTOKEN456" not in redacted
+    assert "AWSACCESSKEY789" not in redacted
     assert "client_secret=<redacted>" in redacted
     assert "refresh_token=<redacted>" in redacted
+    assert "aws_access_key_id=<redacted>" in redacted
     assert "ok=1" in redacted
 
 
@@ -54,3 +63,19 @@ def test_existing_token_assignment_redaction_still_applies() -> None:
 
     assert "CANONICALTOKEN123" not in redacted
     assert redacted == f"token={REDACTED_EVIDENCE_VALUE}"
+
+
+def test_redacts_access_key_id_assignments_and_nested_values() -> None:
+    """AWS-style access key IDs should not survive string or structured redaction."""
+    secret = "AWSACCESSKEY123"
+    text = f"aws_access_key_id='{secret}' access-key-id={secret}"
+
+    redacted_text = redact_evidence_string(text, max_chars=500)
+    redacted_value = redact_evidence_value({"aws_access_key_id": secret, "nested": {"access-key-id": secret}})
+
+    assert secret not in redacted_text
+    assert secret not in str(redacted_value)
+    assert redacted_value == {
+        "aws_access_key_id": REDACTED_EVIDENCE_VALUE,
+        "nested": {"access-key-id": REDACTED_EVIDENCE_VALUE},
+    }

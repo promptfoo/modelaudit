@@ -1881,6 +1881,9 @@ __import__('pickle').loads(data)
         dict_secret = "ZIP_DICT_SECRET"
         custom_secret = "ZIP_CUSTOM_SECRET"
         nested_secret = "ZIP_NESTED_SECRET"
+        access_key_id_secret = "ZIP_ACCESS_KEY_ID_SECRET"
+        metric_secret = "ZIP_METRIC_SECRET"
+        loss_secret = "ZIP_LOSS_SECRET"
 
         def direct_lambda_code(x: Any) -> Any:
             token = "ZIP_DIRECT_SECRET"
@@ -1917,14 +1920,27 @@ __import__('pickle').loads(data)
                         "config": {
                             "api_key": custom_secret,
                             "nested": {"token": nested_secret},
+                            "aws_access_key_id": access_key_id_secret,
                             "units": 4,
                         },
                     },
                 ]
             },
+            "compile_config": {
+                "metrics": [{"class_name": "MaliciousMetric", "config": {"api_key": metric_secret}}],
+                "loss": {"class_name": "MaliciousLoss", "config": {"token": loss_secret}},
+            },
         }
         model_path = create_configured_keras_zip(tmp_path, config, file_name="redacted_details.keras")
-        raw_secrets = [direct_secret, dict_secret, custom_secret, nested_secret]
+        raw_secrets = [
+            direct_secret,
+            dict_secret,
+            custom_secret,
+            nested_secret,
+            access_key_id_secret,
+            metric_secret,
+            loss_secret,
+        ]
 
         scanner_result = KerasZipScanner().scan(str(model_path))
         details_json = json.dumps([check.details for check in scanner_result.checks], default=str)

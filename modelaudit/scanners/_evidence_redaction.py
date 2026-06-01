@@ -14,11 +14,19 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "access_key",
         "access-key",
+        "access_key_id",
+        "access-key-id",
         "access_token",
         "access-token",
         "api_key",
         "api-key",
         "apikey",
+        "aws_access_key_id",
+        "aws-access-key-id",
+        "aws_secret_access_key",
+        "aws-secret-access-key",
+        "aws_session_token",
+        "aws-session-token",
         "auth_token",
         "auth-token",
         "client_secret",
@@ -44,7 +52,8 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
 )
 SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[_-])*"
-    r"(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|credential|"
+    r"(?:access[_-]?key[_-]?id|access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|"
+    r"credential|"
     r"password|passwd|private[_-]?key|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
 )
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
