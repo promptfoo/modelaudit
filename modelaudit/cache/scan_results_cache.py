@@ -202,11 +202,12 @@ class ScanResultsCache:
             with open(cache_file_path, encoding="utf-8") as f:
                 cache_entry = json.load(f)
 
-            if (
-                file_path is not None
-                and file_stat is not None
-                and not self._is_cache_entry_valid_with_stat(cache_entry, file_path, file_stat)
-            ):
+            if file_path is not None and file_stat is not None:
+                is_valid = self._is_cache_entry_valid_with_stat(cache_entry, file_path, file_stat)
+            else:
+                is_valid = self._call_graph_source_fingerprints_are_valid(cache_entry)
+
+            if not is_valid:
                 cache_file_path.unlink()
                 self._record_cache_miss("invalid")
                 return None
@@ -286,7 +287,14 @@ class ScanResultsCache:
             file_hash = content_hash or self.hasher.hash_file_with_stat(file_path, file_stat)
             mtime_ns = getattr(file_stat, "st_mtime_ns", int(file_stat.st_mtime * 1_000_000_000))
             private_metadata = scan_result.get("_private_metadata") if isinstance(scan_result, dict) else None
-            cache_private_metadata = dict(private_metadata) if isinstance(private_metadata, dict) else {}
+            fingerprint_metadata = (
+                private_metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY)
+                if isinstance(private_metadata, dict)
+                else None
+            )
+            cache_private_metadata = (
+                {_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY: fingerprint_metadata} if fingerprint_metadata is not None else {}
+            )
             persisted_scan_result = dict(scan_result)
             persisted_scan_result.pop("_private_metadata", None)
 

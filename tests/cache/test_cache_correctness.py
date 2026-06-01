@@ -321,6 +321,78 @@ def test_scan_cache_uses_private_call_graph_source_fingerprints_without_returnin
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
+def test_scan_cache_by_key_invalidates_private_call_graph_source_fingerprint_change(tmp_path: Path) -> None:
+    source_path = tmp_path / "helper.py"
+    source_path.write_text("def entrypoint():\n    return 1\n")
+
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "metadata": {
+            "pickle_report_status": "complete",
+            "pickle_verdict": "clean",
+            "import_references": [{"module": "helper", "name": "entrypoint"}],
+            "callable_invocations": [{"module": "helper", "name": "entrypoint"}],
+        },
+        "_private_metadata": {
+            "call_graph_source_fingerprints": {
+                "reusable": True,
+                "search_context": [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path],
+                "fingerprints": {str(source_path.absolute()): hashlib.sha256(source_path.read_bytes()).hexdigest()},
+            }
+        },
+    }
+
+    assert cache.store_result(str(file_path), scan_result, version_context=version_context)
+    cache_key = cache.generate_cache_key(str(file_path), version_context=version_context)
+    assert cache_key is not None
+    assert cache.get_cached_result_by_key(cache_key) is not None
+
+    source_path.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
+
+    assert cache.get_cached_result_by_key(cache_key) is None
+
+
+def test_scan_cache_private_metadata_cannot_override_cache_bookkeeping(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, "model.pkl")
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = build_cache_version_context({})
+    fingerprint_metadata = {
+        "reusable": True,
+        "search_context": [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path],
+        "fingerprints": {},
+    }
+    scan_result = {
+        "checks": [],
+        "issues": [],
+        "metadata": {
+            "pickle_report_status": "complete",
+            "pickle_verdict": "clean",
+            "import_references": [],
+            "callable_invocations": [],
+        },
+        "_private_metadata": {
+            "call_graph_source_fingerprints": fingerprint_metadata,
+            "access_count": "invalid",
+            "scanned_at": 0,
+            "unrecognized": "private",
+        },
+    }
+
+    assert cache.store_result(str(file_path), scan_result, version_context=version_context)
+    cache_key = cache.generate_cache_key(str(file_path), version_context=version_context)
+    assert cache_key is not None
+    cache_entry = json.loads(cache._get_cache_file_path(cache_key).read_text(encoding="utf-8"))
+
+    assert cache_entry["cache_metadata"]["call_graph_source_fingerprints"] == fingerprint_metadata
+    assert cache_entry["cache_metadata"]["access_count"] == 1
+    assert cache_entry["cache_metadata"]["scanned_at"] > 0
+    assert "unrecognized" not in cache_entry["cache_metadata"]
+
+
 def test_cached_scan_skips_persisting_operational_failures(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
