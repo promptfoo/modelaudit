@@ -271,14 +271,13 @@ def _get_with_jfrog_redirect_policy(
             return response
 
         location = response.headers.get("Location")
+        response.close()
         if not location:
-            response.close()
             raise requests.exceptions.RequestException(
                 f"JFrog redirect response missing Location header for {redact_jfrog_url_for_display(current_url)}"
             )
 
         current_url = urljoin(current_url, location)
-        response.close()
         current_headers = headers if _is_trusted_jfrog_auth_target(current_url) else {}
 
     raise requests.exceptions.TooManyRedirects(

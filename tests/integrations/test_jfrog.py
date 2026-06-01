@@ -308,6 +308,26 @@ class TestJFrogDownload:
         redirect_response.close.assert_called_once_with()
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_malformed_redirect_location_closes_response(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Malformed redirect targets must not leave streamed responses open."""
+        redirect_response = MagicMock(spec=requests.Response)
+        redirect_response.status_code = 302
+        redirect_response.headers = {"Location": "https://[::1"}
+        mock_get.return_value = redirect_response
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        with pytest.raises(Exception, match="Invalid IPv6 URL"):
+            download_artifact(
+                "https://company.jfrog.io/artifactory/repo/model.bin",
+                cache_dir=tmp_path,
+                api_token="test-token",
+            )
+
+        redirect_response.close.assert_called_once_with()
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_http_jfrog_saas_url_is_rejected_before_credentials(
         self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
