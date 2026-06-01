@@ -13,6 +13,7 @@ import h5py
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners import keras_utils
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 
@@ -1241,6 +1242,128 @@ def test_lambda_dict_bytecode_with_dangerous_module_fields_still_checks_module_r
         and check.details.get("function") == "system"
         for check in result.checks
     )
+
+
+def test_lambda_safe_string_with_dangerous_module_fields_still_checks_module_reference(tmp_path: Path) -> None:
+    """Safe-looking inline Lambda code must not suppress a dangerous sibling module reference."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "mixed_safe_string_module_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "mixed_safe_string_module",
+                            "function": "lambda x: x / 255",
+                            "module": "os",
+                            "function_name": "system",
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("pattern_type") == "safe_normalization"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("module") == "os"
+        and check.details.get("function") == "system"
+        for check in result.checks
+    )
+
+
+def test_lambda_dict_bytecode_does_not_match_dangerous_substrings_inside_identifiers(tmp_path: Path) -> None:
+    """Benign identifiers such as `opened` must not become critical `open` bytecode findings."""
+    encoded_code = base64.b64encode(b"def benign():\n    opened = 1\n    return opened\n").decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "benign_identifier_dict_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "benign_identifier_dict_lambda",
+                            "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert not any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        and check.details.get("analysis_status") == "opaque_bytecode"
+        for check in result.checks
+    )
+
+
+def test_lambda_dict_oversized_code_is_not_decoded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Oversized encoded Lambda bytecode must fail closed before allocating a decoded copy."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "oversized_dict_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "oversized_dict_lambda",
+                            "function": {"class_name": "__lambda__", "config": {"code": "A" * 9}},
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    def fail_decode(_encoded: str) -> bytes:
+        raise AssertionError("oversized Lambda bytecode must not be decoded")
+
+    monkeypatch.setattr(keras_utils, "_MAX_LAMBDA_DICT_CODE_B64_CHARS", 8)
+    monkeypatch.setattr(keras_utils.base64, "b64decode", fail_decode)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    oversized_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("analysis_status") == "code_size_limit_exceeded"
+    ]
+    assert len(oversized_checks) == 1
+    assert oversized_checks[0].severity == IssueSeverity.WARNING
+    assert oversized_checks[0].details["encoded_code_chars"] == 9
+    assert oversized_checks[0].details["max_encoded_code_chars"] == 8
 
 
 def test_keras_h5_scanner_empty_file(tmp_path):
