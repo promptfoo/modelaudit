@@ -318,12 +318,13 @@ def test_executorch_duplicate_pickle_members_scan_malicious_first_entry(tmp_path
     assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
 
 
-def test_renamed_executorch_archive_duplicate_pickle_routes_and_detects_shadowed_payload(tmp_path: Path) -> None:
+def test_renamed_executorch_archive_duplicate_members_route_and_detect_shadowed_payload(tmp_path: Path) -> None:
     model_path = tmp_path / "duplicate-model.jpg"
     with zipfile.ZipFile(model_path, "w") as zipf:
         zipf.writestr("version", "1")
         zipf.writestr("bytecode.pkl", _pickle_payload_with_eval("print('evil')"))
         zipf.writestr("bytecode.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("version", "not-a-version")
 
     file_result = core.scan_file(str(model_path), config={"cache_scan_results": False})
     result = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
