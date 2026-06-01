@@ -23,7 +23,12 @@ def _get_model_extensions() -> set[str]:
 
 def _normalized_model_path(url: str) -> str | None:
     """Return a decoded path that remains within download.pytorch.org/models."""
-    path = unquote(urlsplit(url).path)
+    path = urlsplit(url).path
+    decoded_path = unquote(path)
+    while decoded_path != path:
+        path = decoded_path
+        decoded_path = unquote(path)
+
     if "\\" in path or "\x00" in path:
         return None
     normalized_path = posixpath.normpath(path)
@@ -32,12 +37,40 @@ def _normalized_model_path(url: str) -> str | None:
     return normalized_path
 
 
-def _weight_filename(url: str) -> str:
-    """Return a safe local basename for an extracted PyTorch Hub weight URL."""
+def _weight_relative_path(url: str) -> Path:
+    """Return a safe local relative path for an extracted PyTorch Hub weight URL."""
     normalized_path = _normalized_model_path(url)
     if normalized_path is None:
         raise ValueError(f"Unsafe PyTorch Hub model URL: {url}")
-    return PurePosixPath(normalized_path).name
+    return Path(*PurePosixPath(normalized_path).relative_to("/models").parts)
+
+
+def _artifact_download_paths(urls: list[str]) -> list[tuple[str, Path]]:
+    """Preserve artifact subpaths and uniquify any remaining local collisions."""
+    artifacts: list[tuple[str, Path]] = []
+    used_paths: set[Path] = set()
+
+    for url in urls:
+        relative_path = _weight_relative_path(url)
+        download_path = relative_path
+        duplicate_index = 2
+        while download_path in used_paths:
+            download_path = Path(f"__modelaudit_duplicate_{duplicate_index}") / relative_path
+            duplicate_index += 1
+
+        used_paths.add(download_path)
+        artifacts.append((url, download_path))
+
+    return artifacts
+
+
+def _safe_destination_path(dest_dir: Path, relative_path: Path) -> Path:
+    """Return a contained local destination without following cache symlinks outside the root."""
+    dest_file = dest_dir / relative_path
+    if not dest_file.resolve().is_relative_to(dest_dir.resolve()):
+        raise ValueError(f"Unsafe PyTorch Hub cache path: {relative_path.as_posix()}")
+    dest_file.parent.mkdir(parents=True, exist_ok=True)
+    return dest_file
 
 
 def is_pytorch_hub_url(url: str) -> bool:
@@ -103,9 +136,8 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
                 shutil.rmtree(dest_dir, ignore_errors=True)
             raise Exception(f"Cannot download model from {url}: {message}")
 
-    for weight_url in weight_urls:
-        filename = _weight_filename(weight_url)
-        dest_file = dest_dir / filename
+    for weight_url, relative_path in _artifact_download_paths(weight_urls):
+        dest_file = _safe_destination_path(dest_dir, relative_path)
         try:
             with requests.get(weight_url, stream=True, timeout=30) as resp:
                 resp.raise_for_status()
@@ -155,13 +187,12 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
 
     try:
         total_files = len(weight_urls)
-        for i, weight_url in enumerate(weight_urls):
+        for i, (weight_url, relative_path) in enumerate(_artifact_download_paths(weight_urls)):
             is_last = i == total_files - 1
-            filename = _weight_filename(weight_url)
-            dest_file = temp_dir / filename
+            dest_file = _safe_destination_path(temp_dir, relative_path)
 
             if show_progress:
-                click.echo(f"⬇️  Downloading {filename}")
+                click.echo(f"⬇️  Downloading {relative_path.as_posix()}")
 
             try:
                 with requests.get(weight_url, stream=True, timeout=30) as resp:
