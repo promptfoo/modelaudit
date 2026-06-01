@@ -10,7 +10,9 @@ from itertools import islice
 from pathlib import Path
 from typing import Any
 
+from ..detectors.network_comm import _redact_urls_in_text
 from ..models import Check, CheckStatus, Issue, IssueSeverity, ModelAuditResultModel, create_initial_audit_result
+from ..utils.sources.cloud_storage import redact_cloud_error_for_display
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +105,10 @@ def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[st
     return result
 
 
+def _redact_mlflow_error_for_display(error: object) -> str:
+    return redact_cloud_error_for_display(_redact_urls_in_text(str(error)))
+
+
 def _bounded_artifact_listing(
     list_artifacts: Any,
     artifact_path: str | None,
@@ -164,7 +170,7 @@ def _preflight_mlflow_download_budget(
         list_artifacts = artifact_repository.list_artifacts
     except Exception as e:
         details["reason"] = "artifact_size_unavailable"
-        details["error"] = str(e)
+        details["error"] = _redact_mlflow_error_for_display(e)
         return _mlflow_budget_failure_result(
             model_uri,
             "Unable to determine MLflow artifact size before download",
@@ -282,7 +288,7 @@ def _preflight_mlflow_download_budget(
                     )
     except Exception as e:
         details["reason"] = "artifact_size_unavailable"
-        details["error"] = str(e)
+        details["error"] = _redact_mlflow_error_for_display(e)
         return _mlflow_budget_failure_result(
             model_uri,
             "Unable to determine MLflow artifact size before download",

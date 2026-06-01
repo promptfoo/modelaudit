@@ -2096,7 +2096,7 @@ def test_scan_mlflow_uri_budget_refusal_is_not_recorded_as_completed(
     )
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "models:/TestModel/1"])
+    result = runner.invoke(cli, ["scan", "--format", "text", "models:/TestModel/1"])
 
     assert result.exit_code == 2
     assert "Download refused by configured size budget" in result.output

@@ -224,6 +224,31 @@ def test_scan_mlflow_model_rejects_unknown_size_before_download(
 
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_redacts_size_lookup_error_before_reporting(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+) -> None:
+    """Remote size lookup failures should not copy backend credentials into findings."""
+    secret_url = "https://user:password@example.com/AKIAIOSFODNN7EXAMPLE?X-Amz-Signature=supersecret"
+    mock_mlflow = MagicMock()
+    mock_mlflow.artifacts.get_artifact_repository.side_effect = RuntimeError(f"size unavailable for {secret_url}")
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1", max_file_size=1000)
+
+    mock_mkdtemp.assert_not_called()
+    mock_scan.assert_not_called()
+    reported_error = result.checks[0].details["error"]
+    serialized_result = result.model_dump_json()
+    assert "user:password" not in serialized_result
+    assert "AKIAIOSFODNN7EXAMPLE" not in serialized_result
+    assert "supersecret" not in serialized_result
+    assert reported_error == "size unavailable for https://example.com/<redacted>"
+    assert result.issues[0].details["error"] == reported_error
+
+
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
 def test_scan_mlflow_model_rejects_oversized_artifact_before_download(
     mock_scan: MagicMock,
     mock_mkdtemp: MagicMock,
