@@ -657,6 +657,22 @@ def _should_defer_hash_for_max_file_size(file_path: str, config: dict[str, Any])
     return file_size > max_file_size and not should_use_advanced_handler(file_path)
 
 
+def _should_defer_hash_for_max_total_size(
+    config: dict[str, Any],
+    *,
+    hashed_bytes: int = 0,
+) -> bool:
+    """Avoid hashing files after the aggregate scan read budget is crossed."""
+    try:
+        max_total_size = int(config.get("max_total_size", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if max_total_size <= 0:
+        return False
+
+    return hashed_bytes > max_total_size
+
+
 def _hash_files_by_path(file_paths: list[str], *, config: dict[str, Any] | None = None) -> dict[str, str]:
     """Hash files individually so scan results stay path-specific.
 
@@ -670,6 +686,7 @@ def _hash_files_by_path(file_paths: list[str], *, config: dict[str, Any] | None 
     """
     content_hashes: dict[str, str] = {}
     hashes_by_inode: dict[tuple[int, int, int, int], str] = {}
+    hashed_bytes = 0
 
     for file_path in file_paths:
         hash_config = config or {}
@@ -697,6 +714,11 @@ def _hash_files_by_path(file_paths: list[str], *, config: dict[str, Any] | None 
                 # Fall back to direct hashing when stat is unavailable or the file changes mid-scan.
                 pass
 
+            if _should_defer_hash_for_max_total_size(hash_config, hashed_bytes=hashed_bytes):
+                content_hashes[file_path] = f"unhashable_max_total_size_{id(file_path)}"
+                continue
+            with suppress(OSError):
+                hashed_bytes += os.path.getsize(file_path)
             content_hashes[file_path] = _calculate_file_hash(file_path)
             if inode_key is not None:
                 hashes_by_inode[inode_key] = content_hashes[file_path]
@@ -813,6 +835,7 @@ def scan_model_directory_or_file(
     }
     # Track file hashes for aggregate hash computation
     file_hashes: list[str] = []
+    top_level_hashed_bytes = 0
     nearby_license_cache: dict[str, list[str]] = {}
     pickle_source_snapshot_stack = ExitStack()
 
@@ -1352,11 +1375,18 @@ def scan_model_directory_or_file(
                 # Hash the top-level target before scanning. Archive scanners merge
                 # nested member results into their metadata, so scanner-emitted
                 # hashes are not always the bytes of this target.
-                if not _should_defer_hash_for_safetensors_header_limit(
-                    target, config
-                ) and not _should_defer_hash_for_max_file_size(target, config):
+                if (
+                    not _should_defer_hash_for_safetensors_header_limit(target, config)
+                    and not _should_defer_hash_for_max_file_size(target, config)
+                    and not _should_defer_hash_for_max_total_size(
+                        config,
+                        hashed_bytes=top_level_hashed_bytes,
+                    )
+                ):
                     try:
                         top_level_hashing_started_at = _start_phase_timing(phase_timings)
+                        with suppress(OSError):
+                            top_level_hashed_bytes += os.path.getsize(target)
                         file_hash = _calculate_file_hash(target)
                         file_hashes.append(file_hash)
                     except Exception as e:
@@ -1404,8 +1434,11 @@ def scan_model_directory_or_file(
                         f"Total scan size limit exceeded: {results.bytes_scanned} bytes (max: {max_total_size})",
                         severity=IssueSeverity.INFO.value,
                         location=target,
-                        details={"max_total_size": max_total_size},
+                        details={"max_total_size": max_total_size, "analysis_incomplete": True},
                     )
+                    scan_metadata["success"] = False
+                    scan_metadata["has_operational_errors"] = True
+                    break
 
                 if progress_callback:
                     progress_callback(f"Completed scanning: {target}", 100.0)
@@ -2215,9 +2248,14 @@ def scan_model_streaming(
     start_time = time.time()
     results = create_initial_audit_result()
     file_hashes: list[str] = []
+    top_level_hashed_bytes = 0
     files_processed = 0
     skip_file_types: bool = bool(kwargs.get("skip_file_types", False))
     scan_kwargs = normalize_scanner_selection_config(kwargs)
+    try:
+        max_total_size = int(scan_kwargs.get("max_total_size", 0) or 0)
+    except (TypeError, ValueError):
+        max_total_size = 0
     scanner_selection = policy_from_config(scan_kwargs)
     scanner_selection_extensions = selected_scanner_extensions(scanner_selection) if scanner_selection.active else None
     if scanner_selection.active:
@@ -2292,14 +2330,21 @@ def scan_model_streaming(
                 }
 
                 file_hash: str | None = None
-                if not _should_defer_hash_for_safetensors_header_limit(
-                    str(scan_path), scan_config
-                ) and not _should_defer_hash_for_max_file_size(str(scan_path), scan_config):
+                if (
+                    not _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config)
+                    and not _should_defer_hash_for_max_file_size(str(scan_path), scan_config)
+                    and not _should_defer_hash_for_max_total_size(
+                        scan_config,
+                        hashed_bytes=top_level_hashed_bytes,
+                    )
+                ):
                     if progress_callback:
                         progress_callback(
                             f"Hashing {source_path.name}",
                             (files_processed / (files_processed + 1)) * 100,
                         )
+                    with suppress(OSError):
+                        top_level_hashed_bytes += scan_path.stat().st_size
                     file_hash = compute_sha256_hash(scan_path)
                     file_hashes.append(file_hash)
 
@@ -2359,6 +2404,16 @@ def scan_model_streaming(
                         results.assets.extend(convert_assets_to_models([asset]))
 
                 files_processed += 1
+                if max_total_size > 0 and results.bytes_scanned > max_total_size:
+                    _add_issue_to_model(
+                        results,
+                        f"Total scan size limit exceeded: {results.bytes_scanned} bytes (max: {max_total_size})",
+                        severity=IssueSeverity.INFO.value,
+                        location=report_path,
+                        details={"max_total_size": max_total_size, "analysis_incomplete": True},
+                    )
+                    results.has_errors = True
+                    break
 
             except Exception as e:
                 logger.error(f"Error processing {source_path}: {e}", exc_info=True)

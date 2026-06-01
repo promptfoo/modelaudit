@@ -780,6 +780,74 @@ def test_scan_model_streaming_does_not_hash_files_over_max_file_size(
     assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
 
 
+def test_scan_model_streaming_fails_closed_after_max_total_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = tmp_path / "oversized.pkl"
+    payload.write_bytes(pickle.dumps({"safe": True}) + b"X" * 128)
+    scan_result = ScanResult(scanner_name="bounded_test")
+    scan_result.bytes_scanned = 128
+    scan_result.finish(success=True)
+    hashed_paths: list[Path] = []
+    file_hash = "a" * 64
+
+    def track_hash(path: Path) -> str:
+        hashed_paths.append(path)
+        return file_hash
+
+    monkeypatch.setattr("modelaudit.utils.helpers.file_hash.compute_sha256_hash", track_hash)
+    monkeypatch.setattr("modelaudit.core.scan_file", lambda _path, **_kwargs: scan_result)
+
+    result = scan_model_streaming(
+        file_generator=iter([(payload, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        max_total_size=64,
+        cache_enabled=False,
+    )
+
+    assert hashed_paths == [payload]
+    assert result.files_scanned == 1
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(issue.message.startswith("Total scan size limit exceeded") for issue in result.issues)
+
+
+def test_scan_model_streaming_stops_hashing_at_max_total_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "first.pkl"
+    first.write_bytes(b"A" * 32)
+    second = tmp_path / "second.pkl"
+    second.write_bytes(b"B" * 33)
+    third = tmp_path / "third.pkl"
+    third.write_bytes(b"C")
+    hashed_paths: list[Path] = []
+    first_hash = "a" * 64
+
+    def track_hash(path: Path) -> str:
+        hashed_paths.append(path)
+        return first_hash
+
+    monkeypatch.setattr("modelaudit.utils.helpers.file_hash.compute_sha256_hash", track_hash)
+    monkeypatch.setattr("modelaudit.core.scan_file", lambda _path, **_kwargs: create_mock_scan_result(bytes_scanned=1))
+
+    result = scan_model_streaming(
+        file_generator=iter([(first, False), (second, False), (third, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        max_total_size=64,
+        cache_enabled=False,
+    )
+
+    assert hashed_paths == [first, second]
+    assert result.files_scanned == 3
+    assert result.content_hash == compute_aggregate_hash([first_hash, first_hash])
+    assert result.success is True
+
+
 def test_scan_model_streaming_content_hash_deterministic():
     """Test that content hash is deterministic for same files."""
     # Create two files with same content
