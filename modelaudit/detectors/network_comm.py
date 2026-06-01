@@ -18,6 +18,10 @@ _URL_IN_TEXT_PATTERN = re.compile(
     r"(?:https?|ftp|ftps|ssh|telnet|ws|wss|s3|gs|az|wasbs?|abfss?)://[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+",
     re.IGNORECASE,
 )
+_URL_BYTES_PATTERN = re.compile(
+    rb"(?:https?|ftp|ftps|ssh|telnet|ws|wss)://[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+",
+    re.IGNORECASE,
+)
 _SENSITIVE_PATH_TOKEN_PATTERN = re.compile(
     r"(?i)^(?:"
     r"AKIA[0-9A-Z]{16}|"
@@ -575,6 +579,17 @@ _DOCUMENTATION_CONTEXT_NAME_PREFIXES: tuple[str, ...] = (
     "model_card",
     "license",
 )
+_TOKEN_LIST_CONTEXT_NAMES: frozenset[str] = frozenset(
+    {
+        "classes.txt",
+        "labels.txt",
+        "tokenizer.txt",
+        "tokens.txt",
+        "vocab.txt",
+        "vocabulary.txt",
+    }
+)
+_TOKEN_LIST_CONTEXT_PREFIXES: tuple[str, ...] = ("label", "token", "vocab")
 _PROSE_MARKERS: tuple[str, ...] = (
     " example",
     " examples",
@@ -602,6 +617,18 @@ _CODE_LINE_MARKERS: tuple[bytes, ...] = (
 )
 _INLINE_COMPOUND_STATEMENT_PATTERN = re.compile(
     rb"^\s*(?:if|elif|else|for|while|with|try|except|finally|match|case)\b[^#\n]*:\s*\S"
+)
+_CONFIG_ASSIGNMENT_PATTERN = re.compile(rb"(?:^|[\s{[(,;])[A-Za-z_][A-Za-z0-9_.-]*\s*=")
+_SUSPICIOUS_NETWORK_LABEL_PATTERN = re.compile(
+    rb"\b(?:beacon|callback|c2|command(?:[_ -]+and[_ -]+control)?|exfil(?:tration)?|phone[_ -]+home|webhook)\b"
+    rb"[^\n]{0,32}:\s*$",
+    re.IGNORECASE,
+)
+_SHELL_NETWORK_COMMAND_PATTERN = re.compile(
+    rb"^\s*(?:(?:[$>#]|[A-Za-z0-9._-]+[$#])\s*)?"
+    rb"(?:(?:bash|sh|zsh)\s+-c\s+[\"']?\s*)?"
+    rb"(?:curl|fetch|invoke-webrequest|iwr|powershell(?:\.exe)?|pwsh|wget)\b",
+    re.IGNORECASE,
 )
 _STRUCTURED_METADATA_PREFIXES: tuple[bytes, ...] = (b"{", b"[", b'"', b"'")
 _EXPLICIT_VERSION_LITERAL_CONTEXT_PATTERN = re.compile(
@@ -649,14 +676,65 @@ def _is_documentation_context(context: str) -> bool:
     return filename.endswith(_DOCUMENTATION_CONTEXT_EXTENSIONS) or stem.startswith(_DOCUMENTATION_CONTEXT_NAME_PREFIXES)
 
 
-def _extract_line(data: bytes, match_index: int) -> bytes:
-    """Extract the line containing a matched network token."""
+def _is_token_list_context(context: str) -> bool:
+    """Return whether a scan context names an inert vocabulary or label token list."""
+    context_lower = context.lower()
+    context_segments = [segment for segment in context_lower.replace("\\", "/").split("/") if segment]
+    filename = context_segments[-1] if context_segments else context_lower
+    return filename in _TOKEN_LIST_CONTEXT_NAMES or (
+        filename.endswith(".txt") and filename.startswith(_TOKEN_LIST_CONTEXT_PREFIXES)
+    )
+
+
+def _line_bounds(data: bytes, match_index: int) -> tuple[int, int]:
+    """Return bounded offsets for the line containing a matched token."""
     line_start = max(data.rfind(b"\n", 0, match_index) + 1, match_index - _MAX_PROSE_LINE_CONTEXT_BYTES)
     line_end = data.find(b"\n", match_index)
     if line_end == -1:
         line_end = len(data)
-    line_end = min(line_end, match_index + _MAX_PROSE_LINE_CONTEXT_BYTES)
+    return line_start, min(line_end, match_index + _MAX_PROSE_LINE_CONTEXT_BYTES)
+
+
+def _extract_line(data: bytes, match_index: int) -> bytes:
+    """Extract the line containing a matched network token."""
+    line_start, line_end = _line_bounds(data, match_index)
     return data[line_start:line_end]
+
+
+def _url_match_span_containing_offset(data: bytes, offset: int) -> tuple[int, int] | None:
+    """Return the bounded URL match containing an offset, if present."""
+    scan_start = max(0, offset - _MAX_URL_TEXT_LOOKUP_BYTES)
+    scan_end = min(len(data), offset + _MAX_URL_TEXT_LOOKUP_BYTES)
+    return next(
+        (
+            match.span()
+            for match in _URL_BYTES_PATTERN.finditer(data, scan_start, scan_end)
+            if match.start() <= offset < match.end()
+        ),
+        None,
+    )
+
+
+def _extract_line_without_network_reference(data: bytes, match_index: int, token_len: int) -> bytes:
+    """Return line context outside the matched URL or domain token."""
+    line_start, line_end = _line_bounds(data, match_index)
+    reference_start, reference_end = _url_match_span_containing_offset(data, match_index) or (
+        match_index,
+        match_index + token_len,
+    )
+    return data[line_start:reference_start] + data[reference_end:line_end]
+
+
+def _is_bare_token_list_reference(data: bytes, *, match_index: int, token_len: int, context: str) -> bool:
+    """Return whether a finding came from an inert one-token vocabulary or label line."""
+    return (
+        _is_token_list_context(context)
+        and not _extract_line_without_network_reference(
+            data,
+            match_index,
+            token_len,
+        ).strip()
+    )
 
 
 def _iter_pattern_matches(data: bytes, pattern: bytes) -> Iterator[int]:
@@ -723,16 +801,25 @@ def _is_doc_only_network_reference(
 
 def _is_doc_only_url_reference(data: bytes, *, match_index: int, token_len: int, context: str) -> bool:
     """Return whether a URL or domain is ordinary prose in a documentation sidecar."""
+    if _is_bare_token_list_reference(data, match_index=match_index, token_len=token_len, context=context):
+        return True
     if not _is_documentation_context(context):
         return False
 
     line_lower = _extract_line(data, match_index).lower()
+    line_without_reference = _extract_line_without_network_reference(data, match_index, token_len).lower()
     stripped = line_lower.lstrip()
+    if _SHELL_NETWORK_COMMAND_PATTERN.match(stripped):
+        return False
+    if _SUSPICIOUS_NETWORK_LABEL_PATTERN.search(line_without_reference):
+        return False
     if any(stripped.startswith(prefix) for prefix in _CODE_LINE_PREFIXES):
         return False
     if _INLINE_COMPOUND_STATEMENT_PATTERN.match(line_lower):
         return False
-    if any(marker in line_lower for marker in _CODE_LINE_MARKERS):
+    if _CONFIG_ASSIGNMENT_PATTERN.search(line_without_reference):
+        return False
+    if any(marker in line_without_reference for marker in (b";", b"lambda ")):
         return False
     return not _has_call_syntax(data, match_index, token_len)
 
@@ -741,9 +828,7 @@ class NetworkCommDetector:
     """Detector for network communication patterns in model files."""
 
     # URL patterns - also match ftp, ftps, ssh, etc.
-    URL_PATTERN = re.compile(
-        rb"(?:https?|ftp|ftps|ssh|telnet|ws|wss)://[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+", re.IGNORECASE
-    )
+    URL_PATTERN = _URL_BYTES_PATTERN
 
     # Cloud storage URL patterns for detecting external resource references
     # These patterns detect references to cloud storage that could indicate
@@ -1092,6 +1177,13 @@ class NetworkCommDetector:
             for match in pattern.finditer(data):
                 url = match.group().decode("utf-8", errors="ignore")
                 safe_url = _redact_url_for_finding(url)
+                if _is_bare_token_list_reference(
+                    data,
+                    match_index=match.start(),
+                    token_len=len(match.group()),
+                    context=context,
+                ):
+                    continue
 
                 # Skip duplicates
                 if url in seen_urls:
@@ -1130,6 +1222,13 @@ class NetworkCommDetector:
         # IPv4
         for match in self.IPV4_PATTERN.finditer(data):
             ip = match.group().decode("utf-8", errors="ignore")
+            if _is_bare_token_list_reference(
+                data,
+                match_index=match.start(),
+                token_len=len(match.group()),
+                context=context,
+            ):
+                continue
 
             # Check for common false positives (version numbers) only when the
             # matched token itself is the version literal.
@@ -1183,6 +1282,13 @@ class NetworkCommDetector:
         # IPv6
         for match in self.IPV6_PATTERN.finditer(data):
             ip = match.group().decode("utf-8", errors="ignore")
+            if _is_bare_token_list_reference(
+                data,
+                match_index=match.start(),
+                token_len=len(match.group()),
+                context=context,
+            ):
+                continue
             with suppress(ipaddress.AddressValueError):
                 ip6_obj = ipaddress.IPv6Address(ip)
 
@@ -1365,6 +1471,13 @@ class NetworkCommDetector:
         for lib in self.NETWORK_LIBRARIES:
             for pattern in self.NETWORK_LIBRARY_PATTERNS[lib]:
                 for match_index in _iter_pattern_matches(data, pattern):
+                    if _is_bare_token_list_reference(
+                        data,
+                        match_index=match_index,
+                        token_len=len(pattern),
+                        context=context,
+                    ):
+                        continue
                     if _is_doc_only_network_reference(
                         data,
                         match_index=match_index,
@@ -1390,6 +1503,7 @@ class NetworkCommDetector:
                             "message": f"Network library detected: {lib.decode()}",
                             "library": lib.decode(),
                             "pattern": pattern.decode("utf-8", errors="ignore"),
+                            "position": match_index,
                             "context": context,
                         }
                     )
@@ -1402,6 +1516,8 @@ class NetworkCommDetector:
         """Scan for network function calls."""
         for func in self.NETWORK_FUNCTIONS:
             for idx in _iter_pattern_matches(data, func):
+                if _is_bare_token_list_reference(data, match_index=idx, token_len=len(func), context=context):
+                    continue
                 if _is_doc_only_network_reference(
                     data,
                     match_index=idx,
@@ -1430,6 +1546,7 @@ class NetworkCommDetector:
                         "message": f"Network function call detected: {func.decode()}",
                         "function": func.decode(),
                         "snippet": snippet,
+                        "position": idx,
                         "context": context,
                     }
                 )
@@ -1439,30 +1556,32 @@ class NetworkCommDetector:
         """Scan for command & control patterns."""
         lowered_data = data.lower()
         for pattern in self.cc_patterns:
-            idx = lowered_data.find(pattern)
-            if idx < 0:
-                continue
+            for idx in _iter_pattern_matches(lowered_data, pattern):
+                if _is_bare_token_list_reference(data, match_index=idx, token_len=len(pattern), context=context):
+                    continue
 
-            snippet = _redacted_snippet_for_match(data, idx, idx + len(pattern), before=30, after=30)
+                snippet = _redacted_snippet_for_match(data, idx, idx + len(pattern), before=30, after=30)
 
-            confidence = 0.8
-            severity = "CRITICAL"
+                confidence = 0.8
+                severity = "CRITICAL"
 
-            # Very suspicious patterns
-            if pattern in [b"malware", b"backdoor", b"trojan", b"botnet"]:
-                confidence = 0.95
+                # Very suspicious patterns
+                if pattern in [b"malware", b"backdoor", b"trojan", b"botnet"]:
+                    confidence = 0.95
 
-            self.findings.append(
-                {
-                    "type": "cc_pattern",
-                    "severity": severity,
-                    "confidence": confidence,
-                    "message": f"C&C pattern detected: {pattern.decode()}",
-                    "pattern": pattern.decode(),
-                    "snippet": snippet,
-                    "context": context,
-                }
-            )
+                self.findings.append(
+                    {
+                        "type": "cc_pattern",
+                        "severity": severity,
+                        "confidence": confidence,
+                        "message": f"C&C pattern detected: {pattern.decode()}",
+                        "pattern": pattern.decode(),
+                        "snippet": snippet,
+                        "position": idx,
+                        "context": context,
+                    }
+                )
+                break
 
     def _scan_suspicious_ports(self, data: bytes, context: str) -> None:
         """Scan for references to suspicious ports."""
@@ -1492,21 +1611,36 @@ class NetworkCommDetector:
         # For non-ML files, use the original port detection logic
         for port in self.SUSPICIOUS_PORTS:
             for pattern_bytes in self.PORT_PATTERNS[port]:
-                if pattern_bytes in data:
-                    port_name = self._get_port_name(port)
+                match_index = next(
+                    (
+                        index
+                        for index in _iter_pattern_matches(data, pattern_bytes)
+                        if not _is_bare_token_list_reference(
+                            data,
+                            match_index=index,
+                            token_len=len(pattern_bytes),
+                            context=context,
+                        )
+                    ),
+                    None,
+                )
+                if match_index is None:
+                    continue
+                port_name = self._get_port_name(port)
 
-                    self.findings.append(
-                        {
-                            "type": "suspicious_port",
-                            "severity": "MEDIUM",
-                            "confidence": 0.6,
-                            "message": f"Suspicious port detected: {port} ({port_name})",
-                            "port": port,
-                            "service": port_name,
-                            "context": context,
-                        }
-                    )
-                    break
+                self.findings.append(
+                    {
+                        "type": "suspicious_port",
+                        "severity": "MEDIUM",
+                        "confidence": 0.6,
+                        "message": f"Suspicious port detected: {port} ({port_name})",
+                        "port": port,
+                        "service": port_name,
+                        "position": match_index,
+                        "context": context,
+                    }
+                )
+                break
 
     def _scan_explicit_network_patterns_in_ml_models(self, data: bytes, context: str) -> None:
         """Scan for very explicit network patterns in ML models with high confidence."""

