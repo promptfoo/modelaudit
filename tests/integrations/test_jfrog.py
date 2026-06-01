@@ -1,3 +1,4 @@
+import importlib
 import io
 import logging
 import os
@@ -7,6 +8,7 @@ import sys
 import tarfile
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlparse
 
@@ -14,7 +16,9 @@ import pytest
 import requests
 
 from modelaudit.scanner_selection import scanner_selection_config_from_inputs
+from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 from modelaudit.utils.sources.jfrog import (
+    _scanner_ids_for_detected_jfrog_format,
     detect_jfrog_target_type,
     download_artifact,
     download_jfrog_folder,
@@ -25,7 +29,7 @@ from modelaudit.utils.sources.jfrog import (
     list_jfrog_folder_contents,
     redact_jfrog_url_for_display,
 )
-from tests.helpers import create_mock_coreml, create_mock_onnx
+from tests.helpers import create_mock_coreml, create_mock_mxnet_symbol, create_mock_onnx
 
 
 class _FakeStreamingResponse:
@@ -48,6 +52,30 @@ class _FakeStreamingResponse:
 
     def close(self) -> None:
         self.closed = True
+
+
+def _build_tensorflow_remote_route_payloads() -> dict[str, bytes]:
+    """Build minimal vendored-proto TensorFlow fixtures without importing TensorFlow itself."""
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
+
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph_node = metagraph.graph_def.node.add()
+    metagraph_node.name = "pyfunc_node"
+    metagraph_node.op = "PyFunc"
+
+    saved_model = saved_model_pb2.SavedModel()
+    saved_model.saved_model_schema_version = 1
+    saved_node = saved_model.meta_graphs.add().graph_def.node.add()
+    saved_node.name = "pyfunc_node"
+    saved_node.op = "PyFunc"
+
+    return {
+        "metagraph.payload": cast(bytes, metagraph.SerializeToString()),
+        "savedmodel.payload": cast(bytes, saved_model.SerializeToString()),
+    }
 
 
 class TestJFrogURLDetection:
@@ -154,6 +182,26 @@ class TestJFrogDownload:
         assert mock_get.call_args_list[1].args[0] == ("https://company.jfrog.io/artifactory/repo/model.bin?download=1")
         assert mock_get.call_args_list[1].kwargs["headers"]["X-JFrog-Art-Api"] == "test-token"
         assert redirect_response.closed is True
+        assert final_response.closed is True
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_closes_response_before_parsing_malformed_redirect(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Malformed redirect targets must not leak streamed responses."""
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        redirect_response = _FakeStreamingResponse(b"", status_code=302, headers={"Location": "https://[::1"})
+        mock_get.return_value = redirect_response
+
+        with pytest.raises(Exception, match="Failed to download artifact"):
+            download_artifact(
+                "https://company.jfrog.io/artifactory/repo/model.bin",
+                cache_dir=tmp_path,
+                api_token="test-token",
+            )
+
+        assert redirect_response.closed is True
+        assert not any(tmp_path.iterdir())
 
     def test_invalid_url(self):
         with pytest.raises(ValueError):
@@ -871,6 +919,135 @@ class TestJFrogFolderDownload:
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     @patch("modelaudit.utils.sources.jfrog.download_artifact")
     @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_selective_includes_local_bounded_content_routes(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Remote probes should preserve renamed formats recognized by bounded local predicates."""
+        cntk_payload = (
+            b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02"
+            b"\x12\x09\x0a\x03uid\x12\x02ab CompositeFunction primitive_functions "
+        )
+        lightgbm_payload = (
+            b"tree=0\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+            b"tree_sizes=12\nnum_leaves=2\nsplit_feature=0\nleaf_value=0.1 0.2\n"
+        )
+        torch7_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential "
+        executorch_payload = b"\x04\x00\x00\x00ET12payload"
+        mxnet_payload = create_mock_mxnet_symbol(tmp_path / "fixture-symbol.json").read_bytes()
+        payloads = {
+            "https://company.jfrog.io/artifactory/repo/models/cntk.payload": cntk_payload,
+            "https://company.jfrog.io/artifactory/repo/models/lightgbm.payload": lightgbm_payload,
+            "https://company.jfrog.io/artifactory/repo/models/torch7.payload": torch7_payload,
+            "https://company.jfrog.io/artifactory/repo/models/executorch.payload": executorch_payload,
+            "https://company.jfrog.io/artifactory/repo/models/mxnet.payload": mxnet_payload,
+        }
+        mock_list.return_value = [
+            {"name": Path(url).name, "path": url, "size": len(payload), "human_size": "Unknown"}
+            for url, payload in payloads.items()
+        ]
+        mock_get.side_effect = lambda url, **_kwargs: _FakeStreamingResponse(payloads[url])
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(urlparse(url).path).name
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path / "downloads",
+            show_progress=False,
+        )
+
+        assert {call.args[0] for call in mock_download.call_args_list} == set(payloads)
+        probed_urls = [call.args[0] for call in mock_get.call_args_list]
+        mxnet_url = "https://company.jfrog.io/artifactory/repo/models/mxnet.payload"
+        assert probed_urls.count(mxnet_url) == 2
+        assert all(probed_urls.count(url) == 1 for url in set(payloads) - {mxnet_url})
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_selective_skips_local_route_near_matches(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Remote probes should not pull benign near matches for longer local signatures."""
+        payloads = {
+            "https://company.jfrog.io/artifactory/repo/models/cntk.payload": b"\x0a\x07version \x0a\x03uid",
+            "https://company.jfrog.io/artifactory/repo/models/lightgbm.payload": b"tree=0\nversion=v4\n",
+            "https://company.jfrog.io/artifactory/repo/models/torch7.payload": b"torch nn.Sequential source text",
+            "https://company.jfrog.io/artifactory/repo/models/executorch.payload": b"\x04\x00\x00\x00ETxxpayload",
+            "https://company.jfrog.io/artifactory/repo/models/mxnet.payload": b'{"nodes":[],"arg_nodes":[],"heads":[]}',
+        }
+        mock_list.return_value = [
+            {"name": Path(url).name, "path": url, "size": len(payload), "human_size": "Unknown"}
+            for url, payload in payloads.items()
+        ]
+        mock_get.side_effect = lambda url, **_kwargs: _FakeStreamingResponse(payloads[url])
+
+        with pytest.raises(ValueError, match="No scannable model files found"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path / "downloads",
+                show_progress=False,
+            )
+
+        mock_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_selective_includes_tensorflow_protobuf_routes(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Selective remote probes should preserve renamed TensorFlow protobuf models."""
+        payloads = {
+            f"https://company.jfrog.io/artifactory/repo/models/{name}": payload
+            for name, payload in _build_tensorflow_remote_route_payloads().items()
+        }
+        mock_list.return_value = [
+            {"name": Path(url).name, "path": url, "size": len(payload), "human_size": "Unknown"}
+            for url, payload in payloads.items()
+        ]
+        mock_get.side_effect = lambda url, **_kwargs: _FakeStreamingResponse(payloads[url])
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(urlparse(url).path).name
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            show_progress=False,
+        )
+
+        assert {call.args[0] for call in mock_download.call_args_list} == set(payloads)
+
+    def test_jfrog_protobuf_candidate_scanner_selection_preserves_tensorflow_routes(self) -> None:
+        """Ambiguous remote protobufs should remain eligible for TensorFlow scanner selection."""
+        scanner_ids = _scanner_ids_for_detected_jfrog_format(PROTOBUF_MODEL_CANDIDATE_FORMAT)
+
+        assert {"coreml", "onnx", "protobuf_model_candidate", "tf_metagraph", "tf_savedmodel"} <= scanner_ids
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
     def test_download_jfrog_folder_probe_fails_closed_on_untrusted_redirect(
         self,
         mock_list: MagicMock,
@@ -1005,6 +1182,7 @@ class TestJFrogFolderDownload:
         tmp_path: Path,
     ) -> None:
         """Selective remote probes should preserve ONNX, CoreML, and TAR payloads with renamed suffixes."""
+        pytest.importorskip("onnx")
         onnx_payload = create_mock_onnx(tmp_path / "fixture.onnx").read_bytes()
         coreml_payload = create_mock_coreml(tmp_path / "fixture.mlmodel").read_bytes()
         tar_buffer = io.BytesIO()

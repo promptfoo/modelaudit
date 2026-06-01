@@ -341,6 +341,7 @@ def download_artifact(
         except Exception:
             logger.warning(message)
 
+    response: requests.Response | None = None
     try:
         response, _download_url = _get_jfrog_response_with_redirect_policy(
             url,
@@ -383,6 +384,9 @@ def download_artifact(
             shutil.rmtree(temp_dir)
         error_msg = redact_jfrog_error_for_display(e, url)
         raise Exception(f"Failed to download artifact from {display_url}: {error_msg}") from e
+    finally:
+        if response is not None:
+            response.close()
 
 
 def get_jfrog_base_url(url: str) -> str:
@@ -506,8 +510,8 @@ def _get_jfrog_response_with_redirect_policy(
                 f"{redact_jfrog_url_for_display(current_url)} did not include a Location header"
             )
 
-        redirected_url = urljoin(current_url, location)
         response.close()
+        redirected_url = urljoin(current_url, location)
         if _get_jfrog_probe_origin(redirected_url) != original_origin:
             raise requests.exceptions.RequestException(
                 "Refusing cross-origin JFrog redirect from "
@@ -549,6 +553,105 @@ def _looks_like_remote_safetensors(prefix: bytes, size_hint: int) -> bool:
         return False
 
 
+def _read_jfrog_content_prefix(
+    file_url: str,
+    *,
+    headers: dict[str, str],
+    timeout: int,
+    max_bytes: int,
+) -> tuple[bytes, str]:
+    """Read a bounded JFrog artifact prefix or fail closed with a redacted error."""
+    request_headers = {
+        **headers,
+        "Range": f"bytes=0-{max_bytes - 1}",
+        "Accept-Encoding": "identity",
+    }
+    response: requests.Response | None = None
+    try:
+        response, probe_download_url = _get_jfrog_response_with_redirect_policy(
+            file_url,
+            headers=request_headers,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=max_bytes):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= max_bytes:
+                break
+        return b"".join(chunks)[:max_bytes], probe_download_url
+    except Exception as exc:
+        raise ValueError(
+            "JFrog folder selective filtering incomplete: unable to inspect skipped artifact "
+            f"{redact_jfrog_url_for_display(file_url)}: {redact_jfrog_error_for_display(exc, file_url)}"
+        ) from exc
+    finally:
+        if response is not None:
+            response.close()
+
+
+def _detect_jfrog_mxnet_symbol_route(
+    file_url: str,
+    prefix: bytes,
+    size_hint: int,
+    *,
+    headers: dict[str, str],
+    timeout: int,
+) -> str | None:
+    """Return a bounded MXNet JSON route for a suffix-skipped JFrog artifact."""
+    from modelaudit.utils.file.detection import MXNET_SYMBOL_SIGNATURE_READ_BYTES, _detect_mxnet_symbol_prefix_route
+
+    normalized_prefix = prefix[3:] if prefix.startswith(b"\xef\xbb\xbf") else prefix
+    if not normalized_prefix.lstrip().startswith(b"{"):
+        return None
+
+    max_probe_size = MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1
+    if size_hint > 0:
+        max_probe_size = min(size_hint, max_probe_size)
+    mxnet_probe, _probe_download_url = _read_jfrog_content_prefix(
+        file_url,
+        headers=headers,
+        timeout=timeout,
+        max_bytes=max_probe_size,
+    )
+    mxnet_probe = mxnet_probe[3:] if mxnet_probe.startswith(b"\xef\xbb\xbf") else mxnet_probe
+    if len(mxnet_probe) > MXNET_SYMBOL_SIGNATURE_READ_BYTES:
+        return _detect_mxnet_symbol_prefix_route(
+            mxnet_probe[:MXNET_SYMBOL_SIGNATURE_READ_BYTES],
+            fail_closed_without_hint=True,
+        )
+    return _detect_mxnet_symbol_prefix_route(
+        mxnet_probe,
+        sample_is_prefix=(size_hint > len(mxnet_probe)) or (size_hint <= 0 and len(mxnet_probe) >= max_probe_size),
+        fail_closed_without_hint=True,
+    )
+
+
+def _detect_jfrog_tensorflow_protobuf_route(prefix: bytes) -> str | None:
+    """Classify bounded TensorFlow protobuf evidence using the local path-backed parser."""
+    from modelaudit.utils.file.detection import (
+        TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+        _classify_bounded_tensorflow_protobuf,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="modelaudit_jfrog_probe_") as probe_dir:
+        probe_path = Path(probe_dir) / "probe.pb"
+        probe_path.write_bytes(prefix)
+        route = _classify_bounded_tensorflow_protobuf(probe_path, len(prefix))
+
+    if route in {"tf_metagraph", "tf_savedmodel"}:
+        return route
+    if route == "oversized":
+        return "tf_metagraph"
+    if route in {"oversized_candidate", "inconclusive"}:
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    return None
+
+
 def _detect_jfrog_content_route_format(
     file_info: dict[str, Any],
     *,
@@ -559,36 +662,12 @@ def _detect_jfrog_content_route_format(
     """Return a content-routed model format for a JFrog file, if cheaply identifiable."""
     file_url = str(file_info["path"])
     headers = _build_jfrog_probe_auth_headers(file_url, api_token=api_token, access_token=access_token)
-    headers = {
-        **headers,
-        "Range": f"bytes=0-{_JFROG_CONTENT_SNIFF_BYTES - 1}",
-        "Accept-Encoding": "identity",
-    }
-
-    response: requests.Response | None = None
-    try:
-        response, probe_download_url = _get_jfrog_response_with_redirect_policy(
-            file_url, headers=headers, timeout=timeout
-        )
-        response.raise_for_status()
-        chunks: list[bytes] = []
-        total = 0
-        for chunk in response.iter_content(chunk_size=_JFROG_CONTENT_SNIFF_BYTES):
-            if not chunk:
-                continue
-            chunks.append(chunk)
-            total += len(chunk)
-            if total >= _JFROG_CONTENT_SNIFF_BYTES:
-                break
-        prefix = b"".join(chunks)[:_JFROG_CONTENT_SNIFF_BYTES]
-    except Exception as exc:
-        raise ValueError(
-            "JFrog folder selective filtering incomplete: unable to inspect skipped artifact "
-            f"{redact_jfrog_url_for_display(file_url)}: {redact_jfrog_error_for_display(exc, file_url)}"
-        ) from exc
-    finally:
-        if response is not None:
-            response.close()
+    prefix, probe_download_url = _read_jfrog_content_prefix(
+        file_url,
+        headers=headers,
+        timeout=timeout,
+        max_bytes=_JFROG_CONTENT_SNIFF_BYTES,
+    )
 
     if not prefix:
         return None, probe_download_url
@@ -604,12 +683,33 @@ def _detect_jfrog_content_route_format(
     from modelaudit.utils.file.detection import (
         PROTOBUF_MODEL_CANDIDATE_FORMAT,
         _could_start_proto0_or_1_pickle,
+        _is_cntk_signature,
+        _is_content_routed_lightgbm_signature,
+        _is_executorch_binary_signature,
+        _is_torch7_signature,
         _looks_like_coreml_model_proto_prefix,
         _looks_like_onnx_model_proto_stream,
         _looks_like_proto0_or_1_pickle,
         _looks_like_uncompressed_tar_header,
         detect_format_from_magic_bytes,
     )
+
+    if _is_cntk_signature(prefix):
+        return "cntk", probe_download_url
+    if _is_content_routed_lightgbm_signature(prefix):
+        return "lightgbm", probe_download_url
+
+    mxnet_route = _detect_jfrog_mxnet_symbol_route(
+        file_url,
+        prefix,
+        size_hint,
+        headers=headers,
+        timeout=timeout,
+    )
+    if mxnet_route is not None:
+        return mxnet_route, probe_download_url
+    if _is_executorch_binary_signature(prefix):
+        return "executorch", probe_download_url
 
     detected_format = detect_format_from_magic_bytes(
         prefix[:4],
@@ -634,6 +734,8 @@ def _detect_jfrog_content_route_format(
         return "pickle", probe_download_url
     if detected_format == "unknown" and _looks_like_uncompressed_tar_header(prefix):
         return "tar", probe_download_url
+    if detected_format == "unknown" and _is_torch7_signature(prefix):
+        return "torch7", probe_download_url
     if detected_format == "unknown":
         sample_is_prefix = size_hint <= 0 or size_hint > len(prefix) or len(prefix) >= _JFROG_CONTENT_SNIFF_BYTES
         coreml_status = _looks_like_coreml_model_proto_prefix(prefix, sample_is_prefix=sample_is_prefix)
@@ -642,6 +744,9 @@ def _detect_jfrog_content_route_format(
         onnx_status = _looks_like_onnx_model_proto_stream(BytesIO(prefix), len(prefix))
         if onnx_status is True:
             return "onnx", probe_download_url
+        tensorflow_route = _detect_jfrog_tensorflow_protobuf_route(prefix)
+        if tensorflow_route is not None:
+            return tensorflow_route, probe_download_url
         if sample_is_prefix and (coreml_status is None or onnx_status is None):
             return PROTOBUF_MODEL_CANDIDATE_FORMAT, probe_download_url
     return (None if detected_format == "unknown" else detected_format), probe_download_url
@@ -649,7 +754,10 @@ def _detect_jfrog_content_route_format(
 
 def _scanner_ids_for_detected_jfrog_format(detected_format: str) -> set[str]:
     from modelaudit.scanner_registry_metadata import get_scanner_registry_metadata
-    from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
+    from modelaudit.utils.file.detection import (
+        PROTOBUF_MODEL_CANDIDATE_FORMAT,
+        TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+    )
 
     scanner_ids: set[str] = set()
     for scanner_id, scanner_info in get_scanner_registry_metadata().items():
@@ -658,7 +766,9 @@ def _scanner_ids_for_detected_jfrog_format(detected_format: str) -> set[str]:
     if detected_format == "zip":
         scanner_ids.update(_JFROG_ZIP_STRUCTURE_ROUTED_SCANNER_IDS)
     if detected_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
-        scanner_ids.update({"coreml", "onnx"})
+        scanner_ids.update({"coreml", "onnx", "tf_metagraph", "tf_savedmodel"})
+    if detected_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
+        scanner_ids.update({"tf_metagraph", "tf_savedmodel"})
     return scanner_ids
 
 
