@@ -1934,7 +1934,16 @@ __import__('pickle').loads(data)
             for check in result.checks
         )
 
-    def test_wrapped_layer_config_invalid_layer_type_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        ("wrapper_class", "expected_exit_code"),
+        [("TimeDistributed", 2), ("keras.layers.TimeDistributed", 1)],
+    )
+    def test_wrapped_layer_config_invalid_layer_type_fails_closed(
+        self,
+        tmp_path: Path,
+        wrapper_class: str,
+        expected_exit_code: int,
+    ) -> None:
         """Malformed wrapper `config.layer` values make nested-layer coverage incomplete."""
         keras_path = create_configured_keras_zip(
             tmp_path,
@@ -1943,7 +1952,7 @@ __import__('pickle').loads(data)
                 "config": {
                     "layers": [
                         {
-                            "class_name": "TimeDistributed",
+                            "class_name": wrapper_class,
                             "name": "broken_wrapper",
                             "config": {"layer": "not a layer dict"},
                         }
@@ -1962,7 +1971,98 @@ __import__('pickle').loads(data)
             check.name == "Wrapped Layer Type Validation" and check.status == CheckStatus.FAILED
             for check in result.checks
         )
+        assert determine_exit_code(audit_result) == expected_exit_code
+
+    def test_wrapped_layer_config_missing_class_name_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
+        """Wrapper-owned layer dictionaries require a class name for complete nested analysis."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "TimeDistributed",
+                            "name": "broken_wrapper",
+                            "config": {"layer": {"config": {"units": 1}}},
+                        }
+                    ]
+                },
+            },
+            file_name="broken_wrapped_layer_structure.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        audit_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_wrapped_layer_structure_invalid" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Wrapped Layer Structure Validation" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
         assert determine_exit_code(audit_result) == 2
+
+    @pytest.mark.parametrize("layer_class", ["Dense", "myproject.TimeDistributed"])
+    def test_nonwrapper_layer_config_scalar_nested_names_remain_quiet(self, tmp_path: Path, layer_class: str) -> None:
+        """Ordinary layer metadata named `layer`, `cell`, or `cells` must not be treated as nested layers."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": layer_class,
+                            "name": "metadata_layer",
+                            "config": {
+                                "units": 1,
+                                "layer": "encoder",
+                                "cell": "relu",
+                                "cells": ["left", "right"],
+                            },
+                        }
+                    ]
+                },
+            },
+            file_name="nonwrapper_nested_names.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        assert not any(check.name == "Wrapped Layer Type Validation" for check in result.checks)
+
+    def test_bidirectional_nullable_backward_layer_remains_quiet(self, tmp_path: Path) -> None:
+        """A nullable optional Bidirectional backward layer must not make a valid config inconclusive."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "Bidirectional",
+                            "name": "bidirectional_wrapper",
+                            "config": {
+                                "layer": {
+                                    "class_name": "LSTM",
+                                    "name": "forward_lstm",
+                                    "config": {"name": "forward_lstm"},
+                                },
+                                "backward_layer": None,
+                            },
+                        }
+                    ]
+                },
+            },
+            file_name="nullable_backward_layer.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        assert not any(check.name == "Wrapped Layer Type Validation" for check in result.checks)
 
     def test_wrapped_layer_config_depth_budget_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
         """Excessive wrapper nesting must fail closed before exhausting the Python stack."""
@@ -1999,6 +2099,53 @@ __import__('pickle').loads(data)
             for check in result.checks
         )
         assert determine_exit_code(audit_result) == 2
+        _assert_inconclusive_keras_zip_scan_not_cached(
+            keras_path,
+            "keras_zip_nested_layer_depth_exceeded",
+            tmp_path / "nested-layer-depth-cache",
+        )
+
+    def test_wrapped_layer_config_depth_budget_preserves_security_exit1(self, tmp_path: Path) -> None:
+        """A depth-limit outcome must not suppress an independently detected malicious Lambda."""
+        nested_layer: dict[str, Any] = {
+            "class_name": "Dense",
+            "name": "leaf",
+            "config": {"units": 1},
+        }
+        for index in range(KerasZipScanner.MAX_NESTED_LAYER_DEPTH + 1):
+            nested_layer = {
+                "class_name": "TimeDistributed",
+                "name": f"wrapper_{index}",
+                "config": {"layer": nested_layer},
+            }
+
+        encoded_code = base64.b64encode(b"exec('print(1)')").decode()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "name": "malicious_lambda",
+                            "config": {"function": [encoded_code, None, None]},
+                        },
+                        nested_layer,
+                    ]
+                },
+            },
+            keras_version="2.10.0",
+            file_name="deep_wrapped_layer_with_lambda.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        audit_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_nested_layer_depth_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert determine_exit_code(audit_result) == 1
 
     def test_invalid_json_config(self, tmp_path: Path) -> None:
         """Test handling of invalid JSON in config."""

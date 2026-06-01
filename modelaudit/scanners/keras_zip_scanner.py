@@ -175,6 +175,14 @@ class KerasZipScanner(BaseScanner):
     _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
     _NESTED_LAYER_CONFIG_KEYS: ClassVar[tuple[str, ...]] = ("layer", "backward_layer", "cell", "cells")
     _NESTED_LAYER_LIST_CONFIG_KEYS: ClassVar[frozenset[str]] = frozenset({"cell", "cells"})
+    _NESTED_LAYER_CONFIG_KEYS_BY_CLASS: ClassVar[dict[str, frozenset[str]]] = {
+        "Bidirectional": frozenset({"layer", "backward_layer"}),
+        "RNN": frozenset({"cell"}),
+        "SpectralNormalization": frozenset({"layer"}),
+        "StackedRNNCells": frozenset({"cells"}),
+        "TimeDistributed": frozenset({"layer"}),
+        "Wrapper": frozenset({"layer"}),
+    }
     _WRAPPED_LAYER_SCAN_MODEL: ClassVar[dict[str, Any]] = {"class_name": "Sequential", "config": {"layers": []}}
 
     name = "keras_zip"
@@ -939,13 +947,14 @@ class KerasZipScanner(BaseScanner):
                         details={"actual_type": type(nested_config).__name__, "expected_type": "dict"},
                     )
 
-            self._scan_wrapped_layer_config(layer_config, result, layer_name, nested_layer_depth)
+            self._scan_wrapped_layer_config(layer_class, layer_config, result, layer_name, nested_layer_depth)
 
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
 
     def _scan_wrapped_layer_config(
         self,
+        layer_class: Any,
         layer_config: Any,
         result: ScanResult,
         layer_name: str,
@@ -955,16 +964,47 @@ class KerasZipScanner(BaseScanner):
         if not isinstance(layer_config, dict):
             return
 
+        required_config_keys = self._nested_layer_config_keys_for_class(layer_class)
         for config_key in self._NESTED_LAYER_CONFIG_KEYS:
             if config_key not in layer_config:
                 continue
 
             nested_layer = layer_config.get(config_key)
-            if isinstance(nested_layer, list) and config_key in self._NESTED_LAYER_LIST_CONFIG_KEYS:
-                self._scan_wrapped_layer_list(nested_layer, result, layer_name, config_key, nested_layer_depth)
+            if nested_layer is None:
                 continue
 
-            self._scan_wrapped_layer_value(nested_layer, result, layer_name, config_key, nested_layer_depth)
+            require_layer_shape = config_key in required_config_keys
+            if isinstance(nested_layer, list) and config_key in self._NESTED_LAYER_LIST_CONFIG_KEYS:
+                self._scan_wrapped_layer_list(
+                    nested_layer,
+                    result,
+                    layer_name,
+                    config_key,
+                    nested_layer_depth,
+                    require_layer_shape=require_layer_shape,
+                )
+                continue
+
+            self._scan_wrapped_layer_value(
+                nested_layer,
+                result,
+                layer_name,
+                config_key,
+                nested_layer_depth,
+                require_layer_shape=require_layer_shape,
+            )
+
+    @classmethod
+    def _nested_layer_config_keys_for_class(cls, layer_class: Any) -> frozenset[str]:
+        if not isinstance(layer_class, str):
+            return frozenset()
+
+        normalized_class = layer_class.strip()
+        if "." in normalized_class and not normalized_class.lower().startswith(
+            ("keras.", "tensorflow.keras.", "tensorflow.python.keras.", "tf.keras.", "tf_keras.")
+        ):
+            return frozenset()
+        return cls._NESTED_LAYER_CONFIG_KEYS_BY_CLASS.get(normalized_class.rsplit(".", 1)[-1], frozenset())
 
     def _scan_wrapped_layer_list(
         self,
@@ -973,6 +1013,8 @@ class KerasZipScanner(BaseScanner):
         layer_name: str,
         config_key: str,
         nested_layer_depth: int,
+        *,
+        require_layer_shape: bool,
     ) -> None:
         for index, nested_layer in enumerate(nested_layers):
             self._scan_wrapped_layer_value(
@@ -981,6 +1023,7 @@ class KerasZipScanner(BaseScanner):
                 layer_name,
                 f"{config_key}[{index}]",
                 nested_layer_depth,
+                require_layer_shape=require_layer_shape,
             )
 
     def _scan_wrapped_layer_value(
@@ -990,9 +1033,26 @@ class KerasZipScanner(BaseScanner):
         layer_name: str,
         config_key: str,
         nested_layer_depth: int,
+        *,
+        require_layer_shape: bool,
     ) -> None:
         if isinstance(nested_layer, dict):
+            nested_layer_class = nested_layer.get("class_name")
+            if require_layer_shape and (not isinstance(nested_layer_class, str) or not nested_layer_class.strip()):
+                self._mark_inconclusive_scan_result(result, "keras_zip_wrapped_layer_structure_invalid")
+                result.add_check(
+                    name="Wrapped Layer Structure Validation",
+                    passed=False,
+                    message="Invalid wrapped layer structure: expected non-empty class_name",
+                    rule_code="S902",
+                    severity=IssueSeverity.INFO,
+                    location=f"{self.current_file_path} (layer: {layer_name}, config: {config_key})",
+                    details={"config_key": config_key, "expected_key": "class_name"},
+                )
+                return
             self._scan_wrapped_layer_dict(nested_layer, result, nested_layer_depth)
+            return
+        if not require_layer_shape:
             return
 
         self._mark_inconclusive_scan_result(result, "keras_zip_wrapped_layer_invalid_type")
