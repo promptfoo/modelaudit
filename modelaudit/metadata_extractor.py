@@ -73,82 +73,86 @@ class ModelMetadataExtractor:
         results: dict[str, Any] = {"directory": directory, "files": [], "summary": {"total_files": 0, "formats": {}}}
         base_path = Path(directory).resolve()
         base_dir = str(base_path)
-        base_depth = len(base_path.parts)
         files_considered = 0
         bytes_considered = 0
-        entries_considered = 0
+        entries_considered = 1
         stop_traversal = False
+        pending_directories = [(base_path, 0)]
 
-        for root, dir_names, files in os.walk(directory):
-            if entries_considered >= MAX_METADATA_DIRECTORY_ENTRIES:
-                self._mark_directory_budget_exceeded(
-                    results,
-                    limit="max_entries",
-                    max_entries=MAX_METADATA_DIRECTORY_ENTRIES,
-                    entries_considered=entries_considered,
-                    path=root,
-                )
-                dir_names[:] = []
-                break
+        if entries_considered > MAX_METADATA_DIRECTORY_ENTRIES:
+            self._mark_directory_budget_exceeded(
+                results,
+                limit="max_entries",
+                max_entries=MAX_METADATA_DIRECTORY_ENTRIES,
+                entries_considered=entries_considered,
+                path=base_dir,
+            )
+            return results
 
-            entries_considered += 1
-            current_depth = max(len(Path(root).resolve().parts) - base_depth, 0)
-            if current_depth > MAX_METADATA_DIRECTORY_DEPTH:
-                self._mark_directory_budget_exceeded(
-                    results,
-                    limit="max_depth",
-                    max_depth=MAX_METADATA_DIRECTORY_DEPTH,
-                    observed_depth=current_depth,
-                    path=root,
-                )
-                dir_names[:] = []
+        while pending_directories and not stop_traversal:
+            root_path, current_depth = pending_directories.pop()
+            root = str(root_path)
+            child_directories: list[Path] = []
+            files: list[str] = []
+            try:
+                with os.scandir(root_path) as entries:
+                    for entry in entries:
+                        if entries_considered >= MAX_METADATA_DIRECTORY_ENTRIES:
+                            self._mark_directory_budget_exceeded(
+                                results,
+                                limit="max_entries",
+                                max_entries=MAX_METADATA_DIRECTORY_ENTRIES,
+                                entries_considered=entries_considered,
+                                path=entry.path,
+                            )
+                            stop_traversal = True
+                            break
+
+                        entries_considered += 1
+                        try:
+                            is_directory = entry.is_dir(follow_symlinks=False)
+                        except OSError:
+                            is_directory = False
+
+                        if is_directory:
+                            child_depth = current_depth + 1
+                            if child_depth > MAX_METADATA_DIRECTORY_DEPTH:
+                                self._mark_directory_budget_exceeded(
+                                    results,
+                                    limit="max_depth",
+                                    max_depth=MAX_METADATA_DIRECTORY_DEPTH,
+                                    observed_depth=child_depth,
+                                    path=entry.path,
+                                )
+                                continue
+                            child_directories.append(Path(entry.path))
+                            continue
+
+                        try:
+                            if entry.is_symlink() and entry.is_dir():
+                                continue
+                        except OSError:
+                            pass
+
+                        if files_considered >= MAX_METADATA_DIRECTORY_FILES:
+                            self._mark_directory_budget_exceeded(
+                                results,
+                                limit="max_files",
+                                max_files=MAX_METADATA_DIRECTORY_FILES,
+                                files_considered=files_considered,
+                                path=entry.path,
+                            )
+                            stop_traversal = True
+                            break
+
+                        files_considered += 1
+                        files.append(entry.name)
+            except OSError as e:
+                results["files"].append({"file": root_path.name, "path": root, "error": str(e)})
                 continue
 
-            remaining_directory_entries = max(MAX_METADATA_DIRECTORY_ENTRIES - entries_considered, 0)
-            if len(dir_names) > remaining_directory_entries:
-                self._mark_directory_budget_exceeded(
-                    results,
-                    limit="max_entries",
-                    max_entries=MAX_METADATA_DIRECTORY_ENTRIES,
-                    entries_considered=entries_considered,
-                    discovered_directories=len(dir_names),
-                    path=root,
-                )
-                dir_names[:] = []
-                stop_traversal = True
-            else:
-                dir_names[:] = sorted(dir_names[:remaining_directory_entries])
-
-            file_sort_limit = min(
-                MAX_METADATA_DIRECTORY_FILES - files_considered + 1,
-                MAX_METADATA_DIRECTORY_ENTRIES - entries_considered + 1,
-            )
-            files = sorted(files[: max(file_sort_limit, 0)])
+            files.sort()
             for file in files:
-                if files_considered >= MAX_METADATA_DIRECTORY_FILES:
-                    self._mark_directory_budget_exceeded(
-                        results,
-                        limit="max_files",
-                        max_files=MAX_METADATA_DIRECTORY_FILES,
-                        files_considered=files_considered,
-                        path=os.path.join(root, file),
-                    )
-                    stop_traversal = True
-                    break
-
-                if entries_considered >= MAX_METADATA_DIRECTORY_ENTRIES:
-                    self._mark_directory_budget_exceeded(
-                        results,
-                        limit="max_entries",
-                        max_entries=MAX_METADATA_DIRECTORY_ENTRIES,
-                        entries_considered=entries_considered,
-                        path=os.path.join(root, file),
-                    )
-                    stop_traversal = True
-                    break
-
-                files_considered += 1
-                entries_considered += 1
                 file_path = os.path.join(root, file)
                 try:
                     if not is_within_directory(base_dir, file_path):
@@ -195,9 +199,8 @@ class ModelMetadataExtractor:
                     logger.debug("Metadata extraction failed for %s: %s", file_path, e, exc_info=True)
                     results["files"].append({"file": file, "path": file_path, "error": str(e)})
 
-            if stop_traversal:
-                dir_names[:] = []
-                break
+            child_directories.sort(key=lambda child_path: child_path.name)
+            pending_directories.extend((child_path, current_depth + 1) for child_path in reversed(child_directories))
 
         return results
 

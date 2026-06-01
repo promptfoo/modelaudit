@@ -6,6 +6,8 @@ import pickle
 import pickletools
 import struct
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -331,35 +333,46 @@ class TestModelMetadataExtractor:
 
         assert metadata["analysis_incomplete"] is True
         assert metadata["budget_events"][0]["limit"] == "max_entries"
-        assert metadata["budget_events"][0]["entries_considered"] == 1
-        assert metadata["budget_events"][0]["discovered_directories"] == 3
+        assert metadata["budget_events"][0]["entries_considered"] == 2
 
-    def test_extract_directory_metadata_caps_file_names_before_sorting(
+    def test_extract_directory_metadata_bounds_flat_directory_enumeration(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Flat directories should only sort the bounded file-name prefix."""
+        """Flat directories should stop enumeration after the bounded sentinel."""
         extractor = metadata_extractor_module.ModelMetadataExtractor()
         scan_dir = tmp_path / "scan"
         scan_dir.mkdir()
-        sorted_input_sizes: list[int] = []
+        yielded_names: list[str] = []
 
-        def bounded_sorted(values: list[str]) -> list[str]:
-            sorted_input_sizes.append(len(values))
-            return sorted(values)
+        class FakeEntry:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.path = str(scan_dir / name)
+
+            def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+                return False
+
+            def is_symlink(self) -> bool:
+                return False
+
+        def iter_entries() -> Iterator[FakeEntry]:
+            for index in range(100):
+                name = f"file-{index}.fake"
+                yielded_names.append(name)
+                yield FakeEntry(name)
+
+        @contextmanager
+        def fake_scandir(_directory: object) -> Iterator[Iterator[FakeEntry]]:
+            yield iter_entries()
 
         monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_FILES", 2)
-        monkeypatch.setattr(metadata_extractor_module, "sorted", bounded_sorted, raising=False)
-        monkeypatch.setattr(
-            metadata_extractor_module.os,
-            "walk",
-            lambda _directory: [(str(scan_dir), [], [f"file-{index}.fake" for index in range(100)])],
-        )
+        monkeypatch.setattr(metadata_extractor_module.os, "scandir", fake_scandir)
 
         metadata = extractor.extract(str(scan_dir))
 
-        assert max(sorted_input_sizes) == 3
+        assert yielded_names == ["file-0.fake", "file-1.fake", "file-2.fake"]
         assert metadata["analysis_incomplete"] is True
         assert metadata["budget_events"][0]["limit"] == "max_files"
 
