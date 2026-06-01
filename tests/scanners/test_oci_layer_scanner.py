@@ -1018,6 +1018,45 @@ class TestOciLayerScanner:
         assert checks[0].details["compressed_size"] < layer_path.stat().st_size
         assert checks[0].details["actual_ratio"] > 2.0
 
+    @pytest.mark.parametrize("tail_kind", ["checksum", "truncated"])
+    def test_scan_layer_counts_partial_gzip_tail_for_ratio(self, tmp_path: Path, tail_kind: str) -> None:
+        """Decoded bytes from malformed trailing gzip members must still count toward the ratio budget."""
+        payload = tmp_path / "payload.bin"
+        payload.write_bytes(b"safe")
+
+        raw_tar_path = tmp_path / "raw-partial-tail.tar"
+        with tarfile.open(raw_tar_path, "w") as tar:
+            tar.add(payload, arcname="payload.bin")
+        raw_tar = raw_tar_path.read_bytes()
+
+        malformed_tail = bytearray(gzip.compress(b"\x00" * 256 * 1024))
+        if tail_kind == "checksum":
+            malformed_tail[-8] ^= 0x01
+        else:
+            del malformed_tail[-4:]
+
+        layer_path = tmp_path / f"{tail_kind}-partial-tail.tar.gz"
+        layer_path.write_bytes(gzip.compress(raw_tar) + malformed_tail)
+
+        manifest_path = tmp_path / f"{tail_kind}-partial-tail.manifest"
+        manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy:
+            result = OciLayerScanner(
+                {
+                    "compressed_max_decompressed_bytes": 1024 * 1024,
+                    "compressed_max_decompression_ratio": 100.0,
+                }
+            ).scan(str(manifest_path))
+
+        assert result.success is False
+        assert mock_copy.call_count == 1
+        assert "oci_layer_decompression_ratio_exceeded" in result.metadata["scan_outcome_reasons"]
+        checks = [check for check in result.checks if check.name == "Layer Decompression Budget Check"]
+        assert len(checks) == 1
+        assert checks[0].details["decompressed_size"] > len(raw_tar)
+        assert checks[0].details["actual_ratio"] > 100.0
+
     def test_scan_layer_sizes_concatenated_gzip_members_for_ratio(self, tmp_path: Path) -> None:
         """Concatenated gzip members should be included in the compressed budget denominator."""
         payload = tmp_path / "payload.bin"

@@ -52,6 +52,7 @@ class OciLayerScanner(BaseScanner):
     _MEMBER_HEADER_PROBE_BYTES: ClassVar[int] = 64
     _GZIP_CHUNK_BYTES: ClassVar[int] = 1024 * 1024
     _GZIP_OUTPUT_CHUNK_BYTES: ClassVar[int] = 1024 * 1024
+    _GZIP_TRAILER_BYTES: ClassVar[int] = 8
     _DEFAULT_MAX_LAYER_FILE_SIZE: ClassVar[int] = 10 * 1024 * 1024 * 1024
     _DEFAULT_MAX_LAYER_ENTRIES: ClassVar[int] = 10000
     _DEFAULT_MAX_DECOMPRESSED_BYTES: ClassVar[int] = 512 * 1024 * 1024
@@ -152,10 +153,19 @@ class OciLayerScanner(BaseScanner):
 
                 while data:
                     try:
-                        before_len = len(data)
-                        output = decompressor.decompress(data, self._GZIP_OUTPUT_CHUNK_BYTES)
+                        compressed_input = data
+                        withheld = b""
+                        if len(data) > self._GZIP_TRAILER_BYTES:
+                            compressed_input = data[: -self._GZIP_TRAILER_BYTES]
+                            withheld = data[-self._GZIP_TRAILER_BYTES :]
+                        before_len = len(compressed_input)
+                        output = decompressor.decompress(compressed_input, self._GZIP_OUTPUT_CHUNK_BYTES)
                     except zlib.error:
-                        return completed_compressed or None, completed_decompressed, False
+                        return (
+                            completed_compressed + member_compressed or None,
+                            completed_decompressed + member_decompressed,
+                            False,
+                        )
                     member_compressed += before_len - len(decompressor.unconsumed_tail) - len(decompressor.unused_data)
                     member_decompressed += len(output)
                     compressed_consumed = completed_compressed + member_compressed
@@ -165,7 +175,7 @@ class OciLayerScanner(BaseScanner):
                     if decompressor.eof:
                         completed_compressed = compressed_consumed
                         completed_decompressed = decompressed_seen
-                        data = decompressor.unused_data
+                        data = decompressor.unused_data + withheld
                         while len(data) < 2:
                             chunk = layer_file.read(self._GZIP_CHUNK_BYTES)
                             if not chunk:
@@ -177,10 +187,14 @@ class OciLayerScanner(BaseScanner):
                         member_compressed = 0
                         member_decompressed = 0
                         continue
-                    data = decompressor.unconsumed_tail
+                    data = decompressor.unconsumed_tail + withheld
         if decompressor.eof:
             return completed_compressed, completed_decompressed, False
-        return completed_compressed or None, completed_decompressed, False
+        return (
+            completed_compressed + member_compressed or None,
+            completed_decompressed + member_decompressed,
+            False,
+        )
 
     @staticmethod
     def _get_scannable_extension(member_name: str) -> str | None:
