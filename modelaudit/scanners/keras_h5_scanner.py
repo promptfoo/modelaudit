@@ -982,7 +982,7 @@ class KerasH5Scanner(BaseScanner):
                         details={
                             "layer_class": "Lambda",
                             "description": self.suspicious_layer_types["Lambda"],
-                            "layer_config": layer_config,
+                            "layer_config_omitted": "lambda_config_may_contain_sensitive_literals",
                             "validation_error": error,
                         },
                         why=get_pattern_explanation("lambda_layer"),

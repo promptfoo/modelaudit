@@ -1085,6 +1085,7 @@ def test_lambda_dict_bytecode_with_dangerous_pattern_still_critical(tmp_path: Pa
 def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path: Path) -> None:
     direct_secret = "H5_DIRECT_SECRET"
     dict_secret = "H5_DICT_SECRET"
+    invalid_secret = "H5_INVALID_SECRET"
 
     def dangerous_lambda_code(x: Any) -> Any:
         client_secret = "H5_DICT_SECRET"
@@ -1112,6 +1113,13 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
                             "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
                         },
                     },
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "invalid_lambda",
+                            "function": f"lambda x: (exec(, aws_secret_access_key='{invalid_secret}')",
+                        },
+                    },
                 ],
             },
         },
@@ -1137,6 +1145,12 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
         and "code_preview" not in check.details
         for check in scanner_result.checks
     )
+    assert any(
+        check.name == "Lambda Layer Suspicious Keywords Check"
+        and check.details.get("layer_config_omitted") == "lambda_config_may_contain_sensitive_literals"
+        and "layer_config" not in check.details
+        for check in scanner_result.checks
+    )
 
     audit_result = scan_model_directory_or_file(str(model_path))
     json_output = audit_result.model_dump_json(indent=2, exclude_none=True)
@@ -1144,8 +1158,10 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
 
     assert direct_secret not in json_output
     assert dict_secret not in json_output
+    assert invalid_secret not in json_output
     assert direct_secret not in sarif_output
     assert dict_secret not in sarif_output
+    assert invalid_secret not in sarif_output
 
 
 def test_keras_h5_scanner_empty_file(tmp_path):
