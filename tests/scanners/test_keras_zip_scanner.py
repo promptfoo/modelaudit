@@ -21,6 +21,7 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners import keras_utils as keras_utils_module
 from modelaudit.scanners import keras_zip_scanner as keras_zip_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner, _has_get_file_reference
@@ -371,6 +372,105 @@ class TestKerasZipScanner:
                 "path": "/payload",
             },
         ]
+
+    def test_embedded_hdf5_external_reference_traversal_limit_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Bounded embedded HDF5 traversal must return exit 2 when no finding precedes the limit."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        weights_path = tmp_path / "nested_regular.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            f.create_group("layers").create_group("dense").create_group("vars")
+
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=weights_path,
+        )
+        monkeypatch.setattr(KerasZipScanner, "MAX_HDF5_LINK_VISITS", 2)
+
+        reason = "keras_zip_external_reference_analysis_limit_exceeded"
+        _assert_inconclusive_keras_zip_scan(
+            keras_path,
+            reason,
+            "Embedded HDF5 External Reference Analysis Limit",
+        )
+        _assert_inconclusive_keras_zip_scan_not_cached(keras_path, reason, tmp_path / "traversal-limit-cache")
+
+    def test_embedded_hdf5_external_reference_reports_are_bounded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Reference evidence must stay bounded while preserving the security finding."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        weights_path = tmp_path / "many_external_links.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            for index in range(3):
+                f[f"linked_{index}"] = h5py.ExternalLink("missing_external_source.h5", f"/payload/{index}")
+
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=weights_path,
+        )
+        monkeypatch.setattr(KerasZipScanner, "MAX_HDF5_EXTERNAL_REFERENCE_REPORTS", 2)
+
+        result = KerasZipScanner().scan(str(keras_path))
+        reason = "keras_zip_external_reference_analysis_limit_exceeded"
+        assert reason in result.metadata["scan_outcome_reasons"]
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert len(cve_issues[0].details["external_references"]) == 2
+        assert cve_issues[0].details["external_reference_count"] == 3
+        assert cve_issues[0].details["external_references_truncated"] is True
+
+        audit_result = scan_model_directory_or_file(str(keras_path), cache_enabled=False)
+        assert determine_exit_code(audit_result) == 1
+
+    def test_embedded_hdf5_external_storage_segment_reports_are_bounded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """External-storage segment evidence must be capped without hiding the security risk."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+
+        weights_path = tmp_path / "many_external_segments.weights.h5"
+        with h5py.File(weights_path, "w") as f:
+            f.create_dataset(
+                "external_kernel",
+                shape=(3,),
+                dtype="float32",
+                external=[(f"weights-{index}.raw", 0, 4) for index in range(3)],
+            )
+
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            weights_h5_path=weights_path,
+        )
+        monkeypatch.setattr(KerasZipScanner, "MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS", 2)
+
+        result = KerasZipScanner().scan(str(keras_path))
+        reason = "keras_zip_external_reference_analysis_limit_exceeded"
+        assert reason in result.metadata["scan_outcome_reasons"]
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        external_reference = cve_issues[0].details["external_references"][0]
+        assert len(external_reference["segments"]) == 2
+        assert external_reference["segment_count"] == 3
+        assert external_reference["segments_truncated"] is True
+
+        audit_result = scan_model_directory_or_file(str(keras_path), cache_enabled=False)
+        assert determine_exit_code(audit_result) == 1
 
     @pytest.mark.parametrize(
         "keras_version",
@@ -1730,6 +1830,143 @@ __import__('pickle').loads(data)
             and check.details.get("function") == "system"
             for check in result.checks
         )
+
+    @pytest.mark.parametrize("function_format", ["list", "dict"])
+    def test_lambda_bytecode_pattern_matching_uses_token_boundaries(
+        self,
+        tmp_path: Path,
+        function_format: str,
+    ) -> None:
+        """Benign identifiers containing dangerous substrings must not escalate Lambda findings."""
+        encoded_code = base64.b64encode(b"opened").decode()
+        function_data: Any = [encoded_code, None, None]
+        if function_format == "dict":
+            function_data = {"class_name": "__lambda__", "config": {"code": encoded_code}}
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "substring_lambda",
+                        "config": {"function": function_data},
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        assert not any(
+            issue.severity == IssueSeverity.CRITICAL and "substring_lambda" in issue.message for issue in result.issues
+        )
+
+    @pytest.mark.parametrize("network_reference", ["https://evil.example/payload", "urllib3.PoolManager"])
+    def test_dict_lambda_bytecode_token_boundaries_preserve_network_signals(
+        self,
+        tmp_path: Path,
+        network_reference: str,
+    ) -> None:
+        """Boundary-aware Lambda matching must retain explicit network indicators."""
+        encoded_code = base64.b64encode(network_reference.encode()).decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "network_lambda",
+                        "config": {
+                            "function": {
+                                "class_name": "__lambda__",
+                                "config": {"code": encoded_code},
+                            }
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and "network_lambda" in issue.message for issue in result.issues
+        )
+
+    @pytest.mark.parametrize("function_format", ["list", "dict"])
+    def test_oversized_lambda_bytecode_is_not_decoded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        function_format: str,
+    ) -> None:
+        """Oversized Lambda bytecode must produce a bounded warning without base64 allocation."""
+        oversized_code = "A" * (1024 * 1024 + 1)
+        function_data: Any = [oversized_code, None, None]
+        if function_format == "dict":
+            function_data = {"class_name": "__lambda__", "config": {"code": oversized_code}}
+
+        def fail_decode(_value: Any) -> bytes:
+            raise AssertionError("oversized Lambda bytecode was decoded")
+
+        decoder_module = keras_zip_scanner_module if function_format == "list" else keras_utils_module
+        monkeypatch.setattr(decoder_module.base64, "b64decode", fail_decode)
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "oversized_lambda",
+                        "config": {"function": function_data},
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        matching_checks = [
+            check
+            for check in result.checks
+            if check.name == "Lambda Layer Detection"
+            and check.details.get("layer_name") == "oversized_lambda"
+            and check.details.get("analysis_status") == "code_size_limit_exceeded"
+        ]
+        assert len(matching_checks) == 1
+        assert matching_checks[0].severity == IssueSeverity.WARNING
+
+    def test_malformed_dict_lambda_diagnostic_does_not_echo_payload(self, tmp_path: Path) -> None:
+        """Malformed Lambda metadata diagnostics must not retain attacker-controlled payloads."""
+        payload = "do-not-echo-this-payload"
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "malformed_lambda",
+                        "config": {
+                            "function": {
+                                "class_name": "__lambda__",
+                                "config": payload,
+                            }
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        matching_checks = [
+            check
+            for check in result.checks
+            if check.name == "Lambda Layer Detection" and check.details.get("layer_name") == "malformed_lambda"
+        ]
+        assert len(matching_checks) == 1
+        assert matching_checks[0].details["config_type"] == "str"
+        assert payload not in str(matching_checks[0].details)
 
     def test_stringlookup_external_vocabulary_path_triggers_cve_2025_12058(self, tmp_path: Path) -> None:
         """Absolute StringLookup vocabulary paths should be attributed to CVE-2025-12058 on vulnerable Keras."""

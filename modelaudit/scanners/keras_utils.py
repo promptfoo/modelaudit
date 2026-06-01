@@ -31,11 +31,14 @@ _LAMBDA_DANGEROUS_PATTERNS: list[str] = [
     "webbrowser",
     "socket",
     "http",
+    "https",
     "urllib",
+    "urllib3",
     "shutil",
     "ctypes",
 ]
 _MARSHALLED_CODE_FILENAME_RE = re.compile(r"(?i)(?:[A-Za-z]:)?[\\/][^\x00-\x1f\x7f\"'`<>|]+?\.py[co]?")
+_MAX_LAMBDA_DICT_CODE_B64_CHARS = 1024 * 1024
 
 _EXTRA_SAFE_KERAS_LOSS_IDENTIFIERS: frozenset[str] = frozenset(
     {
@@ -138,7 +141,12 @@ def find_case_insensitive_substrings(text: str, patterns: Iterable[str]) -> list
 
 def find_lambda_dangerous_patterns(text: str, patterns: Iterable[str]) -> list[str]:
     """Match dangerous Lambda bytecode text while ignoring marshalled source filenames."""
-    return find_case_insensitive_substrings(_MARSHALLED_CODE_FILENAME_RE.sub(" ", text), patterns)
+    sanitized = _MARSHALLED_CODE_FILENAME_RE.sub(" ", text)
+    return [
+        pattern
+        for pattern in patterns
+        if re.search(rf"(?<![0-9A-Za-z_]){re.escape(pattern)}(?![0-9A-Za-z_])", sanitized, re.IGNORECASE)
+    ]
 
 
 def iter_keras_serialized_identifiers(value: Any) -> Iterator[tuple[str, Any]]:
@@ -270,7 +278,7 @@ def check_lambda_dict_function(
                 "layer_class": "Lambda",
                 "function_format": "dict",
                 "parse_status": "invalid_config",
-                "function_dict": function_dict,
+                "config_type": type(config).__name__,
             },
             why="Malformed dict-format Lambda metadata is suspicious and prevents bytecode inspection.",
         )
@@ -291,6 +299,25 @@ def check_lambda_dict_function(
                 "function_format": "dict",
             },
             why="Lambda layers with dict-format functions indicate Keras 3.x bytecode serialisation.",
+        )
+        return True
+
+    if len(code_b64) > _MAX_LAMBDA_DICT_CODE_B64_CHARS:
+        result.add_check(
+            name="Lambda Layer Detection",
+            passed=False,
+            message=f"Lambda layer '{layer_name}' contains dict-format code that exceeds the bounded analysis limit",
+            severity=IssueSeverity.WARNING,
+            location=location,
+            details={
+                "layer_name": layer_name,
+                "layer_class": "Lambda",
+                "function_format": "dict",
+                "analysis_status": "code_size_limit_exceeded",
+                "encoded_code_chars": len(code_b64),
+                "max_encoded_code_chars": _MAX_LAMBDA_DICT_CODE_B64_CHARS,
+            },
+            why="Oversized Lambda bytecode was not decoded because it exceeds the bounded static-analysis limit.",
         )
         return True
 

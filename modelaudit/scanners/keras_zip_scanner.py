@@ -193,6 +193,10 @@ class KerasZipScanner(BaseScanner):
 
     MAX_EMBEDDED_WEIGHTS_BYTES: ClassVar[int] = 100 * 1024 * 1024
     MAX_DUPLICATE_MEMBER_COMPARE_CANDIDATES: ClassVar[int] = 16
+    MAX_LAMBDA_LIST_CODE_B64_CHARS: ClassVar[int] = 1024 * 1024
+    MAX_HDF5_LINK_VISITS: ClassVar[int] = 4096
+    MAX_HDF5_EXTERNAL_REFERENCE_REPORTS: ClassVar[int] = 20
+    MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS: ClassVar[int] = 20
 
     name = "keras_zip"
     description = "Scans ZIP-based Keras model files for suspicious configurations and Lambda layers"
@@ -1561,6 +1565,7 @@ class KerasZipScanner(BaseScanner):
 
         temp_path = None
         findings: list[dict[str, Any]] = []
+        external_reference_analysis: dict[str, Any] = {}
         try:
             with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as temp_file:
                 temp_path = temp_file.name
@@ -1580,7 +1585,10 @@ class KerasZipScanner(BaseScanner):
                         temp_file.write(chunk)
 
             with h5py.File(temp_path, "r") as h5_file:
-                findings = self._collect_hdf5_external_references(h5_file)
+                findings = self._collect_hdf5_external_references(
+                    h5_file,
+                    analysis=external_reference_analysis,
+                )
         except _EmbeddedWeightsLimitExceeded as exc:
             weights_entry = weights_info.filename
             self._mark_inconclusive_scan_result(result, "keras_zip_embedded_weights_too_large")
@@ -1607,6 +1615,30 @@ class KerasZipScanner(BaseScanner):
             if temp_path and os.path.exists(temp_path):
                 os.unlink(temp_path)
 
+        if any(
+            external_reference_analysis.get(key)
+            for key in (
+                "link_visits_truncated",
+                "external_references_truncated",
+                "external_storage_segments_truncated",
+            )
+        ):
+            reason = "keras_zip_external_reference_analysis_limit_exceeded"
+            self._mark_inconclusive_scan_result(result, reason)
+            result.add_check(
+                name="Embedded HDF5 External Reference Analysis Limit",
+                passed=False,
+                message="Embedded Keras HDF5 external-reference analysis reached a configured safety limit",
+                severity=IssueSeverity.INFO,
+                location=f"{self.current_file_path}:{weights_info.filename}",
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
+                    **external_reference_analysis,
+                },
+                rule_code="S902",
+            )
+
         if not findings:
             return
 
@@ -1623,6 +1655,18 @@ class KerasZipScanner(BaseScanner):
             "remediation": "Upgrade to Keras >= 3.12.1 or >= 3.13.2 and reject weights using HDF5 external references.",
             "external_references": findings,
         }
+        if external_reference_analysis.get("external_references_truncated") or external_reference_analysis.get(
+            "external_storage_segments_truncated"
+        ):
+            details.update(
+                {
+                    "external_reference_count": external_reference_analysis["external_reference_count"],
+                    "external_references_truncated": external_reference_analysis["external_references_truncated"],
+                    "external_storage_segments_truncated": external_reference_analysis[
+                        "external_storage_segments_truncated"
+                    ],
+                }
+            )
 
         if isinstance(keras_version, str):
             details["keras_version"] = keras_version
@@ -1659,66 +1703,115 @@ class KerasZipScanner(BaseScanner):
             },
         )
 
-    @staticmethod
-    def _collect_hdf5_external_references(h5_file: Any) -> list[dict[str, Any]]:
+    @classmethod
+    def _collect_hdf5_external_references(
+        cls,
+        h5_file: Any,
+        *,
+        analysis: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         """Collect HDF5 ExternalLink and external-storage datasets without following links."""
         findings: list[dict[str, Any]] = []
+        external_reference_count = 0
+        external_storage_segments_truncated = False
 
         def visit(name: str, link: Any) -> None:
+            nonlocal external_reference_count, external_storage_segments_truncated
             if isinstance(link, h5py.ExternalLink):
-                findings.append(
-                    {
-                        "kind": "ExternalLink",
-                        "hdf5_path": f"/{name}".replace("//", "/"),
-                        "filename": link.filename,
-                        "path": link.path,
-                    },
-                )
+                external_reference_count += 1
+                if len(findings) < cls.MAX_HDF5_EXTERNAL_REFERENCE_REPORTS:
+                    findings.append(
+                        {
+                            "kind": "ExternalLink",
+                            "hdf5_path": f"/{name}".replace("//", "/"),
+                            "filename": link.filename,
+                            "path": link.path,
+                        },
+                    )
                 return
 
             if not isinstance(link, h5py.HardLink):
                 return
 
             obj = h5_file.get(name, getlink=False)
-            if isinstance(obj, h5py.Dataset) and obj.external:
-                findings.append(
-                    {
-                        "kind": "external_storage",
-                        "hdf5_path": f"/{name}".replace("//", "/"),
-                        "segments": [
-                            {"filename": filename, "offset": int(offset), "size": int(size)}
-                            for filename, offset, size in obj.external
-                        ],
-                    },
-                )
+            if not isinstance(obj, h5py.Dataset):
+                return
 
-        KerasZipScanner._visit_hdf5_links(h5_file, visit)
+            external_storage = obj.external
+            if not external_storage:
+                return
+
+            external_reference_count += 1
+            if len(findings) >= cls.MAX_HDF5_EXTERNAL_REFERENCE_REPORTS:
+                return
+
+            segments = [
+                {"filename": filename, "offset": int(offset), "size": int(size)}
+                for filename, offset, size in external_storage[: cls.MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS]
+            ]
+            finding: dict[str, Any] = {
+                "kind": "external_storage",
+                "hdf5_path": f"/{name}".replace("//", "/"),
+                "segments": segments,
+            }
+            if len(external_storage) > len(segments):
+                external_storage_segments_truncated = True
+                finding["segment_count"] = len(external_storage)
+                finding["segments_truncated"] = True
+            findings.append(finding)
+
+        visited_link_count, link_visits_truncated = cls._visit_hdf5_links(
+            h5_file,
+            visit,
+            max_links=cls.MAX_HDF5_LINK_VISITS,
+        )
+        if analysis is not None:
+            analysis.update(
+                {
+                    "visited_link_count": visited_link_count,
+                    "max_link_visits": cls.MAX_HDF5_LINK_VISITS,
+                    "link_visits_truncated": link_visits_truncated,
+                    "external_reference_count": external_reference_count,
+                    "reported_external_reference_count": len(findings),
+                    "external_references_truncated": external_reference_count > len(findings),
+                    "external_storage_segments_truncated": external_storage_segments_truncated,
+                }
+            )
 
         return findings
 
-    @staticmethod
-    def _visit_hdf5_links(group: Any, visit: Any, prefix: str = "", visited: set[Any] | None = None) -> None:
+    @classmethod
+    def _visit_hdf5_links(cls, h5_file: Any, visit: Any, *, max_links: int) -> tuple[int, bool]:
         """Traverse HDF5 links without following ExternalLink or SoftLink targets."""
-        if visited is None:
-            visited = set()
+        visited_link_count = 0
+        visited_group_ids: set[Any] = set()
+        groups_to_visit: list[tuple[Any, str]] = [(h5_file, "")]
 
-        group_identity = KerasZipScanner._hdf5_object_identity(group)
-        if group_identity in visited:
-            return
-        visited.add(group_identity)
-
-        for child_name in group:
-            child_key = str(child_name)
-            child_path = f"{prefix}/{child_key}" if prefix else child_key
-            link = group.get(child_name, getlink=True)
-            visit(child_path, link)
-
-            if not isinstance(link, h5py.HardLink):
+        while groups_to_visit:
+            group, prefix = groups_to_visit.pop()
+            group_identity = cls._hdf5_object_identity(group)
+            if group_identity in visited_group_ids:
                 continue
+            visited_group_ids.add(group_identity)
 
-            obj = group.get(child_name, getlink=False)
-            if isinstance(obj, h5py.Group):
-                KerasZipScanner._visit_hdf5_links(obj, visit, child_path, visited)
+            for child_name in group:
+                if visited_link_count >= max_links:
+                    return visited_link_count, True
+                visited_link_count += 1
+
+                child_key = str(child_name)
+                child_path = f"{prefix}/{child_key}" if prefix else child_key
+                link = group.get(child_name, getlink=True)
+                visit(child_path, link)
+
+                if not isinstance(link, h5py.HardLink):
+                    continue
+
+                obj = group.get(child_name, getlink=False)
+                if isinstance(obj, h5py.Group):
+                    groups_to_visit.append((obj, child_path))
+
+        return visited_link_count, False
 
     @staticmethod
     def _hdf5_object_identity(obj: Any) -> Any:
@@ -1869,6 +1962,34 @@ class KerasZipScanner(BaseScanner):
         if function_data and isinstance(function_data, list) and len(function_data) > 0:
             # First element is the base64-encoded function
             encoded_function = function_data[0]
+
+            if (
+                encoded_function
+                and isinstance(encoded_function, str)
+                and len(encoded_function) > self.MAX_LAMBDA_LIST_CODE_B64_CHARS
+            ):
+                result.add_check(
+                    name="Lambda Layer Detection",
+                    passed=False,
+                    message=(
+                        f"Lambda layer '{layer_name}' contains list-format code that exceeds the bounded analysis limit"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    location=f"{self.current_file_path} (layer: {layer_name})",
+                    details={
+                        "layer_name": layer_name,
+                        "layer_class": "Lambda",
+                        "function_format": "list",
+                        "analysis_status": "code_size_limit_exceeded",
+                        "encoded_code_chars": len(encoded_function),
+                        "max_encoded_code_chars": self.MAX_LAMBDA_LIST_CODE_B64_CHARS,
+                    },
+                    why=(
+                        "Oversized Lambda bytecode was not decoded because it exceeds the bounded "
+                        "static-analysis limit."
+                    ),
+                )
+                encoded_function = ""
 
             if encoded_function and isinstance(encoded_function, str):
                 try:
