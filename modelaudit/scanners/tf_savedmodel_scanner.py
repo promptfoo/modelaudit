@@ -2,6 +2,7 @@
 
 import base64
 import contextlib
+import hashlib
 import logging
 import os
 import re
@@ -245,6 +246,24 @@ class TensorFlowSavedModelScanner(BaseScanner):
             },
         )
 
+    @staticmethod
+    def _add_bounded_file_integrity_check(path: str, result: ScanResult, content: bytes) -> None:
+        """Record hashes for the same bounded metadata bytes used by security analysis."""
+        hashes = {
+            "md5": hashlib.md5(content).hexdigest(),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "sha512": hashlib.sha512(content).hexdigest(),
+        }
+        result.add_check(
+            name="File Integrity Hash",
+            passed=True,
+            message="File integrity hashes calculated",
+            location=path,
+            details={**hashes, "file_size": len(content)},
+        )
+        result.metadata["file_hashes"] = hashes
+        result.metadata["file_size"] = len(content)
+
     def scan(self, path: str) -> ScanResult:
         """Scan a TensorFlow SavedModel file or directory"""
         # Check if path is valid
@@ -314,21 +333,22 @@ class TensorFlowSavedModelScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        # Add file integrity check for compliance
-        self.add_file_integrity_check(path, result)
         self.current_file_path = path
 
         # Check if this is a keras_metadata.pb file
         if path.endswith("keras_metadata.pb"):
             # Scan it for Lambda layers
             try:
-                self._scan_keras_metadata(path, result)
+                self._scan_keras_metadata(path, result, add_integrity_check=True)
             except OSError as e:
                 return self._finish_read_failure(result, path, e)
             result.finish(
                 success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
             )
             return result
+
+        # Add file integrity check for compliance
+        self.add_file_integrity_check(path, result)
 
         try:
             # Import vendored protos module (sets up sys.path for tensorflow.* imports)
@@ -1281,7 +1301,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 why=get_tf_op_explanation(node.op),
             )
 
-    def _scan_keras_metadata(self, path: str, result: ScanResult) -> None:
+    def _scan_keras_metadata(self, path: str, result: ScanResult, *, add_integrity_check: bool = False) -> None:
         """Scan keras_metadata.pb for Lambda layers and unsafe patterns"""
         try:
             with open(path, "rb") as f:
@@ -1290,6 +1310,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 if len(content) > _MAX_KERAS_METADATA_PARSE_BYTES:
                     self._mark_keras_metadata_parse_budget_exceeded(result, path)
                     return
+                if add_integrity_check:
+                    self._add_bounded_file_integrity_check(path, result, content)
 
                 # Convert to string for pattern matching
                 content_str = content.decode("utf-8", errors="ignore")

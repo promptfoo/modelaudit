@@ -1,5 +1,7 @@
 import base64
 import builtins
+import hashlib
+import io
 import pickle
 import shutil
 from pathlib import Path
@@ -239,6 +241,55 @@ def test_tf_savedmodel_standalone_oversized_keras_metadata_is_inconclusive(
     )
     assert not any(check.name == "File Integrity Hash" for check in direct.checks)
     assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_keras_metadata_swap_to_oversized_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(b"A")
+    monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", 32)
+    monkeypatch.setattr(tf_savedmodel_module, "open", lambda *_args, **_kwargs: io.BytesIO(b"A" * 33), raising=False)
+    monkeypatch.setattr(
+        tf_savedmodel_module.TensorFlowSavedModelScanner,
+        "calculate_file_hashes",
+        lambda *_args, **_kwargs: pytest.fail("bounded metadata scans must not reopen the path for hashing"),
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+
+    assert result.success is False
+    assert result.bytes_scanned == 32
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "keras_metadata_parse_budget_exceeded"
+    assert not any(check.name == "File Integrity Hash" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_in_budget_keras_metadata_hashes_bounded_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_path = tmp_path / "keras_metadata.pb"
+    content = b'{"class_name": "Dense"}'
+    metadata_path.write_bytes(content)
+    monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", 64)
+    monkeypatch.setattr(
+        tf_savedmodel_module.TensorFlowSavedModelScanner,
+        "calculate_file_hashes",
+        lambda *_args, **_kwargs: pytest.fail("bounded metadata scans must hash the analyzed bytes"),
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+
+    integrity_checks = [check for check in result.checks if check.name == "File Integrity Hash"]
+    assert result.success is True
+    assert len(integrity_checks) == 1
+    assert integrity_checks[0].details["sha256"] == hashlib.sha256(content).hexdigest()
+    assert integrity_checks[0].details["file_size"] == len(content)
+    assert result.metadata["file_hashes"]["sha256"] == hashlib.sha256(content).hexdigest()
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
