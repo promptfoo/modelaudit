@@ -2221,6 +2221,12 @@ def scan_model_streaming(
             if time.time() - start_time > timeout:
                 results.has_errors = True
                 logger.error(f"Streaming scan timeout after {timeout}s")
+                if delete_after_scan and source_path.exists():
+                    try:
+                        source_path.unlink()
+                        logger.debug(f"Deleted {source_path} after streaming timeout")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete {source_path} after streaming timeout: {e}")
                 break
 
             try:
@@ -2361,5 +2367,12 @@ def scan_model_streaming(
         logger.error(f"Streaming scan failed: {e}")
         results.has_errors = True
         raise
+    finally:
+        close_generator = getattr(file_generator, "close", None)
+        if callable(close_generator):
+            try:
+                close_generator()
+            except Exception as e:
+                logger.warning(f"Failed to close streaming file generator: {e}")
 
     return results

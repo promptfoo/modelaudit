@@ -814,6 +814,32 @@ def test_scan_model_streaming_empty_generator():
     assert result.content_hash is None or result.content_hash == compute_aggregate_hash([])
 
 
+def test_scan_model_streaming_timeout_closes_generator_and_deletes_yielded_file(tmp_path: Path) -> None:
+    streamed_file = tmp_path / "streamed.pkl"
+    streamed_file.write_bytes(b"payload")
+    generator_closed = False
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        nonlocal generator_closed
+        try:
+            yield (streamed_file, True)
+        finally:
+            generator_closed = True
+
+    retained_generator = file_generator()
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        result = scan_model_streaming(
+            file_generator=retained_generator,
+            timeout=0,
+            delete_after_scan=True,
+        )
+
+    assert result.has_errors is True
+    assert generator_closed is True
+    assert not streamed_file.exists()
+    mock_scan.assert_not_called()
+
+
 def test_scan_model_streaming_scan_error_handling(temp_test_files):
     """Test that scan errors are handled gracefully in streaming mode."""
 

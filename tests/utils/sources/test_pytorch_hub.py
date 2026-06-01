@@ -124,6 +124,49 @@ def test_download_pytorch_hub_model_streaming_enforces_max_size_while_streaming(
     assert not stream_dir.exists()
 
 
+@patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_streaming_deduplicates_links_before_budget_check(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_mkdtemp: MagicMock,
+    tmp_path: Path,
+) -> None:
+    stream_dir = tmp_path / "stream"
+    stream_dir.mkdir()
+    mock_mkdtemp.return_value = str(stream_dir)
+    weight_url = "https://download.pytorch.org/models/resnet50.pth"
+    html_resp = MagicMock()
+    html_resp.text = f'<a href="{weight_url}">first</a><a href="{weight_url}">second</a>'
+    html_resp.raise_for_status = lambda: None
+    file_resp = MagicMock()
+    file_resp.__enter__.return_value = file_resp
+    file_resp.headers = {"content-length": "3"}
+    file_resp.iter_content.return_value = [b"abc"]
+    file_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, file_resp]
+
+    head_resp = MagicMock()
+    head_resp.ok = True
+    head_resp.headers = {"content-length": "3"}
+    mock_head.return_value = head_resp
+
+    yielded = [
+        (file_path.read_bytes(), is_last)
+        for file_path, is_last in download_pytorch_hub_model_streaming(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            show_progress=False,
+            max_size=4,
+        )
+    ]
+
+    assert yielded == [(b"abc", True)]
+    assert not stream_dir.exists()
+    mock_head.assert_called_once_with(weight_url, timeout=10)
+    assert mock_get.call_count == 2
+
+
 def test_download_pytorch_hub_model_invalid_url():
     with pytest.raises(ValueError):
         download_pytorch_hub_model("https://example.com/model")

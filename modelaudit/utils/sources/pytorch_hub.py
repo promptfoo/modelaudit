@@ -20,7 +20,7 @@ def is_pytorch_hub_url(url: str) -> bool:
 def _extract_weight_urls(html: str) -> list[str]:
     """Extract weight file URLs from a PyTorch Hub page."""
     pattern = r"https://download\.pytorch\.org/models/[\w\-_.]+(?:\.pt|\.pth(?:\.tar\.gz|\.zip)?)(?![\w.])"
-    return re.findall(pattern, html)
+    return list(dict.fromkeys(re.findall(pattern, html)))
 
 
 def _get_total_size(urls: list[str]) -> int:
