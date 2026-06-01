@@ -91,6 +91,10 @@ _DEFAULT_SANDBOX_RENDER_MAX_OUTPUT_CHARS = 64 * 1024
 _DEFAULT_SANDBOX_RENDER_MAX_MEMORY_BYTES = 512 * 1024 * 1024
 _SANDBOX_RENDER_SPAWN_STARTUP_GRACE_SECONDS = 2.0
 _SANDBOX_RENDER_BUDGET_REASON = "jinja2_sandbox_render_budget_exceeded"
+_EAGER_RANGE_ITERATION_FILTERS = frozenset({"groupby", "join", "list", "max", "min", "slice", "sort", "sum"})
+_LAZY_RANGE_ITERATION_FILTERS = frozenset(
+    {"batch", "map", "reject", "rejectattr", "reverse", "select", "selectattr", "unique"}
+)
 
 
 class _SandboxRenderBudgetExceeded(Exception):
@@ -1360,20 +1364,8 @@ class Jinja2TemplateScanner(BaseScanner):
         if self._template_ast_has_static_range_list_budget_risk(parsed):
             return True
 
-        range_threshold = max(1, self.sandbox_render_max_output_chars)
-        for node in parsed.find_all(jinja2.nodes.Call):
-            if not self._is_range_call(node):
-                continue
-            range_count = self._constant_range_iteration_count(node.args, range_threshold)
-            if range_count is not None:
-                if range_count >= range_threshold:
-                    return True
-                continue
-
-            stop_arg = node.args[1] if len(node.args) >= 2 else node.args[0]
-            range_bound = self._constant_int_expression_value(stop_arg, range_threshold)
-            if range_bound is not None and abs(range_bound) >= range_threshold:
-                return True
+        if self._template_ast_has_static_iterated_range_budget_risk(parsed):
+            return True
 
         for node in parsed.find_all(jinja2.nodes.Mul):
             projected_size = self._constant_repeated_sequence_size(node.left, node.right)
@@ -1382,16 +1374,52 @@ class Jinja2TemplateScanner(BaseScanner):
 
         return False
 
+    def _template_ast_has_static_iterated_range_budget_risk(self, parsed: Any) -> bool:
+        range_threshold = max(1, self.sandbox_render_max_output_chars)
+        for node in parsed.find_all(jinja2.nodes.For):
+            if self._range_iterable_exceeds_static_budget(node.iter, range_threshold):
+                return True
+
+        for node in parsed.find_all(jinja2.nodes.Filter):
+            if node.name in _EAGER_RANGE_ITERATION_FILTERS and self._range_iterable_exceeds_static_budget(
+                node.node,
+                range_threshold,
+            ):
+                return True
+
+        return False
+
     def _template_ast_has_static_range_list_budget_risk(self, parsed: Any) -> bool:
         range_threshold = max(1, self.sandbox_render_max_output_chars)
         for node in parsed.find_all(jinja2.nodes.Filter):
-            if node.name != "list" or not self._is_range_call(node.node):
+            if node.name != "list":
                 continue
-            projected_size = self._constant_range_rendered_list_size(node.node.args, range_threshold)
+            range_call = self._iterable_range_call(node.node)
+            if range_call is None:
+                continue
+            projected_size = self._constant_range_rendered_list_size(range_call.args, range_threshold)
             if projected_size is not None and projected_size > self.sandbox_render_max_output_chars:
                 return True
 
         return False
+
+    def _range_iterable_exceeds_static_budget(self, node: Any, threshold: int) -> bool:
+        range_call = self._iterable_range_call(node)
+        if range_call is None:
+            return False
+
+        range_count = self._constant_range_iteration_count(range_call.args, threshold)
+        if range_count is not None:
+            return range_count >= threshold
+
+        stop_arg = range_call.args[1] if len(range_call.args) >= 2 else range_call.args[0]
+        range_bound = self._constant_int_expression_value(stop_arg, threshold)
+        return range_bound is not None and abs(range_bound) >= threshold
+
+    def _iterable_range_call(self, node: Any) -> Any | None:
+        while isinstance(node, jinja2.nodes.Filter) and node.name in _LAZY_RANGE_ITERATION_FILTERS:
+            node = node.node
+        return node if self._is_range_call(node) else None
 
     def _is_range_call(self, node: Any) -> bool:
         return (
@@ -1421,8 +1449,6 @@ class Jinja2TemplateScanner(BaseScanner):
     def _constant_sequence_size(self, node: Any) -> int | None:
         if isinstance(node, jinja2.nodes.Const) and isinstance(node.value, str | bytes):
             return len(node.value)
-        if isinstance(node, jinja2.nodes.Const) and isinstance(node.value, int | float | bool):
-            return len(str(node.value))
         if isinstance(node, jinja2.nodes.List | jinja2.nodes.Tuple):
             item_sizes: list[int] = []
             is_tuple = isinstance(node, jinja2.nodes.Tuple)
