@@ -20,6 +20,14 @@ from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 _DECODE_INCONCLUSIVE_REASON = "r_serialized_decode_incomplete"
 _READ_INCONCLUSIVE_REASON = "r_serialized_read_failed"
 _STRING_EXTRACTION_INCONCLUSIVE_REASON = "r_serialized_string_extraction_incomplete"
+_R_CREDENTIAL_KEY_PATTERN = r"(?:api[_-]?key|token|secret|password)"
+_R_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    rf"""(?ix)(?:
+        \b{_R_CREDENTIAL_KEY_PATTERN}\s*(?::|=|<{{1,2}}-)\s*["'][^"']{{6,}}["']
+        |
+        ["'][^"']{{6,}}["']\s*->{{1,2}}\s*\b{_R_CREDENTIAL_KEY_PATTERN}
+    )"""
+)
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -103,9 +111,7 @@ class RSerializedScanner(BaseScanner):
         "aws_access_key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
         "github_token": re.compile(r"\bghp_[A-Za-z0-9]{36}\b"),
         "openai_key_like": re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),
-        "generic_secret_assignment": re.compile(
-            r"(?i)\b(api[_-]?key|token|secret|password)\s*[:=]\s*[\"'][^\"']{6,}[\"']"
-        ),
+        "generic_secret_assignment": _R_CREDENTIAL_ASSIGNMENT_RE,
     }
 
     def __init__(self, config: dict[str, object] | None = None):

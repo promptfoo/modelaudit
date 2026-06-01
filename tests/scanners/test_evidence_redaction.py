@@ -67,3 +67,18 @@ def test_redacts_r_assignment_operators() -> None:
     assert "R_PASSWORD_SECRET" not in redacted
     assert f"token <- '{REDACTED_EVIDENCE_VALUE}'" in redacted
     assert f"password <<- {REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+def test_redacts_r_rightward_assignment_operators() -> None:
+    """Native R rightward assignment operators should not preserve raw credential values."""
+    redacted = redact_evidence_string(
+        "'R_TOKEN_SECRET' -> token \"R_PASSWORD_SECRET\" ->> password R_BARE_SECRET -> service_token",
+        max_chars=500,
+    )
+
+    assert "R_TOKEN_SECRET" not in redacted
+    assert "R_PASSWORD_SECRET" not in redacted
+    assert "R_BARE_SECRET" not in redacted
+    assert f"'{REDACTED_EVIDENCE_VALUE}' -> token" in redacted
+    assert f'"{REDACTED_EVIDENCE_VALUE}" ->> password' in redacted
+    assert f"{REDACTED_EVIDENCE_VALUE} -> service_token" in redacted

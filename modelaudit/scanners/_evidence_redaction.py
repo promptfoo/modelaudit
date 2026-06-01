@@ -58,6 +58,12 @@ SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{SENSITIVE_ASSIGNMENT_OPERATOR}\s*)([\"']).*?\3"
 )
+RIGHTWARD_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)[^\s\"';&|]+(\s*->{{1,2}}\s*{SENSITIVE_ASSIGNMENT_KEY}\b)"
+)
+QUOTED_RIGHTWARD_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"""(?i)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')(\s*->{{1,2}}\s*{SENSITIVE_ASSIGNMENT_KEY}\b)"""
+)
 
 
 def _redact_malformed_url(raw_url: str) -> str:
@@ -108,6 +114,11 @@ def _redact_quoted_assignment(match: re.Match[str]) -> str:
     return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
+def _redact_quoted_rightward_assignment(match: re.Match[str]) -> str:
+    quote = match.group(1)[0]
+    return f"{quote}{REDACTED_EVIDENCE_VALUE}{quote}{match.group(2)}"
+
+
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
@@ -120,7 +131,9 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
     redacted = URL_RE.sub(_redact_url, text)
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
+    redacted = QUOTED_RIGHTWARD_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_rightward_assignment, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+    redacted = RIGHTWARD_SENSITIVE_ASSIGNMENT_RE.sub(rf"{REDACTED_EVIDENCE_VALUE}\1", redacted)
     return _truncate(redacted, max_chars)
