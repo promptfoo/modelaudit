@@ -504,6 +504,27 @@ def test_numpy_object_dtype_pickle_selection_skip_is_inconclusive(tmp_path: Path
     assert not any("exec" in issue.message.lower() for issue in result.issues)
 
 
+def test_numpy_numeric_dtype_numpy_only_remains_conclusive(tmp_path: Path) -> None:
+    path = tmp_path / "numeric_numpy_only.npy"
+    np.save(path, np.arange(4))
+
+    result = scan_model_directory_or_file(
+        str(path),
+        scanners=["numpy"],
+        cache_scan_results=False,
+    )
+    metadata = result.file_metadata[str(path)]
+
+    assert result.success is True
+    assert determine_exit_code(result) == 0
+    assert metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pickle"
+        for check in result.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
 def test_numpy_object_dtype_pickle_selection_control_detects_exec(tmp_path: Path) -> None:
     arr = np.array([_ExecPayload()], dtype=object)
     path = tmp_path / "malicious_object_numpy_and_pickle.npy"
