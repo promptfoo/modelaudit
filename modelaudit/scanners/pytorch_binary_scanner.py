@@ -349,8 +349,8 @@ class PyTorchBinaryScanner(BaseScanner):
                 # Get character right after interpreter
                 next_char = snippet[interp_len : interp_len + 1]
 
-                # Valid next characters: newline, space, tab, or / (for /usr/bin/env python)
-                if next_char in (b"\n", b"\r", b" ", b"\t", b"/"):
+                # Valid next characters: newline or whitespace before interpreter arguments.
+                if next_char in (b"\n", b"\r", b" ", b"\t"):
                     return True
 
         return False
@@ -413,12 +413,19 @@ class PyTorchBinaryScanner(BaseScanner):
         # Analyze ML context for this chunk
         file_size = self.get_file_size(self.current_file_path)
         ml_context = analyze_binary_for_ml_context(chunk, file_size)
+        reported_signatures = {
+            (check.details.get("signature"), check.details.get("offset"))
+            for check in result.checks
+            if check.name == "Executable Signature Detection"
+        }
 
         # Count patterns for density analysis
         pattern_counts = {}
 
         # Common executable signatures
         for sig, description in EXECUTABLE_SIGNATURES.items():
+            if sig.startswith(b"#!/") and sig != b"#!/":
+                continue
             if sig in chunk:
                 # Count all occurrences
                 positions = []
@@ -427,7 +434,7 @@ class PyTorchBinaryScanner(BaseScanner):
                     pos = chunk.find(sig, pos)
                     if pos == -1:
                         break
-                    if pos + len(sig) > overlap_prefix_len:
+                    if pos + len(sig) > overlap_prefix_len or sig == b"#!/":
                         positions.append(offset + pos)
                     pos += len(sig)
 
@@ -483,7 +490,11 @@ class PyTorchBinaryScanner(BaseScanner):
                 filtered_positions.append(pos)
 
             # Report significant patterns that weren't filtered out
-            for pos in filtered_positions[:10]:  # Limit to first 10
+            reported_count = 0
+            for pos in filtered_positions:
+                signature_key = (sig.hex(), pos)
+                if signature_key in reported_signatures:
+                    continue
                 result.add_check(
                     name="Executable Signature Detection",
                     passed=False,
@@ -500,6 +511,10 @@ class PyTorchBinaryScanner(BaseScanner):
                         "ml_context_confidence": ml_context.get("weight_confidence", 0),
                     },
                 )
+                reported_signatures.add(signature_key)
+                reported_count += 1
+                if reported_count >= 10:
+                    break
 
             # Add debug note about ignored patterns (only shown in verbose mode)
             if ignored_count > 0 and len(positions) > 5:

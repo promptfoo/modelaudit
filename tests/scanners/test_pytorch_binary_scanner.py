@@ -394,6 +394,87 @@ def test_pytorch_binary_scanner_ignores_invalid_late_shebang_alias(tmp_path: Pat
     assert not any(issue.rule_code == "S501" and "Shell script shebang" in issue.message for issue in result.issues)
 
 
+def test_pytorch_binary_scanner_detects_late_shebang_across_chunk_boundary_once(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "late_boundary_shebang.bin"
+    chunk_size = 1024 * 1024
+    shebang_offset = 2 * chunk_size - 10
+    binary_file.write_bytes(b"\xff" * shebang_offset + b"#!/bin/bash\necho hidden\n" + b"\xff" * 128)
+
+    result = scanner.scan(str(binary_file))
+
+    shebang_issues = [
+        issue for issue in result.issues if issue.rule_code == "S501" and "Shell script shebang" in issue.message
+    ]
+    assert len(shebang_issues) == 1
+    assert shebang_issues[0].details["signature"] == b"#!/".hex()
+    assert shebang_issues[0].details["offset"] == shebang_offset
+
+
+def test_pytorch_binary_scanner_coalesces_late_shebang_aliases(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "late_shebang.bin"
+    chunk_size = 1024 * 1024
+    shebang_offset = chunk_size + 512
+    binary_file.write_bytes(b"\xff" * shebang_offset + b"#!/bin/bash\necho hidden\n" + b"\xff" * 128)
+
+    result = scanner.scan(str(binary_file))
+
+    shebang_issues = [
+        issue for issue in result.issues if issue.rule_code == "S501" and "Shell script shebang" in issue.message
+    ]
+    assert len(shebang_issues) == 1
+    assert shebang_issues[0].details["signature"] == b"#!/".hex()
+    assert shebang_issues[0].details["offset"] == shebang_offset
+
+
+def test_pytorch_binary_scanner_reconsiders_carried_shebang_under_new_chunk_context(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "carried_shebang_context.bin"
+    chunk_size = 1024 * 1024
+    shebang = b"#!/bin/bash\n"
+    shebang_offset = chunk_size - 20
+    binary_file.write_bytes(b"\x00" * shebang_offset + shebang + b"\x00" * (20 - len(shebang)) + b"\xff" * 1024)
+
+    result = scanner.scan(str(binary_file))
+
+    shebang_issues = [
+        issue for issue in result.issues if issue.rule_code == "S501" and "Shell script shebang" in issue.message
+    ]
+    assert len(shebang_issues) == 1
+    assert shebang_issues[0].details["signature"] == b"#!/".hex()
+    assert shebang_issues[0].details["offset"] == shebang_offset
+
+
+def test_pytorch_binary_scanner_deduplicates_carried_shebang(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "carried_shebang.bin"
+    chunk_size = 1024 * 1024
+    shebang = b"#!/bin/bash\n"
+    shebang_offset = chunk_size - 20
+    binary_file.write_bytes(b"\xff" * shebang_offset + shebang + b"\xff" * (20 - len(shebang)) + b"\xff" * 1024)
+
+    result = scanner.scan(str(binary_file))
+
+    shebang_issues = [
+        issue for issue in result.issues if issue.rule_code == "S501" and "Shell script shebang" in issue.message
+    ]
+    assert len(shebang_issues) == 1
+    assert shebang_issues[0].details["signature"] == b"#!/".hex()
+    assert shebang_issues[0].details["offset"] == shebang_offset
+
+
+def test_pytorch_binary_scanner_ignores_invalid_late_shebang_interpreter_subpath(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "late_invalid_shebang_subpath.bin"
+    chunk_size = 1024 * 1024
+    binary_file.write_bytes(b"\xff" * (chunk_size + 512) + b"#!/bin/bash/not-an-interpreter\n" + b"\xff" * 128)
+
+    result = scanner.scan(str(binary_file))
+
+    assert not any(issue.rule_code == "S501" and "Shell script shebang" in issue.message for issue in result.issues)
+
+
 @pytest.mark.skip(
     reason="ML context filtering now ignores executable signatures in weight-like data to reduce false positives"
 )
