@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import stat
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -792,6 +793,7 @@ class TestCloudPathSecurity:
     ) -> None:
         fs = make_fs_mock()
         fs.info.return_value = {"type": "file", "size": 512}
+        fs.open.return_value = BytesIO(b"model")
         mock_fs_class.return_value = fs
 
         model_url = "s3://bucket/models/model.pkl"
@@ -817,8 +819,8 @@ class TestCloudPathSecurity:
 
         assert result == tmp_path
         fs.info.assert_called_once_with(model_url)
-        fs.get.assert_called_once()
-        assert fs.get.call_args.args[0] == model_url
+        fs.open.assert_called_once_with(model_url, "rb")
+        fs.get.assert_not_called()
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
@@ -853,6 +855,39 @@ class TestCloudPathSecurity:
             )
 
         fs.get.assert_not_called()
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_with_max_size_rejects_underreported_transfer_without_retry(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 4}
+        fs.open.return_value = BytesIO(b"oversized")
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 4,
+            "name": "model.bin",
+            "human_size": "4 B",
+            "estimated_time": "instant",
+        }
+
+        with pytest.raises(ValueError, match="Cloud download exceeds maximum allowed size"):
+            download_from_cloud(
+                "s3://bucket/model.bin",
+                cache_dir=tmp_path,
+                max_size=4,
+                use_cache=False,
+                show_progress=False,
+            )
+
+        fs.open.assert_called_once_with("s3://bucket/model.bin", "rb")
+        fs.get.assert_not_called()
+        assert not (tmp_path / "model.bin").exists()
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
@@ -954,6 +989,7 @@ class TestCloudPathSecurity:
     ) -> None:
         fs = make_fs_mock()
         fs.info.return_value = {"type": "file", "size": 512}
+        fs.open.return_value = BytesIO(b"model")
         mock_fs_class.return_value = fs
 
         model_url = "s3://bucket/models/model.pkl"
@@ -979,8 +1015,33 @@ class TestCloudPathSecurity:
 
         assert len(streamed) == 1
         fs.info.assert_called_once_with(model_url)
-        fs.get.assert_called_once()
-        assert fs.get.call_args.args[0] == model_url
+        fs.open.assert_called_once_with(model_url, "rb")
+        fs.get.assert_not_called()
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_streaming_download_with_max_size_rejects_underreported_transfer_without_retry(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 4}
+        fs.open.return_value = BytesIO(b"oversized")
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 4,
+            "name": "model.bin",
+            "human_size": "4 B",
+            "estimated_time": "instant",
+        }
+
+        with pytest.raises(ValueError, match="Cloud download exceeds maximum allowed size"):
+            list(download_from_cloud_streaming("s3://bucket/model.bin", max_size=4, show_progress=False))
+
+        fs.open.assert_called_once_with("s3://bucket/model.bin", "rb")
+        fs.get.assert_not_called()
 
 
 class TestCloudCacheSafety:

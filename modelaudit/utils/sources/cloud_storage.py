@@ -23,6 +23,7 @@ from ..helpers.disk_space import check_disk_space
 
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
+_CLOUD_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
     (
@@ -666,6 +667,36 @@ def _selected_cloud_download_size(fs: Any, files: list[dict[str, Any]], max_size
     return total_size
 
 
+class _CloudDownloadBudgetExceeded(ValueError):
+    """Raised when a cloud transfer exceeds its bounded acquisition budget."""
+
+
+def _download_cloud_object(fs: Any, file_url: str, local_path: Path, max_bytes: int | None) -> int:
+    """Download one cloud object while enforcing an optional transfer budget."""
+    if max_bytes is None:
+        fs.get(file_url, str(local_path))
+        return 0
+
+    bytes_written = 0
+    try:
+        with fs.open(file_url, "rb") as remote_file, local_path.open("wb") as local_file:
+            while True:
+                chunk = remote_file.read(min(_CLOUD_DOWNLOAD_CHUNK_BYTES, max_bytes - bytes_written + 1))
+                if not chunk:
+                    return bytes_written
+                if not isinstance(chunk, bytes):
+                    raise TypeError("cloud filesystem returned non-bytes content")
+                bytes_written += len(chunk)
+                if bytes_written > max_bytes:
+                    raise _CloudDownloadBudgetExceeded(
+                        f"Cloud download exceeds maximum allowed size ({format_size(max_bytes)})"
+                    )
+                local_file.write(chunk)
+    except Exception:
+        local_path.unlink(missing_ok=True)
+        raise
+
+
 def download_from_cloud(
     url: str,
     cache_dir: Path | None = None,
@@ -835,6 +866,7 @@ def download_from_cloud(
             assert files is not None
 
             # Download files
+            remaining_download_bytes = max_size
             for file_info in files:
                 file_url = file_info["path"]
                 local_path = _build_safe_local_path(url, file_url, download_path)
@@ -845,13 +877,16 @@ def download_from_cloud(
 
                 @retry_with_backoff(
                     max_retries=3,
+                    do_not_retry_on=(_CloudDownloadBudgetExceeded,),
                     verbose=show_progress,
                     sanitize_error=_cloud_error_sanitizer(file_url),
                 )
-                def download_file(url=file_url, path=local_path):
-                    fs.get(url, str(path))
+                def download_file(url=file_url, path=local_path, budget=remaining_download_bytes):
+                    return _download_cloud_object(fs, url, path, budget)
 
-                download_file()
+                downloaded_bytes = download_file()
+                if remaining_download_bytes is not None:
+                    remaining_download_bytes -= downloaded_bytes
         else:
             # Single file download
             file_name = _cloud_url_basename(url)
@@ -859,11 +894,12 @@ def download_from_cloud(
 
             @retry_with_backoff(
                 max_retries=3,
+                do_not_retry_on=(_CloudDownloadBudgetExceeded,),
                 verbose=show_progress,
                 sanitize_error=_cloud_error_sanitizer(url),
             )
             def download_single_file():
-                fs.get(url, str(local_file))
+                return _download_cloud_object(fs, url, local_file, max_size)
 
             if show_progress and size > 100 * 1024 * 1024 * 1024:  # Show progress for files > 100GB
                 with yaspin(text=f"Downloading {file_name}") as spinner:
@@ -976,6 +1012,7 @@ def download_from_cloud_streaming(
     try:
         # Download files one at a time
         total_files = len(files)
+        remaining_download_bytes = max_size
         for i, file_info in enumerate(files):
             file_url = file_info["path"]
             file_name = file_info.get("name") or _cloud_url_basename(file_url)
@@ -990,13 +1027,16 @@ def download_from_cloud_streaming(
 
             @retry_with_backoff(
                 max_retries=3,
+                do_not_retry_on=(_CloudDownloadBudgetExceeded,),
                 verbose=show_progress,
                 sanitize_error=_cloud_error_sanitizer(file_url),
             )
-            def download_file(url=file_url, path=local_path):
-                fs.get(url, str(path))
+            def download_file(url=file_url, path=local_path, budget=remaining_download_bytes):
+                return _download_cloud_object(fs, url, path, budget)
 
-            download_file()
+            downloaded_bytes = download_file()
+            if remaining_download_bytes is not None:
+                remaining_download_bytes -= downloaded_bytes
 
             yield (local_path, is_last)
 
