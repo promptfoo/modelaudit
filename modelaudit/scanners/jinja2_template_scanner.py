@@ -529,6 +529,14 @@ class Jinja2TemplateScanner(BaseScanner):
                 if key == "tokenizer.chat_template" and hasattr(field, "parts") and hasattr(field, "data"):
                     value = field.parts[field.data[0]]
                     if isinstance(value, list | tuple):
+                        if len(value) > self.max_template_size:
+                            self._add_template_size_failure(
+                                extraction_failures,
+                                "gguf",
+                                "tokenizer.chat_template",
+                                len(value),
+                            )
+                            continue
                         # Convert list of integers to string
                         template_str = "".join(chr(i) for i in value if isinstance(i, int) and 0 <= i <= 1114111)
                     else:

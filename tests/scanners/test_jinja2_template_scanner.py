@@ -1,7 +1,9 @@
 """Tests for Jinja2TemplateScanner covering CVE-2024-34359 and SSTI detection."""
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -752,6 +754,32 @@ class TestJinja2TemplateScannerEdgeCases:
         assert len(size_checks) == 1
         assert size_checks[0].details["format"] == "gguf"
         assert size_checks[0].details["skipped_template_locations"] == ["tokenizer.chat_template"]
+
+    def test_list_backed_gguf_oversized_chat_template_fails_before_iteration(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class ExplodingTemplateList(list[int]):
+            def __iter__(self) -> Iterator[int]:
+                raise AssertionError("oversized GGUF template must not be materialized")
+
+        class FakeGGUFReader:
+            def __init__(self, _path: str) -> None:
+                self.fields = {
+                    "tokenizer.chat_template": SimpleNamespace(
+                        parts=[ExplodingTemplateList([ord("a")] * 65)],
+                        data=[0],
+                    )
+                }
+
+        monkeypatch.setattr(jinja2_template_scanner, "GGUFReader", FakeGGUFReader, raising=False)
+
+        templates, failures = Jinja2TemplateScanner({"max_template_size": 64})._extract_gguf_templates("fake.gguf")
+
+        assert templates == {}
+        assert len(failures) == 1
+        assert failures[0]["reason"] == "jinja2_template_size_limit_exceeded"
+        assert failures[0]["template_size"] == 65
 
     def test_small_json_chat_template_still_analyzed(self, tmp_path: Path) -> None:
         payload = "{{ lipsum.__globals__.os.popen('id') }}"
