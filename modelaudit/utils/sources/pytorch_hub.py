@@ -66,6 +66,37 @@ def _remove_partial_file(path: Path) -> None:
         path.unlink()
 
 
+def _download_weight_file(weight_url: str, dest_file: Path, downloaded_size: int, max_size: int | None) -> int:
+    """Download one weight file atomically and return the cumulative byte count."""
+    partial_file: Path | None = None
+    try:
+        with requests.get(weight_url, stream=True, timeout=30) as resp:
+            resp.raise_for_status()
+            content_length = _response_content_length(resp)
+            if content_length is not None:
+                _enforce_max_size(downloaded_size + content_length, max_size)
+
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=f".{dest_file.name}.",
+                suffix=".part",
+                dir=dest_file.parent,
+                delete=False,
+            ) as f:
+                partial_file = Path(f.name)
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        _enforce_max_size(downloaded_size + len(chunk), max_size)
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+
+        partial_file.replace(dest_file)
+        return downloaded_size
+    finally:
+        if partial_file is not None:
+            _remove_partial_file(partial_file)
+
+
 def download_pytorch_hub_model(url: str, cache_dir: Path | None = None, max_size: int | None = None) -> Path:
     """Download model weights referenced from a PyTorch Hub page."""
     if not is_pytorch_hub_url(url):
@@ -101,25 +132,12 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None, max_size
         filename = weight_url.split("/")[-1]
         dest_file = dest_dir / filename
         try:
-            with requests.get(weight_url, stream=True, timeout=30) as resp:
-                resp.raise_for_status()
-                content_length = _response_content_length(resp)
-                if content_length is not None:
-                    _enforce_max_size(downloaded_size + content_length, max_size)
-
-                with open(dest_file, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            _enforce_max_size(downloaded_size + len(chunk), max_size)
-                            f.write(chunk)
-                            downloaded_size += len(chunk)
+            downloaded_size = _download_weight_file(weight_url, dest_file, downloaded_size, max_size)
         except ValueError:
-            _remove_partial_file(dest_file)
             if cache_dir is None:
                 shutil.rmtree(dest_dir, ignore_errors=True)
             raise
         except Exception as e:
-            _remove_partial_file(dest_file)
             if cache_dir is None:
                 shutil.rmtree(dest_dir, ignore_errors=True)
             raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
@@ -180,18 +198,7 @@ def download_pytorch_hub_model_streaming(
                 click.echo(f"⬇️  Downloading {filename}")
 
             try:
-                with requests.get(weight_url, stream=True, timeout=30) as resp:
-                    resp.raise_for_status()
-                    content_length = _response_content_length(resp)
-                    if content_length is not None:
-                        _enforce_max_size(downloaded_size + content_length, max_size)
-
-                    with open(dest_file, "wb") as f:
-                        for chunk in resp.iter_content(chunk_size=8192):
-                            if chunk:
-                                _enforce_max_size(downloaded_size + len(chunk), max_size)
-                                f.write(chunk)
-                                downloaded_size += len(chunk)
+                downloaded_size = _download_weight_file(weight_url, dest_file, downloaded_size, max_size)
             except ValueError:
                 raise
             except Exception as e:

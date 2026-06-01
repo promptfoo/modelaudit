@@ -153,6 +153,85 @@ def test_download_pytorch_hub_model_enforces_max_size_while_streaming(
     assert not (tmp_path / "resnet50.pth").exists()
 
 
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_preserves_existing_cache_file_after_size_rejection(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    tmp_path: Path,
+) -> None:
+    html_resp = MagicMock()
+    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
+    html_resp.raise_for_status = lambda: None
+    file_resp = MagicMock()
+    file_resp.__enter__.return_value = file_resp
+    file_resp.headers = {}
+    file_resp.iter_content.return_value = [b"abc", b"def"]
+    file_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, file_resp]
+
+    head_resp = MagicMock()
+    head_resp.ok = False
+    head_resp.headers = {}
+    mock_head.return_value = head_resp
+
+    cached_file = tmp_path / "resnet50.pth"
+    cached_file.write_bytes(b"trusted-cache")
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        download_pytorch_hub_model(
+            "https://pytorch.org/hub/pytorch_vision_resnet/",
+            cache_dir=tmp_path,
+            max_size=4,
+        )
+
+    assert cached_file.read_bytes() == b"trusted-cache"
+    assert not list(tmp_path.glob(".*.part"))
+
+
+@patch("modelaudit.utils.sources.pytorch_hub.check_disk_space")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.head")
+@patch("modelaudit.utils.sources.pytorch_hub.requests.get")
+def test_download_pytorch_hub_model_does_not_follow_existing_cache_symlink(
+    mock_get: MagicMock,
+    mock_head: MagicMock,
+    mock_check: MagicMock,
+    tmp_path: Path,
+) -> None:
+    html_resp = MagicMock()
+    html_resp.text = '<a href="https://download.pytorch.org/models/resnet50.pth">link</a>'
+    html_resp.raise_for_status = lambda: None
+    file_resp = MagicMock()
+    file_resp.__enter__.return_value = file_resp
+    file_resp.headers = {"content-length": "3"}
+    file_resp.iter_content.return_value = [b"abc"]
+    file_resp.raise_for_status = lambda: None
+    mock_get.side_effect = [html_resp, file_resp]
+
+    head_resp = MagicMock()
+    head_resp.ok = True
+    head_resp.headers = {"content-length": "3"}
+    mock_head.return_value = head_resp
+    mock_check.return_value = (True, "ok")
+
+    outside_file = tmp_path / "outside.pth"
+    outside_file.write_bytes(b"trusted-cache")
+    cached_file = tmp_path / "resnet50.pth"
+    try:
+        cached_file.symlink_to(outside_file)
+    except OSError as exc:  # pragma: no cover - depends on host symlink support
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    download_pytorch_hub_model(
+        "https://pytorch.org/hub/pytorch_vision_resnet/",
+        cache_dir=tmp_path,
+    )
+
+    assert outside_file.read_bytes() == b"trusted-cache"
+    assert not cached_file.is_symlink()
+    assert cached_file.read_bytes() == b"abc"
+
+
 @patch("modelaudit.utils.sources.pytorch_hub.tempfile.mkdtemp")
 @patch("modelaudit.utils.sources.pytorch_hub.requests.head")
 @patch("modelaudit.utils.sources.pytorch_hub.requests.get")
