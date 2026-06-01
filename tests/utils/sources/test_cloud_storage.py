@@ -189,6 +189,37 @@ def test_analyze_cloud_target_directory_fails_on_partial_metadata_error(
     assert hidden_url not in serialized
 
 
+@patch("fsspec.filesystem")
+def test_analyze_cloud_target_bounds_partial_metadata_error_details(
+    mock_fs: MagicMock,
+) -> None:
+    url = "s3://bucket/path/"
+    failed_urls = [f"s3://bucket/path/evil-{index}.pkl?X-Amz-Signature=secret-{index}" for index in range(5)]
+    fs = make_fs_mock()
+
+    def info_side_effect(path: str) -> dict[str, object]:
+        if path == url:
+            return {"type": "directory", "name": "bucket/path/"}
+        raise PermissionError(f"metadata denied for {path}: {'x' * 1024}")
+
+    fs.info.side_effect = info_side_effect
+    fs.glob.return_value = failed_urls
+    mock_fs.return_value = fs
+
+    result = asyncio.run(analyze_cloud_target(url))
+    serialized = json.dumps(result)
+
+    assert result["type"] == "unknown"
+    assert result["analysis_incomplete"] is True
+    assert result["metadata_error_count"] == 5
+    assert len(result["metadata_errors"]) == 3
+    assert all(len(entry["error"]) <= 512 for entry in result["metadata_errors"])
+    assert result["error"].endswith("; ...")
+    assert "evil-4.pkl" not in serialized
+    assert "X-Amz-Signature" not in serialized
+    assert "secret-" not in serialized
+
+
 def test_filter_scannable_files_handles_signed_cloud_urls() -> None:
     files = [{"path": "s3://bucket/model.pkl?X-Amz-Signature=secret"}]
 

@@ -32,6 +32,8 @@ _SENSITIVE_QUERY_PARAM_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
+_MAX_CLOUD_METADATA_ERROR_SAMPLES = 3
+_MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS = 512
 
 
 def _run_coroutine_sync(coro_factory: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
@@ -85,6 +87,13 @@ def redact_cloud_error_for_display(message: object, source_url: str | None = Non
         redacted = redacted.replace(source_url, redact_url_for_display(source_url))
     redacted = _URL_USERINFO_RE.sub(r"\1<credentials-redacted>@", redacted)
     return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1<redacted>", redacted)
+
+
+def _bound_cloud_metadata_error_display(message: str) -> str:
+    """Limit model-controlled cloud metadata diagnostics retained in memory."""
+    if len(message) <= _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS:
+        return message
+    return f"{message[: _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS - 3]}..."
 
 
 def _cloud_error_sanitizer(source_url: str) -> Callable[[Exception], str]:
@@ -335,6 +344,7 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         # It's a directory, list contents
         files = []
         total_size = 0
+        metadata_error_count = 0
         metadata_errors: list[dict[str, str]] = []
 
         # List all files recursively
@@ -357,25 +367,27 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
                     files.append(file_metadata)
                     total_size += size
             except Exception as exc:
-                metadata_errors.append(
-                    {
-                        "path": redact_url_for_display(item),
-                        "error": redact_cloud_error_for_display(exc, item),
-                    }
-                )
+                metadata_error_count += 1
+                if len(metadata_errors) < _MAX_CLOUD_METADATA_ERROR_SAMPLES:
+                    metadata_errors.append(
+                        {
+                            "path": _bound_cloud_metadata_error_display(redact_url_for_display(item)),
+                            "error": _bound_cloud_metadata_error_display(redact_cloud_error_for_display(exc, item)),
+                        }
+                    )
 
-        if metadata_errors:
-            sample_errors = "; ".join(f"{entry['path']}: {entry['error']}" for entry in metadata_errors[:3])
-            if len(metadata_errors) > 3:
+        if metadata_error_count:
+            sample_errors = "; ".join(f"{entry['path']}: {entry['error']}" for entry in metadata_errors)
+            if metadata_error_count > len(metadata_errors):
                 sample_errors = f"{sample_errors}; ..."
             return {
                 "type": "unknown",
                 "analysis_incomplete": True,
-                "metadata_error_count": len(metadata_errors),
+                "metadata_error_count": metadata_error_count,
                 "metadata_errors": metadata_errors,
                 "error": (
                     "Cloud directory analysis incomplete: metadata lookup failed for "
-                    f"{len(metadata_errors)} object(s) under {redact_url_for_display(url)}: "
+                    f"{metadata_error_count} object(s) under {redact_url_for_display(url)}: "
                     f"{sample_errors}"
                 ),
             }
