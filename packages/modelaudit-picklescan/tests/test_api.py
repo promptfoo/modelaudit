@@ -26,6 +26,7 @@ import pytest
 
 import modelaudit_picklescan.api as package_api
 from modelaudit_picklescan import (
+    CoverageSummary,
     Finding,
     PickleReport,
     PickleScanner,
@@ -1223,6 +1224,32 @@ def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
     assert report.coverage.bytes_total == archive_path.stat().st_size
     assert report.coverage.bytes_scanned > 0
+
+
+@pytest.mark.parametrize("metadata_key", ["import_references_truncated", "callable_invocations_truncated"])
+def test_combine_pytorch_zip_reports_preserves_member_truncation_metadata(metadata_key: str) -> None:
+    pickle_entry = zipfile.ZipInfo("archive/data.pkl")
+    member_report = PickleReport(
+        source="model.pt:archive/data.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        coverage=CoverageSummary(bytes_scanned=1, bytes_total=1),
+        metadata={"analysis_incomplete": True, metadata_key: True},
+    )
+
+    report = package_api._combine_pytorch_zip_reports(
+        source="model.pt",
+        size=1,
+        entry_count=1,
+        pickle_entries=[pickle_entry],
+        member_reports=[member_report],
+        extra_notices=(),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.metadata["analysis_incomplete"] is True
+    assert report.metadata[metadata_key] is True
 
 
 def test_scan_file_detects_hidden_pytorch_zip_pickle_member_with_data_pickle(tmp_path: Path) -> None:

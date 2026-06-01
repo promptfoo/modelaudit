@@ -27,6 +27,7 @@ _INCONCLUSIVE_NOTICE_CODES = frozenset(
         "parse_incomplete",
         "known_stream_truncated",
         "import_references_truncated",
+        "callable_invocations_truncated",
         "timeout",
         "unbounded_stream_truncated",
     }
@@ -51,6 +52,7 @@ _LEGACY_SCAN_OUTCOME_REASONS = {
     "parse_incomplete": "pickle_analysis_incomplete",
     "known_stream_truncated": "known_stream_truncated",
     "import_references_truncated": "import_references_truncated",
+    "callable_invocations_truncated": "callable_invocations_truncated",
     "timeout": "scan_timeout",
     "unbounded_stream_truncated": "unbounded_stream_truncated",
 }
@@ -175,8 +177,9 @@ def pickle_report_to_scan_result(
     if suppress_parse_failure_escalation:
         result.metadata["trusted_incomplete_tail"] = True
     has_only_parse_errors = bool(report.errors) and all(error.category == "parse_error" for error in report.errors)
+    has_inconclusive_notice = any(notice.code in _INCONCLUSIVE_NOTICE_CODES for notice in report.notices)
 
-    if report.status == ScanStatus.INCONCLUSIVE:
+    if report.status == ScanStatus.INCONCLUSIVE or has_inconclusive_notice:
         result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
         result.metadata["scan_outcome_reasons"] = [
             _legacy_scan_outcome_reason(notice.code)
@@ -347,7 +350,7 @@ def pickle_report_to_scan_result(
         )
 
     scan_success = (
-        report.status == ScanStatus.COMPLETE
+        (report.status == ScanStatus.COMPLETE and not has_inconclusive_notice)
         or (report.status == ScanStatus.INCONCLUSIVE and report.has_security_findings)
         or (report.status == ScanStatus.ERROR and has_only_parse_errors)
     )

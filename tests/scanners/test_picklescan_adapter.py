@@ -605,6 +605,56 @@ def test_pickle_report_to_scan_result_fails_closed_for_truncated_import_referenc
     assert notice_check.message == "Import reference metadata exceeded the scanner reporting limit"
 
 
+def test_pickle_report_to_scan_result_fails_closed_for_legacy_complete_truncated_import_references() -> None:
+    report = PickleReport(
+        source="legacy-import-reference-cap.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        notices=(
+            Notice(
+                message="Import reference metadata exceeded the scanner reporting limit",
+                severity=Severity.INFO,
+                location="legacy-import-reference-cap.pkl",
+                code="import_references_truncated",
+                details={"analysis_incomplete": True, "max_import_references": 10_000},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["import_references_truncated"]
+    assert result.metadata["analysis_incomplete"] is True
+    assert should_cache_scan_result(result.to_dict()) is False
+
+
+def test_pickle_report_to_scan_result_fails_closed_for_legacy_complete_truncated_callable_invocations() -> None:
+    report = PickleReport(
+        source="legacy-callable-invocation-cap.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        notices=(
+            Notice(
+                message="Callable invocation metadata exceeded the scanner reporting limit",
+                severity=Severity.INFO,
+                location="legacy-callable-invocation-cap.pkl",
+                code="callable_invocations_truncated",
+                details={"analysis_incomplete": True, "max_callable_invocations": 10_000},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["callable_invocations_truncated"]
+    assert result.metadata["analysis_incomplete"] is True
+    assert should_cache_scan_result(result.to_dict()) is False
+
+
 def test_pickle_report_to_scan_result_fails_closed_for_encoded_nested_truncation_notice() -> None:
     report = PickleReport(
         source="oversized-encoded.pkl",
