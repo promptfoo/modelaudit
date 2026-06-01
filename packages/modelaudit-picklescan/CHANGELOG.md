@@ -51,7 +51,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- fail closed on protocol 5 out-of-band buffer opcodes instead of reporting clean coverage
+- fail closed on protocol 5 `NEXT_BUFFER` opcodes instead of reporting clean coverage
 - detect dynamic `type()` namespaces that can hide callable protocol hooks
 - fail closed when encoded nested-pickle probe candidates exhaust the analysis cap
 - prevent call-graph alias cycles from hanging scans

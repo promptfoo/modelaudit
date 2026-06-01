@@ -4553,11 +4553,67 @@ def test_scan_bytes_collapses_protocol5_buffer_opcode_notices() -> None:
 def test_scan_bytes_preserves_readonly_buffer_empty_stack_parity() -> None:
     report = scan_bytes(b"\x80\x05\x98\x93.", source="readonly-empty-stack.pkl")
 
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
     finding = next(finding for finding in report.findings if finding.rule_code == "MALFORMED_STACK_GLOBAL")
     assert finding.details["module_operand"] == "NoneType:None"
     assert finding.details["name_operand"] == "NoneType:None"
     buffer_notice = next(notice for notice in report.notices if notice.code == "buffer_opcode")
     assert buffer_notice.details["readonly_buffer_empty_stack_count"] == 1
+    assert buffer_notice.details["analysis_incomplete"] is True
+
+
+def test_scan_bytes_fails_closed_for_readonly_buffer_empty_stack() -> None:
+    report = scan_bytes(b"\x80\x05\x98.", source="readonly-empty-stack.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not report.is_clean
+    buffer_notice = next(notice for notice in report.notices if notice.code == "buffer_opcode")
+    assert buffer_notice.details["next_buffer_count"] == 0
+    assert buffer_notice.details["readonly_buffer_empty_stack_count"] == 1
+    assert buffer_notice.details["readonly_buffer_invalid_stack_count"] == 1
+    assert buffer_notice.details["requires_external_buffer_context"] is False
+    assert buffer_notice.details["analysis_incomplete"] is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x80\x05N\x98.",
+        b"\x80\x05G\x00\x00\x00\x00\x00\x00\x00\x00\x98.",
+    ],
+    ids=["primitive-none", "opaque-float"],
+)
+def test_scan_bytes_fails_closed_for_non_buffer_readonly_operand(payload: bytes) -> None:
+    report = scan_bytes(payload, source="non-buffer-readonly.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not report.is_clean
+    buffer_notice = next(notice for notice in report.notices if notice.code == "buffer_opcode")
+    assert buffer_notice.details["next_buffer_count"] == 0
+    assert buffer_notice.details["readonly_buffer_empty_stack_count"] == 0
+    assert buffer_notice.details["readonly_buffer_invalid_stack_count"] == 1
+    assert buffer_notice.details["requires_external_buffer_context"] is False
+    assert buffer_notice.details["analysis_incomplete"] is True
+
+
+def test_scan_bytes_preserves_complete_coverage_for_in_band_readonly_buffer() -> None:
+    report = scan_bytes(
+        b"\x80\x05\x96\x01\x00\x00\x00\x00\x00\x00\x00A\x98.",
+        source="in-band-readonly-buffer.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.is_clean
+    buffer_notice = next(notice for notice in report.notices if notice.code == "buffer_opcode")
+    assert buffer_notice.details["next_buffer_count"] == 0
+    assert buffer_notice.details["readonly_buffer_count"] == 1
+    assert buffer_notice.details["readonly_buffer_invalid_stack_count"] == 0
+    assert buffer_notice.details["requires_external_buffer_context"] is False
+    assert buffer_notice.details["analysis_incomplete"] is False
 
 
 def test_scan_bytes_records_oversized_frame_notice() -> None:

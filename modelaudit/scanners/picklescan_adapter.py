@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from modelaudit_picklescan import Finding, PickleReport, ScanError, ScanOptions, ScanStatus, Severity
+from modelaudit_picklescan import Finding, Notice, PickleReport, ScanError, ScanOptions, ScanStatus, Severity
 
 from modelaudit.config.explanations import get_import_explanation
 
@@ -65,6 +65,21 @@ _BENIGN_SERIALIZATION_TAIL_MODULE_PREFIXES = frozenset(
         "sklearn",
     }
 )
+
+
+def _notice_marks_incomplete_coverage(notice: Notice) -> bool:
+    if notice.code not in _INCONCLUSIVE_NOTICE_CODES:
+        return False
+    if notice.code != "buffer_opcode":
+        return True
+    counts = [
+        notice.details.get("next_buffer_count"),
+        notice.details.get("readonly_buffer_empty_stack_count"),
+        notice.details.get("readonly_buffer_invalid_stack_count", 0),
+    ]
+    if any(not isinstance(count, int) or isinstance(count, bool) or count < 0 for count in counts):
+        return True
+    return any(count != 0 for count in counts)
 
 
 def _parse_positive_float(value: Any, default: float) -> float:
@@ -178,7 +193,7 @@ def pickle_report_to_scan_result(
     incomplete_notice_reasons = [
         _legacy_scan_outcome_reason(notice.code)
         for notice in report.notices
-        if notice.code in _INCONCLUSIVE_NOTICE_CODES
+        if _notice_marks_incomplete_coverage(notice)
     ]
     has_incomplete_coverage = report.status == ScanStatus.INCONCLUSIVE or (
         report.status == ScanStatus.COMPLETE and bool(incomplete_notice_reasons)
@@ -234,9 +249,10 @@ def pickle_report_to_scan_result(
         }
         details.setdefault("pickle_notice_code", notice.code)
         notice_is_nested_payload = notice.code in _NESTED_PAYLOAD_NOTICE_CODES
+        notice_marks_incomplete_coverage = _notice_marks_incomplete_coverage(notice)
         result.add_check(
             name="Standalone Pickle Notice",
-            passed=notice.code not in _INCONCLUSIVE_NOTICE_CODES and not notice_is_nested_payload,
+            passed=not notice_marks_incomplete_coverage and not notice_is_nested_payload,
             message=notice.message,
             severity=IssueSeverity.CRITICAL if notice_is_nested_payload else _to_issue_severity(notice.severity),
             location=notice.location,
