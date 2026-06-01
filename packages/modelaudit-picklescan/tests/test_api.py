@@ -936,6 +936,7 @@ def test_scan_bytes_scans_legacy_string_opcodes_for_raw_nested_payloads(payload:
 RAW_NESTED_UNICODE_LITERAL = b"AAAAAAcos\nsystem\n)R.BBBB"
 RAW_NESTED_PICKLE_SIZE = len(b"cos\nsystem\n)R.")
 UNICODE_SCALAR_NEAR_MATCH = "AAAAAAco\u2603\nsafe\n)X.BBBB".encode("utf-8")
+BINARY_STACK_GLOBAL_NESTED_PICKLE = b"\x80\x04\x8c\x02os\x94\x8c\x06system\x94\x93)R."
 
 
 @pytest.mark.parametrize(
@@ -962,6 +963,101 @@ def test_scan_bytes_scans_unicode_opcodes_for_raw_nested_payloads(payload: bytes
         finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
         for finding in report.findings
     )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x80\x04"
+        + _short_binunicode("".join(chr(byte) for byte in BINARY_STACK_GLOBAL_NESTED_PICKLE).encode("utf-8"))
+        + b".",
+        b"V" + b"".join(f"\\u{byte:04x}".encode("ascii") for byte in BINARY_STACK_GLOBAL_NESTED_PICKLE) + b"\n.",
+    ],
+    ids=["short-binunicode", "protocol0-unicode"],
+)
+def test_scan_bytes_decodes_unicode_scalars_before_probing_raw_nested_payloads(payload: bytes) -> None:
+    report = scan_bytes(payload, source="unicode-scalar-raw-nested.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("encoding") == "raw"
+        and finding.details.get("payload_size") == len(BINARY_STACK_GLOBAL_NESTED_PICKLE)
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_scans_protocol0_container_starts_in_unicode_literals() -> None:
+    nested_payload = b"(cos\nsystem\n)R."
+    report = scan_bytes(
+        b"\x80\x02" + _binunicode(b"AAAAAA" + nested_payload + b"BBBB") + b".",
+        source="unicode-protocol0-container-raw-nested.pkl",
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("encoding") == "raw"
+        and finding.details.get("payload_size") == len(nested_payload)
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_fails_closed_for_under_limit_malformed_unicode_raw_nested_payloads() -> None:
+    nested_payload = b"cos\nsystem\n)R"
+    report = scan_bytes(
+        b"\x80\x02" + _binunicode(nested_payload) + b".",
+        source="unicode-malformed-raw-nested.pkl",
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("encoding") == "raw"
+        and finding.details.get("nested_has_execution_opcode") is True
+        and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_scans_ascii_raw_nested_payloads_in_mixed_unicode_literals() -> None:
+    report = scan_bytes(
+        b"\x80\x02" + _binunicode("prefix\u2603cos\nsystem\n)R.".encode("utf-8")) + b".",
+        source="mixed-unicode-raw-nested.pkl",
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("literal", ["Value " * 65, "I am a value. " * 65, "list " * 65])
+def test_scan_bytes_ignores_repeated_protocol0_prefixes_in_benign_unicode_literals(literal: str) -> None:
+    report = scan_bytes(pickle.dumps(literal, protocol=4), source="benign-protocol0-prefix-prose.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(notice.code != "nested_probe_limit" for notice in report.notices)
+
+
+def test_scan_bytes_ignores_protocol0_inst_like_yaml_text_literals() -> None:
+    literal = "!!python/object/apply:builtins.exec\n- !!python/object/apply:operator.add\n"
+
+    report = scan_bytes(pickle.dumps(literal, protocol=4), source="benign-inst-like-yaml.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code != "S213" for finding in report.findings)
 
 
 @pytest.mark.parametrize(

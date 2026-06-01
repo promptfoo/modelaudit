@@ -13,9 +13,10 @@ use crate::nested::{
     decode_possible_encoded_pickle, detect_oversized_encoded_pickle_prefixes,
     encoded_literal_may_contain_pickle, encoded_nested_literal_probe_coverage_incomplete,
     encoded_nested_literal_probe_windows_with_limit, encoded_nested_window_char_limit,
-    has_execution_opcode, has_pickle_prefix, looks_like_pickle_payload,
+    has_binary_pickle_prefix, has_execution_opcode, has_pickle_prefix, looks_like_pickle_payload,
     nested_pickle_probe_offsets, pickle_payload_extent,
-    truncated_pickle_prefix_requires_fail_closed, MAX_NESTED_PAYLOAD_PROBES,
+    protocol0_global_or_inst_prefix_has_import_reference_lines,
+    truncated_pickle_prefix_requires_fail_closed, NestedProbeOffsets, MAX_NESTED_PAYLOAD_PROBES,
 };
 use crate::nested_surface::{
     encoded_nested_payload_finding, is_allowlisted_nested_constructor_ref,
@@ -858,7 +859,7 @@ impl<'a> ScanState<'a> {
                     }
                     "UNICODE" => {
                         if let ArgValue::Text(value) = &opcode.arg {
-                            self.scan_raw_nested_unicode_bytes(value.as_bytes(), position);
+                            self.scan_raw_nested_unicode_text(value, position);
                         }
                     }
                     _ => {}
@@ -4825,8 +4826,25 @@ impl<'a> ScanState<'a> {
     }
 
     fn scan_raw_nested_pickle_bytes(&mut self, value: &[u8], position: usize) {
+        self.scan_raw_nested_pickle_bytes_with_policy(value, position, true);
+    }
+
+    fn scan_raw_nested_unicode_pickle_bytes(&mut self, value: &[u8], position: usize) {
+        self.scan_raw_nested_pickle_bytes_with_policy(value, position, false);
+    }
+
+    fn scan_raw_nested_pickle_bytes_with_policy(
+        &mut self,
+        value: &[u8],
+        position: usize,
+        allow_ambiguous_malformed_prefix: bool,
+    ) {
         let mut skip_offsets_before = 0usize;
-        let probe_offsets = nested_pickle_probe_offsets(value);
+        let probe_offsets = if allow_ambiguous_malformed_prefix {
+            nested_pickle_probe_offsets(value)
+        } else {
+            self.raw_nested_unicode_probe_offsets(value)
+        };
         let limit_exceeded = probe_offsets.limit_exceeded;
         for offset in probe_offsets.offsets {
             if offset < skip_offsets_before {
@@ -4859,7 +4877,12 @@ impl<'a> ScanState<'a> {
                 skip_offsets_before = offset.saturating_add(payload_len);
                 continue;
             }
-            if has_pickle_prefix(probe) && has_execution_opcode(probe) {
+            if has_pickle_prefix(probe)
+                && has_execution_opcode(probe)
+                && (allow_ambiguous_malformed_prefix
+                    || has_binary_pickle_prefix(probe)
+                    || protocol0_global_or_inst_prefix_has_import_reference_lines(probe))
+            {
                 let surface_outcome =
                     self.surface_nested_pickle_findings(probe, "raw", position + offset);
                 self.add_nested_payload_finding(
@@ -4886,62 +4909,79 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn scan_raw_nested_unicode_bytes(&mut self, value: &[u8], position: usize) {
-        let mut skip_offsets_before = 0usize;
-        let mut probe_count = 0usize;
-        for offset in 0..value.len().saturating_sub(1) {
-            if offset < skip_offsets_before
-                || !matches!(value[offset], 0x80 | b'c' | b'i')
-                || !has_pickle_prefix(&value[offset..])
-            {
-                continue;
+    fn raw_nested_unicode_probe_offsets(&self, value: &[u8]) -> NestedProbeOffsets {
+        let mut offsets = Vec::new();
+        let last_stop_offset = value.iter().rposition(|byte| *byte == b'.');
+        let mut search_start = 0usize;
+        while search_start < value.len().saturating_sub(1) {
+            let probe_offsets = nested_pickle_probe_offsets(&value[search_start..]);
+            for relative_offset in probe_offsets.offsets.iter().copied() {
+                let offset = search_start.saturating_add(relative_offset);
+                let remaining_len = value.len().saturating_sub(offset);
+                let end = value
+                    .len()
+                    .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
+                let probe = &value[offset..end];
+                let complete_payload = last_stop_offset.is_some_and(|stop| offset < stop)
+                    && pickle_payload_extent(probe, self.options.max_nested_pickle_bytes).is_some();
+                let malformed_payload = has_execution_opcode(probe)
+                    && (has_binary_pickle_prefix(probe)
+                        || protocol0_global_or_inst_prefix_has_import_reference_lines(probe));
+                let truncated_payload = remaining_len > self.options.max_nested_pickle_bytes
+                    && truncated_pickle_prefix_requires_fail_closed(probe);
+                if !complete_payload && !malformed_payload && !truncated_payload {
+                    continue;
+                }
+                if offsets.len() >= MAX_NESTED_PAYLOAD_PROBES {
+                    return NestedProbeOffsets {
+                        offsets,
+                        limit_exceeded: true,
+                    };
+                }
+                offsets.push(offset);
             }
-            if probe_count >= MAX_NESTED_PAYLOAD_PROBES {
-                self.record_nested_probe_limit_exceeded("raw", value.len(), position);
-                return;
+            let Some(last_relative_offset) = probe_offsets.offsets.last() else {
+                break;
+            };
+            if !probe_offsets.limit_exceeded {
+                break;
             }
-            probe_count += 1;
+            search_start = search_start
+                .saturating_add(*last_relative_offset)
+                .saturating_add(1);
+        }
+        NestedProbeOffsets {
+            offsets,
+            limit_exceeded: false,
+        }
+    }
 
-            let remaining_len = value.len().saturating_sub(offset);
-            let end = value
-                .len()
-                .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
-            let probe = &value[offset..end];
-            if let Some(payload_len) =
-                pickle_payload_extent(probe, self.options.max_nested_pickle_bytes)
-            {
-                let candidate = &probe[..payload_len];
-                let nested_has_execution_opcode = has_execution_opcode(candidate);
-                let surface_outcome =
-                    self.surface_nested_pickle_findings(candidate, "raw", position + offset);
-                let promote_complete_payload =
-                    surface_outcome.promote_complete_payload(nested_has_execution_opcode);
-                if nested_has_execution_opcode || promote_complete_payload {
-                    self.add_nested_payload_finding(
-                        raw_nested_payload_finding(
-                            candidate.len(),
-                            position + offset,
-                            false,
-                            nested_has_execution_opcode,
-                        ),
-                        promote_complete_payload,
-                    );
+    fn scan_raw_nested_unicode_bytes(&mut self, value: &[u8], position: usize) {
+        let Ok(text) = std::str::from_utf8(value) else {
+            self.scan_raw_nested_pickle_bytes(value, position);
+            return;
+        };
+        self.scan_raw_nested_unicode_text(text, position);
+    }
+
+    fn scan_raw_nested_unicode_text(&mut self, value: &str, position: usize) {
+        let mut segment = Vec::new();
+        let mut segment_position = position;
+        for (offset, character) in value.char_indices() {
+            let Ok(byte) = u8::try_from(u32::from(character)) else {
+                if !segment.is_empty() {
+                    self.scan_raw_nested_unicode_pickle_bytes(&segment, segment_position);
+                    segment.clear();
                 }
-                if surface_outcome.should_stop_raw_probe_scan(nested_has_execution_opcode) {
-                    return;
-                }
-                skip_offsets_before = offset.saturating_add(payload_len);
                 continue;
+            };
+            if segment.is_empty() {
+                segment_position = position.saturating_add(offset);
             }
-            let candidate_truncated = remaining_len > self.options.max_nested_pickle_bytes;
-            if candidate_truncated && truncated_pickle_prefix_requires_fail_closed(probe) {
-                self.add_nested_payload_finding(
-                    raw_nested_payload_finding(remaining_len, position + offset, true, false),
-                    true,
-                );
-                self.record_raw_nested_payload_truncated(remaining_len, position + offset);
-                return;
-            }
+            segment.push(byte);
+        }
+        if !segment.is_empty() {
+            self.scan_raw_nested_unicode_pickle_bytes(&segment, segment_position);
         }
     }
 
