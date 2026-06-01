@@ -3583,9 +3583,9 @@ class TestCVE20243660LambdaAttribution:
         assert passed_version_checks == []
         assert determine_exit_code(audit_result) == 1
 
-    @pytest.mark.parametrize("keras_version", ["2.13.0+cpu", "2.13.0.post1", "2.13.0cpu", "2.13.1"])
+    @pytest.mark.parametrize("keras_version", ["2.13.0+cpu", "2.13.0.post1", "2.13.1"])
     def test_no_cve_for_stable_keras_213_variants(self, tmp_path: Path, keras_version: str) -> None:
-        """Stable fixed and unrecognized Keras 2.13 variants should stay outside CVE-2024-3660 attribution."""
+        """Stable fixed Keras 2.13 variants should stay outside CVE-2024-3660 attribution."""
         scanner = KerasZipScanner()
         encoded = base64.b64encode(b"lambda x: x * 2").decode()
         config = {
@@ -3604,6 +3604,37 @@ class TestCVE20243660LambdaAttribution:
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2024-3660"]
         assert cve_issues == []
+
+    @pytest.mark.parametrize("keras_version", ["2.13.0cpu", "2.13.0candidate", "keras-2.13.0"])
+    def test_noncanonical_keras_213_versions_warn_instead_of_pass(self, tmp_path: Path, keras_version: str) -> None:
+        """Unrecognized fixed-boundary qualifiers must not suppress Lambda risk with a passing check."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"lambda x: x * 2").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "my_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        keras_path = self._make_keras_zip(config, tmp_path, keras_version=keras_version)
+
+        result = scanner.scan(keras_path)
+        audit_result = scan_model_directory_or_file(keras_path, config={"cache_scan_results": False})
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2024-3660"]
+        passed_version_checks = [check for check in result.checks if check.name == "Lambda Version Risk Check"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+        assert cve_issues[0].details["keras_version"] == keras_version
+        assert cve_issues[0].details["parse_status"] == "unknown"
+        assert passed_version_checks == []
+        assert determine_exit_code(audit_result) == 1
 
     def test_cve_for_two_part_keras_version(self, tmp_path: Path) -> None:
         """Lambda in Keras 2.10 (two-part version) should be CVE-attributed."""

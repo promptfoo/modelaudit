@@ -802,7 +802,10 @@ class KerasZipScanner(BaseScanner):
             if is_lambda_layer:
                 self._check_lambda_layer(layer, result, layer_name)
                 keras_version = result.metadata.get("keras_version")
-                if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2024_3660(keras_version):
+                cve_2024_3660_status = (
+                    self._is_vulnerable_to_cve_2024_3660(keras_version) if isinstance(keras_version, str) else None
+                )
+                if cve_2024_3660_status is True:
                     # CVE-2024-3660: Lambda layers enable arbitrary code injection
                     result.add_check(
                         name="CVE-2024-3660: Lambda Layer Code Injection",
@@ -825,7 +828,7 @@ class KerasZipScanner(BaseScanner):
                         },
                         why=get_cve_2024_3660_explanation("lambda_code_injection"),
                     )
-                elif isinstance(keras_version, str):
+                elif cve_2024_3660_status is False:
                     result.add_check(
                         name="Lambda Version Risk Check",
                         passed=True,
@@ -837,20 +840,31 @@ class KerasZipScanner(BaseScanner):
                         details={"layer_name": layer_name, "layer_class": "Lambda", "keras_version": keras_version},
                     )
                 else:
+                    version_context = (
+                        f"keras_version '{keras_version}' is non-canonical"
+                        if isinstance(keras_version, str)
+                        else "keras_version is unavailable"
+                    )
                     result.add_check(
                         name="Lambda Risk (Version Unknown)",
                         passed=False,
                         message=(
-                            f"Lambda layer '{layer_name}' detected but keras_version is unavailable; "
-                            "cannot confidently attribute CVE-2024-3660 without version context"
+                            f"Lambda layer '{layer_name}' detected but {version_context}; "
+                            "cannot confidently attribute CVE-2024-3660 without reliable version context"
                         ),
                         severity=IssueSeverity.WARNING,
                         location=f"{self.current_file_path} (layer: {layer_name})",
                         details={
                             "layer_name": layer_name,
                             "layer_class": "Lambda",
+                            "keras_version": keras_version,
+                            "parse_status": "unknown",
                             "cve_id": "CVE-2024-3660",
+                            "cvss": 9.8,
+                            "cwe": "CWE-94",
+                            "description": "Lambda layer deserialization can enable arbitrary code injection.",
                             "affected_versions": "Keras < 2.13.0",
+                            "remediation": "Remove Lambda layers or upgrade Keras to >= 2.13",
                         },
                     )
             elif layer_class in self.suspicious_layer_types:
@@ -1968,27 +1982,35 @@ class KerasZipScanner(BaseScanner):
                     )
 
     @staticmethod
-    def _is_vulnerable_to_cve_2024_3660(version: str) -> bool:
-        """Return True for Keras versions lower than 2.13.0, including prereleases of 2.13.0.
+    def _is_vulnerable_to_cve_2024_3660(version: str) -> bool | None:
+        """Return True/False for parseable Keras versions, else None.
 
         Handles two-part versions (e.g. "2.10") by treating missing patch as 0.
         """
         version_match = _KERAS_RELEASE_VERSION_PATTERN.match(version)
         if not version_match:
-            return False
+            return None
 
         try:
             major = int(version_match.group(1))
             minor = int(version_match.group(2))
             patch = int(version_match.group(3) or 0)
         except ValueError:
-            return False
+            return None
 
         suffix = (version_match.group(4) or "").strip().lower()
-        public_suffix = suffix.lstrip("._-")
-        is_prerelease = not suffix.startswith("+") and bool(_KERAS_PRERELEASE_SUFFIX_PATTERN.match(public_suffix))
         parsed = (major, minor, patch)
-        return parsed < (2, 13, 0) or (parsed == (2, 13, 0) and is_prerelease)
+        if parsed < (2, 13, 0):
+            return True
+        if parsed > (2, 13, 0):
+            return False
+        if not suffix or suffix.startswith("+") or suffix.startswith(".post") or suffix.startswith("post"):
+            return False
+
+        public_suffix = suffix.lstrip("._-")
+        if _KERAS_PRERELEASE_SUFFIX_PATTERN.match(public_suffix):
+            return True
+        return None
 
     @staticmethod
     def _is_vulnerable_to_cve_2025_12058(version: str) -> bool:
