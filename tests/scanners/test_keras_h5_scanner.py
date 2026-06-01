@@ -1268,7 +1268,7 @@ def test_malicious_keras_model_still_detected(tmp_path: Path) -> None:
 
 
 def test_lambda_module_reference_uses_token_boundaries_for_benign_modules(tmp_path: Path) -> None:
-    """Benign module names containing suspicious substrings should not trigger CRITICAL findings."""
+    """Benign module names containing suspicious substrings should stay warning-level."""
     model_path = create_custom_h5_file(
         tmp_path,
         {
@@ -1293,12 +1293,121 @@ def test_lambda_module_reference_uses_token_boundaries_for_benign_modules(tmp_pa
     result = KerasH5Scanner().scan(str(model_path))
 
     assert result.success is True
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Module Reference Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(matching_checks) == 1
+    assert matching_checks[0].severity == IssueSeverity.WARNING
+    assert matching_checks[0].details["allowlist_status"] == "not_allowlisted"
     assert not any(
-        check.name == "Lambda Layer Module Reference Check" and check.status == CheckStatus.FAILED
+        check.name == "Lambda Layer Module Reference Check" and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
     )
     assert not any(
         check.name == "Suspicious Configuration String Check" and check.details.get("suspicious_term") == "system"
+        for check in result.checks
+    )
+
+
+def test_lambda_allowlisted_framework_module_reference_still_passes(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "allowlisted_module_reference",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "module": "keras.layers",
+                            "function_name": "normalize",
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="allowlisted_module_reference.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("allowlist_status") == "allowlisted"
+        for check in result.checks
+    )
+
+
+def test_lambda_safe_source_does_not_suppress_dangerous_module_reference(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "mixed_source_module_reference",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "function": "lambda x: x / 255",
+                            "module": "os",
+                            "function_name": "system",
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="mixed_source_module_reference.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_lambda_allowlisted_module_does_not_suppress_dict_bytecode_analysis(tmp_path: Path) -> None:
+    encoded_code = base64.b64encode(b"import os\nos.system('id')").decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "mixed_dict_module_reference",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "mixed_dict_lambda",
+                            "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                            "module": "keras.layers",
+                            "function_name": "normalize",
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="mixed_dict_module_reference.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("layer_name") == "mixed_dict_lambda"
         for check in result.checks
     )
 
