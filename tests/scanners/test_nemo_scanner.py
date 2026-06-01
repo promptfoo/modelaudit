@@ -3471,6 +3471,7 @@ class TestCVE202523304HydraTarget:
             },
             {"safe_target": "nemo.Model", "model": {"_target_": "${safe_target}"}},
             {"safe_target": "nemo.Model", "model": {"_target_": r"\\${safe_target}"}},
+            {"safe_target": "nemo.Model", "model": {"_target_": "$${safe_target}"}},
         ],
     )
     def test_interpolated_target_fails_closed(self, tmp_path: Path, config: dict[str, Any]) -> None:
@@ -3538,6 +3539,30 @@ class TestCVE202523304HydraTarget:
             and check.details.get("target") == target
             for check in result.checks
         )
+
+    def test_interpolated_target_diagnostics_redact_and_bound_config_evidence(self, tmp_path: Path) -> None:
+        """Interpolation findings should not retain unbounded secret-bearing config strings."""
+        secret = "INTERPOLATIONSECRET123"
+        path_secret = "PATHSECRET456"
+        target = f"${{oc.env:CALLABLE,token={secret}}}" + ("A" * 400)
+        path = _create_nemo_file(
+            tmp_path,
+            {f"client_secret={path_secret}": {"_target_": target}},
+        )
+
+        result = NemoScanner().scan(str(path))
+
+        checks = [check for check in result.checks if check.name == "CVE-2025-23304: Interpolated Hydra _target_"]
+        assert len(checks) == 1
+        check = checks[0]
+        assert secret not in check.message
+        assert path_secret not in check.message
+        assert secret not in check.details["target"]
+        assert path_secret not in check.details["config_path"]
+        assert "<redacted>" in check.details["target"]
+        assert "<redacted>" in check.details["config_path"]
+        assert len(check.details["target"]) <= 256
+        assert len(check.details["config_path"]) <= 256
 
     def test_torch_load_target_fails_aggregate_scan(self, tmp_path: Path) -> None:
         """A NeMo config using torch.load should produce a security failure, not exit 0."""

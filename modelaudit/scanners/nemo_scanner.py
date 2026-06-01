@@ -22,6 +22,7 @@ from ..utils import is_absolute_archive_path, sanitize_archive_path
 from ..utils.file.detection import is_nemo_archive
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete
+from ._evidence_redaction import redact_evidence_string
 from .archive_member_security import (
     is_executable_archive_member_name,
     is_python_archive_member_name,
@@ -161,6 +162,7 @@ _SUSPICIOUS_TARGET_PATTERNS = (
 )
 _TARGET_TOKEN_RE = re.compile(r"__import__|[A-Z]+(?=[A-Z][a-z0-9]|[0-9_]|$)|[A-Z]?[a-z0-9]+")
 _UNESCAPED_HYDRA_INTERPOLATION_RE = re.compile(r"(?<!\\)(?:\\\\)*\$\{")
+_NEMO_MAX_CONFIG_EVIDENCE_CHARS = 256
 
 CVE_2025_23304_ID = "CVE-2025-23304"
 CVE_2025_23304_CVSS = 7.6
@@ -2246,20 +2248,23 @@ class NemoScanner(BaseScanner):
         archive_path: str,
         result: ScanResult,
     ) -> None:
+        display_target = redact_evidence_string(target, max_chars=_NEMO_MAX_CONFIG_EVIDENCE_CHARS)
+        display_config_path = redact_evidence_string(config_path, max_chars=_NEMO_MAX_CONFIG_EVIDENCE_CHARS)
+        display_config_name = redact_evidence_string(config_name, max_chars=_NEMO_MAX_CONFIG_EVIDENCE_CHARS)
         result.add_check(
             name=f"{CVE_2025_23304_ID}: Interpolated Hydra _target_",
             passed=False,
             message=(
                 f"{CVE_2025_23304_ID}: Interpolated _target_ "
-                f"'{target}' at {config_path} in {config_name} "
+                f"'{display_target}' at {display_config_path} in {display_config_name} "
                 "can resolve to a dangerous callable at load time"
             ),
             severity=IssueSeverity.CRITICAL,
-            location=f"{archive_path}:{config_name}",
+            location=f"{archive_path}:{display_config_name}",
             details={
-                "target": target,
-                "config_path": config_path,
-                "config_file": config_name,
+                "target": display_target,
+                "config_path": display_config_path,
+                "config_file": display_config_name,
                 "cve_id": CVE_2025_23304_ID,
                 "cvss": CVE_2025_23304_CVSS,
                 "cwe": CVE_2025_23304_CWE,
