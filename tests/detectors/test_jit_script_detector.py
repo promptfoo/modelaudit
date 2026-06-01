@@ -1697,6 +1697,20 @@ class TestJITScriptDetector:
         assert incomplete[0].details["omitted_bytes"] > 0
         assert not any(finding.severity == "CRITICAL" for finding in findings)
 
+    def test_scan_model_does_not_report_incomplete_for_visible_window_marker_noise(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        detector = JITScriptDetector()
+        monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 64)
+        prefix = (b"\x00\xffdef \x00" + (b"A" * 64))[:64]
+        data = prefix + (b"B" * 80) + (b"C" * 64)
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert not any(finding.type == "analysis_incomplete" for finding in findings)
+        assert not any(finding.severity == "CRITICAL" for finding in findings)
+
     def test_scan_model_reports_incomplete_coverage_when_snippet_budget_drops_candidates(self) -> None:
         detector = JITScriptDetector()
         leading_blocks = b"".join(

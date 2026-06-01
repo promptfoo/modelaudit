@@ -1284,6 +1284,25 @@ def test_pytorch_zip_jit_hidden_middle_only_source_marks_inconclusive(
     assert determine_exit_code(aggregate) == 2
 
 
+def test_pytorch_zip_jit_visible_window_marker_noise_stays_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 64)
+    prefix = (b"\x00\xffdef \x00" + (b"A" * 64))[:64]
+    model_path = _create_pytorch_zip_with_jit_source(
+        tmp_path / "visible_window_marker_noise.pt",
+        prefix + (b"B" * 80) + (b"C" * 64),
+        member_name="archive/code/debug/source",
+    )
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert "analysis_incomplete" not in result.metadata
+    assert not any(check.name == "JIT/Script Analysis Incomplete" for check in result.checks)
+
+
 def test_pytorch_zip_jit_internal_snippet_budget_marks_inconclusive(tmp_path: Path) -> None:
     leading_blocks = b"".join(
         f"def benign_{index}():\n    return {index}\n}}\x00".encode()

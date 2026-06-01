@@ -1105,6 +1105,14 @@ def _embedded_python_middle_bytes_omitted(data: bytes) -> bool:
     return len(data) > 2 * _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES
 
 
+def _omitted_middle_contains_embedded_python_marker(data: bytes) -> bool:
+    if not _embedded_python_middle_bytes_omitted(data):
+        return False
+    omitted_start = _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES
+    omitted_end = len(data) - _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES
+    return any(data.find(marker, omitted_start, omitted_end) >= 0 for marker in _EMBEDDED_PYTHON_START_MARKERS)
+
+
 def _bounded_middle_priority_import_offsets(data: bytes) -> list[int]:
     if not _embedded_python_middle_bytes_omitted(data):
         return []
@@ -2827,9 +2835,7 @@ class JITScriptDetector:
             should_probe_embedded_python_coverage and self._has_parseable_framed_python_source(data)
         )
         has_trusted_omitted_python_marker = (
-            trusted_embedded_python_model
-            and _embedded_python_middle_bytes_omitted(data)
-            and any(marker in data for marker in _EMBEDDED_PYTHON_START_MARKERS)
+            trusted_embedded_python_model and _omitted_middle_contains_embedded_python_marker(data)
         )
         if self._looks_like_dangerous_python_source(data):
             findings.extend(
