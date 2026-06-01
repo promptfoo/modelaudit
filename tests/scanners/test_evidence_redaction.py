@@ -37,6 +37,22 @@ def test_redacts_compound_sensitive_query_parameters() -> None:
     assert "ok=1" in redacted
 
 
+def test_redacts_semicolon_and_nested_sensitive_query_parameters() -> None:
+    """Alternative separators and nested encodings must not preserve credential values."""
+    text = (
+        "first=https://example.com/callback?ok=1;to%6ben=SEMICOLONSECRET123 "
+        "second=https://example.com/callback?ok=token%253DNESTEDSECRET456 "
+        "third=https://example.com/callback?ok=1&amp;token=HTMLSECRET789"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "SEMICOLONSECRET123" not in redacted
+    assert "NESTEDSECRET456" not in redacted
+    assert "HTMLSECRET789" not in redacted
+    assert redacted.count(REDACTED_EVIDENCE_VALUE) == 3
+
+
 def test_redacts_malformed_userinfo_url() -> None:
     """Malformed userinfo URLs should fail closed instead of returning raw evidence."""
     text = "download=https://user:LEAKY-PASS@[::1/path?token=QUERYSECRET"

