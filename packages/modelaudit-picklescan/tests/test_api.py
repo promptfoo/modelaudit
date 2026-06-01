@@ -1787,6 +1787,57 @@ def test_scan_stream_known_size_cap_does_not_report_native_short_read() -> None:
     assert report.coverage.bytes_total == len(payload)
 
 
+def test_scan_stream_known_size_cap_does_not_report_unproven_oversized_frame_tamper() -> None:
+    prefix = b"HEADER"
+    payload = b"\x80\x04\x95\x02\x00\x00\x00\x00\x00\x00\x00}."
+    stream = io.BytesIO(prefix + payload)
+    stream.seek(len(prefix))
+
+    report = PickleScanner(ScanOptions(max_known_stream_read_bytes=11)).scan_stream(
+        stream,
+        source="known-size-capped-frame.pkl",
+        size=len(payload),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert not any(notice.code == "oversized_frame" for notice in report.notices)
+    assert any(notice.code == "known_stream_truncated" for notice in report.notices)
+
+
+def test_scan_stream_known_size_cap_preserves_proven_oversized_frame_tamper() -> None:
+    payload = b"\x80\x04\x95\x03\x00\x00\x00\x00\x00\x00\x00}."
+
+    report = PickleScanner(ScanOptions(max_known_stream_read_bytes=11)).scan_stream(
+        io.BytesIO(payload),
+        source="known-size-capped-oversized-frame.pkl",
+        size=len(payload),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    finding = next(finding for finding in report.findings if finding.rule_code == "STRUCTURAL_TAMPER")
+    assert finding.details["tamper_type"] == "oversized_frame"
+    assert any(notice.code == "oversized_frame" for notice in report.notices)
+    assert any(notice.code == "known_stream_truncated" for notice in report.notices)
+
+
+def test_scan_stream_unknown_size_cap_does_not_report_unproven_oversized_frame_tamper() -> None:
+    payload = b"\x80\x04\x95\x02\x00\x00\x00\x00\x00\x00\x00}."
+
+    report = PickleScanner(ScanOptions(max_unbounded_stream_read_bytes=11)).scan_stream(
+        io.BytesIO(payload),
+        source="unknown-size-capped-frame.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert not any(notice.code == "oversized_frame" for notice in report.notices)
+    assert any(notice.code == "unbounded_stream_truncated" for notice in report.notices)
+
+
 def test_scan_stream_bounds_protocol_zero_readline_without_declared_size() -> None:
     stream = NoUnboundedReadlineStream(b"S'" + (b"a" * 64))
 
