@@ -2,6 +2,7 @@ import builtins
 import json
 import os
 import pickle
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -498,6 +499,27 @@ def test_orbax_directory_entry_count_limit_fails_closed(tmp_path: Path) -> None:
         and check.details["analysis_incomplete"] is True
         for check in result.checks
     )
+
+
+def test_orbax_directory_probe_routes_entry_limit_to_fail_closed_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir = tmp_path / "orbax_probe_limit"
+    checkpoint_dir.mkdir()
+    entries_yielded = 0
+
+    def synthetic_entries(path: Path) -> Iterator[Path]:
+        nonlocal entries_yielded
+        assert path == checkpoint_dir
+        for index in range(JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES + 1):
+            entries_yielded += 1
+            yield checkpoint_dir / f"unrelated_{index}.txt"
+
+    monkeypatch.setattr(Path, "iterdir", synthetic_entries)
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is True
+    assert entries_yielded == JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES + 1
 
 
 def test_orbax_checkpoint_file_count_limit_fails_closed(tmp_path: Path) -> None:

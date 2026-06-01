@@ -793,9 +793,15 @@ class JaxCheckpointScanner(BaseScanner):
             if (path_obj / orbax_file).exists():
                 return True
 
-        # Check for JAX checkpoint patterns
-        jax_patterns = ["step_*", "params_*", "state_*", "model_*"]
-        return any(next(path_obj.glob(pattern), None) is not None for pattern in jax_patterns)
+        # Probe once and route oversized directories into the scanner's
+        # fail-closed entry-limit handling.
+        jax_prefixes = ("step_", "params_", "state_", "model_")
+        for entry_index, entry in enumerate(path_obj.iterdir(), start=1):
+            if entry_index > cls.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES:
+                return True
+            if entry.name.startswith(jax_prefixes):
+                return True
+        return False
 
     @classmethod
     def _header_starts_with_legacy_pickle_opcode(cls, header: bytes) -> bool:
