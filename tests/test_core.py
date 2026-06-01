@@ -808,6 +808,7 @@ def test_scan_file_passes_shard_allowlist_to_advanced_handler(
     shard = tmp_path / "model-00001-of-00002.safetensors"
     shard.write_bytes(b"inside-shard")
     allowed_path = str(shard.resolve())
+    captured_selection_allowed_paths: list[list[str] | None] = []
     captured_allowed_paths: list[list[str] | None] = []
 
     class DummyScanner:
@@ -844,7 +845,11 @@ def test_scan_file_passes_shard_allowlist_to_advanced_handler(
         result.finish(success=True)
         return result
 
-    monkeypatch.setattr(core_module, "should_use_advanced_handler", lambda path: path == str(shard))
+    def fake_should_use_advanced_handler(path: str, *, allowed_shard_paths: list[str] | None = None) -> bool:
+        captured_selection_allowed_paths.append(allowed_shard_paths)
+        return path == str(shard)
+
+    monkeypatch.setattr(core_module, "should_use_advanced_handler", fake_should_use_advanced_handler)
     monkeypatch.setattr(core_module, "_select_preferred_scanner_id", fake_select_preferred_scanner_id)
     monkeypatch.setattr(core_module._registry, "get_scanner_for_path", fake_get_scanner_for_path)
     monkeypatch.setattr(core_module, "scan_advanced_large_file", fake_scan_advanced_large_file)
@@ -864,6 +869,7 @@ def test_scan_file_passes_shard_allowlist_to_advanced_handler(
     )
 
     assert result.scanner_name == "dummy"
+    assert captured_selection_allowed_paths == [[allowed_path]]
     assert captured_allowed_paths == [[allowed_path]]
 
 
@@ -874,6 +880,7 @@ def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(
     shard = tmp_path / "model-00001-of-00002.safetensors"
     shard.write_bytes(b"inside-shard")
     allowed_path = str(shard.resolve())
+    captured_selection_allowed_paths: list[list[str] | None] = []
     captured_allowed_paths: list[list[str] | None] = []
 
     class DummyPreferredScanner:
@@ -910,7 +917,11 @@ def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(
         result.finish(success=True)
         return result
 
-    monkeypatch.setattr(core_module, "should_use_advanced_handler", lambda path: path == str(shard))
+    def fake_should_use_advanced_handler(path: str, *, allowed_shard_paths: list[str] | None = None) -> bool:
+        captured_selection_allowed_paths.append(allowed_shard_paths)
+        return path == str(shard)
+
+    monkeypatch.setattr(core_module, "should_use_advanced_handler", fake_should_use_advanced_handler)
     monkeypatch.setattr(core_module, "_select_preferred_scanner_id", fake_select_preferred_scanner_id)
     monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda scanner_id: DummyPreferredScanner)
     monkeypatch.setattr(
@@ -935,6 +946,7 @@ def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(
     )
 
     assert result.scanner_name == "dummy_preferred"
+    assert captured_selection_allowed_paths == [[allowed_path]]
     assert captured_allowed_paths == [[allowed_path]]
 
 

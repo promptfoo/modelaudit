@@ -149,6 +149,7 @@ class ShardedModelDetector:
         """
         file_name = Path(file_path).name
         dir_path = Path(file_path).parent
+        requested_path = str(Path(file_path).absolute())
         allowed_path_set = {str(Path(path).resolve()) for path in allowed_paths} if allowed_paths is not None else None
 
         for pattern in cls.SHARD_PATTERNS:
@@ -169,9 +170,13 @@ class ShardedModelDetector:
                         resolved_file = str(file.resolve())
                         if allowed_path_set is not None and resolved_file not in allowed_path_set:
                             continue
-                        if allowed_path_set is None and not _is_resolved_path_within_directory(
-                            dir_path,
-                            resolved_file,
+                        if (
+                            allowed_path_set is None
+                            and not _is_resolved_path_within_directory(
+                                dir_path,
+                                resolved_file,
+                            )
+                            and str(file.absolute()) != requested_path
                         ):
                             out_of_scope_shards.append(str(file))
                             continue
@@ -627,6 +632,11 @@ class AdvancedFileHandler:
             out_of_scope_count = self.shard_info.get("out_of_scope_shard_count")
             if isinstance(missing_count, int) and missing_count > 0:
                 _mark_inconclusive_scan_outcome(result, "missing_model_shards")
+            if isinstance(out_of_scope_count, int) and out_of_scope_count > 0:
+                _mark_inconclusive_scan_outcome(result, "out_of_scope_model_shards")
+            if isinstance(unreadable_count, int) and unreadable_count > 0:
+                _mark_inconclusive_scan_outcome(result, "unreadable_model_shards")
+            if isinstance(missing_count, int) and missing_count > 0:
                 result.add_check(
                     name="Sharded Model Coverage Check",
                     passed=False,
@@ -650,7 +660,6 @@ class AdvancedFileHandler:
                     },
                 )
             elif isinstance(out_of_scope_count, int) and out_of_scope_count > 0:
-                _mark_inconclusive_scan_outcome(result, "out_of_scope_model_shards")
                 result.add_check(
                     name="Sharded Model Coverage Check",
                     passed=False,
@@ -663,13 +672,14 @@ class AdvancedFileHandler:
                         "present_total_shards": self.shard_info.get("total_shards"),
                         "out_of_scope_shard_count": out_of_scope_count,
                         "out_of_scope_shards": self.shard_info.get("out_of_scope_shards", []),
+                        "unreadable_shard_count": self.shard_info.get("unreadable_shard_count", 0),
+                        "unreadable_shards": self.shard_info.get("unreadable_shards", []),
                         "analysis_incomplete": True,
                         "scan_outcome": "inconclusive",
                         "scan_outcome_reason": "out_of_scope_model_shards",
                     },
                 )
             elif isinstance(unreadable_count, int) and unreadable_count > 0:
-                _mark_inconclusive_scan_outcome(result, "unreadable_model_shards")
                 result.add_check(
                     name="Sharded Model Coverage Check",
                     passed=False,
@@ -734,18 +744,19 @@ class AdvancedFileHandler:
         return result
 
 
-def should_use_advanced_handler(file_path: str) -> bool:
+def should_use_advanced_handler(file_path: str, *, allowed_shard_paths: list[str] | None = None) -> bool:
     """
     Check if file should use advanced file handler.
 
     Args:
         file_path: Path to check
+        allowed_shard_paths: Validated shard targets permitted during grouped directory scans
 
     Returns:
         True if advanced handler should be used
     """
     # Check for sharded model
-    if ShardedModelDetector.detect_shards(file_path):
+    if ShardedModelDetector.detect_shards(file_path, allowed_paths=allowed_shard_paths):
         return True
 
     # Check file size

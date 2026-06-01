@@ -1705,7 +1705,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     # Check if we should use extreme handler BEFORE applying size limits
     # Extreme handler bypasses size limits for large models
-    use_extreme_handler = should_use_advanced_handler(path)
+    allowed_shard_paths = _allowed_shard_paths_from_config(config)
+    use_extreme_handler = should_use_advanced_handler(path, allowed_shard_paths=allowed_shard_paths)
 
     # Check file size limit only if NOT using extreme handler
     max_file_size = config.get("max_file_size", 0)  # Default unlimited
@@ -1971,7 +1972,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     scanner,
                     progress_callback,
                     timeout * 2,
-                    allowed_shard_paths=_allowed_shard_paths_from_config(config),
+                    allowed_shard_paths=allowed_shard_paths,
                 )  # Double timeout for extreme files
             elif use_large_handler:
                 logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
@@ -2026,7 +2027,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                         scanner,
                         progress_callback,
                         timeout * 2,
-                        allowed_shard_paths=_allowed_shard_paths_from_config(config),
+                        allowed_shard_paths=allowed_shard_paths,
                     )  # Double timeout for extreme files
                 elif use_large_handler:
                     logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")

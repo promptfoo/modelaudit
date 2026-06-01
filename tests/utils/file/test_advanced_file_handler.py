@@ -233,6 +233,29 @@ class TestShardedModelDetector:
         assert shard_info["total_shards"] == 2
         assert "out_of_scope_shard_count" not in shard_info
 
+    def test_detect_shards_preserves_direct_symlink_representative_outside_scan_directory(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """The user-selected shard remains scannable even when its target is outside the containing directory."""
+        outside_dir = tmp_path / "outside"
+        scan_dir = tmp_path / "scan"
+        outside_dir.mkdir()
+        scan_dir.mkdir()
+        shard_one = scan_dir / "model-00001-of-00002.safetensors"
+        outside_target = outside_dir / "outside-shard.safetensors"
+        outside_target.write_bytes(b"outside")
+        shard_one.symlink_to(outside_target)
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_one))
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shard_one)]
+        assert shard_info["total_shards"] == 1
+        assert shard_info["missing_shard_count"] == 1
+        assert should_use_advanced_handler(str(shard_one))
+
     def test_no_shards_detected(self) -> None:
         """Test when file is not sharded."""
         with tempfile.NamedTemporaryFile(suffix=".bin") as f:
@@ -481,6 +504,37 @@ class TestAdvancedFileHandler:
         assert len(coverage_checks) == 1
         assert coverage_checks[0].details["out_of_scope_shard_count"] == 1
         assert coverage_checks[0].details["out_of_scope_shards"] == [str(shard_two)]
+
+    def test_sharded_model_reports_out_of_scope_and_unreadable_shards(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Distinct shard coverage gaps must all remain visible to operators."""
+        outside_dir = tmp_path / "outside"
+        scan_dir = tmp_path / "scan"
+        outside_dir.mkdir()
+        scan_dir.mkdir()
+        shard_one = scan_dir / "checkpoint_1.pt"
+        shard_two = scan_dir / "checkpoint_2.pt"
+        shard_three = scan_dir / "checkpoint_3.pt"
+        outside_target = outside_dir / "outside-shard.pt"
+        shard_one.write_bytes(b"safe")
+        outside_target.write_bytes(b"outside")
+        shard_two.symlink_to(outside_target)
+        shard_three.symlink_to(scan_dir / "missing-shard")
+
+        result = AdvancedFileHandler(str(shard_one), CompletingShardScanner()).scan()
+
+        coverage_checks = [check for check in result.checks if check.name == "Sharded Model Coverage Check"]
+        assert result.success is False
+        assert "out_of_scope_model_shards" in result.metadata["scan_outcome_reasons"]
+        assert "unreadable_model_shards" in result.metadata["scan_outcome_reasons"]
+        assert len(coverage_checks) == 1
+        assert coverage_checks[0].details["out_of_scope_shard_count"] == 1
+        assert coverage_checks[0].details["out_of_scope_shards"] == [str(shard_two)]
+        assert coverage_checks[0].details["unreadable_shard_count"] == 1
+        assert coverage_checks[0].details["unreadable_shards"] == [str(shard_three)]
 
     def test_sharded_model_honors_allowed_shard_paths(self, tmp_path: Path) -> None:
         """Restricted shard scans must not expand beyond the validated allowlist."""
