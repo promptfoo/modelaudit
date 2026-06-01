@@ -2508,6 +2508,7 @@ def test_pytorch_zip_scanner_entry_limit(tmp_path: Path) -> None:
 def test_pytorch_zip_scanner_entry_limit_skips_late_entries(tmp_path: Path) -> None:
     """Entries after the configured archive-entry cap should not be processed as covered."""
     zip_path = tmp_path / "late_symlink_after_entry_limit.pt"
+    symlink_target = tmp_path / "late-target"
 
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("version", "3")
@@ -2516,7 +2517,7 @@ def test_pytorch_zip_scanner_entry_limit_skips_late_entries(tmp_path: Path) -> N
         symlink_info = zipfile.ZipInfo("late_symlink")
         symlink_info.external_attr = 0o120777 << 16
         symlink_info.compress_type = zipfile.ZIP_STORED
-        zipf.writestr(symlink_info, "/etc/shadow")
+        zipf.writestr(symlink_info, str(symlink_target))
 
     scanner = PyTorchZipScanner(config={"max_archive_entries": 3})
     result = scanner.scan(str(zip_path))
@@ -2828,9 +2829,10 @@ def test_pytorch_zip_scanner_no_symlinks_passes(tmp_path):
     assert all(c.status == CheckStatus.PASSED for c in symlink_checks)
 
 
-def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
+def test_pytorch_zip_scanner_combined_security_controls(tmp_path: Path) -> None:
     """Test that multiple security controls fire together without interfering."""
     zip_path = tmp_path / "model.pt"
+    symlink_target = tmp_path / "combined-target"
 
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("version", "3")
@@ -2838,7 +2840,7 @@ def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
         symlink_info = zipfile.ZipInfo("evil_link")
         symlink_info.external_attr = 0o120777 << 16
         symlink_info.compress_type = zipfile.ZIP_STORED
-        zipf.writestr(symlink_info, "/etc/shadow")
+        zipf.writestr(symlink_info, str(symlink_target))
         for i in range(12):
             zipf.writestr(f"entry_{i}.txt", "data")
 
