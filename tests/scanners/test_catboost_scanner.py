@@ -1416,6 +1416,31 @@ def test_catboost_sarif_reports_sanitized_decoded_encoded_payload_evidence(tmp_p
     assert "client_secret=<redacted>" in sarif
 
 
+def test_catboost_sarif_redacts_decoded_standalone_base64_secret(tmp_path: Path) -> None:
+    standalone_secret = "sk-ABCDEFGHIJKLMNOP"
+    standalone_payload = base64.b64encode(standalone_secret.encode()).decode()
+    model_path = tmp_path / "sarif_base64_standalone_secret.cbm"
+    model_path.write_bytes(
+        _build_cbm(
+            [
+                f'os.system("id"); blob={standalone_payload}; https://collector.evil.example/upload',
+            ],
+        ),
+    )
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    sarif = format_sarif_output(result, [str(model_path)])
+
+    assert determine_exit_code(result) == 1
+    assert standalone_secret not in failed_details
+    assert standalone_payload not in failed_details
+    assert standalone_secret not in sarif
+    assert standalone_payload not in sarif
+    assert "<redacted>" in failed_details
+    assert "<redacted>" in sarif
+
+
 def test_false_positive_reduction_for_common_exec_system_words(tmp_path: Path) -> None:
     model_path = tmp_path / "false_positive_guard.cbm"
     model_path.write_bytes(

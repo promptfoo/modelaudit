@@ -160,6 +160,11 @@ BARE_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*)"
     rf"(?!{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)[^\"'\s;&|]+"
 )
+UNKNOWN_AUTHORIZATION_SCHEME_VALUE_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*)"
+    rf"(?!{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)"
+    rf"([^\"'\s;&|]+)(\s+)(?!{SENSITIVE_ASSIGNMENT_KEY}\s*{ASSIGNMENT_SEPARATOR})([^\"'\s;&|]+)"
+)
 TRIPLE_QUOTED_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN}){PYTHON_LITERAL_OPEN_RE}(?:{PYTHON_STRING_PREFIX_RE})(\\*)([\"'])\2\3\2\3[\s\S]*?\2\3\2\3\2\3"
 )
@@ -1608,6 +1613,13 @@ def _redact_bare_authorization_value(match: re.Match[str]) -> str:
     return f"{match.group(1)}{REDACTED_EVIDENCE_VALUE}"
 
 
+def _redact_unknown_authorization_scheme_value(match: re.Match[str]) -> str:
+    trailing_token = match.group(4)
+    if COMMAND_CONTEXT_LITERAL_RE.fullmatch(trailing_token):
+        return f"{match.group(1)}{REDACTED_EVIDENCE_VALUE}{match.group(3)}{trailing_token}"
+    return f"{match.group(1)}{REDACTED_EVIDENCE_VALUE}"
+
+
 def _redact_command_user_password(match: re.Match[str]) -> str:
     return f"{match.group(1)}{match.group(2)}{match.group(3)}{REDACTED_EVIDENCE_VALUE}{match.group(5)}"
 
@@ -1713,6 +1725,8 @@ def _redact_command_string_literals(text: str) -> str:
 
 def _redact_command_evidence_text(text: str) -> str:
     redacted = AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, text)
+    redacted = UNKNOWN_AUTHORIZATION_SCHEME_VALUE_RE.sub(_redact_unknown_authorization_scheme_value, redacted)
+    redacted = BARE_AUTHORIZATION_VALUE_RE.sub(_redact_bare_authorization_value, redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = COMMAND_SECRET_OPTION_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = COMMAND_USER_PASSWORD_RE.sub(_redact_command_user_password, redacted)
@@ -1776,6 +1790,7 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = _redact_adjacent_string_literals(redacted)
     redacted = _redact_residual_expression_literals(redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, redacted)
+    redacted = UNKNOWN_AUTHORIZATION_SCHEME_VALUE_RE.sub(_redact_unknown_authorization_scheme_value, redacted)
     redacted = BARE_AUTHORIZATION_VALUE_RE.sub(_redact_bare_authorization_value, redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_sensitive_assignment, redacted)

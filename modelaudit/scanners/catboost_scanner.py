@@ -108,7 +108,7 @@ def _redact_reversible_base64_evidence(text: str, depth: int = 0) -> str:
             return match.group(0)
 
         decoded_text = _redact_reversible_base64_evidence(decoded_text, depth + 1)
-        redacted_decoded = redact_evidence_string(decoded_text, max_chars=160)
+        redacted_decoded = redact_evidence_string(_redact_standalone_secret_tokens(decoded_text), max_chars=160)
         if REDACTED_EVIDENCE_VALUE in redacted_decoded or REDACTED_URL_CREDENTIALS in redacted_decoded:
             return redacted_decoded
         return match.group(0)
