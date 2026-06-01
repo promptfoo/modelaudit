@@ -1438,7 +1438,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
     @staticmethod
     def _protobuf_string_scan_windows(string_val: str) -> tuple[list[tuple[int, int, str]], bool]:
-        """Return bounded scan windows and whether they cover the whole string."""
+        """Return bounded merged scan regions and whether they cover the whole string."""
         string_length = len(string_val)
         if string_length <= _MAX_PROTOBUF_STRING_FULL_SCAN_CHARS:
             return [(0, string_length, string_val)], True
@@ -1451,22 +1451,23 @@ class TensorFlowSavedModelScanner(BaseScanner):
             max(0, string_length // 2 - window_size // 2),
             max(0, string_length - window_size),
         ]
-        windows: list[tuple[int, int, str]] = []
         seen: set[tuple[int, int]] = set()
         for start in starts:
             end = min(string_length, start + window_size)
-            key = (start, end)
-            if key in seen:
-                continue
-            seen.add(key)
-            windows.append((start, end, string_val[start:end]))
+            seen.add((start, end))
 
-        covered_until = 0
-        for start, end, _scan_text in sorted(windows):
-            if start > covered_until:
-                break
-            covered_until = max(covered_until, end)
-        return windows, covered_until >= string_length
+        merged_intervals: list[tuple[int, int]] = []
+        for start, end in sorted(seen):
+            if not merged_intervals or start > merged_intervals[-1][1]:
+                merged_intervals.append((start, end))
+                continue
+
+            previous_start, previous_end = merged_intervals[-1]
+            merged_intervals[-1] = (previous_start, max(previous_end, end))
+
+        windows = [(start, end, string_val[start:end]) for start, end in merged_intervals]
+        scanned_entire_string = len(windows) == 1 and windows[0][0] == 0 and windows[0][1] >= string_length
+        return windows, scanned_entire_string
 
     def _check_protobuf_string_injection(self, saved_model: Any, result: ScanResult) -> None:
         """Check for string injection attacks in protobuf fields"""

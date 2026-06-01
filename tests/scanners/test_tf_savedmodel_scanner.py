@@ -643,6 +643,37 @@ def test_fully_covered_windowed_protobuf_string_preserves_success(tmp_path: Path
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_fully_covered_windowed_protobuf_string_detects_boundary_split_injection(tmp_path: Path) -> None:
+    split_offset = 32_768
+    split_prefix = "os.syst"
+    payload = ("A" * (split_offset - len(split_prefix)) + "os.system('/bin/echo split exploit')").ljust(49_152, "A")
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "boundary_split_payload_node",
+                "string_attrs": {"payload": payload},
+            }
+        ],
+        model_name="boundary_split_windowed_string",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    injection_checks = [
+        check
+        for check in result.checks
+        if check.name == "Protobuf String Injection Check" and check.details.get("attack_type") == "system_command"
+    ]
+    assert result.success is False
+    assert determine_exit_code(aggregate) == 1
+    assert injection_checks
+    assert injection_checks[0].details["string_scan_strategy"] == "full"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_partial_window_match_does_not_hide_incomplete_protobuf_string_scan(tmp_path: Path) -> None:
     oversized_value = "../" + ("A" * 99_997) + "os.system('/bin/echo hidden exploit')" + ("A" * 200_000)
     model_path = _create_test_savedmodel_with_scoped_nodes(
