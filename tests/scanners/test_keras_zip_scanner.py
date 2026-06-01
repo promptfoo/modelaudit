@@ -2322,7 +2322,17 @@ class TestCVE202549655TorchModuleWrapper:
 
     @pytest.mark.parametrize(
         "keras_version",
-        ["3.11.3", "3.11.3+local", "3.11.3.post1", "3.11.3.post1.dev0", "3.11.4.dev0"],
+        [
+            "3.11.3",
+            "3.11.3+local",
+            "3.11.3.post1",
+            "3.11.3.post1.dev0",
+            "3.11.3-post1.dev0",
+            "3.11.3_post1.dev0",
+            "3.11.3-r1.dev0",
+            "3.11.3rev1.dev0",
+            "3.11.4.dev0",
+        ],
     )
     def test_no_cve_for_fixed_keras_version(self, tmp_path: Path, keras_version: str) -> None:
         """Keras builds at or after final 3.11.3 should not be CVE-attributed."""
@@ -2372,7 +2382,10 @@ class TestCVE202549655TorchModuleWrapper:
             assert len(cve_issues) >= 1, f"Prerelease {prerelease_version} should be treated as vulnerable"
             assert cve_issues[0].severity == IssueSeverity.CRITICAL
 
-    @pytest.mark.parametrize("keras_version", ["3.11.3a0", "3.11.3b1", "3.11.3rc1", "3.11.3.dev0"])
+    @pytest.mark.parametrize(
+        "keras_version",
+        ["3.11.3a0", "3.11.3b1", "3.11.3c1", "3.11.3rc1", "3.11.3.dev0", "3.11.3_dev0"],
+    )
     def test_fixed_boundary_prerelease_versions_treated_as_vulnerable(
         self,
         tmp_path: Path,
@@ -2397,9 +2410,15 @@ class TestCVE202549655TorchModuleWrapper:
         ("keras_version", "expected"),
         [
             ("3.11.3rc1", True),
+            ("3.11.3c1", True),
             ("3.11.3.dev0", True),
+            ("3.11.3_dev0", True),
             ("3.11.3rc1.post1", True),
             ("3.11.3.post1.dev0", False),
+            ("3.11.3-post1.dev0", False),
+            ("3.11.3_post1.dev0", False),
+            ("3.11.3-r1.dev0", False),
+            ("3.11.3rev1.dev0", False),
             ("3.11.3+rc1", False),
             ("3.11.3rcpu", None),
             ("3.11.3devops", None),

@@ -118,6 +118,17 @@ _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
 _KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+_-]*)\s*$")
 _KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(r"(?i)^(?:a|alpha|b|beta|c|rc|pre|preview|dev)")
+_KERAS_PEP440_SUFFIX_PATTERN = re.compile(
+    r"""
+    ^
+    (?P<prerelease>[._-]?(?:alpha|beta|preview|pre|rc|a|b|c)[._-]?\d*)?
+    (?P<postrelease>(?:-\d+|[._-]?(?:post|rev|r)[._-]?\d*))?
+    (?P<devrelease>[._-]?dev[._-]?\d*)?
+    (?:\+[a-z0-9]+(?:[._-][a-z0-9]+)*)?
+    $
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -1044,7 +1055,7 @@ class KerasZipScanner(BaseScanner):
     @staticmethod
     def _is_vulnerable_keras_3_11_x(version: str) -> bool | None:
         """Return True for vulnerable Keras 3.11 TorchModuleWrapper versions."""
-        version_match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+-]*)$", version.strip())
+        version_match = _KERAS_RELEASE_VERSION_PATTERN.match(version)
         if not version_match:
             return None
 
@@ -1054,21 +1065,21 @@ class KerasZipScanner(BaseScanner):
             patch = int(version_match.group(3) or 0)
             suffix = (version_match.group(4) or "").strip().lower()
 
-            is_prerelease = bool(
-                re.search(
-                    r"(?:^|[.\-])(?:alpha|beta|preview|pre|rc|dev|a|b)(?:\d+)?(?:$|[.+-])",
-                    suffix,
-                )
-            )
-            is_fixed_metadata_suffix = suffix.startswith("+") or suffix.startswith(".post") or suffix.startswith("post")
-            if suffix and not (is_prerelease or is_fixed_metadata_suffix):
+            suffix_match = _KERAS_PEP440_SUFFIX_PATTERN.match(suffix)
+            if suffix_match is None:
                 return None
 
             if major != 3 or minor != 11:
                 return False
             if 0 <= patch <= 2:
                 return True
-            return bool(patch == 3 and is_prerelease and not is_fixed_metadata_suffix)
+            if patch != 3:
+                return False
+
+            is_prerelease = suffix_match.group("prerelease") is not None
+            is_postrelease = suffix_match.group("postrelease") is not None
+            is_devrelease = suffix_match.group("devrelease") is not None
+            return is_prerelease or (is_devrelease and not is_postrelease)
         except ValueError:
             return None
 
