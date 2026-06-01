@@ -432,8 +432,15 @@ class TestModelDownload:
             + b"\x00\x00\x00\x00",
             pickle.dumps({"weights": [1, 2, 3]}, protocol=0),
             _make_tar_payload(),
+            b"\x0a\x07version\x0a\x03uidCompositeFunction",
+            (
+                b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\n"
+                b"max_feature_idx=0\ntree=0\nnum_leaves=1\nsplit_feature=0\nleaf_value=0\n"
+            ),
+            b'{"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+            b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00",
         ],
-        ids=["safetensors", "protocol0-pickle", "tar"],
+        ids=["safetensors", "protocol0-pickle", "tar", "cntk", "lightgbm", "mxnet", "executorch"],
     )
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
@@ -461,6 +468,47 @@ class TestModelDownload:
         download_model("https://huggingface.co/test/model")
 
         assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin", "hidden.payload"]
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            struct.pack("<Q", 4) + b"\x00" * 8,
+            b"\x0a\x07version\x0a\x03uid",
+            (
+                b"tree implementation notes\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\n"
+                b"max_feature_idx=0\nnum_leaves=1\nsplit_feature=0\nleaf_value=0\n"
+            ),
+            b'{"nodes":[{"op":"Custom"}],"arg_nodes":[],"heads":[[0,0,0]]}',
+            b"\x0c\x00\x00\x00ETAA\x04\x00\x04\x00\x04\x00\x00\x00",
+        ],
+        ids=["malformed-safetensors", "cntk-notes", "lightgbm-notes", "mxnet-notes", "executorch-near-match"],
+    )
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "hidden.payload"], None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_skips_benign_content_route_near_matches(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+        payload: bytes,
+    ) -> None:
+        """Bounded content probes should not pull benign near-match files into snapshots."""
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "pytorch_model.bin").write_bytes(b"weights")
+        mock_snapshot_download.return_value = str(download_path)
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        download_model("https://huggingface.co/test/model")
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin"]
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(

@@ -22,7 +22,7 @@ from .huggingface_paths import (
 
 logger = logging.getLogger(__name__)
 
-_HF_CONTENT_SNIFF_BYTES = 512
+_HF_CONTENT_SNIFF_BYTES = 8 * 1024
 _HF_CONTENT_SNIFF_MAX_FILES = 256
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
@@ -99,7 +99,7 @@ def _read_huggingface_prefix(repo_id: str, filename: str, max_bytes: int) -> byt
         ) from exc
 
 
-def _looks_like_safetensors_prefix(prefix: bytes) -> bool:
+def _looks_like_safetensors_prefix(repo_id: str, filename: str, prefix: bytes) -> bool:
     """Recognize bounded SafeTensors framing without requiring a local path."""
     if len(prefix) <= 8:
         return False
@@ -108,14 +108,43 @@ def _looks_like_safetensors_prefix(prefix: bytes) -> bool:
     header_prefix = prefix[8:]
     if header_len <= 0 or not header_prefix.startswith(b"{"):
         return False
-    if header_len > len(header_prefix):
+
+    from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
+
+    if header_len > SAFETENSORS_ROUTING_HEADER_PARSE_BYTES:
         return True
 
+    header_probe = _read_huggingface_prefix(repo_id, filename, 8 + header_len)
+    if len(header_probe) != 8 + header_len or header_probe[8:9] != b"{":
+        return False
     try:
-        parsed_header = json.loads(header_prefix[:header_len].decode("utf-8"))
+        parsed_header = json.loads(header_probe[8:].decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False
     return isinstance(parsed_header, dict)
+
+
+def _detect_huggingface_mxnet_symbol_route(repo_id: str, filename: str, prefix: bytes) -> str | None:
+    """Return a bounded MXNet JSON route for a suffix-skipped remote file."""
+    from modelaudit.utils.file.detection import MXNET_SYMBOL_SIGNATURE_READ_BYTES, _detect_mxnet_symbol_prefix_route
+
+    normalized_prefix = prefix[3:] if prefix.startswith(b"\xef\xbb\xbf") else prefix
+    if not normalized_prefix.lstrip().startswith(b"{"):
+        return None
+
+    max_probe_size = MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1
+    mxnet_probe = _read_huggingface_prefix(repo_id, filename, max_probe_size)
+    mxnet_probe = mxnet_probe[3:] if mxnet_probe.startswith(b"\xef\xbb\xbf") else mxnet_probe
+    if len(mxnet_probe) > MXNET_SYMBOL_SIGNATURE_READ_BYTES:
+        return _detect_mxnet_symbol_prefix_route(
+            mxnet_probe[:MXNET_SYMBOL_SIGNATURE_READ_BYTES],
+            fail_closed_without_hint=True,
+        )
+    return _detect_mxnet_symbol_prefix_route(
+        mxnet_probe,
+        sample_is_prefix=len(mxnet_probe) >= max_probe_size,
+        fail_closed_without_hint=True,
+    )
 
 
 def _detect_huggingface_content_route_format(repo_id: str, filename: str) -> str | None:
@@ -127,15 +156,27 @@ def _detect_huggingface_content_route_format(repo_id: str, filename: str) -> str
     from modelaudit.utils.file.detection import (
         PROTO0_1_MAX_PROBE_BYTES,
         _could_start_proto0_or_1_pickle,
+        _is_cntk_signature,
+        _is_content_routed_lightgbm_signature,
+        _is_executorch_binary_signature,
         _looks_like_proto0_or_1_pickle,
         _looks_like_uncompressed_tar_header,
         detect_format_from_magic_bytes,
     )
 
-    if _looks_like_safetensors_prefix(prefix):
+    if _looks_like_safetensors_prefix(repo_id, filename, prefix):
         return "safetensors"
     if _looks_like_uncompressed_tar_header(prefix):
         return "tar"
+    if _is_cntk_signature(prefix):
+        return "cntk"
+    if _is_content_routed_lightgbm_signature(prefix):
+        return "lightgbm"
+
+    mxnet_route = _detect_huggingface_mxnet_symbol_route(repo_id, filename, prefix)
+    if mxnet_route is not None:
+        return mxnet_route
+
     if _could_start_proto0_or_1_pickle(prefix):
         pickle_probe = _read_huggingface_prefix(repo_id, filename, PROTO0_1_MAX_PROBE_BYTES)
         if _looks_like_proto0_or_1_pickle(
@@ -143,6 +184,8 @@ def _detect_huggingface_content_route_format(repo_id: str, filename: str) -> str
             sample_is_prefix=len(pickle_probe) >= PROTO0_1_MAX_PROBE_BYTES,
         ):
             return "pickle"
+    if _is_executorch_binary_signature(prefix):
+        return "executorch"
 
     detected_format = detect_format_from_magic_bytes(
         prefix[:4],
