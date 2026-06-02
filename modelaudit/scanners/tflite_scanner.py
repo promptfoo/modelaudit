@@ -17,12 +17,22 @@ def _memory_map(path: str, file_size: int) -> Any:
     The caller — and the parsed model, which references the buffer — keeps the
     mapping alive for the scan's duration. Empty files return ``b""`` because
     ``mmap`` rejects a zero-length mapping.
+
+    ``file_size`` is the size the caller already validated against the configured
+    read limit. We re-``fstat`` the opened descriptor and map only
+    ``min(file_size, current_size)`` rather than the whole file: if the file grew
+    after the caller's check we must not map past the validated size (a TOCTOU
+    bypass of the limit that the previous chunked read caught), and if it shrank
+    we must not map past EOF.
     """
     if file_size <= 0:
         return b""
     with open(path, "rb") as f:
         # The mapping outlives the file descriptor (POSIX), so closing f is fine.
-        return mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        length = min(file_size, os.fstat(f.fileno()).st_size)
+        if length <= 0:
+            return b""
+        return mmap.mmap(f.fileno(), length, access=mmap.ACCESS_READ)
 
 
 try:
