@@ -234,7 +234,7 @@ def test_tflite_read_failure_is_inconclusive_without_security_finding(
 
     with (
         patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", True),
-        patch.object(TFLiteScanner, "_read_file_safely", side_effect=read_exception),
+        patch("modelaudit.scanners.tflite_scanner._memory_map", side_effect=read_exception),
     ):
         result = TFLiteScanner().scan(str(path))
         aggregate = core.scan_model_directory_or_file(str(path), recursive=False, cache_scan_results=False)
