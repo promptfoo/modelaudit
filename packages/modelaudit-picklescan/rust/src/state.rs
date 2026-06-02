@@ -78,8 +78,11 @@ const TIME_CHECK_INTERVAL_OPCODES: usize = 4096;
 const MAX_IMPORT_REFERENCES: usize = 10_000;
 const MAX_TRACKED_DICT_ENTRIES: usize = 1024;
 const MAX_TRACKED_DICT_UNKNOWN_KEY_VALUES: usize = 16;
+const MAX_TRACKED_FUTURE_CALLBACKS: usize = 1024;
+const MAX_TRACKED_MEMO_VALUES: usize = 65_536;
+const MAX_TRACKED_STACK_VALUES: usize = 65_536;
 const MAX_TRACKED_STATE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_TRACKED_VALUE_DEPTH: usize = 8;
+const MAX_TRACKED_VALUE_DEPTH: usize = 64;
 const MAX_MAPPING_TRAVERSAL_NODES: usize = 2048;
 const MAX_TRACKED_STR_JOIN_RESULT_BYTES: usize = 4096;
 
@@ -513,6 +516,8 @@ pub(crate) struct ScanState<'a> {
     import_references_truncated: bool,
     callable_invocations_truncated: bool,
     tracked_state_bytes: usize,
+    tracked_stack_value_bytes: Vec<usize>,
+    tracked_stack_bytes: usize,
     tracked_state_budget_exhausted: bool,
 }
 
@@ -573,6 +578,8 @@ impl<'a> ScanState<'a> {
             import_references_truncated: false,
             callable_invocations_truncated: false,
             tracked_state_bytes: 0,
+            tracked_stack_value_bytes: Vec::new(),
+            tracked_stack_bytes: 0,
             tracked_state_budget_exhausted: false,
         }
     }
@@ -681,8 +688,7 @@ impl<'a> ScanState<'a> {
                     if self.first_pickle_end_pos.is_none() {
                         self.first_pickle_end_pos = Some(self.position_offset + index);
                     }
-                    self.stack.clear();
-                    self.memo.clear();
+                    self.reset_simulated_pickle_state();
                     break;
                 }
             }
@@ -735,10 +741,67 @@ impl<'a> ScanState<'a> {
     }
 
     fn push_stack_value(&mut self, value: StackValue) {
-        if self.reserve_tracked_state_for_value(&value, "stack") {
+        if self.stack.len() >= MAX_TRACKED_STACK_VALUES {
+            self.record_tracked_state_budget_exhausted("stack_entries", self.stack.len() + 1);
+            self.clear_stack_values();
+            self.stack.push(StackValue::Other);
+            self.tracked_stack_value_bytes.push(0);
+            return;
+        }
+        let cost = Self::stack_value_state_cost(&value);
+        if self.can_reserve_tracked_stack_bytes(cost, "stack") {
             self.stack.push(value);
+            self.tracked_stack_value_bytes.push(cost);
+            self.tracked_stack_bytes += cost;
         } else {
             self.stack.push(StackValue::Other);
+            self.tracked_stack_value_bytes.push(0);
+        }
+    }
+
+    fn pop_stack_value(&mut self) -> Option<StackValue> {
+        let value = self.stack.pop()?;
+        let cost = self.tracked_stack_value_bytes.pop().unwrap_or_default();
+        self.tracked_stack_bytes = self.tracked_stack_bytes.saturating_sub(cost);
+        Some(value)
+    }
+
+    fn replace_top_stack_value(&mut self, value: StackValue) {
+        if self.pop_stack_value().is_some() {
+            self.push_stack_value(value);
+        }
+    }
+
+    fn clear_stack_values(&mut self) {
+        self.stack.clear();
+        self.tracked_stack_value_bytes.clear();
+        self.tracked_stack_bytes = 0;
+    }
+
+    fn reset_simulated_pickle_state(&mut self) {
+        self.clear_stack_values();
+        self.memo.clear();
+        self.tracked_state_bytes = 0;
+    }
+
+    fn can_reserve_tracked_stack_bytes(&mut self, cost: usize, reason: &'static str) -> bool {
+        if cost == 0 {
+            return true;
+        }
+        match self
+            .tracked_state_bytes
+            .checked_add(self.tracked_stack_bytes)
+            .and_then(|total| total.checked_add(cost))
+        {
+            Some(total) if total <= MAX_TRACKED_STATE_BYTES => true,
+            Some(total) => {
+                self.record_tracked_state_budget_exhausted(reason, total);
+                false
+            }
+            None => {
+                self.record_tracked_state_budget_exhausted(reason, usize::MAX);
+                false
+            }
         }
     }
 
@@ -755,9 +818,13 @@ impl<'a> ScanState<'a> {
         if cost == 0 {
             return true;
         }
-        match self.tracked_state_bytes.checked_add(cost) {
+        match self
+            .tracked_state_bytes
+            .checked_add(self.tracked_stack_bytes)
+            .and_then(|total| total.checked_add(cost))
+        {
             Some(total) if total <= MAX_TRACKED_STATE_BYTES => {
-                self.tracked_state_bytes = total;
+                self.tracked_state_bytes += cost;
                 true
             }
             Some(total) => {
@@ -771,6 +838,23 @@ impl<'a> ScanState<'a> {
         }
     }
 
+    fn reserve_optional_tracked_state_bytes(&mut self, cost: usize) -> bool {
+        if cost == 0 {
+            return true;
+        }
+        match self
+            .tracked_state_bytes
+            .checked_add(self.tracked_stack_bytes)
+            .and_then(|total| total.checked_add(cost))
+        {
+            Some(total) if total <= MAX_TRACKED_STATE_BYTES => {
+                self.tracked_state_bytes += cost;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn stack_value_state_cost(value: &StackValue) -> usize {
         Self::stack_value_state_cost_at_depth(value, 0)
     }
@@ -781,7 +865,7 @@ impl<'a> ScanState<'a> {
 
     fn stack_value_state_cost_at_depth(value: &StackValue, depth: usize) -> usize {
         if depth >= MAX_TRACKED_VALUE_DEPTH {
-            return 1;
+            return MAX_TRACKED_STATE_BYTES.saturating_add(1);
         }
         match value {
             StackValue::Text(value) | StackValue::StringTemplate { template: value } => value.len(),
@@ -856,6 +940,33 @@ impl<'a> ScanState<'a> {
         }
     }
 
+    fn tracked_dict_value_is_security_relevant(value: &StackValue) -> bool {
+        match value {
+            StackValue::Global(_)
+            | StackValue::Constructed(_)
+            | StackValue::CallIterator { .. }
+            | StackValue::CallIteratorTuple { .. }
+            | StackValue::DefaultDict { .. }
+            | StackValue::DynamicType { .. }
+            | StackValue::TrackedDict { .. }
+            | StackValue::MappingWrapper { .. }
+            | StackValue::StringTemplate { .. }
+            | StackValue::RegexPattern { .. }
+            | StackValue::RegexScannerLexicon { .. }
+            | StackValue::RegexScanner { .. }
+            | StackValue::FutureCallbacks(_) => true,
+            StackValue::Tuple(values) => values
+                .iter()
+                .any(Self::tracked_dict_value_is_security_relevant),
+            StackValue::Text(_)
+            | StackValue::TextSpan { .. }
+            | StackValue::Bytes { .. }
+            | StackValue::Primitive { .. }
+            | StackValue::Mark
+            | StackValue::Other => false,
+        }
+    }
+
     fn record_tracked_state_budget_exhausted(&mut self, reason: &'static str, observed: usize) {
         if self.status.is_complete() {
             self.status = ScanStatus::Inconclusive;
@@ -885,6 +996,14 @@ impl<'a> ScanState<'a> {
                 ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
             ],
         });
+    }
+
+    fn can_insert_tracked_memo_value(&mut self, index: i64) -> bool {
+        if self.memo.contains_key(&index) || self.memo.len() < MAX_TRACKED_MEMO_VALUES {
+            return true;
+        }
+        self.record_tracked_state_budget_exhausted("memo_entries", self.memo.len() + 1);
+        false
     }
 
     fn handle_parse_error(&mut self, error: ParseError, index: usize) {
@@ -1042,9 +1161,9 @@ impl<'a> ScanState<'a> {
             "READONLY_BUFFER" => {
                 self.record_buffer_opcode(opcode.name, position, self.stack.is_empty());
             }
-            "MARK" => self.stack.push(StackValue::Mark),
+            "MARK" => self.push_stack_value(StackValue::Mark),
             "POP" => {
-                self.stack.pop();
+                self.pop_stack_value();
             }
             "DUP" => {
                 self.duplicate_top_stack_value();
@@ -1106,16 +1225,15 @@ impl<'a> ScanState<'a> {
                     if let Some(index) = opcode.arg.as_i64() {
                         let value = self.with_memo_index(value, index);
                         if !self.reserve_tracked_state_for_value(&value, "memo_store") {
-                            if let Some(top) = self.stack.last_mut() {
-                                *top = StackValue::Other;
-                            }
-                            self.memo.insert(index, StackValue::Other);
+                            self.replace_top_stack_value(StackValue::Other);
+                            return;
+                        }
+                        if !self.can_insert_tracked_memo_value(index) {
+                            self.replace_top_stack_value(StackValue::Other);
                             return;
                         }
                         let stack_value = Self::memo_value_for_stack(index, &value);
-                        if let Some(top) = self.stack.last_mut() {
-                            *top = stack_value;
-                        }
+                        self.replace_top_stack_value(stack_value);
                         self.memo.insert(index, value);
                     }
                 }
@@ -1125,16 +1243,15 @@ impl<'a> ScanState<'a> {
                     let index = self.next_public_memoize_index();
                     let value = self.with_memo_index(value, index);
                     if !self.reserve_tracked_state_for_value(&value, "memo_store") {
-                        if let Some(top) = self.stack.last_mut() {
-                            *top = StackValue::Other;
-                        }
-                        self.memo.insert(index, StackValue::Other);
+                        self.replace_top_stack_value(StackValue::Other);
+                        return;
+                    }
+                    if !self.can_insert_tracked_memo_value(index) {
+                        self.replace_top_stack_value(StackValue::Other);
                         return;
                     }
                     let stack_value = Self::memo_value_for_stack(index, &value);
-                    if let Some(top) = self.stack.last_mut() {
-                        *top = stack_value;
-                    }
+                    self.replace_top_stack_value(stack_value);
                     self.memo.insert(index, value);
                 }
             }
@@ -1163,8 +1280,8 @@ impl<'a> ScanState<'a> {
                 self.record_global_ref(&reference, opcode.name);
             }
             "STACK_GLOBAL" => {
-                let name_value = self.stack.pop();
-                let module_value = self.stack.pop();
+                let name_value = self.pop_stack_value();
+                let module_value = self.pop_stack_value();
                 let reference = self.resolve_stack_global(module_value, name_value, position);
                 self.push_stack_value(StackValue::Global(reference.clone()));
                 self.record_global_ref(&reference, opcode.name);
@@ -1434,9 +1551,9 @@ impl<'a> ScanState<'a> {
     }
 
     fn pop_value_operand_preserving_mark(&mut self) -> Option<StackValue> {
-        match self.stack.pop() {
+        match self.pop_stack_value() {
             Some(StackValue::Mark) => {
-                self.stack.push(StackValue::Mark);
+                self.push_stack_value(StackValue::Mark);
                 None
             }
             value => value,
@@ -1445,7 +1562,7 @@ impl<'a> ScanState<'a> {
 
     fn pop_to_mark(&mut self) -> Vec<StackValue> {
         let mut values = Vec::new();
-        while let Some(item) = self.stack.pop() {
+        while let Some(item) = self.pop_stack_value() {
             if matches!(item, StackValue::Mark) {
                 break;
             }
@@ -1471,11 +1588,13 @@ impl<'a> ScanState<'a> {
                 return;
             }
             let index = self.allocate_internal_memo_index();
+            if !self.can_insert_tracked_memo_value(index) {
+                self.push_stack_value(StackValue::Other);
+                return;
+            }
             let shared = self.with_memo_index(value, index);
             let stack_value = Self::memo_value_for_stack(index, &shared);
-            if let Some(top) = self.stack.last_mut() {
-                *top = stack_value.clone();
-            }
+            self.replace_top_stack_value(stack_value.clone());
             self.memo.insert(index, shared);
             self.push_stack_value(stack_value);
         } else {
@@ -1540,24 +1659,28 @@ impl<'a> ScanState<'a> {
                 .first()
                 .and_then(|value| stack_value_string(value, self.payload));
             if let Some(value) = pair.get(1) {
+                let security_relevant = Self::tracked_dict_value_is_security_relevant(value);
                 if let Some(key) = key {
-                    if !self.reserve_tracked_state_for_value(value, "tracked_dict_entry")
-                        || !self.reserve_tracked_state_bytes(key.len(), "tracked_dict_entry_key")
-                        || !Self::insert_tracked_dict_entry(&mut entries, key, value.clone())
-                    {
-                        unknown_key_values_overflowed = true;
-                        entry_budget_exhausted = true;
-                    }
-                } else {
-                    if self.reserve_tracked_state_for_value(value, "tracked_dict_unknown_key") {
-                        Self::insert_tracked_dict_unknown_key_value(
-                            &mut unknown_key_values,
-                            &mut unknown_key_values_overflowed,
-                            value.clone(),
-                        );
+                    if security_relevant {
+                        if !self.reserve_tracked_state_for_value(value, "tracked_dict_entry")
+                            || !self
+                                .reserve_tracked_state_bytes(key.len(), "tracked_dict_entry_key")
+                            || !Self::insert_tracked_dict_entry(&mut entries, key, value.clone())
+                        {
+                            unknown_key_values_overflowed = true;
+                            entry_budget_exhausted = true;
+                        }
                     } else {
-                        unknown_key_values_overflowed = true;
+                        self.insert_optional_tracked_dict_shadow_entry(&mut entries, key);
                     }
+                } else if self.reserve_tracked_state_for_value(value, "tracked_dict_unknown_key") {
+                    Self::insert_tracked_dict_unknown_key_value(
+                        &mut unknown_key_values,
+                        &mut unknown_key_values_overflowed,
+                        value.clone(),
+                    );
+                } else {
+                    unknown_key_values_overflowed = true;
                 }
             }
         }
@@ -1580,6 +1703,10 @@ impl<'a> ScanState<'a> {
             Some(StackValue::TrackedDict { memo_index, .. }) => *memo_index,
             _ => return,
         };
+        if !Self::tracked_dict_value_is_security_relevant(&value) {
+            self.record_top_tracked_dict_shadow_entry(key, memo_index);
+            return;
+        }
         if !self.reserve_tracked_state_bytes(
             Self::tracked_dict_entry_state_cost(key, &value),
             "tracked_dict_entry",
@@ -1618,6 +1745,43 @@ impl<'a> ScanState<'a> {
                 "tracked_dict_entries",
                 MAX_TRACKED_DICT_ENTRIES + 1,
             );
+        }
+    }
+
+    fn record_top_tracked_dict_shadow_entry(&mut self, key: &str, memo_index: Option<i64>) {
+        self.remove_top_tracked_dict_entry(key, memo_index);
+        let can_insert = if let Some(memo_index) = memo_index {
+            matches!(
+                self.memo.get(&memo_index),
+                Some(StackValue::TrackedDict { entries, .. })
+                    if entries.len() < MAX_TRACKED_DICT_ENTRIES
+            )
+        } else {
+            matches!(
+                self.stack.last(),
+                Some(StackValue::TrackedDict { entries, .. })
+                    if entries.len() < MAX_TRACKED_DICT_ENTRIES
+            )
+        };
+        if !can_insert || !self.reserve_optional_tracked_state_bytes(key.len()) {
+            return;
+        }
+        if let Some(memo_index) = memo_index {
+            if let Some(StackValue::TrackedDict { entries, .. }) = self.memo.get_mut(&memo_index) {
+                entries.push((key.to_string(), StackValue::Other));
+            }
+        } else if let Some(StackValue::TrackedDict { entries, .. }) = self.stack.last_mut() {
+            entries.push((key.to_string(), StackValue::Other));
+        }
+    }
+
+    fn remove_top_tracked_dict_entry(&mut self, key: &str, memo_index: Option<i64>) {
+        if let Some(memo_index) = memo_index {
+            if let Some(StackValue::TrackedDict { entries, .. }) = self.memo.get_mut(&memo_index) {
+                entries.retain(|(candidate, _)| candidate != key);
+            }
+        } else if let Some(StackValue::TrackedDict { entries, .. }) = self.stack.last_mut() {
+            entries.retain(|(candidate, _)| candidate != key);
         }
     }
 
@@ -1689,6 +1853,20 @@ impl<'a> ScanState<'a> {
         }
     }
 
+    fn insert_optional_tracked_dict_shadow_entry(
+        &mut self,
+        entries: &mut Vec<(String, StackValue)>,
+        key: String,
+    ) {
+        if let Some((_, value)) = entries.iter_mut().find(|(candidate, _)| candidate == &key) {
+            *value = StackValue::Other;
+        } else if entries.len() < MAX_TRACKED_DICT_ENTRIES
+            && self.reserve_optional_tracked_state_bytes(key.len())
+        {
+            entries.push((key, StackValue::Other));
+        }
+    }
+
     fn insert_tracked_dict_unknown_key_value(
         unknown_key_values: &mut Vec<StackValue>,
         unknown_key_values_overflowed: &mut bool,
@@ -1716,7 +1894,7 @@ impl<'a> ScanState<'a> {
         }
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
-            if let Some(value) = self.stack.pop() {
+            if let Some(value) = self.pop_stack_value() {
                 values.push(value);
             }
         }
@@ -2286,6 +2464,12 @@ impl<'a> ScanState<'a> {
             return;
         };
         let key = stack_value_string(key, self.payload);
+        if key.is_some() && !Self::tracked_dict_value_is_security_relevant(value) {
+            if let Some(key) = key.as_deref() {
+                self.record_memoized_tracked_dict_shadow_entry(memo_index, key);
+            }
+            return;
+        }
         if match key.as_deref() {
             Some(key) => !self.reserve_tracked_state_bytes(
                 Self::tracked_dict_entry_state_cost(key, value),
@@ -2325,6 +2509,27 @@ impl<'a> ScanState<'a> {
         }
     }
 
+    fn record_memoized_tracked_dict_shadow_entry(&mut self, memo_index: i64, key: &str) {
+        self.remove_memoized_tracked_dict_entry(memo_index, key);
+        let can_insert = matches!(
+            self.memo.get(&memo_index),
+            Some(StackValue::TrackedDict { entries, .. })
+                if entries.len() < MAX_TRACKED_DICT_ENTRIES
+        );
+        if !can_insert || !self.reserve_optional_tracked_state_bytes(key.len()) {
+            return;
+        }
+        if let Some(StackValue::TrackedDict { entries, .. }) = self.memo.get_mut(&memo_index) {
+            entries.push((key.to_string(), StackValue::Other));
+        }
+    }
+
+    fn remove_memoized_tracked_dict_entry(&mut self, memo_index: i64, key: &str) {
+        if let Some(StackValue::TrackedDict { entries, .. }) = self.memo.get_mut(&memo_index) {
+            entries.retain(|(candidate, _)| candidate != key);
+        }
+    }
+
     fn record_tracked_dict_setdefault_mutation(
         &mut self,
         target: &StackValue,
@@ -2354,6 +2559,12 @@ impl<'a> ScanState<'a> {
             type_name: "NoneType",
             repr: "None".to_string(),
         });
+        if key.is_some() && !Self::tracked_dict_value_is_security_relevant(&value) {
+            if let Some(key) = key.as_deref() {
+                self.record_memoized_tracked_dict_shadow_entry(memo_index, key);
+            }
+            return;
+        }
         if match key.as_deref() {
             Some(key) => !self.reserve_tracked_state_bytes(
                 Self::tracked_dict_entry_state_cost(key, &value),
@@ -4357,6 +4568,22 @@ impl<'a> ScanState<'a> {
     }
 
     fn memoized_future_add_callback(&mut self, memo_index: i64, callback: GlobalRef) {
+        let Some(callback_count) = self.memo.get(&memo_index).and_then(|value| match value {
+            StackValue::FutureCallbacks(callbacks) => Some(callbacks.callbacks.len()),
+            _ => None,
+        }) else {
+            return;
+        };
+        if callback_count >= MAX_TRACKED_FUTURE_CALLBACKS {
+            self.record_tracked_state_budget_exhausted("future_callbacks", callback_count + 1);
+            return;
+        }
+        if !self.reserve_tracked_state_bytes(
+            callback.module.len().saturating_add(callback.name.len()),
+            "future_callback",
+        ) {
+            return;
+        }
         if let Some(StackValue::FutureCallbacks(callbacks)) = self.memo.get_mut(&memo_index) {
             callbacks.callbacks.push(callback);
         }
@@ -4380,7 +4607,7 @@ impl<'a> ScanState<'a> {
         }
         let mut values = Vec::with_capacity(operand_count);
         for _ in 0..operand_count {
-            if let Some(value) = self.stack.pop() {
+            if let Some(value) = self.pop_stack_value() {
                 values.push(value);
             }
         }
@@ -4933,24 +5160,27 @@ impl<'a> ScanState<'a> {
             let [key, value] = pair.as_slice() else {
                 return None;
             };
+            let security_relevant = Self::tracked_dict_value_is_security_relevant(value);
             if let Some(key) = stack_value_string(key, self.payload) {
-                if !self.reserve_tracked_state_for_value(value, "tracked_dict_entry")
-                    || !self.reserve_tracked_state_bytes(key.len(), "tracked_dict_entry_key")
-                    || !Self::insert_tracked_dict_entry(&mut entries, key, value.clone())
-                {
-                    unknown_key_values_overflowed = true;
-                    entry_budget_exhausted = true;
-                }
-            } else {
-                if self.reserve_tracked_state_for_value(value, "tracked_dict_unknown_key") {
-                    Self::insert_tracked_dict_unknown_key_value(
-                        &mut unknown_key_values,
-                        &mut unknown_key_values_overflowed,
-                        value.clone(),
-                    );
+                if security_relevant {
+                    if !self.reserve_tracked_state_for_value(value, "tracked_dict_entry")
+                        || !self.reserve_tracked_state_bytes(key.len(), "tracked_dict_entry_key")
+                        || !Self::insert_tracked_dict_entry(&mut entries, key, value.clone())
+                    {
+                        unknown_key_values_overflowed = true;
+                        entry_budget_exhausted = true;
+                    }
                 } else {
-                    unknown_key_values_overflowed = true;
+                    self.insert_optional_tracked_dict_shadow_entry(&mut entries, key);
                 }
+            } else if self.reserve_tracked_state_for_value(value, "tracked_dict_unknown_key") {
+                Self::insert_tracked_dict_unknown_key_value(
+                    &mut unknown_key_values,
+                    &mut unknown_key_values_overflowed,
+                    value.clone(),
+                );
+            } else {
+                unknown_key_values_overflowed = true;
             }
         }
         if entry_budget_exhausted {
@@ -5020,12 +5250,17 @@ impl<'a> ScanState<'a> {
             StackValue::TrackedDict {
                 entries,
                 memo_index,
+                unknown_key_values_overflowed,
                 ..
             } => {
                 if memo_index.is_some_and(|index| !visited.insert(index)) {
                     return false;
                 }
-                self.current_tracked_dict_entries(entries, *memo_index)
+                self.current_tracked_dict_unknown_key_values_overflowed(
+                    *unknown_key_values_overflowed,
+                    *memo_index,
+                ) || self
+                    .current_tracked_dict_entries(entries, *memo_index)
                     .iter()
                     .any(|(_, value)| {
                         self.mapping_may_contain_default_factory_inner(value, visited)
@@ -5627,7 +5862,7 @@ impl<'a> ScanState<'a> {
             self.first_persistent_id_position = Some(position);
         }
         let persistent_id = if opcode.name == "BINPERSID" {
-            self.stack.pop()
+            self.pop_stack_value()
         } else {
             Some(StackValue::Text(opcode.arg.coerce_text(self.payload)))
         };
@@ -6774,12 +7009,22 @@ mod tests {
         payload.push(b's');
     }
 
+    fn append_dict_global_setitem(payload: &mut Vec<u8>, key: &str, module: &str, name: &str) {
+        payload.extend_from_slice(&short_binunicode(key.as_bytes()));
+        payload.push(b'c');
+        payload.extend_from_slice(module.as_bytes());
+        payload.push(b'\n');
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(b'\n');
+        payload.push(b's');
+    }
+
     #[test]
     fn tracked_dict_insertions_are_entry_bounded() {
         let options = default_test_options();
         let mut payload = b"\x80\x04}".to_vec();
         for index in 0..(MAX_TRACKED_DICT_ENTRIES + 8) {
-            append_dict_setitem(&mut payload, &format!("k{index:04}"), "value");
+            append_dict_global_setitem(&mut payload, &format!("k{index:04}"), "builtins", "help");
         }
         payload.push(b'.');
 
@@ -6790,7 +7035,7 @@ mod tests {
         assert!(has_notice_code(&scan, "tracked_state_budget"));
 
         let mut benign_payload = b"\x80\x04}".to_vec();
-        for index in 0..8 {
+        for index in 0..(MAX_TRACKED_DICT_ENTRIES + 8) {
             append_dict_setitem(&mut benign_payload, &format!("safe{index}"), "value");
         }
         benign_payload.push(b'.');
@@ -6799,6 +7044,71 @@ mod tests {
 
         assert_eq!(benign_scan.status, ScanStatus::Complete);
         assert!(!has_notice_code(&benign_scan, "tracked_state_budget"));
+    }
+
+    #[test]
+    fn inert_tracked_dict_overwrite_replaces_security_relevant_entry_with_shadow() {
+        let options = default_test_options();
+        let payload = b".";
+        let mut scan = ScanState::new(
+            "tracked-dict-inert-overwrite.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+        scan.push_stack_value(StackValue::TrackedDict {
+            entries: vec![(
+                "callback".to_string(),
+                StackValue::Global(GlobalRef {
+                    module: "builtins".to_string(),
+                    name: "help".to_string(),
+                    position: 0,
+                    malformed: false,
+                }),
+            )],
+            unknown_key_values: Vec::new(),
+            unknown_key_values_overflowed: false,
+            memo_index: None,
+        });
+
+        scan.record_top_tracked_dict_entry("callback", StackValue::Other);
+
+        let Some(StackValue::TrackedDict { entries, .. }) = scan.stack.last() else {
+            panic!("tracked dictionary was replaced");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "callback");
+        assert!(matches!(entries[0].1, StackValue::Other));
+    }
+
+    #[test]
+    fn discarded_inert_tracked_dict_shadows_do_not_consume_optional_bytes() {
+        let options = default_test_options();
+        let payload = b".";
+        let mut scan = ScanState::new(
+            "tracked-dict-discarded-shadow-budget.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+        let mut entries = Vec::new();
+        for index in 0..(MAX_TRACKED_DICT_ENTRIES * 5) {
+            scan.insert_optional_tracked_dict_shadow_entry(
+                &mut entries,
+                format!("{index:04}-{}", "A".repeat(1024)),
+            );
+        }
+
+        assert_eq!(entries.len(), MAX_TRACKED_DICT_ENTRIES);
+        assert!(scan.tracked_state_bytes < MAX_TRACKED_STATE_BYTES / 2);
+        assert_eq!(scan.status, ScanStatus::Complete);
+        assert!(!has_notice_code(&scan, "tracked_state_budget"));
     }
 
     #[test]
@@ -6825,6 +7135,23 @@ mod tests {
 
         assert_eq!(benign_scan.status, ScanStatus::Complete);
         assert!(!has_notice_code(&benign_scan, "tracked_state_budget"));
+    }
+
+    #[test]
+    fn protocol0_popped_text_stack_materialization_releases_state_budget() {
+        let options = default_test_options();
+        let chunk = "A".repeat(64 * 1024);
+        let mut payload = Vec::new();
+        for _ in 0..(MAX_TRACKED_STATE_BYTES / chunk.len() + 2) {
+            append_protocol0_unicode(&mut payload, &chunk);
+            payload.push(b'0');
+        }
+        payload.push(b'.');
+
+        let scan = run_test_scan("protocol0-popped-text-budget.pkl", &payload, &options);
+
+        assert_eq!(scan.status, ScanStatus::Complete);
+        assert!(!has_notice_code(&scan, "tracked_state_budget"));
     }
 
     #[test]
@@ -6855,6 +7182,128 @@ mod tests {
 
         assert_eq!(scan.status, ScanStatus::Complete);
         assert!(!has_notice_code(&scan, "tracked_state_budget"));
+    }
+
+    #[test]
+    fn deeply_nested_mapping_wrappers_fail_closed() {
+        let options = default_test_options();
+        let payload = b".";
+        let mut scan = ScanState::new(
+            "nested-mapping-wrapper-budget.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+        let mut value = StackValue::Other;
+        for _ in 0..=MAX_TRACKED_VALUE_DEPTH {
+            value = StackValue::MappingWrapper {
+                reference: GlobalRef {
+                    module: "types".to_string(),
+                    name: "MappingProxyType".to_string(),
+                    position: 0,
+                    malformed: false,
+                },
+                mappings: vec![value],
+            };
+        }
+
+        scan.push_stack_value(value);
+
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert!(matches!(scan.stack.last(), Some(StackValue::Other)));
+        assert!(has_notice_code(&scan, "tracked_state_budget"));
+    }
+
+    #[test]
+    fn zero_cost_stack_values_are_entry_bounded() {
+        let options = default_test_options();
+        let payload = b".";
+        let mut scan = ScanState::new(
+            "stack-entry-budget.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        for _ in 0..=MAX_TRACKED_STACK_VALUES {
+            scan.push_stack_value(StackValue::Other);
+        }
+
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.stack.len(), 1);
+        assert!(has_notice_code(&scan, "tracked_state_budget"));
+    }
+
+    #[test]
+    fn zero_cost_memo_values_are_entry_bounded() {
+        let options = default_test_options();
+        let payload = b".";
+        let mut scan = ScanState::new(
+            "memo-entry-budget.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+        for index in 0..MAX_TRACKED_MEMO_VALUES {
+            assert!(scan.can_insert_tracked_memo_value(index as i64));
+            scan.memo.insert(index as i64, StackValue::Other);
+        }
+
+        assert!(!scan.can_insert_tracked_memo_value(MAX_TRACKED_MEMO_VALUES as i64));
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.memo.len(), MAX_TRACKED_MEMO_VALUES);
+        assert!(has_notice_code(&scan, "tracked_state_budget"));
+    }
+
+    #[test]
+    fn memoized_future_callbacks_are_entry_bounded() {
+        let options = default_test_options();
+        let payload = b".";
+        let mut scan = ScanState::new(
+            "future-callback-budget.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+        scan.memo.insert(
+            0,
+            StackValue::FutureCallbacks(FutureCallbacks {
+                callbacks: Vec::new(),
+                done: false,
+                memo_index: Some(0),
+            }),
+        );
+        for _ in 0..=MAX_TRACKED_FUTURE_CALLBACKS {
+            scan.memoized_future_add_callback(
+                0,
+                GlobalRef {
+                    module: "builtins".to_string(),
+                    name: "help".to_string(),
+                    position: 0,
+                    malformed: false,
+                },
+            );
+        }
+
+        let StackValue::FutureCallbacks(callbacks) = scan.memo.get(&0).expect("memoized future")
+        else {
+            panic!("memoized future callbacks were replaced");
+        };
+        assert_eq!(callbacks.callbacks.len(), MAX_TRACKED_FUTURE_CALLBACKS);
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert!(has_notice_code(&scan, "tracked_state_budget"));
     }
 
     #[test]
