@@ -13,20 +13,9 @@ from ..utils.file.detection import has_inconclusive_renamed_flax_msgpack_routing
 try:
     import msgpack
 
-    # Try to import exceptions module - not available in all msgpack versions
-    try:
-        from msgpack import exceptions as msgpack_exceptions
-
-        HAS_MSGPACK_EXCEPTIONS = True
-    except (ImportError, AttributeError):
-        msgpack_exceptions = None  # type: ignore[assignment]
-        HAS_MSGPACK_EXCEPTIONS = False
-
     HAS_MSGPACK = True
 except Exception:  # pragma: no cover - optional dependency missing
     HAS_MSGPACK = False
-    HAS_MSGPACK_EXCEPTIONS = False
-    msgpack_exceptions = None  # type: ignore[assignment]
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -1168,10 +1157,9 @@ class FlaxMsgpackScanner(BaseScanner):
             "max_map_len": self.max_items_per_container,
         }
 
-    def _msgpack_unpackb_kwargs(self) -> dict[str, Any]:
-        kwargs = self._msgpack_unpacker_kwargs()
-        kwargs.pop("max_buffer_size", None)
-        return kwargs
+    def _msgpack_stream_read_size(self) -> int:
+        """Leave decoder-buffer headroom for an object split across filesystem reads."""
+        return min(self.chunk_size, max(self.max_msgpack_decode_bytes // 2, 1))
 
     @staticmethod
     def _is_msgpack_limit_error(error: Exception) -> bool:
@@ -1208,6 +1196,43 @@ class FlaxMsgpackScanner(BaseScanner):
         )
         result.finish(success=False)
 
+    def _add_msgpack_stream_object_limit_check(self, result: ScanResult, path: str, parsed_object_count: int) -> None:
+        result.add_check(
+            name="Msgpack Stream Object Limit",
+            passed=False,
+            message=f"Msgpack stream object count exceeds configured limit ({self.max_msgpack_stream_objects})",
+            severity=IssueSeverity.WARNING,
+            location=path,
+            details={
+                "max_msgpack_stream_objects": self.max_msgpack_stream_objects,
+                "parsed_object_count": parsed_object_count,
+            },
+            rule_code="S902",
+        )
+        result.metadata["operational_error"] = True
+        result.metadata["operational_error_reason"] = "msgpack_stream_object_limit_exceeded"
+        result.finish(success=False)
+
+    @staticmethod
+    def _is_msgpack_out_of_data(error: Exception) -> bool:
+        return type(error).__name__ == "OutOfData"
+
+    def _drain_msgpack_unpacker(self, unpacker: Any, objects: list[Any], result: ScanResult, path: str) -> bool | None:
+        """Append complete objects and report whether the unpacker consumed a partial tail."""
+        while True:
+            previous_offset = unpacker.tell()
+            try:
+                stream_obj = unpacker.unpack()
+            except Exception as error:
+                if self._is_msgpack_out_of_data(error):
+                    return unpacker.tell() > previous_offset
+                raise
+
+            if len(objects) >= self.max_msgpack_stream_objects:
+                self._add_msgpack_stream_object_limit_check(result, path, len(objects))
+                return None
+            objects.append(stream_obj)
+
     def _add_msgpack_stream_integrity_check(self, objects: list[Any], result: ScanResult, path: str) -> None:
         if len(objects) <= 1:
             return
@@ -1229,116 +1254,19 @@ class FlaxMsgpackScanner(BaseScanner):
             rule_code="S902",
         )
 
-    def _unpack_msgpack_objects(self, file_data: bytes, result: ScanResult, path: str) -> list[Any] | None:
-        """Unpack all msgpack objects in a bounded byte buffer and preserve trailing-object warnings."""
-        try:
-            return [msgpack.unpackb(file_data, **self._msgpack_unpackb_kwargs())]
-        except Exception as e:
-            if self._is_msgpack_limit_error(e):
-                self._add_msgpack_decode_limit_check(result, path, e)
-                return None
-
-            extra_data_detected = False
-            if (
-                HAS_MSGPACK_EXCEPTIONS
-                and msgpack_exceptions
-                and hasattr(msgpack_exceptions, "ExtraData")
-                and isinstance(e, msgpack_exceptions.ExtraData)
-            ):
-                extra_data_detected = True
-
-            if extra_data_detected:
-                unpacker = msgpack.Unpacker(**self._msgpack_unpacker_kwargs())
-                unpacker.feed(file_data)
-                try:
-                    objects: list[Any] = []
-                    for stream_obj in unpacker:
-                        if len(objects) >= self.max_msgpack_stream_objects:
-                            result.add_check(
-                                name="Msgpack Stream Object Limit",
-                                passed=False,
-                                message=(
-                                    "Msgpack stream object count exceeds configured limit "
-                                    f"({self.max_msgpack_stream_objects})"
-                                ),
-                                severity=IssueSeverity.WARNING,
-                                location=path,
-                                details={
-                                    "max_msgpack_stream_objects": self.max_msgpack_stream_objects,
-                                    "parsed_object_count": len(objects),
-                                },
-                                rule_code="S902",
-                            )
-                            result.metadata["operational_error"] = True
-                            result.metadata["operational_error_reason"] = "msgpack_stream_object_limit_exceeded"
-                            result.finish(success=False)
-                            return None
-                        objects.append(stream_obj)
-                except Exception as unpack_e:
-                    if self._is_msgpack_limit_error(unpack_e):
-                        self._add_msgpack_decode_limit_check(result, path, unpack_e)
-                    else:
-                        self._add_msgpack_parse_failure_check(result, path, unpack_e)
-                    return None
-
-                if objects:
-                    self._add_msgpack_stream_integrity_check(objects, result, path)
-                    return objects
-
-                result.add_check(
-                    name="Msgpack Parse Check",
-                    passed=False,
-                    message="Failed to parse msgpack data: stream contained trailing bytes but no decodable objects",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    details={"parse_error": "no decodable objects"},
-                    rule_code="S902",
-                )
-                result.finish(success=False)
-                return None
-
-            result.add_check(
-                name="Msgpack Format Validation",
-                passed=False,
-                message=f"Invalid msgpack format: {e!s}",
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={"msgpack_error": str(e)},
-                rule_code="S902",
-            )
-            result.finish(success=False)
-            return None
-
     def _unpack_msgpack_objects_from_path(self, path: str, result: ScanResult) -> list[Any] | None:
         """Stream MessagePack from disk so scans do not allocate the whole file before decoding."""
         unpacker = msgpack.Unpacker(**self._msgpack_unpacker_kwargs())
         objects: list[Any] = []
+        has_incomplete_tail = False
         try:
             with open(path, "rb") as source:
-                while chunk := source.read(self.chunk_size):
+                while chunk := source.read(self._msgpack_stream_read_size()):
                     unpacker.feed(chunk)
-                    for stream_obj in unpacker:
-                        if len(objects) >= self.max_msgpack_stream_objects:
-                            result.add_check(
-                                name="Msgpack Stream Object Limit",
-                                passed=False,
-                                message=(
-                                    "Msgpack stream object count exceeds configured limit "
-                                    f"({self.max_msgpack_stream_objects})"
-                                ),
-                                severity=IssueSeverity.WARNING,
-                                location=path,
-                                details={
-                                    "max_msgpack_stream_objects": self.max_msgpack_stream_objects,
-                                    "parsed_object_count": len(objects),
-                                },
-                                rule_code="S902",
-                            )
-                            result.metadata["operational_error"] = True
-                            result.metadata["operational_error_reason"] = "msgpack_stream_object_limit_exceeded"
-                            result.finish(success=False)
-                            return None
-                        objects.append(stream_obj)
+                    drain_result = self._drain_msgpack_unpacker(unpacker, objects, result, path)
+                    if drain_result is None:
+                        return None
+                    has_incomplete_tail = drain_result
         except Exception as e:
             if self._is_msgpack_limit_error(e):
                 self._add_msgpack_decode_limit_check(result, path, e)
@@ -1346,6 +1274,9 @@ class FlaxMsgpackScanner(BaseScanner):
                 self._add_msgpack_parse_failure_check(result, path, e)
             return None
 
+        if has_incomplete_tail:
+            self._add_msgpack_parse_failure_check(result, path, ValueError("incomplete trailing msgpack object"))
+            return None
         if not objects:
             result.add_check(
                 name="Msgpack Parse Check",

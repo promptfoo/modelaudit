@@ -375,6 +375,23 @@ def test_flax_msgpack_scalar_trailing_junk_stays_warning(tmp_path: Path) -> None
     assert stream_checks[0].details["trailing_objects_are_container_like"] is False
 
 
+def test_flax_msgpack_incomplete_trailing_object_fails_closed(tmp_path: Path) -> None:
+    """A partial trailing object must not disappear into the streaming unpacker buffer."""
+    path = tmp_path / "incomplete_trailing_object.msgpack"
+    payload = msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True) + b"\x81\xa1"
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Msgpack Parse Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["parse_error"] == "incomplete trailing msgpack object"
+        for check in result.checks
+    )
+
+
 def test_flax_msgpack_caps_trailing_stream_object_count(tmp_path: Path) -> None:
     """Too many trailing msgpack objects should fail closed without materializing the full stream."""
     path = tmp_path / "many_objects.msgpack"
@@ -413,6 +430,19 @@ def test_flax_msgpack_streaming_decode_does_not_call_unpackb(
 
     assert result.success is True
     assert result.metadata.get("top_level_type") == "dict"
+
+
+def test_flax_msgpack_small_decode_buffer_accepts_stream_of_small_objects(tmp_path: Path) -> None:
+    """A bounded decoder should stream complete small objects without buffering the whole file."""
+    path = tmp_path / "small_stream_objects.msgpack"
+    payload = b"".join(msgpack.packb({"params": {"n": [index]}}, use_bin_type=True) for index in range(8))
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 32}).scan(str(path))
+
+    assert result.success is True
+    assert result.metadata.get("msgpack_object_count") == 8
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
 
 
 def test_flax_msgpack_decode_limit_is_inconclusive(tmp_path: Path) -> None:
