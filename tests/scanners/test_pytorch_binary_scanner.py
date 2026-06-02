@@ -239,6 +239,75 @@ def test_pytorch_binary_code_patterns_affect_security_exit(tmp_path: Path) -> No
     assert determine_exit_code(aggregate) == 1
 
 
+@pytest.mark.parametrize(
+    "description",
+    [
+        b"The open(path) helper reads a checkpoint.",
+        b"The input(shape) field is required.",
+        b"Use mmap(length) for large tensors.",
+    ],
+)
+def test_pytorch_binary_context_dependent_code_patterns_do_not_affect_security_exit(
+    tmp_path: Path,
+    description: bytes,
+) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "documented-helper.bin"
+    binary_file.write_bytes(b"\x00" * 128 + description + b"\x00" * 128)
+
+    direct = scanner.scan(str(binary_file))
+    aggregate = scan_model_directory_or_file(str(binary_file), cache_scan_results=False)
+
+    code_issues = [issue for issue in direct.issues if "Suspicious code pattern found" in issue.message]
+
+    assert code_issues
+    assert all(issue.severity == IssueSeverity.INFO for issue in code_issues)
+    assert all(issue.details["pattern_confidence"] == "context_dependent" for issue in code_issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_pytorch_binary_security_pattern_near_matches_do_not_affect_security_exit(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "benign-security-near-match.bin"
+    binary_file.write_bytes(b"\x00" * 128 + b"reeval(value) and ecos.systematic labels" + b"\x00" * 128)
+
+    direct = scanner.scan(str(binary_file))
+    aggregate = scan_model_directory_or_file(str(binary_file), cache_scan_results=False)
+
+    assert not [issue for issue in direct.issues if "Suspicious code pattern found" in issue.message]
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "payload, expected_pattern",
+    [
+        (b"eval ('1 + 1')", "eval("),
+        (b"os \n . \t system('id')", "os.system"),
+    ],
+)
+def test_pytorch_binary_security_patterns_allow_bounded_whitespace(
+    tmp_path: Path,
+    payload: bytes,
+    expected_pattern: str,
+) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "spaced-active-code.bin"
+    binary_file.write_bytes(b"\x00" * 128 + payload + b"\x00" * 128)
+
+    direct = scanner.scan(str(binary_file))
+    aggregate = scan_model_directory_or_file(str(binary_file), cache_scan_results=False)
+
+    code_issues = [
+        issue
+        for issue in direct.issues
+        if issue.details.get("pattern") == expected_pattern and issue.severity == IssueSeverity.WARNING
+    ]
+
+    assert code_issues
+    assert all(issue.details["pattern_confidence"] == "high" for issue in code_issues)
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_pytorch_binary_benign_tensor_data_stays_clean(tmp_path: Path) -> None:
     scanner = PyTorchBinaryScanner()
     binary_file = tmp_path / "benign-weights.bin"
@@ -264,6 +333,19 @@ def test_pytorch_binary_scanner_detects_code_pattern_split_across_chunk_boundary
 
     assert result.success is True
     assert any("os.system" in issue.message for issue in result.issues)
+
+
+def test_pytorch_binary_scanner_detects_spaced_code_pattern_split_across_chunk_boundary(tmp_path: Path) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "boundary_spaced_code_pattern.bin"
+    _write_chunk_boundary_payload(binary_file, b"os \n . \t system", prefix_len=6)
+
+    result = scanner.scan(str(binary_file))
+
+    assert any(
+        issue.details.get("pattern") == "os.system" and issue.severity == IssueSeverity.WARNING
+        for issue in result.issues
+    )
 
 
 @pytest.mark.skip(

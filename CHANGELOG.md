@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- classify active code patterns in PyTorch binary artifacts as security findings so scan exits reflect them
+- classify high-confidence active code patterns in PyTorch binary artifacts as security findings so scan exits reflect them
 - scan ONNX external data references in sparse initializers, tensor-valued attributes, and function defaults
 - avoid false-positive process-launch findings for parsed framed Python string literals
 - detect dangerous Python calls retrieved through module namespace dictionaries in ZIP and TAR members
