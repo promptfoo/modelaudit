@@ -2939,7 +2939,8 @@ def test_scan_bytes_ignores_nested_function_body_sink_when_outer_function_is_imp
 
     report = scan_bytes(payload, source=f"{module_name}.pkl")
 
-    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
     assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
 
 

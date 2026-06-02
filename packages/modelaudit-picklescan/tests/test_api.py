@@ -3464,6 +3464,58 @@ def test_scan_bytes_warns_on_import_only_custom_global_that_executes_module_init
     assert marker.read_text(encoding="utf-8") == "owned"
 
 
+def test_scan_bytes_warns_on_source_available_import_only_custom_global(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_source_payload_{uuid.uuid4().hex}"
+    marker = tmp_path / "source_available_import_only_global_marker"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_warns_on_unresolved_import_only_custom_global() -> None:
+    module_name = f"modelaudit_c095_missing_payload_{uuid.uuid4().hex}"
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_warns_on_unreviewed_submodule_of_allowlisted_package() -> None:
+    report = scan_bytes(b"cnumpy.evil\nGadget\n.", source="numpy-evil.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.evil.Gadget"
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_keeps_allowlisted_import_only_global_clean() -> None:
     payload = b"ccollections\nOrderedDict\n."
 

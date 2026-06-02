@@ -7,9 +7,7 @@ pub(crate) fn callable_severity(module: &str, name: &str) -> Option<&'static str
 }
 
 pub(crate) fn global_import_requires_review(module: &str) -> bool {
-    let top_level_module = module.split('.').next().unwrap_or(module);
     !IMPORT_ONLY_GLOBAL_ALLOWLIST_MODULES.contains(&module)
-        && !IMPORT_ONLY_GLOBAL_ALLOWLIST_MODULES.contains(&top_level_module)
         && !dangerous_global_module_is_listed(module)
 }
 
@@ -223,11 +221,13 @@ const IMPORT_ONLY_GLOBAL_ALLOWLIST_MODULES: &[&str] = &[
     "__builtins__",
     "_operator",
     "_pytest",
+    "_pytest._py.path",
     "_tkinter",
     "array",
     "builtins",
     "click",
     "collections",
+    "collections.abc",
     "copyreg",
     "datetime",
     "decimal",
@@ -237,15 +237,18 @@ const IMPORT_ONLY_GLOBAL_ALLOWLIST_MODULES: &[&str] = &[
     "heapq",
     "itertools",
     "joblib",
+    "joblib.numpy_pickle",
     "logging",
     "mailbox",
     "math",
     "numpy",
+    "numpy._core.multiarray",
     "operator",
     "pathlib",
     "random",
     "re",
     "torch",
+    "torch._utils",
     "types",
     "uuid",
 ];
@@ -1198,6 +1201,8 @@ mod tests {
         assert!(!global_import_requires_review("dotenv.main"));
         assert!(!global_import_requires_review("random"));
         assert!(global_import_requires_review("modelaudit_custom_payload"));
+        assert!(global_import_requires_review("numpy.evil"));
+        assert!(global_import_requires_review("torch.evil"));
         assert!(global_import_requires_review("vendor.package"));
     }
 
