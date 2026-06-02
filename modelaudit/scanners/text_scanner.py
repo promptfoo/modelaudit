@@ -10,6 +10,27 @@ from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, Sc
 TEXT_CONTENT_SECURITY_SCAN_INCOMPLETE_REASON = "text_content_security_scan_incomplete"
 TEXT_CONTENT_SECURITY_DETECTOR_FAILED_REASON = "text_content_security_detector_failed"
 DEFAULT_TEXT_CONTENT_SECURITY_SCAN_BYTES = 100 * 1024 * 1024
+DOCUMENTATION_TEXT_FILENAMES = frozenset(
+    {
+        "license.md",
+        "license.txt",
+        "model_card.md",
+        "readme.md",
+        "readme.markdown",
+        "readme.txt",
+        "requirements.txt",
+    }
+)
+PASSIVE_DOCUMENTATION_NETWORK_FINDING_TYPES = frozenset(
+    {
+        "cloud_storage_url",
+        "domain",
+        "domain_name",
+        "ipv4_address",
+        "ipv6_address",
+        "url_detected",
+    }
+)
 
 
 class TextScanner(BaseScanner):
@@ -62,6 +83,30 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
+    def _is_documentation_sidecar(path: str) -> bool:
+        filename = os.path.basename(path).lower()
+        return filename in DOCUMENTATION_TEXT_FILENAMES or os.path.splitext(filename)[1] in {
+            ".markdown",
+            ".md",
+            ".rst",
+        }
+
+    @classmethod
+    def _downgrade_passive_documentation_network_findings(
+        cls,
+        path: str,
+        findings: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not cls._is_documentation_sidecar(path):
+            return findings
+        return [
+            {**finding, "severity": "INFO"}
+            if finding.get("type") in PASSIVE_DOCUMENTATION_NETWORK_FINDING_TYPES
+            else finding
+            for finding in findings
+        ]
+
+    @staticmethod
     def _is_unreadable_path_result(result: ScanResult) -> bool:
         return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
 
@@ -110,6 +155,15 @@ class TextScanner(BaseScanner):
         )
 
     def _run_content_security_checks(self, path: str, result: ScanResult, file_size: int) -> int:
+        check_secrets = self._get_bool_config("check_secrets", True)
+        check_network = self._get_bool_config("check_network_comm", True)
+        if not check_secrets:
+            result.metadata.setdefault("disabled_checks", []).append("Embedded Secrets Detection")
+        if not check_network:
+            result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
+        if not check_secrets and not check_network:
+            return 0
+
         read_limit = self._get_content_security_scan_bytes()
         try:
             with open(path, "rb") as file_obj:
@@ -134,47 +188,50 @@ class TextScanner(BaseScanner):
         inspected_bytes = len(inspected_payload)
 
         detector_failed = False
-        try:
-            secret_findings = self.collect_embedded_secret_findings(
-                inspected_payload,
-                path,
-                raise_on_error=True,
-            )
-            self.add_embedded_secret_findings(secret_findings, result, context=path)
-        except Exception as error:
-            detector_failed = True
-            self._mark_content_security_scan_incomplete(
-                result,
-                path,
-                reason=TEXT_CONTENT_SECURITY_DETECTOR_FAILED_REASON,
-                message=f"Embedded secret detector failed for text content: {error!s}",
-                details={
-                    "detector": "secrets",
-                    "exception": str(error),
-                    "exception_type": type(error).__name__,
-                },
-            )
+        if check_secrets:
+            try:
+                secret_findings = self.collect_embedded_secret_findings(
+                    inspected_payload,
+                    path,
+                    raise_on_error=True,
+                )
+                self.add_embedded_secret_findings(secret_findings, result, context=path)
+            except Exception as error:
+                detector_failed = True
+                self._mark_content_security_scan_incomplete(
+                    result,
+                    path,
+                    reason=TEXT_CONTENT_SECURITY_DETECTOR_FAILED_REASON,
+                    message=f"Embedded secret detector failed for text content: {error!s}",
+                    details={
+                        "detector": "secrets",
+                        "exception": str(error),
+                        "exception_type": type(error).__name__,
+                    },
+                )
 
-        try:
-            network_findings = self.collect_network_communication_findings(
-                inspected_payload,
-                path,
-                raise_on_error=True,
-            )
-            self.add_network_communication_findings(network_findings, result, context=path)
-        except Exception as error:
-            detector_failed = True
-            self._mark_content_security_scan_incomplete(
-                result,
-                path,
-                reason=TEXT_CONTENT_SECURITY_DETECTOR_FAILED_REASON,
-                message=f"Network communication detector failed for text content: {error!s}",
-                details={
-                    "detector": "network_communication",
-                    "exception": str(error),
-                    "exception_type": type(error).__name__,
-                },
-            )
+        if check_network:
+            try:
+                network_findings = self.collect_network_communication_findings(
+                    inspected_payload,
+                    path,
+                    raise_on_error=True,
+                )
+                network_findings = self._downgrade_passive_documentation_network_findings(path, network_findings)
+                self.add_network_communication_findings(network_findings, result, context=path)
+            except Exception as error:
+                detector_failed = True
+                self._mark_content_security_scan_incomplete(
+                    result,
+                    path,
+                    reason=TEXT_CONTENT_SECURITY_DETECTOR_FAILED_REASON,
+                    message=f"Network communication detector failed for text content: {error!s}",
+                    details={
+                        "detector": "network_communication",
+                        "exception": str(error),
+                        "exception_type": type(error).__name__,
+                    },
+                )
 
         if truncated:
             self._mark_content_security_scan_incomplete(
@@ -186,6 +243,11 @@ class TextScanner(BaseScanner):
                     "file_size": file_size,
                     "read_limit": read_limit,
                     "inspected_bytes": inspected_bytes,
+                    "enabled_detectors": [
+                        detector
+                        for detector, enabled in (("secrets", check_secrets), ("network_communication", check_network))
+                        if enabled
+                    ],
                 },
             )
         elif not detector_failed:

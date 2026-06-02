@@ -573,7 +573,23 @@ class BaseScanner(ABC):
         Returns:
             Number of secrets detected
         """
-        findings = self.collect_embedded_secret_findings(data, context, enable_check=enable_check)
+        if not enable_check or not self._get_bool_config("check_secrets", True):
+            return 0
+
+        try:
+            findings = self.collect_embedded_secret_findings(
+                data,
+                context,
+                enable_check=enable_check,
+                raise_on_error=True,
+            )
+        except ImportError:
+            logger.debug("SecretsDetector not available, skipping secrets check")
+            return 0
+        except Exception as e:
+            logger.warning(f"Error checking for embedded secrets: {e}")
+            return 0
+
         return self.add_embedded_secret_findings(findings, result, context=context)
 
     def collect_embedded_secret_findings(
@@ -584,7 +600,7 @@ class BaseScanner(ABC):
         raise_on_error: bool = False,
     ) -> list[dict[str, Any]]:
         """Collect embedded secret findings without creating checks."""
-        if not enable_check or not self.config.get("check_secrets", True):
+        if not enable_check or not self._get_bool_config("check_secrets", True):
             return []
 
         try:
@@ -890,7 +906,7 @@ class BaseScanner(ABC):
         Returns:
             List of findings
         """
-        if not enable_check or not self.config.get("check_network_comm", True):
+        if not enable_check or not self._get_bool_config("check_network_comm", True):
             return []
 
         try:
@@ -1012,7 +1028,7 @@ class BaseScanner(ABC):
         Returns:
             Number of network communication patterns detected
         """
-        if not enable_check or not self.config.get("check_network_comm", True):
+        if not enable_check or not self._get_bool_config("check_network_comm", True):
             return 0
 
         try:

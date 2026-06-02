@@ -50,6 +50,72 @@ def test_text_scanner_runs_content_security_detectors_for_ml_sidecars(tmp_path: 
     )
 
 
+def test_text_scanner_documentation_urls_are_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("Documentation: https://docs.example.com/model-card\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    network_issues = [
+        issue for issue in result.issues if issue.type == "text_check" and "detected" in issue.message.lower()
+    ]
+    assert network_issues
+    assert all(issue.severity == IssueSeverity.INFO for issue in network_issues)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_text_scanner_documentation_cc_markers_remain_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("callback_url=https://evil.example/exfil\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("type") == "cc_pattern"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_text_scanner_disabled_detectors_do_not_report_clean_coverage(tmp_path: Path) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text("token\n", encoding="utf-8")
+
+    result = TextScanner(config={"check_secrets": False, "check_network_comm": False}).scan(str(text_path))
+
+    assert result.metadata["disabled_checks"] == [
+        "Embedded Secrets Detection",
+        "Network Communication Detection",
+    ]
+    assert not any(check.name == "Embedded Secrets Detection" for check in result.checks)
+    assert not any(check.name == "Network Communication Detection" for check in result.checks)
+    assert not any(check.name == "Text Content Security Coverage" for check in result.checks)
+
+
+def test_text_scanner_fails_closed_when_secret_detector_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text("token\n", encoding="utf-8")
+
+    def raise_detector_error(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        raise RuntimeError("simulated secret detector failure")
+
+    monkeypatch.setattr(TextScanner, "collect_embedded_secret_findings", raise_detector_error)
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "text_content_security_detector_failed"
+    assert not any(
+        check.name == "Embedded Secrets Detection" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+
+
 def test_text_scanner_fails_closed_when_content_detector_coverage_is_truncated(tmp_path: Path) -> None:
     text_path = tmp_path / "tokens.txt"
     text_path.write_text("token\n" + ("safe\n" * 20), encoding="utf-8")
