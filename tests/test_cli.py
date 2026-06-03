@@ -13,7 +13,7 @@ from click.testing import CliRunner
 
 from modelaudit import __version__
 from modelaudit.cache.trusted_config_store import TrustedConfigStore
-from modelaudit.cli import _summarize_progress_tree, cli, expand_paths, format_text_output
+from modelaudit.cli import _resolve_scan_runtime_config, _summarize_progress_tree, cli, expand_paths, format_text_output
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
@@ -778,6 +778,43 @@ def test_scan_max_file_size(tmp_path):
     assert "500" in result.output or "File too large" in result.output  # Should mention the max file size or error
 
 
+@pytest.mark.parametrize(
+    "cloud_url",
+    [
+        "s3://bucket/model.bin",
+        "r2://bucket/model.bin",
+        "gcs://bucket/model.bin",
+        "https://bucket.s3.amazonaws.com/model.bin",
+        "https://storage.googleapis.com/bucket/model.bin",
+        "https://account.r2.cloudflarestorage.com/bucket/model.bin",
+    ],
+)
+def test_cloud_auto_size_limit_applies_to_download_budget(tmp_path: Path, cloud_url: str) -> None:
+    runtime = _resolve_scan_runtime_config(
+        [cloud_url],
+        format="json",
+        output=None,
+        timeout=None,
+        max_size=None,
+        cache_dir=str(tmp_path / "cache"),
+        progress=False,
+        no_cache=False,
+        no_whitelist=False,
+        stream=False,
+        strict=False,
+        verbose=False,
+        quiet=True,
+        scanners=(),
+        exclude_scanners=(),
+        suppress=(),
+        severity=(),
+        scan_start_time=0.0,
+    )
+
+    assert runtime.max_file_size == 50 * 1024 * 1024 * 1024
+    assert runtime.max_download_bytes == runtime.max_file_size
+
+
 def test_format_text_output():
     """Test the format_text_output function."""
     # Create a sample results dictionary
@@ -1045,6 +1082,49 @@ def test_scan_huggingface_file_download_failure_redacts_url(mock_download_file):
     assert "hf_secret" not in output
     assert "token=" not in output
     assert "https://huggingface.co/test/model/resolve/main/file.bin" in output
+
+
+@pytest.mark.parametrize(("max_size", "expected_bytes"), [("2KB", 2048), ("0", 0)])
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_file_passes_max_size_to_download(
+    mock_scan: MagicMock,
+    mock_download_file: MagicMock,
+    tmp_path: Path,
+    max_size: str,
+    expected_bytes: int,
+) -> None:
+    """Direct HuggingFace file downloads should receive the CLI download budget before fetch."""
+    downloaded_file = tmp_path / "model.bin"
+    downloaded_file.write_bytes(b"model")
+    mock_download_file.return_value = downloaded_file
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=4,
+        issues=[],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["test_scanner"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "--no-cache",
+            "--format",
+            "json",
+            "--max-size",
+            max_size,
+            "https://huggingface.co/test/model/resolve/main/model.bin",
+        ],
+    )
+
+    assert result.exit_code == 0
+    mock_download_file.assert_called_once()
+    assert mock_download_file.call_args.kwargs["max_size"] == expected_bytes
+    assert mock_scan.call_args.args[0] == str(downloaded_file)
 
 
 @patch("modelaudit.cli.is_huggingface_url")
