@@ -1773,6 +1773,41 @@ class TestJITScriptDetector:
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
 
+    def test_scan_model_detects_late_conditional_expression_alias_call(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = (
+            b"\x00\xffimport runpy as rp\n" + padding + b"(rp.run_path if True else print)('payload.py')\n" + padding
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_late_statically_safe_conditional_expression_alias_call(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport runpy as rp\n" + padding + b"(rp.run_path if False else print)('safe')\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_detects_late_member_load_invoked_by_local_target(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+        source = b"\x00\xffimport runpy as rp\n" + padding + b"for f in [rp.run_path]: f('payload.py')\n" + padding
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
     def test_scan_model_ignores_long_chain_after_safe_module_rebind(self) -> None:
         detector = JITScriptDetector()
         padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)

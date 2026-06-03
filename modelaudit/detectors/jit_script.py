@@ -3666,7 +3666,16 @@ def _priority_alias_usage_lines(
                 resolved_context = b"\n".join(
                     [priority_context, *(candidate[start:end] for start, end in state_spans), member_load_line]
                 )
-                if "S110" not in attribute_rule_codes and not _snippet_loads_native_library_member(resolved_context):
+                has_native_member_marker = any(
+                    loader_name in member_load_line for loader_name in (b"cdll", b"oledll", b"pydll", b"windll")
+                )
+                if "S110" not in attribute_rule_codes and b"(" not in member_load_line and not has_native_member_marker:
+                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    line_start = line_end
+                    continue
+                resolved_rule_codes = _snippet_resolved_high_risk_rule_codes(resolved_context)
+                replay_rule_codes = attribute_rule_codes or resolved_rule_codes
+                if not replay_rule_codes.intersection(resolved_rule_codes):
                     multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
                     line_start = line_end
                     continue
@@ -3691,9 +3700,7 @@ def _priority_alias_usage_lines(
                 usage_lines.append(usage_span)
                 return (
                     usage_lines,
-                    proof_rule_codes(root_names, conservative=True)
-                    if overflowed and reaches_retained_alias
-                    else frozenset(),
+                    replay_rule_codes if overflowed and reaches_retained_alias else frozenset(),
                 )
         elif line_end > search_start and b"(" in code_line:
             potential_root_names = _potential_late_callable_root_names(code_line).intersection(
@@ -6448,6 +6455,63 @@ def _bounded_late_binding_statement(candidate: bytes, line_start: int, line_end:
     return candidate[span[0] : span[1]], span
 
 
+def _explicit_call_target(node: ast.AST) -> ast.AST:
+    while True:
+        if isinstance(node, ast.Attribute) and node.attr == "__call__":
+            node = node.value
+            continue
+        if (
+            isinstance(node, ast.Call)
+            and _simple_reference_name(node.func) in {"getattr", "builtins.getattr"}
+            and not node.keywords
+            and len(node.args) >= 2
+            and _static_getattr_member_name(node.args[1]) == "__call__"
+        ):
+            node = node.args[0]
+            continue
+        return node
+
+
+def _callable_expression_candidates(node: ast.AST) -> list[ast.AST]:
+    node = _explicit_call_target(node)
+    if isinstance(node, ast.IfExp):
+        condition = _static_late_truth_value(node.test)
+        if condition is True:
+            return _callable_expression_candidates(node.body)
+        if condition is False:
+            return _callable_expression_candidates(node.orelse)
+        return [*(_callable_expression_candidates(node.body)), *(_callable_expression_candidates(node.orelse))]
+    return [node]
+
+
+def _callable_expression_root_names(node: ast.AST) -> set[str]:
+    root_names: set[str] = set()
+    for callable_node in _callable_expression_candidates(node):
+        root = callable_node
+        while isinstance(root, (ast.Attribute, ast.Subscript)):
+            root = root.value
+        if isinstance(root, ast.Name):
+            root_names.add(root.id)
+    return root_names
+
+
+def _callable_expression_uses_priority_alias(node: ast.AST, alias_names: set[str]) -> bool:
+    for callable_node in _callable_expression_candidates(node):
+        root = callable_node
+        members: set[str] = set()
+        while isinstance(root, (ast.Attribute, ast.Subscript)):
+            if isinstance(root, ast.Attribute):
+                members.add(root.attr)
+            root = root.value
+        if (
+            isinstance(root, ast.Name)
+            and root.id in alias_names
+            and (not members or not members.isdisjoint(_PRIORITY_CALL_MEMBER_NAMES))
+        ):
+            return True
+    return False
+
+
 def _callable_root_names(fragment: bytes) -> set[str]:
     source, _byte_offsets = _decode_utf8_with_byte_offsets(fragment)
     source = textwrap.dedent(source)
@@ -6462,11 +6526,7 @@ def _callable_root_names(fragment: bytes) -> set[str]:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        callable_node = node.func
-        while isinstance(callable_node, (ast.Attribute, ast.Subscript)):
-            callable_node = callable_node.value
-        if isinstance(callable_node, ast.Name):
-            root_names.add(callable_node.id)
+        root_names.update(_callable_expression_root_names(node.func))
     return root_names
 
 
@@ -6491,11 +6551,15 @@ def _member_load_root_names(fragment: bytes) -> set[str]:
 def _snippet_loads_native_library_member(source_bytes: bytes) -> bool:
     if not any(loader_name in source_bytes for loader_name in (b"cdll", b"oledll", b"pydll", b"windll")):
         return False
+    return "S110" in _snippet_resolved_high_risk_rule_codes(source_bytes)
+
+
+def _snippet_resolved_high_risk_rule_codes(source_bytes: bytes) -> frozenset[str]:
     source, _byte_offsets = _decode_utf8_with_byte_offsets(source_bytes)
     parsed_snippet = _parse_embedded_python_snippet(textwrap.dedent(source))
     if parsed_snippet is None:
-        return False
-    return any(code == "S110" for _name, code in _resolve_alias_aware_high_risk_calls(parsed_snippet[0]))
+        return frozenset()
+    return frozenset(code for _name, code in _resolve_alias_aware_high_risk_calls(parsed_snippet[0]))
 
 
 def _potential_late_callable_root_names(code_line: bytes) -> set[str]:
@@ -6529,30 +6593,7 @@ def _fragment_has_continued_priority_alias_call(fragment: bytes, aliases: frozen
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        callable_node = node.func
-        while True:
-            if isinstance(callable_node, ast.Attribute) and callable_node.attr == "__call__":
-                callable_node = callable_node.value
-                continue
-            if (
-                isinstance(callable_node, ast.Call)
-                and _simple_reference_name(callable_node.func) in {"getattr", "builtins.getattr"}
-                and not callable_node.keywords
-                and len(callable_node.args) >= 2
-                and _static_getattr_member_name(callable_node.args[1]) == "__call__"
-            ):
-                callable_node = callable_node.args[0]
-                continue
-            break
-        members: set[str] = set()
-        while isinstance(callable_node, ast.Attribute):
-            members.add(callable_node.attr)
-            callable_node = callable_node.value
-        if (
-            isinstance(callable_node, ast.Name)
-            and callable_node.id in alias_names
-            and (not members or not members.isdisjoint(_PRIORITY_CALL_MEMBER_NAMES))
-        ):
+        if _callable_expression_uses_priority_alias(node.func, alias_names):
             return True
     return False
 
