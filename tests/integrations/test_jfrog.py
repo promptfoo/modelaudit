@@ -54,6 +54,18 @@ class _FakeStreamingResponse:
         self.closed = True
 
 
+def _encode_proto_varint(value: int) -> bytes:
+    if value < 0:
+        raise ValueError("protobuf varints cannot encode negative values")
+
+    encoded = bytearray()
+    while value > 0x7F:
+        encoded.append((value & 0x7F) | 0x80)
+        value >>= 7
+    encoded.append(value)
+    return bytes(encoded)
+
+
 def _build_tensorflow_remote_route_payloads() -> dict[str, bytes]:
     """Build minimal vendored-proto TensorFlow fixtures without importing TensorFlow itself."""
     import modelaudit.protos  # noqa: F401
@@ -181,6 +193,28 @@ class TestJFrogDownload:
         assert result.read_bytes() == b"data"
         assert mock_get.call_args_list[1].args[0] == ("https://company.jfrog.io/artifactory/repo/model.bin?download=1")
         assert mock_get.call_args_list[1].kwargs["headers"]["X-JFrog-Art-Api"] == "test-token"
+        assert redirect_response.closed is True
+        assert final_response.closed is True
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_follows_default_port_same_origin_redirect(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Default-port redirects should be treated as the same effective origin."""
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        redirected_url = "https://company.jfrog.io:443/artifactory/repo/model.bin?download=1"
+        redirect_response = _FakeStreamingResponse(b"", status_code=302, headers={"Location": redirected_url})
+        final_response = _FakeStreamingResponse(b"data")
+        mock_get.side_effect = [redirect_response, final_response]
+
+        result = download_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            cache_dir=tmp_path,
+            api_token="test-token",
+        )
+
+        assert result.read_bytes() == b"data"
+        assert mock_get.call_args_list[1].args[0] == redirected_url
         assert redirect_response.closed is True
         assert final_response.closed is True
 
@@ -966,9 +1000,83 @@ class TestJFrogFolderDownload:
 
         assert {call.args[0] for call in mock_download.call_args_list} == set(payloads)
         probed_urls = [call.args[0] for call in mock_get.call_args_list]
-        mxnet_url = "https://company.jfrog.io/artifactory/repo/models/mxnet.payload"
-        assert probed_urls.count(mxnet_url) == 2
-        assert all(probed_urls.count(url) == 1 for url in set(payloads) - {mxnet_url})
+        assert all(probed_urls.count(url) == 1 for url in set(payloads))
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_selective_includes_jax_json_checkpoint(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Remote JSON probes should preserve renamed JAX/Orbax checkpoint metadata."""
+        payload_url = "https://company.jfrog.io/artifactory/repo/models/checkpoint.payload"
+        payload = b'{"framework":"jax","checkpoint_type":"orbax"}'
+        mock_list.return_value = [
+            {"name": "checkpoint.payload", "path": payload_url, "size": len(payload), "human_size": "Unknown"}
+        ]
+        mock_get.return_value = _FakeStreamingResponse(payload)
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(urlparse(url).path).name
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            show_progress=False,
+            scanner_selection=scanner_selection_config_from_inputs(scanners=["jax_checkpoint"]),
+        )
+
+        mock_download.assert_called_once_with(
+            payload_url,
+            cache_dir=tmp_path,
+            api_token=None,
+            access_token=None,
+            timeout=30,
+        )
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_json_probe_stays_within_sniff_cap(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """JSON-looking remote probes should not expand beyond the 64 KiB sniff bound."""
+        payload_url = "https://company.jfrog.io/artifactory/repo/models/large-json.payload"
+        payload = b"{" + (b" " * (64 * 1024 - 1)) + b'"framework":"jax"}'
+        mock_list.return_value = [
+            {"name": "large-json.payload", "path": payload_url, "size": 0, "human_size": "Unknown"}
+        ]
+        mock_get.return_value = _FakeStreamingResponse(payload)
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(urlparse(url).path).name
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            show_progress=False,
+            scanner_selection=scanner_selection_config_from_inputs(scanners=["mxnet"]),
+        )
+
+        assert mock_get.call_count == 1
+        assert mock_get.call_args.kwargs["headers"]["Range"] == "bytes=0-65535"
+        mock_download.assert_called_once()
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     @patch("modelaudit.utils.sources.jfrog.download_artifact")
@@ -1174,6 +1282,53 @@ class TestJFrogFolderDownload:
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     @patch("modelaudit.utils.sources.jfrog.download_artifact")
     @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_probe_allows_default_port_redirect(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Content probes should not reject redirects that only spell out the default port."""
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        hidden_url = "https://company.jfrog.io/artifactory/repo/models/model.payload"
+        redirected_url = "https://company.jfrog.io:443/artifactory/repo/models/model.payload?download=1"
+        payload = b"\x08\x00\x00\x00TFL3" + b"\x00" * 16
+        redirect_response = _FakeStreamingResponse(b"", status_code=302, headers={"Location": redirected_url})
+        final_response = _FakeStreamingResponse(payload)
+        mock_get.side_effect = [redirect_response, final_response]
+        mock_list.return_value = [
+            {"name": "model.payload", "path": hidden_url, "size": len(payload), "human_size": "24 B"}
+        ]
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(urlparse(url).path).name
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            api_token="test-token",
+            show_progress=False,
+        )
+
+        assert mock_get.call_args_list[1].args[0] == redirected_url
+        assert mock_get.call_args_list[1].kwargs["headers"]["X-JFrog-Art-Api"] == "test-token"
+        mock_download.assert_called_once_with(
+            redirected_url,
+            cache_dir=tmp_path,
+            api_token="test-token",
+            access_token=None,
+            timeout=30,
+        )
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
     def test_download_jfrog_folder_selective_includes_structured_remote_routes(
         self,
         mock_list: MagicMock,
@@ -1218,6 +1373,47 @@ class TestJFrogFolderDownload:
 
         assert result_dir == tmp_path / "downloads"
         assert {call.args[0] for call in mock_download.call_args_list} == set(payloads)
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_preserves_truncated_onnx_probe_candidate(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_get: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Truncated ONNX graph evidence should remain eligible for protobuf-model routing."""
+        payload_url = "https://company.jfrog.io/artifactory/repo/models/model.payload"
+        graph_field_prefix = _encode_proto_varint((7 << 3) | 2) + _encode_proto_varint(128 * 1024)
+        payload = b"\x08\x08" + graph_field_prefix + (b"\x0a" * (64 * 1024))
+        mock_list.return_value = [
+            {"name": "model.payload", "path": payload_url, "size": 128 * 1024, "human_size": "128 KiB"}
+        ]
+        mock_get.return_value = _FakeStreamingResponse(payload)
+
+        def download_side_effect(url: str, cache_dir: Path, **_kwargs: object) -> Path:
+            downloaded_file = cache_dir / Path(urlparse(url).path).name
+            downloaded_file.write_bytes(b"mock file content")
+            return downloaded_file
+
+        mock_download.side_effect = download_side_effect
+
+        download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            show_progress=False,
+            scanner_selection=scanner_selection_config_from_inputs(scanners=["onnx"]),
+        )
+
+        mock_download.assert_called_once_with(
+            payload_url,
+            cache_dir=tmp_path,
+            api_token=None,
+            access_token=None,
+            timeout=30,
+        )
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     @patch("modelaudit.utils.sources.jfrog.download_artifact")

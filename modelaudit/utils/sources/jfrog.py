@@ -12,7 +12,7 @@ from collections.abc import Collection, Mapping
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TypedDict
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import ParseResult, urljoin, urlparse, urlunparse
 
 import click
 import requests
@@ -214,6 +214,18 @@ def _get_requests_prepared_hostname(url: str) -> str:
     return _normalize_hostname(urlparse(prepared_url).hostname or "")
 
 
+def _normalized_url_port(parsed_url: ParseResult) -> int | None:
+    port = parsed_url.port
+    if port is not None:
+        return port
+    scheme = parsed_url.scheme.lower()
+    if scheme == "https":
+        return 443
+    if scheme == "http":
+        return 80
+    return None
+
+
 def _get_jfrog_probe_origin(url: str) -> tuple[str, str, int | None] | None:
     """Return one unambiguous effective origin for a probe URL."""
     try:
@@ -222,8 +234,16 @@ def _get_jfrog_probe_origin(url: str) -> tuple[str, str, int | None] | None:
         if not prepared_url:
             return None
         prepared = urlparse(prepared_url)
-        parsed_origin = (parsed.scheme.lower(), _normalize_hostname(parsed.hostname or ""), parsed.port)
-        prepared_origin = (prepared.scheme.lower(), _normalize_hostname(prepared.hostname or ""), prepared.port)
+        parsed_origin = (
+            parsed.scheme.lower(),
+            _normalize_hostname(parsed.hostname or ""),
+            _normalized_url_port(parsed),
+        )
+        prepared_origin = (
+            prepared.scheme.lower(),
+            _normalize_hostname(prepared.hostname or ""),
+            _normalized_url_port(prepared),
+        )
     except (requests.exceptions.RequestException, ValueError):
         return None
 
@@ -595,40 +615,39 @@ def _read_jfrog_content_prefix(
 
 
 def _detect_jfrog_mxnet_symbol_route(
-    file_url: str,
     prefix: bytes,
     size_hint: int,
-    *,
-    headers: dict[str, str],
-    timeout: int,
 ) -> str | None:
     """Return a bounded MXNet JSON route for a suffix-skipped JFrog artifact."""
-    from modelaudit.utils.file.detection import MXNET_SYMBOL_SIGNATURE_READ_BYTES, _detect_mxnet_symbol_prefix_route
+    from modelaudit.utils.file.detection import _detect_mxnet_symbol_prefix_route
 
     normalized_prefix = prefix[3:] if prefix.startswith(b"\xef\xbb\xbf") else prefix
     if not normalized_prefix.lstrip().startswith(b"{"):
         return None
 
-    max_probe_size = MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1
-    if size_hint > 0:
-        max_probe_size = min(size_hint, max_probe_size)
-    mxnet_probe, _probe_download_url = _read_jfrog_content_prefix(
-        file_url,
-        headers=headers,
-        timeout=timeout,
-        max_bytes=max_probe_size,
-    )
-    mxnet_probe = mxnet_probe[3:] if mxnet_probe.startswith(b"\xef\xbb\xbf") else mxnet_probe
-    if len(mxnet_probe) > MXNET_SYMBOL_SIGNATURE_READ_BYTES:
-        return _detect_mxnet_symbol_prefix_route(
-            mxnet_probe[:MXNET_SYMBOL_SIGNATURE_READ_BYTES],
-            fail_closed_without_hint=True,
-        )
     return _detect_mxnet_symbol_prefix_route(
-        mxnet_probe,
-        sample_is_prefix=(size_hint > len(mxnet_probe)) or (size_hint <= 0 and len(mxnet_probe) >= max_probe_size),
+        normalized_prefix,
+        sample_is_prefix=(size_hint > len(prefix)) or (size_hint <= 0 and len(prefix) >= _JFROG_CONTENT_SNIFF_BYTES),
         fail_closed_without_hint=True,
     )
+
+
+def _detect_jfrog_jax_json_checkpoint_route(prefix: bytes, size_hint: int) -> str | None:
+    from modelaudit.utils.file.detection import has_jax_json_checkpoint_structure
+
+    normalized_prefix = prefix[3:] if prefix.startswith(b"\xef\xbb\xbf") else prefix
+    if not normalized_prefix.lstrip().startswith(b"{"):
+        return None
+
+    sample_is_prefix = (size_hint > len(prefix)) or (size_hint <= 0 and len(prefix) >= _JFROG_CONTENT_SNIFF_BYTES)
+    try:
+        payload = json.loads(prefix.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return "jax_checkpoint" if sample_is_prefix else None
+
+    if has_jax_json_checkpoint_structure(payload):
+        return "jax_checkpoint"
+    return None
 
 
 def _detect_jfrog_tensorflow_protobuf_route(prefix: bytes) -> str | None:
@@ -690,6 +709,7 @@ def _detect_jfrog_content_route_format(
         _looks_like_coreml_model_proto_prefix,
         _looks_like_onnx_model_proto_stream,
         _looks_like_proto0_or_1_pickle,
+        _looks_like_proto_message_prefix,
         _looks_like_uncompressed_tar_header,
         detect_format_from_magic_bytes,
     )
@@ -700,14 +720,14 @@ def _detect_jfrog_content_route_format(
         return "lightgbm", probe_download_url
 
     mxnet_route = _detect_jfrog_mxnet_symbol_route(
-        file_url,
         prefix,
         size_hint,
-        headers=headers,
-        timeout=timeout,
     )
     if mxnet_route is not None:
         return mxnet_route, probe_download_url
+    jax_route = _detect_jfrog_jax_json_checkpoint_route(prefix, size_hint)
+    if jax_route is not None:
+        return jax_route, probe_download_url
     if _is_executorch_binary_signature(prefix):
         return "executorch", probe_download_url
 
@@ -747,7 +767,9 @@ def _detect_jfrog_content_route_format(
         tensorflow_route = _detect_jfrog_tensorflow_protobuf_route(prefix)
         if tensorflow_route is not None:
             return tensorflow_route, probe_download_url
-        if sample_is_prefix and (coreml_status is None or onnx_status is None):
+        if sample_is_prefix and (
+            coreml_status is None or onnx_status is None or _looks_like_proto_message_prefix(prefix)
+        ):
             return PROTOBUF_MODEL_CANDIDATE_FORMAT, probe_download_url
     return (None if detected_format == "unknown" else detected_format), probe_download_url
 
@@ -755,6 +777,7 @@ def _detect_jfrog_content_route_format(
 def _scanner_ids_for_detected_jfrog_format(detected_format: str) -> set[str]:
     from modelaudit.scanner_registry_metadata import get_scanner_registry_metadata
     from modelaudit.utils.file.detection import (
+        MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
         PROTOBUF_MODEL_CANDIDATE_FORMAT,
         TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     )
@@ -769,6 +792,8 @@ def _scanner_ids_for_detected_jfrog_format(detected_format: str) -> set[str]:
         scanner_ids.update({"coreml", "onnx", "tf_metagraph", "tf_savedmodel"})
     if detected_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
         scanner_ids.update({"tf_metagraph", "tf_savedmodel"})
+    if detected_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
+        scanner_ids.add("mxnet")
     return scanner_ids
 
 
