@@ -52,8 +52,9 @@ def _get_model_extensions() -> set[str]:
 def _build_extension_allow_patterns() -> list[str]:
     """Build conservative glob patterns for scannable files."""
     extensions = _get_model_extensions()
-    patterns = {f"*{ext}" for ext in extensions}
-    patterns.update(f"**/*{ext}" for ext in extensions)
+    suffix_globs = {_case_insensitive_suffix_glob(ext) for ext in extensions if ext}
+    patterns = {f"*{suffix}" for suffix in suffix_globs}
+    patterns.update(f"**/*{suffix}" for suffix in suffix_globs)
     return sorted(patterns)
 
 
@@ -80,6 +81,24 @@ def _extract_huggingface_repo_files(repo_info: Any) -> list[str] | None:
     return files
 
 
+def _case_insensitive_suffix_glob(extension: str) -> str:
+    """Build a fnmatch suffix glob that preserves mixed-case remote files."""
+    return "".join(f"[{char.lower()}{char.upper()}]" if char.isalpha() else char for char in extension)
+
+
+def _is_scannable_hf_file(filename: str, extensions: set[str]) -> bool:
+    """Return whether a listed Hugging Face file has a supported suffix."""
+    filename_lower = filename.lower()
+    return any(filename_lower.endswith(ext.lower()) for ext in extensions if ext)
+
+
+def _raise_no_scannable_hf_files(repo_id: str) -> None:
+    raise Exception(
+        f"Refusing to download full snapshot for {repo_id}: "
+        "repository listing contains no recognized ModelAudit-scannable files"
+    )
+
+
 def _get_hf_cache_root() -> Path:
     """Return the HuggingFace hub cache root."""
     try:
@@ -88,6 +107,34 @@ def _get_hf_cache_root() -> Path:
         return Path(HF_HUB_CACHE)
     except Exception:
         return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _format_size(size_bytes: int) -> str:
+    """Format a byte count for user-facing download budget errors."""
+    size = float(size_bytes)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024.0:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} PB"
+
+
+def _normalize_download_size_limit(max_size: int | None) -> int | None:
+    """Normalize ModelAudit's zero-is-unlimited download size semantics."""
+    if max_size is not None and max_size < 0:
+        raise ValueError("Maximum download size must be non-negative")
+    return max_size or None
+
+
+def _is_huggingface_commit_sha(revision: object) -> bool:
+    """Return whether revision is a full immutable Git commit SHA."""
+    if not isinstance(revision, str) or len(revision) not in {40, 64}:
+        return False
+    try:
+        int(revision, 16)
+    except ValueError:
+        return False
+    return True
 
 
 def _is_within_directory(base_dir: Path, target: Path) -> bool:
@@ -138,8 +185,9 @@ def _list_huggingface_repo_files_at_revision(repo_id: str, timeout_seconds: floa
 
     repo_info = HfApi().repo_info(repo_id, timeout=timeout_seconds, files_metadata=False)
     raw_revision = getattr(repo_info, "sha", None)
-    if not isinstance(raw_revision, str) or not raw_revision:
+    if not _is_huggingface_commit_sha(raw_revision):
         raise Exception(f"Cannot enforce max-size for {repo_id}: repository revision unavailable")
+    assert isinstance(raw_revision, str)
 
     files = _extract_huggingface_repo_files(repo_info)
     if files is None:
@@ -167,10 +215,11 @@ def _get_huggingface_path_sizes(
             repo_info_kwargs["revision"] = requested_revision
         repo_info = api.repo_info(repo_id, **repo_info_kwargs)
         raw_revision = getattr(repo_info, "sha", None)
-        if not isinstance(raw_revision, str) or not raw_revision:
+        if not _is_huggingface_commit_sha(raw_revision):
             raise Exception(f"Cannot enforce max-size for {repo_id}: repository revision unavailable")
+        assert isinstance(raw_revision, str)
         resolved_revision = raw_revision
-
+    assert resolved_revision is not None
     path_info = api.get_paths_info(repo_id, filenames, revision=resolved_revision)
     sizes: dict[str, int | None] = {}
     for item in path_info:
@@ -178,7 +227,9 @@ def _get_huggingface_path_sizes(
         if not isinstance(path, str):
             continue
         raw_size = getattr(item, "size", None)
-        sizes[path] = raw_size if isinstance(raw_size, int) and raw_size >= 0 else None
+        sizes[path] = (
+            raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+        )
     return sizes, resolved_revision
 
 
@@ -191,9 +242,11 @@ def _ensure_huggingface_selection_within_max_size(
     resolved_revision: str | None = None,
 ) -> str | None:
     """Fail before transfer when selected Hugging Face files exceed the download budget."""
-    if max_size is None or not filenames:
+    size_limit = _normalize_download_size_limit(max_size)
+    if size_limit is None or not filenames:
         return None
 
+    filenames = list(dict.fromkeys(filenames))
     sizes, revision = _get_huggingface_path_sizes(
         repo_id,
         filenames,
@@ -206,12 +259,45 @@ def _ensure_huggingface_selection_within_max_size(
         if size is None:
             raise Exception(f"Cannot download {repo_id}: unknown size for selected file {filename}")
         total_size += size
-        if total_size > max_size:
+        if total_size > size_limit:
             raise Exception(
                 f"Cannot download {repo_id}: selected Hugging Face files total {total_size} bytes "
-                f"exceeds max size {max_size} bytes"
+                f"exceeds max size {size_limit} bytes"
             )
     return revision
+
+
+def _verify_huggingface_selection_within_max_size(
+    repo_id: str,
+    downloaded_path: Path,
+    filenames: list[str],
+    max_size: int | None,
+    *,
+    initial_size: int = 0,
+) -> int:
+    """Fail closed when downloaded selected files cannot be verified within the cap."""
+    size_limit = _normalize_download_size_limit(max_size)
+    if size_limit is None:
+        return initial_size
+
+    total_size = initial_size
+    for filename in dict.fromkeys(filenames):
+        file_path = downloaded_path / filename
+        if not file_path.is_file():
+            raise ValueError(f"Cannot verify max-size for {repo_id}: downloaded selected file missing: {filename}")
+        try:
+            file_size = file_path.stat().st_size
+        except OSError as exc:
+            raise ValueError(
+                f"Cannot verify max-size for {repo_id}: downloaded selected file unreadable: {filename}"
+            ) from exc
+        total_size += file_size
+        if total_size > size_limit:
+            raise ValueError(
+                f"Cannot download {repo_id}: downloaded selected Hugging Face files total {total_size} bytes "
+                f"exceeds max size {size_limit} bytes"
+            )
+    return total_size
 
 
 def get_model_info(url: str) -> dict:
@@ -363,6 +449,8 @@ def download_model(
 
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 
+        size_limit = _normalize_download_size_limit(max_size)
+
         # Enable/disable progress bars based on parameter
         if not show_progress:
             disable_progress_bars()
@@ -373,7 +461,7 @@ def download_model(
 
         # Resolve capped listings and transfers against one immutable revision.
         budget_revision = None
-        if max_size is not None:
+        if size_limit is not None:
             try:
                 repo_files, budget_revision = _list_huggingface_repo_files_at_revision(repo_id)
             except Exception as exc:
@@ -391,7 +479,7 @@ def download_model(
 
         # Find model files in the repository (using centralized model extensions)
         model_extensions = _get_model_extensions()
-        model_files = [f for f in repo_files if any(f.endswith(ext) for ext in model_extensions)]
+        model_files = [f for f in repo_files if _is_scannable_hf_file(f, model_extensions)]
 
         # Download strategy:
         # - When cache_dir is provided: Use local_dir to place files directly there (safer)
@@ -415,7 +503,7 @@ def download_model(
             revision = _ensure_huggingface_selection_within_max_size(
                 repo_id,
                 model_files,
-                max_size,
+                size_limit,
                 resolved_revision=budget_revision,
             )
             download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
@@ -429,28 +517,17 @@ def download_model(
                 )
             download_kwargs["allow_patterns"] = extension_allow_patterns
         else:
-            if max_size is not None and not repo_files:
-                raise Exception(f"Cannot download {repo_id}: repository contains no files")
-            revision = _ensure_huggingface_selection_within_max_size(
-                repo_id,
-                repo_files,
-                max_size,
-                resolved_revision=budget_revision,
-            )
-            if revision is not None:
-                download_kwargs["revision"] = revision
-                download_kwargs["allow_patterns"] = _build_literal_allow_patterns(repo_files)
+            _raise_no_scannable_hf_files(repo_id)
 
-        if "allow_patterns" in download_kwargs:
-            local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
-        else:
-            # Fallback: download everything if no model files identified
-            local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
+        local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
 
         # Verify we actually got model files
         downloaded_path = Path(local_path)
+        _verify_huggingface_selection_within_max_size(repo_id, downloaded_path, model_files, size_limit)
         model_extensions = _get_model_extensions()
-        found_models = any(downloaded_path.glob(f"*{ext}") for ext in model_extensions)
+        found_models = any(
+            path.is_file() and _is_scannable_hf_file(path.name, model_extensions) for path in downloaded_path.rglob("*")
+        )
 
         if not found_models and not any(downloaded_path.glob("config.json")):
             # If no model files and no config, warn the user
@@ -524,6 +601,8 @@ def download_model_streaming(
 
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 
+        size_limit = _normalize_download_size_limit(max_size)
+
         # Configure progress display
         if not show_progress:
             disable_progress_bars()
@@ -533,7 +612,7 @@ def download_model_streaming(
 
         # Resolve capped listings and transfers against one immutable revision.
         budget_revision = None
-        if max_size is not None:
+        if size_limit is not None:
             try:
                 repo_files, budget_revision = _list_huggingface_repo_files_at_revision(repo_id)
             except Exception as exc:
@@ -548,16 +627,14 @@ def download_model_streaming(
 
         # Filter for model files
         model_extensions = _get_model_extensions()
-        model_files = [f for f in repo_files if any(f.endswith(ext) for ext in model_extensions)]
+        model_files = [f for f in repo_files if _is_scannable_hf_file(f, model_extensions)]
 
         if not model_files:
-            # Fallback: download all files if no recognized extensions found
-            # This maintains parity with download_model() behavior
-            model_files = repo_files
+            _raise_no_scannable_hf_files(repo_id)
         revision = _ensure_huggingface_selection_within_max_size(
             repo_id,
             model_files,
-            max_size,
+            size_limit,
             resolved_revision=budget_revision,
         )
 
@@ -569,6 +646,7 @@ def download_model_streaming(
 
         # Download each file one at a time
         total_files = len(model_files)
+        downloaded_total_size = 0
         for idx, filename in enumerate(model_files):
             is_last = idx == total_files - 1
 
@@ -588,7 +666,15 @@ def download_model_streaming(
                 # Use HF default cache
                 local_path = hf_hub_download(**download_kwargs)
 
-            yield (Path(local_path), is_last)
+            downloaded_file = Path(local_path)
+            downloaded_total_size = _verify_huggingface_selection_within_max_size(
+                repo_id,
+                downloaded_file.parent,
+                [downloaded_file.name],
+                size_limit,
+                initial_size=downloaded_total_size,
+            )
+            yield (downloaded_file, is_last)
 
     except Exception as e:
         raise Exception(
@@ -602,17 +688,18 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
     Args:
         url: Direct HuggingFace file URL (e.g., https://huggingface.co/user/repo/resolve/main/file.bin)
         cache_dir: Optional cache directory for downloads
-        max_size: Optional maximum download size in bytes
+        max_size: Optional maximum file size to download; 0 disables the limit
 
     Returns:
         Path to the downloaded file
 
     Raises:
         ValueError: If URL is invalid
+        ValueError: If max_size is set and file size is unknown or exceeds it
         Exception: If download fails
     """
     try:
-        from huggingface_hub import hf_hub_download
+        from huggingface_hub import HfApi, hf_hub_download
     except ImportError as e:
         raise ImportError(
             "huggingface-hub package is required for HuggingFace URL support. "
@@ -623,19 +710,50 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
     display_url = redact_huggingface_url_for_display(url)
 
     try:
-        resolved_revision = _ensure_huggingface_selection_within_max_size(
-            repo_id,
-            [filename],
-            max_size,
-            requested_revision=branch,
-        )
+        if max_size is not None and max_size < 0:
+            raise ValueError("Maximum file size must be non-negative")
+
+        size_limit = max_size or None
+        download_revision = branch
+        if size_limit is not None:
+            api = HfApi()
+            repo_info = api.repo_info(repo_id, revision=branch)
+            pinned_revision = getattr(repo_info, "sha", None)
+            if not _is_huggingface_commit_sha(pinned_revision):
+                raise ValueError(f"Unable to determine immutable revision for {display_url}; refusing capped download")
+            assert isinstance(pinned_revision, str)
+
+            path_info = api.get_paths_info(repo_id, filename, revision=pinned_revision)
+            file_metadata = path_info[0] if path_info else None
+            file_size = getattr(file_metadata, "size", None)
+            if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
+                raise ValueError(f"Unable to determine file size for {display_url}; refusing capped download")
+            if file_size > size_limit:
+                raise ValueError(
+                    f"File size ({_format_size(file_size)}) exceeds maximum allowed size ({_format_size(size_limit)})"
+                )
+            download_revision = pinned_revision
+
         # Use hf_hub_download for single file downloads
         local_path = hf_hub_download(
             repo_id=repo_id,
             filename=filename,
-            revision=resolved_revision or branch,
+            revision=download_revision,
             cache_dir=str(cache_dir) if cache_dir else None,
         )
-        return Path(local_path)
+        downloaded_path = Path(local_path)
+        if size_limit is not None:
+            try:
+                downloaded_size = downloaded_path.stat().st_size
+            except OSError as exc:
+                raise ValueError(
+                    f"Unable to verify downloaded file size for {display_url}; refusing capped download"
+                ) from exc
+            if downloaded_size > size_limit:
+                raise ValueError(
+                    f"Downloaded file size ({_format_size(downloaded_size)}) "
+                    f"exceeds maximum allowed size ({_format_size(size_limit)})"
+                )
+        return downloaded_path
     except Exception as e:
         raise Exception(f"Failed to download file from {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e

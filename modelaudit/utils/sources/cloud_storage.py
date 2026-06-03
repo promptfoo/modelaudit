@@ -23,6 +23,7 @@ from ..helpers.disk_space import check_disk_space
 
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
+_CLOUD_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
     (
@@ -32,6 +33,8 @@ _SENSITIVE_QUERY_PARAM_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
+_MAX_CLOUD_METADATA_ERROR_SAMPLES = 3
+_MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS = 512
 
 
 def _run_coroutine_sync(coro_factory: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
@@ -85,6 +88,22 @@ def redact_cloud_error_for_display(message: object, source_url: str | None = Non
         redacted = redacted.replace(source_url, redact_url_for_display(source_url))
     redacted = _URL_USERINFO_RE.sub(r"\1<credentials-redacted>@", redacted)
     return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1<redacted>", redacted)
+
+
+def _bound_cloud_metadata_error_display(message: str) -> str:
+    """Limit model-controlled cloud metadata diagnostics retained in memory."""
+    if len(message) <= _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS:
+        return message
+    return f"{message[: _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS - 3]}..."
+
+
+def _cloud_metadata_error_sample(path: object, error: object) -> dict[str, str]:
+    """Return a bounded, credential-safe metadata failure sample."""
+    path_text = str(path)
+    return {
+        "path": _bound_cloud_metadata_error_display(redact_cloud_error_for_display(path_text, path_text)),
+        "error": _bound_cloud_metadata_error_display(redact_cloud_error_for_display(error, path_text)),
+    }
 
 
 def _cloud_error_sanitizer(source_url: str) -> Callable[[Exception], str]:
@@ -335,6 +354,8 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         # It's a directory, list contents
         files = []
         total_size = 0
+        metadata_error_count = 0
+        metadata_errors: list[dict[str, str]] = []
 
         # List all files recursively
         # Ensure URL ends with / for proper globbing
@@ -342,7 +363,10 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         for item in fs.glob(glob_pattern):
             try:
                 item_info = fs.info(item)
-                if item_info.get("type") == "file" or "size" in item_info:
+                item_type = item_info.get("type")
+                if item_type == "directory":
+                    continue
+                if item_type == "file" or "size" in item_info:
                     size = item_info.get("size", 0)
                     file_metadata = {
                         "path": item,
@@ -355,8 +379,28 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
                         file_metadata["etag"] = etag
                     files.append(file_metadata)
                     total_size += size
-            except Exception:
-                continue
+                else:
+                    raise ValueError("cloud provider returned incomplete metadata for listed object")
+            except Exception as exc:
+                metadata_error_count += 1
+                if len(metadata_errors) < _MAX_CLOUD_METADATA_ERROR_SAMPLES:
+                    metadata_errors.append(_cloud_metadata_error_sample(item, exc))
+
+        if metadata_error_count:
+            sample_errors = "; ".join(f"{entry['path']}: {entry['error']}" for entry in metadata_errors)
+            if metadata_error_count > len(metadata_errors):
+                sample_errors = f"{sample_errors}; ..."
+            return {
+                "type": "unknown",
+                "analysis_incomplete": True,
+                "metadata_error_count": metadata_error_count,
+                "metadata_errors": metadata_errors,
+                "error": (
+                    "Cloud directory analysis incomplete: metadata lookup failed for "
+                    f"{metadata_error_count} object(s) under {redact_url_for_display(url)}: "
+                    f"{sample_errors}"
+                ),
+            }
 
         directory_metadata: dict[str, Any] = {
             "type": "directory",
@@ -641,6 +685,78 @@ def _clear_directory_contents(path: Path) -> None:
             child.unlink()
 
 
+def _selected_cloud_download_size(fs: Any, files: list[dict[str, Any]], max_size: int) -> int:
+    """Return the late-bound size of selected objects, failing closed on unknown sizes."""
+    total_size = 0
+    for file_info in files:
+        file_url = str(file_info["path"])
+        try:
+            file_size = get_cloud_object_size(fs, file_url, strict=True)
+        except ValueError as exc:
+            raise ValueError(
+                "Unable to enforce maximum cloud download size for selected object "
+                f"{redact_url_for_display(file_url)} because its size could not be determined"
+            ) from exc
+        if file_size is None:
+            raise ValueError(
+                "Unable to enforce maximum cloud download size for selected object "
+                f"{redact_url_for_display(file_url)} because its size could not be determined"
+            )
+        total_size += file_size
+        if total_size > max_size:
+            raise ValueError(
+                f"File size ({format_size(total_size)}) exceeds maximum allowed size ({format_size(max_size)})"
+            )
+    return total_size
+
+
+class _CloudDownloadBudgetExceeded(ValueError):
+    """Raised when a cloud transfer exceeds its bounded acquisition budget."""
+
+
+class _CloudDownloadBudget:
+    """Track a cloud acquisition budget across objects and retry attempts."""
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self.remaining_bytes = max_bytes
+
+    def read_size(self) -> int:
+        """Return a bounded read size that can detect one byte over budget."""
+        return min(_CLOUD_DOWNLOAD_CHUNK_BYTES, self.remaining_bytes + 1)
+
+    def consume(self, byte_count: int) -> None:
+        """Charge transferred bytes to the shared acquisition budget."""
+        if byte_count > self.remaining_bytes:
+            raise _CloudDownloadBudgetExceeded(
+                f"Cloud download exceeds maximum allowed size ({format_size(self.max_bytes)})"
+            )
+        self.remaining_bytes -= byte_count
+
+
+def _download_cloud_object(fs: Any, file_url: str, local_path: Path, budget: _CloudDownloadBudget | None) -> int:
+    """Download one cloud object while enforcing an optional transfer budget."""
+    if budget is None:
+        fs.get(file_url, str(local_path))
+        return 0
+
+    bytes_written = 0
+    try:
+        with fs.open(file_url, "rb") as remote_file, local_path.open("wb") as local_file:
+            while True:
+                chunk = remote_file.read(budget.read_size())
+                if not chunk:
+                    return bytes_written
+                if not isinstance(chunk, bytes):
+                    raise TypeError("cloud filesystem returned non-bytes content")
+                budget.consume(len(chunk))
+                bytes_written += len(chunk)
+                local_file.write(chunk)
+    except Exception:
+        local_path.unlink(missing_ok=True)
+        raise
+
+
 def download_from_cloud(
     url: str,
     cache_dir: Path | None = None,
@@ -700,8 +816,16 @@ def download_from_cloud(
         return f"stream://{url}"
 
     # Check size limits
-    size = metadata.get("total_size", metadata.get("size", 0))
-    if max_size and size > max_size:
+    try:
+        size = _parse_size_value(metadata.get("total_size", metadata.get("size", 0)))
+    except (TypeError, ValueError) as exc:
+        if max_size and not (metadata["type"] == "directory" and selective):
+            raise ValueError(
+                "Unable to enforce maximum cloud download size for "
+                f"{redact_url_for_display(url)}: invalid size metadata"
+            ) from exc
+        size = 0
+    if max_size and size > max_size and not (metadata["type"] == "directory" and selective):
         raise ValueError(f"File size ({format_size(size)}) exceeds maximum allowed size ({format_size(max_size)})")
 
     # Show warning for large files
@@ -730,36 +854,8 @@ def download_from_cloud(
         # fsspec filesystems don't need explicit cleanup - use directly without 'with' statement
         fs = fsspec.filesystem(fs_protocol, **fs_args)
 
-        # Check available disk space before downloading
-        object_size: int | None
-        try:
-            object_size = get_cloud_object_size(fs, url, strict=True)
-        except ValueError as exc:
-            # Fall back to metadata-derived size when available. If no reliable size is
-            # available, continue without a pre-download disk check (legacy behavior).
-            if size > 0:
-                object_size = int(size)
-                if show_progress:
-                    click.echo(f"⚠️  Falling back to metadata size estimate for disk check: {exc}")
-            else:
-                object_size = None
-                if show_progress:
-                    click.echo(
-                        "⚠️  Unable to determine download size for "
-                        f"{redact_url_for_display(url)}; continuing without disk check: {exc}"
-                    )
-
-        if object_size is not None:
-            has_space, message = check_disk_space(download_path, object_size)
-            if not has_space:
-                raise Exception(f"Cannot download from {redact_url_for_display(url)}: {message}")
-
-        # Download based on type
+        files: list[dict[str, Any]] | None = None
         if metadata["type"] == "directory":
-            if cache:
-                _clear_directory_contents(download_path)
-
-            # Handle directory download
             raw_files = metadata.get("files")
             if raw_files is None:
                 files = []
@@ -769,7 +865,7 @@ def download_from_cloud(
                 raise ValueError(f"Invalid metadata for 'files': expected list, got {type(raw_files).__name__}")
 
             if selective:
-                # Filter to only scannable files
+                # Filter to only scannable files before enforcing acquisition budgets.
                 files = filter_scannable_files(files, scannable_extensions=scannable_extensions)
                 if show_progress:
                     total = metadata.get("file_count", 0)
@@ -781,7 +877,56 @@ def download_from_cloud(
             if not files:
                 raise ValueError("No scannable model files found in directory")
 
+        # Check available disk space before downloading
+        object_size: int | None
+        if max_size and files is not None:
+            object_size = _selected_cloud_download_size(fs, files, max_size)
+        else:
+            try:
+                object_size = get_cloud_object_size(fs, url, strict=True)
+            except ValueError as exc:
+                if max_size:
+                    raise ValueError(
+                        "Unable to enforce maximum cloud download size for "
+                        f"{redact_url_for_display(url)} because the object size could not be determined"
+                    ) from exc
+                # Fall back to metadata-derived size when available. If no reliable size is
+                # available, continue without a pre-download disk check (legacy behavior).
+                if size > 0:
+                    object_size = int(size)
+                    if show_progress:
+                        click.echo(f"⚠️  Falling back to metadata size estimate for disk check: {exc}")
+                else:
+                    object_size = None
+                    if show_progress:
+                        click.echo(
+                            "⚠️  Unable to determine download size for "
+                            f"{redact_url_for_display(url)}; continuing without disk check: {exc}"
+                        )
+
+        if object_size is not None:
+            if max_size and object_size > max_size:
+                raise ValueError(
+                    f"File size ({format_size(object_size)}) exceeds maximum allowed size ({format_size(max_size)})"
+                )
+            has_space, message = check_disk_space(download_path, object_size)
+            if not has_space:
+                raise Exception(f"Cannot download from {redact_url_for_display(url)}: {message}")
+        elif max_size:
+            raise ValueError(
+                "Unable to enforce maximum cloud download size for "
+                f"{redact_url_for_display(url)} because the object size could not be determined"
+            )
+
+        # Download based on type
+        if metadata["type"] == "directory":
+            if cache:
+                _clear_directory_contents(download_path)
+
+            assert files is not None
+
             # Download files
+            download_budget = _CloudDownloadBudget(max_size) if max_size else None
             for file_info in files:
                 file_url = file_info["path"]
                 local_path = _build_safe_local_path(url, file_url, download_path)
@@ -792,25 +937,28 @@ def download_from_cloud(
 
                 @retry_with_backoff(
                     max_retries=3,
+                    do_not_retry_on=(_CloudDownloadBudgetExceeded,),
                     verbose=show_progress,
                     sanitize_error=_cloud_error_sanitizer(file_url),
                 )
-                def download_file(url=file_url, path=local_path):
-                    fs.get(url, str(path))
+                def download_file(url=file_url, path=local_path, budget=download_budget):
+                    return _download_cloud_object(fs, url, path, budget)
 
                 download_file()
         else:
             # Single file download
             file_name = _cloud_url_basename(url)
             local_file = download_path / file_name
+            download_budget = _CloudDownloadBudget(max_size) if max_size else None
 
             @retry_with_backoff(
                 max_retries=3,
+                do_not_retry_on=(_CloudDownloadBudgetExceeded,),
                 verbose=show_progress,
                 sanitize_error=_cloud_error_sanitizer(url),
             )
             def download_single_file():
-                fs.get(url, str(local_file))
+                return _download_cloud_object(fs, url, local_file, download_budget)
 
             if show_progress and size > 100 * 1024 * 1024 * 1024:  # Show progress for files > 100GB
                 with yaspin(text=f"Downloading {file_name}") as spinner:
@@ -874,9 +1022,18 @@ def download_from_cloud_streaming(
         error_msg = metadata.get("error", "Unknown cloud target type")
         raise ValueError(f"Failed to analyze cloud target {redact_url_for_display(url)}: {error_msg}")
 
-    # Check size limits
-    size = metadata.get("total_size", metadata.get("size", 0))
-    if max_size and size > max_size:
+    # Check size limits. Selective directory downloads are capped after filtering
+    # so unrelated prefix contents do not reject a bounded acquisition.
+    try:
+        size = _parse_size_value(metadata.get("total_size", metadata.get("size", 0)))
+    except (TypeError, ValueError) as exc:
+        if max_size and not (metadata["type"] == "directory" and selective):
+            raise ValueError(
+                "Unable to enforce maximum cloud download size for "
+                f"{redact_url_for_display(url)}: invalid size metadata"
+            ) from exc
+        size = 0
+    if max_size and size > max_size and not (metadata["type"] == "directory" and selective):
         raise ValueError(f"Total size ({format_size(size)}) exceeds maximum allowed size ({format_size(max_size)})")
 
     # Get filesystem
@@ -905,12 +1062,16 @@ def download_from_cloud_streaming(
         # Single file
         files = [{"path": url, "name": _cloud_url_basename(url), "size": metadata.get("size", 0)}]
 
+    if max_size:
+        _selected_cloud_download_size(fs, files, max_size)
+
     # Create temp directory for downloads
     temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_stream_"))
 
     try:
         # Download files one at a time
         total_files = len(files)
+        download_budget = _CloudDownloadBudget(max_size) if max_size else None
         for i, file_info in enumerate(files):
             file_url = file_info["path"]
             file_name = file_info.get("name") or _cloud_url_basename(file_url)
@@ -925,11 +1086,12 @@ def download_from_cloud_streaming(
 
             @retry_with_backoff(
                 max_retries=3,
+                do_not_retry_on=(_CloudDownloadBudgetExceeded,),
                 verbose=show_progress,
                 sanitize_error=_cloud_error_sanitizer(file_url),
             )
-            def download_file(url=file_url, path=local_path):
-                fs.get(url, str(path))
+            def download_file(url=file_url, path=local_path, budget=download_budget):
+                return _download_cloud_object(fs, url, path, budget)
 
             download_file()
 
