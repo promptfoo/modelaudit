@@ -530,6 +530,10 @@ def _resolve_scan_runtime_config(
     if max_size is not None:
         with contextlib.suppress(ValueError):
             max_download_bytes = parse_size_string(max_size)
+    else:
+        configured_max_file_size = config_values.get("max_file_size", 0)
+        if isinstance(configured_max_file_size, int) and configured_max_file_size > 0:
+            max_download_bytes = configured_max_file_size
 
     scanner_selection = config_values.get(SCANNER_SELECTION_CONFIG_KEY)
     scanner_policy = policy_from_config(config_values)
