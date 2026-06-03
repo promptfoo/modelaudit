@@ -243,6 +243,40 @@ print(json.dumps({
         assert tensorflow_file.is_relative_to(project_root / "modelaudit" / "protos")
 
 
+@pytest.mark.parametrize(
+    ("enable_user_site", "expected_trusted"),
+    [
+        pytest.param(False, False, id="disabled"),
+        pytest.param(None, False, id="security-disabled"),
+        pytest.param(True, True, id="enabled"),
+    ],
+)
+def test_tensorflow_trusted_root_honors_user_site_enablement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    enable_user_site: bool | None,
+    expected_trusted: bool,
+) -> None:
+    import modelaudit.protos
+
+    user_site = tmp_path / "user-site"
+    shadow_tensorflow = user_site / "tensorflow"
+    shadow_tensorflow.mkdir(parents=True)
+    (shadow_tensorflow / "__init__.py").write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(modelaudit.protos.sysconfig, "get_paths", lambda: {})
+    monkeypatch.setattr(modelaudit.protos.site, "getsitepackages", lambda: [])
+    monkeypatch.setattr(modelaudit.protos.site, "getusersitepackages", lambda: str(user_site))
+    monkeypatch.setattr(modelaudit.protos.site, "ENABLE_USER_SITE", enable_user_site)
+
+    trusted_root = modelaudit.protos._trusted_tensorflow_root()
+
+    if expected_trusted:
+        assert trusted_root == user_site.resolve()
+    else:
+        assert trusted_root is None
+
+
 def _build_malicious_tf_metagraph() -> bytes:
     _require_tf_protos()
     import modelaudit.protos  # noqa: F401

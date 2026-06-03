@@ -57,12 +57,13 @@ def _trusted_tensorflow_roots() -> list[Path]:
             if root not in seen:
                 roots.append(root)
                 seen.add(root)
-    with suppress(Exception):
-        user_site = site.getusersitepackages()
-        root = Path(user_site).resolve()
-        if root not in seen:
-            roots.append(root)
-            seen.add(root)
+    if site.ENABLE_USER_SITE is True:
+        with suppress(Exception):
+            user_site = site.getusersitepackages()
+            root = Path(user_site).resolve()
+            if root not in seen:
+                roots.append(root)
+                seen.add(root)
 
     return roots
 
