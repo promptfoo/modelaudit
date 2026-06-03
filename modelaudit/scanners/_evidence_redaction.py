@@ -276,7 +276,7 @@ def _redact_structured_evidence(text: str, max_chars: int) -> str | None:
         try:
             parsed = ast.literal_eval(stripped)
         except (MemoryError, RecursionError, SyntaxError, ValueError):
-            parsed = None
+            return _truncate(REDACTED_EVIDENCE_VALUE, max_chars)
 
     if isinstance(parsed, (dict, list, tuple, set)):
         try:
