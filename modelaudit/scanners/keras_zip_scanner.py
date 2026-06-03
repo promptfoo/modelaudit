@@ -591,10 +591,10 @@ class KerasZipScanner(BaseScanner):
         if not isinstance(metadata, dict):
             return
 
-        result.metadata["keras_metadata"] = metadata
+        result.metadata["keras_metadata"] = redact_evidence_value(metadata)
         keras_version = metadata.get("keras_version")
         if isinstance(keras_version, str) and keras_version.strip():
-            result.metadata["keras_version"] = keras_version.strip()
+            result.metadata["keras_version"] = redact_evidence_string(keras_version.strip())
 
     def _check_archive_security_members(
         self,
@@ -871,6 +871,20 @@ class KerasZipScanner(BaseScanner):
                         "layer_class": layer_class,
                         "layer_name": redacted_layer_name,
                         "description": self.suspicious_layer_types[layer_class],
+                    },
+                )
+            elif "class_name" in layer and not isinstance(layer_class, str):
+                result.add_check(
+                    name="Layer Class Type Validation",
+                    passed=False,
+                    message=f"Invalid layer class type: expected str, got {type(layer_class).__name__}",
+                    rule_code="S902",
+                    severity=IssueSeverity.INFO,
+                    location=f"{self.current_file_path} (layer: {redacted_layer_name})",
+                    details={
+                        "layer_name": redacted_layer_name,
+                        "actual_type": type(layer_class).__name__,
+                        "expected_type": "str",
                     },
                 )
             elif isinstance(layer_class, str) and layer_class and not self._is_known_safe_serialized_layer(layer):
@@ -1431,13 +1445,16 @@ class KerasZipScanner(BaseScanner):
         vocabulary = layer_config.get("vocabulary")
         if not self._is_external_stringlookup_vocabulary(vocabulary):
             return
+        if not isinstance(vocabulary, str):
+            return
 
         keras_version = result.metadata.get("keras_version")
+        redacted_vocabulary = redact_evidence_string(vocabulary)
         location = f"{self.current_file_path} (layer: {layer_name})"
         details = {
             "layer_name": layer_name,
             "layer_class": "StringLookup",
-            "vocabulary": vocabulary,
+            "vocabulary": redacted_vocabulary,
             "cve_id": "CVE-2025-12058",
             "cvss": 5.9,
             "cwe": "CWE-502, CWE-918",
@@ -1455,7 +1472,7 @@ class KerasZipScanner(BaseScanner):
                 passed=False,
                 message=(
                     f"CVE-2025-12058: StringLookup layer '{layer_name}' in Keras {keras_version} references "
-                    f"external vocabulary path '{vocabulary}', which can expose local files or trigger SSRF "
+                    f"external vocabulary path '{redacted_vocabulary}', which can expose local files or trigger SSRF "
                     "during model loading"
                 ),
                 severity=IssueSeverity.WARNING,
@@ -1471,7 +1488,7 @@ class KerasZipScanner(BaseScanner):
                 name="StringLookup External Vocabulary Metadata Check",
                 passed=False,
                 message=(
-                    f"StringLookup layer '{layer_name}' references external vocabulary path '{vocabulary}', "
+                    f"StringLookup layer '{layer_name}' references external vocabulary path '{redacted_vocabulary}', "
                     f"and archive metadata reports Keras {keras_version} outside the known CVE-2025-12058 "
                     "vulnerable range (<3.12.0), but metadata-only assessment is inconclusive without runtime "
                     "verification"
@@ -1486,7 +1503,7 @@ class KerasZipScanner(BaseScanner):
             name="StringLookup External Vocabulary Risk (Version Unknown)",
             passed=False,
             message=(
-                f"StringLookup layer '{layer_name}' references external vocabulary path '{vocabulary}', but "
+                f"StringLookup layer '{layer_name}' references external vocabulary path '{redacted_vocabulary}', but "
                 "keras_version is unavailable; cannot confidently attribute CVE-2025-12058 without version context"
             ),
             severity=IssueSeverity.WARNING,

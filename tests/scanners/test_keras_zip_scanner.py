@@ -1895,6 +1895,8 @@ __import__('pickle').loads(data)
         custom_layer_name_secret = "ZIP_CUSTOM_LAYER_NAME_SECRET"
         json_string_secret = "ZIP_JSON_STRING_SECRET"
         lambda_function_name_secret = "ZIP_LAMBDA_FUNCTION_NAME_SECRET"
+        stringlookup_vocabulary_secret = "ZIP_STRINGLOOKUP_VOCABULARY_SECRET"
+        keras_version_secret = "ZIP_KERAS_VERSION_SECRET"
 
         def direct_lambda_code(x: Any) -> Any:
             token = "ZIP_DIRECT_SECRET"
@@ -1954,6 +1956,17 @@ __import__('pickle').loads(data)
                             "function_name": {"token": lambda_function_name_secret},
                         },
                     },
+                    {
+                        "class_name": "StringLookup",
+                        "name": "lookup",
+                        "config": {
+                            "vocabulary": (
+                                "https://user:"
+                                f"{stringlookup_vocabulary_secret}@example.test/vocab.txt?token="
+                                f"{stringlookup_vocabulary_secret}"
+                            ),
+                        },
+                    },
                 ]
             },
             "compile_config": {
@@ -1964,7 +1977,6 @@ __import__('pickle').loads(data)
                 "loss": {"class_name": "MaliciousLoss", "config": {"token": loss_secret}},
             },
         }
-        model_path = create_configured_keras_zip(tmp_path, config, file_name="redacted_details.keras")
         raw_secrets = [
             direct_secret,
             dict_secret,
@@ -1984,8 +1996,16 @@ __import__('pickle').loads(data)
             custom_layer_name_secret,
             json_string_secret,
             lambda_function_name_secret,
+            stringlookup_vocabulary_secret,
+            keras_version_secret,
         ]
 
+        model_path = create_configured_keras_zip(
+            tmp_path,
+            config,
+            file_name="redacted_details.keras",
+            keras_version=f"token={keras_version_secret}",
+        )
         scanner_result = KerasZipScanner().scan(str(model_path))
         details_json = json.dumps([check.details for check in scanner_result.checks], default=str)
         assert all(secret not in details_json for secret in raw_secrets)
@@ -2002,8 +2022,8 @@ __import__('pickle').loads(data)
         assert "<redacted>" in json_output
         assert "<redacted>" in sarif_output
 
-    def test_non_string_layer_class_does_not_abort_scan(self, tmp_path: Path) -> None:
-        """Malformed non-string class names should not crash redaction or scanning."""
+    def test_non_string_layer_class_reports_invalid_type_without_abort(self, tmp_path: Path) -> None:
+        """Malformed non-string class names should fail closed without crashing redaction."""
         config = {
             "class_name": "Sequential",
             "config": {
@@ -2020,6 +2040,7 @@ __import__('pickle').loads(data)
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config, file_name="numeric.keras")))
 
         assert not any(check.name == "Keras ZIP File Scan" for check in result.checks)
+        assert any(check.name == "Layer Class Type Validation" for check in result.checks)
 
     def test_malformed_layer_identifiers_do_not_abort_redaction(self, tmp_path: Path) -> None:
         """Malformed names and Lambda module metadata should not crash evidence redaction."""

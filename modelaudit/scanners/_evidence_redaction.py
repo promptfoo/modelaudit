@@ -71,7 +71,7 @@ QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
 )
 QUOTED_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?P<key_quote>[\"'])(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P=key_quote)"
-    r"(?P<separator>\s*:\s*)(?P<value_quote>[\"']).*?(?P=value_quote)"
+    r"(?P<separator>\s*:\s*)(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
 )
 GENERIC_QUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)(?P<quote>[\"']).*?(?P=quote)"
@@ -153,8 +153,8 @@ def _redact_quoted_key_value(match: re.Match[str]) -> str:
         return match.group(0)
     return (
         f"{match.group('key_quote')}{match.group('key')}{match.group('key_quote')}"
-        f"{match.group('separator')}{match.group('value_quote')}"
-        f"{REDACTED_EVIDENCE_VALUE}{match.group('value_quote')}"
+        f"{match.group('separator')}{match.group('value')[0]}"
+        f"{REDACTED_EVIDENCE_VALUE}{match.group('value')[0]}"
     )
 
 

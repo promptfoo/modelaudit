@@ -184,14 +184,20 @@ def test_redacts_quoted_json_style_credential_strings() -> None:
     """Serialized JSON/dict strings should redact quoted credential key values."""
     json_secret = "JSON_STYLE_SECRET"
     camel_json_secret = "JSON_STYLE_CAMEL_SECRET"
+    escaped_json_secret = "JSON_STYLE_ESCAPED_SECRET"
 
     redacted_text = redact_evidence_string(
-        f'{{"api_key":"{json_secret}","clientSecret":"{camel_json_secret}","safe":"ok"}}',
+        (
+            f'{{"api_key":"{json_secret}","clientSecret":"{camel_json_secret}",'
+            f'"secret":"abc\\"{escaped_json_secret}","safe":"ok"}}'
+        ),
         max_chars=500,
     )
 
     assert json_secret not in redacted_text
     assert camel_json_secret not in redacted_text
+    assert escaped_json_secret not in redacted_text
     assert f'"api_key":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert f'"clientSecret":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
+    assert f'"secret":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert '"safe":"ok"' in redacted_text
