@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- strip JFrog credentials from untrusted redirect hops during artifact and Storage API requests
 - enforce direct Hugging Face file `--max-size` budgets before downloading
 - scan duplicate and case-varied ExecuTorch pickle ZIP members without shadowable-name or metadata-routing bypasses
 - refresh cloud cache entries that cannot be proven within the configured download size limit
