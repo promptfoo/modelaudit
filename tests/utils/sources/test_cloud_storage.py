@@ -168,6 +168,35 @@ def test_analyze_cloud_target_directory_success(mock_fs: MagicMock) -> None:
 
 
 @patch("fsspec.filesystem")
+def test_analyze_cloud_target_directory_ignores_explicit_directory_metadata(
+    mock_fs: MagicMock,
+) -> None:
+    url = "s3://bucket/path/"
+    directory_url = "s3://bucket/path/nested/"
+    model_url = "s3://bucket/path/nested/model.bin"
+    fs = make_fs_mock()
+
+    def info_side_effect(path: str) -> dict[str, object]:
+        if path == url:
+            return {"type": "directory", "name": "bucket/path/"}
+        if path == directory_url:
+            return {"type": "directory", "size": 0}
+        if path == model_url:
+            return {"type": "file", "size": 2048}
+        raise FileNotFoundError(path)
+
+    fs.info.side_effect = info_side_effect
+    fs.glob.return_value = [directory_url, model_url]
+    mock_fs.return_value = fs
+
+    result = asyncio.run(analyze_cloud_target(url))
+
+    assert result["type"] == "directory"
+    assert result["file_count"] == 1
+    assert result["files"][0]["path"] == model_url
+
+
+@patch("fsspec.filesystem")
 def test_analyze_cloud_target_directory_fails_on_partial_metadata_error(
     mock_fs: MagicMock,
 ) -> None:
@@ -187,6 +216,52 @@ def test_analyze_cloud_target_directory_fails_on_partial_metadata_error(
     assert "X-Amz-Signature" not in serialized
     assert "secret" not in serialized
     assert hidden_url not in serialized
+
+
+@patch("fsspec.filesystem")
+def test_analyze_cloud_target_directory_fails_on_incomplete_listed_object_metadata(
+    mock_fs: MagicMock,
+) -> None:
+    url = "s3://bucket/path/"
+    hidden_path = "bucket/path/hidden.pkl"
+    fs = make_fs_mock()
+    fs.info.side_effect = lambda path: {"type": "directory"} if path == url else {}
+    fs.glob.return_value = [hidden_path]
+    mock_fs.return_value = fs
+
+    result = asyncio.run(analyze_cloud_target(url))
+
+    assert result["type"] == "unknown"
+    assert result["analysis_incomplete"] is True
+    assert result["metadata_error_count"] == 1
+    assert result["metadata_errors"][0]["path"] == hidden_path
+    assert "incomplete metadata" in result["metadata_errors"][0]["error"]
+
+
+@patch("fsspec.filesystem")
+def test_analyze_cloud_target_redacts_protocol_stripped_metadata_error_path(
+    mock_fs: MagicMock,
+) -> None:
+    url = "s3://bucket/path/"
+    hidden_path = "bucket/path/hidden.pkl?X-Amz-Signature=secret"
+    fs = make_fs_mock()
+
+    def info_side_effect(path: str) -> dict[str, object]:
+        if path == url:
+            return {"type": "directory"}
+        raise PermissionError(f"metadata denied for {path}")
+
+    fs.info.side_effect = info_side_effect
+    fs.glob.return_value = [hidden_path]
+    mock_fs.return_value = fs
+
+    result = asyncio.run(analyze_cloud_target(url))
+    serialized = json.dumps(result)
+
+    assert result["type"] == "unknown"
+    assert result["analysis_incomplete"] is True
+    assert result["metadata_errors"][0]["path"].endswith("X-Amz-Signature=<redacted>")
+    assert "secret" not in serialized
 
 
 @patch("fsspec.filesystem")

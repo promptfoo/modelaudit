@@ -96,6 +96,15 @@ def _bound_cloud_metadata_error_display(message: str) -> str:
     return f"{message[: _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS - 3]}..."
 
 
+def _cloud_metadata_error_sample(path: object, error: object) -> dict[str, str]:
+    """Return a bounded, credential-safe metadata failure sample."""
+    path_text = str(path)
+    return {
+        "path": _bound_cloud_metadata_error_display(redact_cloud_error_for_display(path_text, path_text)),
+        "error": _bound_cloud_metadata_error_display(redact_cloud_error_for_display(error, path_text)),
+    }
+
+
 def _cloud_error_sanitizer(source_url: str) -> Callable[[Exception], str]:
     def sanitize(exc: Exception) -> str:
         return redact_cloud_error_for_display(exc, source_url)
@@ -353,7 +362,10 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         for item in fs.glob(glob_pattern):
             try:
                 item_info = fs.info(item)
-                if item_info.get("type") == "file" or "size" in item_info:
+                item_type = item_info.get("type")
+                if item_type == "directory":
+                    continue
+                if item_type == "file" or "size" in item_info:
                     size = item_info.get("size", 0)
                     file_metadata = {
                         "path": item,
@@ -366,15 +378,12 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
                         file_metadata["etag"] = etag
                     files.append(file_metadata)
                     total_size += size
+                else:
+                    raise ValueError("cloud provider returned incomplete metadata for listed object")
             except Exception as exc:
                 metadata_error_count += 1
                 if len(metadata_errors) < _MAX_CLOUD_METADATA_ERROR_SAMPLES:
-                    metadata_errors.append(
-                        {
-                            "path": _bound_cloud_metadata_error_display(redact_url_for_display(item)),
-                            "error": _bound_cloud_metadata_error_display(redact_cloud_error_for_display(exc, item)),
-                        }
-                    )
+                    metadata_errors.append(_cloud_metadata_error_sample(item, exc))
 
         if metadata_error_count:
             sample_errors = "; ".join(f"{entry['path']}: {entry['error']}" for entry in metadata_errors)
