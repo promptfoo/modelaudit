@@ -13,7 +13,7 @@ from click.testing import CliRunner
 
 from modelaudit import __version__
 from modelaudit.cache.trusted_config_store import TrustedConfigStore
-from modelaudit.cli import _summarize_progress_tree, cli, expand_paths, format_text_output
+from modelaudit.cli import _resolve_scan_runtime_config, _summarize_progress_tree, cli, expand_paths, format_text_output
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
@@ -776,6 +776,43 @@ def test_scan_max_file_size(tmp_path):
     assert result.output  # Should have some output
     # Note: JSON output format doesn't include file paths
     assert "500" in result.output or "File too large" in result.output  # Should mention the max file size or error
+
+
+@pytest.mark.parametrize(
+    "cloud_url",
+    [
+        "s3://bucket/model.bin",
+        "r2://bucket/model.bin",
+        "gcs://bucket/model.bin",
+        "https://bucket.s3.amazonaws.com/model.bin",
+        "https://storage.googleapis.com/bucket/model.bin",
+        "https://account.r2.cloudflarestorage.com/bucket/model.bin",
+    ],
+)
+def test_cloud_auto_size_limit_applies_to_download_budget(tmp_path: Path, cloud_url: str) -> None:
+    runtime = _resolve_scan_runtime_config(
+        [cloud_url],
+        format="json",
+        output=None,
+        timeout=None,
+        max_size=None,
+        cache_dir=str(tmp_path / "cache"),
+        progress=False,
+        no_cache=False,
+        no_whitelist=False,
+        stream=False,
+        strict=False,
+        verbose=False,
+        quiet=True,
+        scanners=(),
+        exclude_scanners=(),
+        suppress=(),
+        severity=(),
+        scan_start_time=0.0,
+    )
+
+    assert runtime.max_file_size == 50 * 1024 * 1024 * 1024
+    assert runtime.max_download_bytes == runtime.max_file_size
 
 
 def test_format_text_output():
