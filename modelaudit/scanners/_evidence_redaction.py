@@ -80,8 +80,9 @@ QUOTED_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\3)[\s\S])*\3"
 )
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(\b(?:proxy[-_]?authorization|authorization)\s*[:=]\s*)(?:(?:bearer|basic)\s+)?"
-    r"[^\s\"';&|]+"
+    r"(?i)(\b(?:proxy[-_]?authorization|authorization)\s*[:=]\s*)(?!\s*[rubf]*[\"'])"
+    r"(?:(?:bearer|basic)\s+)?"
+    r"[^;&|\r\n]+"
 )
 BEARER_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(

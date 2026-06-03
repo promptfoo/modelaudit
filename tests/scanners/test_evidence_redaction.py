@@ -75,7 +75,7 @@ def test_redacts_bare_quoted_authorization_values() -> None:
     text = (
         'Authorization: "Bearer AUTHSECRET123" '
         'proxy_authorization="Basic PROXYAUTHSECRET123" '
-        "proxy_authorization=Basic PROXYBARESECRET123 "
+        "proxy_authorization=Basic PROXYBARESECRET123; "
         'safe="value"'
     )
 
@@ -87,6 +87,27 @@ def test_redacts_bare_quoted_authorization_values() -> None:
     assert f'Authorization: "{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert f'proxy_authorization="{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert f"proxy_authorization={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert 'safe="value"' in redacted
+
+
+def test_redacts_full_proxy_authorization_schemes() -> None:
+    """Proxy authorization schemes should consume the full header value."""
+    digest_secret = "PROXYDIGESTSECRET123"
+    ntlm_secret = "PROXYNTLMSECRET123"
+
+    redacted = redact_evidence_string(
+        (
+            f'proxy_authorization=Digest username="u", response="{digest_secret}"; '
+            f"Proxy-Authorization: NTLM {ntlm_secret}; "
+            'safe="value"'
+        ),
+        max_chars=500,
+    )
+
+    assert digest_secret not in redacted
+    assert ntlm_secret not in redacted
+    assert f"proxy_authorization={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f"Proxy-Authorization: {REDACTED_EVIDENCE_VALUE}" in redacted
     assert 'safe="value"' in redacted
 
 
