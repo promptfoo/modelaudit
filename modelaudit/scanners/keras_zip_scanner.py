@@ -1761,6 +1761,12 @@ class KerasZipScanner(BaseScanner):
         return []
 
     @staticmethod
+    def _references_dangerous_module_literal(module_literal: str, dangerous_modules: set[str]) -> bool:
+        """Match dangerous module names as exact module/path segments."""
+        module_segments = [segment for segment in re.split(r"[^A-Za-z0-9_]+", module_literal.strip()) if segment]
+        return any(segment in dangerous_modules for segment in module_segments)
+
+    @staticmethod
     def _is_primarily_documentation(context: str, node: dict[str, Any]) -> bool:
         """Heuristically detect documentation-only nodes to reduce false positives."""
         context_lower = context.lower()
@@ -2016,7 +2022,7 @@ class KerasZipScanner(BaseScanner):
 
             if module_name or function_name:
                 # Module/function reference - check for dangerous imports
-                dangerous_modules = ["os", "sys", "subprocess", "eval", "exec", "__builtins__"]
+                dangerous_modules = {"os", "sys", "subprocess", "eval", "exec", "__builtins__"}
                 module_literals = (
                     [module_name]
                     if isinstance(module_name, str)
@@ -2030,7 +2036,7 @@ class KerasZipScanner(BaseScanner):
                     (
                         module_literal
                         for module_literal in module_literals
-                        if any(dangerous in module_literal for dangerous in dangerous_modules)
+                        if self._references_dangerous_module_literal(module_literal, dangerous_modules)
                     ),
                     None,
                 )

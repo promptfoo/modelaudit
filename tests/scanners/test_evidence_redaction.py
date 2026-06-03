@@ -34,9 +34,11 @@ def test_redacts_compound_credential_assignments() -> None:
 def test_redacts_compound_sensitive_query_parameters() -> None:
     """Compound query credential keys should be redacted in URL evidence."""
     semicolon_secret = "SEMICOLON_QUERY_SECRET"
+    redirect_secret = "REDIRECT_QUERY_SECRET"
     text = (
         "url=https://example.com/callback?client_secret=CLIENTSECRET123&refresh_token=REFRESHTOKEN456"
         f"&aws_access_key_id=AWSACCESSKEY789&ok=1;token={semicolon_secret}"
+        f"&redirect=https://user:{redirect_secret}@evil.test/model"
     )
 
     redacted = redact_evidence_string(text, max_chars=500)
@@ -45,10 +47,12 @@ def test_redacts_compound_sensitive_query_parameters() -> None:
     assert "REFRESHTOKEN456" not in redacted
     assert "AWSACCESSKEY789" not in redacted
     assert semicolon_secret not in redacted
+    assert redirect_secret not in redacted
     assert "client_secret=<redacted>" in redacted
     assert "refresh_token=<redacted>" in redacted
     assert "aws_access_key_id=<redacted>" in redacted
     assert "token=<redacted>" in redacted
+    assert REDACTED_URL_CREDENTIALS in redacted
     assert "ok=1" in redacted
 
 
@@ -254,6 +258,22 @@ def test_redacts_sensitive_container_assignments() -> None:
     assert f"api_key={REDACTED_EVIDENCE_VALUE}" in redacted_text
     assert f'"api_key":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert 'safe=["visible"]' in redacted_text
+
+
+def test_redacts_embedded_structured_credential_literals() -> None:
+    """Structured credential containers should redact even when embedded in prose."""
+    json_secret = "EMBEDDED_JSON_SECRET"
+    repr_secret = "EMBEDDED_REPR_SECRET"
+
+    redacted_text = redact_evidence_string(
+        f"note {{\"api_key\":[\"{json_secret}\"]}} and repr {{'token':['{repr_secret}']}}",
+        max_chars=500,
+    )
+
+    assert json_secret not in redacted_text
+    assert repr_secret not in redacted_text
+    assert f'"api_key":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
+    assert f'"token":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
 
 
 def test_redacts_repr_style_container_credential_values() -> None:

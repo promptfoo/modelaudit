@@ -138,7 +138,9 @@ def _redact_url(match: re.Match[str]) -> str:
         if _is_sensitive_detail_key(key):
             query_items.append((key, REDACTED_EVIDENCE_VALUE))
         else:
-            query_items.append((key, value))
+            query_items.append(
+                (key, redact_evidence_string(value, max_chars=max(len(value), len(REDACTED_EVIDENCE_VALUE))))
+            )
 
     return urlunsplit(
         (
@@ -246,6 +248,44 @@ def _redact_container_assignments(text: str) -> str:
     return "".join(redacted_chunks)
 
 
+def _redact_embedded_structured_containers(text: str) -> str:
+    redacted_chunks: list[str] = []
+    last_index = 0
+    search_index = 0
+
+    while search_index < len(text):
+        container_starts = [
+            index for index in (text.find("{", search_index), text.find("[", search_index)) if index != -1
+        ]
+        if not container_starts:
+            break
+
+        container_start = min(container_starts)
+        container_end = _find_balanced_container_end(text, container_start)
+        if container_end is None:
+            search_index = container_start + 1
+            continue
+
+        container_text = text[container_start:container_end]
+        redacted_container = _redact_structured_evidence(
+            container_text,
+            max_chars=len(container_text),
+            fail_closed=False,
+        )
+        if redacted_container is not None and redacted_container != container_text:
+            redacted_chunks.append(text[last_index:container_start])
+            redacted_chunks.append(redacted_container)
+            last_index = container_end
+
+        search_index = container_end
+
+    if not redacted_chunks:
+        return text
+
+    redacted_chunks.append(text[last_index:])
+    return "".join(redacted_chunks)
+
+
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
@@ -263,7 +303,7 @@ def _serialize_redacted_structured_value(value: Any, max_chars: int) -> str:
     return _truncate(serialized_value, max_chars)
 
 
-def _redact_structured_evidence(text: str, max_chars: int) -> str | None:
+def _redact_structured_evidence(text: str, max_chars: int, *, fail_closed: bool = True) -> str | None:
     stripped = text.strip()
     if not stripped.startswith(("{", "[")):
         return None
@@ -276,7 +316,7 @@ def _redact_structured_evidence(text: str, max_chars: int) -> str | None:
         try:
             parsed = ast.literal_eval(stripped)
         except (MemoryError, RecursionError, SyntaxError, ValueError):
-            return _truncate(REDACTED_EVIDENCE_VALUE, max_chars)
+            return _truncate(REDACTED_EVIDENCE_VALUE, max_chars) if fail_closed else None
 
     if isinstance(parsed, (dict, list, tuple, set)):
         try:
@@ -297,6 +337,7 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = _redact_container_assignments(redacted)
+    redacted = _redact_embedded_structured_containers(redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = QUOTED_KEY_VALUE_RE.sub(_redact_quoted_key_value, redacted)
     redacted = GENERIC_QUOTED_ASSIGNMENT_RE.sub(_redact_generic_quoted_assignment, redacted)

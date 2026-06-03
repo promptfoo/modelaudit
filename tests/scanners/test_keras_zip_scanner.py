@@ -2085,6 +2085,11 @@ __import__('pickle').loads(data)
                         "name": "malformed_dict_module",
                         "config": {"module": {"os": True}, "function_name": "system"},
                     },
+                    {
+                        "class_name": "Lambda",
+                        "name": "benign_cosine_module",
+                        "config": {"module": ["cosine"], "function_name": "call"},
+                    },
                 ]
             },
         }
@@ -2096,6 +2101,7 @@ __import__('pickle').loads(data)
         assert not any(check.name == "Keras ZIP File Scan" for check in result.checks)
         lambda_module_checks = [check for check in result.checks if check.name == "Lambda Layer Module Reference Check"]
         assert len(lambda_module_checks) >= 2
+        assert not any(check.details.get("layer_name") == "benign_cosine_module" for check in lambda_module_checks)
 
     def test_compile_config_detects_nested_metric_and_loss_mappings(self, tmp_path: Path) -> None:
         """Nested compile_config structures should not bypass custom-object detection."""
