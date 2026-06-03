@@ -9,6 +9,7 @@ import shutil
 import struct
 import tempfile
 from collections.abc import Collection, Mapping
+from http.cookiejar import CookieJar
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TypedDict
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 MAX_RECURSION_DEPTH = 64  # Prevent runaway recursion in folder traversal
 _MAX_JFROG_PROBE_REDIRECTS = 5
 _MAX_JFROG_CONTENT_PROBES = 256
+_MAX_JFROG_REDIRECTS = 5
 _JFROG_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
     r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|secret|api-key|api_key|apikey|sig)[^=\s&]*=)[^\s&#]+",
@@ -148,6 +150,8 @@ def is_jfrog_url(url: str) -> bool:
     """Check if a URL points to a JFrog Artifactory file or folder."""
     parsed = urlparse(url)
     hostname = _normalize_hostname(parsed.hostname or "")
+    if not hostname or hostname != _get_requests_prepared_hostname(url):
+        return False
     if parsed.scheme != "https" and not (parsed.scheme == "http" and _is_local_jfrog_host(hostname)):
         return False
     if "/artifactory/" not in parsed.path:
@@ -257,7 +261,8 @@ def _is_trusted_jfrog_auth_target(url: str) -> bool:
         return False
 
     hostname = _normalize_hostname(parsed.hostname or "")
-    return bool(hostname and hostname in _get_trusted_jfrog_hosts())
+    prepared_hostname = _get_requests_prepared_hostname(url)
+    return bool(hostname and hostname == prepared_hostname and hostname in _get_trusted_jfrog_hosts())
 
 
 def _is_trusted_jfrog_probe_auth_target(url: str) -> bool:
@@ -301,6 +306,51 @@ def _build_jfrog_auth_headers(
         return {"Authorization": f"Bearer {env_access_token}"}
 
     return {}
+
+
+def _get_with_jfrog_redirect_policy(
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout: int,
+    stream: bool = False,
+) -> requests.Response:
+    """GET a JFrog URL while isolating credentials from untrusted redirects."""
+    current_url = url
+    current_headers = headers
+    current_is_trusted = _is_trusted_jfrog_auth_target(url)
+    trusted_redirect_cookies = requests.cookies.RequestsCookieJar()
+    untrusted_redirect_cookies = requests.cookies.RequestsCookieJar()
+    for _redirect_count in range(_MAX_JFROG_REDIRECTS + 1):
+        current_cookies = trusted_redirect_cookies if current_is_trusted else untrusted_redirect_cookies
+        response = requests.get(
+            current_url,
+            headers=current_headers,
+            cookies=current_cookies,
+            timeout=timeout,
+            stream=stream,
+            allow_redirects=False,
+        )
+        if response.status_code not in _JFROG_REDIRECT_STATUS_CODES:
+            return response
+
+        location = response.headers.get("Location")
+        response_cookies = getattr(response, "cookies", None)
+        if isinstance(response_cookies, CookieJar):
+            requests.cookies.merge_cookies(current_cookies, response_cookies)
+        response.close()
+        if not location:
+            raise requests.exceptions.RequestException(
+                f"JFrog redirect response missing Location header for {redact_jfrog_url_for_display(current_url)}"
+            )
+
+        current_url = urljoin(current_url, location)
+        current_is_trusted = _is_trusted_jfrog_auth_target(current_url)
+        current_headers = headers if current_is_trusted else {}
+
+    raise requests.exceptions.TooManyRedirects(
+        f"Exceeded {_MAX_JFROG_REDIRECTS} redirects for JFrog URL {redact_jfrog_url_for_display(url)}"
+    )
 
 
 def download_artifact(
@@ -363,10 +413,12 @@ def download_artifact(
 
     response: requests.Response | None = None
     try:
-        response, _download_url = _get_jfrog_response_with_redirect_policy(
+        # Use requests for proper authentication and error handling
+        response = _get_with_jfrog_redirect_policy(
             url,
             headers=headers,
             timeout=timeout,
+            stream=True,
         )
 
         # Raise an exception for HTTP error responses
@@ -511,10 +563,12 @@ def _get_jfrog_response_with_redirect_policy(
             f"Refusing parser-confused JFrog URL {redact_jfrog_url_for_display(url)}"
         )
 
+    redirect_cookies = requests.cookies.RequestsCookieJar()
     for _redirect_count in range(_MAX_JFROG_PROBE_REDIRECTS + 1):
         response = requests.get(
             current_url,
             headers=headers,
+            cookies=redirect_cookies,
             stream=True,
             timeout=timeout,
             allow_redirects=False,
@@ -523,6 +577,9 @@ def _get_jfrog_response_with_redirect_policy(
             return response, current_url
 
         location = response.headers.get("Location")
+        response_cookies = getattr(response, "cookies", None)
+        if isinstance(response_cookies, CookieJar):
+            requests.cookies.merge_cookies(redirect_cookies, response_cookies)
         if not location:
             response.close()
             raise requests.exceptions.TooManyRedirects(
@@ -671,6 +728,43 @@ def _detect_jfrog_tensorflow_protobuf_route(prefix: bytes) -> str | None:
     return None
 
 
+def _detect_jfrog_xml_model_route(prefix: bytes, size_hint: int) -> str | None:
+    """Classify bounded XML model evidence using the local root-tag parser."""
+    from modelaudit.utils.file.detection import _could_be_xml_prefix, _detect_xml_model_format
+
+    if not _could_be_xml_prefix(prefix):
+        return None
+
+    route = _detect_xml_model_format(
+        prefix,
+        sample_is_prefix=size_hint <= 0 or size_hint > len(prefix) or len(prefix) >= _JFROG_CONTENT_SNIFF_BYTES,
+    )
+    return None if route == "unknown" else route
+
+
+def _detect_jfrog_flax_msgpack_route(prefix: bytes, size_hint: int) -> str | None:
+    """Recognize Flax MessagePack roots using the bounded local structure probe."""
+    from modelaudit.utils.file.detection import _probe_flax_msgpack_checkpoint_stream
+
+    sample_is_prefix = size_hint <= 0 or size_hint > len(prefix) or len(prefix) >= _JFROG_CONTENT_SNIFF_BYTES
+    declared_size = max(size_hint, len(prefix) + (1 if sample_is_prefix else 0))
+    route_state = _probe_flax_msgpack_checkpoint_stream(
+        BytesIO(prefix),
+        declared_size,
+        sample_is_prefix=sample_is_prefix,
+    )
+    return "flax_msgpack" if route_state is True else None
+
+
+def _detect_jfrog_llamafile_route(prefix: bytes) -> str | None:
+    """Recognize llamafile executable evidence within the bounded remote prefix."""
+    from modelaudit.utils.file.detection import LLAMAFILE_MARKER, _is_supported_llamafile_executable_header
+
+    if _is_supported_llamafile_executable_header(prefix[:4]) and LLAMAFILE_MARKER in prefix.lower():
+        return "llamafile"
+    return None
+
+
 def _detect_jfrog_content_route_format(
     file_info: dict[str, Any],
     *,
@@ -728,6 +822,9 @@ def _detect_jfrog_content_route_format(
     jax_route = _detect_jfrog_jax_json_checkpoint_route(prefix, size_hint)
     if jax_route is not None:
         return jax_route, probe_download_url
+    llamafile_route = _detect_jfrog_llamafile_route(prefix)
+    if llamafile_route is not None:
+        return llamafile_route, probe_download_url
     if _is_executorch_binary_signature(prefix):
         return "executorch", probe_download_url
 
@@ -757,6 +854,9 @@ def _detect_jfrog_content_route_format(
     if detected_format == "unknown" and _is_torch7_signature(prefix):
         return "torch7", probe_download_url
     if detected_format == "unknown":
+        xml_route = _detect_jfrog_xml_model_route(prefix, size_hint)
+        if xml_route is not None:
+            return xml_route, probe_download_url
         sample_is_prefix = size_hint <= 0 or size_hint > len(prefix) or len(prefix) >= _JFROG_CONTENT_SNIFF_BYTES
         coreml_status = _looks_like_coreml_model_proto_prefix(prefix, sample_is_prefix=sample_is_prefix)
         if coreml_status is True:
@@ -767,6 +867,9 @@ def _detect_jfrog_content_route_format(
         tensorflow_route = _detect_jfrog_tensorflow_protobuf_route(prefix)
         if tensorflow_route is not None:
             return tensorflow_route, probe_download_url
+        flax_route = _detect_jfrog_flax_msgpack_route(prefix, size_hint)
+        if flax_route is not None:
+            return flax_route, probe_download_url
         if sample_is_prefix and (
             coreml_status is None or onnx_status is None or _looks_like_proto_message_prefix(prefix)
         ):
@@ -780,6 +883,7 @@ def _scanner_ids_for_detected_jfrog_format(detected_format: str) -> set[str]:
         MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
         PROTOBUF_MODEL_CANDIDATE_FORMAT,
         TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+        XML_MODEL_INCONCLUSIVE_FORMAT,
     )
 
     scanner_ids: set[str] = set()
@@ -788,12 +892,16 @@ def _scanner_ids_for_detected_jfrog_format(detected_format: str) -> set[str]:
             scanner_ids.add(scanner_id)
     if detected_format == "zip":
         scanner_ids.update(_JFROG_ZIP_STRUCTURE_ROUTED_SCANNER_IDS)
+    if detected_format in {"tar", "gzip", "bzip2", "xz"}:
+        scanner_ids.add("nemo")
     if detected_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
         scanner_ids.update({"coreml", "onnx", "tf_metagraph", "tf_savedmodel"})
     if detected_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
         scanner_ids.update({"tf_metagraph", "tf_savedmodel"})
     if detected_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
         scanner_ids.add("mxnet")
+    if detected_format == XML_MODEL_INCONCLUSIVE_FORMAT:
+        scanner_ids.update({"openvino", "pmml"})
     return scanner_ids
 
 
@@ -884,7 +992,7 @@ def detect_jfrog_target_type(
     headers = _build_jfrog_auth_headers(storage_api_url, api_token=api_token, access_token=access_token)
 
     try:
-        response = requests.get(storage_api_url, headers=headers, timeout=timeout)
+        response = _get_with_jfrog_redirect_policy(storage_api_url, headers=headers, timeout=timeout)
         response.raise_for_status()
 
         data = response.json()
