@@ -1712,20 +1712,47 @@ class KerasZipScanner(BaseScanner):
         return findings
 
     @staticmethod
-    def _extract_string_literals(value: Any, *, include_dict_values: bool = False) -> list[str]:
+    def _extract_string_literals(
+        value: Any,
+        *,
+        include_dict_values: bool = False,
+        include_dict_keys: bool = False,
+    ) -> list[str]:
         """Extract string literals from simple container values."""
         if isinstance(value, str):
             return [value]
         if isinstance(value, (list, tuple, set)):
             values: list[str] = []
             for item in value:
-                values.extend(KerasZipScanner._extract_string_literals(item, include_dict_values=include_dict_values))
+                values.extend(
+                    KerasZipScanner._extract_string_literals(
+                        item,
+                        include_dict_values=include_dict_values,
+                        include_dict_keys=include_dict_keys,
+                    )
+                )
             return values
-        if include_dict_values and isinstance(value, dict):
-            dict_values: list[str] = []
-            for item in value.values():
-                dict_values.extend(KerasZipScanner._extract_string_literals(item, include_dict_values=True))
-            return dict_values
+        if isinstance(value, dict):
+            literals: list[str] = []
+            if include_dict_keys:
+                for key in value:
+                    literals.extend(
+                        KerasZipScanner._extract_string_literals(
+                            key,
+                            include_dict_values=include_dict_values,
+                            include_dict_keys=True,
+                        )
+                    )
+            if include_dict_values:
+                for item in value.values():
+                    literals.extend(
+                        KerasZipScanner._extract_string_literals(
+                            item,
+                            include_dict_values=True,
+                            include_dict_keys=include_dict_keys,
+                        )
+                    )
+            return literals
         return []
 
     @staticmethod
@@ -1986,7 +2013,13 @@ class KerasZipScanner(BaseScanner):
                 # Module/function reference - check for dangerous imports
                 dangerous_modules = ["os", "sys", "subprocess", "eval", "exec", "__builtins__"]
                 module_literals = (
-                    [module_name] if isinstance(module_name, str) else self._extract_string_literals(module_name)
+                    [module_name]
+                    if isinstance(module_name, str)
+                    else self._extract_string_literals(
+                        module_name,
+                        include_dict_values=True,
+                        include_dict_keys=True,
+                    )
                 )
                 dangerous_module = next(
                     (

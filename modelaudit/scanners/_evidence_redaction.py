@@ -78,6 +78,10 @@ GENERIC_QUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)"
     r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
 )
+GENERIC_CONTAINER_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)"
+    r"(?P<value>\[(?:\\.|[^\]\\])*\]|\{(?:\\.|[^}\\])*\})"
+)
 GENERIC_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)[^\s\"';&|]+"
 )
@@ -167,6 +171,12 @@ def _redact_generic_quoted_assignment(match: re.Match[str]) -> str:
     return f"{match.group('key')}{match.group('separator')}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
+def _redact_generic_container_assignment(match: re.Match[str]) -> str:
+    if not _is_sensitive_detail_key(match.group("key")):
+        return match.group(0)
+    return f"{match.group('key')}{match.group('separator')}{REDACTED_EVIDENCE_VALUE}"
+
+
 def _redact_generic_assignment(match: re.Match[str]) -> str:
     if not _is_sensitive_detail_key(match.group("key")):
         return match.group(0)
@@ -197,6 +207,7 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+    redacted = GENERIC_CONTAINER_ASSIGNMENT_RE.sub(_redact_generic_container_assignment, redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = QUOTED_KEY_VALUE_RE.sub(_redact_quoted_key_value, redacted)
     redacted = GENERIC_QUOTED_ASSIGNMENT_RE.sub(_redact_generic_quoted_assignment, redacted)

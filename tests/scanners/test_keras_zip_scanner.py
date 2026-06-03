@@ -1899,6 +1899,7 @@ __import__('pickle').loads(data)
         keras_version_secret = "ZIP_KERAS_VERSION_SECRET"
         escaped_assignment_secret = "ZIP_ESCAPED_ASSIGNMENT_SECRET"
         json_container_secret = "ZIP_JSON_CONTAINER_SECRET"
+        container_assignment_secret = "ZIP_CONTAINER_ASSIGNMENT_SECRET"
 
         def direct_lambda_code(x: Any) -> Any:
             token = "ZIP_DIRECT_SECRET"
@@ -1943,6 +1944,7 @@ __import__('pickle').loads(data)
                             "metadata": f'{{"api_key":"{json_string_secret}","safe":"ok"}}',
                             "metadata_container": f'{{"api_key":["{json_container_secret}"],"safe":["ok"]}}',
                             "escaped_assignment": f"awsSecretAccessKey='abc\\'{escaped_assignment_secret}'",
+                            "container_assignment": f'awsSecretAccessKey=["{container_assignment_secret}"]',
                             f"token={config_key_secret}": "secret key should be redacted",
                             "units": 4,
                         },
@@ -2004,6 +2006,7 @@ __import__('pickle').loads(data)
             keras_version_secret,
             escaped_assignment_secret,
             json_container_secret,
+            container_assignment_secret,
         ]
 
         model_path = create_configured_keras_zip(
@@ -2065,6 +2068,11 @@ __import__('pickle').loads(data)
                         "name": "malformed_module",
                         "config": {"module": ["os"], "function_name": "system"},
                     },
+                    {
+                        "class_name": "Lambda",
+                        "name": "malformed_dict_module",
+                        "config": {"module": {"os": True}, "function_name": "system"},
+                    },
                 ]
             },
         }
@@ -2074,7 +2082,8 @@ __import__('pickle').loads(data)
         )
 
         assert not any(check.name == "Keras ZIP File Scan" for check in result.checks)
-        assert any(check.name == "Lambda Layer Module Reference Check" for check in result.checks)
+        lambda_module_checks = [check for check in result.checks if check.name == "Lambda Layer Module Reference Check"]
+        assert len(lambda_module_checks) >= 2
 
     def test_compile_config_detects_nested_metric_and_loss_mappings(self, tmp_path: Path) -> None:
         """Nested compile_config structures should not bypass custom-object detection."""

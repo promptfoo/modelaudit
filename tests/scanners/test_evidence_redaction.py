@@ -222,3 +222,20 @@ def test_redacts_json_string_container_credential_values() -> None:
     assert f'"api_key":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert f'"token":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert '"safe":["ok"]' in redacted_text
+
+
+def test_redacts_sensitive_container_assignments() -> None:
+    """Credential assignments should consume array and object values before redaction."""
+    array_secret = "CONTAINER_ASSIGNMENT_ARRAY_SECRET"
+    object_secret = "CONTAINER_ASSIGNMENT_OBJECT_SECRET"
+
+    redacted_text = redact_evidence_string(
+        (f'awsSecretAccessKey=["{array_secret}"] token={{"nested":"{object_secret}"}} safe=["visible"]'),
+        max_chars=500,
+    )
+
+    assert array_secret not in redacted_text
+    assert object_secret not in redacted_text
+    assert f"awsSecretAccessKey={REDACTED_EVIDENCE_VALUE}" in redacted_text
+    assert f"token={REDACTED_EVIDENCE_VALUE}" in redacted_text
+    assert 'safe=["visible"]' in redacted_text
