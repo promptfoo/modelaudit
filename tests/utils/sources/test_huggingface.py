@@ -659,7 +659,7 @@ class TestModelDownload:
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_at_revision",
-        return_value=(["model?.bin"], "abc123"),
+        return_value=(["model[latest].bin"], "abc123"),
     )
     @patch("huggingface_hub.HfApi.get_paths_info")
     @patch("huggingface_hub.snapshot_download")
@@ -674,13 +674,13 @@ class TestModelDownload:
         """Budgeted literal filenames must not widen into Hub glob matches."""
         download_path = tmp_path / "download"
         download_path.mkdir()
-        (download_path / "model?.bin").write_bytes(b"weights")
+        (download_path / "model[latest].bin").write_bytes(b"weights")
         mock_snapshot_download.return_value = str(download_path)
-        mock_get_paths_info.return_value = [SimpleNamespace(path="model?.bin", size=700)]
+        mock_get_paths_info.return_value = [SimpleNamespace(path="model[latest].bin", size=700)]
 
         download_model("https://huggingface.co/test/model", max_size=1000)
 
-        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["model[?].bin"]
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["model[[]latest].bin"]
         assert mock_snapshot_download.call_args.kwargs["revision"] == "abc123"
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
