@@ -262,20 +262,24 @@ def check_lambda_dict_function(
     if class_name != "__lambda__":
         return False
 
+    redacted_layer_name = redact_evidence_string(str(layer_name))
     config = function_dict.get("config")
     if not isinstance(config, dict):
         result.add_check(
             name="Lambda Layer Detection",
             passed=False,
-            message=f"Lambda layer '{layer_name}' uses malformed dict-format function metadata (config is not a dict)",
+            message=(
+                f"Lambda layer '{redacted_layer_name}' uses malformed dict-format function metadata "
+                "(config is not a dict)"
+            ),
             severity=IssueSeverity.WARNING,
             location=location,
             details={
-                "layer_name": layer_name,
+                "layer_name": redacted_layer_name,
                 "layer_class": "Lambda",
                 "function_format": "dict",
                 "parse_status": "invalid_config",
-                "function_dict": function_dict,
+                "function_dict": redact_evidence_value(function_dict),
             },
             why="Malformed dict-format Lambda metadata is suspicious and prevents bytecode inspection.",
         )
@@ -287,11 +291,11 @@ def check_lambda_dict_function(
         result.add_check(
             name="Lambda Layer Detection",
             passed=False,
-            message=f"Lambda layer '{layer_name}' uses dict-format function with no code field",
+            message=f"Lambda layer '{redacted_layer_name}' uses dict-format function with no code field",
             severity=IssueSeverity.WARNING,
             location=location,
             details={
-                "layer_name": layer_name,
+                "layer_name": redacted_layer_name,
                 "layer_class": "Lambda",
                 "function_format": "dict",
             },
@@ -306,11 +310,11 @@ def check_lambda_dict_function(
         result.add_check(
             name="Lambda Layer Detection",
             passed=False,
-            message=f"Lambda layer '{layer_name}' contains non-decodable dict-format code",
+            message=f"Lambda layer '{redacted_layer_name}' contains non-decodable dict-format code",
             severity=IssueSeverity.WARNING,
             location=location,
             details={
-                "layer_name": layer_name,
+                "layer_name": redacted_layer_name,
                 "layer_class": "Lambda",
                 "function_format": "dict",
             },
@@ -325,12 +329,13 @@ def check_lambda_dict_function(
             name="Lambda Layer Code Analysis",
             passed=False,
             message=(
-                f"Lambda layer '{layer_name}' contains dangerous patterns in bytecode: {', '.join(found_patterns)}"
+                f"Lambda layer '{redacted_layer_name}' contains dangerous patterns in bytecode: "
+                f"{', '.join(found_patterns)}"
             ),
             severity=IssueSeverity.CRITICAL,
             location=location,
             details={
-                "layer_name": layer_name,
+                "layer_name": redacted_layer_name,
                 "layer_class": "Lambda",
                 "dangerous_patterns": found_patterns,
                 "function_format": "dict_bytecode",
@@ -346,13 +351,13 @@ def check_lambda_dict_function(
             name="Lambda Layer Code Analysis",
             passed=False,
             message=(
-                f"Lambda layer '{layer_name}' contains embedded bytecode (dict-format) with no dangerous "
+                f"Lambda layer '{redacted_layer_name}' contains embedded bytecode (dict-format) with no dangerous "
                 "text patterns detected"
             ),
             severity=IssueSeverity.WARNING,
             location=location,
             details={
-                "layer_name": layer_name,
+                "layer_name": redacted_layer_name,
                 "layer_class": "Lambda",
                 "function_format": "dict_bytecode",
                 "analysis_status": "opaque_bytecode",

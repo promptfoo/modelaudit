@@ -767,6 +767,7 @@ class KerasZipScanner(BaseScanner):
 
             layer_class = layer.get("class_name", "")
             layer_name = layer.get("name", f"layer_{i}")
+            redacted_layer_name = redact_evidence_string(str(layer_name))
 
             layer_config = layer.get("config")
             if "config" in layer and not isinstance(layer_config, dict):
@@ -777,26 +778,26 @@ class KerasZipScanner(BaseScanner):
                     message=f"Invalid layer config type: expected dict, got {type(layer_config).__name__}",
                     rule_code="S902",
                     severity=IssueSeverity.INFO,
-                    location=f"{self.current_file_path} (layer: {layer_name})",
+                    location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                     details={
-                        "layer_name": layer_name,
+                        "layer_name": redacted_layer_name,
                         "actual_type": type(layer_config).__name__,
                         "expected_type": "dict",
                     },
                 )
 
             # Update layer count
-            layer_count_key = redact_evidence_string(layer_class)
+            layer_count_key = redact_evidence_string(str(layer_class))
             layer_counts[layer_count_key] = layer_counts.get(layer_count_key, 0) + 1
 
             # CVE-2025-49655: TorchModuleWrapper uses torch.load(weights_only=False)
             if layer_class == "TorchModuleWrapper":
-                self._check_torch_module_wrapper(result, layer_name)
+                self._check_torch_module_wrapper(result, redacted_layer_name)
             # CVE-2025-1550: Check ALL layers for dangerous module references
-            self._check_layer_module_references(layer, result, layer_name)
+            self._check_layer_module_references(layer, result, redacted_layer_name)
             # CVE-2025-12058: StringLookup can load external vocabulary paths even with safe_mode=True
             if layer_class == "StringLookup":
-                self._check_stringlookup_vocabulary_path(layer, result, layer_name)
+                self._check_stringlookup_vocabulary_path(layer, result, redacted_layer_name)
 
             is_lambda_layer = self._is_lambda_layer_class(layer_class)
 
@@ -810,13 +811,13 @@ class KerasZipScanner(BaseScanner):
                         name="CVE-2024-3660: Lambda Layer Code Injection",
                         passed=False,
                         message=(
-                            f"CVE-2024-3660: Lambda layer '{layer_name}' in Keras {keras_version} enables "
+                            f"CVE-2024-3660: Lambda layer '{redacted_layer_name}' in Keras {keras_version} enables "
                             "arbitrary code injection during model loading"
                         ),
                         severity=IssueSeverity.CRITICAL,
-                        location=f"{self.current_file_path} (layer: {layer_name})",
+                        location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                         details={
-                            "layer_name": layer_name,
+                            "layer_name": redacted_layer_name,
                             "layer_class": "Lambda",
                             "keras_version": keras_version,
                             "cve_id": "CVE-2024-3660",
@@ -832,24 +833,28 @@ class KerasZipScanner(BaseScanner):
                         name="Lambda Version Risk Check",
                         passed=True,
                         message=(
-                            f"Lambda layer '{layer_name}' detected with Keras {keras_version}; "
+                            f"Lambda layer '{redacted_layer_name}' detected with Keras {keras_version}; "
                             "outside known CVE-2024-3660 vulnerable range (<2.13.0)"
                         ),
-                        location=f"{self.current_file_path} (layer: {layer_name})",
-                        details={"layer_name": layer_name, "layer_class": "Lambda", "keras_version": keras_version},
+                        location=f"{self.current_file_path} (layer: {redacted_layer_name})",
+                        details={
+                            "layer_name": redacted_layer_name,
+                            "layer_class": "Lambda",
+                            "keras_version": keras_version,
+                        },
                     )
                 else:
                     result.add_check(
                         name="Lambda Risk (Version Unknown)",
                         passed=False,
                         message=(
-                            f"Lambda layer '{layer_name}' detected but keras_version is unavailable; "
+                            f"Lambda layer '{redacted_layer_name}' detected but keras_version is unavailable; "
                             "cannot confidently attribute CVE-2024-3660 without version context"
                         ),
                         severity=IssueSeverity.WARNING,
-                        location=f"{self.current_file_path} (layer: {layer_name})",
+                        location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                         details={
-                            "layer_name": layer_name,
+                            "layer_name": redacted_layer_name,
                             "layer_class": "Lambda",
                             "cve_id": "CVE-2024-3660",
                             "affected_versions": "Keras < 2.13.0",
@@ -861,16 +866,15 @@ class KerasZipScanner(BaseScanner):
                     passed=False,
                     message=f"Suspicious layer type found: {layer_class}",
                     severity=IssueSeverity.WARNING,
-                    location=f"{self.current_file_path} (layer: {layer_name})",
+                    location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                     details={
                         "layer_class": layer_class,
-                        "layer_name": layer_name,
+                        "layer_name": redacted_layer_name,
                         "description": self.suspicious_layer_types[layer_class],
                     },
                 )
-            elif layer_class and not self._is_known_safe_serialized_layer(layer):
+            elif isinstance(layer_class, str) and layer_class and not self._is_known_safe_serialized_layer(layer):
                 redacted_layer_class = redact_evidence_string(layer_class)
-                redacted_layer_name = redact_evidence_string(layer_name)
                 result.add_check(
                     name="Custom Layer Class Detection",
                     passed=False,
@@ -915,7 +919,7 @@ class KerasZipScanner(BaseScanner):
                         message=f"Invalid nested model config type: expected dict, got {type(nested_config).__name__}",
                         rule_code="S902",
                         severity=IssueSeverity.INFO,
-                        location=f"{self.current_file_path} (layer: {layer_name})",
+                        location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                         details={"actual_type": type(nested_config).__name__, "expected_type": "dict"},
                     )
 
@@ -1092,7 +1096,9 @@ class KerasZipScanner(BaseScanner):
                 module_keys_to_check.append((key, config_value.strip()))
 
         layer_class = str(layer.get("class_name", ""))
+        redacted_layer_class = redact_evidence_string(layer_class)
         for key, module_value in module_keys_to_check:
+            redacted_module_value = redact_evidence_string(module_value)
             # Extract the top-level module name (e.g., "os" from "os.path")
             top_module = module_value.split(".")[0]
 
@@ -1108,15 +1114,15 @@ class KerasZipScanner(BaseScanner):
                     passed=False,
                     message=(
                         f"CVE-2025-1550: Layer '{layer_name}' references dangerous module "
-                        f"'{module_value}' in {key} field — arbitrary code execution via safe_mode bypass"
+                        f"'{redacted_module_value}' in {key} field — arbitrary code execution via safe_mode bypass"
                     ),
                     severity=IssueSeverity.CRITICAL,
                     location=f"{self.current_file_path} (layer: {layer_name})",
                     details={
                         "layer_name": layer_name,
-                        "layer_class": layer.get("class_name", ""),
+                        "layer_class": redacted_layer_class,
                         "key": key,
-                        "module": module_value,
+                        "module": redacted_module_value,
                         "cve_id": "CVE-2025-1550",
                         "cvss": 9.8,
                         "cwe": "CWE-502",
@@ -1134,15 +1140,15 @@ class KerasZipScanner(BaseScanner):
                     passed=False,
                     message=(
                         f"CVE-2025-1550: Layer '{layer_name}' references non-allowlisted module "
-                        f"'{module_value}' in {key} field — potential safe_mode bypass"
+                        f"'{redacted_module_value}' in {key} field — potential safe_mode bypass"
                     ),
                     severity=IssueSeverity.WARNING,
                     location=f"{self.current_file_path} (layer: {layer_name})",
                     details={
                         "layer_name": layer_name,
-                        "layer_class": layer.get("class_name", ""),
+                        "layer_class": redacted_layer_class,
                         "key": key,
-                        "module": module_value,
+                        "module": redacted_module_value,
                         "cve_id": "CVE-2025-1550",
                         "cvss": 9.8,
                         "cwe": "CWE-502",
@@ -1819,6 +1825,7 @@ class KerasZipScanner(BaseScanner):
 
     def _check_lambda_layer(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check Lambda layer for executable Python code"""
+        redacted_layer_name = redact_evidence_string(str(layer_name))
         layer_config = layer.get("config", {})
         if not isinstance(layer_config, dict):
             return
@@ -1861,11 +1868,14 @@ class KerasZipScanner(BaseScanner):
                         result.add_check(
                             name="Dangerous Lambda Layer",
                             passed=False,
-                            message=f"Lambda layer '{layer_name}' contains dangerous code: {', '.join(found_patterns)}",
+                            message=(
+                                f"Lambda layer '{redacted_layer_name}' contains dangerous code: "
+                                f"{', '.join(found_patterns)}"
+                            ),
                             severity=IssueSeverity.CRITICAL,
-                            location=f"{self.current_file_path} (layer: {layer_name})",
+                            location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                             details={
-                                "layer_name": layer_name,
+                                "layer_name": redacted_layer_name,
                                 "layer_class": "Lambda",
                                 "dangerous_patterns": found_patterns,
                                 "code_preview_omitted": "encoded_lambda_may_contain_sensitive_constants",
@@ -1886,11 +1896,11 @@ class KerasZipScanner(BaseScanner):
                                 result.add_check(
                                     name="Lambda Layer Code Analysis",
                                     passed=False,
-                                    message=f"Lambda layer '{layer_name}' contains potentially dangerous code",
+                                    message=f"Lambda layer '{redacted_layer_name}' contains potentially dangerous code",
                                     severity=IssueSeverity.WARNING,
-                                    location=f"{self.current_file_path} (layer: {layer_name})",
+                                    location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                                     details={
-                                        "layer_name": layer_name,
+                                        "layer_name": redacted_layer_name,
                                         "layer_class": "Lambda",
                                         "code_analysis": risk_desc,
                                         "code_preview_omitted": "encoded_lambda_may_contain_sensitive_constants",
@@ -1901,10 +1911,10 @@ class KerasZipScanner(BaseScanner):
                                 result.add_check(
                                     name="Lambda Layer Code Analysis",
                                     passed=True,
-                                    message=f"Lambda layer '{layer_name}' contains safe Python code",
-                                    location=f"{self.current_file_path} (layer: {layer_name})",
+                                    message=f"Lambda layer '{redacted_layer_name}' contains safe Python code",
+                                    location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                                     details={
-                                        "layer_name": layer_name,
+                                        "layer_name": redacted_layer_name,
                                         "layer_class": "Lambda",
                                     },
                                 )
@@ -1914,13 +1924,13 @@ class KerasZipScanner(BaseScanner):
                                 name="Lambda Layer Detection",
                                 passed=False,
                                 message=(
-                                    f"Lambda layer '{layer_name}' contains opaque encoded bytecode with no dangerous "
-                                    "text patterns detected"
+                                    f"Lambda layer '{redacted_layer_name}' contains opaque encoded bytecode with no "
+                                    "dangerous text patterns detected"
                                 ),
                                 severity=IssueSeverity.WARNING,
-                                location=f"{self.current_file_path} (layer: {layer_name})",
+                                location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                                 details={
-                                    "layer_name": layer_name,
+                                    "layer_name": redacted_layer_name,
                                     "layer_class": "Lambda",
                                     "validation_error": error,
                                     "analysis_status": "opaque_bytecode",
@@ -1935,18 +1945,21 @@ class KerasZipScanner(BaseScanner):
                     result.add_check(
                         name="Lambda Layer Decoding",
                         passed=False,
-                        message=f"Failed to decode Lambda layer '{layer_name}' function",
+                        message=f"Failed to decode Lambda layer '{redacted_layer_name}' function",
                         severity=IssueSeverity.WARNING,
-                        location=f"{self.current_file_path} (layer: {layer_name})",
+                        location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                         details={
-                            "layer_name": layer_name,
+                            "layer_name": redacted_layer_name,
                             "error": str(e),
                         },
                     )
         elif isinstance(function_data, dict):
             # Keras 3.x dict-format Lambda: {"class_name": "__lambda__", "config": {"code": ...}}
             check_lambda_dict_function(
-                function_data, result, f"{self.current_file_path} (layer: {layer_name})", layer_name
+                function_data,
+                result,
+                f"{self.current_file_path} (layer: {redacted_layer_name})",
+                redacted_layer_name,
             )
         else:
             # Lambda layer without encoded function - check other fields
@@ -1957,16 +1970,23 @@ class KerasZipScanner(BaseScanner):
                 # Module/function reference - check for dangerous imports
                 dangerous_modules = ["os", "sys", "subprocess", "eval", "exec", "__builtins__"]
                 if module_name and any(dangerous in module_name for dangerous in dangerous_modules):
+                    redacted_module_name = redact_evidence_string(module_name)
+                    redacted_function_name = (
+                        redact_evidence_string(function_name) if isinstance(function_name, str) else function_name
+                    )
                     result.add_check(
                         name="Lambda Layer Module Reference Check",
                         passed=False,
-                        message=f"Lambda layer '{layer_name}' references potentially dangerous module: {module_name}",
+                        message=(
+                            f"Lambda layer '{redacted_layer_name}' references potentially dangerous module: "
+                            f"{redacted_module_name}"
+                        ),
                         severity=IssueSeverity.CRITICAL,
-                        location=f"{self.current_file_path} (layer: {layer_name})",
+                        location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                         details={
-                            "layer_name": layer_name,
-                            "module": module_name,
-                            "function": function_name,
+                            "layer_name": redacted_layer_name,
+                            "module": redacted_module_name,
+                            "function": redacted_function_name,
                         },
                         why=get_pattern_explanation("lambda_layer"),
                     )

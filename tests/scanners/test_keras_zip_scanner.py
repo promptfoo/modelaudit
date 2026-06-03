@@ -1879,6 +1879,7 @@ __import__('pickle').loads(data)
     def test_keras_zip_details_redact_credentials_in_json_and_sarif(self, tmp_path: Path) -> None:
         direct_secret = "ZIP_DIRECT_SECRET"
         dict_secret = "ZIP_DICT_SECRET"
+        lambda_layer_name_secret = "ZIP_LAMBDA_LAYER_NAME_SECRET"
         custom_secret = "ZIP_CUSTOM_SECRET"
         nested_secret = "ZIP_NESTED_SECRET"
         access_key_id_secret = "ZIP_ACCESS_KEY_ID_SECRET"
@@ -1892,6 +1893,7 @@ __import__('pickle').loads(data)
         loss_secret = "ZIP_LOSS_SECRET"
         custom_layer_class_secret = "ZIP_CUSTOM_LAYER_CLASS_SECRET"
         custom_layer_name_secret = "ZIP_CUSTOM_LAYER_NAME_SECRET"
+        json_string_secret = "ZIP_JSON_STRING_SECRET"
 
         def direct_lambda_code(x: Any) -> Any:
             token = "ZIP_DIRECT_SECRET"
@@ -1907,7 +1909,7 @@ __import__('pickle').loads(data)
                 "layers": [
                     {
                         "class_name": "Lambda",
-                        "name": "direct_lambda",
+                        "name": f"token={lambda_layer_name_secret}",
                         "config": {
                             "function": [base64.b64encode(marshal.dumps(direct_lambda_code.__code__)).decode()],
                         },
@@ -1933,6 +1935,7 @@ __import__('pickle').loads(data)
                             f"awsSecretAccessKey={camel_case_key_secret}": "secret key should be redacted",
                             "source": (f"https://example.test/model.keras?clientSecret={camel_case_query_secret}&ok=1"),
                             "Authorization": f"Basic {authorization_secret}",
+                            "metadata": f'{{"api_key":"{json_string_secret}","safe":"ok"}}',
                             f"token={config_key_secret}": "secret key should be redacted",
                             "units": 4,
                         },
@@ -1956,6 +1959,7 @@ __import__('pickle').loads(data)
         raw_secrets = [
             direct_secret,
             dict_secret,
+            lambda_layer_name_secret,
             custom_secret,
             nested_secret,
             access_key_id_secret,
@@ -1969,6 +1973,7 @@ __import__('pickle').loads(data)
             loss_secret,
             custom_layer_class_secret,
             custom_layer_name_secret,
+            json_string_secret,
         ]
 
         scanner_result = KerasZipScanner().scan(str(model_path))
@@ -1986,6 +1991,25 @@ __import__('pickle').loads(data)
         assert all(secret not in sarif_output for secret in raw_secrets)
         assert "<redacted>" in json_output
         assert "<redacted>" in sarif_output
+
+    def test_non_string_layer_class_does_not_abort_scan(self, tmp_path: Path) -> None:
+        """Malformed non-string class names should not crash redaction or scanning."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": 123,
+                        "name": "numeric_class",
+                        "config": {},
+                    }
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config, file_name="numeric.keras")))
+
+        assert not any(check.name == "Keras ZIP File Scan" for check in result.checks)
 
     def test_compile_config_detects_nested_metric_and_loss_mappings(self, tmp_path: Path) -> None:
         """Nested compile_config structures should not bypass custom-object detection."""
