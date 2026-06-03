@@ -51,9 +51,28 @@ def _get_model_extensions() -> set[str]:
 def _build_extension_allow_patterns() -> list[str]:
     """Build conservative glob patterns for scannable files."""
     extensions = _get_model_extensions()
-    patterns = {f"*{ext}" for ext in extensions}
-    patterns.update(f"**/*{ext}" for ext in extensions)
+    suffix_globs = {_case_insensitive_suffix_glob(ext) for ext in extensions if ext}
+    patterns = {f"*{suffix}" for suffix in suffix_globs}
+    patterns.update(f"**/*{suffix}" for suffix in suffix_globs)
     return sorted(patterns)
+
+
+def _case_insensitive_suffix_glob(extension: str) -> str:
+    """Build a fnmatch suffix glob that preserves mixed-case remote files."""
+    return "".join(f"[{char.lower()}{char.upper()}]" if char.isalpha() else char for char in extension)
+
+
+def _is_scannable_hf_file(filename: str, extensions: set[str]) -> bool:
+    """Return whether a listed Hugging Face file has a supported suffix."""
+    filename_lower = filename.lower()
+    return any(filename_lower.endswith(ext.lower()) for ext in extensions if ext)
+
+
+def _raise_no_scannable_hf_files(repo_id: str) -> None:
+    raise Exception(
+        f"Refusing to download full snapshot for {repo_id}: "
+        "repository listing contains no recognized ModelAudit-scannable files"
+    )
 
 
 def _get_hf_cache_root() -> Path:
@@ -290,7 +309,7 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
 
         # Find model files in the repository (using centralized model extensions)
         model_extensions = _get_model_extensions()
-        model_files = [f for f in repo_files if any(f.endswith(ext) for ext in model_extensions)]
+        model_files = [f for f in repo_files if _is_scannable_hf_file(f, model_extensions)]
 
         # Download strategy:
         # - When cache_dir is provided: Use local_dir to place files directly there (safer)
@@ -319,17 +338,17 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
                     f"Refusing to download full snapshot for {repo_id}: no selective allowlist patterns available"
                 )
             download_kwargs["allow_patterns"] = extension_allow_patterns
-
-        if "allow_patterns" in download_kwargs:
-            local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
         else:
-            # Fallback: download everything if no model files identified
-            local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
+            _raise_no_scannable_hf_files(repo_id)
+
+        local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
 
         # Verify we actually got model files
         downloaded_path = Path(local_path)
         model_extensions = _get_model_extensions()
-        found_models = any(downloaded_path.glob(f"*{ext}") for ext in model_extensions)
+        found_models = any(
+            path.is_file() and _is_scannable_hf_file(path.name, model_extensions) for path in downloaded_path.rglob("*")
+        )
 
         if not found_models and not any(downloaded_path.glob("config.json")):
             # If no model files and no config, warn the user
@@ -415,12 +434,10 @@ def download_model_streaming(
 
         # Filter for model files
         model_extensions = _get_model_extensions()
-        model_files = [f for f in repo_files if any(f.endswith(ext) for ext in model_extensions)]
+        model_files = [f for f in repo_files if _is_scannable_hf_file(f, model_extensions)]
 
         if not model_files:
-            # Fallback: download all files if no recognized extensions found
-            # This maintains parity with download_model() behavior
-            model_files = repo_files
+            _raise_no_scannable_hf_files(repo_id)
 
         # Setup cache directory
         download_path = None
