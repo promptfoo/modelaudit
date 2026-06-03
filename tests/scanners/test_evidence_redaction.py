@@ -167,6 +167,29 @@ def test_redacts_indexed_credential_keys() -> None:
     }
 
 
+def test_redacts_dotted_credential_keys() -> None:
+    """Dotted credential names should be canonicalized before redaction."""
+    secret_key_secret = "DOTTED_SECRET_KEY_SECRET"
+    api_key_secret = "DOTTED_API_KEY_SECRET"
+    quoted_secret = "DOTTED_QUOTED_SECRET"
+
+    redacted = redact_evidence_string(
+        f'secret.key={secret_key_secret} api.key={api_key_secret} "secret.key":"{quoted_secret}"',
+        max_chars=500,
+    )
+    redacted_value = redact_evidence_value({"secret.key": secret_key_secret}, max_string_chars=500)
+
+    serialized_value = json.dumps(redacted_value)
+    assert secret_key_secret not in redacted
+    assert api_key_secret not in redacted
+    assert quoted_secret not in redacted
+    assert secret_key_secret not in serialized_value
+    assert f"secret.key={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f"api.key={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f'"secret.key":"{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert redacted_value == {"secret.key": REDACTED_EVIDENCE_VALUE}
+
+
 def test_redacts_whitespace_separated_credential_flags() -> None:
     """CLI-style credential flags should redact the following value token."""
     api_secret = "CLI_API_KEY_SECRET"
@@ -201,6 +224,29 @@ def test_redacts_leading_underscore_credential_assignments() -> None:
     assert api_secret not in redacted
     assert f"_token={REDACTED_EVIDENCE_VALUE}" in redacted
     assert f"_api_key='{REDACTED_EVIDENCE_VALUE}'" in redacted
+
+
+def test_redacts_call_style_sensitive_assignment_values() -> None:
+    """Sensitive assignment values should consume calls and prefixed literals."""
+    call_secret = "CALL_STYLE_SECRET"
+    f_string_secret = "PREFIXED_LITERAL_SECRET"
+    unbalanced_secret = "UNBALANCED_CALL_SECRET"
+
+    redacted = redact_evidence_string(
+        (
+            f'api_key=SecretStr("{call_secret}") '
+            f'api_key=f"{f_string_secret}" '
+            f'api_key=SecretStr("{unbalanced_secret}" safe=value'
+        ),
+        max_chars=500,
+    )
+
+    assert call_secret not in redacted
+    assert f_string_secret not in redacted
+    assert unbalanced_secret not in redacted
+    assert f"api_key={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f'api_key=f"{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert "safe=value" not in redacted
 
 
 def test_redacts_access_key_id_assignments_and_nested_values() -> None:

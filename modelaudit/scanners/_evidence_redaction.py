@@ -66,7 +66,7 @@ SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"password|passwd|private[_-]?key|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
     r"(?:\[[a-z0-9_-]{0,32}\])*"
 )
-DETAIL_KEY_PATTERN: Final[str] = r"[A-Za-z0-9_][A-Za-z0-9_-]{0,80}(?:\[[A-Za-z0-9_-]{0,32}\]){0,8}"
+DETAIL_KEY_PATTERN: Final[str] = r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,80}(?:\[[A-Za-z0-9_-]{0,32}\]){0,8}"
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?)" r"[^\s\"';&|]+"
 )
@@ -76,10 +76,16 @@ SENSITIVE_FLAG_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?P<separator>\s+)(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s\"';&|-][^\s\"';&|]*)"
 )
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)[^\s\"';&|]+"
+    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)(?![rubf]{{0,3}}[\"'])[^\s\"';&|]+"
 )
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
+    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*(?:[rubf]{{0,3}})?)"
+    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
+)
+CALL_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
+    rf"\b(?P<key>{DETAIL_KEY_PATTERN})(?P<separator>\s*[:=]\s*)"
+    r"(?:(?P<callee>[A-Za-z_][A-Za-z0-9_.]{0,120})\s*)?"
+    r"(?P<opener>[\[({])"
 )
 QUOTED_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?P<key_quote>[\"'])(?P<key>{DETAIL_KEY_PATTERN})(?P=key_quote)"
@@ -94,7 +100,7 @@ GENERIC_CONTAINER_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
     r"(?P<opener>[\[({])"
 )
 GENERIC_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"\b(?P<key>{DETAIL_KEY_PATTERN})(?P<separator>\s*[:=]\s*)[^\s\"';&|]+"
+    rf"\b(?P<key>{DETAIL_KEY_PATTERN})(?P<separator>\s*[:=]\s*)(?![rRuUbBfF]{{0,3}}[\"'])[^\s\"';&|]+"
 )
 EMBEDDED_SENSITIVE_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?P<quote>[\"']?)(?P<key>{DETAIL_KEY_PATTERN})(?P=quote)\s*:"
@@ -285,6 +291,34 @@ def _redact_container_assignments(text: str) -> str:
     return "".join(redacted_chunks)
 
 
+def _redact_call_assignments(text: str) -> str:
+    redacted_chunks: list[str] = []
+    last_index = 0
+    search_index = 0
+
+    while match := CALL_ASSIGNMENT_START_RE.search(text, search_index):
+        container_start = match.start("opener")
+        container_end = _find_balanced_container_end(text, container_start)
+        if not _is_sensitive_detail_key(match.group("key")):
+            search_index = match.end()
+            continue
+
+        redacted_chunks.append(text[last_index : match.start()])
+        redacted_chunks.append(f"{match.group('key')}{match.group('separator')}{REDACTED_EVIDENCE_VALUE}")
+        if container_end is None:
+            last_index = len(text)
+            break
+
+        last_index = container_end
+        search_index = container_end
+
+    if not redacted_chunks:
+        return text
+
+    redacted_chunks.append(text[last_index:])
+    return "".join(redacted_chunks)
+
+
 def _redact_embedded_structured_containers(text: str) -> str:
     redacted_chunks: list[str] = []
     last_index = 0
@@ -414,6 +448,7 @@ def redact_evidence_string(text: str, max_chars: int = 180, *, _url_depth: int =
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_FLAG_VALUE_RE.sub(_redact_sensitive_flag_value, redacted)
+    redacted = _redact_call_assignments(redacted)
     redacted = _redact_container_assignments(redacted)
     redacted = _redact_embedded_structured_containers(redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
