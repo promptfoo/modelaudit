@@ -1827,6 +1827,21 @@ class JITScriptDetector:
                     for element in target.elts:
                         self._bind_target(element, None)
 
+            def _bind_target_from_value(self, target: ast.AST, value: ast.AST) -> None:
+                if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
+                    for index, element in enumerate(target.elts):
+                        if index < len(value.elts):
+                            self._bind_target_from_value(element, value.elts[index])
+                        else:
+                            self._bind_target(element, None)
+                    return
+
+                self._bind_target(
+                    target,
+                    self._resolve_builtin(value),
+                    builtins_module=self._is_builtins_module(value),
+                )
+
             @staticmethod
             def _constant_truth(node: ast.AST) -> bool | None:
                 if isinstance(node, ast.Constant) and isinstance(node.value, (bool, int, str, bytes, type(None))):
@@ -1884,19 +1899,13 @@ class JITScriptDetector:
 
             def visit_Assign(self, node: ast.Assign) -> None:
                 self.visit(node.value)
-                builtin = self._resolve_builtin(node.value)
-                builtins_module = self._is_builtins_module(node.value)
                 for target in node.targets:
-                    self._bind_target(target, builtin, builtins_module=builtins_module)
+                    self._bind_target_from_value(target, node.value)
 
             def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
                 if node.value is not None:
                     self.visit(node.value)
-                    self._bind_target(
-                        node.target,
-                        self._resolve_builtin(node.value),
-                        builtins_module=self._is_builtins_module(node.value),
-                    )
+                    self._bind_target_from_value(node.target, node.value)
                 else:
                     self._bind_target(node.target, None)
 
@@ -1906,11 +1915,7 @@ class JITScriptDetector:
 
             def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
                 self.visit(node.value)
-                self._bind_target(
-                    node.target,
-                    self._resolve_builtin(node.value),
-                    builtins_module=self._is_builtins_module(node.value),
-                )
+                self._bind_target_from_value(node.target, node.value)
 
             def _visit_function_node(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
                 self._bind_name(node.name, None)

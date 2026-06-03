@@ -163,6 +163,31 @@ class TestJITScriptDetector:
         assert any("exec" in getattr(f, "builtin", "") for f in findings)
         assert any("__import__" in getattr(f, "builtin", "") for f in findings)
 
+    def test_detect_dangerous_builtin_alias_assigned_by_tuple_unpacking(self) -> None:
+        detector = JITScriptDetector()
+        data = b"""
+        def process_input(x):
+            (sink,) = (eval,)
+            return sink(x)
+        """
+
+        findings = detector._extract_and_check_python_code(data, "Test", "test.model")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    def test_dangerous_builtin_alias_tuple_unpacking_can_be_shadowed(self) -> None:
+        detector = JITScriptDetector()
+        data = b"""
+        def process_input(x):
+            sink = eval
+            (sink,) = (len,)
+            return sink(x)
+        """
+
+        findings = detector._extract_and_check_python_code(data, "Test", "test.model")
+
+        assert not any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
     def test_detect_code_execution_patterns(self):
         """Test detection of code execution patterns in binary data."""
         detector = JITScriptDetector()
