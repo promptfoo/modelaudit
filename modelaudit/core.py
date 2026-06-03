@@ -211,9 +211,6 @@ def _redact_stream_record_for_reporting(record: Issue | Check, stream_url: str, 
 
 def _redact_stream_scan_result_for_reporting(scan_result: ScanResult, stream_url: str, report_url: str) -> None:
     """Strip signed query material from scanner-owned records before aggregation."""
-    if stream_url == report_url:
-        return
-
     for issue in scan_result.issues:
         _redact_stream_record_for_reporting(issue, stream_url, report_url)
     for check in scan_result.checks:

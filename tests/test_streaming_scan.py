@@ -220,6 +220,38 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
     assert all(asset.path != stream_url for asset in result.assets)
 
 
+def test_streaming_safe_source_still_redacts_related_signed_urls() -> None:
+    """Stream record sanitization should not depend on the source URL needing redaction."""
+    stream_url = "https://bucket.s3.amazonaws.com/model.pkl"
+    related_url = "https://collector.example/upload?visible=yes&token=secondary-secret"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.bytes_scanned = 128
+    scan_result.metadata.update({"related_url": related_url})
+    scan_result.add_issue(
+        f"Related signed URL {related_url}",
+        severity=IssueSeverity.WARNING,
+        location=stream_url,
+        details={"related_url": related_url},
+    )
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file") as mock_stream,
+        patch("modelaudit.scanners.get_scanner_for_file") as mock_scanner,
+    ):
+        dummy_scanner = object()
+        mock_scanner.return_value = dummy_scanner
+        mock_stream.return_value = (scan_result, True)
+
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    mock_stream.assert_called_once_with(stream_url, dummy_scanner)
+    json_text = result.model_dump_json(exclude_none=True)
+    assert "secondary-secret" not in json_text
+    assert "token=<redacted>" in json_text
+    assert "visible=yes" in json_text
+
+
 def test_streaming_signed_url_no_scanner_error_is_redacted() -> None:
     """stream:// scanner-routing failures must not persist signed URL material."""
     stream_url = "https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=deadbeef&token=secret-token"
