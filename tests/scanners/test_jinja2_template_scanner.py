@@ -1133,6 +1133,37 @@ class TestJinja2TemplateScannerEdgeCases:
         assert "scan_outcome" not in result.metadata
         assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
 
+    @pytest.mark.parametrize(
+        "template_content",
+        [
+            "{{ range(1000)|min }}",
+            "{{ range(1000)|max }}",
+            "{{ range(1000)|sum }}",
+            "{{ range(1000)|slice(10) }}",
+        ],
+    )
+    def test_unavailable_sandbox_worker_keeps_scalar_and_lazy_range_filters_clean(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        template_content: str,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "bounded-range-filter.jinja"
+        template_file.write_text(template_content, encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 64})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
     def test_unavailable_sandbox_worker_fails_closed_for_large_range_loop(
         self,
         tmp_path: Path,
@@ -1141,6 +1172,29 @@ class TestJinja2TemplateScannerEdgeCases:
         pytest.importorskip("jinja2.sandbox")
         template_file = tmp_path / "range-loop.jinja"
         template_file.write_text("{% for i in range(1000) %}{% endfor %}", encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        budget_checks = [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+        assert len(budget_checks) == 1
+        assert budget_checks[0].details["budget_type"] == "worker_unavailable"
+
+    def test_unavailable_sandbox_worker_fails_closed_when_lazy_slice_is_iterated(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "range-slice-loop.jinja"
+        template_file.write_text("{% for group in range(1000)|slice(10) %}{% endfor %}", encoding="utf-8")
 
         scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
         monkeypatch.setattr(
@@ -1195,6 +1249,97 @@ class TestJinja2TemplateScannerEdgeCases:
 
         assert status == "budget_exceeded"
         assert detail == "output"
+
+    @pytest.mark.parametrize(
+        "template_content",
+        [
+            "{{ range(10 ** 13 + 1, 2 * 10 ** 13)|list }}",
+            "{{ range(-(2 * 10 ** 13), -(10 ** 13))|list }}",
+            "{{ range(2 * 10 ** 13, 10 ** 13, -1)|list }}",
+            "{{ range(10 ** 101, 2 * 10 ** 101)|list }}",
+            "{{ range(10 ** 1000 - 10 ** 101)|list }}",
+            "{{ range(+(10 ** 8))|list }}",
+            "{{ range(10 ** 8 // 1)|list }}",
+            "{{ range((10 ** 8) % 100000001)|list }}",
+            "{{ range(10 ** 8 if true else 1)|list }}",
+            '{{ range("100000000"|int)|list }}',
+            "{{ range((-100000000)|abs)|list }}",
+        ],
+    )
+    def test_static_preflight_preserves_large_range_bound_risk(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        template_content: str,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+
+        def fail_get_context(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("sandbox worker should not start")
+
+        monkeypatch.setattr(jinja2_template_scanner.mp, "get_context", fail_get_context)
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+
+        assert scanner._test_template_safety_with_budget(template_content) == ("budget_exceeded", "output")
+
+    @pytest.mark.parametrize(
+        "template_content",
+        [
+            "{{ range(0, 10 ** 8, 0)|list }}",
+            "{{ range(0, 10 ** 8, 1, 2)|list }}",
+            "{{ range((10 ** 1000) * 0)|list }}",
+            "{{ range(0 * (10 ** 1000))|list }}",
+            "{{ range((10 ** 1000) ** 0)|list }}",
+            "{{ range(2 ** -(10 ** 1000))|list }}",
+            "{{ range(0 // (10 ** 1000))|list }}",
+            "{{ range(0 % (10 ** 1000))|list }}",
+            "{{ range(10 ** 1000 - 10 ** 1000)|list }}",
+            "{{ range((10 ** 1000) // (10 ** 1000))|list }}",
+            "{{ range((10 ** 1000) % (10 ** 1000))|list }}",
+        ],
+    )
+    def test_unavailable_sandbox_worker_keeps_non_amplifying_and_invalid_range_calls_clean(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        template_content: str,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "invalid-range.jinja"
+        template_file.write_text(template_content, encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 16})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
+    def test_unavailable_sandbox_worker_keeps_small_range_at_large_offset_clean(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "large-offset-small-range.jinja"
+        template_file.write_text("{{ range(10 ** 13, 10 ** 13 + 1)|list }}", encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 64})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
 
     def test_unavailable_sandbox_worker_fails_closed_for_materialized_lazy_range_filter(
         self,
@@ -1545,6 +1690,20 @@ class TestJinja2TemplateScannerEdgeCases:
 
 class TestJinja2TemplateScannerConfiguration:
     """Test scanner configuration options."""
+
+    @pytest.mark.parametrize("value", [float("-inf"), float("inf"), float("nan")])
+    def test_non_finite_sandbox_budget_config_uses_defaults(self, value: float) -> None:
+        scanner = Jinja2TemplateScanner(
+            {
+                "sandbox_render_timeout_seconds": value,
+                "sandbox_render_max_output_chars": value,
+                "sandbox_render_max_memory_bytes": value,
+            }
+        )
+
+        assert scanner.sandbox_render_timeout_seconds == 0.5
+        assert scanner.sandbox_render_max_output_chars == 64 * 1024
+        assert scanner.sandbox_render_max_memory_bytes == 512 * 1024 * 1024
 
     def test_sensitivity_high(self, tmp_path: Path) -> None:
         """Test high sensitivity mode."""

@@ -19,6 +19,7 @@ Key Features:
 """
 
 import json
+import math
 import multiprocessing as mp
 import os
 import platform
@@ -91,10 +92,10 @@ _DEFAULT_SANDBOX_RENDER_MAX_OUTPUT_CHARS = 64 * 1024
 _DEFAULT_SANDBOX_RENDER_MAX_MEMORY_BYTES = 512 * 1024 * 1024
 _SANDBOX_RENDER_SPAWN_STARTUP_GRACE_SECONDS = 2.0
 _SANDBOX_RENDER_BUDGET_REASON = "jinja2_sandbox_render_budget_exceeded"
-_STATIC_INT_EVAL_MAX_ABS = 1_000_000_000_000
-_EAGER_RANGE_ITERATION_FILTERS = frozenset({"groupby", "join", "list", "max", "min", "slice", "sort", "sum"})
+_STATIC_INT_EVAL_MAX_ABS = 10**100
+_EAGER_RANGE_ITERATION_FILTERS = frozenset({"groupby", "join", "list", "sort"})
 _LAZY_RANGE_ITERATION_FILTERS = frozenset(
-    {"batch", "map", "reject", "rejectattr", "reverse", "select", "selectattr", "unique"}
+    {"batch", "map", "reject", "rejectattr", "reverse", "select", "selectattr", "slice", "unique"}
 )
 
 
@@ -322,12 +323,12 @@ class Jinja2TemplateScanner(BaseScanner):
             value = float(self.config.get(key, default))
         except (TypeError, ValueError):
             return default
-        return value if value > 0 else default
+        return value if math.isfinite(value) and value > 0 else default
 
     def _positive_int_config(self, key: str, default: int) -> int:
         try:
             value = int(self.config.get(key, default))
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             return default
         return value if value > 0 else default
 
@@ -1446,7 +1447,10 @@ class Jinja2TemplateScanner(BaseScanner):
             isinstance(node, jinja2.nodes.Call)
             and isinstance(node.node, jinja2.nodes.Name)
             and node.node.name == "range"
-            and bool(node.args)
+            and 1 <= len(node.args) <= 3
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
         )
 
     def _parse_template_ast(self, template_content: str) -> Any | None:
@@ -1565,32 +1569,177 @@ class Jinja2TemplateScanner(BaseScanner):
         return total
 
     def _constant_int_expression_value(self, node: Any, cap: int) -> int | None:
+        result = self._constant_int_expression_result(node, cap)
+        return result[0] if result is not None else None
+
+    def _constant_int_expression_result(self, node: Any, cap: int) -> tuple[int, bool] | None:
         if isinstance(node, jinja2.nodes.Const):
             if isinstance(node.value, bool) or not isinstance(node.value, int):
                 return None
-            return node.value
-        if isinstance(node, jinja2.nodes.Neg):
-            value = self._constant_int_expression_value(node.node, cap)
-            return -value if value is not None else None
-        if isinstance(node, jinja2.nodes.Add | jinja2.nodes.Sub | jinja2.nodes.Mul):
-            left = self._constant_int_expression_value(node.left, cap)
-            right = self._constant_int_expression_value(node.right, cap)
-            if left is None or right is None:
+            return self._constant_int_result(node.value, cap)
+        if isinstance(node, jinja2.nodes.Neg | jinja2.nodes.Pos):
+            result = self._constant_int_expression_result(node.node, cap)
+            if result is None or isinstance(node, jinja2.nodes.Pos):
+                return result
+            value, saturated = result
+            return self._constant_int_result(-value, cap, saturated=saturated)
+        if isinstance(
+            node,
+            jinja2.nodes.Add | jinja2.nodes.Sub | jinja2.nodes.Mul | jinja2.nodes.FloorDiv | jinja2.nodes.Mod,
+        ):
+            left_result = self._constant_int_expression_result(node.left, cap)
+            right_result = self._constant_int_expression_result(node.right, cap)
+            if left_result is None or right_result is None:
+                return None
+            left, left_saturated = left_result
+            right, right_saturated = right_result
+            if isinstance(node, jinja2.nodes.FloorDiv | jinja2.nodes.Mod) and right == 0 and not right_saturated:
                 return None
             if isinstance(node, jinja2.nodes.Add):
-                return self._cap_constant_int(left + right, cap)
+                if left_saturated or right_saturated:
+                    if left_saturated and not right_saturated and right == 0:
+                        return left_result
+                    if right_saturated and not left_saturated and left == 0:
+                        return right_result
+                    return self._saturated_constant_int_result(cap)
+                return self._constant_int_result(left + right, cap)
             if isinstance(node, jinja2.nodes.Sub):
-                return self._cap_constant_int(left - right, cap)
-            return self._cap_constant_int(left * right, cap)
+                if node.left == node.right:
+                    return self._constant_int_result(0, cap)
+                if left_saturated or right_saturated:
+                    if left_saturated and not right_saturated and right == 0:
+                        return left_result
+                    if right_saturated and not left_saturated and left == 0:
+                        return self._saturated_constant_int_result(cap, -1 if right > 0 else 1)
+                    return self._saturated_constant_int_result(cap)
+                return self._constant_int_result(left - right, cap)
+            if isinstance(node, jinja2.nodes.Mul):
+                if (not left_saturated and left == 0) or (not right_saturated and right == 0):
+                    return self._constant_int_result(0, cap)
+                if left_saturated or right_saturated:
+                    return self._saturated_constant_int_result(cap, -1 if left * right < 0 else 1)
+                return self._constant_int_result(left * right, cap)
+            if isinstance(node, jinja2.nodes.FloorDiv):
+                if node.left == node.right:
+                    return self._constant_int_result(1, cap)
+                if not left_saturated and left == 0:
+                    return self._constant_int_result(0, cap)
+                if left_saturated or right_saturated:
+                    if not left_saturated:
+                        return self._constant_int_result(0, cap)
+                    if not right_saturated and abs(right) == 1:
+                        return self._saturated_constant_int_result(cap, -1 if left * right < 0 else 1)
+                    return self._saturated_constant_int_result(cap)
+                return self._constant_int_result(left // right, cap)
+            if node.left == node.right or (not left_saturated and left == 0):
+                return self._constant_int_result(0, cap)
+            if left_saturated or right_saturated:
+                if left_saturated and not right_saturated and abs(right) == 1:
+                    return self._constant_int_result(0, cap)
+                return self._saturated_constant_int_result(cap)
+            return self._constant_int_result(left % right, cap)
         if isinstance(node, jinja2.nodes.Pow):
-            left = self._constant_int_expression_value(node.left, cap)
-            right = self._constant_int_expression_value(node.right, cap)
-            if left is None or right is None or right < 0:
+            left_result = self._constant_int_expression_result(node.left, cap)
+            right_result = self._constant_int_expression_result(node.right, cap)
+            if left_result is None or right_result is None:
                 return None
-            if abs(left) > 1 and right > 32:
-                return cap + 1
-            return self._cap_constant_int(left**right, cap)
+            left, left_saturated = left_result
+            right, right_saturated = right_result
+            if right < 0:
+                return None
+            if not right_saturated and right == 0:
+                return self._constant_int_result(1, cap)
+            if not left_saturated and left in {-1, 0, 1}:
+                return self._constant_int_result(0 if left == 0 else 1, cap)
+            if left_saturated or right_saturated:
+                return self._saturated_constant_int_result(cap)
+            magnitude_cap = self._constant_int_magnitude_cap(cap)
+            if abs(left) > 1 and right > magnitude_cap.bit_length():
+                sign = -1 if left < 0 and right % 2 else 1
+                return self._saturated_constant_int_result(cap, sign)
+            return self._constant_int_result(left**right, cap)
+        if isinstance(node, jinja2.nodes.CondExpr):
+            condition = self._constant_condition_value(node.test)
+            if condition is None:
+                return None
+            branch = node.expr1 if condition else node.expr2
+            return self._constant_int_expression_result(branch, cap) if branch is not None else None
+        if isinstance(node, jinja2.nodes.Filter):
+            return self._constant_int_filter_result(node, cap)
         return None
+
+    def _constant_int_filter_result(self, node: Any, cap: int) -> tuple[int, bool] | None:
+        if node.kwargs or node.dyn_args is not None or node.dyn_kwargs is not None:
+            return None
+        if node.name == "abs" and not node.args:
+            result = self._constant_int_expression_result(node.node, cap)
+            if result is None:
+                return None
+            value, saturated = result
+            return self._constant_int_result(abs(value), cap, saturated=saturated)
+        if node.name != "int" or len(node.args) > 2:
+            return None
+
+        if node.args:
+            parsed_default_result = self._constant_int_expression_result(node.args[0], cap)
+            if parsed_default_result is None:
+                return None
+            default_result = parsed_default_result
+        else:
+            default_result = self._constant_int_result(0, cap)
+
+        base = 10
+        if len(node.args) == 2:
+            base_result = self._constant_int_expression_result(node.args[1], cap)
+            if base_result is None or base_result[1]:
+                return None
+            base = base_result[0]
+
+        source_result = self._constant_int_expression_result(node.node, cap)
+        if source_result is not None:
+            return source_result
+        if not isinstance(node.node, jinja2.nodes.Const):
+            return None
+
+        value = node.node.value
+        try:
+            if isinstance(value, float):
+                if not math.isfinite(value):
+                    return default_result
+                parsed = int(value)
+            elif isinstance(value, str):
+                text = value.strip()
+                if len(text) > 1024:
+                    return self._saturated_constant_int_result(cap, -1 if text.startswith("-") else 1)
+                try:
+                    parsed = int(text, base)
+                except ValueError:
+                    float_value = float(text)
+                    if not math.isfinite(float_value):
+                        return default_result
+                    parsed = int(float_value)
+            else:
+                return default_result
+        except (OverflowError, TypeError, ValueError):
+            return default_result
+        return self._constant_int_result(parsed, cap)
+
+    @staticmethod
+    def _constant_condition_value(node: Any) -> bool | None:
+        if not isinstance(node, jinja2.nodes.Const):
+            return None
+        value = node.value
+        if value is None or isinstance(value, bool | int | float | str | bytes):
+            return bool(value)
+        return None
+
+    def _constant_int_result(self, value: int, cap: int, *, saturated: bool = False) -> tuple[int, bool]:
+        capped_value = self._cap_constant_int(value, cap)
+        return capped_value, saturated or self._constant_int_is_saturated(capped_value, cap)
+
+    def _saturated_constant_int_result(self, cap: int, sign: int = 1) -> tuple[int, bool]:
+        magnitude = self._constant_int_magnitude_cap(cap) + 1
+        return (magnitude if sign >= 0 else -magnitude), True
 
     def _constant_range_iteration_count(self, args: list[Any], cap: int) -> int | None:
         range_values = self._constant_range_values(args, cap)
@@ -1600,11 +1749,17 @@ class Jinja2TemplateScanner(BaseScanner):
 
     def _constant_range_values(self, args: list[Any], cap: int) -> tuple[int, int, int] | None:
         values: list[int] = []
+        saturated = False
         for arg in args[:3]:
-            value = self._constant_int_expression_value(arg, cap)
-            if value is None:
+            result = self._constant_int_expression_result(arg, cap)
+            if result is None:
                 return None
+            value, value_saturated = result
+            saturated = saturated or value_saturated
             values.append(value)
+
+        if saturated:
+            return 0, max(1, abs(cap)) + 1, 1
 
         if len(values) == 1:
             start = 0
@@ -1616,7 +1771,7 @@ class Jinja2TemplateScanner(BaseScanner):
             step = values[2] if len(values) >= 3 else 1
 
         if step == 0:
-            return None
+            return 0, 0, 1
         return start, stop, step
 
     def _range_iteration_count(self, start: int, stop: int, step: int, cap: int) -> int:
@@ -1628,8 +1783,15 @@ class Jinja2TemplateScanner(BaseScanner):
             return 0
         return min(((start - stop - 1) // abs(step)) + 1, cap + 1)
 
+    @staticmethod
+    def _constant_int_magnitude_cap(cap: int) -> int:
+        return max(abs(cap), _STATIC_INT_EVAL_MAX_ABS)
+
+    def _constant_int_is_saturated(self, value: int, cap: int) -> bool:
+        return abs(value) > self._constant_int_magnitude_cap(cap)
+
     def _cap_constant_int(self, value: int, cap: int) -> int:
-        magnitude_cap = max(abs(cap), _STATIC_INT_EVAL_MAX_ABS)
+        magnitude_cap = self._constant_int_magnitude_cap(cap)
         if abs(value) <= magnitude_cap:
             return value
         return magnitude_cap + 1 if value > 0 else -(magnitude_cap + 1)
