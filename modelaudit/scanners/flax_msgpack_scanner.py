@@ -564,21 +564,29 @@ class FlaxMsgpackScanner(BaseScanner):
             },
         )
 
-    def _check_preanalysis_structure_budget(self, obj: Any, result: ScanResult, *, location: str) -> bool:
+    def _check_preanalysis_structure_budget(
+        self,
+        obj: Any,
+        result: ScanResult,
+        *,
+        location: str,
+        max_nodes: int | None = None,
+    ) -> bool:
         """Bound helper-analysis traversal before running ML/JAX metadata prechecks."""
         stack: list[tuple[Any, str, int]] = [(obj, location, 0)]
         visited_nodes = 0
+        node_limit = self.max_structure_nodes if max_nodes is None else max_nodes
 
         while stack:
             value, value_location, depth = stack.pop()
             visited_nodes += 1
-            if visited_nodes > self.max_structure_nodes:
+            if visited_nodes > node_limit:
                 self._add_structure_budget_check(
                     result,
                     location=value_location,
                     budget="node_count",
                     observed=visited_nodes,
-                    maximum=self.max_structure_nodes,
+                    maximum=node_limit,
                 )
                 return False
             if depth > self.max_recursion_depth:
@@ -655,8 +663,12 @@ class FlaxMsgpackScanner(BaseScanner):
 
         return " ".join(fragments).lower()
 
-    def _new_content_traversal_state(self) -> dict[str, Any]:
-        return {"nodes": 0, "node_budget_reported": False}
+    def _new_content_traversal_state(self, *, max_nodes: int | None = None) -> dict[str, Any]:
+        return {
+            "nodes": 0,
+            "max_nodes": self.max_structure_nodes if max_nodes is None else max_nodes,
+            "node_budget_reported": False,
+        }
 
     def _analyze_content(
         self,
@@ -670,14 +682,14 @@ class FlaxMsgpackScanner(BaseScanner):
         if traversal_state is None:
             traversal_state = self._new_content_traversal_state()
         traversal_state["nodes"] += 1
-        if traversal_state["nodes"] > self.max_structure_nodes:
+        if traversal_state["nodes"] > traversal_state["max_nodes"]:
             if not traversal_state["node_budget_reported"]:
                 self._add_structure_budget_check(
                     result,
                     location=location,
                     budget="node_count",
                     observed=traversal_state["nodes"],
-                    maximum=self.max_structure_nodes,
+                    maximum=traversal_state["max_nodes"],
                 )
                 traversal_state["node_budget_reported"] = True
             return
@@ -1254,6 +1266,90 @@ class FlaxMsgpackScanner(BaseScanner):
             rule_code="S902",
         )
 
+    def _unpack_bounded_msgpack_preview_value(
+        self,
+        unpacker: Any,
+        *,
+        depth: int,
+        state: dict[str, int],
+    ) -> tuple[Any, bool]:
+        """Decode a bounded visible prefix without materializing oversized containers."""
+        if depth > self.max_recursion_depth or state["nodes"] >= self.max_structure_nodes:
+            return None, False
+        state["nodes"] += 1
+
+        try:
+            map_length = unpacker.read_map_header()
+        except ValueError:
+            pass
+        else:
+            pairs: list[dict[Any, Any]] = []
+            for _ in range(min(map_length, self.max_items_per_container)):
+                key, key_complete = self._unpack_bounded_msgpack_preview_value(
+                    unpacker,
+                    depth=depth + 1,
+                    state=state,
+                )
+                if not key_complete:
+                    pairs.append({"<partial_key>": key})
+                    return pairs, False
+                value, value_complete = self._unpack_bounded_msgpack_preview_value(
+                    unpacker,
+                    depth=depth + 1,
+                    state=state,
+                )
+                try:
+                    pair = {key: value}
+                except TypeError:
+                    pair = {str(key): value}
+                pairs.append(pair)
+                if not value_complete:
+                    return pairs, False
+            return pairs, map_length <= self.max_items_per_container
+
+        try:
+            array_length = unpacker.read_array_header()
+        except ValueError:
+            pass
+        else:
+            items: list[Any] = []
+            for _ in range(min(array_length, self.max_items_per_container)):
+                value, value_complete = self._unpack_bounded_msgpack_preview_value(
+                    unpacker,
+                    depth=depth + 1,
+                    state=state,
+                )
+                items.append(value)
+                if not value_complete:
+                    return items, False
+            return items, array_length <= self.max_items_per_container
+
+        return unpacker.unpack(), True
+
+    def _scan_bounded_msgpack_decode_prefix(self, path: str, result: ScanResult) -> None:
+        """Preserve visible security findings when normal decoding hits a budget."""
+        state = {"nodes": 0}
+        try:
+            with open(path, "rb") as source:
+                unpacker = msgpack.Unpacker(
+                    source,
+                    read_size=self._msgpack_stream_read_size(),
+                    **self._msgpack_unpacker_kwargs(),
+                )
+                for object_index in range(self.max_msgpack_stream_objects):
+                    preview, complete = self._unpack_bounded_msgpack_preview_value(
+                        unpacker,
+                        depth=0,
+                        state=state,
+                    )
+                    if preview is not None:
+                        self._analyze_content(preview, f"root[bounded_decode_prefix_{object_index}]", result)
+                    if not complete:
+                        break
+        except Exception:
+            # The original decode failure is already surfaced as inconclusive.
+            return
+
     def _unpack_msgpack_objects_from_path(self, path: str, result: ScanResult) -> list[Any] | None:
         """Stream MessagePack from disk so scans do not allocate the whole file before decoding."""
         unpacker = msgpack.Unpacker(**self._msgpack_unpacker_kwargs())
@@ -1269,6 +1365,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     has_incomplete_tail = drain_result
         except Exception as e:
             if self._is_msgpack_limit_error(e):
+                self._scan_bounded_msgpack_decode_prefix(path, result)
                 self._add_msgpack_decode_limit_check(result, path, e)
             else:
                 self._add_msgpack_parse_failure_check(result, path, e)
@@ -1359,7 +1456,13 @@ class FlaxMsgpackScanner(BaseScanner):
             if len(objects) > 1:
                 result.metadata["msgpack_object_count"] = len(objects)
 
-            preanalysis_complete = self._check_preanalysis_structure_budget(obj, result, location="root")
+            max_nodes_per_object = max(1, self.max_structure_nodes // len(objects))
+            preanalysis_complete = self._check_preanalysis_structure_budget(
+                obj,
+                result,
+                location="root",
+                max_nodes=max_nodes_per_object,
+            )
             ml_analysis: dict[str, Any] | None = None
             if preanalysis_complete:
                 # Extract JAX/Flax specific metadata and architecture information
@@ -1373,14 +1476,24 @@ class FlaxMsgpackScanner(BaseScanner):
                 self._check_jax_specific_threats(obj, result)
 
             # Perform deep security analysis
-            traversal_state = self._new_content_traversal_state()
+            traversal_state = self._new_content_traversal_state(max_nodes=max_nodes_per_object)
             self._analyze_content(obj, "root", result, traversal_state=traversal_state)
 
             for object_index, stream_obj in enumerate(objects[1:], start=1):
                 stream_location = f"root[msgpack_object_{object_index}]"
-                if self._check_preanalysis_structure_budget(stream_obj, result, location=stream_location):
+                if self._check_preanalysis_structure_budget(
+                    stream_obj,
+                    result,
+                    location=stream_location,
+                    max_nodes=max_nodes_per_object,
+                ):
                     self._check_jax_specific_threats(stream_obj, result)
-                self._analyze_content(stream_obj, stream_location, result, traversal_state=traversal_state)
+                self._analyze_content(
+                    stream_obj,
+                    stream_location,
+                    result,
+                    traversal_state=self._new_content_traversal_state(max_nodes=max_nodes_per_object),
+                )
 
             result.bytes_scanned = file_size
         except MemoryError:

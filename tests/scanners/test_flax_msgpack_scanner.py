@@ -335,6 +335,25 @@ def test_flax_msgpack_scans_trailing_msgpack_objects(tmp_path: Path) -> None:
     )
 
 
+def test_flax_msgpack_preserves_trailing_scan_after_first_object_exhausts_node_budget(tmp_path: Path) -> None:
+    """A large first object must not starve a small malicious trailing object."""
+    path = tmp_path / "trailing_after_budget.msgpack"
+    payload = msgpack.packb({"params": list(range(8))}, use_bin_type=True)
+    payload += msgpack.packb("eval('x')", use_bin_type=True)
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_structure_nodes": 4}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == r"Suspicious code pattern detected: eval\s*\("
+        and issue.location == "root[msgpack_object_1]"
+        for issue in result.issues
+    )
+
+
 def test_flax_msgpack_benign_trailing_dict_object_is_info_only(tmp_path: Path) -> None:
     """Valid trailing dict objects should be scanned without warning-level stream noise."""
     path = tmp_path / "benign_two_objects.msgpack"
@@ -461,6 +480,54 @@ def test_flax_msgpack_decode_limit_is_inconclusive(tmp_path: Path) -> None:
         and check.details["analysis_incomplete"] is True
         for check in result.checks
     )
+
+
+@pytest.mark.parametrize(
+    "oversized_value",
+    [
+        ["eval('x')", "safe", "extra"],
+        {"payload": "eval('x')", "safe": "ok", "extra": "ok"},
+    ],
+)
+def test_flax_msgpack_decode_limit_scans_visible_oversized_container_prefix(
+    tmp_path: Path,
+    oversized_value: object,
+) -> None:
+    """Early malicious values remain visible when a container exceeds the decode cap."""
+    path = tmp_path / "oversized_container.msgpack"
+    create_msgpack_file(path, {"params": oversized_value})
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_items_per_container": 2,
+            "max_msgpack_decode_bytes": 1024,
+        }
+    ).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.DECODE_LIMIT_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.message == r"Suspicious code pattern detected: eval\s*\("
+        for issue in result.issues
+    )
+
+
+def test_flax_msgpack_decode_limit_does_not_join_adjacent_visible_strings(tmp_path: Path) -> None:
+    """Structurally separate values must not become a synthetic suspicious pattern."""
+    path = tmp_path / "oversized_benign_strings.msgpack"
+    create_msgpack_file(path, {"params": ["ev", "al(", "extra"]})
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_items_per_container": 2,
+            "max_msgpack_decode_bytes": 1024,
+        }
+    ).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_flax_msgpack_large_containers(tmp_path):

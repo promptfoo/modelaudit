@@ -7,9 +7,10 @@ import os
 import pickletools
 import re
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -658,6 +659,7 @@ class JaxCheckpointScanner(BaseScanner):
         check_name: str = "JSON Pattern Security Check",
         message_prefix: str = "Suspicious pattern in bounded JSON checkpoint prefix",
         depth_check_name: str = "JSON Metadata Traversal Depth Limit",
+        on_string_value: Callable[[str, str], None] | None = None,
     ) -> None:
         """Scan decoded JSON string content visible inside the bounded prefix."""
         with open(path, "rb") as source:
@@ -682,6 +684,8 @@ class JaxCheckpointScanner(BaseScanner):
 
         finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
         for context, text_value in string_values:
+            if on_string_value is not None:
+                on_string_value(context, text_value)
             self._add_suspicious_pattern_checks(
                 text_value,
                 context=context,
@@ -991,6 +995,11 @@ class JaxCheckpointScanner(BaseScanner):
                             check_name="Orbax Pattern Security Check",
                             message_prefix="Suspicious pattern in bounded Orbax metadata prefix",
                             depth_check_name="Orbax Metadata Traversal Depth Limit",
+                            on_string_value=partial(
+                                self._check_bounded_orbax_restore_fn,
+                                path=str(metadata_path),
+                                result=result,
+                            ),
                         )
                         continue
 
@@ -1042,26 +1051,42 @@ class JaxCheckpointScanner(BaseScanner):
                     treat_legacy_pickle_header_as_checkpoint=True,
                 )
 
+    def _check_bounded_orbax_restore_fn(
+        self,
+        context: str,
+        text_value: str,
+        *,
+        path: str,
+        result: ScanResult,
+    ) -> None:
+        """Run the dedicated restore-function check when the root value is visible."""
+        if context == "orbax_metadata_bounded_prefix.restore_fn":
+            self._add_orbax_restore_fn_check(text_value, path, result)
+
+    def _add_orbax_restore_fn_check(self, restore_fn_value: Any, path: str, result: ScanResult) -> None:
+        """Report a visible Orbax restore function with dangerous values promoted."""
+        restore_fn_text = str(restore_fn_value)
+        restore_fn_is_dangerous = bool(self._DANGEROUS_RESTORE_FN_PATTERN.search(restore_fn_text))
+        result.add_check(
+            name="Orbax Restore Function Check",
+            passed=False,
+            message=(
+                "Dangerous restore function detected in Orbax metadata"
+                if restore_fn_is_dangerous
+                else "Custom restore function detected in Orbax metadata"
+            ),
+            severity=IssueSeverity.CRITICAL if restore_fn_is_dangerous else IssueSeverity.WARNING,
+            location=path,
+            details={"restore_fn": restore_fn_text[:200]},
+            rule_code="S302",
+        )
+
     def _analyze_orbax_metadata(self, metadata: dict[str, Any], path: str, result: ScanResult) -> None:
         """Analyze Orbax metadata for security issues."""
 
         # Check for suspicious restore functions
         if "restore_fn" in metadata:
-            restore_fn_value = str(metadata["restore_fn"])
-            restore_fn_is_dangerous = bool(self._DANGEROUS_RESTORE_FN_PATTERN.search(restore_fn_value))
-            result.add_check(
-                name="Orbax Restore Function Check",
-                passed=False,
-                message=(
-                    "Dangerous restore function detected in Orbax metadata"
-                    if restore_fn_is_dangerous
-                    else "Custom restore function detected in Orbax metadata"
-                ),
-                severity=IssueSeverity.CRITICAL if restore_fn_is_dangerous else IssueSeverity.WARNING,
-                location=path,
-                details={"restore_fn": restore_fn_value[:200]},
-                rule_code="S302",
-            )
+            self._add_orbax_restore_fn_check(metadata["restore_fn"], path, result)
 
         # Check for code injection in metadata
         pattern_finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
