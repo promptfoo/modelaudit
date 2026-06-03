@@ -67,7 +67,8 @@ QUOTED_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\3)[\s\S])*\3"
 )
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?)" r"[^\s\"';&|]+"
+    r"(?i)(\b(?:proxy[-_]?authorization|authorization)\s*[:=]\s*)(?:(?:bearer|basic)\s+)?"
+    r"[^\s\"';&|]+"
 )
 BEARER_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
@@ -92,7 +93,7 @@ UNTERMINATED_QUOTED_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
 )
 UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)({PYTHON_STRING_PREFIX})"
-    rf"({PYTHON_QUOTE_DELIMITER})(?:(?!\4)[^\s;&|])*(?=$|\s|[;&|])"
+    rf"({PYTHON_QUOTE_DELIMITER})(?:(?!\4)[^;&|])*(?=$|[;&|])"
 )
 UNTERMINATED_QUOTED_SENSITIVE_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)([\"']{QUOTED_SENSITIVE_KEY}[\"']\s*:\s*)({PYTHON_STRING_PREFIX})"

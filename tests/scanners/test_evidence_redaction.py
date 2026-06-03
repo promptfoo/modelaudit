@@ -72,14 +72,21 @@ def test_redacts_quoted_authorization_key_values() -> None:
 
 def test_redacts_bare_quoted_authorization_values() -> None:
     """Bare Authorization assignments with quoted values should be redacted."""
-    text = 'Authorization: "Bearer AUTHSECRET123" proxy_authorization="Basic PROXYAUTHSECRET123" safe="value"'
+    text = (
+        'Authorization: "Bearer AUTHSECRET123" '
+        'proxy_authorization="Basic PROXYAUTHSECRET123" '
+        "proxy_authorization=Basic PROXYBARESECRET123 "
+        'safe="value"'
+    )
 
     redacted = redact_evidence_string(text, max_chars=500)
 
     assert "AUTHSECRET123" not in redacted
     assert "PROXYAUTHSECRET123" not in redacted
+    assert "PROXYBARESECRET123" not in redacted
     assert f'Authorization: "{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert f'proxy_authorization="{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f"proxy_authorization={REDACTED_EVIDENCE_VALUE}" in redacted
     assert 'safe="value"' in redacted
 
 
@@ -152,7 +159,16 @@ def test_redacts_unterminated_prefixed_quoted_assignments() -> None:
 
     assert "TRUNCATEDSECRET123" not in redacted
     assert f'api_key=f"{REDACTED_EVIDENCE_VALUE}"' in redacted
-    assert "requests.get" in redacted
+    assert "requests.get" not in redacted
+
+
+def test_redacts_unterminated_multiword_quoted_assignments() -> None:
+    """Truncated quoted assignments should consume multi-word secret suffixes."""
+    redacted = redact_evidence_string('api_key="BEGIN PRIVATE KEY', max_chars=500)
+
+    assert "BEGIN" not in redacted
+    assert "PRIVATE KEY" not in redacted
+    assert redacted == f'api_key="{REDACTED_EVIDENCE_VALUE}"'
 
 
 @pytest.mark.parametrize(
