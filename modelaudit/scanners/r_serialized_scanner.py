@@ -20,12 +20,23 @@ from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 _DECODE_INCONCLUSIVE_REASON = "r_serialized_decode_incomplete"
 _READ_INCONCLUSIVE_REASON = "r_serialized_read_failed"
 _STRING_EXTRACTION_INCONCLUSIVE_REASON = "r_serialized_string_extraction_incomplete"
-_R_CREDENTIAL_KEY_PATTERN = r"(?:api[_-]?key|token|secret|password)"
+_R_CREDENTIAL_KEY_PATTERN = (
+    r"(?:[a-z0-9]+[_-])*"
+    r"(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|password|"
+    r"passwd|private[_-]?key|refresh[_-]?token|secret|secret[_-]?key|token)"
+)
+_R_BACKTICK_CREDENTIAL_KEY_PATTERN = (
+    r"(?:[a-z0-9]+[\s_-]+)*"
+    r"(?:access[\s_-]*key|access[\s_-]*token|api[\s_-]*key|apikey|auth[\s_-]*token|client[\s_-]*secret|"
+    r"password|passwd|private[\s_-]*key|refresh[\s_-]*token|secret|secret[\s_-]*key|token)"
+)
+_R_CREDENTIAL_IDENTIFIER = rf"(?:`{_R_BACKTICK_CREDENTIAL_KEY_PATTERN}`|\b{_R_CREDENTIAL_KEY_PATTERN}\b)"
+_R_QUOTED_CREDENTIAL_VALUE = r"""(?:"(?:\\.|[^"\\]){6,}"|'(?:\\.|[^'\\]){6,}')"""
 _R_CREDENTIAL_ASSIGNMENT_RE = re.compile(
     rf"""(?ix)(?:
-        \b{_R_CREDENTIAL_KEY_PATTERN}\s*(?::|=|<{{1,2}}-)\s*["'][^"']{{6,}}["']
+        {_R_CREDENTIAL_IDENTIFIER}\s*(?::|=|<{{1,2}}-)\s*{_R_QUOTED_CREDENTIAL_VALUE}
         |
-        ["'][^"']{{6,}}["']\s*->{{1,2}}\s*\b{_R_CREDENTIAL_KEY_PATTERN}
+        {_R_QUOTED_CREDENTIAL_VALUE}\s*->{{1,2}}\s*{_R_CREDENTIAL_IDENTIFIER}
     )"""
 )
 

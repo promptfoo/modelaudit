@@ -82,3 +82,21 @@ def test_redacts_r_rightward_assignment_operators() -> None:
     assert f"'{REDACTED_EVIDENCE_VALUE}' -> token" in redacted
     assert f'"{REDACTED_EVIDENCE_VALUE}" ->> password' in redacted
     assert f"{REDACTED_EVIDENCE_VALUE} -> service_token" in redacted
+
+
+def test_redacts_escaped_and_backticked_r_assignments() -> None:
+    """Escaped quoted values and backticked R identifiers should not leak secrets."""
+    redacted = redact_evidence_string(
+        r"""token <- "ABC\"ESCAPED_SECRET" `access-token` <- 'BACKTICK_LEFT' """
+        + '"BACKTICK_RIGHT" -> `client-secret`; `api key` <- "SPACED_BACKTICK"',
+        max_chars=500,
+    )
+
+    assert "ESCAPED_SECRET" not in redacted
+    assert "BACKTICK_LEFT" not in redacted
+    assert "BACKTICK_RIGHT" not in redacted
+    assert "SPACED_BACKTICK" not in redacted
+    assert f'token <- "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f"`access-token` <- '{REDACTED_EVIDENCE_VALUE}'" in redacted
+    assert f'"{REDACTED_EVIDENCE_VALUE}" -> `client-secret`' in redacted
+    assert f'`api key` <- "{REDACTED_EVIDENCE_VALUE}"' in redacted

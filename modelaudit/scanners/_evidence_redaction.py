@@ -47,22 +47,32 @@ SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|credential|"
     r"password|passwd|private[_-]?key|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
 )
+SENSITIVE_BACKTICK_ASSIGNMENT_KEY: Final[str] = (
+    r"(?:[a-z0-9]+[\s_-]+)*"
+    r"(?:access[\s_-]*key|access[\s_-]*token|api[\s_-]*key|apikey|auth[\s_-]*token|client[\s_-]*secret|"
+    r"credential|password|passwd|private[\s_-]*key|refresh[\s_-]*token|sas|secret|secret[\s_-]*key|"
+    r"signature|sig|token)"
+)
+SENSITIVE_ASSIGNMENT_IDENTIFIER: Final[str] = (
+    rf"(?:`{SENSITIVE_BACKTICK_ASSIGNMENT_KEY}`|\b{SENSITIVE_ASSIGNMENT_KEY}\b)"
+)
 SENSITIVE_ASSIGNMENT_OPERATOR: Final[str] = r"(?:[:=]|<{1,2}-)"
+QUOTED_EVIDENCE_VALUE: Final[str] = r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')"""
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?)" r"[^\s\"';&|]+"
 )
 BEARER_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{SENSITIVE_ASSIGNMENT_OPERATOR}\s*)[^\s\"';&|]+"
+    rf"(?i)({SENSITIVE_ASSIGNMENT_IDENTIFIER}\s*{SENSITIVE_ASSIGNMENT_OPERATOR}\s*)[^\s\"';&|]+"
 )
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*{SENSITIVE_ASSIGNMENT_OPERATOR}\s*)([\"']).*?\3"
+    rf"(?i)({SENSITIVE_ASSIGNMENT_IDENTIFIER}\s*{SENSITIVE_ASSIGNMENT_OPERATOR}\s*)({QUOTED_EVIDENCE_VALUE})"
 )
 RIGHTWARD_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)[^\s\"';&|]+(\s*->{{1,2}}\s*{SENSITIVE_ASSIGNMENT_KEY}\b)"
+    rf"(?i)[^\s\"';&|]+(\s*->{{1,2}}\s*{SENSITIVE_ASSIGNMENT_IDENTIFIER})"
 )
 QUOTED_RIGHTWARD_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"""(?i)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')(\s*->{{1,2}}\s*{SENSITIVE_ASSIGNMENT_KEY}\b)"""
+    rf"(?i)({QUOTED_EVIDENCE_VALUE})(\s*->{{1,2}}\s*{SENSITIVE_ASSIGNMENT_IDENTIFIER})"
 )
 
 
@@ -110,7 +120,7 @@ def _redact_url(match: re.Match[str]) -> str:
 
 
 def _redact_quoted_assignment(match: re.Match[str]) -> str:
-    quote = match.group(3)
+    quote = match.group(2)[0]
     return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 

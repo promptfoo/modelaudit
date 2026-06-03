@@ -587,7 +587,7 @@ def test_scan_redacts_rightward_assignment_payload_samples(tmp_path: Path) -> No
                 "expression",
                 "language",
                 "base::system('curl'); 'R_TOKEN_RIGHTWARD' -> token; "
-                '"R_PASS_RIGHTWARD" ->> password; R_BARE_RIGHTWARD -> access_token',
+                + '"R_PASS_RIGHTWARD" ->> password; R_BARE_RIGHTWARD -> access_token',
             ]
         ),
     )
@@ -613,12 +613,47 @@ def test_scan_redacts_rightward_assignment_payload_samples(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize(
+    ("assignment", "secret"),
+    [
+        (r'token <- "ABC\"ESCAPED_SECRET"', "ESCAPED_SECRET"),
+        ('`access-token` <- "BACKTICK_LEFT_SECRET"', "BACKTICK_LEFT_SECRET"),
+        ('"BACKTICK_RIGHT_SECRET" -> `client-secret`', "BACKTICK_RIGHT_SECRET"),
+        ('`access token` <- "SPACED_BACKTICK_SECRET"', "SPACED_BACKTICK_SECRET"),
+    ],
+)
+def test_scan_redacts_complex_r_assignment_payload_samples(tmp_path: Path, assignment: str, secret: str) -> None:
+    path = tmp_path / "complex-assignment-sample-leak.rds"
+    _write_raw_r_serialized(path, f"expression\nlanguage\nbase::system('curl'); {assignment}")
+
+    result = RSerializedScanner().scan(str(path))
+
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    assert len(symbol_checks) == 1
+    payload_checks = _check_by_name(result, "Serialized Expression Payload Detection")
+    assert len(payload_checks) == 1
+    samples = [
+        symbol_checks[0].details["examples"][0]["sample"],
+        payload_checks[0].details["examples"][0]["sample"],
+    ]
+
+    for sample in samples:
+        assert "<redacted>" in sample
+        assert secret not in sample
+
+
+@pytest.mark.parametrize(
     "assignment",
     [
         "token <- 'LEFTWARD_SECRET'",
         "password <<- 'GLOBAL_LEFT_SECRET'",
         "'RIGHTWARD_SECRET' -> token",
         "'GLOBAL_RIGHT_SECRET' ->> password",
+        "access_token <- 'COMPOUND_LEFT_SECRET'",
+        "'COMPOUND_RIGHT_SECRET' -> client_secret",
+        "`access-token` <- 'BACKTICK_LEFT_SECRET'",
+        "'BACKTICK_RIGHT_SECRET' -> `refresh-token`",
+        "`api key` <- 'SPACED_BACKTICK_SECRET'",
+        r'token <- "ABC\"ESCAPED_SECRET"',
     ],
 )
 def test_scan_detects_native_r_credential_assignments(tmp_path: Path, assignment: str) -> None:
@@ -631,6 +666,22 @@ def test_scan_detects_native_r_credential_assignments(tmp_path: Path, assignment
     assert len(credential_checks) == 1
     assert credential_checks[0].status == CheckStatus.FAILED
     assert credential_checks[0].details["pattern_classes"] == ["generic_secret_assignment"]
+
+
+def test_scan_allows_benign_r_assignment_key_near_matches(tmp_path: Path) -> None:
+    path = tmp_path / "benign-native-assignments.rds"
+    _write_raw_r_serialized(
+        path,
+        "monkey <- 'BENIGN_VALUE'; tokenizer <- 'BENIGN_VALUE'; `not-a-tokenizer` <- 'BENIGN_VALUE'; "
+        "`not a tokenizer` <- 'BENIGN_VALUE'; signature <- 'gaussian'; credential <- 'standard'; "
+        "sas <- 'dataset-value'; sig <- 'benign-value'",
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.PASSED
 
 
 def test_scan_doc_heavy_content_with_risky_words_is_not_critical(tmp_path: Path) -> None:
