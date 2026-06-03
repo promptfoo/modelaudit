@@ -81,6 +81,22 @@ def test_redacts_malformed_userinfo_url() -> None:
     assert "https://<credentials-redacted>@[::1/path" in redacted
 
 
+def test_redacts_userinfo_for_generic_url_schemes() -> None:
+    """Credential-bearing URLs should redact userinfo across schemes."""
+    ssh_secret = "SSH_URL_SECRET"
+    postgres_secret = "POSTGRES_URL_SECRET"
+
+    redacted = redact_evidence_string(
+        f"ssh://user:{ssh_secret}@example.test/path postgres://user:{postgres_secret}@example.test/db",
+        max_chars=500,
+    )
+
+    assert ssh_secret not in redacted
+    assert postgres_secret not in redacted
+    assert "ssh://<credentials-redacted>@example.test/path" in redacted
+    assert "postgres://<credentials-redacted>@example.test/db" in redacted
+
+
 def test_existing_token_assignment_redaction_still_applies() -> None:
     """Canonical token assignments should keep their existing redaction behavior."""
     redacted = redact_evidence_string("token=CANONICALTOKEN123", max_chars=500)
@@ -119,6 +135,38 @@ def test_redacts_plural_and_value_suffixed_credential_keys() -> None:
     }
 
 
+def test_redacts_indexed_credential_keys() -> None:
+    """Indexed credential names should preserve the sensitive base key context."""
+    api_secret = "INDEXED_API_KEY_SECRET"
+    token_secret = "INDEXED_TOKEN_SECRET"
+    query_secret = "INDEXED_QUERY_SECRET"
+
+    redacted_text = redact_evidence_string(
+        f"api_key[0]={api_secret} https://example.test/model.keras?token[0]={query_secret}&ok=1",
+        max_chars=500,
+    )
+    redacted_value = redact_evidence_value(
+        {
+            "api_key[0]": api_secret,
+            "token[0]": token_secret,
+        },
+        max_string_chars=500,
+    )
+
+    serialized_value = json.dumps(redacted_value)
+    assert api_secret not in redacted_text
+    assert query_secret not in redacted_text
+    assert api_secret not in serialized_value
+    assert token_secret not in serialized_value
+    assert f"api_key[0]={REDACTED_EVIDENCE_VALUE}" in redacted_text
+    assert REDACTED_EVIDENCE_VALUE in redacted_text
+    assert "ok=1" in redacted_text
+    assert redacted_value == {
+        "api_key[0]": REDACTED_EVIDENCE_VALUE,
+        "token[0]": REDACTED_EVIDENCE_VALUE,
+    }
+
+
 def test_redacts_whitespace_separated_credential_flags() -> None:
     """CLI-style credential flags should redact the following value token."""
     api_secret = "CLI_API_KEY_SECRET"
@@ -137,6 +185,22 @@ def test_redacts_whitespace_separated_credential_flags() -> None:
     assert f"--token '{REDACTED_EVIDENCE_VALUE}'" in redacted
     assert f"--password {REDACTED_EVIDENCE_VALUE}" in redacted
     assert "--safe visible" in redacted
+
+
+def test_redacts_leading_underscore_credential_assignments() -> None:
+    """Assignment-style credential keys may start with underscores."""
+    token_secret = "LEADING_UNDERSCORE_TOKEN_SECRET"
+    api_secret = "LEADING_UNDERSCORE_API_SECRET"
+
+    redacted = redact_evidence_string(
+        f"_token={token_secret} _api_key='{api_secret}'",
+        max_chars=500,
+    )
+
+    assert token_secret not in redacted
+    assert api_secret not in redacted
+    assert f"_token={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f"_api_key='{REDACTED_EVIDENCE_VALUE}'" in redacted
 
 
 def test_redacts_access_key_id_assignments_and_nested_values() -> None:

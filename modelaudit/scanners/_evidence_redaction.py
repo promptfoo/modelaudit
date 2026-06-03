@@ -15,7 +15,7 @@ MAX_URL_QUERY_REDACTION_DEPTH: Final[int] = 8
 MAX_REDACTION_VALUE_DEPTH: Final[int] = 100
 MAX_EMBEDDED_CONTAINER_MALFORMED_COUNT: Final[int] = 64
 
-URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://[^\s\"'<>]+")
+URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+")
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "access_key",
@@ -60,17 +60,19 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
-    r"(?:[a-z0-9]+[_-])*"
+    r"_*(?:[a-z0-9]+[_-])*"
     r"(?:access[_-]?key[_-]?id|access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|"
     r"credential|"
     r"password|passwd|private[_-]?key|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
+    r"(?:\[[a-z0-9_-]{0,32}\])*"
 )
+DETAIL_KEY_PATTERN: Final[str] = r"[A-Za-z0-9_][A-Za-z0-9_-]{0,80}(?:\[[A-Za-z0-9_-]{0,32}\]){0,8}"
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?)" r"[^\s\"';&|]+"
 )
 BEARER_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 SENSITIVE_FLAG_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?P<prefix>(?:^|(?<=\s))-{1,2})(?P<key>[A-Za-z0-9_][A-Za-z0-9_-]{0,80})"
+    rf"(?P<prefix>(?:^|(?<=\s))-{{1,2}})(?P<key>{DETAIL_KEY_PATTERN})"
     r"(?P<separator>\s+)(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s\"';&|-][^\s\"';&|]*)"
 )
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
@@ -80,22 +82,22 @@ QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
 )
 QUOTED_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?P<key_quote>[\"'])(?P<key>[A-Za-z0-9_][A-Za-z0-9_-]{0,80})(?P=key_quote)"
+    rf"(?P<key_quote>[\"'])(?P<key>{DETAIL_KEY_PATTERN})(?P=key_quote)"
     r"(?P<separator>\s*:\s*)(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
 )
 GENERIC_QUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)"
+    rf"\b(?P<key>{DETAIL_KEY_PATTERN})(?P<separator>\s*[:=]\s*)"
     r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
 )
 GENERIC_CONTAINER_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
-    r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)"
+    rf"\b(?P<key>{DETAIL_KEY_PATTERN})(?P<separator>\s*[:=]\s*)"
     r"(?P<opener>[\[({])"
 )
 GENERIC_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)[^\s\"';&|]+"
+    rf"\b(?P<key>{DETAIL_KEY_PATTERN})(?P<separator>\s*[:=]\s*)[^\s\"';&|]+"
 )
 EMBEDDED_SENSITIVE_KEY_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?P<quote>[\"']?)(?P<key>[A-Za-z0-9_][A-Za-z0-9_-]{0,80})(?P=quote)\s*:"
+    rf"(?P<quote>[\"']?)(?P<key>{DETAIL_KEY_PATTERN})(?P=quote)\s*:"
 )
 SENSITIVE_DETAIL_KEY_SUFFIXES: Final[tuple[str, ...]] = (
     "accesskeyid",
@@ -421,12 +423,16 @@ def redact_evidence_string(text: str, max_chars: int = 180, *, _url_depth: int =
     return _truncate(redacted, max_chars)
 
 
+def _strip_bracket_suffixes(key: str) -> str:
+    return re.sub(r"(?:\[[^\[\]]{0,32}\])+$", "", key)
+
+
 def _canonicalize_detail_key(key: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", key.lower())
+    return re.sub(r"[^a-z0-9]+", "", _strip_bracket_suffixes(key).lower())
 
 
 def _is_sensitive_detail_key(key: str) -> bool:
-    normalized = key.lower()
+    normalized = _strip_bracket_suffixes(key).lower()
     canonical = _canonicalize_detail_key(key)
     return (
         normalized in SENSITIVE_QUERY_KEYS
