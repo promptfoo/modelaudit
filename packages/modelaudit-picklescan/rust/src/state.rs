@@ -1649,11 +1649,7 @@ impl<'a> ScanState<'a> {
                 } => Self::memo_value_for_stack(index, &value),
                 _ => value,
             };
-            let cost = self
-                .tracked_stack_value_bytes
-                .last()
-                .copied()
-                .unwrap_or_else(|| Self::stack_value_state_cost(&stack_value));
+            let cost = Self::stack_value_state_cost(&stack_value);
             self.push_stack_value_with_tracked_cost(stack_value, cost, "dup");
         }
     }
@@ -7266,6 +7262,26 @@ mod tests {
         payload.push(b'.');
 
         let scan = run_test_scan("memo-read-stack-budget.pkl", &payload, &options);
+
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.verdict, ScanVerdict::Unknown);
+        assert!(has_notice_code(&scan, "tracked_state_budget"));
+    }
+
+    #[test]
+    fn dup_of_memoized_non_reference_values_is_state_bounded() {
+        let options = default_test_options();
+        let value = "A".repeat(512 * 1024);
+        let mut payload = b"\x80\x04".to_vec();
+        append_protocol0_unicode(&mut payload, &value);
+        payload.extend_from_slice(b"q\x00");
+        payload.extend(std::iter::repeat_n(
+            b'2',
+            MAX_TRACKED_STATE_BYTES / value.len() + 2,
+        ));
+        payload.push(b'.');
+
+        let scan = run_test_scan("memoized-dup-stack-budget.pkl", &payload, &options);
 
         assert_eq!(scan.status, ScanStatus::Inconclusive);
         assert_eq!(scan.verdict, ScanVerdict::Unknown);
