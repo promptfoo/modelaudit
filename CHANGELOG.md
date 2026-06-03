@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- avoid false inconclusive Flax overlap results for complete pickle payloads with no trailing data
 - scan ONNX external data references in sparse initializers, tensor-valued attributes, and function defaults
 - avoid false-positive process-launch findings for parsed framed Python string literals
 - detect dangerous Python calls retrieved through module namespace dictionaries in ZIP and TAR members
@@ -16,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect embedded Python `asyncio.create_subprocess_*` calls and resolved JIT `subprocess` launch aliases
 - detect embedded Python `runpy.run_module`, `runpy.run_path`, and `runpy._run_module_as_main` dynamic-module execution calls
 - preserve embedded Python runpy, webbrowser, and ctypes findings across continued imports, late aliases, and bounded tail-window extraction gaps
+- mark embedded Python/JIT byte and snippet budget exhaustion as incomplete coverage instead of clean scans
 - detect embedded Python `webbrowser` launches and `ctypes` native-library loads in archives and JIT-scanned content
 - resolve embedded `ctypes` loads through more CDLL-subclass construction forms (`__new__` returning inside `try`/`for`/`while`/`with`, `super()`/`*args` initializer forwarding) and indirect loader/controller bindings (conditional, boolean, walrus, and loop-bound expressions)
 - honor benign loader/controller member overwrites spelled as `setattr(..., **{})` or starred `setattr(*(...))`
@@ -23,14 +25,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - scan dangerous RKNN safe-key metadata values instead of suppressing the whole key-value string
 - scan ONNX external data initializers in nested graphs, functions, and training graphs
 - route protocol-0 JAX checkpoint pickles through pickle opcode security checks
+- bound Orbax directory metadata parsing and checkpoint entry enumeration before scanning JAX checkpoints
 - harden legacy JAX checkpoint pickle routing against bounded-prefix bypasses and benign sidecar false positives
 - detect dangerous Python calls retrieved or installed through module namespace dictionaries in ZIP and TAR members, while avoiding comprehension-local false positives
 - preflight and stream-enforce cumulative SevenZip extraction budgets before writing oversized archives
-- mark oversized structured JSON/YAML Jinja template fields as incomplete coverage instead of clean
+- harden structured JSON/YAML/GGUF Jinja template extraction against oversized values, nested containers, and colliding template paths
 - redact capability tokens embedded in network URL path segments
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- strip JFrog credentials from untrusted redirect hops during artifact and Storage API requests
+- enforce direct Hugging Face file `--max-size` budgets before downloading
+- scan duplicate and case-varied ExecuTorch pickle ZIP members without shadowable-name or metadata-routing bypasses
+- refresh cloud cache entries that cannot be proven within the configured download size limit
+- enforce automatic cloud download size limits when remote size metadata is missing or late-bound
+- avoid importing attacker-shadowed TensorFlow protobuf packages during static scanning
 - inspect every parsed GGUF chat template when duplicate or trailing malformed metadata could otherwise hide SSTI payloads
 - bound GGUF declared metadata and tensor collections, and cap reported tensor summaries, so oversized structures fail closed without exhausting scanner resources
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
@@ -39,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
+- fail closed when cloud directory metadata cannot be read for every listed object
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
 - detect external references in weights-only Keras HDF5 layouts without Keras metadata
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
@@ -59,6 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve per-shard metadata when aggregating sharded model families
 - prevent picklescan call-graph alias cycles from hanging scans
 - preserve HuggingFace snapshot shard paths while grouping cache-backed families
+- fail closed when Hugging Face repository listings contain no recognized scannable files instead of downloading the full repository
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - classify unavailable manifest and ML text reads as inconclusive rather than security findings, including routing, preflight, and stale cache transitions
 - classify unavailable manifest cloud-reference inspection as inconclusive rather than reporting complete coverage
