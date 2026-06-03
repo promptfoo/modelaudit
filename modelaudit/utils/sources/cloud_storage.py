@@ -37,6 +37,7 @@ _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECAS
 _CLOUD_CONTENT_SNIFF_BYTES = 8 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
+_MSGPACK_CONTAINER_MARKERS = frozenset((*range(0x80, 0x90), 0xDE, 0xDF))
 
 
 def _run_coroutine_sync(coro_factory: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
@@ -622,6 +623,84 @@ def _read_cloud_content_prefix(fs: Any, file_url: str, max_bytes: int) -> bytes:
         ) from exc
 
 
+def _read_cloud_content_range(fs: Any, file_url: str, offset: int, max_bytes: int) -> bytes:
+    """Read a bounded remote byte range or fail closed with a redacted error."""
+    try:
+        with fs.open(file_url, "rb") as remote_file:
+            remote_file.seek(offset)
+            payload = remote_file.read(max_bytes)
+            if not isinstance(payload, bytes):
+                raise TypeError("cloud filesystem returned non-bytes content")
+            return payload
+    except Exception as exc:
+        raise ValueError(
+            "Cloud directory selective filtering incomplete: unable to inspect skipped object "
+            f"{redact_url_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+        ) from exc
+
+
+def _detect_cloud_shared_skip_filter_route(
+    fs: Any,
+    file_url: str,
+    prefix: bytes,
+    size: int,
+    *,
+    size_is_known: bool,
+) -> str | None:
+    """Route skipped cloud objects through the same bounded detector as local skips."""
+    from modelaudit.utils.file.detection import (
+        _COREML_PROTO_SIGNATURE_READ_BYTES,
+        FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+        LLAMAFILE_ROUTE_SCAN_BYTES,
+        LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+        MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+        _could_start_coreml_model_proto,
+        _is_executorch_binary_signature,
+        _is_supported_llamafile_executable_header,
+        detect_file_format_for_skip_filter,
+    )
+
+    probe_size = _CLOUD_CONTENT_SNIFF_BYTES
+    if prefix.lstrip().startswith((b"{", b"[")):
+        probe_size = max(probe_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
+    if prefix and prefix[0] in _MSGPACK_CONTAINER_MARKERS:
+        probe_size = max(probe_size, FLAX_MSGPACK_STRUCTURE_READ_BYTES)
+    if _could_start_coreml_model_proto(prefix[:16]):
+        probe_size = max(probe_size, _COREML_PROTO_SIGNATURE_READ_BYTES)
+    if _is_executorch_binary_signature(prefix[:8]):
+        probe_size = max(probe_size, 64 * 1024)
+    if _is_supported_llamafile_executable_header(prefix[:4]):
+        probe_size = max(probe_size, LLAMAFILE_ROUTE_SCAN_BYTES)
+
+    if size_is_known:
+        probe_size = min(size, probe_size)
+
+    probe = prefix
+    if len(probe) < probe_size:
+        probe = _read_cloud_content_prefix(fs, file_url, probe_size)
+
+    tail: bytes | None = None
+    tail_offset: int | None = None
+    if size_is_known and size > LLAMAFILE_ROUTE_SCAN_BYTES and _is_supported_llamafile_executable_header(prefix[:4]):
+        tail_size = min(size, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES)
+        tail_offset = size - tail_size
+        tail = _read_cloud_content_range(fs, file_url, tail_offset, tail_size)
+
+    basename = _cloud_url_basename(file_url) or "cloud-object"
+    with tempfile.TemporaryDirectory(prefix="modelaudit_cloud_probe_") as temp_dir:
+        probe_path = Path(temp_dir) / Path(basename).name
+        with probe_path.open("wb") as handle:
+            handle.write(probe)
+            if tail is not None and tail_offset is not None:
+                handle.seek(tail_offset)
+                handle.write(tail)
+            if size_is_known and size > probe_path.stat().st_size:
+                handle.truncate(size)
+
+        detected_format = detect_file_format_for_skip_filter(str(probe_path))
+        return None if detected_format == "unknown" else detected_format
+
+
 def _is_cloud_safetensors_routing_candidate(
     fs: Any,
     file_url: str,
@@ -778,7 +857,16 @@ def _detect_cloud_content_route_format(fs: Any, file_info: dict[str, Any]) -> st
                 "Cloud directory selective filtering incomplete: unable to classify skipped ZIP object "
                 f"{redact_url_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
             ) from exc
-    return None if detected_format == "unknown" else detected_format
+    if detected_format != "unknown":
+        return detected_format
+
+    return _detect_cloud_shared_skip_filter_route(
+        fs,
+        file_url,
+        prefix,
+        size,
+        size_is_known=size_is_known,
+    )
 
 
 def _filter_scannable_cloud_files(
