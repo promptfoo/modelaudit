@@ -67,6 +67,7 @@ class TestJFrogDownload:
     def test_download_success(self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # Mock successful response
         mock_response = mock_get.return_value
+        mock_response.status_code = 200
         mock_response.raise_for_status.return_value = None
         mock_response.headers = {"Content-Length": "4"}
         mock_response.iter_content.return_value = [b"data"]
@@ -83,6 +84,7 @@ class TestJFrogDownload:
         call_args = mock_get.call_args
         assert "X-JFrog-Art-Api" in call_args[1]["headers"]
         assert call_args[1]["headers"]["X-JFrog-Art-Api"] == "test-token"
+        assert call_args[1]["allow_redirects"] is False
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_download_rejects_content_length_over_max_size(
@@ -236,6 +238,7 @@ class TestJFrogDownload:
     def test_authentication_methods(self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test different authentication methods."""
         mock_response = mock_get.return_value
+        mock_response.status_code = 200
         mock_response.raise_for_status.return_value = None
         mock_response.iter_content.return_value = [b"data"]
         monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
@@ -260,6 +263,7 @@ class TestJFrogDownload:
     ) -> None:
         """Explicit caller credentials should not be shadowed by ambient env tokens."""
         mock_response = mock_get.return_value
+        mock_response.status_code = 200
         mock_response.raise_for_status.return_value = None
         mock_response.iter_content.return_value = [b"data"]
         monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
@@ -278,6 +282,7 @@ class TestJFrogDownload:
     def test_environment_variables(self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test authentication via environment variables."""
         mock_response = mock_get.return_value
+        mock_response.status_code = 200
         mock_response.raise_for_status.return_value = None
         mock_response.iter_content.return_value = [b"data"]
         monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
@@ -301,6 +306,7 @@ class TestJFrogDownload:
     ) -> None:
         """Credentials should not be sent to arbitrary JFrog SaaS tenants."""
         mock_response = mock_get.return_value
+        mock_response.status_code = 200
         mock_response.raise_for_status.return_value = None
         mock_response.iter_content.return_value = [b"data"]
         monkeypatch.setenv("JFROG_API_TOKEN", "env-api-token")
@@ -321,6 +327,243 @@ class TestJFrogDownload:
         assert "env-api-token" not in caplog.text
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_parser_confused_initial_jfrog_url_receives_no_credentials(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Parser-confused initial URLs must be rejected before any request is sent."""
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        with pytest.raises(ValueError, match="Not a JFrog URL"):
+            download_artifact(
+                "https://evil.example\\@company.jfrog.io/artifactory/repo/model.bin",
+                cache_dir=tmp_path,
+                api_token="test-token",
+            )
+
+        mock_get.assert_not_called()
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_untrusted_download_redirect_strips_credentials(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """API tokens must not be forwarded to an untrusted redirect target."""
+        redirect_response = MagicMock(spec=requests.Response)
+        redirect_response.status_code = 302
+        redirect_response.headers = {"Location": "https://evil.example/artifacts/model.bin"}
+        final_response = MagicMock(spec=requests.Response)
+        final_response.status_code = 200
+        final_response.headers = {}
+        final_response.raise_for_status.return_value = None
+        final_response.iter_content.return_value = [b"data"]
+        mock_get.side_effect = [redirect_response, final_response]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        result = download_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            cache_dir=tmp_path,
+            api_token="test-token",
+        )
+
+        assert result.read_bytes() == b"data"
+        assert mock_get.call_args_list[0].kwargs["headers"] == {"X-JFrog-Art-Api": "test-token"}
+        assert mock_get.call_args_list[1].args[0] == "https://evil.example/artifacts/model.bin"
+        assert mock_get.call_args_list[1].kwargs["headers"] == {}
+        assert all(call.kwargs["allow_redirects"] is False for call in mock_get.call_args_list)
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_untrusted_download_redirect_enforces_streaming_budget(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Redirected bodies must remain capped after credentials are stripped."""
+        redirect_response = MagicMock(spec=requests.Response)
+        redirect_response.status_code = 302
+        redirect_response.headers = {"Location": "https://evil.example/artifacts/model.bin"}
+        final_response = MagicMock(spec=requests.Response)
+        final_response.status_code = 200
+        final_response.headers = {}
+        final_response.raise_for_status.return_value = None
+        final_response.iter_content.return_value = [b"123", b"456"]
+        mock_get.side_effect = [redirect_response, final_response]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        with pytest.raises(Exception, match="exceeds maximum allowed size"):
+            download_artifact(
+                "https://company.jfrog.io/artifactory/repo/model.bin",
+                cache_dir=tmp_path,
+                api_token="test-token",
+                max_size=5,
+            )
+
+        assert mock_get.call_args_list[0].kwargs["headers"] == {"X-JFrog-Art-Api": "test-token"}
+        assert mock_get.call_args_list[1].kwargs["headers"] == {}
+        assert not any(tmp_path.iterdir())
+        redirect_response.close.assert_called_once_with()
+        final_response.close.assert_called_once_with()
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_parser_confused_redirect_strips_credentials(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Redirect trust must use the effective Requests destination host."""
+        redirect_response = MagicMock(spec=requests.Response)
+        redirect_response.status_code = 302
+        redirect_response.headers = {"Location": "https://evil.example\\@company.jfrog.io/artifacts/model.bin"}
+        final_response = MagicMock(spec=requests.Response)
+        final_response.status_code = 200
+        final_response.headers = {}
+        final_response.raise_for_status.return_value = None
+        final_response.iter_content.return_value = [b"data"]
+        mock_get.side_effect = [redirect_response, final_response]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        result = download_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            cache_dir=tmp_path,
+            api_token="test-token",
+        )
+
+        assert result.read_bytes() == b"data"
+        assert mock_get.call_args_list[0].kwargs["headers"] == {"X-JFrog-Art-Api": "test-token"}
+        assert mock_get.call_args_list[1].args[0] == "https://evil.example\\@company.jfrog.io/artifacts/model.bin"
+        assert mock_get.call_args_list[1].kwargs["headers"] == {}
+        assert all(call.kwargs["allow_redirects"] is False for call in mock_get.call_args_list)
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_trusted_download_redirect_preserves_credentials(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Credentials can be reused when a redirect target is explicitly trusted."""
+        redirect_response = MagicMock(spec=requests.Response)
+        redirect_response.status_code = 307
+        redirect_response.headers = {"Location": "/artifactory/repo/model.bin?download=1"}
+        final_response = MagicMock(spec=requests.Response)
+        final_response.status_code = 200
+        final_response.headers = {}
+        final_response.raise_for_status.return_value = None
+        final_response.iter_content.return_value = [b"data"]
+        mock_get.side_effect = [redirect_response, final_response]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        result = download_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            cache_dir=tmp_path,
+            api_token="test-token",
+        )
+
+        assert result.read_bytes() == b"data"
+        assert mock_get.call_args_list[1].args[0] == ("https://company.jfrog.io/artifactory/repo/model.bin?download=1")
+        assert mock_get.call_args_list[1].kwargs["headers"] == {"X-JFrog-Art-Api": "test-token"}
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_redirect_preserves_response_cookies(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Manual redirects should preserve stickiness/session cookies through the cookie jar."""
+        redirect_response = MagicMock(spec=requests.Response)
+        redirect_response.status_code = 302
+        redirect_response.headers = {"Location": "/artifactory/repo/model.bin?node=1"}
+        redirect_response.cookies = requests.cookies.cookiejar_from_dict({"ROUTEID": "backend-a"})
+        final_response = MagicMock(spec=requests.Response)
+        final_response.status_code = 200
+        final_response.headers = {}
+        final_response.raise_for_status.return_value = None
+        final_response.iter_content.return_value = [b"data"]
+        mock_get.side_effect = [redirect_response, final_response]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        result = download_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            cache_dir=tmp_path,
+            api_token="test-token",
+        )
+
+        assert result.read_bytes() == b"data"
+        first_cookie_jar = mock_get.call_args_list[0].kwargs["cookies"]
+        second_cookie_jar = mock_get.call_args_list[1].kwargs["cookies"]
+        assert first_cookie_jar is second_cookie_jar
+        assert second_cookie_jar.get("ROUTEID") == "backend-a"
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_redirect_isolates_cookies_across_trust_boundaries(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Trusted JFrog cookies must not cross an untrusted redirect hop."""
+        trusted_redirect = MagicMock(spec=requests.Response)
+        trusted_redirect.status_code = 302
+        trusted_redirect.headers = {"Location": "https://evil.example/artifacts/model.bin"}
+        trusted_redirect.cookies = requests.cookies.cookiejar_from_dict({"JFROG_SESSION": "trusted-session"})
+        untrusted_redirect = MagicMock(spec=requests.Response)
+        untrusted_redirect.status_code = 302
+        untrusted_redirect.headers = {"Location": "https://company.jfrog.io/artifactory/repo/model.bin?node=1"}
+        untrusted_redirect.cookies = requests.cookies.cookiejar_from_dict({"EVIL_SESSION": "untrusted-session"})
+        final_response = MagicMock(spec=requests.Response)
+        final_response.status_code = 200
+        final_response.headers = {}
+        final_response.raise_for_status.return_value = None
+        final_response.iter_content.return_value = [b"data"]
+        mock_get.side_effect = [trusted_redirect, untrusted_redirect, final_response]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        result = download_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            cache_dir=tmp_path,
+            api_token="test-token",
+        )
+
+        assert result.read_bytes() == b"data"
+        trusted_cookie_jar = mock_get.call_args_list[0].kwargs["cookies"]
+        untrusted_cookie_jar = mock_get.call_args_list[1].kwargs["cookies"]
+        returning_trusted_cookie_jar = mock_get.call_args_list[2].kwargs["cookies"]
+        assert trusted_cookie_jar is returning_trusted_cookie_jar
+        assert trusted_cookie_jar is not untrusted_cookie_jar
+        assert trusted_cookie_jar.get("JFROG_SESSION") == "trusted-session"
+        assert trusted_cookie_jar.get("EVIL_SESSION") is None
+        assert untrusted_cookie_jar.get("JFROG_SESSION") is None
+        assert untrusted_cookie_jar.get("EVIL_SESSION") == "untrusted-session"
+        assert mock_get.call_args_list[1].kwargs["headers"] == {}
+        assert mock_get.call_args_list[2].kwargs["headers"] == {"X-JFrog-Art-Api": "test-token"}
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_redirect_without_location_fails_closed(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Redirect responses without a target must not be scanned as artifact bodies."""
+        redirect_response = MagicMock(spec=requests.Response)
+        redirect_response.status_code = 302
+        redirect_response.headers = {}
+        mock_get.return_value = redirect_response
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        with pytest.raises(Exception, match="JFrog redirect response missing Location header"):
+            download_artifact(
+                "https://company.jfrog.io/artifactory/repo/model.bin",
+                cache_dir=tmp_path,
+                api_token="test-token",
+            )
+
+        redirect_response.close.assert_called_once_with()
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_malformed_redirect_location_closes_response(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Malformed redirect targets must not leave streamed responses open."""
+        redirect_response = MagicMock(spec=requests.Response)
+        redirect_response.status_code = 302
+        redirect_response.headers = {"Location": "https://[::1"}
+        mock_get.return_value = redirect_response
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        with pytest.raises(Exception, match="Invalid IPv6 URL"):
+            download_artifact(
+                "https://company.jfrog.io/artifactory/repo/model.bin",
+                cache_dir=tmp_path,
+                api_token="test-token",
+            )
+
+        redirect_response.close.assert_called_once_with()
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_http_jfrog_saas_url_is_rejected_before_credentials(
         self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -338,6 +581,7 @@ class TestJFrogDownload:
     ) -> None:
         """Storage API probing should share the same credential forwarding policy."""
         mock_response = mock_get.return_value
+        mock_response.status_code = 200
         mock_response.raise_for_status.return_value = None
         mock_response.json.return_value = {"repo": "public-repo", "path": "/model.bin", "size": 12}
         monkeypatch.setenv("JFROG_API_TOKEN", "env-api-token")
@@ -351,11 +595,66 @@ class TestJFrogDownload:
         assert mock_get.call_args[1]["headers"] == {}
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_storage_api_untrusted_redirect_strips_credentials(
+        self, mock_get: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Storage API redirects must not forward credentials to untrusted hosts."""
+        redirect_response = MagicMock(spec=requests.Response)
+        redirect_response.status_code = 302
+        redirect_response.headers = {"Location": "https://evil.example/storage/model.bin"}
+        final_response = MagicMock(spec=requests.Response)
+        final_response.status_code = 200
+        final_response.headers = {}
+        final_response.raise_for_status.return_value = None
+        final_response.json.return_value = {"repo": "repo", "path": "/model.bin", "size": 12}
+        mock_get.side_effect = [redirect_response, final_response]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        result = detect_jfrog_target_type(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            api_token="test-token",
+        )
+
+        assert result["type"] == "file"
+        assert mock_get.call_args_list[0].kwargs["headers"] == {"X-JFrog-Art-Api": "test-token"}
+        assert mock_get.call_args_list[1].args[0] == "https://evil.example/storage/model.bin"
+        assert mock_get.call_args_list[1].kwargs["headers"] == {}
+        assert all(call.kwargs["allow_redirects"] is False for call in mock_get.call_args_list)
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_storage_api_parser_confused_redirect_strips_credentials(
+        self, mock_get: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Storage API redirects share the effective-destination host check."""
+        redirect_response = MagicMock(spec=requests.Response)
+        redirect_response.status_code = 302
+        redirect_response.headers = {"Location": "https://evil.example\\@company.jfrog.io/storage/model.bin"}
+        final_response = MagicMock(spec=requests.Response)
+        final_response.status_code = 200
+        final_response.headers = {}
+        final_response.raise_for_status.return_value = None
+        final_response.json.return_value = {"repo": "repo", "path": "/model.bin", "size": 12}
+        mock_get.side_effect = [redirect_response, final_response]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        result = detect_jfrog_target_type(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            api_token="test-token",
+        )
+
+        assert result["type"] == "file"
+        assert mock_get.call_args_list[0].kwargs["headers"] == {"X-JFrog-Art-Api": "test-token"}
+        assert mock_get.call_args_list[1].args[0] == "https://evil.example\\@company.jfrog.io/storage/model.bin"
+        assert mock_get.call_args_list[1].kwargs["headers"] == {}
+        assert all(call.kwargs["allow_redirects"] is False for call in mock_get.call_args_list)
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_storage_api_explicit_access_token_precedes_environment_api_token(
         self, mock_get: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Explicit Storage API access tokens should not be shadowed by env API tokens."""
         mock_response = mock_get.return_value
+        mock_response.status_code = 200
         mock_response.raise_for_status.return_value = None
         mock_response.json.return_value = {"repo": "repo", "path": "/model.bin", "size": 12}
         monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
@@ -370,9 +669,15 @@ class TestJFrogDownload:
         assert mock_get.call_args[1]["headers"] == {"Authorization": "Bearer explicit-access-token"}
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
-    def test_no_authentication(self, mock_get, tmp_path, caplog):
+    def test_no_authentication(
+        self,
+        mock_get: MagicMock,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         """Test anonymous access when no authentication is provided."""
         mock_response = mock_get.return_value
+        mock_response.status_code = 200
         mock_response.raise_for_status.return_value = None
         mock_response.iter_content.return_value = [b"data"]
 

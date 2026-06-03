@@ -8,9 +8,10 @@ import re
 import shutil
 import tempfile
 from collections.abc import Collection
+from http.cookiejar import CookieJar
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TypedDict
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import click
 import requests
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 # Constants
 MAX_RECURSION_DEPTH = 64  # Prevent runaway recursion in folder traversal
 JFROG_DOWNLOAD_CHUNK_SIZE = 8192
+_MAX_JFROG_REDIRECTS = 5
+_JFROG_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
     r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|secret|api-key|api_key|apikey|sig)[^=\s&]*=)[^\s&#]+",
     re.IGNORECASE,
@@ -139,6 +142,8 @@ def is_jfrog_url(url: str) -> bool:
     """Check if a URL points to a JFrog Artifactory file or folder."""
     parsed = urlparse(url)
     hostname = _normalize_hostname(parsed.hostname or "")
+    if not hostname or hostname != _get_requests_prepared_hostname(url):
+        return False
     if parsed.scheme != "https" and not (parsed.scheme == "http" and _is_local_jfrog_host(hostname)):
         return False
     if "/artifactory/" not in parsed.path:
@@ -192,6 +197,19 @@ def _is_jfrog_service_host(hostname: str) -> bool:
     return hostname == "jfrog.io" or hostname.endswith(".jfrog.io") or _is_local_jfrog_host(hostname)
 
 
+def _get_requests_prepared_hostname(url: str) -> str:
+    """Return the hostname Requests will connect to after URL preparation."""
+    try:
+        prepared_url = requests.Request("GET", url).prepare().url
+    except requests.exceptions.RequestException:
+        return ""
+
+    if not prepared_url:
+        return ""
+
+    return _normalize_hostname(urlparse(prepared_url).hostname or "")
+
+
 def _is_trusted_jfrog_auth_target(url: str) -> bool:
     """Return True when credentials may be sent to this JFrog URL."""
     parsed = urlparse(url)
@@ -199,7 +217,8 @@ def _is_trusted_jfrog_auth_target(url: str) -> bool:
         return False
 
     hostname = _normalize_hostname(parsed.hostname or "")
-    return bool(hostname and hostname in _get_trusted_jfrog_hosts())
+    prepared_hostname = _get_requests_prepared_hostname(url)
+    return bool(hostname and hostname == prepared_hostname and hostname in _get_trusted_jfrog_hosts())
 
 
 def _build_jfrog_auth_headers(
@@ -303,6 +322,51 @@ def _cleanup_failed_artifact_download(temp_dir: Path | None, partial_path: Path 
             partial_path.unlink()
 
 
+def _get_with_jfrog_redirect_policy(
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout: int,
+    stream: bool = False,
+) -> requests.Response:
+    """GET a JFrog URL while isolating credentials from untrusted redirects."""
+    current_url = url
+    current_headers = headers
+    current_is_trusted = _is_trusted_jfrog_auth_target(url)
+    trusted_redirect_cookies = requests.cookies.RequestsCookieJar()
+    untrusted_redirect_cookies = requests.cookies.RequestsCookieJar()
+    for _redirect_count in range(_MAX_JFROG_REDIRECTS + 1):
+        current_cookies = trusted_redirect_cookies if current_is_trusted else untrusted_redirect_cookies
+        response = requests.get(
+            current_url,
+            headers=current_headers,
+            cookies=current_cookies,
+            timeout=timeout,
+            stream=stream,
+            allow_redirects=False,
+        )
+        if response.status_code not in _JFROG_REDIRECT_STATUS_CODES:
+            return response
+
+        location = response.headers.get("Location")
+        response_cookies = getattr(response, "cookies", None)
+        if isinstance(response_cookies, CookieJar):
+            requests.cookies.merge_cookies(current_cookies, response_cookies)
+        response.close()
+        if not location:
+            raise requests.exceptions.RequestException(
+                f"JFrog redirect response missing Location header for {redact_jfrog_url_for_display(current_url)}"
+            )
+
+        current_url = urljoin(current_url, location)
+        current_is_trusted = _is_trusted_jfrog_auth_target(current_url)
+        current_headers = headers if current_is_trusted else {}
+
+    raise requests.exceptions.TooManyRedirects(
+        f"Exceeded {_MAX_JFROG_REDIRECTS} redirects for JFrog URL {redact_jfrog_url_for_display(url)}"
+    )
+
+
 def download_artifact(
     url: str,
     cache_dir: Path | None = None,
@@ -372,7 +436,7 @@ def download_artifact(
     response: requests.Response | None = None
     try:
         # Use requests for proper authentication and error handling
-        response = requests.get(
+        response = _get_with_jfrog_redirect_policy(
             url,
             headers=headers,
             timeout=timeout,
@@ -541,7 +605,7 @@ def detect_jfrog_target_type(
     headers = _build_jfrog_auth_headers(storage_api_url, api_token=api_token, access_token=access_token)
 
     try:
-        response = requests.get(storage_api_url, headers=headers, timeout=timeout)
+        response = _get_with_jfrog_redirect_policy(storage_api_url, headers=headers, timeout=timeout)
         response.raise_for_status()
 
         data = response.json()
