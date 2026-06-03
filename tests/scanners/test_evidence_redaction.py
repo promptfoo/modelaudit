@@ -56,23 +56,30 @@ def test_redacts_quoted_key_values_with_escaped_delimiters() -> None:
 
 def test_redacts_quoted_authorization_key_values() -> None:
     """Quoted Authorization headers should not preserve credential values."""
-    text = 'headers={"Authorization": "Basic BASICSECRET123", "safe": "value"}'
+    text = (
+        'headers={"Authorization": "Basic BASICSECRET123", '
+        '"Proxy-Authorization": "Basic PROXYBASICSECRET123", "safe": "value"}'
+    )
 
     redacted = redact_evidence_string(text, max_chars=500)
 
     assert "BASICSECRET123" not in redacted
+    assert "PROXYBASICSECRET123" not in redacted
     assert f'"Authorization": "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f'"Proxy-Authorization": "{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert '"safe": "value"' in redacted
 
 
 def test_redacts_bare_quoted_authorization_values() -> None:
     """Bare Authorization assignments with quoted values should be redacted."""
-    text = 'Authorization: "Bearer AUTHSECRET123" safe="value"'
+    text = 'Authorization: "Bearer AUTHSECRET123" proxy_authorization="Basic PROXYAUTHSECRET123" safe="value"'
 
     redacted = redact_evidence_string(text, max_chars=500)
 
     assert "AUTHSECRET123" not in redacted
+    assert "PROXYAUTHSECRET123" not in redacted
     assert f'Authorization: "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f'proxy_authorization="{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert 'safe="value"' in redacted
 
 

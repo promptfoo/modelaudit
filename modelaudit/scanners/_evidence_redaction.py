@@ -56,10 +56,10 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
 SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[_-])*"
     r"(?:access[_-]?key[_-]?id|access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|"
-    r"client[_-]?secret|credential|password|passwd|private[_-]?key|refresh[_-]?token|sas|secret|"
-    r"secret[_-]?key|signature|sig|token)"
+    r"authorization|client[_-]?secret|credential|password|passwd|private[_-]?key|proxy[_-]?authorization|"
+    r"refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
 )
-QUOTED_SENSITIVE_KEY: Final[str] = rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|authorization)"
+QUOTED_SENSITIVE_KEY: Final[str] = SENSITIVE_ASSIGNMENT_KEY
 PYTHON_STRING_PREFIX: Final[str] = r"[rubf]*"
 PYTHON_QUOTE_DELIMITER: Final[str] = r"(?:'''|\"\"\"|[\"'])"
 QUOTED_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
