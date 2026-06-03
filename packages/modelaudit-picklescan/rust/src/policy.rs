@@ -23,13 +23,8 @@ fn pathlib_callable_severity(module: &str, name: &str) -> Option<&'static str> {
 fn direct_global_severity(module: &str, name: &str) -> Option<&'static str> {
     direct_global_severity_without_wrapper_alias(module, name)
         .or_else(|| wrapper_global_alias_severity(module, name))
-        .or_else(|| {
-            if dotted_global_policy_budget_exceeded(name) {
-                Some("warning")
-            } else {
-                dangerous_global_prefix_severity(module, name)
-            }
-        })
+        .or_else(|| dangerous_global_prefix_severity(module, name))
+        .or_else(|| dotted_global_policy_budget_exceeded(name).then_some("warning"))
 }
 
 fn wrapper_global_alias_severity(module: &str, name: &str) -> Option<&'static str> {
@@ -53,14 +48,17 @@ fn strip_wrapper_global_suffix(name: &str) -> Option<&str> {
 }
 
 fn dangerous_global_prefix_severity(module: &str, name: &str) -> Option<&'static str> {
-    let parts = bounded_dotted_parts(name)?;
-    for split in 1..parts.len() {
-        if is_inert_global_metadata_tail(&parts[split..]) {
+    for (segments_seen, (split, _)) in name.match_indices('.').enumerate() {
+        if segments_seen >= MAX_DOTTED_GLOBAL_SEGMENTS || split > MAX_DOTTED_GLOBAL_BYTES {
+            break;
+        }
+        let tail = &name[split + 1..];
+        if is_inert_global_metadata_tail(tail) {
             continue;
         }
-        let candidate = parts[..split].join(".");
-        if let Some(severity) = direct_global_severity_without_wrapper_alias(module, &candidate)
-            .or_else(|| wrapper_global_alias_severity(module, &candidate))
+        let candidate = &name[..split];
+        if let Some(severity) = direct_global_severity_without_wrapper_alias(module, candidate)
+            .or_else(|| wrapper_global_alias_severity(module, candidate))
         {
             return Some(severity);
         }
@@ -68,11 +66,8 @@ fn dangerous_global_prefix_severity(module: &str, name: &str) -> Option<&'static
     None
 }
 
-fn is_inert_global_metadata_tail(parts: &[&str]) -> bool {
-    matches!(
-        parts,
-        ["__doc__"] | ["__name__"] | ["__module__"] | ["__qualname__"]
-    )
+fn is_inert_global_metadata_tail(tail: &str) -> bool {
+    matches!(tail, "__doc__" | "__name__" | "__module__" | "__qualname__")
 }
 
 fn direct_global_severity_without_wrapper_alias(module: &str, name: &str) -> Option<&'static str> {
@@ -1178,6 +1173,10 @@ mod tests {
             .join(".");
 
         assert_eq!(global_severity("safe", &long_dotted_name), Some("warning"));
+        assert_eq!(
+            global_severity("os", &format!("system.{long_dotted_name}")),
+            Some("critical")
+        );
         assert_eq!(
             global_severity("safe", "wrapper.os.system"),
             Some("critical")
