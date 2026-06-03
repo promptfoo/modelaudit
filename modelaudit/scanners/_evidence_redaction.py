@@ -29,6 +29,7 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "aws-session-token",
         "auth_token",
         "auth-token",
+        "authorization",
         "client_secret",
         "client-secret",
         "credential",
@@ -36,6 +37,8 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "passwd",
         "private_key",
         "private-key",
+        "proxy_authorization",
+        "proxy-authorization",
         "refresh_token",
         "refresh-token",
         "sas",
@@ -144,12 +147,18 @@ def redact_evidence_value(value: Any, max_string_chars: int = 180) -> Any:
     if isinstance(value, str):
         return redact_evidence_string(value, max_chars=max_string_chars)
     if isinstance(value, dict):
-        return {
-            key: REDACTED_EVIDENCE_VALUE
-            if isinstance(key, str) and _is_sensitive_detail_key(key)
-            else redact_evidence_value(child, max_string_chars=max_string_chars)
-            for key, child in value.items()
-        }
+        redacted_items: dict[Any, Any] = {}
+        for key, child in value.items():
+            if not isinstance(key, str):
+                redacted_items[key] = redact_evidence_value(child, max_string_chars=max_string_chars)
+                continue
+
+            redacted_key = redact_evidence_string(key, max_chars=max_string_chars)
+            if _is_sensitive_detail_key(key):
+                redacted_items[redacted_key] = REDACTED_EVIDENCE_VALUE
+            else:
+                redacted_items[redacted_key] = redact_evidence_value(child, max_string_chars=max_string_chars)
+        return redacted_items
     if isinstance(value, list):
         return [redact_evidence_value(child, max_string_chars=max_string_chars) for child in value]
     if isinstance(value, tuple):

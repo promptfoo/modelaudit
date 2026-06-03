@@ -12,7 +12,7 @@ from modelaudit.detectors.suspicious_symbols import (
     KNOWN_SAFE_MODEL_CLASSES,
 )
 
-from ._evidence_redaction import redact_evidence_value
+from ._evidence_redaction import redact_evidence_string, redact_evidence_value
 from .base import IssueSeverity, ScanResult
 
 # Dangerous patterns to look for inside decoded Lambda bytecode / source
@@ -202,13 +202,17 @@ def _check_custom_object_config(
             continue
         seen_identifiers.add(normalized_identifier)
 
+        redacted_identifier = redact_evidence_string(identifier)
         result.add_check(
             name=check_name,
             passed=False,
-            message=f"Model contains custom {object_kind}: {identifier}",
+            message=f"Model contains custom {object_kind}: {redacted_identifier}",
             severity=IssueSeverity.WARNING,
             location=location,
-            details={details_key: redact_evidence_value(raw_object), "identifier": identifier},
+            details={
+                details_key: redact_evidence_value(raw_object),
+                "identifier": redacted_identifier,
+            },
             rule_code="S305",
         )
 

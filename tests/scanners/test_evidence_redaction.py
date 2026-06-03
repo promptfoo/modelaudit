@@ -1,7 +1,10 @@
 """Tests for scanner evidence redaction helpers."""
 
+import json
+
 from modelaudit.scanners._evidence_redaction import (
     REDACTED_EVIDENCE_VALUE,
+    REDACTED_URL_CREDENTIALS,
     redact_evidence_string,
     redact_evidence_value,
 )
@@ -79,3 +82,46 @@ def test_redacts_access_key_id_assignments_and_nested_values() -> None:
         "aws_access_key_id": REDACTED_EVIDENCE_VALUE,
         "nested": {"access-key-id": REDACTED_EVIDENCE_VALUE},
     }
+
+
+def test_redacts_authorization_values_by_structured_key() -> None:
+    """Header-like detail keys should redact opaque values without needing a prefix in the value."""
+    secret = "ZIP_AUTHORIZATION_SECRET"
+
+    redacted_value = redact_evidence_value(
+        {
+            "Authorization": f"Basic {secret}",
+            "headers": {"proxy-authorization": f"Bearer {secret}"},
+        }
+    )
+
+    serialized_value = json.dumps(redacted_value)
+    assert secret not in serialized_value
+    assert redacted_value == {
+        "Authorization": REDACTED_EVIDENCE_VALUE,
+        "headers": {"proxy-authorization": REDACTED_EVIDENCE_VALUE},
+    }
+
+
+def test_redacts_secret_bearing_structured_keys() -> None:
+    """Secret-bearing dict keys should be redacted as evidence too."""
+    token_key_secret = "ZIP_TOKEN_KEY_SECRET"
+    url_key_secret = "ZIP_URL_KEY_SECRET"
+
+    redacted_value = redact_evidence_value(
+        {
+            f"token={token_key_secret}": "kept",
+            f"https://user:{url_key_secret}@example.test/model.keras?api_key={token_key_secret}": {
+                "safe": "value",
+            },
+        },
+        max_string_chars=500,
+    )
+
+    serialized_value = json.dumps(redacted_value)
+    assert token_key_secret not in serialized_value
+    assert url_key_secret not in serialized_value
+    assert f"token={REDACTED_EVIDENCE_VALUE}" in redacted_value
+    assert f"https://{REDACTED_URL_CREDENTIALS}@example.test/model.keras?api_key={REDACTED_EVIDENCE_VALUE}" in (
+        redacted_value
+    )
