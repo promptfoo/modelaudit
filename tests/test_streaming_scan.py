@@ -844,7 +844,7 @@ def test_scan_model_streaming_stops_hashing_at_max_total_size(
 
     assert hashed_paths == [first, second]
     assert result.files_scanned == 3
-    assert result.content_hash == compute_aggregate_hash([first_hash, first_hash])
+    assert result.content_hash is None
     assert result.success is True
 
 

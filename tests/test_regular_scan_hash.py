@@ -293,7 +293,7 @@ class TestHashGenerationEdgeCases:
         result = scan_model_directory_or_file(
             str(tmp_path),
             max_file_size=64,
-            cache_scan_results=False,
+            cache_enabled=False,
         )
 
         assert str(oversized) not in hashed_paths
@@ -320,7 +320,41 @@ class TestHashGenerationEdgeCases:
         result = scan_model_directory_or_file(
             str(oversized),
             max_file_size=64,
-            cache_scan_results=False,
+            cache_enabled=False,
+        )
+
+        assert determine_exit_code(result) == 2
+        assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
+        assert result.has_errors is True
+
+    def test_single_file_scan_bypasses_cache_hash_for_max_file_size(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cache lookup should not content-hash files regular scanning will reject."""
+        from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
+
+        oversized = tmp_path / "oversized.pkl"
+        oversized.write_bytes(b"X" * 128)
+
+        def fail_if_cache_hashes_oversized(self: SecureFileHasher, path: str) -> str:
+            if path == str(oversized):
+                pytest.fail("oversized file was content-hashed for cache lookup before max_file_size rejection")
+            return "a" * 64
+
+        monkeypatch.setattr(SecureFileHasher, "hash_file", fail_if_cache_hashes_oversized)
+        monkeypatch.setattr(
+            SecureFileHasher,
+            "hash_file_with_stat",
+            lambda self, path, _stat: fail_if_cache_hashes_oversized(self, path),
+        )
+
+        result = scan_model_directory_or_file(
+            str(oversized),
+            max_file_size=64,
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            content_hash_threshold=1,
+            max_cache_file_size=1024,
         )
 
         assert determine_exit_code(result) == 2
@@ -357,6 +391,46 @@ class TestHashGenerationEdgeCases:
         assert hashed_paths == [str(first), str(second)]
         assert content_hashes[str(third)].startswith("unhashable_max_total_size_")
 
+    def test_directory_scan_omits_content_hash_when_max_total_hashing_incomplete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Successful scans must not publish aggregate hashes for only a prefix of files."""
+        from modelaudit import core
+        from modelaudit.scanner_results import ScanResult
+
+        first = tmp_path / "first.pkl"
+        first.write_bytes(b"A" * 32)
+        second = tmp_path / "second.pkl"
+        second.write_bytes(b"B" * 33)
+        third = tmp_path / "third.pkl"
+        third.write_bytes(b"C")
+
+        original_hash = core._calculate_file_hash
+        hashed_paths: list[str] = []
+
+        def track_hash(path: str) -> str:
+            hashed_paths.append(path)
+            return original_hash(path)
+
+        def successful_scan(_path: str, _config: dict[str, object]) -> ScanResult:
+            scan_result = ScanResult(scanner_name="bounded_test")
+            scan_result.bytes_scanned = 1
+            scan_result.finish(success=True)
+            return scan_result
+
+        monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
+        monkeypatch.setattr(core, "scan_file", successful_scan)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            max_total_size=64,
+            cache_enabled=False,
+        )
+
+        assert len(hashed_paths) == 2
+        assert result.content_hash is None
+        assert result.success is True
+
     def test_single_file_scan_fails_closed_after_max_total_size(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -383,7 +457,7 @@ class TestHashGenerationEdgeCases:
         result = scan_model_directory_or_file(
             str(oversized),
             max_total_size=64,
-            cache_scan_results=False,
+            cache_enabled=False,
         )
 
         assert hashed_paths == [str(oversized)]

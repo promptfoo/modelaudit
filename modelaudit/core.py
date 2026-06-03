@@ -835,6 +835,7 @@ def scan_model_directory_or_file(
     }
     # Track file hashes for aggregate hash computation
     file_hashes: list[str] = []
+    aggregate_hash_complete = True
     top_level_hashed_bytes = 0
     nearby_license_cache: dict[str, list[str]] = {}
     pickle_source_snapshot_stack = ExitStack()
@@ -1138,6 +1139,10 @@ def scan_model_directory_or_file(
 
                 top_level_hashing_started_at = _start_phase_timing(phase_timings)
                 content_hashes = _hash_files_by_path(hash_paths, config=config)
+                if any(
+                    content_hash.startswith("unhashable_max_total_size_") for content_hash in content_hashes.values()
+                ):
+                    aggregate_hash_complete = False
                 _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
                 duplicate_paths_by_hash: dict[str, list[str]] = {}
                 for file_path, content_hash in content_hashes.items():
@@ -1375,13 +1380,16 @@ def scan_model_directory_or_file(
                 # Hash the top-level target before scanning. Archive scanners merge
                 # nested member results into their metadata, so scanner-emitted
                 # hashes are not always the bytes of this target.
+                defer_hash_for_max_total_size = _should_defer_hash_for_max_total_size(
+                    config,
+                    hashed_bytes=top_level_hashed_bytes,
+                )
+                if defer_hash_for_max_total_size:
+                    aggregate_hash_complete = False
                 if (
                     not _should_defer_hash_for_safetensors_header_limit(target, config)
                     and not _should_defer_hash_for_max_file_size(target, config)
-                    and not _should_defer_hash_for_max_total_size(
-                        config,
-                        hashed_bytes=top_level_hashed_bytes,
-                    )
+                    and not defer_hash_for_max_total_size
                 ):
                     try:
                         top_level_hashing_started_at = _start_phase_timing(phase_timings)
@@ -1496,7 +1504,7 @@ def scan_model_directory_or_file(
     results.success = not _results_should_be_unsuccessful(results)
 
     # Compute aggregate content hash if we collected file hashes
-    if file_hashes:
+    if file_hashes and aggregate_hash_complete:
         from .utils.helpers.secure_hasher import compute_aggregate_hash
 
         aggregate_hash_started_at = _start_phase_timing(phase_timings)
@@ -2248,6 +2256,7 @@ def scan_model_streaming(
     start_time = time.time()
     results = create_initial_audit_result()
     file_hashes: list[str] = []
+    aggregate_hash_complete = True
     top_level_hashed_bytes = 0
     files_processed = 0
     skip_file_types: bool = bool(kwargs.get("skip_file_types", False))
@@ -2330,13 +2339,16 @@ def scan_model_streaming(
                 }
 
                 file_hash: str | None = None
+                defer_hash_for_max_total_size = _should_defer_hash_for_max_total_size(
+                    scan_config,
+                    hashed_bytes=top_level_hashed_bytes,
+                )
+                if defer_hash_for_max_total_size:
+                    aggregate_hash_complete = False
                 if (
                     not _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config)
                     and not _should_defer_hash_for_max_file_size(str(scan_path), scan_config)
-                    and not _should_defer_hash_for_max_total_size(
-                        scan_config,
-                        hashed_bytes=top_level_hashed_bytes,
-                    )
+                    and not defer_hash_for_max_total_size
                 ):
                     if progress_callback:
                         progress_callback(
@@ -2429,7 +2441,7 @@ def scan_model_streaming(
                         logger.warning(f"Failed to delete {source_path}: {e}")
 
         # Compute aggregate hash from all file hashes
-        if file_hashes:
+        if file_hashes and aggregate_hash_complete:
             results.content_hash = compute_aggregate_hash(file_hashes)
             logger.info(f"Computed aggregate content hash: {results.content_hash}")
 
