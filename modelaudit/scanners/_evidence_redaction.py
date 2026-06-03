@@ -15,7 +15,7 @@ URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://
 STANDALONE_SECRET_RE: Final[re.Pattern[str]] = re.compile(
     r"(?<![A-Za-z0-9])(?:"
     r"AKIA[0-9A-Z]{16}|"
-    r"gh[ps]_[A-Za-z0-9]{36}|"
+    r"gh[opsur]_[A-Za-z0-9]{36}|"
     r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|"
     r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_.+/=-]*|"
     r"sk-(?:proj-)?[A-Za-z0-9]{24,}|"

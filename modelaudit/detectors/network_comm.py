@@ -21,7 +21,7 @@ _URL_IN_TEXT_PATTERN = re.compile(
 _SENSITIVE_PATH_TOKEN_PATTERN = re.compile(
     r"(?i)^(?:"
     r"AKIA[0-9A-Z]{16}|"
-    r"gh[ps]_[A-Za-z0-9]{36}|"
+    r"gh[opsur]_[A-Za-z0-9]{36}|"
     r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|"
     r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_.+/=-]*|"
     r"sk-(?:proj-)?[A-Za-z0-9]{24,}|"

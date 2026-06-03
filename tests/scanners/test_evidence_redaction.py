@@ -1,5 +1,7 @@
 """Tests for scanner evidence redaction helpers."""
 
+import pytest
+
 from modelaudit.scanners._evidence_redaction import REDACTED_EVIDENCE_VALUE, redact_evidence_string
 
 
@@ -66,9 +68,10 @@ def test_redacts_capability_tokens_in_url_paths() -> None:
     assert redacted == f"https://example.com/path/{REDACTED_EVIDENCE_VALUE}/model.bin"
 
 
-def test_redacts_standalone_secret_shapes() -> None:
+@pytest.mark.parametrize("prefix", ["ghp", "gho", "ghu", "ghs", "ghr"])
+def test_redacts_standalone_github_token_shapes(prefix: str) -> None:
     """Secret-shaped strings should be redacted even without assignment syntax."""
-    token = "ghp_" + "a" * 36
+    token = f"{prefix}_" + "a" * 36
 
     redacted = redact_evidence_string(f"metadata key: {token}", max_chars=500)
 

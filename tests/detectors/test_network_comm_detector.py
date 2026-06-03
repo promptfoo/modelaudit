@@ -697,10 +697,11 @@ class TestNetworkCommDetector:
 
         assert url_finding["url"] == f"https://huggingface.co/org/repo/resolve/main/{filename}"
 
-    def test_github_path_tokens_are_redacted(self) -> None:
+    @pytest.mark.parametrize("prefix", ["ghp", "gho", "ghu", "ghs", "ghr"])
+    def test_github_path_tokens_are_redacted(self, prefix: str) -> None:
         """Known token formats embedded in URL paths should be removed."""
         detector = NetworkCommDetector()
-        github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        github_token = f"{prefix}_abcdefghijklmnopqrstuvwxyz0123456789"
         data = f"https://raw.githubusercontent.com/org/repo/{github_token}/model.py".encode()
 
         findings = detector.scan(data, "model.pkl")
