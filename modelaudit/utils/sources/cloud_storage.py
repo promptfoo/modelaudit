@@ -122,6 +122,25 @@ def _cloud_url_basename(url: str) -> str:
     return Path(path).name
 
 
+def _remove_path(path: Path) -> None:
+    """Remove a file, directory, symlink, or special path without following symlinks."""
+    if path.is_symlink() or not path.is_dir():
+        path.unlink(missing_ok=True)
+    else:
+        shutil.rmtree(path)
+
+
+def _prepare_cache_subdirectory(cache_dir: Path, cache_key: str) -> Path:
+    """Create a cache-key directory without following replaced path components."""
+    cache_subdir = cache_dir
+    for component in (cache_key[:2], cache_key[2:4]):
+        cache_subdir /= component
+        if cache_subdir.is_symlink() or (cache_subdir.exists() and not cache_subdir.is_dir()):
+            cache_subdir.unlink()
+        cache_subdir.mkdir(exist_ok=True)
+    return cache_subdir
+
+
 def _metadata_etag(metadata: Mapping[str, Any] | None) -> str | None:
     """Extract a stable object validator from fsspec-style metadata."""
     if not metadata:
@@ -558,14 +577,14 @@ class GCSCache:
         cache_key = self.get_cache_key(url)
 
         # Create cache subdirectory
-        cache_subdir = self.cache_dir / cache_key[:2] / cache_key[2:4]
-        cache_subdir.mkdir(parents=True, exist_ok=True)
+        cache_subdir = _prepare_cache_subdirectory(self.cache_dir, cache_key)
 
         # Determine cache path
         if local_path.is_file():
             cache_path = cache_subdir / local_path.name
             # Don't copy if it's already in the cache directory
             if not _is_within_directory(self.cache_dir, local_path):
+                _remove_path(cache_path)
                 shutil.copy2(local_path, cache_path)
             else:
                 cache_path = local_path
@@ -574,8 +593,7 @@ class GCSCache:
             cache_path = cache_subdir / "content"
             # Don't copy if it's already in the cache directory
             if not _is_within_directory(self.cache_dir, local_path):
-                if cache_path.exists():
-                    shutil.rmtree(cache_path)
+                _remove_path(cache_path)
                 shutil.copytree(local_path, cache_path)
             else:
                 cache_path = local_path
@@ -679,15 +697,14 @@ def _clear_directory_contents(path: Path) -> None:
     if not path.exists():
         return
     for child in path.iterdir():
-        if child.is_dir():
-            shutil.rmtree(child)
-        else:
-            child.unlink()
+        _remove_path(child)
 
 
 def _cached_path_within_size_limit(path: Path, max_size: int) -> bool:
     """Return whether a cached file or directory can be proven within a size limit."""
     try:
+        if path.is_symlink():
+            return False
         if path.is_file():
             return path.stat().st_size <= max_size
         if not path.is_dir():
@@ -867,9 +884,7 @@ def download_from_cloud(
     if cache:
         # When using cache, download directly to cache location
         cache_key = cache.get_cache_key(url)
-        cache_subdir = cache.cache_dir / cache_key[:2] / cache_key[2:4]
-        cache_subdir.mkdir(parents=True, exist_ok=True)
-        download_path = cache_subdir
+        download_path = _prepare_cache_subdirectory(cache.cache_dir, cache_key)
     elif cache_dir is None:
         download_path = Path(tempfile.mkdtemp(prefix="modelaudit_cloud_"))
     else:
@@ -981,6 +996,8 @@ def download_from_cloud(
             file_name = _cloud_url_basename(url)
             local_file = download_path / file_name
             download_budget = _CloudDownloadBudget(max_size) if max_size else None
+            if cache:
+                _remove_path(local_file)
 
             @retry_with_backoff(
                 max_retries=3,
