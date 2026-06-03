@@ -1311,7 +1311,8 @@ impl<'a> ScanState<'a> {
                         .get(&index)
                         .map(|value| Self::memo_value_for_stack(index, value))
                     {
-                        self.push_stack_value_with_tracked_cost(value, 0, "memo_stack_reference");
+                        let cost = Self::stack_value_state_cost(&value);
+                        self.push_stack_value_with_tracked_cost(value, cost, "memo_stack_value");
                     } else {
                         self.push_stack_value(StackValue::Other);
                     }
@@ -7244,12 +7245,31 @@ mod tests {
         let options = default_test_options();
         let mut payload = b"\x80\x04".to_vec();
         append_protocol0_unicode(&mut payload, &"A".repeat(3 * 1024 * 1024));
-        payload.extend_from_slice(b"q\x00h\x00.");
+        payload.extend_from_slice(b"q\x00.");
 
         let scan = run_test_scan("large-memo-transfer.pkl", &payload, &options);
 
         assert_eq!(scan.status, ScanStatus::Complete);
         assert!(!has_notice_code(&scan, "tracked_state_budget"));
+    }
+
+    #[test]
+    fn memo_reads_of_non_reference_values_are_state_bounded() {
+        let options = default_test_options();
+        let value = "A".repeat(512 * 1024);
+        let mut payload = b"\x80\x04".to_vec();
+        append_protocol0_unicode(&mut payload, &value);
+        payload.extend_from_slice(b"q\x00");
+        for _ in 0..(MAX_TRACKED_STATE_BYTES / value.len() + 2) {
+            payload.extend_from_slice(b"h\x00");
+        }
+        payload.push(b'.');
+
+        let scan = run_test_scan("memo-read-stack-budget.pkl", &payload, &options);
+
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.verdict, ScanVerdict::Unknown);
+        assert!(has_notice_code(&scan, "tracked_state_budget"));
     }
 
     #[test]
