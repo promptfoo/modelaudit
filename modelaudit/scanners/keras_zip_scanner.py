@@ -676,7 +676,13 @@ class KerasZipScanner(BaseScanner):
             return False
         if "keras_zip_embedded_weights_too_large" in reasons:
             return True
-        return "keras_zip_embedded_weights_h5py_unavailable" in reasons
+        return any(
+            reason in reasons
+            for reason in (
+                "keras_zip_embedded_weights_h5py_unavailable",
+                "keras_zip_embedded_weights_hdf5_signature_probe_incomplete",
+            )
+        )
 
     @staticmethod
     def _is_expected_recursive_weights_limit_noise(entry: Any) -> bool:
@@ -1574,6 +1580,8 @@ class KerasZipScanner(BaseScanner):
         if not HAS_H5PY:
             hdf5_signature_offset = _zip_member_hdf5_signature_offset(archive, weights_info)
             if hdf5_signature_offset is None:
+                if weights_info.file_size > _HDF5_SIGNATURE_SCAN_MAX_BYTES:
+                    self._mark_embedded_weights_hdf5_signature_probe_incomplete(weights_info, result)
                 return
 
             weights_entry = weights_info.filename
@@ -1708,6 +1716,35 @@ class KerasZipScanner(BaseScanner):
             | {
                 "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
             },
+        )
+
+    def _mark_embedded_weights_hdf5_signature_probe_incomplete(
+        self,
+        weights_info: zipfile.ZipInfo,
+        result: ScanResult,
+    ) -> None:
+        weights_entry = weights_info.filename
+        reason = "keras_zip_embedded_weights_hdf5_signature_probe_incomplete"
+        self._mark_inconclusive_scan_result(result, reason)
+        result.add_check(
+            name="Embedded Weights HDF5 Signature Probe",
+            passed=False,
+            message=(
+                "Skipping embedded model.weights.h5 inspection because h5py is unavailable and the weights entry "
+                "is too large to rule out a valid HDF5 user-block signature within the bounded probe window. "
+                "Install with 'pip install modelaudit[h5]'."
+            ),
+            severity=IssueSeverity.INFO,
+            location=f"{self.current_file_path}:{weights_entry}",
+            details={
+                "entry": weights_entry,
+                "required_package": "h5py",
+                "file_size": weights_info.file_size,
+                "hdf5_signature_probe_max_bytes": _HDF5_SIGNATURE_SCAN_MAX_BYTES,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+            rule_code="S902",
         )
 
     def _scan_embedded_weights_hdf5_userblock(

@@ -24,7 +24,11 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import keras_h5_scanner as keras_h5_scanner_module
 from modelaudit.scanners import keras_zip_scanner as keras_zip_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.keras_zip_scanner import KerasZipScanner, _has_get_file_reference
+from modelaudit.scanners.keras_zip_scanner import (
+    _HDF5_SIGNATURE_SCAN_MAX_BYTES,
+    KerasZipScanner,
+    _has_get_file_reference,
+)
 from modelaudit.utils.file import detection as file_detection
 
 try:
@@ -380,6 +384,41 @@ class TestKerasZipScanner:
             for issue in result.issues
         )
         assert not any(check.name == "H5PY Library Check" for check in result.checks)
+
+    def test_oversized_userblock_embedded_weights_missing_h5py_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Missing h5py must fail closed when a bounded probe cannot rule out a large HDF5 user block."""
+        hdf5_signature_offset = 16 * 1024 * 1024
+        assert hdf5_signature_offset > _HDF5_SIGNATURE_SCAN_MAX_BYTES
+        weights_payload = bytearray(hdf5_signature_offset + 8)
+        weights_payload[hdf5_signature_offset : hdf5_signature_offset + 8] = b"\x89HDF\r\n\x1a\n"
+        keras_path = tmp_path / "oversized_userblock.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.12.0"}))
+            zf.writestr("model.weights.h5", bytes(weights_payload))
+
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+        reason = "keras_zip_embedded_weights_hdf5_signature_probe_incomplete"
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert reason in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Embedded Weights HDF5 Signature Probe"
+            and check.status == CheckStatus.FAILED
+            and check.details["hdf5_signature_probe_max_bytes"] == _HDF5_SIGNATURE_SCAN_MAX_BYTES
+            and check.details["scan_outcome_reason"] == reason
+            for check in result.checks
+        )
+        assert not any(check.name == "H5PY Library Check" for check in result.checks)
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
     def test_missing_h5py_without_embedded_weights_stays_conclusive(
         self,
