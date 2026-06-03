@@ -2013,6 +2013,13 @@ class KerasZipScanner(BaseScanner):
                         "importlib",
                         "runpy",
                         "webbrowser",
+                        "socket",
+                        "http",
+                        "https",
+                        "urllib",
+                        "urllib3",
+                        "shutil",
+                        "ctypes",
                     ]
 
                     found_patterns = find_lambda_dangerous_patterns(decoded_str, dangerous_patterns)

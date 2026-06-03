@@ -1861,14 +1861,22 @@ __import__('pickle').loads(data)
             issue.severity == IssueSeverity.CRITICAL and "substring_lambda" in issue.message for issue in result.issues
         )
 
+    @pytest.mark.parametrize("function_format", ["list", "dict"])
     @pytest.mark.parametrize("network_reference", ["https://evil.example/payload", "urllib3.PoolManager"])
-    def test_dict_lambda_bytecode_token_boundaries_preserve_network_signals(
+    def test_lambda_bytecode_token_boundaries_preserve_network_signals(
         self,
         tmp_path: Path,
         network_reference: str,
+        function_format: str,
     ) -> None:
         """Boundary-aware Lambda matching must retain explicit network indicators."""
         encoded_code = base64.b64encode(network_reference.encode()).decode()
+        function_data: Any = [encoded_code, None, None]
+        if function_format == "dict":
+            function_data = {
+                "class_name": "__lambda__",
+                "config": {"code": encoded_code},
+            }
         config = {
             "class_name": "Sequential",
             "config": {
@@ -1876,12 +1884,7 @@ __import__('pickle').loads(data)
                     {
                         "class_name": "Lambda",
                         "name": "network_lambda",
-                        "config": {
-                            "function": {
-                                "class_name": "__lambda__",
-                                "config": {"code": encoded_code},
-                            }
-                        },
+                        "config": {"function": function_data},
                     }
                 ]
             },
