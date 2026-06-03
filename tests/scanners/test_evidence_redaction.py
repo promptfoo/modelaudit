@@ -68,6 +68,39 @@ def test_redacts_capability_tokens_in_url_paths() -> None:
     assert redacted == f"https://example.com/path/{REDACTED_EVIDENCE_VALUE}/model.bin"
 
 
+@pytest.mark.parametrize("scheme", ["ftps", "ssh", "telnet", "ws", "wss", "az", "wasb", "wasbs", "abfs", "abfss"])
+def test_redacts_capability_tokens_in_supported_network_url_schemes(scheme: str) -> None:
+    """Every URL scheme recognized by the network detector should redact path tokens."""
+    token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+
+    redacted = redact_evidence_string(f"{scheme}://example.com/path/{token}/model.bin", max_chars=500)
+
+    assert token not in redacted
+    assert redacted == f"{scheme}://example.com/path/{REDACTED_EVIDENCE_VALUE}/model.bin"
+
+
+def test_preserves_azure_authority_container_while_redacting_object_path_token() -> None:
+    """A valid Azure authority container is identity, not userinfo."""
+    token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+
+    redacted = redact_evidence_string(
+        f"wasbs://container@account.blob.core.windows.net/{token}/model.bin",
+        max_chars=500,
+    )
+
+    assert redacted == f"wasbs://container@account.blob.core.windows.net/{REDACTED_EVIDENCE_VALUE}/model.bin"
+
+
+def test_redacts_azure_authority_userinfo_that_is_not_a_valid_container() -> None:
+    """Azure authority credentials must not be mistaken for a container name."""
+    redacted = redact_evidence_string(
+        "wasbs://container:secret@account.blob.core.windows.net/model.bin",
+        max_chars=500,
+    )
+
+    assert redacted == "wasbs://<credentials-redacted>@account.blob.core.windows.net/model.bin"
+
+
 @pytest.mark.parametrize("prefix", ["ghp", "gho", "ghu", "ghs", "ghr"])
 def test_redacts_standalone_github_token_shapes(prefix: str) -> None:
     """Secret-shaped strings should be redacted even without assignment syntax."""

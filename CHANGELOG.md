@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preflight and stream-enforce cumulative SevenZip extraction budgets before writing oversized archives
 - mark oversized structured JSON/YAML Jinja template fields as incomplete coverage instead of clean
 - redact capability tokens embedded in network URL path segments
-- redact Flax/JAX MessagePack scanner evidence samples, contexts, key paths, and metadata before serialization
+- redact Flax/JAX MessagePack scanner samples, contexts, key paths, structured fields, metadata, and errors
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts

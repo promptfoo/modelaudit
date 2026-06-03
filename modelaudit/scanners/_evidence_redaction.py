@@ -6,12 +6,18 @@ import re
 from typing import Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from ..detectors.network_comm import _redact_url_path_tokens
+from ..detectors.network_comm import (
+    _AZURE_AUTHORITY_CONTAINER_SCHEMES,
+    _is_azure_authority_container,
+    _redact_url_path_tokens,
+)
 
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 
-URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://[^\s\"'<>]+")
+URL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)\b(?:https?|ftp|ftps|ssh|telnet|ws|wss|s3|gs|az|wasbs?|abfss?|file)://[^\s\"'<>]+"
+)
 STANDALONE_SECRET_RE: Final[re.Pattern[str]] = re.compile(
     r"(?<![A-Za-z0-9])(?:"
     r"AKIA[0-9A-Z]{16}|"
@@ -94,7 +100,11 @@ def _redact_url(match: re.Match[str]) -> str:
 
     netloc = parsed.netloc
     if "@" in netloc:
-        netloc = f"{REDACTED_URL_CREDENTIALS}@{netloc.rsplit('@', 1)[1]}"
+        authority_prefix, _separator, hostname = netloc.rpartition("@")
+        if parsed.scheme.lower() not in _AZURE_AUTHORITY_CONTAINER_SCHEMES or not _is_azure_authority_container(
+            authority_prefix
+        ):
+            netloc = f"{REDACTED_URL_CREDENTIALS}@{hostname}"
 
     query_items = []
     for key, value in parse_qsl(parsed.query, keep_blank_values=True):

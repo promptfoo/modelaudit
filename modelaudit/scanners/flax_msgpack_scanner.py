@@ -56,6 +56,10 @@ def _redact_evidence_location(location: Any) -> str:
     return redact_evidence_string(_stringify_evidence_fragment(location), max_chars=_EVIDENCE_LOCATION_CHARS)
 
 
+def _redact_evidence_sample(value: Any) -> str:
+    return redact_evidence_string(_stringify_evidence_fragment(value), max_chars=_EVIDENCE_SAMPLE_CHARS)
+
+
 def _redact_evidence_key(key: Any) -> Any:
     if key is None or isinstance(key, bool | int | float):
         return key
@@ -389,7 +393,7 @@ class FlaxMsgpackScanner(BaseScanner):
                             location=_redact_evidence_location(child_path),
                             details={
                                 "transform": transform,
-                                "context": redact_evidence_string(value_str, max_chars=_EVIDENCE_SAMPLE_CHARS),
+                                "context": _redact_evidence_sample(value_str),
                             },
                             rule_code="S1105",  # JAX compilation risks
                         )
@@ -420,6 +424,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 # Check for unusual shape specifications that might indicate attacks
                 if "shape" in data and isinstance(data["shape"], list | tuple):
                     shape = data["shape"]
+                    shape_evidence = [_redact_evidence_key(dim) for dim in shape]
                     if any(dim < 0 for dim in shape if isinstance(dim, int)):
                         result.add_check(
                             name="Tensor Shape Validation",
@@ -427,7 +432,7 @@ class FlaxMsgpackScanner(BaseScanner):
                             message="Invalid tensor shape with negative dimensions",
                             severity=IssueSeverity.INFO,
                             location=_redact_evidence_location(path),
-                            details={"shape": shape},
+                            details={"shape": shape_evidence},
                             rule_code="S902",
                         )
                     elif any(dim > 10**9 for dim in shape if isinstance(dim, int)):
@@ -437,7 +442,7 @@ class FlaxMsgpackScanner(BaseScanner):
                             message="Suspiciously large tensor dimensions",
                             severity=IssueSeverity.WARNING,
                             location=_redact_evidence_location(path),
-                            details={"shape": shape, "max_safe_dimension": 10**9},
+                            details={"shape": shape_evidence, "max_safe_dimension": 10**9},
                             rule_code="S804",
                         )
 
@@ -473,7 +478,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     location=_redact_evidence_location(location),
                     details={
                         "pattern": pattern,
-                        "sample": redact_evidence_string(value, max_chars=_EVIDENCE_SAMPLE_CHARS),
+                        "sample": _redact_evidence_sample(value),
                         "full_length": len(value),
                     },
                     rule_code=rule_code,
@@ -511,7 +516,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 location=_redact_evidence_location(location),
                 details={
                     "suspicious_key": key,
-                    "value_sample": redact_evidence_string(str(value), max_chars=_EVIDENCE_SAMPLE_CHARS),
+                    "value_sample": _redact_evidence_sample(value),
                 },
                 rule_code="S999",
             )
@@ -1015,13 +1020,14 @@ class FlaxMsgpackScanner(BaseScanner):
                             return None
                         objects.append(stream_obj)
                 except Exception as unpack_e:
+                    error_message = _redact_evidence_sample(unpack_e)
                     result.add_check(
                         name="Msgpack Parse Check",
                         passed=False,
-                        message=f"Failed to parse msgpack data: {unpack_e}",
+                        message=f"Failed to parse msgpack data: {error_message}",
                         severity=IssueSeverity.WARNING,
                         location=path,
-                        details={"parse_error": str(unpack_e)},
+                        details={"parse_error": error_message},
                         rule_code="S902",
                     )
                     result.finish(success=False)
@@ -1059,13 +1065,14 @@ class FlaxMsgpackScanner(BaseScanner):
                 result.finish(success=False)
                 return None
 
+            error_message = _redact_evidence_sample(e)
             result.add_check(
                 name="Msgpack Format Validation",
                 passed=False,
-                message=f"Invalid msgpack format: {e!s}",
+                message=f"Invalid msgpack format: {error_message}",
                 severity=IssueSeverity.INFO,
                 location=path,
-                details={"msgpack_error": str(e)},
+                details={"msgpack_error": error_message},
                 rule_code="S902",
             )
             result.finish(success=False)
@@ -1171,13 +1178,14 @@ class FlaxMsgpackScanner(BaseScanner):
             result.finish(success=False)
             return result
         except Exception as e:
+            error_message = _redact_evidence_sample(e)
             result.add_check(
                 name="Flax Msgpack Processing",
                 passed=False,
-                message=f"Unexpected error processing Flax msgpack file: {e!s}",
+                message=f"Unexpected error processing Flax msgpack file: {error_message}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"error_type": type(e).__name__, "error_message": str(e)},
+                details={"error_type": type(e).__name__, "error_message": error_message},
                 rule_code="S902",
             )
             result.finish(success=False)

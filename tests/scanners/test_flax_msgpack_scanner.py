@@ -866,6 +866,62 @@ def test_flax_msgpack_redacts_function_metadata_value_sample(tmp_path: Path) -> 
     assert token not in serialized
 
 
+def test_flax_msgpack_redacts_model_controlled_tensor_shape_evidence(tmp_path: Path) -> None:
+    path = tmp_path / "leaky_shape.msgpack"
+    secret = "SHAPESECRET123456789"
+    create_msgpack_file(path, {"params": {"shape": [-1, f"token={secret}"]}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+    shape_check = next(check for check in result.checks if check.name == "Tensor Shape Validation")
+
+    assert shape_check.details["shape"] == [-1, "token=<redacted>"]
+    assert secret not in result.to_json()
+
+
+def test_flax_msgpack_redacts_parse_error_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "leaky_parse_error.msgpack"
+    secret = "PARSEERRORSECRET123456789"
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}})
+
+    def raise_parse_error(*_args: Any, **_kwargs: Any) -> object:
+        raise ValueError(f"token={secret}")
+
+    monkeypatch.setattr(msgpack, "unpackb", raise_parse_error)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+    parse_check = next(check for check in result.checks if check.name == "Msgpack Format Validation")
+
+    assert parse_check.details["msgpack_error"] == "token=<redacted>"
+    assert secret not in result.to_json()
+
+
+def test_flax_msgpack_redacts_unexpected_processing_error_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "leaky_processing_error.msgpack"
+    secret = "PROCESSINGERRORSECRET123456789"
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}})
+
+    def raise_processing_error(
+        _self: FlaxMsgpackScanner,
+        _obj: Any,
+        _result: ScanResult,
+    ) -> dict[str, Any]:
+        raise RuntimeError(f"client_secret={secret}")
+
+    monkeypatch.setattr(FlaxMsgpackScanner, "_analyze_ml_structure", raise_processing_error)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+    processing_check = next(check for check in result.checks if check.name == "Flax Msgpack Processing")
+
+    assert processing_check.details["error_message"] == "client_secret=<redacted>"
+    assert secret not in result.to_json()
+
+
 def test_flax_msgpack_function_metadata_value_sample_requires_exact_callable(tmp_path: Path) -> None:
     exact_path = tmp_path / "exact_callable.msgpack"
     noisy_path = tmp_path / "noisy_callable.msgpack"
