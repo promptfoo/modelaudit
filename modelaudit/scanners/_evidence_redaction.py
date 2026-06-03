@@ -150,7 +150,14 @@ COMMAND_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)((?:(?<!\w)--(?:user|proxy-user)|(?<!\w)-[a-z]*u)(?:=|\s+)?)([\"']?)([^:\s\"';&|]+:)"
     r"([^\"'\s;&|)]+)([\"']?)"
 )
+STANDALONE_SECRET_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|[A-Za-z0-9_+/=-]{32,})\b"
+)
 HIGH_ENTROPY_TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{12,}|[A-Za-z0-9_+/=-]{24,})\b")
+COMMAND_SENSITIVE_HEADER_VALUE_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*:\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s\"';&|)]+)"
+)
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(\bauthorization\s*{ASSIGNMENT_SEPARATOR}\s*{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)"
     rf"((?:(?!\b{SENSITIVE_ASSIGNMENT_KEY}\s*{ASSIGNMENT_SEPARATOR}).)*?)"
@@ -1676,6 +1683,8 @@ def _find_command_context_end(text: str, start: int) -> int:
 def _command_context_spans(text: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     for match in COMMAND_EVIDENCE_RE.finditer(text):
+        if spans and match.start() < spans[-1][1]:
+            continue
         end = _find_command_context_end(text, match.start())
         if spans and match.start() <= spans[-1][1]:
             spans[-1] = (spans[-1][0], max(spans[-1][1], end))
@@ -1728,16 +1737,19 @@ def _redact_command_evidence_text(text: str) -> str:
     redacted = UNKNOWN_AUTHORIZATION_SCHEME_VALUE_RE.sub(_redact_unknown_authorization_scheme_value, redacted)
     redacted = BARE_AUTHORIZATION_VALUE_RE.sub(_redact_bare_authorization_value, redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+    redacted = COMMAND_SENSITIVE_HEADER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = COMMAND_SECRET_OPTION_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = COMMAND_USER_PASSWORD_RE.sub(_redact_command_user_password, redacted)
     pieces: list[str] = []
     cursor = 0
     for match in COMMAND_URL_CONTEXT_RE.finditer(redacted):
-        chunk = HIGH_ENTROPY_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, redacted[cursor : match.start()])
+        chunk = STANDALONE_SECRET_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, redacted[cursor : match.start()])
+        chunk = HIGH_ENTROPY_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, chunk)
         pieces.append(COMMAND_LITERAL_SENSITIVE_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, chunk))
         pieces.append(match.group(0))
         cursor = match.end()
-    chunk = HIGH_ENTROPY_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, redacted[cursor:])
+    chunk = STANDALONE_SECRET_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, redacted[cursor:])
+    chunk = HIGH_ENTROPY_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, chunk)
     pieces.append(COMMAND_LITERAL_SENSITIVE_TOKEN_RE.sub(REDACTED_EVIDENCE_VALUE, chunk))
     return "".join(pieces)
 
