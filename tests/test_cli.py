@@ -999,6 +999,34 @@ def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
     assert "Download failed" in result.output
 
 
+@patch("modelaudit.utils.sources.huggingface.get_model_size", return_value=None)
+@patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={"", ".bin"})
+@patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=(["notes.unknown"], None))
+@patch("huggingface_hub.snapshot_download")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_no_scannable_listing_fails_closed(
+    mock_scan: MagicMock,
+    mock_snapshot_download: MagicMock,
+    _mock_list_repo_files: MagicMock,
+    _mock_get_extensions: MagicMock,
+    _mock_get_model_size: MagicMock,
+) -> None:
+    """Unsupported-only repositories should exit 2 without downloading or scanning."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", "--no-cache", "--format", "json", "https://huggingface.co/test/model"],
+    )
+
+    parsed = parse_click_json_output(result.output)
+    assert result.exit_code == 2
+    assert parsed["has_errors"] is True
+    assert parsed["files_scanned"] == 0
+    assert "repository listing contains no recognized ModelAudit-scannable files" in result.output
+    mock_snapshot_download.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 @patch("modelaudit.cli.download_file_from_hf")
 def test_scan_huggingface_file_download_failure_redacts_url(mock_download_file):
     """Redact direct-file URL secrets from CLI download failures."""
@@ -1547,6 +1575,29 @@ def test_scan_huggingface_streaming_download_failure(mock_download_streaming, mo
     # Should fail with error code 2
     assert result.exit_code == 2
     assert "Error" in result.output
+
+
+@patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={"", ".bin"})
+@patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=(["notes.unknown"], None))
+@patch("huggingface_hub.hf_hub_download")
+def test_scan_huggingface_streaming_no_scannable_listing_fails_closed(
+    mock_hf_hub_download: MagicMock,
+    _mock_list_repo_files: MagicMock,
+    _mock_get_extensions: MagicMock,
+) -> None:
+    """Lazy streaming listing failures should exit 2 instead of reporting a clean scan."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", "--stream", "--no-cache", "--format", "json", "hf://test/model"],
+    )
+
+    parsed = parse_click_json_output(result.output)
+    assert result.exit_code == 2
+    assert parsed["has_errors"] is True
+    assert parsed["files_scanned"] == 0
+    assert "repository listing contains no recognized ModelAudit-scannable files" in result.output
+    mock_hf_hub_download.assert_not_called()
 
 
 @patch("modelaudit.cli.is_huggingface_url")

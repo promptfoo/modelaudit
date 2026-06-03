@@ -51,7 +51,7 @@ def _get_model_extensions() -> set[str]:
 def _build_extension_allow_patterns() -> list[str]:
     """Build conservative glob patterns for scannable files."""
     extensions = _get_model_extensions()
-    suffix_globs = {_case_insensitive_suffix_glob(ext) for ext in extensions}
+    suffix_globs = {_case_insensitive_suffix_glob(ext) for ext in extensions if ext}
     patterns = {f"*{suffix}" for suffix in suffix_globs}
     patterns.update(f"**/*{suffix}" for suffix in suffix_globs)
     return sorted(patterns)
@@ -65,7 +65,7 @@ def _case_insensitive_suffix_glob(extension: str) -> str:
 def _is_scannable_hf_file(filename: str, extensions: set[str]) -> bool:
     """Return whether a listed Hugging Face file has a supported suffix."""
     filename_lower = filename.lower()
-    return any(filename_lower.endswith(ext.lower()) for ext in extensions)
+    return any(filename_lower.endswith(ext.lower()) for ext in extensions if ext)
 
 
 def _raise_no_scannable_hf_files(repo_id: str) -> None:

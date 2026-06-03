@@ -300,7 +300,7 @@ class TestModelDownload:
         mock_snapshot_download.assert_called_once()
         assert mock_snapshot_download.call_args.kwargs["local_dir"] == str(existing_path)
 
-    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin", ".json"})
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={"", ".bin", ".json"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
         return_value=(None, "repo listing failed"),
@@ -366,35 +366,65 @@ class TestModelDownload:
         assert error is None
         mock_repo_info.assert_called_once_with("test/model", timeout=7, files_metadata=False)
 
+    @patch("modelaudit.utils.sources.huggingface.get_model_size", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={"", ".bin"})
     @patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=(["notes.unknown"], None))
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_listing_success_without_scannable_files_fails_closed(
         self,
         mock_snapshot_download: MagicMock,
         _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_get_model_size: MagicMock,
         tmp_path: Path,
     ) -> None:
         """A successful listing with no scannable files must not fall back to a full snapshot."""
-        download_path = tmp_path / "download"
-        download_path.mkdir()
-        (download_path / "config.json").write_text("{}")
-        mock_snapshot_download.return_value = str(download_path)
+        cache_dir = tmp_path / "cache"
+        download_path = cache_dir / "huggingface" / "test" / "model"
 
         with pytest.raises(
             Exception,
             match="Refusing to download full snapshot for test/model: "
             "repository listing contains no recognized ModelAudit-scannable files",
         ):
-            download_model("https://huggingface.co/test/model")
+            download_model("https://huggingface.co/test/model", cache_dir=cache_dir)
 
         mock_snapshot_download.assert_not_called()
+        assert not download_path.exists()
 
+    @patch("modelaudit.utils.sources.huggingface.get_model_size", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={"", ".bin"})
+    @patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=(["notes.unknown"], None))
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_listing_without_scannable_files_preserves_existing_cache(
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_get_model_size: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Fail-closed listing checks must not delete a user's preexisting cache."""
+        cache_dir = tmp_path / "cache"
+        download_path = cache_dir / "huggingface" / "test" / "model"
+        download_path.mkdir(parents=True)
+        cached_file = download_path / "cached.bin"
+        cached_file.write_bytes(b"cached")
+
+        with pytest.raises(Exception, match="repository listing contains no recognized ModelAudit-scannable files"):
+            download_model("https://huggingface.co/test/model", cache_dir=cache_dir)
+
+        mock_snapshot_download.assert_not_called()
+        assert cached_file.read_bytes() == b"cached"
+
+    @patch("modelaudit.utils.sources.huggingface.get_model_size", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=([], None))
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_empty_listing_fails_closed(
         self,
         mock_snapshot_download: MagicMock,
         _mock_list_repo_files: MagicMock,
+        _mock_get_model_size: MagicMock,
     ) -> None:
         """An empty successful listing should not trigger a full-snapshot download."""
         with pytest.raises(
@@ -406,6 +436,7 @@ class TestModelDownload:
 
         mock_snapshot_download.assert_not_called()
 
+    @patch("modelaudit.utils.sources.huggingface.get_model_size", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -417,6 +448,7 @@ class TestModelDownload:
         mock_snapshot_download: MagicMock,
         _mock_list_repo_files: MagicMock,
         _mock_get_extensions: MagicMock,
+        _mock_get_model_size: MagicMock,
         tmp_path: Path,
     ) -> None:
         """Supported remote suffixes should match local case-insensitive routing."""
@@ -467,7 +499,7 @@ class TestModelDownload:
 class TestModelDownloadStreaming:
     """Test streaming model downloads from HuggingFace."""
 
-    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={"", ".bin"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
         return_value=(["pytorch_model.bin", "README.md"], None),
