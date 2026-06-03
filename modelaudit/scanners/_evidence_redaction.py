@@ -69,6 +69,12 @@ SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)([\"']).*?\3"
 )
+GENERIC_QUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)(?P<quote>[\"']).*?(?P=quote)"
+)
+GENERIC_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)[^\s\"';&|]+"
+)
 SENSITIVE_DETAIL_KEY_SUFFIXES: Final[tuple[str, ...]] = (
     "accesskeyid",
     "accesskey",
@@ -117,7 +123,7 @@ def _redact_url(match: re.Match[str]) -> str:
 
     query_items = []
     for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if key.lower() in SENSITIVE_QUERY_KEYS:
+        if _is_sensitive_detail_key(key):
             query_items.append((key, REDACTED_EVIDENCE_VALUE))
         else:
             query_items.append((key, value))
@@ -138,6 +144,21 @@ def _redact_quoted_assignment(match: re.Match[str]) -> str:
     return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
+def _redact_generic_quoted_assignment(match: re.Match[str]) -> str:
+    if not _is_sensitive_detail_key(match.group("key")):
+        return match.group(0)
+    return (
+        f"{match.group('key')}{match.group('separator')}"
+        f"{match.group('quote')}{REDACTED_EVIDENCE_VALUE}{match.group('quote')}"
+    )
+
+
+def _redact_generic_assignment(match: re.Match[str]) -> str:
+    if not _is_sensitive_detail_key(match.group("key")):
+        return match.group(0)
+    return f"{match.group('key')}{match.group('separator')}{REDACTED_EVIDENCE_VALUE}"
+
+
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
@@ -153,6 +174,8 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+    redacted = GENERIC_QUOTED_ASSIGNMENT_RE.sub(_redact_generic_quoted_assignment, redacted)
+    redacted = GENERIC_ASSIGNMENT_RE.sub(_redact_generic_assignment, redacted)
     return _truncate(redacted, max_chars)
 
 

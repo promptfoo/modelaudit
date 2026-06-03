@@ -1883,11 +1883,15 @@ __import__('pickle').loads(data)
         nested_secret = "ZIP_NESTED_SECRET"
         access_key_id_secret = "ZIP_ACCESS_KEY_ID_SECRET"
         camel_case_secret = "ZIP_CAMEL_CASE_SECRET"
+        camel_case_key_secret = "ZIP_CAMEL_CASE_KEY_SECRET"
+        camel_case_query_secret = "ZIP_CAMEL_CASE_QUERY_SECRET"
         authorization_secret = "ZIP_AUTHORIZATION_SECRET"
         config_key_secret = "ZIP_CONFIG_KEY_SECRET"
         metric_secret = "ZIP_METRIC_SECRET"
         metric_identifier_secret = "ZIP_METRIC_IDENTIFIER_SECRET"
         loss_secret = "ZIP_LOSS_SECRET"
+        custom_layer_class_secret = "ZIP_CUSTOM_LAYER_CLASS_SECRET"
+        custom_layer_name_secret = "ZIP_CUSTOM_LAYER_NAME_SECRET"
 
         def direct_lambda_code(x: Any) -> Any:
             token = "ZIP_DIRECT_SECRET"
@@ -1926,10 +1930,17 @@ __import__('pickle').loads(data)
                             "nested": {"token": nested_secret},
                             "aws_access_key_id": access_key_id_secret,
                             "awsSecretAccessKey": camel_case_secret,
+                            f"awsSecretAccessKey={camel_case_key_secret}": "secret key should be redacted",
+                            "source": (f"https://example.test/model.keras?clientSecret={camel_case_query_secret}&ok=1"),
                             "Authorization": f"Basic {authorization_secret}",
                             f"token={config_key_secret}": "secret key should be redacted",
                             "units": 4,
                         },
+                    },
+                    {
+                        "class_name": f"token={custom_layer_class_secret}",
+                        "name": f"token={custom_layer_name_secret}",
+                        "config": {"units": 4},
                     },
                 ]
             },
@@ -1949,11 +1960,15 @@ __import__('pickle').loads(data)
             nested_secret,
             access_key_id_secret,
             camel_case_secret,
+            camel_case_key_secret,
+            camel_case_query_secret,
             authorization_secret,
             config_key_secret,
             metric_secret,
             metric_identifier_secret,
             loss_secret,
+            custom_layer_class_secret,
+            custom_layer_name_secret,
         ]
 
         scanner_result = KerasZipScanner().scan(str(model_path))

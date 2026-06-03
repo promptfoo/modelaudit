@@ -31,7 +31,7 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
-from ._evidence_redaction import redact_evidence_value
+from ._evidence_redaction import redact_evidence_string, redact_evidence_value
 from .archive_dispatch import SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY
 from .archive_member_security import is_executable_archive_member_name
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
@@ -786,7 +786,8 @@ class KerasZipScanner(BaseScanner):
                 )
 
             # Update layer count
-            layer_counts[layer_class] = layer_counts.get(layer_class, 0) + 1
+            layer_count_key = redact_evidence_string(layer_class)
+            layer_counts[layer_count_key] = layer_counts.get(layer_count_key, 0) + 1
 
             # CVE-2025-49655: TorchModuleWrapper uses torch.load(weights_only=False)
             if layer_class == "TorchModuleWrapper":
@@ -868,15 +869,17 @@ class KerasZipScanner(BaseScanner):
                     },
                 )
             elif layer_class and not self._is_known_safe_serialized_layer(layer):
+                redacted_layer_class = redact_evidence_string(layer_class)
+                redacted_layer_name = redact_evidence_string(layer_name)
                 result.add_check(
                     name="Custom Layer Class Detection",
                     passed=False,
-                    message=f"Unknown/custom layer class detected: {layer_class}",
+                    message=f"Unknown/custom layer class detected: {redacted_layer_class}",
                     severity=IssueSeverity.WARNING,
-                    location=f"{self.current_file_path} (layer: {layer_name})",
+                    location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                     details={
-                        "layer_class": layer_class,
-                        "layer_name": layer_name,
+                        "layer_class": redacted_layer_class,
+                        "layer_name": redacted_layer_name,
                         "layer_config": redact_evidence_value(layer.get("config", {}), max_string_chars=200),
                         "risk": "Custom layer classes require external code to load and may execute arbitrary logic",
                     },
@@ -885,15 +888,17 @@ class KerasZipScanner(BaseScanner):
 
             # Check for custom objects
             if self._should_flag_registered_object(layer):
+                redacted_layer_name = redact_evidence_string(layer_name)
+                redacted_registered_name = redact_evidence_string(layer["registered_name"])
                 result.add_check(
                     name="Custom Object Detection",
                     passed=False,
-                    message=f"Custom registered object found: {layer['registered_name']}",
+                    message=f"Custom registered object found: {redacted_registered_name}",
                     severity=IssueSeverity.WARNING,
-                    location=f"{self.current_file_path} (layer: {layer_name})",
+                    location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                     details={
-                        "layer_name": layer_name,
-                        "registered_name": layer["registered_name"],
+                        "layer_name": redacted_layer_name,
+                        "registered_name": redacted_registered_name,
                     },
                 )
 

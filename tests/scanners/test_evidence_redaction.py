@@ -154,3 +154,27 @@ def test_redacts_camel_case_structured_credential_keys() -> None:
         "xAmzSecurityToken": REDACTED_EVIDENCE_VALUE,
         "servicePrivateKey": REDACTED_EVIDENCE_VALUE,
     }
+
+
+def test_redacts_camel_case_assignments_and_url_query_keys() -> None:
+    """CamelCase credential aliases should redact in assignment text and URL queries."""
+    assignment_secret = "CAMEL_ASSIGNMENT_SECRET"
+    quoted_secret = "CAMEL_QUOTED_SECRET"
+    query_secret = "CAMEL_QUERY_SECRET"
+
+    redacted_text = redact_evidence_string(
+        (
+            f"awsSecretAccessKey={assignment_secret} "
+            f"clientSecret='{quoted_secret}' "
+            f"https://example.test/model.keras?xAmzSecurityToken={query_secret}&ok=1"
+        ),
+        max_chars=500,
+    )
+
+    assert assignment_secret not in redacted_text
+    assert quoted_secret not in redacted_text
+    assert query_secret not in redacted_text
+    assert f"awsSecretAccessKey={REDACTED_EVIDENCE_VALUE}" in redacted_text
+    assert f"clientSecret='{REDACTED_EVIDENCE_VALUE}'" in redacted_text
+    assert f"xAmzSecurityToken={REDACTED_EVIDENCE_VALUE}" in redacted_text
+    assert "ok=1" in redacted_text
