@@ -89,6 +89,56 @@ def test_existing_token_assignment_redaction_still_applies() -> None:
     assert redacted == f"token={REDACTED_EVIDENCE_VALUE}"
 
 
+def test_redacts_plural_and_value_suffixed_credential_keys() -> None:
+    """Plural and value-suffixed credential keys should redact child values."""
+    credential_secret = "PLURAL_CREDENTIAL_SECRET"
+    value_secret = "API_KEY_VALUE_SECRET"
+
+    redacted_text = redact_evidence_string(
+        f"credentials={credential_secret} api_key_value={value_secret}",
+        max_chars=500,
+    )
+    redacted_value = redact_evidence_value(
+        {
+            "credentials": credential_secret,
+            "api_key_value": value_secret,
+            "nested": {"accessTokenValue": value_secret},
+        },
+        max_string_chars=500,
+    )
+
+    serialized_value = json.dumps(redacted_value)
+    assert credential_secret not in redacted_text
+    assert value_secret not in redacted_text
+    assert credential_secret not in serialized_value
+    assert value_secret not in serialized_value
+    assert redacted_value == {
+        "credentials": REDACTED_EVIDENCE_VALUE,
+        "api_key_value": REDACTED_EVIDENCE_VALUE,
+        "nested": {"accessTokenValue": REDACTED_EVIDENCE_VALUE},
+    }
+
+
+def test_redacts_whitespace_separated_credential_flags() -> None:
+    """CLI-style credential flags should redact the following value token."""
+    api_secret = "CLI_API_KEY_SECRET"
+    token_secret = "CLI_TOKEN_SECRET"
+    password_secret = "CLI_PASSWORD_SECRET"
+
+    redacted = redact_evidence_string(
+        f"--api-key {api_secret} --token '{token_secret}' --config --password {password_secret} --safe visible",
+        max_chars=500,
+    )
+
+    assert api_secret not in redacted
+    assert token_secret not in redacted
+    assert password_secret not in redacted
+    assert f"--api-key {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f"--token '{REDACTED_EVIDENCE_VALUE}'" in redacted
+    assert f"--password {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "--safe visible" in redacted
+
+
 def test_redacts_access_key_id_assignments_and_nested_values() -> None:
     """AWS-style access key IDs should not survive string or structured redaction."""
     secret = "AWSACCESSKEY123"
@@ -335,6 +385,29 @@ def test_redacts_embedded_structured_credential_literals() -> None:
     assert f'"token":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert f'["api_key","{REDACTED_EVIDENCE_VALUE}"]' in redacted_text
     assert f'"api_key":"{REDACTED_EVIDENCE_VALUE}"' in redacted_escaped
+
+
+def test_redacts_quoted_non_letter_sensitive_key_fragments() -> None:
+    """Quoted credential fragments should allow digit or underscore key starts."""
+    two_factor_secret = "TWO_FACTOR_TOKEN_SECRET"
+    underscore_secret = "UNDERSCORE_TOKEN_SECRET"
+
+    redacted = redact_evidence_string(
+        f'fragments "2fa_token":"{two_factor_secret}" and "_token":"{underscore_secret}"',
+        max_chars=500,
+    )
+
+    assert two_factor_secret not in redacted
+    assert underscore_secret not in redacted
+    assert f'"2fa_token":"{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f'"_token":"{REDACTED_EVIDENCE_VALUE}"' in redacted
+
+
+def test_fails_closed_for_container_heavy_malformed_evidence() -> None:
+    """Malformed container-heavy strings should avoid quadratic redaction scans."""
+    redacted = redact_evidence_string("note " + "(" * 20000, max_chars=500)
+
+    assert redacted == REDACTED_EVIDENCE_VALUE
 
 
 def test_redacts_repr_style_container_credential_values() -> None:

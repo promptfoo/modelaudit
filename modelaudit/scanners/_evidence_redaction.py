@@ -13,6 +13,7 @@ REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 STRUCTURED_REDACTION_PARSE_LIMIT: Final[int] = 10 * 1024
 MAX_URL_QUERY_REDACTION_DEPTH: Final[int] = 8
 MAX_REDACTION_VALUE_DEPTH: Final[int] = 100
+MAX_EMBEDDED_CONTAINER_MALFORMED_COUNT: Final[int] = 64
 
 URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://[^\s\"'<>]+")
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
@@ -68,6 +69,10 @@ AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?)" r"[^\s\"';&|]+"
 )
 BEARER_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+SENSITIVE_FLAG_VALUE_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?P<prefix>(?:^|(?<=\s))-{1,2})(?P<key>[A-Za-z0-9_][A-Za-z0-9_-]{0,80})"
+    r"(?P<separator>\s+)(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s\"';&|-][^\s\"';&|]*)"
+)
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)[^\s\"';&|]+"
 )
@@ -75,7 +80,7 @@ QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
 )
 QUOTED_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?P<key_quote>[\"'])(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P=key_quote)"
+    r"(?P<key_quote>[\"'])(?P<key>[A-Za-z0-9_][A-Za-z0-9_-]{0,80})(?P=key_quote)"
     r"(?P<separator>\s*:\s*)(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
 )
 GENERIC_QUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
@@ -90,7 +95,7 @@ GENERIC_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)[^\s\"';&|]+"
 )
 EMBEDDED_SENSITIVE_KEY_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?P<quote>[\"']?)(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P=quote)\s*:"
+    r"(?P<quote>[\"']?)(?P<key>[A-Za-z0-9_][A-Za-z0-9_-]{0,80})(?P=quote)\s*:"
 )
 SENSITIVE_DETAIL_KEY_SUFFIXES: Final[tuple[str, ...]] = (
     "accesskeyid",
@@ -186,6 +191,17 @@ def _redact_quoted_key_value(match: re.Match[str]) -> str:
     )
 
 
+def _redact_sensitive_flag_value(match: re.Match[str]) -> str:
+    if not _is_sensitive_detail_key(match.group("key")):
+        return match.group(0)
+    value = match.group("value")
+    if value.startswith(("'", '"')):
+        redacted_value = f"{value[0]}{REDACTED_EVIDENCE_VALUE}{value[0]}"
+    else:
+        redacted_value = REDACTED_EVIDENCE_VALUE
+    return f"{match.group('prefix')}{match.group('key')}{match.group('separator')}{redacted_value}"
+
+
 def _redact_generic_quoted_assignment(match: re.Match[str]) -> str:
     if not _is_sensitive_detail_key(match.group("key")):
         return match.group(0)
@@ -199,7 +215,7 @@ def _redact_generic_assignment(match: re.Match[str]) -> str:
     return f"{match.group('key')}{match.group('separator')}{REDACTED_EVIDENCE_VALUE}"
 
 
-def _find_balanced_container_end(text: str, start: int) -> int | None:
+def _find_balanced_container_end(text: str, start: int, *, max_scan_chars: int | None = None) -> int | None:
     if start >= len(text) or text[start] not in "[{(":
         return None
 
@@ -207,8 +223,9 @@ def _find_balanced_container_end(text: str, start: int) -> int | None:
     stack = [text[start]]
     quote: str | None = None
     escaped = False
+    scan_end = len(text) if max_scan_chars is None else min(len(text), start + max_scan_chars)
 
-    for index in range(start + 1, len(text)):
+    for index in range(start + 1, scan_end):
         char = text[index]
         if quote is not None:
             if escaped:
@@ -270,6 +287,7 @@ def _redact_embedded_structured_containers(text: str) -> str:
     redacted_chunks: list[str] = []
     last_index = 0
     search_index = 0
+    malformed_container_count = 0
 
     while search_index < len(text):
         container_starts = [
@@ -281,8 +299,18 @@ def _redact_embedded_structured_containers(text: str) -> str:
             break
 
         container_start = min(container_starts)
-        container_end = _find_balanced_container_end(text, container_start)
+        container_end = _find_balanced_container_end(
+            text,
+            container_start,
+            max_scan_chars=STRUCTURED_REDACTION_PARSE_LIMIT,
+        )
         if container_end is None:
+            malformed_container_count += 1
+            if (
+                malformed_container_count >= MAX_EMBEDDED_CONTAINER_MALFORMED_COUNT
+                or len(text) - container_start > STRUCTURED_REDACTION_PARSE_LIMIT
+            ):
+                return REDACTED_EVIDENCE_VALUE
             search_index = container_start + 1
             continue
 
@@ -383,6 +411,7 @@ def redact_evidence_string(text: str, max_chars: int = 180, *, _url_depth: int =
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+    redacted = SENSITIVE_FLAG_VALUE_RE.sub(_redact_sensitive_flag_value, redacted)
     redacted = _redact_container_assignments(redacted)
     redacted = _redact_embedded_structured_containers(redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
@@ -402,7 +431,13 @@ def _is_sensitive_detail_key(key: str) -> bool:
     return (
         normalized in SENSITIVE_QUERY_KEYS
         or re.fullmatch(SENSITIVE_ASSIGNMENT_KEY, normalized) is not None
-        or any(canonical.endswith(suffix) for suffix in SENSITIVE_DETAIL_KEY_SUFFIXES)
+        or any(
+            canonical.endswith(suffix)
+            or canonical.endswith(f"{suffix}s")
+            or canonical.endswith(f"{suffix}value")
+            or canonical.endswith(f"{suffix}values")
+            for suffix in SENSITIVE_DETAIL_KEY_SUFFIXES
+        )
     )
 
 
