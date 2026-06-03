@@ -7,6 +7,7 @@ import re
 import shutil
 import tempfile
 from collections.abc import Collection
+from http.cookiejar import CookieJar
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TypedDict
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -259,10 +260,12 @@ def _get_with_jfrog_redirect_policy(
     """GET a JFrog URL while stripping credentials from untrusted redirects."""
     current_url = url
     current_headers = headers
+    redirect_cookies = requests.cookies.RequestsCookieJar()
     for _redirect_count in range(_MAX_JFROG_REDIRECTS + 1):
         response = requests.get(
             current_url,
             headers=current_headers,
+            cookies=redirect_cookies,
             timeout=timeout,
             stream=stream,
             allow_redirects=False,
@@ -271,6 +274,9 @@ def _get_with_jfrog_redirect_policy(
             return response
 
         location = response.headers.get("Location")
+        response_cookies = getattr(response, "cookies", None)
+        if isinstance(response_cookies, CookieJar):
+            requests.cookies.merge_cookies(redirect_cookies, response_cookies)
         response.close()
         if not location:
             raise requests.exceptions.RequestException(

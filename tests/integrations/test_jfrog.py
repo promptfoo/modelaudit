@@ -288,6 +288,35 @@ class TestJFrogDownload:
         assert mock_get.call_args_list[1].kwargs["headers"] == {"X-JFrog-Art-Api": "test-token"}
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_redirect_preserves_response_cookies(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Manual redirects should preserve stickiness/session cookies through the cookie jar."""
+        redirect_response = MagicMock(spec=requests.Response)
+        redirect_response.status_code = 302
+        redirect_response.headers = {"Location": "/artifactory/repo/model.bin?node=1"}
+        redirect_response.cookies = requests.cookies.cookiejar_from_dict({"ROUTEID": "backend-a"})
+        final_response = MagicMock(spec=requests.Response)
+        final_response.status_code = 200
+        final_response.headers = {}
+        final_response.raise_for_status.return_value = None
+        final_response.iter_content.return_value = [b"data"]
+        mock_get.side_effect = [redirect_response, final_response]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        result = download_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            cache_dir=tmp_path,
+            api_token="test-token",
+        )
+
+        assert result.read_bytes() == b"data"
+        first_cookie_jar = mock_get.call_args_list[0].kwargs["cookies"]
+        second_cookie_jar = mock_get.call_args_list[1].kwargs["cookies"]
+        assert first_cookie_jar is second_cookie_jar
+        assert second_cookie_jar.get("ROUTEID") == "backend-a"
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_download_redirect_without_location_fails_closed(
         self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
