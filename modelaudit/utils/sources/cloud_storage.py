@@ -721,6 +721,7 @@ def _detect_cloud_shared_skip_filter_route(
         _COREML_PROTO_SIGNATURE_READ_BYTES,
         _XML_MODEL_SIGNATURE_READ_BYTES,
         FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+        JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
         LLAMAFILE_ROUTE_SCAN_BYTES,
         LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
         MXNET_SYMBOL_SIGNATURE_READ_BYTES,
@@ -733,8 +734,17 @@ def _detect_cloud_shared_skip_filter_route(
 
     probe_size = _CLOUD_CONTENT_SNIFF_BYTES
     is_llamafile_candidate = _is_supported_llamafile_executable_header(prefix[:4])
-    if prefix.lstrip().startswith((b"{", b"[")):
+    normalized_prefix = prefix.lstrip()
+    if normalized_prefix.startswith(b"\xef\xbb\xbf"):
+        normalized_prefix = normalized_prefix[3:].lstrip()
+    if normalized_prefix.startswith((b"{", b"[")):
         probe_size = max(probe_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
+    if not normalized_prefix and not size_is_known:
+        probe_size = max(
+            probe_size,
+            JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1,
+            MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1,
+        )
     if prefix and prefix[0] in _MSGPACK_CONTAINER_MARKERS:
         probe_size = max(probe_size, FLAX_MSGPACK_STRUCTURE_READ_BYTES)
     if _could_start_coreml_model_proto(prefix[:16]):
@@ -751,9 +761,13 @@ def _detect_cloud_shared_skip_filter_route(
     if size_is_known:
         probe_size = min(size, probe_size)
 
+    probe_read_size = probe_size if size_is_known else probe_size + 1
     probe = prefix
-    if len(probe) < probe_size:
-        probe = _read_cloud_content_prefix(fs, file_url, probe_size)
+    if len(probe) < probe_read_size:
+        probe = _read_cloud_content_prefix(fs, file_url, probe_read_size)
+    if not size_is_known and len(probe) < probe_read_size:
+        size = len(probe)
+        size_is_known = True
 
     tail: bytes | None = None
     tail_offset: int | None = None

@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from modelaudit.utils.file.detection import _XML_MODEL_SIGNATURE_READ_BYTES, JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES
 from modelaudit.utils.helpers.retry import RetryError
 from modelaudit.utils.sources.cloud_storage import (
     GCSCache,
@@ -483,6 +484,67 @@ def test_filter_scannable_cloud_files_handles_short_remote_reads() -> None:
     files = [{"path": url, "name": "model.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
 
     assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": "tflite"}]
+
+
+def test_filter_scannable_cloud_files_preserves_whitespace_prefixed_jax_json() -> None:
+    url = "s3://bucket/models/checkpoint.payload"
+    payload = (b" " * (9 * 1024)) + json.dumps({"framework": "jax", "orbax_version": "0.1.0"}).encode()
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "checkpoint.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": "jax_checkpoint"}]
+
+
+def test_filter_scannable_cloud_files_preserves_jax_json_after_routing_budget() -> None:
+    url = "s3://bucket/models/checkpoint.payload"
+    payload = (b" " * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1)) + json.dumps({"framework": "jax"}).encode()
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "checkpoint.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": "jax_checkpoint"}]
+
+
+def test_filter_scannable_cloud_files_skips_complete_whitespace_content() -> None:
+    url = "s3://bucket/models/blank.payload"
+    payload = b" " * (9 * 1024)
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "blank.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == []
+
+
+def test_filter_scannable_cloud_files_preserves_oversized_inconclusive_xml() -> None:
+    url = "s3://bucket/models/model.payload"
+    payload = (
+        b"<?xml version='1.0'?><!DOCTYPE PMML ["
+        + (b"x" * (_XML_MODEL_SIGNATURE_READ_BYTES + 64))
+        + b"]><PMML version='4.4'></PMML>"
+    )
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "model.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == [
+        {**files[0], "content_detected_format": "xml_model_inconclusive"}
+    ]
+
+
+def test_filter_scannable_cloud_files_skips_complete_xml_probe_without_model_root() -> None:
+    url = "s3://bucket/models/notes.payload"
+    payload = (
+        b"<?xml version='1.0'?><!--"
+        + (b"x" * (_XML_MODEL_SIGNATURE_READ_BYTES - len(b"<?xml version='1.0'?><!--") - len(b"-->")))
+        + b"-->"
+    )
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "notes.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert len(payload) == _XML_MODEL_SIGNATURE_READ_BYTES
+    assert _filter_scannable_cloud_files(files, fs=fs) == []
 
 
 def test_filter_scannable_cloud_files_uses_actual_llamafile_size(monkeypatch: pytest.MonkeyPatch) -> None:
