@@ -255,6 +255,12 @@ _DANGEROUS_TARGETS = {
     "http.client.HTTPConnection.getresponse",
     "http.client.HTTPSConnection.getresponse",
     "socket.create_connection",
+    "socket.getaddrinfo",
+    "socket.getfqdn",
+    "socket.gethostbyaddr",
+    "socket.gethostbyname",
+    "socket.gethostbyname_ex",
+    "socket.getnameinfo",
     "socket.socket.connect",
     "socket.socket.connect_ex",
     "socket.socket.send",
@@ -291,6 +297,11 @@ _DANGEROUS_TARGETS = {
     "_socket.SocketType.recv",
     "_socket.SocketType.recvfrom",
     "_socket.SocketType.recvmsg",
+    "_socket.getaddrinfo",
+    "_socket.gethostbyaddr",
+    "_socket.gethostbyname",
+    "_socket.gethostbyname_ex",
+    "_socket.getnameinfo",
     "os.open",
     "posix.open",
     "nt.open",
@@ -310,8 +321,32 @@ _DANGEROUS_TARGETS = {
     "posix.scandir",
     "nt.scandir",
     "os.stat",
+    "os.path.exists",
+    "os.path.isfile",
+    "os.path.isdir",
+    "os.path.islink",
+    "os.path.getatime",
+    "os.path.getctime",
+    "os.path.getmtime",
+    "os.path.getsize",
     "posix.stat",
+    "posixpath.exists",
+    "posixpath.isfile",
+    "posixpath.isdir",
+    "posixpath.islink",
+    "posixpath.getatime",
+    "posixpath.getctime",
+    "posixpath.getmtime",
+    "posixpath.getsize",
     "nt.stat",
+    "ntpath.exists",
+    "ntpath.isfile",
+    "ntpath.isdir",
+    "ntpath.islink",
+    "ntpath.getatime",
+    "ntpath.getctime",
+    "ntpath.getmtime",
+    "ntpath.getsize",
     "os.lstat",
     "posix.lstat",
     "nt.lstat",
@@ -339,8 +374,23 @@ _DANGEROUS_TARGETS = {
     "pathlib.PosixPath.readlink",
     "pathlib.WindowsPath.readlink",
     "pathlib.Path.stat",
+    "pathlib.Path.exists",
+    "pathlib.Path.is_file",
+    "pathlib.Path.is_dir",
+    "pathlib.Path.is_symlink",
+    "pathlib.Path.is_mount",
     "pathlib.PosixPath.stat",
+    "pathlib.PosixPath.exists",
+    "pathlib.PosixPath.is_file",
+    "pathlib.PosixPath.is_dir",
+    "pathlib.PosixPath.is_symlink",
+    "pathlib.PosixPath.is_mount",
     "pathlib.WindowsPath.stat",
+    "pathlib.WindowsPath.exists",
+    "pathlib.WindowsPath.is_file",
+    "pathlib.WindowsPath.is_dir",
+    "pathlib.WindowsPath.is_symlink",
+    "pathlib.WindowsPath.is_mount",
     "pathlib.Path.lstat",
     "pathlib.PosixPath.lstat",
     "pathlib.WindowsPath.lstat",
@@ -2346,11 +2396,23 @@ class NemoScanner(BaseScanner):
 
                 child_ancestors = ancestors | {identity}
                 if isinstance(value, dict):
-                    for child_key, child_value in reversed(list(value.items())):
+                    for child_key in reversed(value):
+                        if visited_nodes + len(pending) >= NEMO_MAX_CONFIG_TRAVERSAL_NODES:
+                            raise _NemoConfigTraversalLimit(
+                                "nemo_config_traversal_node_limit",
+                                "YAML config exceeded the traversal node safety limit",
+                            )
+                        child_value = value[child_key]
                         child_path = _append_config_path(config_path, str(child_key))
                         pending.append((child_value, child_path, depth + 1, child_ancestors, value, child_key))
                 else:
-                    for index, child_value in reversed(list(enumerate(value))):
+                    for index in range(len(value) - 1, -1, -1):
+                        if visited_nodes + len(pending) >= NEMO_MAX_CONFIG_TRAVERSAL_NODES:
+                            raise _NemoConfigTraversalLimit(
+                                "nemo_config_traversal_node_limit",
+                                "YAML config exceeded the traversal node safety limit",
+                            )
+                        child_value = value[index]
                         child_path = _append_config_path(config_path, f"[{index}]")
                         pending.append((child_value, child_path, depth + 1, child_ancestors, None, index))
 

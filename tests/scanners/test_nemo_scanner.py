@@ -18,6 +18,7 @@ except ImportError:
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.scanners import nemo_scanner as nemo_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.nemo_scanner import NemoScanner, _get_nested_scanner_for_file
 from modelaudit.utils.file import detection as file_detection
@@ -3645,6 +3646,27 @@ class TestCVE202523304HydraTarget:
                 },
             ),
             (
+                "socket.getaddrinfo",
+                {
+                    "_target_": "socket.getaddrinfo",
+                    "_args_": ["attacker.example", 443],
+                },
+            ),
+            (
+                "socket.gethostbyname",
+                {
+                    "_target_": "socket.gethostbyname",
+                    "_args_": ["attacker.example"],
+                },
+            ),
+            (
+                "_socket.gethostbyname",
+                {
+                    "_target_": "_socket.gethostbyname",
+                    "_args_": ["attacker.example"],
+                },
+            ),
+            (
                 "socket.socket.sendto",
                 {
                     "_target_": "socket.socket.sendto",
@@ -3813,6 +3835,48 @@ class TestCVE202523304HydraTarget:
                 },
             ),
             (
+                "os.path.exists",
+                {
+                    "_target_": "os.path.exists",
+                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "posixpath.isfile",
+                {
+                    "_target_": "posixpath.isfile",
+                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "ntpath.isdir",
+                {
+                    "_target_": "ntpath.isdir",
+                    "_args_": ["C:/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.Path.exists",
+                {
+                    "_target_": "pathlib.Path.exists",
+                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.PosixPath.is_file",
+                {
+                    "_target_": "pathlib.PosixPath.is_file",
+                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.WindowsPath.is_dir",
+                {
+                    "_target_": "pathlib.WindowsPath.is_dir",
+                    "_args_": ["C:/modelaudit-nemo-secret"],
+                },
+            ),
+            (
                 "pathlib.PosixPath.write_text",
                 {
                     "_target_": "pathlib.PosixPath.write_text",
@@ -3935,6 +3999,13 @@ class TestCVE202523304HydraTarget:
                 {
                     "_target_": "socket.create_connection",
                     "_args_": [["169.254.169.254", 80]],
+                },
+            ),
+            (
+                "socket.getaddrinfo",
+                {
+                    "_target_": "socket.getaddrinfo",
+                    "_args_": ["attacker.example", 443],
                 },
             ),
             (
@@ -4088,6 +4159,20 @@ class TestCVE202523304HydraTarget:
                 {
                     "_target_": "glob.glob",
                     "_args_": ["/tmp/*"],
+                },
+            ),
+            (
+                "os.path.exists",
+                {
+                    "_target_": "os.path.exists",
+                    "_args_": ["/tmp/modelaudit-nemo-secret"],
+                },
+            ),
+            (
+                "pathlib.Path.exists",
+                {
+                    "_target_": "pathlib.Path.exists",
+                    "_args_": ["/tmp/modelaudit-nemo-secret"],
                 },
             ),
             (
@@ -4299,6 +4384,29 @@ class TestCVE202523304HydraTarget:
         assert direct_result.success is False
         assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "nemo_config_recursive_alias" in direct_result.metadata["scan_outcome_reasons"]
+        assert determine_exit_code(aggregate_result) == 2
+
+    def test_wide_yaml_config_returns_inconclusive_before_enqueuing_all_children(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Wide YAML configs should respect the node budget before expanding every sibling."""
+        monkeypatch.setattr(nemo_scanner_module, "NEMO_MAX_CONFIG_TRAVERSAL_NODES", 8)
+        path = _create_nemo_file(
+            tmp_path,
+            {"model": {f"child_{index}": {"value": index} for index in range(32)}},
+        )
+
+        direct_result = NemoScanner().scan(str(path))
+        aggregate_result = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False},
+        )
+
+        assert direct_result.success is False
+        assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_config_traversal_node_limit" in direct_result.metadata["scan_outcome_reasons"]
         assert determine_exit_code(aggregate_result) == 2
 
     def test_recursive_yaml_alias_preserves_detected_security_exit1(self, tmp_path: Path) -> None:
