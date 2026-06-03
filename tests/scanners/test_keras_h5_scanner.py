@@ -325,31 +325,37 @@ def test_missing_h5py_invalidates_stale_cache_entries(
 ) -> None:
     """Missing h5py must not return stale clean H5 cache entries."""
     model_path = create_h5_with_external_link(tmp_path)
+    extensionless_model_path = tmp_path / "extensionless_hdf5"
+    extensionless_model_path.write_bytes(model_path.read_bytes())
     cache_dir = tmp_path / "stale-missing-h5py-cache"
     config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
 
     reset_cache_manager()
     try:
         cache_manager = get_cache_manager(str(cache_dir), enabled=True)
-        assert cache_manager.store_result(
-            str(model_path),
-            {
-                "scanner": "keras_h5",
-                "success": True,
-                "issues": [],
-                "checks": [],
-                "metadata": {},
-            },
-            version_context=build_cache_version_context(config),
-        )
+        for cached_path in (model_path, extensionless_model_path):
+            assert cache_manager.store_result(
+                str(cached_path),
+                {
+                    "scanner": "keras_h5",
+                    "success": True,
+                    "issues": [],
+                    "checks": [],
+                    "metadata": {},
+                },
+                version_context=build_cache_version_context(config),
+            )
 
         monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
-        result = KerasH5Scanner(config=config).scan_with_cache(str(model_path))
+        scanner = KerasH5Scanner(config=config)
 
-        assert result.success is False
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "keras_h5_h5py_unavailable" in result.metadata["scan_outcome_reasons"]
-        assert cache_manager.get_stats()["total_entries"] == 1
+        for cached_path in (model_path, extensionless_model_path):
+            result = scanner.scan_with_cache(str(cached_path))
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert "keras_h5_h5py_unavailable" in result.metadata["scan_outcome_reasons"]
+
+        assert cache_manager.get_stats()["total_entries"] == 2
     finally:
         reset_cache_manager()
 
@@ -360,6 +366,8 @@ def test_missing_h5py_cache_bypass_requires_hdf5_content(
 ) -> None:
     """ZIP-backed .keras files should retain normal caching when h5py is unavailable."""
     h5_model_path = create_h5_with_external_link(tmp_path)
+    extensionless_model_path = tmp_path / "extensionless_hdf5"
+    extensionless_model_path.write_bytes(h5_model_path.read_bytes())
     zip_model_path = tmp_path / "model.keras"
     with zipfile.ZipFile(zip_model_path, "w") as zip_file:
         zip_file.writestr("config.json", "{}")
@@ -367,6 +375,7 @@ def test_missing_h5py_cache_bypass_requires_hdf5_content(
     monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
 
     assert should_bypass_cache_for_missing_h5py(str(h5_model_path)) is True
+    assert should_bypass_cache_for_missing_h5py(str(extensionless_model_path)) is True
     assert should_bypass_cache_for_missing_h5py(str(zip_model_path)) is False
 
 

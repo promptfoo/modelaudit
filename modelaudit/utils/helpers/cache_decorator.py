@@ -83,9 +83,6 @@ def should_bypass_cache_for_read_failure_aware_file(file_path: str) -> bool:
 
 def should_bypass_cache_for_missing_h5py(file_path: str) -> bool:
     """Bypass stale HDF5 cache entries when Keras H5 analysis is unavailable."""
-    if os.path.splitext(file_path)[1].lower() not in {".h5", ".hdf5", ".keras"}:
-        return False
-
     try:
         with open(file_path, "rb") as handle:
             if handle.read(len(_HDF5_MAGIC)) != _HDF5_MAGIC:
