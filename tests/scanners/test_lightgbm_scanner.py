@@ -287,8 +287,16 @@ def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
 
     result = LightGBMScanner().scan(str(path))
 
+    network_checks = _check_by_name(result, "Network Indicator Check")
+    assert len(network_checks) == 1
+    assert network_checks[0].details == {
+        "examples": [
+            {"line": "18", "type": "url", "value": "https://collector.evil.example"},
+            {"line": "19", "type": "url", "value": "https://collector.evil.example"},
+        ]
+    }
+
     failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
-    assert "https://collector.evil.example" in failed_details
     assert "lgb_user" not in failed_details
     assert "lgb_pass" not in failed_details
     assert "LGB_SECRET" not in failed_details
