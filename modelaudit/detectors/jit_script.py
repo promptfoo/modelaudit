@@ -182,6 +182,12 @@ _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"(?:(?:async\s+)?def\s+\w+|class\s+\w+|import\s+[A-Za-z_][\w.]*|"
     rb"from\s+[A-Za-z_][\w.]*(?:\s|\\\r?\n)+import)"
 )
+_UNAMBIGUOUS_EMBEDDED_PYTHON_START_PATTERN = re.compile(
+    rb"(?:(?:async\s+)?def\s+\w+\s*[\[(]|"
+    rb"class\s+\w+\s*[\[(:]|"
+    rb"import\s+[A-Za-z_][\w.]*(?:\s*(?:,|as\b|\\\r?\n|\r?\n|$))|"
+    rb"from\s+[A-Za-z_][\w.]*(?:\s|\\\r?\n)+import(?:\s|\\\r?\n)+(?:\(|[A-Za-z_*]))"
+)
 _EMBEDDED_PYTHON_CONTEXT_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])(?:if\s+True\s*:|import\s+[A-Za-z_][\w.]*|from\s+[A-Za-z_][\w.]*|"
     + _EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN
@@ -211,6 +217,8 @@ def _has_source_like_embedded_python_start(data: bytes, *, start_offset: int = 0
         candidate = data[match.start() : match.start() + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES]
         code_str, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
         if _parse_embedded_python_snippet(code_str) is not None:
+            return True
+        if _UNAMBIGUOUS_EMBEDDED_PYTHON_START_PATTERN.match(candidate):
             return True
     return False
 

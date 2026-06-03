@@ -302,6 +302,45 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    @pytest.mark.parametrize(
+        "header",
+        [
+            b"def payload():\n    values = (\n",
+            b"class Payload:\n    values = (\n",
+        ],
+    )
+    def test_extract_embedded_python_marks_long_unparseable_definition_incomplete(self, header: bytes) -> None:
+        detector = JITScriptDetector()
+        continuation = b"        1,\n"
+        data = (
+            header
+            + continuation * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT // len(continuation) + 1)
+            + b"    )\n"
+        )
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "long_definition.pt")
+
+        assert any(
+            finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_BYTE_LIMIT_REASON
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            b"def payload is described here\n",
+            b"class Payload is described here\n",
+        ],
+    )
+    def test_scan_model_ignores_large_definition_like_prose(self, prose: bytes) -> None:
+        detector = JITScriptDetector()
+        data = prose + b"A" * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT + 100)
+
+        findings = detector.scan_model(data, "pytorch", "definition_prose.pt")
+
+        assert not any(finding.type == "analysis_incomplete" for finding in findings)
+
     def test_scan_model_does_not_duplicate_import_only_pytorch_source_findings(self) -> None:
         detector = JITScriptDetector()
 
