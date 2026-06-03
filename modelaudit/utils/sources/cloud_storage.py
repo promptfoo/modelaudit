@@ -714,9 +714,29 @@ class _CloudDownloadBudgetExceeded(ValueError):
     """Raised when a cloud transfer exceeds its bounded acquisition budget."""
 
 
-def _download_cloud_object(fs: Any, file_url: str, local_path: Path, max_bytes: int | None) -> int:
+class _CloudDownloadBudget:
+    """Track a cloud acquisition budget across objects and retry attempts."""
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self.remaining_bytes = max_bytes
+
+    def read_size(self) -> int:
+        """Return a bounded read size that can detect one byte over budget."""
+        return min(_CLOUD_DOWNLOAD_CHUNK_BYTES, self.remaining_bytes + 1)
+
+    def consume(self, byte_count: int) -> None:
+        """Charge transferred bytes to the shared acquisition budget."""
+        if byte_count > self.remaining_bytes:
+            raise _CloudDownloadBudgetExceeded(
+                f"Cloud download exceeds maximum allowed size ({format_size(self.max_bytes)})"
+            )
+        self.remaining_bytes -= byte_count
+
+
+def _download_cloud_object(fs: Any, file_url: str, local_path: Path, budget: _CloudDownloadBudget | None) -> int:
     """Download one cloud object while enforcing an optional transfer budget."""
-    if max_bytes is None:
+    if budget is None:
         fs.get(file_url, str(local_path))
         return 0
 
@@ -724,16 +744,13 @@ def _download_cloud_object(fs: Any, file_url: str, local_path: Path, max_bytes: 
     try:
         with fs.open(file_url, "rb") as remote_file, local_path.open("wb") as local_file:
             while True:
-                chunk = remote_file.read(min(_CLOUD_DOWNLOAD_CHUNK_BYTES, max_bytes - bytes_written + 1))
+                chunk = remote_file.read(budget.read_size())
                 if not chunk:
                     return bytes_written
                 if not isinstance(chunk, bytes):
                     raise TypeError("cloud filesystem returned non-bytes content")
+                budget.consume(len(chunk))
                 bytes_written += len(chunk)
-                if bytes_written > max_bytes:
-                    raise _CloudDownloadBudgetExceeded(
-                        f"Cloud download exceeds maximum allowed size ({format_size(max_bytes)})"
-                    )
                 local_file.write(chunk)
     except Exception:
         local_path.unlink(missing_ok=True)
@@ -909,7 +926,7 @@ def download_from_cloud(
             assert files is not None
 
             # Download files
-            remaining_download_bytes = max_size
+            download_budget = _CloudDownloadBudget(max_size) if max_size else None
             for file_info in files:
                 file_url = file_info["path"]
                 local_path = _build_safe_local_path(url, file_url, download_path)
@@ -924,16 +941,15 @@ def download_from_cloud(
                     verbose=show_progress,
                     sanitize_error=_cloud_error_sanitizer(file_url),
                 )
-                def download_file(url=file_url, path=local_path, budget=remaining_download_bytes):
+                def download_file(url=file_url, path=local_path, budget=download_budget):
                     return _download_cloud_object(fs, url, path, budget)
 
-                downloaded_bytes = download_file()
-                if remaining_download_bytes is not None:
-                    remaining_download_bytes -= downloaded_bytes
+                download_file()
         else:
             # Single file download
             file_name = _cloud_url_basename(url)
             local_file = download_path / file_name
+            download_budget = _CloudDownloadBudget(max_size) if max_size else None
 
             @retry_with_backoff(
                 max_retries=3,
@@ -942,7 +958,7 @@ def download_from_cloud(
                 sanitize_error=_cloud_error_sanitizer(url),
             )
             def download_single_file():
-                return _download_cloud_object(fs, url, local_file, max_size)
+                return _download_cloud_object(fs, url, local_file, download_budget)
 
             if show_progress and size > 100 * 1024 * 1024 * 1024:  # Show progress for files > 100GB
                 with yaspin(text=f"Downloading {file_name}") as spinner:
@@ -1055,7 +1071,7 @@ def download_from_cloud_streaming(
     try:
         # Download files one at a time
         total_files = len(files)
-        remaining_download_bytes = max_size
+        download_budget = _CloudDownloadBudget(max_size) if max_size else None
         for i, file_info in enumerate(files):
             file_url = file_info["path"]
             file_name = file_info.get("name") or _cloud_url_basename(file_url)
@@ -1074,12 +1090,10 @@ def download_from_cloud_streaming(
                 verbose=show_progress,
                 sanitize_error=_cloud_error_sanitizer(file_url),
             )
-            def download_file(url=file_url, path=local_path, budget=remaining_download_bytes):
+            def download_file(url=file_url, path=local_path, budget=download_budget):
                 return _download_cloud_object(fs, url, path, budget)
 
-            downloaded_bytes = download_file()
-            if remaining_download_bytes is not None:
-                remaining_download_bytes -= downloaded_bytes
+            download_file()
 
             yield (local_path, is_last)
 

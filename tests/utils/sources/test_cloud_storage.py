@@ -36,6 +36,15 @@ def make_fs_mock() -> MagicMock:
     return fs
 
 
+class _FailAfterPayload(BytesIO):
+    """Return the payload once, then simulate a transient transport failure."""
+
+    def read(self, size: int | None = -1) -> bytes:
+        if self.tell() == len(self.getvalue()):
+            raise OSError("connection reset")
+        return super().read(size)
+
+
 def configure_partial_metadata_failure(fs: MagicMock, url: str) -> tuple[str, str]:
     model_url = f"{url.rstrip('/')}/model.bin"
     hidden_url = f"{url.rstrip('/')}/evil.pkl?X-Amz-Signature=secret"
@@ -935,6 +944,37 @@ class TestCloudPathSecurity:
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
+    def test_download_with_zero_max_size_remains_uncapped(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.side_effect = RuntimeError("permission denied")
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 0,
+            "name": "model.bin",
+            "human_size": "0 B",
+            "estimated_time": "instant",
+        }
+
+        result = download_from_cloud(
+            "s3://bucket/model.bin",
+            cache_dir=tmp_path,
+            max_size=0,
+            use_cache=False,
+            show_progress=False,
+        )
+
+        assert result == tmp_path / "model.bin"
+        fs.get.assert_called_once_with("s3://bucket/model.bin", str(result))
+        fs.open.assert_not_called()
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
     @pytest.mark.parametrize("metadata_size", [0, 1])
     def test_download_with_max_size_fails_when_size_cannot_be_determined(
         self,
@@ -1072,6 +1112,41 @@ class TestCloudPathSecurity:
         fs.get.assert_not_called()
         assert not (tmp_path / "model.bin").exists()
 
+    @patch("modelaudit.utils.helpers.retry.time.sleep")
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_with_max_size_counts_failed_attempts_against_budget(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        mock_sleep: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 3}
+        fs.open.side_effect = lambda *_args: _FailAfterPayload(b"abc")
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 3,
+            "name": "model.bin",
+            "human_size": "3 B",
+            "estimated_time": "instant",
+        }
+
+        with pytest.raises(ValueError, match="Cloud download exceeds maximum allowed size"):
+            download_from_cloud(
+                "s3://bucket/model.bin",
+                cache_dir=tmp_path,
+                max_size=4,
+                use_cache=False,
+                show_progress=False,
+            )
+
+        assert fs.open.call_count == 2
+        mock_sleep.assert_called_once()
+        assert not (tmp_path / "model.bin").exists()
+
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
     def test_download_with_max_size_rejects_late_object_size_over_limit(
@@ -1161,6 +1236,29 @@ class TestCloudPathSecurity:
 
         fs.get.assert_not_called()
 
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_streaming_download_with_zero_max_size_remains_uncapped(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+    ) -> None:
+        fs = make_fs_mock()
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 0,
+            "name": "model.bin",
+            "human_size": "0 B",
+            "estimated_time": "instant",
+        }
+
+        streamed = list(download_from_cloud_streaming("s3://bucket/model.bin", max_size=0, show_progress=False))
+
+        assert len(streamed) == 1
+        fs.get.assert_called_once()
+        fs.open.assert_not_called()
+
     @pytest.mark.parametrize("prefix_size", [2048, "unknown"])
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
@@ -1225,6 +1323,33 @@ class TestCloudPathSecurity:
 
         fs.open.assert_called_once_with("s3://bucket/model.bin", "rb")
         fs.get.assert_not_called()
+
+    @patch("modelaudit.utils.helpers.retry.time.sleep")
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_streaming_download_with_max_size_counts_failed_attempts_against_budget(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 3}
+        fs.open.side_effect = lambda *_args: _FailAfterPayload(b"abc")
+        mock_fs_class.return_value = fs
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 3,
+            "name": "model.bin",
+            "human_size": "3 B",
+            "estimated_time": "instant",
+        }
+
+        with pytest.raises(ValueError, match="Cloud download exceeds maximum allowed size"):
+            list(download_from_cloud_streaming("s3://bucket/model.bin", max_size=4, show_progress=False))
+
+        assert fs.open.call_count == 2
+        mock_sleep.assert_called_once()
 
 
 class TestCloudCacheSafety:
