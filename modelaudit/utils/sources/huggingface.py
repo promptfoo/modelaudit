@@ -463,7 +463,7 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
     Args:
         url: Direct HuggingFace file URL (e.g., https://huggingface.co/user/repo/resolve/main/file.bin)
         cache_dir: Optional cache directory for downloads
-        max_size: Optional maximum file size to download
+        max_size: Optional maximum file size to download; 0 disables the limit
 
     Returns:
         Path to the downloaded file
@@ -485,8 +485,12 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
     display_url = redact_huggingface_url_for_display(url)
 
     try:
+        if max_size is not None and max_size < 0:
+            raise ValueError("Maximum file size must be non-negative")
+
+        size_limit = max_size or None
         download_revision = branch
-        if max_size is not None:
+        if size_limit is not None:
             api = HfApi()
             repo_info = api.repo_info(repo_id, revision=branch)
             pinned_revision = getattr(repo_info, "sha", None)
@@ -496,11 +500,11 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
             path_info = api.get_paths_info(repo_id, filename, revision=pinned_revision)
             file_metadata = path_info[0] if path_info else None
             file_size = getattr(file_metadata, "size", None)
-            if file_size is None:
+            if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
                 raise ValueError(f"Unable to determine file size for {display_url}; refusing capped download")
-            if file_size > max_size:
+            if file_size > size_limit:
                 raise ValueError(
-                    f"File size ({_format_size(file_size)}) exceeds maximum allowed size ({_format_size(max_size)})"
+                    f"File size ({_format_size(file_size)}) exceeds maximum allowed size ({_format_size(size_limit)})"
                 )
             download_revision = pinned_revision
 
@@ -511,6 +515,19 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
             revision=download_revision,
             cache_dir=str(cache_dir) if cache_dir else None,
         )
-        return Path(local_path)
+        downloaded_path = Path(local_path)
+        if size_limit is not None:
+            try:
+                downloaded_size = downloaded_path.stat().st_size
+            except OSError as exc:
+                raise ValueError(
+                    f"Unable to verify downloaded file size for {display_url}; refusing capped download"
+                ) from exc
+            if downloaded_size > size_limit:
+                raise ValueError(
+                    f"Downloaded file size ({_format_size(downloaded_size)}) "
+                    f"exceeds maximum allowed size ({_format_size(size_limit)})"
+                )
+        return downloaded_path
     except Exception as e:
         raise Exception(f"Failed to download file from {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
