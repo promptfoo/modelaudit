@@ -196,10 +196,10 @@ _COMPOUND_HEADER_MATCH_PATTERN = re.compile(
 _EmbeddedPythonCandidate = tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]
 
 
-def _has_source_like_embedded_python_start(data: bytes) -> bool:
+def _has_source_like_embedded_python_start(data: bytes, *, start_offset: int = 0) -> bool:
     """Return whether a Python start marker follows source indentation or binary framing."""
     source_start_probes = 0
-    for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(data):
+    for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(data, start_offset):
         cursor = match.start()
         while cursor > 0 and data[cursor - 1] in b" \t\r":
             cursor -= 1
@@ -1976,7 +1976,23 @@ class JITScriptDetector:
         prioritized_matches, omitted_budgeted_spans = _select_prioritized_embedded_python_snippets(
             matches, bounded=bounded
         )
-        if not include_full_source and len(data) > _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT:
+        has_bounded_source = _has_source_like_embedded_python_start(bounded)
+        has_source_beyond_bound = (
+            not include_full_source
+            and len(data) > _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+            and _has_source_like_embedded_python_start(
+                data,
+                start_offset=max(
+                    0,
+                    _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT - _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES,
+                ),
+            )
+        )
+        if (
+            not include_full_source
+            and len(data) > _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+            and (has_bounded_source or has_source_beyond_bound)
+        ):
             findings.append(
                 _embedded_python_analysis_incomplete_finding(
                     framework=framework,
@@ -2486,19 +2502,39 @@ class JITScriptDetector:
             elif b"onnx" in data or b"ai.onnx" in data:
                 model_type = "onnx"
 
+        source_like_embedded_python = (
+            _has_source_like_embedded_python_start(data)
+            if model_type == "pickle"
+            or (
+                model_type in ["pytorch", "torchscript", "unknown"] and len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+            )
+            else False
+        )
+        model_specific_embedded_python_fully_scanned = False
+
         # Scan based on model type
         if model_type in ["pytorch", "torchscript"]:
             findings.extend(self.scan_torchscript(data, context))
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
+            model_specific_embedded_python_fully_scanned = (
+                source_like_embedded_python and len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+            )
 
         if model_type in ["tensorflow", "tf", "keras"]:
             findings.extend(self.scan_tensorflow(data, context))
+            model_specific_embedded_python_fully_scanned = (
+                len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+                and (b"SavedFunction" in data or b"saved_model.pb" in data)
+                and (b"python_function" in data or b"function_spec" in data)
+                and _has_source_like_embedded_python_start(data)
+            )
 
         if model_type == "onnx":
             findings.extend(self.scan_onnx(data, context))
 
-        if model_type == "pickle" and _has_source_like_embedded_python_start(data):
+        if model_type == "pickle" and source_like_embedded_python:
             findings.extend(self._extract_and_check_python_code(data, "Generic Python", context))
+            model_specific_embedded_python_fully_scanned = len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
 
         # Always check for generic dangerous patterns
         # Only run fallback scanners if model type is truly unknown
@@ -2510,8 +2546,16 @@ class JITScriptDetector:
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
             findings.extend(self.scan_tensorflow(data, context))
             findings.extend(self.scan_onnx(data, context))
+            model_specific_embedded_python_fully_scanned = len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT and (
+                source_like_embedded_python
+                or (
+                    (b"SavedFunction" in data or b"saved_model.pb" in data)
+                    and (b"python_function" in data or b"function_spec" in data)
+                    and _has_source_like_embedded_python_start(data)
+                )
+            )
 
-        if self._looks_like_dangerous_python_source(data):
+        if not model_specific_embedded_python_fully_scanned and self._looks_like_dangerous_python_source(data):
             findings.extend(
                 self._extract_and_check_python_code(
                     data,
@@ -2520,7 +2564,7 @@ class JITScriptDetector:
                     include_full_source=True,
                 )
             )
-        elif self._looks_like_framed_dangerous_python_source(data):
+        elif not model_specific_embedded_python_fully_scanned and self._looks_like_framed_dangerous_python_source(data):
             for window, include_full_source in _embedded_python_extraction_windows(data):
                 findings.extend(
                     self._extract_and_check_python_code(
