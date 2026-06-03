@@ -142,6 +142,7 @@ _MAX_PRIORITY_ASSIGNMENT_PROBES = 48
 # Bound nested ``:``-header recursion when extracting an embedded statement so a
 # crafted deeply-indented blob cannot exhaust the interpreter stack.
 _MAX_BODY_STATEMENT_NESTING = 100
+_MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES = 64
 _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT = 1_000_000
 _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES = 1_000_000
 _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES = 16_384
@@ -193,6 +194,25 @@ _COMPOUND_HEADER_MATCH_PATTERN = re.compile(
     rb"\b(?:async\s+def|if|elif|else|for|while|try|except|finally|with|class|def)\b"
 )
 _EmbeddedPythonCandidate = tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]
+
+
+def _has_source_like_embedded_python_start(data: bytes) -> bool:
+    """Return whether a Python start marker follows source indentation or binary framing."""
+    source_start_probes = 0
+    for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(data):
+        cursor = match.start()
+        while cursor > 0 and data[cursor - 1] in b" \t\r":
+            cursor -= 1
+        if cursor > 0 and data[cursor - 1] != 0x0A and 0x20 <= data[cursor - 1] < 0x7F:
+            continue
+        source_start_probes += 1
+        if source_start_probes > _MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES:
+            return True
+        candidate = data[match.start() : match.start() + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES]
+        code_str, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
+        if _parse_embedded_python_snippet(code_str) is not None:
+            return True
+    return False
 
 
 def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
@@ -1740,7 +1760,7 @@ class JITScriptDetector:
         # Look for embedded Python code even when framework markers are absent.
         # Scanner callers can hand us raw code-bearing blobs, and an attacker can
         # remove marker strings without removing the executable payload.
-        if _EMBEDDED_PYTHON_START_PATTERN.search(data) is not None:
+        if _has_source_like_embedded_python_start(data):
             code_findings = self._extract_and_check_python_code(data, "TorchScript", context)
             findings.extend(code_findings)
 
@@ -2477,7 +2497,7 @@ class JITScriptDetector:
         if model_type == "onnx":
             findings.extend(self.scan_onnx(data, context))
 
-        if model_type == "pickle" and _EMBEDDED_PYTHON_START_PATTERN.search(data) is not None:
+        if model_type == "pickle" and _has_source_like_embedded_python_start(data):
             findings.extend(self._extract_and_check_python_code(data, "Generic Python", context))
 
         # Always check for generic dangerous patterns

@@ -276,6 +276,16 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
+    def test_scan_model_ignores_large_prose_import_in_omitted_middle(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"A" * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT + 100)
+        prose = b"\ninstructions import numpy for setup\nimport numpy is required by this model\n"
+        data = b"\x00\xff" + padding + prose + padding
+
+        findings = detector.scan_model(data, "pytorch", "prose_import.pt")
+
+        assert not any(finding.type == "analysis_incomplete" for finding in findings)
+
     def test_scan_model_ignores_large_import_near_match(self) -> None:
         detector = JITScriptDetector()
         data = b"metadata_import harmless\n" * (
@@ -285,6 +295,17 @@ class TestJITScriptDetector:
         findings = detector.scan_model(data, "pytorch", "metadata.pt")
 
         assert not any(finding.type == "analysis_incomplete" for finding in findings)
+
+    def test_scan_model_fails_closed_after_source_start_probe_budget(self) -> None:
+        detector = JITScriptDetector()
+        data = b"\n".join(
+            f"import harmless_{index} is prose".encode()
+            for index in range(jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 1)
+        )
+
+        findings = detector.scan_model(data, "pytorch", "many_ambiguous_imports.pt")
+
+        assert any(finding.type == "analysis_incomplete" for finding in findings)
 
     def test_extract_embedded_python_marks_snippet_budget_incomplete(self) -> None:
         detector = JITScriptDetector()
