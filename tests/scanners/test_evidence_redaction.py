@@ -113,6 +113,30 @@ def test_redacts_prefixed_quoted_assignments_without_second_pass_corruption() ->
     assert 'safe=f"value"' in redacted
 
 
+def test_redacts_sensitive_call_and_container_assignment_values() -> None:
+    """Sensitive assignments should consume call and container-shaped values."""
+    call_secret = "CALLSECRET123"
+    list_secret = "LISTSECRET123"
+    unbalanced_secret = "UNBALANCEDSECRET123"
+
+    redacted = redact_evidence_string(
+        (
+            f'api_key=SecretStr("{call_secret}") '
+            f'client_secret=["{list_secret}"] '
+            f'private_key=SecretStr("{unbalanced_secret}" safe=value'
+        ),
+        max_chars=500,
+    )
+
+    assert call_secret not in redacted
+    assert list_secret not in redacted
+    assert unbalanced_secret not in redacted
+    assert f"api_key={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f"client_secret={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f"private_key={REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "safe=value" not in redacted
+
+
 def test_redacts_unterminated_prefixed_quoted_assignments() -> None:
     """Truncated snippets should still fail closed for prefixed quoted credentials."""
     text = 'api_key=f"TRUNCATEDSECRET123 requests.get'
@@ -152,7 +176,7 @@ def test_redacts_compound_sensitive_query_parameters() -> None:
     """Compound query credential keys should be redacted in URL evidence."""
     text = (
         "url=https://example.com/callback?client_secret=CLIENTSECRET123&refresh_token=REFRESHTOKEN456"
-        "&aws_access_key_id=AWSACCESSKEY789&ok=1"
+        "&aws_access_key_id=AWSACCESSKEY789&ok=1;authorization=AUTHQUERYSECRET&token=SEMICOLONSECRET"
     )
 
     redacted = redact_evidence_string(text, max_chars=500)
@@ -160,10 +184,30 @@ def test_redacts_compound_sensitive_query_parameters() -> None:
     assert "CLIENTSECRET123" not in redacted
     assert "REFRESHTOKEN456" not in redacted
     assert "AWSACCESSKEY789" not in redacted
+    assert "AUTHQUERYSECRET" not in redacted
+    assert "SEMICOLONSECRET" not in redacted
     assert "client_secret=<redacted>" in redacted
     assert "refresh_token=<redacted>" in redacted
     assert "aws_access_key_id=<redacted>" in redacted
+    assert "authorization=<redacted>" in redacted
+    assert "token=<redacted>" in redacted
     assert "ok=1" in redacted
+
+
+def test_redacts_userinfo_for_generic_url_schemes() -> None:
+    """Credential-bearing URLs should redact userinfo across schemes."""
+    ssh_secret = "SSHSECRET123"
+    postgres_secret = "POSTGRESSECRET123"
+
+    redacted = redact_evidence_string(
+        f"ssh://user:{ssh_secret}@example.test/path postgres://user:{postgres_secret}@example.test/db",
+        max_chars=500,
+    )
+
+    assert ssh_secret not in redacted
+    assert postgres_secret not in redacted
+    assert "ssh://<credentials-redacted>@example.test/path" in redacted
+    assert "postgres://<credentials-redacted>@example.test/db" in redacted
 
 
 def test_redacts_malformed_userinfo_url() -> None:

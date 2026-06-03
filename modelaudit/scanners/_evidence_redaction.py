@@ -9,7 +9,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 
-URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://[^\s\"'<>]+")
+URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+")
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "access_key",
@@ -29,6 +29,7 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "aws-session-token",
         "auth_token",
         "auth-token",
+        "authorization",
         "client_secret",
         "client-secret",
         "credential",
@@ -36,6 +37,8 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "passwd",
         "private_key",
         "private-key",
+        "proxy_authorization",
+        "proxy-authorization",
         "refresh_token",
         "refresh-token",
         "sas",
@@ -73,6 +76,11 @@ SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)({PYTHON_STRING_PREFIX})"
     rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\4)[\s\S])*\4"
+)
+SENSITIVE_CALL_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)\b(?P<prefix>({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)"
+    r"(?:(?P<callee>[A-Za-z_][A-Za-z0-9_.]{0,120})\s*)?"
+    r"(?P<opener>[\[({])"
 )
 QUOTED_SENSITIVE_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)([\"']{QUOTED_SENSITIVE_KEY}[\"']\s*:\s*)({PYTHON_STRING_PREFIX})"
@@ -118,7 +126,7 @@ def _redact_url(match: re.Match[str]) -> str:
         netloc = f"{REDACTED_URL_CREDENTIALS}@{netloc.rsplit('@', 1)[1]}"
 
     query_items = []
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+    for key, value in parse_qsl(parsed.query.replace(";", "&"), keep_blank_values=True):
         if key.lower() in SENSITIVE_QUERY_KEYS:
             query_items.append((key, REDACTED_EVIDENCE_VALUE))
         else:
@@ -150,6 +158,63 @@ def _redact_quoted_authorization(match: re.Match[str]) -> str:
     return f"{match.group(1)}{match.group(2)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
+def _find_balanced_container_end(text: str, start: int) -> int | None:
+    if start >= len(text) or text[start] not in "[{(":
+        return None
+
+    matching_closer = {"[": "]", "{": "}", "(": ")"}
+    stack = [text[start]]
+    quote: str | None = None
+    escaped = False
+
+    for index in range(start + 1, len(text)):
+        char = text[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+
+        if char in ("'", '"'):
+            quote = char
+        elif char in matching_closer:
+            stack.append(char)
+        elif char in "])}":
+            if not stack or matching_closer[stack[-1]] != char:
+                return None
+            stack.pop()
+            if not stack:
+                return index + 1
+
+    return None
+
+
+def _redact_sensitive_call_assignments(text: str) -> str:
+    redacted_chunks: list[str] = []
+    last_index = 0
+    search_index = 0
+
+    while match := SENSITIVE_CALL_ASSIGNMENT_START_RE.search(text, search_index):
+        container_end = _find_balanced_container_end(text, match.start("opener"))
+        redacted_chunks.append(text[last_index : match.start()])
+        redacted_chunks.append(f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}")
+        if container_end is None:
+            last_index = len(text)
+            break
+
+        last_index = container_end
+        search_index = container_end
+
+    if not redacted_chunks:
+        return text
+
+    redacted_chunks.append(text[last_index:])
+    return "".join(redacted_chunks)
+
+
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
@@ -168,6 +233,7 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = UNTERMINATED_QUOTED_AUTHORIZATION_VALUE_RE.sub(_redact_quoted_authorization, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+    redacted = _redact_sensitive_call_assignments(redacted)
     redacted = UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     return _truncate(redacted, max_chars)
