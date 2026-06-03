@@ -1981,20 +1981,30 @@ class KerasZipScanner(BaseScanner):
             # Lambda layer without encoded function - check other fields
             module_name = layer_config.get("module")
             function_name = layer_config.get("function_name")
-            module_name_text = module_name if isinstance(module_name, str) else ""
 
-            if module_name_text or function_name:
+            if module_name or function_name:
                 # Module/function reference - check for dangerous imports
                 dangerous_modules = ["os", "sys", "subprocess", "eval", "exec", "__builtins__"]
-                if module_name_text and any(dangerous in module_name_text for dangerous in dangerous_modules):
-                    redacted_module_name = redact_evidence_string(module_name_text)
+                module_literals = (
+                    [module_name] if isinstance(module_name, str) else self._extract_string_literals(module_name)
+                )
+                dangerous_module = next(
+                    (
+                        module_literal
+                        for module_literal in module_literals
+                        if any(dangerous in module_literal for dangerous in dangerous_modules)
+                    ),
+                    None,
+                )
+                if dangerous_module is not None:
+                    redacted_module_name = redact_evidence_value(module_name)
                     redacted_function_name = redact_evidence_value(function_name)
                     result.add_check(
                         name="Lambda Layer Module Reference Check",
                         passed=False,
                         message=(
                             f"Lambda layer '{redacted_layer_name}' references potentially dangerous module: "
-                            f"{redacted_module_name}"
+                            f"{redact_evidence_string(dangerous_module)}"
                         ),
                         severity=IssueSeverity.CRITICAL,
                         location=f"{self.current_file_path} (layer: {redacted_layer_name})",

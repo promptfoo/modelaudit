@@ -160,12 +160,14 @@ def test_redacts_camel_case_assignments_and_url_query_keys() -> None:
     """CamelCase credential aliases should redact in assignment text and URL queries."""
     assignment_secret = "CAMEL_ASSIGNMENT_SECRET"
     quoted_secret = "CAMEL_QUOTED_SECRET"
+    escaped_quoted_secret = "CAMEL_ESCAPED_QUOTED_SECRET"
     query_secret = "CAMEL_QUERY_SECRET"
 
     redacted_text = redact_evidence_string(
         (
             f"awsSecretAccessKey={assignment_secret} "
             f"clientSecret='{quoted_secret}' "
+            f"awsSecretAccessKey='abc\\'{escaped_quoted_secret}' "
             f"https://example.test/model.keras?xAmzSecurityToken={query_secret}&ok=1"
         ),
         max_chars=500,
@@ -173,9 +175,11 @@ def test_redacts_camel_case_assignments_and_url_query_keys() -> None:
 
     assert assignment_secret not in redacted_text
     assert quoted_secret not in redacted_text
+    assert escaped_quoted_secret not in redacted_text
     assert query_secret not in redacted_text
     assert f"awsSecretAccessKey={REDACTED_EVIDENCE_VALUE}" in redacted_text
     assert f"clientSecret='{REDACTED_EVIDENCE_VALUE}'" in redacted_text
+    assert f"awsSecretAccessKey='{REDACTED_EVIDENCE_VALUE}'" in redacted_text
     assert f"xAmzSecurityToken={REDACTED_EVIDENCE_VALUE}" in redacted_text
     assert "ok=1" in redacted_text
 
@@ -201,3 +205,20 @@ def test_redacts_quoted_json_style_credential_strings() -> None:
     assert f'"clientSecret":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert f'"secret":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert '"safe":"ok"' in redacted_text
+
+
+def test_redacts_json_string_container_credential_values() -> None:
+    """Serialized JSON strings should redact sensitive container values."""
+    array_secret = "JSON_ARRAY_SECRET"
+    object_secret = "JSON_OBJECT_SECRET"
+
+    redacted_text = redact_evidence_string(
+        f'{{"api_key":["{array_secret}"],"token":{{"nested":"{object_secret}"}},"safe":["ok"]}}',
+        max_chars=500,
+    )
+
+    assert array_secret not in redacted_text
+    assert object_secret not in redacted_text
+    assert f'"api_key":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
+    assert f'"token":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
+    assert '"safe":["ok"]' in redacted_text

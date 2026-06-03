@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -67,14 +68,15 @@ SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)[^\s\"';&|]+"
 )
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)([\"']).*?\3"
+    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
 )
 QUOTED_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?P<key_quote>[\"'])(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P=key_quote)"
     r"(?P<separator>\s*:\s*)(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
 )
 GENERIC_QUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)(?P<quote>[\"']).*?(?P=quote)"
+    r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)"
+    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
 )
 GENERIC_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)[^\s\"';&|]+"
@@ -144,7 +146,7 @@ def _redact_url(match: re.Match[str]) -> str:
 
 
 def _redact_quoted_assignment(match: re.Match[str]) -> str:
-    quote = match.group(3)
+    quote = match.group("value")[0]
     return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
@@ -161,10 +163,8 @@ def _redact_quoted_key_value(match: re.Match[str]) -> str:
 def _redact_generic_quoted_assignment(match: re.Match[str]) -> str:
     if not _is_sensitive_detail_key(match.group("key")):
         return match.group(0)
-    return (
-        f"{match.group('key')}{match.group('separator')}"
-        f"{match.group('quote')}{REDACTED_EVIDENCE_VALUE}{match.group('quote')}"
-    )
+    quote = match.group("value")[0]
+    return f"{match.group('key')}{match.group('separator')}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
 def _redact_generic_assignment(match: re.Match[str]) -> str:
@@ -183,6 +183,16 @@ def _truncate(text: str, max_chars: int) -> str:
 
 def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
+    stripped = text.strip()
+    if stripped.startswith(("{", "[")):
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(parsed, (dict, list)):
+                return _truncate(json.dumps(redact_evidence_value(parsed), separators=(",", ":")), max_chars)
+
     redacted = URL_RE.sub(_redact_url, text)
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)

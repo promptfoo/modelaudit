@@ -1897,6 +1897,8 @@ __import__('pickle').loads(data)
         lambda_function_name_secret = "ZIP_LAMBDA_FUNCTION_NAME_SECRET"
         stringlookup_vocabulary_secret = "ZIP_STRINGLOOKUP_VOCABULARY_SECRET"
         keras_version_secret = "ZIP_KERAS_VERSION_SECRET"
+        escaped_assignment_secret = "ZIP_ESCAPED_ASSIGNMENT_SECRET"
+        json_container_secret = "ZIP_JSON_CONTAINER_SECRET"
 
         def direct_lambda_code(x: Any) -> Any:
             token = "ZIP_DIRECT_SECRET"
@@ -1939,6 +1941,8 @@ __import__('pickle').loads(data)
                             "source": (f"https://example.test/model.keras?clientSecret={camel_case_query_secret}&ok=1"),
                             "Authorization": f"Basic {authorization_secret}",
                             "metadata": f'{{"api_key":"{json_string_secret}","safe":"ok"}}',
+                            "metadata_container": f'{{"api_key":["{json_container_secret}"],"safe":["ok"]}}',
+                            "escaped_assignment": f"awsSecretAccessKey='abc\\'{escaped_assignment_secret}'",
                             f"token={config_key_secret}": "secret key should be redacted",
                             "units": 4,
                         },
@@ -1998,6 +2002,8 @@ __import__('pickle').loads(data)
             lambda_function_name_secret,
             stringlookup_vocabulary_secret,
             keras_version_secret,
+            escaped_assignment_secret,
+            json_container_secret,
         ]
 
         model_path = create_configured_keras_zip(
@@ -2068,6 +2074,7 @@ __import__('pickle').loads(data)
         )
 
         assert not any(check.name == "Keras ZIP File Scan" for check in result.checks)
+        assert any(check.name == "Lambda Layer Module Reference Check" for check in result.checks)
 
     def test_compile_config_detects_nested_metric_and_loss_mappings(self, tmp_path: Path) -> None:
         """Nested compile_config structures should not bypass custom-object detection."""
