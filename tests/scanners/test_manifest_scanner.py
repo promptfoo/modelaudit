@@ -722,6 +722,119 @@ def test_manifest_scanner_delegates_malicious_chat_templates_to_jinja_analysis(t
     )
 
 
+def test_manifest_scanner_delegates_nested_chat_template_containers_to_jinja_analysis(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    payload = "{{ ''.__class__.__mro__[1].__subclasses__() }}"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": {
+                    "default": payload,
+                    "description": "plain prose",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner().scan(str(config_path))
+
+    assert any(
+        check.name == "Jinja2 Template Injection Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details["template_location"] == "chat_template.default"
+        for check in result.checks
+    )
+
+
+def test_manifest_scanner_nested_chat_template_collection_enforces_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    scanner = ManifestScanner()
+    timeout_calls = 0
+
+    def raise_during_nested_collection() -> None:
+        nonlocal timeout_calls
+        timeout_calls += 1
+        if timeout_calls == 4:
+            raise TimeoutError("embedded Jinja collection timed out")
+
+    monkeypatch.setattr(scanner, "_check_timeout", raise_during_nested_collection)
+
+    with pytest.raises(TimeoutError, match="embedded Jinja collection timed out"):
+        scanner._collect_jinja_template_fields({"chat_template": {"default": "{{ harmless }}"}})
+
+
+def test_manifest_scanner_nested_oversized_chat_template_fails_closed(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    payload = "{{ message['content'] }}" + (" safe" * 32)
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": {
+                    "default": payload,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner(config={"max_template_size": 64}).scan(str(config_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jinja2_template_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    size_checks = [c for c in result.checks if c.name == "Template Size Limit"]
+    assert len(size_checks) == 1
+    assert size_checks[0].details["skipped_template_locations"] == ["chat_template.default"]
+
+
+def test_manifest_scanner_ignores_plain_nested_chat_template_container_strings(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": {
+                    "description": "plain prose",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner().scan(str(config_path))
+
+    assert not any(check.name.startswith("Jinja2") or check.name == "Template Size Limit" for check in result.checks)
+
+
+def test_manifest_scanner_template_path_collision_does_not_hide_malicious_candidate(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    malicious = "{{ lipsum.__globals__.os.popen('id') }}"
+    benign = "{{ message['content'] }}"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": {
+                    "a.b": malicious,
+                    "a": {"b": benign},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner().scan(str(config_path))
+
+    failed_checks = [check for check in result.checks if check.name == "Jinja2 Template Injection Detection"]
+    assert failed_checks
+    assert any(check.details.get("template_location") == "chat_template.a.b" for check in failed_checks)
+    summary = [check for check in result.checks if check.name == "Jinja2 SSTI Analysis Summary"]
+    assert len(summary) == 1
+    assert summary[0].details["templates_analyzed"] == 2
+
+
 def test_manifest_scanner_keeps_benign_chat_templates_clean(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text(
