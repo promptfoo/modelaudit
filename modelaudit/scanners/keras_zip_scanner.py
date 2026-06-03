@@ -117,8 +117,28 @@ _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
 _HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
+_HDF5_USERBLOCK_FIRST_OFFSET = 512
 _KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+_-]*)\s*$")
 _KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(r"(?i)^(?:a|alpha|b|beta|c|rc|pre|preview|dev)")
+
+
+def _hdf5_signature_offsets(file_size: int) -> list[int]:
+    offsets = [0]
+    offset = _HDF5_USERBLOCK_FIRST_OFFSET
+    while offset + len(_HDF5_MAGIC) <= file_size:
+        offsets.append(offset)
+        offset *= 2
+    return offsets
+
+
+def _zip_member_has_hdf5_signature(archive: zipfile.ZipFile, member_info: zipfile.ZipInfo) -> bool:
+    offsets = _hdf5_signature_offsets(member_info.file_size)
+    if not offsets:
+        return False
+
+    read_size = offsets[-1] + len(_HDF5_MAGIC)
+    prefix = _read_zip_member_prefix(archive, member_info, read_size)
+    return any(prefix[offset : offset + len(_HDF5_MAGIC)] == _HDF5_MAGIC for offset in offsets)
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -1548,7 +1568,7 @@ class KerasZipScanner(BaseScanner):
             return
 
         if not HAS_H5PY:
-            if _read_zip_member_prefix(archive, weights_info, len(_HDF5_MAGIC)) != _HDF5_MAGIC:
+            if not _zip_member_has_hdf5_signature(archive, weights_info):
                 return
 
             weights_entry = weights_info.filename

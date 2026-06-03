@@ -306,6 +306,43 @@ class TestKerasZipScanner:
         finally:
             reset_cache_manager()
 
+    def test_userblock_embedded_weights_missing_h5py_returns_exit2(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """HDF5 weights with a user block should still fail closed when h5py is unavailable."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+        weights_path = tmp_path / "userblock.weights.h5"
+        with h5py.File(weights_path, "w", userblock_size=512) as h5_file:
+            h5_file.create_dataset("kernel", data=[1.0, 2.0])
+        assert weights_path.read_bytes()[512 : 512 + 8] == b"\x89HDF\r\n\x1a\n"
+
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+        reason = "keras_zip_embedded_weights_h5py_unavailable"
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.12.0",
+            weights_h5_path=weights_path,
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert reason in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Embedded Weights H5PY Library Check"
+            and check.status == CheckStatus.FAILED
+            and check.details["scan_outcome_reason"] == reason
+            for check in result.checks
+        )
+        assert not any(check.name == "H5PY Library Check" for check in result.checks)
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
     def test_missing_h5py_without_embedded_weights_stays_conclusive(
         self,
         tmp_path: Path,
