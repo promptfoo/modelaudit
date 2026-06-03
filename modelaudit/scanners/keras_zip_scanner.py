@@ -965,15 +965,17 @@ class KerasZipScanner(BaseScanner):
             return
 
         required_config_keys = self._nested_layer_config_keys_for_class(layer_class)
+        if not required_config_keys:
+            return
+
         for config_key in self._NESTED_LAYER_CONFIG_KEYS:
-            if config_key not in layer_config:
+            if config_key not in required_config_keys or config_key not in layer_config:
                 continue
 
             nested_layer = layer_config.get(config_key)
             if nested_layer is None:
                 continue
 
-            require_layer_shape = config_key in required_config_keys
             if isinstance(nested_layer, list) and config_key in self._NESTED_LAYER_LIST_CONFIG_KEYS:
                 self._scan_wrapped_layer_list(
                     nested_layer,
@@ -981,7 +983,7 @@ class KerasZipScanner(BaseScanner):
                     layer_name,
                     config_key,
                     nested_layer_depth,
-                    require_layer_shape=require_layer_shape,
+                    require_layer_shape=True,
                 )
                 continue
 
@@ -991,7 +993,7 @@ class KerasZipScanner(BaseScanner):
                 layer_name,
                 config_key,
                 nested_layer_depth,
-                require_layer_shape=require_layer_shape,
+                require_layer_shape=True,
             )
 
     @classmethod

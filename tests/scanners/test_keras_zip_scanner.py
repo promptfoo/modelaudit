@@ -1936,7 +1936,7 @@ __import__('pickle').loads(data)
 
     @pytest.mark.parametrize(
         ("wrapper_class", "expected_exit_code"),
-        [("TimeDistributed", 2), ("keras.layers.TimeDistributed", 1)],
+        [("TimeDistributed", 2), ("keras.layers.TimeDistributed", 2)],
     )
     def test_wrapped_layer_config_invalid_layer_type_fails_closed(
         self,
@@ -1972,6 +1972,37 @@ __import__('pickle').loads(data)
             for check in result.checks
         )
         assert determine_exit_code(audit_result) == expected_exit_code
+
+    def test_qualified_safe_wrapper_layer_does_not_raise_custom_layer_warning(self, tmp_path: Path) -> None:
+        """Trusted fully-qualified Keras wrappers should not become custom-layer false positives."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "keras.layers.TimeDistributed",
+                            "name": "qualified_wrapper",
+                            "config": {
+                                "layer": {
+                                    "class_name": "keras.layers.Dense",
+                                    "name": "inner_dense",
+                                    "config": {"units": 1},
+                                },
+                            },
+                        }
+                    ]
+                },
+            },
+            file_name="qualified_wrapped_layer.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        audit_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        assert not any(check.name == "Custom Layer Class Detection" for check in result.checks)
+        assert determine_exit_code(audit_result) == 0
 
     def test_wrapped_layer_config_missing_class_name_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
         """Wrapper-owned layer dictionaries require a class name for complete nested analysis."""
@@ -2032,6 +2063,40 @@ __import__('pickle').loads(data)
 
         assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
         assert not any(check.name == "Wrapped Layer Type Validation" for check in result.checks)
+
+    def test_nonwrapper_layer_config_dict_nested_names_remain_quiet(self, tmp_path: Path) -> None:
+        """Known-safe non-wrapper layers may use nested-name dictionaries as ordinary metadata."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "Dense",
+                            "name": "metadata_layer",
+                            "config": {
+                                "units": 1,
+                                "layer": {"class_name": "MetadataRecord", "config": {"value": "encoder"}},
+                                "cell": {"class_name": "MetadataCell", "config": {"value": "relu"}},
+                                "cells": [{"class_name": "MetadataCell", "config": {"value": "left"}}],
+                            },
+                        }
+                    ]
+                },
+            },
+            file_name="nonwrapper_nested_dict_names.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        audit_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        assert not any(
+            check.name == "Custom Layer Class Detection"
+            and check.details.get("layer_class") in {"MetadataRecord", "MetadataCell"}
+            for check in result.checks
+        )
+        assert determine_exit_code(audit_result) == 0
 
     def test_bidirectional_nullable_backward_layer_remains_quiet(self, tmp_path: Path) -> None:
         """A nullable optional Bidirectional backward layer must not make a valid config inconclusive."""

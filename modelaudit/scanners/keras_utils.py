@@ -67,11 +67,27 @@ _EXTRA_SAFE_KERAS_METRIC_IDENTIFIERS: frozenset[str] = frozenset(
         "tp",
     }
 )
+_TRUSTED_KERAS_MODULE_PREFIXES: tuple[str, ...] = (
+    "keras.",
+    "tensorflow.keras.",
+    "tensorflow.python.keras.",
+    "tf.keras.",
+    "tf_keras.",
+)
 
 
 def _normalize_keras_identifier(value: str) -> str:
     """Normalize serialized Keras identifiers for allowlist lookups."""
     return value.strip().lower()
+
+
+def _normalize_keras_layer_class(value: str) -> str:
+    """Normalize Keras layer class names while preserving custom namespaces."""
+    normalized = value.strip()
+    module_path, _, class_name = normalized.rpartition(".")
+    if class_name and any(f"{module_path.lower()}.".startswith(prefix) for prefix in _TRUSTED_KERAS_MODULE_PREFIXES):
+        return class_name
+    return normalized
 
 
 def _camel_to_snake(value: str) -> str:
@@ -117,7 +133,10 @@ _SAFE_KERAS_METRIC_IDENTIFIERS = _build_safe_identifier_index(
 
 def is_known_safe_keras_layer_class(layer_class: Any) -> bool:
     """Return True when a serialized Keras layer class is known-safe."""
-    return isinstance(layer_class, str) and _normalize_keras_identifier(layer_class) in _SAFE_KERAS_LAYER_CLASSES
+    return (
+        isinstance(layer_class, str)
+        and _normalize_keras_identifier(_normalize_keras_layer_class(layer_class)) in _SAFE_KERAS_LAYER_CLASSES
+    )
 
 
 def is_known_safe_keras_loss(identifier: Any) -> bool:
