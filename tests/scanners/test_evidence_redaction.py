@@ -125,3 +125,32 @@ def test_redacts_secret_bearing_structured_keys() -> None:
     assert f"https://{REDACTED_URL_CREDENTIALS}@example.test/model.keras?api_key={REDACTED_EVIDENCE_VALUE}" in (
         redacted_value
     )
+
+
+def test_redacts_camel_case_structured_credential_keys() -> None:
+    """SDK-style camelCase credential keys should redact values by key context."""
+    aws_secret = "AWS_SECRET_ACCESS_KEY_VALUE"
+    session_secret = "AWS_SESSION_TOKEN_VALUE"
+    amz_secret = "X_AMZ_SECURITY_TOKEN_VALUE"
+    private_key_secret = "SERVICE_PRIVATE_KEY_VALUE"
+
+    redacted_value = redact_evidence_value(
+        {
+            "awsSecretAccessKey": aws_secret,
+            "awsSessionToken": session_secret,
+            "xAmzSecurityToken": amz_secret,
+            "servicePrivateKey": private_key_secret,
+        }
+    )
+
+    serialized_value = json.dumps(redacted_value)
+    assert aws_secret not in serialized_value
+    assert session_secret not in serialized_value
+    assert amz_secret not in serialized_value
+    assert private_key_secret not in serialized_value
+    assert redacted_value == {
+        "awsSecretAccessKey": REDACTED_EVIDENCE_VALUE,
+        "awsSessionToken": REDACTED_EVIDENCE_VALUE,
+        "xAmzSecurityToken": REDACTED_EVIDENCE_VALUE,
+        "servicePrivateKey": REDACTED_EVIDENCE_VALUE,
+    }

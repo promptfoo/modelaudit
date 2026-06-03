@@ -69,6 +69,25 @@ SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)([\"']).*?\3"
 )
+SENSITIVE_DETAIL_KEY_SUFFIXES: Final[tuple[str, ...]] = (
+    "accesskeyid",
+    "accesskey",
+    "accesstoken",
+    "apikey",
+    "authtoken",
+    "clientsecret",
+    "credential",
+    "password",
+    "passwd",
+    "privatekey",
+    "refreshtoken",
+    "sas",
+    "secretkey",
+    "signature",
+    "secret",
+    "sig",
+    "token",
+)
 
 
 def _redact_malformed_url(raw_url: str) -> str:
@@ -137,9 +156,18 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     return _truncate(redacted, max_chars)
 
 
+def _canonicalize_detail_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", key.lower())
+
+
 def _is_sensitive_detail_key(key: str) -> bool:
     normalized = key.lower()
-    return normalized in SENSITIVE_QUERY_KEYS or re.fullmatch(SENSITIVE_ASSIGNMENT_KEY, normalized) is not None
+    canonical = _canonicalize_detail_key(key)
+    return (
+        normalized in SENSITIVE_QUERY_KEYS
+        or re.fullmatch(SENSITIVE_ASSIGNMENT_KEY, normalized) is not None
+        or any(canonical.endswith(suffix) for suffix in SENSITIVE_DETAIL_KEY_SUFFIXES)
+    )
 
 
 def redact_evidence_value(value: Any, max_string_chars: int = 180) -> Any:

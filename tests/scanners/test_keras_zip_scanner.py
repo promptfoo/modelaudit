@@ -1882,6 +1882,7 @@ __import__('pickle').loads(data)
         custom_secret = "ZIP_CUSTOM_SECRET"
         nested_secret = "ZIP_NESTED_SECRET"
         access_key_id_secret = "ZIP_ACCESS_KEY_ID_SECRET"
+        camel_case_secret = "ZIP_CAMEL_CASE_SECRET"
         authorization_secret = "ZIP_AUTHORIZATION_SECRET"
         config_key_secret = "ZIP_CONFIG_KEY_SECRET"
         metric_secret = "ZIP_METRIC_SECRET"
@@ -1924,6 +1925,7 @@ __import__('pickle').loads(data)
                             "api_key": custom_secret,
                             "nested": {"token": nested_secret},
                             "aws_access_key_id": access_key_id_secret,
+                            "awsSecretAccessKey": camel_case_secret,
                             "Authorization": f"Basic {authorization_secret}",
                             f"token={config_key_secret}": "secret key should be redacted",
                             "units": 4,
@@ -1946,6 +1948,7 @@ __import__('pickle').loads(data)
             custom_secret,
             nested_secret,
             access_key_id_secret,
+            camel_case_secret,
             authorization_secret,
             config_key_secret,
             metric_secret,
