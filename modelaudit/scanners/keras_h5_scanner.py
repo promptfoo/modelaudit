@@ -27,6 +27,7 @@ from .keras_utils import (
     check_custom_loss_config,
     check_custom_metric_config,
     check_lambda_dict_function,
+    check_lambda_list_function,
     check_subclassed_model,
     is_known_safe_keras_layer_class,
 )
@@ -915,12 +916,22 @@ class KerasH5Scanner(BaseScanner):
         module_name = layer_config.get("module")
         function_name = layer_config.get("function_name")
 
-        dict_function_handled = isinstance(function_str, dict) and check_lambda_dict_function(
-            function_str,
-            result,
-            self.current_file_path,
-            layer_config.get("name", "lambda"),
-        )
+        layer_name = layer_config.get("name", "lambda")
+        encoded_function_handled = False
+        if isinstance(function_str, dict):
+            encoded_function_handled = check_lambda_dict_function(
+                function_str,
+                result,
+                self.current_file_path,
+                layer_name,
+            )
+        elif isinstance(function_str, list):
+            encoded_function_handled = check_lambda_list_function(
+                function_str,
+                result,
+                self.current_file_path,
+                layer_name,
+            )
 
         # Check if there's actual Python code to validate
         if function_str and isinstance(function_str, str):
@@ -1011,7 +1022,7 @@ class KerasH5Scanner(BaseScanner):
                     why=get_pattern_explanation("lambda_layer"),
                     rule_code="S1103",
                 )
-            elif not dict_function_handled:
+            elif not encoded_function_handled:
                 # Safe module reference - record as passed
                 result.add_check(
                     name="Lambda Layer Module Reference Check",
