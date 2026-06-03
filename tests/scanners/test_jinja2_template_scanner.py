@@ -781,6 +781,83 @@ class TestJinja2TemplateScannerEdgeCases:
         assert failures[0]["reason"] == "jinja2_template_size_limit_exceeded"
         assert failures[0]["template_size"] == 65
 
+    def test_array_backed_gguf_oversized_chat_template_fails_before_stringifying(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class AbbreviatedArrayTemplate:
+            nbytes = 65
+
+            def __str__(self) -> str:
+                return "{{ content }}"
+
+            def tobytes(self) -> bytes:
+                raise AssertionError("oversized GGUF template must not be materialized")
+
+        class FakeGGUFReader:
+            def __init__(self, _path: str) -> None:
+                self.fields = {
+                    "tokenizer.chat_template": SimpleNamespace(
+                        parts=[AbbreviatedArrayTemplate()],
+                        data=[0],
+                    )
+                }
+
+        gguf_file = tmp_path / "model.gguf"
+        gguf_file.write_bytes(b"GGUF")
+        monkeypatch.setattr(jinja2_template_scanner, "HAS_GGUF", True)
+        monkeypatch.setattr(jinja2_template_scanner, "GGUFReader", FakeGGUFReader, raising=False)
+
+        result = Jinja2TemplateScanner({"max_template_size": 64}).scan(str(gguf_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_template_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        size_checks = [c for c in result.checks if c.name == "Template Size Limit"]
+        assert len(size_checks) == 1
+        assert size_checks[0].details["format"] == "gguf"
+        assert size_checks[0].details["skipped_template_locations"] == ["tokenizer.chat_template"]
+        assert size_checks[0].details["template_size"] == 65
+
+    def test_array_backed_gguf_chat_template_decodes_before_analysis(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        payload = "{{ lipsum.__globals__.os.popen('id') }}"
+        payload_bytes = payload.encode("utf-8")
+
+        class ArrayBackedTemplate:
+            nbytes = len(payload_bytes)
+
+            def __str__(self) -> str:
+                return "[123 123 ...]"
+
+            def tobytes(self) -> bytes:
+                return payload_bytes
+
+        class FakeGGUFReader:
+            def __init__(self, _path: str) -> None:
+                self.fields = {
+                    "tokenizer.chat_template": SimpleNamespace(
+                        parts=[ArrayBackedTemplate()],
+                        data=[0],
+                    )
+                }
+
+        gguf_file = tmp_path / "model.gguf"
+        gguf_file.write_bytes(b"GGUF")
+        monkeypatch.setattr(jinja2_template_scanner, "HAS_GGUF", True)
+        monkeypatch.setattr(jinja2_template_scanner, "GGUFReader", FakeGGUFReader, raising=False)
+
+        result = Jinja2TemplateScanner({"max_template_size": 128}).scan(str(gguf_file))
+
+        failed_checks = [check for check in result.checks if check.name == "Jinja2 Template Injection Detection"]
+        assert failed_checks
+        assert any(check.details.get("template_location") == "tokenizer.chat_template" for check in failed_checks)
+        assert not [check for check in result.checks if check.name == "Template Size Limit"]
+
     def test_small_json_chat_template_still_analyzed(self, tmp_path: Path) -> None:
         payload = "{{ lipsum.__globals__.os.popen('id') }}"
         tokenizer_file = tmp_path / "tokenizer_config.json"
