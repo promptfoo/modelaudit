@@ -385,6 +385,45 @@ class TestKerasZipScanner:
         )
         assert not any(check.name == "H5PY Library Check" for check in result.checks)
 
+    def test_userblock_embedded_weights_preserves_executable_security_scan(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Missing h5py must not suppress generic executable checks for HDF5 user-block bytes."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+        weights_path = tmp_path / "userblock_shell.weights.h5"
+        with h5py.File(weights_path, "w", userblock_size=512) as h5_file:
+            h5_file.create_dataset("kernel", data=[1.0, 2.0])
+        with weights_path.open("r+b") as weights_file:
+            weights_file.write(b"#!/bin/sh\necho pwned\n")
+        assert weights_path.read_bytes()[512 : 512 + 8] == b"\x89HDF\r\n\x1a\n"
+
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.12.0",
+            weights_h5_path=weights_path,
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["embedded_weights_hdf5_signature_offset"] == 512
+        assert any(
+            issue.message == "Executable file found in ZIP archive: model.weights.h5"
+            and issue.details.get("entry") == "model.weights.h5"
+            for issue in result.issues
+        )
+        assert not any(check.name == "H5PY Library Check" for check in result.checks)
+        assert not any(
+            issue.rule_code == "S901" and issue.details.get("embedded_weights_hdf5_userblock")
+            for issue in result.issues
+        )
+
     def test_oversized_userblock_embedded_weights_missing_h5py_fails_closed(
         self,
         tmp_path: Path,
@@ -419,6 +458,37 @@ class TestKerasZipScanner:
         )
         assert not any(check.name == "H5PY Library Check" for check in result.checks)
         assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+    def test_oversized_non_hdf5_weights_preserve_generic_pickle_scan(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Probe-incomplete weights must still report generic pickle findings before failing closed."""
+        pickle_payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
+        payload_size = _HDF5_SIGNATURE_SCAN_MAX_BYTES + 1
+        weights_payload = pickle_payload + bytes(payload_size - len(pickle_payload))
+        keras_path = tmp_path / "oversized_disguised_pickle.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.12.0"}))
+            zf.writestr("model.weights.h5", weights_payload)
+
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+        reason = "keras_zip_embedded_weights_hdf5_signature_probe_incomplete"
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert reason in result.metadata["scan_outcome_reasons"]
+        assert any(
+            issue.rule_code == "S201"
+            and issue.details.get("zip_entry") == "model.weights.h5"
+            and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system", "nt.system"))
+            for issue in result.issues
+        )
+        assert not any(check.name == "H5PY Library Check" for check in result.checks)
 
     def test_missing_h5py_without_embedded_weights_stays_conclusive(
         self,

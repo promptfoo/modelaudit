@@ -630,13 +630,11 @@ class ZipScanner(BaseScanner):
                     )
                     continue
 
-                if self._is_security_only_member_entry(name):
-                    continue
-
                 # Extract and scan the file
                 tmp_path: str | None = None
                 try:
                     max_entry_size = self._get_max_entry_size()
+                    is_security_only_member = self._is_security_only_member_entry(name)
 
                     if name.lower().endswith(".zip"):
                         suffix = ".zip"
@@ -670,7 +668,7 @@ class ZipScanner(BaseScanner):
                                     tmp.write(chunk)
                             extracted_uncompressed_size += total_size
 
-                        if archive_ext == ".mar" and name.lower().endswith(".py"):
+                        if archive_ext == ".mar" and name.lower().endswith(".py") and not is_security_only_member:
                             mar_python_result = self._scan_mar_python_entry(path, name, tmp_path, total_size)
                             if mar_python_result is not None:
                                 result.merge(mar_python_result)
@@ -688,6 +686,17 @@ class ZipScanner(BaseScanner):
                                 python_analysis_incomplete_reason="zip_python_member_analysis_incomplete",
                                 executable_analysis_incomplete_reason="zip_executable_member_analysis_incomplete",
                             )
+
+                        if is_security_only_member:
+                            contents.append(
+                                {
+                                    "path": f"{path}:{name}",
+                                    "type": "security_only",
+                                    "size": info.file_size,
+                                }
+                            )
+                            result.bytes_scanned += total_size
+                            continue
 
                         nested_config = dict(self.config)
                         nested_config.pop("skip_archive_entries", None)
