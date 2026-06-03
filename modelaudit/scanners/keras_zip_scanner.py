@@ -1,6 +1,7 @@
 """Scanner for ZIP-based Keras model files (.keras format)."""
 
 import base64
+import io
 import json
 import os
 import re
@@ -118,27 +119,32 @@ _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
 _HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
 _HDF5_USERBLOCK_FIRST_OFFSET = 512
+_HDF5_SIGNATURE_SCAN_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+_-]*)\s*$")
 _KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(r"(?i)^(?:a|alpha|b|beta|c|rc|pre|preview|dev)")
 
 
 def _hdf5_signature_offsets(file_size: int) -> list[int]:
+    max_signature_end = min(file_size, _HDF5_SIGNATURE_SCAN_MAX_BYTES)
     offsets = [0]
     offset = _HDF5_USERBLOCK_FIRST_OFFSET
-    while offset + len(_HDF5_MAGIC) <= file_size:
+    while offset + len(_HDF5_MAGIC) <= max_signature_end:
         offsets.append(offset)
         offset *= 2
     return offsets
 
 
-def _zip_member_has_hdf5_signature(archive: zipfile.ZipFile, member_info: zipfile.ZipInfo) -> bool:
+def _zip_member_hdf5_signature_offset(archive: zipfile.ZipFile, member_info: zipfile.ZipInfo) -> int | None:
     offsets = _hdf5_signature_offsets(member_info.file_size)
     if not offsets:
-        return False
+        return None
 
     read_size = offsets[-1] + len(_HDF5_MAGIC)
     prefix = _read_zip_member_prefix(archive, member_info, read_size)
-    return any(prefix[offset : offset + len(_HDF5_MAGIC)] == _HDF5_MAGIC for offset in offsets)
+    for offset in offsets:
+        if prefix[offset : offset + len(_HDF5_MAGIC)] == _HDF5_MAGIC:
+            return offset
+    return None
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -406,7 +412,7 @@ class KerasZipScanner(BaseScanner):
         from .zip_scanner import ZipScanner
 
         has_embedded_weights_limit = self._has_embedded_weights_limit_reason(result)
-        skip_owned_weights_entry = self._has_embedded_weights_incomplete_reason(result)
+        skip_owned_weights_entry = self._should_skip_owned_weights_entry(result)
         zip_scanner = ZipScanner(self._get_recursive_archive_scan_config(skip_weights_entry=skip_owned_weights_entry))
         nested_result = zip_scanner._scan_zip_file(
             path,
@@ -664,15 +670,13 @@ class KerasZipScanner(BaseScanner):
         return isinstance(reasons, list) and "keras_zip_embedded_weights_too_large" in reasons
 
     @staticmethod
-    def _has_embedded_weights_incomplete_reason(result: ScanResult) -> bool:
+    def _should_skip_owned_weights_entry(result: ScanResult) -> bool:
         reasons = result.metadata.get("scan_outcome_reasons")
-        return isinstance(reasons, list) and any(
-            reason in reasons
-            for reason in (
-                "keras_zip_embedded_weights_too_large",
-                "keras_zip_embedded_weights_h5py_unavailable",
-            )
-        )
+        if not isinstance(reasons, list):
+            return False
+        if "keras_zip_embedded_weights_too_large" in reasons:
+            return True
+        return "keras_zip_embedded_weights_h5py_unavailable" in reasons
 
     @staticmethod
     def _is_expected_recursive_weights_limit_noise(entry: Any) -> bool:
@@ -1568,12 +1572,15 @@ class KerasZipScanner(BaseScanner):
             return
 
         if not HAS_H5PY:
-            if not _zip_member_has_hdf5_signature(archive, weights_info):
+            hdf5_signature_offset = _zip_member_hdf5_signature_offset(archive, weights_info)
+            if hdf5_signature_offset is None:
                 return
 
             weights_entry = weights_info.filename
             reason = "keras_zip_embedded_weights_h5py_unavailable"
+            result.metadata["embedded_weights_hdf5_signature_offset"] = hdf5_signature_offset
             self._mark_inconclusive_scan_result(result, reason)
+            self._scan_embedded_weights_hdf5_userblock(archive, weights_info, hdf5_signature_offset, result)
             result.add_check(
                 name="Embedded Weights H5PY Library Check",
                 passed=False,
@@ -1586,6 +1593,7 @@ class KerasZipScanner(BaseScanner):
                 details={
                     "entry": weights_entry,
                     "required_package": "h5py",
+                    "hdf5_signature_offset": hdf5_signature_offset,
                     "analysis_incomplete": True,
                     "scan_outcome_reason": reason,
                 },
@@ -1701,6 +1709,45 @@ class KerasZipScanner(BaseScanner):
                 "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
             },
         )
+
+    def _scan_embedded_weights_hdf5_userblock(
+        self,
+        archive: zipfile.ZipFile,
+        weights_info: zipfile.ZipInfo,
+        hdf5_signature_offset: int,
+        result: ScanResult,
+    ) -> None:
+        """Preserve security findings hidden before a valid HDF5 user-block signature."""
+        if hdf5_signature_offset <= 0:
+            return
+
+        userblock = _read_zip_member_prefix(archive, weights_info, hdf5_signature_offset).rstrip(b"\x00")
+        if not userblock:
+            return
+
+        from .pickle_scanner import PickleScanner
+        from .picklescan_adapter import apply_pickle_member_context
+
+        weights_entry = weights_info.filename
+        pickle_source = f"{self.current_file_path}:{weights_entry}:hdf5-userblock.pkl"
+        userblock_result = PickleScanner(config=self.config).scan_stream(
+            io.BytesIO(userblock),
+            len(userblock),
+            source=pickle_source,
+        )
+        if not self._scan_result_has_security_findings(userblock_result):
+            return
+
+        apply_pickle_member_context(userblock_result, archive_path=self.current_file_path, member_name=weights_entry)
+        for check in userblock_result.checks:
+            check.details["zip_entry"] = weights_entry
+            check.details["embedded_weights_hdf5_userblock"] = True
+            check.details["hdf5_signature_offset"] = hdf5_signature_offset
+        for issue in userblock_result.issues:
+            issue.details["zip_entry"] = weights_entry
+            issue.details["embedded_weights_hdf5_userblock"] = True
+            issue.details["hdf5_signature_offset"] = hdf5_signature_offset
+        result.merge(userblock_result)
 
     @staticmethod
     def _collect_hdf5_external_references(h5_file: Any) -> list[dict[str, Any]]:

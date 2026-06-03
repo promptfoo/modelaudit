@@ -337,11 +337,49 @@ class TestKerasZipScanner:
         assert any(
             check.name == "Embedded Weights H5PY Library Check"
             and check.status == CheckStatus.FAILED
+            and check.details["hdf5_signature_offset"] == 512
             and check.details["scan_outcome_reason"] == reason
             for check in result.checks
         )
         assert not any(check.name == "H5PY Library Check" for check in result.checks)
         assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+    def test_userblock_embedded_weights_preserves_generic_security_scan(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Missing h5py must not suppress malicious bytes stored before the user-block signature."""
+        if h5py is None:
+            pytest.skip("h5py not available")
+        pickle_payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
+        weights_path = tmp_path / "userblock_pickle.weights.h5"
+        with h5py.File(weights_path, "w", userblock_size=512) as h5_file:
+            h5_file.create_dataset("kernel", data=[1.0, 2.0])
+        with weights_path.open("r+b") as weights_file:
+            weights_file.write(pickle_payload)
+        assert weights_path.read_bytes()[512 : 512 + 8] == b"\x89HDF\r\n\x1a\n"
+
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.12.0",
+            weights_h5_path=weights_path,
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["embedded_weights_hdf5_signature_offset"] == 512
+        assert any(
+            issue.rule_code == "S201"
+            and issue.details.get("zip_entry") == "model.weights.h5"
+            and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system", "nt.system"))
+            for issue in result.issues
+        )
+        assert not any(check.name == "H5PY Library Check" for check in result.checks)
 
     def test_missing_h5py_without_embedded_weights_stays_conclusive(
         self,
