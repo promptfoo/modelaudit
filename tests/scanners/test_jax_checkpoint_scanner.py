@@ -543,6 +543,58 @@ def test_orbax_checkpoint_file_count_limit_fails_closed(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("checkpoint_filename", ["checkpoint_42", "params_0"])
+def test_orbax_prefixed_checkpoint_file_is_scanned(tmp_path: Path, checkpoint_filename: str) -> None:
+    checkpoint_dir = tmp_path / "orbax_prefixed_file"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / checkpoint_filename).write_bytes(b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["global"] == "posix.system"
+        for check in result.checks
+    )
+
+
+def test_orbax_nested_checkpoint_directory_fails_closed(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_nested_checkpoint"
+    nested_checkpoint_dir = checkpoint_dir / "step_0"
+    nested_checkpoint_dir.mkdir(parents=True)
+    (nested_checkpoint_dir / "checkpoint").write_bytes(b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_orbax_checkpoint_entry_uninspected" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Orbax Checkpoint Entry Coverage"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.INFO
+        and check.details["entry"] == "step_0"
+        and check.details["entry_type"] == "directory"
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+
+
+def test_orbax_checkpoint_entry_near_match_does_not_route_directory(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "not_orbax"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "checkpointing_notes.txt").write_text("plain documentation", encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is False
+
+
 class _SafeJaxState:
     def __init__(self) -> None:
         self.framework = "jax"

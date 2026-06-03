@@ -119,6 +119,7 @@ class JaxCheckpointScanner(BaseScanner):
     DEFAULT_MAX_PICKLE_OPCODE_FINDINGS: ClassVar[int] = 256
     DEFAULT_MAX_ORBAX_CHECKPOINT_FILES: ClassVar[int] = 4096
     DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES: ClassVar[int] = 8192
+    _ORBAX_CHECKPOINT_ENTRY_PREFIXES: ClassVar[tuple[str, ...]] = ("step_", "params_", "state_", "model_")
     _DANGEROUS_PICKLE_GLOBALS: ClassVar[frozenset[tuple[str, str]]] = frozenset(
         {
             ("builtins", "__import__"),
@@ -238,6 +239,7 @@ class JaxCheckpointScanner(BaseScanner):
     _ORBAX_METADATA_PREFIX_PATTERN_READ_FAILED_REASON: ClassVar[str] = "jax_orbax_metadata_prefix_pattern_read_failed"
     _ORBAX_DIRECTORY_ENTRY_COUNT_LIMIT_REASON: ClassVar[str] = "jax_orbax_directory_entry_count_limit"
     _ORBAX_CHECKPOINT_FILE_COUNT_LIMIT_REASON: ClassVar[str] = "jax_orbax_checkpoint_file_count_limit"
+    _ORBAX_CHECKPOINT_ENTRY_UNINSPECTED_REASON: ClassVar[str] = "jax_orbax_checkpoint_entry_uninspected"
     _METADATA_TRAVERSAL_LIMIT_REASON: ClassVar[str] = "jax_metadata_traversal_depth_limit"
     _PICKLE_SCAN_LIMIT_REASON: ClassVar[str] = "jax_pickle_scan_limit_exceeded"
     _LEGACY_PICKLE_INITIAL_OPCODES: ClassVar[bytes] = (
@@ -786,7 +788,7 @@ class JaxCheckpointScanner(BaseScanner):
         path_obj = Path(path)
 
         # Orbax checkpoint indicators
-        orbax_files = ["checkpoint", "checkpoint_0", "metadata.json", "_CHECKPOINT", "orbax_checkpoint_metadata.json"]
+        orbax_files = ["metadata.json", "_CHECKPOINT", "orbax_checkpoint_metadata.json"]
 
         # Check for Orbax files
         for orbax_file in orbax_files:
@@ -795,13 +797,17 @@ class JaxCheckpointScanner(BaseScanner):
 
         # Probe once and route oversized directories into the scanner's
         # fail-closed entry-limit handling.
-        jax_prefixes = ("step_", "params_", "state_", "model_")
         for entry_index, entry in enumerate(path_obj.iterdir(), start=1):
             if entry_index > cls.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES:
                 return True
-            if entry.name.startswith(jax_prefixes):
+            if cls._is_orbax_checkpoint_entry_name(entry.name):
                 return True
         return False
+
+    @classmethod
+    def _is_orbax_checkpoint_entry_name(cls, name: str) -> bool:
+        """Return whether a top-level entry has a recognized Orbax/JAX checkpoint name."""
+        return name == "checkpoint" or name.startswith(("checkpoint_", *cls._ORBAX_CHECKPOINT_ENTRY_PREFIXES))
 
     @classmethod
     def _header_starts_with_legacy_pickle_opcode(cls, header: bytes) -> bool:
@@ -1025,6 +1031,30 @@ class JaxCheckpointScanner(BaseScanner):
             },
         )
 
+    def _add_uninspected_orbax_checkpoint_entry(
+        self,
+        *,
+        result: ScanResult,
+        entry_path: Path,
+        entry_type: str,
+    ) -> None:
+        """Fail closed when a recognized checkpoint entry is not a regular file."""
+        mark_inconclusive_scan_result(result, self._ORBAX_CHECKPOINT_ENTRY_UNINSPECTED_REASON)
+        result.add_check(
+            name="Orbax Checkpoint Entry Coverage",
+            passed=False,
+            message="Recognized Orbax/JAX checkpoint entry is not a regular file and was not inspected",
+            severity=IssueSeverity.INFO,
+            location=str(entry_path),
+            rule_code="S902",
+            details={
+                "entry": entry_path.name,
+                "entry_type": entry_type,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": self._ORBAX_CHECKPOINT_ENTRY_UNINSPECTED_REASON,
+            },
+        )
+
     def _handle_oversized_orbax_metadata(
         self,
         *,
@@ -1153,6 +1183,7 @@ class JaxCheckpointScanner(BaseScanner):
         # Scan checkpoint files
         directory_entries_seen = 0
         checkpoint_files_seen = 0
+        uninspected_checkpoint_entry_reported = False
         for checkpoint_file in path_obj.iterdir():
             directory_entries_seen += 1
             if directory_entries_seen > self.max_orbax_directory_entries:
@@ -1174,7 +1205,23 @@ class JaxCheckpointScanner(BaseScanner):
                     rule_code="S902",
                 )
                 break
-            if not checkpoint_file.name.startswith("checkpoint") or not checkpoint_file.is_file():
+            if not self._is_orbax_checkpoint_entry_name(checkpoint_file.name):
+                continue
+            if checkpoint_file.is_symlink() or not checkpoint_file.is_file():
+                if not uninspected_checkpoint_entry_reported:
+                    entry_type = (
+                        "symlink"
+                        if checkpoint_file.is_symlink()
+                        else "directory"
+                        if checkpoint_file.is_dir()
+                        else "non_regular"
+                    )
+                    self._add_uninspected_orbax_checkpoint_entry(
+                        result=result,
+                        entry_path=checkpoint_file,
+                        entry_type=entry_type,
+                    )
+                    uninspected_checkpoint_entry_reported = True
                 continue
             checkpoint_files_seen += 1
             if checkpoint_files_seen > self.max_orbax_checkpoint_files:
