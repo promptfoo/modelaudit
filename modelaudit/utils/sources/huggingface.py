@@ -5,6 +5,8 @@ import logging
 import os
 import struct
 from collections.abc import Iterator
+from dataclasses import dataclass
+from glob import escape as escape_glob_pattern
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 _HF_CONTENT_SNIFF_BYTES = 8 * 1024
 _HF_CONTENT_SNIFF_MAX_FILES = 256
+_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
 
@@ -43,6 +46,20 @@ __all__ = [
 ]
 
 
+@dataclass
+class _HuggingFaceProbeBudget:
+    remaining_bytes: int
+
+    def reserve(self, repo_id: str, max_bytes: int) -> None:
+        """Reserve a bounded remote read or fail closed before issuing it."""
+        if max_bytes <= 0 or max_bytes > self.remaining_bytes:
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: skipped file inspection byte limit exceeded "
+                f"for {repo_id} ({_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES} bytes)"
+            )
+        self.remaining_bytes -= max_bytes
+
+
 def _get_model_extensions() -> set[str]:
     """
     Lazy-load model extensions to avoid circular imports.
@@ -55,27 +72,21 @@ def _get_model_extensions() -> set[str]:
     return get_model_extensions()
 
 
-def _build_extension_allow_patterns() -> list[str]:
-    """Build conservative glob patterns for scannable files."""
-    extensions = _get_model_extensions()
-    patterns = {f"*{ext}" for ext in extensions}
-    patterns.update(f"**/*{ext}" for ext in extensions)
-    return sorted(patterns)
-
-
-def _has_model_extension(filename: str, model_extensions: set[str]) -> bool:
-    filename_lower = filename.lower()
-    return any(filename_lower.endswith(ext.lower()) for ext in model_extensions)
-
-
-def _read_huggingface_prefix(repo_id: str, filename: str, max_bytes: int) -> bytes:
+def _read_huggingface_prefix(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    max_bytes: int,
+) -> bytes:
     """Read a bounded remote prefix for selective content routing."""
+    budget.reserve(repo_id, max_bytes)
     try:
         import requests
         from huggingface_hub import hf_hub_url
         from huggingface_hub.utils import build_hf_headers
 
-        file_url = hf_hub_url(repo_id=repo_id, filename=filename)
+        file_url = hf_hub_url(repo_id=repo_id, filename=filename, revision=revision)
         headers = build_hf_headers(
             token=None,
             headers={"Range": f"bytes=0-{max_bytes - 1}"},
@@ -99,14 +110,27 @@ def _read_huggingface_prefix(repo_id: str, filename: str, max_bytes: int) -> byt
         ) from exc
 
 
-def _read_huggingface_probe(repo_id: str, filename: str, prefix: bytes, max_bytes: int) -> bytes:
+def _read_huggingface_probe(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+    max_bytes: int,
+) -> bytes:
     """Return an existing or freshly expanded bounded remote prefix."""
     if len(prefix) >= max_bytes:
         return prefix[:max_bytes]
-    return _read_huggingface_prefix(repo_id, filename, max_bytes)
+    return _read_huggingface_prefix(repo_id, filename, revision, budget, max_bytes)
 
 
-def _looks_like_safetensors_prefix(repo_id: str, filename: str, prefix: bytes) -> bool:
+def _looks_like_safetensors_prefix(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> bool:
     """Recognize bounded SafeTensors framing without requiring a local path."""
     if len(prefix) <= 8:
         return False
@@ -121,7 +145,7 @@ def _looks_like_safetensors_prefix(repo_id: str, filename: str, prefix: bytes) -
     if header_len > SAFETENSORS_ROUTING_HEADER_PARSE_BYTES:
         return True
 
-    header_probe = _read_huggingface_prefix(repo_id, filename, 8 + header_len)
+    header_probe = _read_huggingface_prefix(repo_id, filename, revision, budget, 8 + header_len)
     if len(header_probe) != 8 + header_len or header_probe[8:9] != b"{":
         return False
     try:
@@ -131,7 +155,13 @@ def _looks_like_safetensors_prefix(repo_id: str, filename: str, prefix: bytes) -
     return isinstance(parsed_header, dict)
 
 
-def _detect_huggingface_mxnet_symbol_route(repo_id: str, filename: str, prefix: bytes) -> str | None:
+def _detect_huggingface_mxnet_symbol_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
     """Return a bounded MXNet JSON route for a suffix-skipped remote file."""
     from modelaudit.utils.file.detection import MXNET_SYMBOL_SIGNATURE_READ_BYTES, _detect_mxnet_symbol_prefix_route
 
@@ -140,7 +170,7 @@ def _detect_huggingface_mxnet_symbol_route(repo_id: str, filename: str, prefix: 
         return None
 
     max_probe_size = MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1
-    mxnet_probe = _read_huggingface_prefix(repo_id, filename, max_probe_size)
+    mxnet_probe = _read_huggingface_prefix(repo_id, filename, revision, budget, max_probe_size)
     mxnet_probe = mxnet_probe[3:] if mxnet_probe.startswith(b"\xef\xbb\xbf") else mxnet_probe
     if len(mxnet_probe) > MXNET_SYMBOL_SIGNATURE_READ_BYTES:
         return _detect_mxnet_symbol_prefix_route(
@@ -154,7 +184,13 @@ def _detect_huggingface_mxnet_symbol_route(repo_id: str, filename: str, prefix: 
     )
 
 
-def _detect_huggingface_xml_model_route(repo_id: str, filename: str, prefix: bytes) -> str | None:
+def _detect_huggingface_xml_model_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
     """Return a bounded XML model route for a suffix-skipped remote file."""
     from modelaudit.utils.file.detection import (
         _XML_MODEL_SIGNATURE_READ_BYTES,
@@ -165,7 +201,7 @@ def _detect_huggingface_xml_model_route(repo_id: str, filename: str, prefix: byt
     if not _could_be_xml_prefix(prefix):
         return None
 
-    xml_probe = _read_huggingface_probe(repo_id, filename, prefix, _XML_MODEL_SIGNATURE_READ_BYTES)
+    xml_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, _XML_MODEL_SIGNATURE_READ_BYTES)
     detected_format = _detect_xml_model_format(
         xml_probe,
         sample_is_prefix=len(xml_probe) >= _XML_MODEL_SIGNATURE_READ_BYTES,
@@ -173,7 +209,13 @@ def _detect_huggingface_xml_model_route(repo_id: str, filename: str, prefix: byt
     return None if detected_format == "unknown" else detected_format
 
 
-def _detect_huggingface_jax_json_route(repo_id: str, filename: str, prefix: bytes) -> str | None:
+def _detect_huggingface_jax_json_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
     """Return a bounded JAX JSON checkpoint route for a suffix-skipped remote file."""
     from modelaudit.utils.file.detection import (
         JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
@@ -188,7 +230,7 @@ def _detect_huggingface_jax_json_route(repo_id: str, filename: str, prefix: byte
 
     if not normalized_prefix:
         max_probe_size = JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1
-        jax_probe = _read_huggingface_probe(repo_id, filename, prefix, max_probe_size)
+        jax_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, max_probe_size)
         normalized_prefix = jax_probe.lstrip()
         if normalized_prefix.startswith(b"\xef\xbb\xbf"):
             normalized_prefix = normalized_prefix[3:].lstrip()
@@ -199,7 +241,7 @@ def _detect_huggingface_jax_json_route(repo_id: str, filename: str, prefix: byte
         return None
 
     max_probe_size = JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1
-    jax_probe = _read_huggingface_probe(repo_id, filename, jax_probe, max_probe_size)
+    jax_probe = _read_huggingface_probe(repo_id, filename, revision, budget, jax_probe, max_probe_size)
     try:
         payload = json.loads(jax_probe.decode("utf-8-sig"))
     except (UnicodeDecodeError, ValueError, RecursionError):
@@ -209,7 +251,13 @@ def _detect_huggingface_jax_json_route(repo_id: str, filename: str, prefix: byte
     return "jax_checkpoint" if has_jax_json_checkpoint_structure(payload) else None
 
 
-def _detect_huggingface_xgboost_ubjson_route(repo_id: str, filename: str, prefix: bytes) -> str | None:
+def _detect_huggingface_xgboost_ubjson_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
     """Return a bounded XGBoost UBJSON route for a suffix-skipped remote file."""
     from modelaudit.utils.file.detection import (
         _XGBOOST_UBJSON_ROUTE_READ_BYTES,
@@ -224,13 +272,25 @@ def _detect_huggingface_xgboost_ubjson_route(repo_id: str, filename: str, prefix
     if not normalized_prefix.startswith(b"{"):
         return None
 
-    xgboost_probe = _read_huggingface_probe(repo_id, filename, prefix, _XGBOOST_UBJSON_ROUTE_READ_BYTES)
+    xgboost_probe = _read_huggingface_probe(
+        repo_id,
+        filename,
+        revision,
+        budget,
+        prefix,
+        _XGBOOST_UBJSON_ROUTE_READ_BYTES,
+    )
     return _detect_extensionless_xgboost_ubjson_route(xgboost_probe)
 
 
-def _detect_huggingface_content_route_format(repo_id: str, filename: str) -> str | None:
+def _detect_huggingface_content_route_format(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+) -> str | None:
     """Return a content-routed model format for a remote file, if cheaply identifiable."""
-    prefix = _read_huggingface_prefix(repo_id, filename, _HF_CONTENT_SNIFF_BYTES)
+    prefix = _read_huggingface_prefix(repo_id, filename, revision, budget, _HF_CONTENT_SNIFF_BYTES)
     if not prefix:
         return None
 
@@ -245,7 +305,7 @@ def _detect_huggingface_content_route_format(repo_id: str, filename: str) -> str
         detect_format_from_magic_bytes,
     )
 
-    if _looks_like_safetensors_prefix(repo_id, filename, prefix):
+    if _looks_like_safetensors_prefix(repo_id, filename, revision, budget, prefix):
         return "safetensors"
     if _looks_like_uncompressed_tar_header(prefix):
         return "tar"
@@ -254,24 +314,24 @@ def _detect_huggingface_content_route_format(repo_id: str, filename: str) -> str
     if _is_content_routed_lightgbm_signature(prefix):
         return "lightgbm"
 
-    xml_route = _detect_huggingface_xml_model_route(repo_id, filename, prefix)
+    xml_route = _detect_huggingface_xml_model_route(repo_id, filename, revision, budget, prefix)
     if xml_route is not None:
         return xml_route
 
-    xgboost_ubjson_route = _detect_huggingface_xgboost_ubjson_route(repo_id, filename, prefix)
+    xgboost_ubjson_route = _detect_huggingface_xgboost_ubjson_route(repo_id, filename, revision, budget, prefix)
     if xgboost_ubjson_route is not None:
         return xgboost_ubjson_route
 
-    jax_json_route = _detect_huggingface_jax_json_route(repo_id, filename, prefix)
+    jax_json_route = _detect_huggingface_jax_json_route(repo_id, filename, revision, budget, prefix)
     if jax_json_route is not None:
         return jax_json_route
 
-    mxnet_route = _detect_huggingface_mxnet_symbol_route(repo_id, filename, prefix)
+    mxnet_route = _detect_huggingface_mxnet_symbol_route(repo_id, filename, revision, budget, prefix)
     if mxnet_route is not None:
         return mxnet_route
 
     if _could_start_proto0_or_1_pickle(prefix):
-        pickle_probe = _read_huggingface_prefix(repo_id, filename, PROTO0_1_MAX_PROBE_BYTES)
+        pickle_probe = _read_huggingface_prefix(repo_id, filename, revision, budget, PROTO0_1_MAX_PROBE_BYTES)
         if _looks_like_proto0_or_1_pickle(
             pickle_probe,
             sample_is_prefix=len(pickle_probe) >= PROTO0_1_MAX_PROBE_BYTES,
@@ -295,11 +355,17 @@ def _detect_huggingface_content_route_format(repo_id: str, filename: str) -> str
     return None if detected_format == "unknown" else detected_format
 
 
-def _select_huggingface_model_files(repo_id: str, repo_files: list[str], model_extensions: set[str]) -> list[str]:
+def _select_huggingface_model_files(
+    repo_id: str,
+    repo_files: list[str],
+    revision: str,
+    model_extensions: set[str],
+) -> list[str]:
     """Select extension-matching files plus bounded content-routed renamed model files."""
-    model_files = [filename for filename in repo_files if _has_model_extension(filename, model_extensions)]
+    model_files = [filename for filename in repo_files if _is_scannable_hf_file(filename, model_extensions)]
     selected_files = set(model_files)
     inspected_files = 0
+    probe_budget = _HuggingFaceProbeBudget(remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES)
 
     for filename in repo_files:
         if filename in selected_files:
@@ -310,13 +376,26 @@ def _select_huggingface_model_files(repo_id: str, repo_files: list[str], model_e
                 f"for {repo_id} ({_HF_CONTENT_SNIFF_MAX_FILES} files)"
             )
         inspected_files += 1
-        detected_format = _detect_huggingface_content_route_format(repo_id, filename)
+        detected_format = _detect_huggingface_content_route_format(repo_id, filename, revision, probe_budget)
         if detected_format is None:
             continue
         model_files.append(filename)
         selected_files.add(filename)
 
     return model_files
+
+
+def _is_scannable_hf_file(filename: str, extensions: set[str]) -> bool:
+    """Return whether a listed Hugging Face file has a supported suffix."""
+    filename_lower = filename.lower()
+    return any(filename_lower.endswith(ext.lower()) for ext in extensions if ext)
+
+
+def _raise_no_scannable_hf_files(repo_id: str) -> None:
+    raise Exception(
+        f"Refusing to download full snapshot for {repo_id}: "
+        "repository listing contains no recognized ModelAudit-scannable files"
+    )
 
 
 def _get_hf_cache_root() -> Path:
@@ -327,6 +406,16 @@ def _get_hf_cache_root() -> Path:
         return Path(HF_HUB_CACHE)
     except Exception:
         return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _format_size(size_bytes: int) -> str:
+    """Format a byte count for user-facing download budget errors."""
+    size = float(size_bytes)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024.0:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} PB"
 
 
 def _is_within_directory(base_dir: Path, target: Path) -> bool:
@@ -355,18 +444,32 @@ def _build_huggingface_download_path(cache_dir: Path, namespace: str, repo_name:
     return resolved_download_path
 
 
-def _list_repo_files_with_timeout(repo_id: str, timeout_seconds: float = 30) -> tuple[list[str] | None, str | None]:
-    """Return repository files or a failure reason if listing times out/errors."""
+def _is_huggingface_commit_sha(revision: object) -> bool:
+    """Return whether revision is a full immutable Git commit SHA."""
+    if not isinstance(revision, str) or len(revision) not in {40, 64}:
+        return False
+    try:
+        int(revision, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _list_repo_files_with_timeout(
+    repo_id: str,
+    timeout_seconds: float = 30,
+) -> tuple[list[str] | None, str | None, str | None]:
+    """Return repository files, their immutable revision, or a failure reason."""
     from huggingface_hub import HfApi
 
     try:
         repo_info = HfApi().repo_info(repo_id, timeout=timeout_seconds, files_metadata=False)
     except Exception as exc:
-        return None, str(exc)
+        return None, None, str(exc)
 
     siblings = getattr(repo_info, "siblings", None)
     if siblings is None:
-        return None, "repository listing unavailable"
+        return None, None, "repository listing unavailable"
 
     files: list[str] = []
     for sibling in siblings:
@@ -378,7 +481,11 @@ def _list_repo_files_with_timeout(repo_id: str, timeout_seconds: float = 30) -> 
         if isinstance(file_name, str) and file_name:
             files.append(file_name)
 
-    return files, None
+    revision = getattr(repo_info, "sha", None)
+    if not _is_huggingface_commit_sha(revision):
+        return files, None, "repository listing did not include an immutable commit SHA"
+
+    return files, revision, None
 
 
 def get_model_info(url: str) -> dict:
@@ -533,19 +640,21 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
         # List files in the repository to identify model files
-        repo_files, repo_listing_error = _list_repo_files_with_timeout(repo_id)
+        repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(repo_id)
         if repo_files is None:
-            repo_listing_failed = True
-            logger.debug("Hugging Face repo listing failed for %s: %s", repo_id, repo_listing_error)
-            repo_files = []
-        else:
-            repo_listing_failed = False
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: "
+                f"failed listing files in repository {repo_id}: {repo_listing_error}"
+            )
+        if repo_revision is None:
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: "
+                f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
+            )
 
         # Find model files in the repository (using centralized model extensions)
         model_extensions = _get_model_extensions()
-        model_files = (
-            [] if repo_listing_failed else _select_huggingface_model_files(repo_id, repo_files, model_extensions)
-        )
+        model_files = _select_huggingface_model_files(repo_id, repo_files, repo_revision, model_extensions)
 
         # Download strategy:
         # - When cache_dir is provided: Use local_dir to place files directly there (safer)
@@ -555,6 +664,7 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
             "repo_id": repo_id,
             "tqdm_class": None,  # Use default tqdm
         }
+        download_kwargs["revision"] = repo_revision
 
         if cache_dir is not None:
             # User provided cache directory - use local_dir for direct placement
@@ -566,35 +676,22 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
 
         # If we found specific model files, download them
         if model_files:
-            download_kwargs["allow_patterns"] = model_files
-        elif repo_listing_failed:
-            extension_allow_patterns = _build_extension_allow_patterns()
-            if not extension_allow_patterns:
-                raise Exception(
-                    f"Refusing to download full snapshot for {repo_id}: no selective allowlist patterns available"
-                )
-            download_kwargs["allow_patterns"] = extension_allow_patterns
-
-        if "allow_patterns" in download_kwargs:
-            local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
+            download_kwargs["allow_patterns"] = [escape_glob_pattern(filename) for filename in model_files]
         else:
-            # Fallback: download everything if no model files identified
-            local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
+            _raise_no_scannable_hf_files(repo_id)
+
+        local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
 
         # Verify we actually got model files
         downloaded_path = Path(local_path)
-        model_extensions = _get_model_extensions()
-        found_models = any(downloaded_path.glob(f"*{ext}") for ext in model_extensions)
-
-        if not found_models and not any(downloaded_path.glob("config.json")):
-            # If no model files and no config, warn the user
-            import warnings
-
-            warnings.warn(
-                f"No model files found in {repo_id}. "
-                "The repository may not contain model weights or uses an unsupported format.",
-                UserWarning,
-                stacklevel=2,
+        downloaded_files = {
+            path.relative_to(downloaded_path).as_posix() for path in downloaded_path.rglob("*") if path.is_file()
+        }
+        missing_model_files = set(model_files).difference(downloaded_files)
+        if missing_model_files:
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: "
+                f"snapshot missing {len(missing_model_files)} selected file(s) for {repo_id}"
             )
 
         return Path(local_path)
@@ -662,20 +759,23 @@ def download_model_streaming(
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
         # List files with timeout without leaking a blocking worker thread.
-        repo_files, repo_listing_error = _list_repo_files_with_timeout(repo_id)
+        repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(repo_id)
         if repo_files is None:
             if repo_listing_error and repo_listing_error.startswith("timed out after"):
                 raise Exception(f"Timeout listing files in repository {repo_id}")
             raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
+        if repo_revision is None:
+            raise Exception(
+                f"Failed listing files in repository {repo_id}: "
+                f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
+            )
 
         # Filter for model files
         model_extensions = _get_model_extensions()
-        model_files = _select_huggingface_model_files(repo_id, repo_files, model_extensions)
+        model_files = _select_huggingface_model_files(repo_id, repo_files, repo_revision, model_extensions)
 
         if not model_files:
-            # Fallback: download all files if no recognized extensions found
-            # This maintains parity with download_model() behavior
-            model_files = repo_files
+            _raise_no_scannable_hf_files(repo_id)
 
         # Setup cache directory
         download_path = None
@@ -694,6 +794,7 @@ def download_model_streaming(
                 local_path = hf_hub_download(
                     repo_id=repo_id,
                     filename=filename,
+                    revision=repo_revision,
                     cache_dir=str(cache_dir / "huggingface"),
                     local_dir=str(download_path),
                 )
@@ -702,6 +803,7 @@ def download_model_streaming(
                 local_path = hf_hub_download(
                     repo_id=repo_id,
                     filename=filename,
+                    revision=repo_revision,
                 )
 
             yield (Path(local_path), is_last)
@@ -712,22 +814,24 @@ def download_model_streaming(
         ) from e
 
 
-def download_file_from_hf(url: str, cache_dir: Path | None = None) -> Path:
+def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int | None = None) -> Path:
     """Download a single file from HuggingFace using direct file URL.
 
     Args:
         url: Direct HuggingFace file URL (e.g., https://huggingface.co/user/repo/resolve/main/file.bin)
         cache_dir: Optional cache directory for downloads
+        max_size: Optional maximum file size to download; 0 disables the limit
 
     Returns:
         Path to the downloaded file
 
     Raises:
         ValueError: If URL is invalid
+        ValueError: If max_size is set and file size is unknown or exceeds it
         Exception: If download fails
     """
     try:
-        from huggingface_hub import hf_hub_download
+        from huggingface_hub import HfApi, hf_hub_download
     except ImportError as e:
         raise ImportError(
             "huggingface-hub package is required for HuggingFace URL support. "
@@ -738,13 +842,49 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None) -> Path:
     display_url = redact_huggingface_url_for_display(url)
 
     try:
+        if max_size is not None and max_size < 0:
+            raise ValueError("Maximum file size must be non-negative")
+
+        size_limit = max_size or None
+        download_revision = branch
+        if size_limit is not None:
+            api = HfApi()
+            repo_info = api.repo_info(repo_id, revision=branch)
+            pinned_revision = getattr(repo_info, "sha", None)
+            if not isinstance(pinned_revision, str) or not pinned_revision:
+                raise ValueError(f"Unable to determine immutable revision for {display_url}; refusing capped download")
+
+            path_info = api.get_paths_info(repo_id, filename, revision=pinned_revision)
+            file_metadata = path_info[0] if path_info else None
+            file_size = getattr(file_metadata, "size", None)
+            if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
+                raise ValueError(f"Unable to determine file size for {display_url}; refusing capped download")
+            if file_size > size_limit:
+                raise ValueError(
+                    f"File size ({_format_size(file_size)}) exceeds maximum allowed size ({_format_size(size_limit)})"
+                )
+            download_revision = pinned_revision
+
         # Use hf_hub_download for single file downloads
         local_path = hf_hub_download(
             repo_id=repo_id,
             filename=filename,
-            revision=branch,
+            revision=download_revision,
             cache_dir=str(cache_dir) if cache_dir else None,
         )
-        return Path(local_path)
+        downloaded_path = Path(local_path)
+        if size_limit is not None:
+            try:
+                downloaded_size = downloaded_path.stat().st_size
+            except OSError as exc:
+                raise ValueError(
+                    f"Unable to verify downloaded file size for {display_url}; refusing capped download"
+                ) from exc
+            if downloaded_size > size_limit:
+                raise ValueError(
+                    f"Downloaded file size ({_format_size(downloaded_size)}) "
+                    f"exceeds maximum allowed size ({_format_size(size_limit)})"
+                )
+        return downloaded_path
     except Exception as e:
         raise Exception(f"Failed to download file from {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
