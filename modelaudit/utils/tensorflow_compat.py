@@ -275,8 +275,7 @@ def get_protobuf_classes() -> tuple[Any, Any]:
     """
     Get SavedModel and GraphDef protobuf classes.
 
-    Uses modelaudit.protos to initialize proto loading (TF-native first, vendored fallback),
-    then imports via tensorflow.core.* which resolves to whichever source is available.
+    Uses modelaudit.protos to initialize safe TensorFlow protobuf loading.
 
     Returns:
         Tuple of (SavedModel, GraphDef) classes
@@ -291,14 +290,13 @@ def get_protobuf_classes() -> tuple[Any, Any]:
             "Reinstall modelaudit or install TensorFlow with: pip install modelaudit[tensorflow]"
         )
 
-    from tensorflow.core.framework.graph_pb2 import GraphDef
-    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+    import modelaudit.protos
 
-    return SavedModel, GraphDef
+    return modelaudit.protos.get_saved_model_class(), modelaudit.protos.get_graph_def_class()
 
 
 def has_tensorflow_protobuf_stubs() -> bool:
-    """Return True when TensorFlow protobuf stubs are available from native or vendored protos."""
+    """Return True when safe TensorFlow protobuf stubs are available."""
     global _HAS_PROTOBUF_STUBS
 
     if _HAS_PROTOBUF_STUBS is None:
