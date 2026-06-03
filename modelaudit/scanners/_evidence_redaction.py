@@ -405,6 +405,9 @@ def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: in
         return redact_evidence_string(repr(value), max_chars=max_string_chars)
     if isinstance(value, dict):
         redacted_items: dict[Any, Any] = {}
+        sensitive_name_value_pair = "value" in value and any(
+            isinstance(value.get(key), str) and _is_sensitive_detail_key(value[key]) for key in ("name", "key")
+        )
         for key, child in value.items():
             if not isinstance(key, str):
                 redacted_items[f"<{type(key).__name__}-key>"] = redact_evidence_value(
@@ -415,7 +418,7 @@ def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: in
                 continue
 
             redacted_key = redact_evidence_string(key, max_chars=max_string_chars)
-            if _is_sensitive_detail_key(key):
+            if _is_sensitive_detail_key(key) or (sensitive_name_value_pair and key == "value"):
                 redacted_items[redacted_key] = REDACTED_EVIDENCE_VALUE
             else:
                 redacted_items[redacted_key] = redact_evidence_value(

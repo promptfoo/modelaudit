@@ -249,10 +249,15 @@ def test_redacts_pair_shaped_credential_lists_and_bounds_value_recursion() -> No
     """Parsed list/tuple evidence should redact key/value pairs and bound recursion."""
     pair_secret = "PAIR_LIST_SECRET"
     nested_pair_secret = "NESTED_PAIR_LIST_SECRET"
+    name_value_secret = "NAME_VALUE_PAIR_SECRET"
     deep_secret = "DEEP_VALUE_SECRET"
 
     redacted_pairs = redact_evidence_value(
-        [["api_key", pair_secret], {"params": [("token", nested_pair_secret)]}],
+        [
+            ["api_key", pair_secret],
+            {"params": [("token", nested_pair_secret)]},
+            {"name": "API_KEY", "value": name_value_secret},
+        ],
         max_string_chars=500,
     )
     deep_value: object = deep_secret
@@ -263,7 +268,9 @@ def test_redacts_pair_shaped_credential_lists_and_bounds_value_recursion() -> No
     serialized_pairs = json.dumps(redacted_pairs, default=str)
     assert pair_secret not in serialized_pairs
     assert nested_pair_secret not in serialized_pairs
+    assert name_value_secret not in serialized_pairs
     assert ["api_key", REDACTED_EVIDENCE_VALUE] in redacted_pairs
+    assert {"name": "API_KEY", "value": REDACTED_EVIDENCE_VALUE} in redacted_pairs
     assert deep_secret not in str(redacted_deep)
     assert REDACTED_EVIDENCE_VALUE in str(redacted_deep)
 
