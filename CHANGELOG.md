@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - scan dangerous RKNN safe-key metadata values instead of suppressing the whole key-value string
 - scan ONNX external data initializers in nested graphs, functions, and training graphs
 - route protocol-0 JAX checkpoint pickles through pickle opcode security checks
+- bound Orbax directory metadata parsing and checkpoint entry enumeration before scanning JAX checkpoints
 - harden legacy JAX checkpoint pickle routing against bounded-prefix bypasses and benign sidecar false positives
 - detect dangerous Python calls retrieved or installed through module namespace dictionaries in ZIP and TAR members, while avoiding comprehension-local false positives
 - preflight and stream-enforce cumulative SevenZip extraction budgets before writing oversized archives
@@ -35,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - enforce direct Hugging Face file `--max-size` budgets before downloading
 - scan duplicate and case-varied ExecuTorch pickle ZIP members without shadowable-name or metadata-routing bypasses
+- refresh cloud cache entries that cannot be proven within the configured download size limit
 - enforce automatic cloud download size limits when remote size metadata is missing or late-bound
 - avoid importing attacker-shadowed TensorFlow protobuf packages during static scanning
 - inspect every parsed GGUF chat template when duplicate or trailing malformed metadata could otherwise hide SSTI payloads
