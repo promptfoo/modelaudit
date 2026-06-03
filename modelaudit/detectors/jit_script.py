@@ -1899,6 +1899,10 @@ def _priority_alias_usage_lines(
             code_start += 1
         code_line = _python_structural_line_bytes(line[code_start:])
         structural_code_line = code_line.strip()
+        if not structural_code_line and continued_expression_start is None:
+            multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+            line_start = line_end
+            continue
         line_indent = len(line) - len(line.lstrip())
         continues_prior_expression = continued_expression_start is not None
         typed_member_keys: set[str] = set()
