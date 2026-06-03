@@ -257,6 +257,7 @@ def test_redacts_pair_shaped_credential_lists_and_bounds_value_recursion() -> No
             ["api_key", pair_secret],
             {"params": [("token", nested_pair_secret)]},
             {"name": "API_KEY", "value": name_value_secret},
+            {"Name": "API_KEY", "Value": name_value_secret},
         ],
         max_string_chars=500,
     )
@@ -271,6 +272,7 @@ def test_redacts_pair_shaped_credential_lists_and_bounds_value_recursion() -> No
     assert name_value_secret not in serialized_pairs
     assert ["api_key", REDACTED_EVIDENCE_VALUE] in redacted_pairs
     assert {"name": "API_KEY", "value": REDACTED_EVIDENCE_VALUE} in redacted_pairs
+    assert {"Name": "API_KEY", "Value": REDACTED_EVIDENCE_VALUE} in redacted_pairs
     assert deep_secret not in str(redacted_deep)
     assert REDACTED_EVIDENCE_VALUE in str(redacted_deep)
 
@@ -312,18 +314,26 @@ def test_redacts_embedded_structured_credential_literals() -> None:
     json_secret = "EMBEDDED_JSON_SECRET"
     repr_secret = "EMBEDDED_REPR_SECRET"
     escaped_secret = "ESCAPED_JSON_LITERAL_SECRET"
+    tuple_secret = "EMBEDDED_TUPLE_SECRET"
+    invalid_secret = "EMBEDDED_INVALID_CONTAINER_SECRET"
 
     redacted_text = redact_evidence_string(
-        f"note {{\"api_key\":[\"{json_secret}\"]}} and repr {{'token':['{repr_secret}']}}",
+        (
+            f"note {{\"api_key\":[\"{json_secret}\"]}} and repr {{'token':['{repr_secret}']}} "
+            f"tuple ('api_key','{tuple_secret}') invalid {{\"api_key\":[{invalid_secret}]}}"
+        ),
         max_chars=500,
     )
     redacted_escaped = redact_evidence_string(json.dumps(f'{{"api_key":["{escaped_secret}"]}}'), max_chars=500)
 
     assert json_secret not in redacted_text
     assert repr_secret not in redacted_text
+    assert tuple_secret not in redacted_text
+    assert invalid_secret not in redacted_text
     assert escaped_secret not in redacted_escaped
     assert f'"api_key":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert f'"token":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
+    assert f'["api_key","{REDACTED_EVIDENCE_VALUE}"]' in redacted_text
     assert f'"api_key":"{REDACTED_EVIDENCE_VALUE}"' in redacted_escaped
 
 

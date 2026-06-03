@@ -89,6 +89,9 @@ GENERIC_CONTAINER_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
 GENERIC_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)[^\s\"';&|]+"
 )
+EMBEDDED_SENSITIVE_KEY_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?P<quote>[\"']?)(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P=quote)\s*:"
+)
 SENSITIVE_DETAIL_KEY_SUFFIXES: Final[tuple[str, ...]] = (
     "accesskeyid",
     "accesskey",
@@ -270,7 +273,9 @@ def _redact_embedded_structured_containers(text: str) -> str:
 
     while search_index < len(text):
         container_starts = [
-            index for index in (text.find("{", search_index), text.find("[", search_index)) if index != -1
+            index
+            for index in (text.find("{", search_index), text.find("[", search_index), text.find("(", search_index))
+            if index != -1
         ]
         if not container_starts:
             break
@@ -287,6 +292,8 @@ def _redact_embedded_structured_containers(text: str) -> str:
             max_chars=len(container_text),
             fail_closed=False,
         )
+        if redacted_container is None and _contains_sensitive_key_literal(container_text):
+            redacted_container = REDACTED_EVIDENCE_VALUE
         if redacted_container is not None and redacted_container != container_text:
             redacted_chunks.append(text[last_index:container_start])
             redacted_chunks.append(redacted_container)
@@ -299,6 +306,10 @@ def _redact_embedded_structured_containers(text: str) -> str:
 
     redacted_chunks.append(text[last_index:])
     return "".join(redacted_chunks)
+
+
+def _contains_sensitive_key_literal(text: str) -> bool:
+    return any(_is_sensitive_detail_key(match.group("key")) for match in EMBEDDED_SENSITIVE_KEY_RE.finditer(text))
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -405,8 +416,12 @@ def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: in
         return redact_evidence_string(repr(value), max_chars=max_string_chars)
     if isinstance(value, dict):
         redacted_items: dict[Any, Any] = {}
-        sensitive_name_value_pair = "value" in value and any(
-            isinstance(value.get(key), str) and _is_sensitive_detail_key(value[key]) for key in ("name", "key")
+        string_keys_by_lower = {key.lower(): key for key in value if isinstance(key, str)}
+        sensitive_name_value_pair = "value" in string_keys_by_lower and any(
+            isinstance(value.get(string_keys_by_lower[key]), str)
+            and _is_sensitive_detail_key(value[string_keys_by_lower[key]])
+            for key in ("name", "key")
+            if key in string_keys_by_lower
         )
         for key, child in value.items():
             if not isinstance(key, str):
@@ -418,7 +433,7 @@ def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: in
                 continue
 
             redacted_key = redact_evidence_string(key, max_chars=max_string_chars)
-            if _is_sensitive_detail_key(key) or (sensitive_name_value_pair and key == "value"):
+            if _is_sensitive_detail_key(key) or (sensitive_name_value_pair and key.lower() == "value"):
                 redacted_items[redacted_key] = REDACTED_EVIDENCE_VALUE
             else:
                 redacted_items[redacted_key] = redact_evidence_value(
