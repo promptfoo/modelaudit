@@ -1322,7 +1322,7 @@ def test_lambda_allowlisted_framework_module_reference_still_passes(tmp_path: Pa
                     {
                         "class_name": "Lambda",
                         "config": {
-                            "module": "keras.layers",
+                            "module": "Keras.layers",
                             "function_name": "normalize",
                         },
                     }
@@ -1339,6 +1339,46 @@ def test_lambda_allowlisted_framework_module_reference_still_passes(tmp_path: Pa
         check.name == "Lambda Layer Module Reference Check"
         and check.status == CheckStatus.PASSED
         and check.details.get("allowlist_status") == "allowlisted"
+        for check in result.checks
+    )
+
+
+def test_lambda_allowlisted_framework_root_does_not_hide_python_callback_helper(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "allowlisted_dangerous_callback",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "module": "tensorflow",
+                            "function_name": "py_function",
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="allowlisted_dangerous_callback.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("module") == "tensorflow"
+        and check.details.get("function") == "py_function"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("function") == "py_function"
         for check in result.checks
     )
 

@@ -103,6 +103,9 @@ class KerasH5Scanner(BaseScanner):
             "exec",
             "open",
             "popen",
+            "numpy_function",
+            "py_func",
+            "py_function",
             "spawn",
             "system",
         }
@@ -1176,7 +1179,7 @@ class KerasH5Scanner(BaseScanner):
         """Return True when a Lambda module reference uses a trusted framework root."""
         if not isinstance(module_name, str) or not module_name.strip():
             return False
-        return module_name.strip().split(".")[0] in cls._SAFE_LAMBDA_MODULE_ROOTS
+        return module_name.strip().split(".")[0].lower() in cls._SAFE_LAMBDA_MODULE_ROOTS
 
     def _check_config_for_suspicious_strings(
         self,
