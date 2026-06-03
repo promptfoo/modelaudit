@@ -7,10 +7,9 @@ import os
 import pickletools
 import re
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import suppress
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -49,6 +48,14 @@ class _BoundedJsonPrefixFrame:
     state: str
     pending_key: str | None = None
     next_index: int = 0
+
+
+@dataclass
+class _OrbaxDirectoryAccounting:
+    """Track files and bytes actually inspected by the Orbax directory scanner."""
+
+    bytes_scanned: int = 0
+    files_scanned: int = 0
 
 
 class JaxCheckpointScanner(BaseScanner):
@@ -110,6 +117,9 @@ class JaxCheckpointScanner(BaseScanner):
     _UTF8_BOM: ClassVar[bytes] = b"\xef\xbb\xbf"
     DEFAULT_MAX_METADATA_PATTERN_FINDINGS: ClassVar[int] = 256
     DEFAULT_MAX_PICKLE_OPCODE_FINDINGS: ClassVar[int] = 256
+    DEFAULT_MAX_ORBAX_CHECKPOINT_FILES: ClassVar[int] = 4096
+    DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES: ClassVar[int] = 8192
+    _ORBAX_CHECKPOINT_ENTRY_PREFIXES: ClassVar[tuple[str, ...]] = ("step_", "params_", "state_", "model_")
     _DANGEROUS_PICKLE_GLOBALS: ClassVar[frozenset[tuple[str, str]]] = frozenset(
         {
             ("builtins", "__import__"),
@@ -225,9 +235,13 @@ class JaxCheckpointScanner(BaseScanner):
     DEFAULT_MAX_PICKLE_SCAN_BYTES: ClassVar[int] = 16 * 1024 * 1024
     _JSON_ANALYSIS_SIZE_LIMIT_REASON: ClassVar[str] = "jax_json_checkpoint_analysis_size_limit"
     _JSON_PREFIX_PATTERN_READ_FAILED_REASON: ClassVar[str] = "jax_json_checkpoint_prefix_pattern_read_failed"
+    _ORBAX_METADATA_ANALYSIS_SIZE_LIMIT_REASON: ClassVar[str] = "jax_orbax_metadata_analysis_size_limit"
+    _ORBAX_METADATA_PREFIX_PATTERN_READ_FAILED_REASON: ClassVar[str] = "jax_orbax_metadata_prefix_pattern_read_failed"
+    _ORBAX_DIRECTORY_ENTRY_COUNT_LIMIT_REASON: ClassVar[str] = "jax_orbax_directory_entry_count_limit"
+    _ORBAX_CHECKPOINT_FILE_COUNT_LIMIT_REASON: ClassVar[str] = "jax_orbax_checkpoint_file_count_limit"
+    _ORBAX_CHECKPOINT_ENTRY_UNINSPECTED_REASON: ClassVar[str] = "jax_orbax_checkpoint_entry_uninspected"
     _METADATA_TRAVERSAL_LIMIT_REASON: ClassVar[str] = "jax_metadata_traversal_depth_limit"
     _PICKLE_SCAN_LIMIT_REASON: ClassVar[str] = "jax_pickle_scan_limit_exceeded"
-    _ORBAX_METADATA_SIZE_LIMIT_REASON: ClassVar[str] = "jax_orbax_metadata_analysis_size_limit"
     _LEGACY_PICKLE_INITIAL_OPCODES: ClassVar[bytes] = (
         b"()BCcFGIJKLMNPSTUVX]}\x82\x83\x84\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x95\x96\x97"
     )
@@ -254,6 +268,16 @@ class JaxCheckpointScanner(BaseScanner):
         self.max_metadata_pattern_findings = self._get_int_config(
             "jax_metadata_max_pattern_findings",
             self.DEFAULT_MAX_METADATA_PATTERN_FINDINGS,
+            minimum=1,
+        )
+        self.max_orbax_checkpoint_files = self._get_int_config(
+            "jax_orbax_max_checkpoint_files",
+            self.DEFAULT_MAX_ORBAX_CHECKPOINT_FILES,
+            minimum=1,
+        )
+        self.max_orbax_directory_entries = self._get_int_config(
+            "jax_orbax_max_directory_entries",
+            self.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES,
             minimum=1,
         )
 
@@ -655,11 +679,11 @@ class JaxCheckpointScanner(BaseScanner):
         path: str,
         result: ScanResult,
         *,
-        context_root: str = "json_checkpoint_bounded_prefix",
+        root_context: str = "json_checkpoint_bounded_prefix",
         check_name: str = "JSON Pattern Security Check",
         message_prefix: str = "Suspicious pattern in bounded JSON checkpoint prefix",
-        depth_check_name: str = "JSON Metadata Traversal Depth Limit",
-        on_string_value: Callable[[str, str], None] | None = None,
+        depth_limit_check_name: str = "JSON Metadata Traversal Depth Limit",
+        detect_orbax_restore_fn: bool = False,
     ) -> None:
         """Scan decoded JSON string content visible inside the bounded prefix."""
         with open(path, "rb") as source:
@@ -672,20 +696,30 @@ class JaxCheckpointScanner(BaseScanner):
         except (json.JSONDecodeError, RecursionError):
             string_values = self._iter_bounded_json_prefix_strings(
                 prefix_text,
-                root_context=context_root,
+                root_context=root_context,
                 depth_cap_contexts=depth_cap_contexts,
             )
         else:
             string_values = self._iter_string_metadata(
                 parsed_root,
-                context_root,
+                root_context,
                 depth_cap_contexts=depth_cap_contexts,
             )
 
         finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
+        orbax_restore_context = f"{root_context}.restore_fn"
+        first_orbax_restore_fn: str | None = None
+        dangerous_orbax_restore_fn: str | None = None
         for context, text_value in string_values:
-            if on_string_value is not None:
-                on_string_value(context, text_value)
+            if detect_orbax_restore_fn and (
+                context == orbax_restore_context
+                or context.startswith(f"{orbax_restore_context}.")
+                or context.startswith(f"{orbax_restore_context}[")
+            ):
+                if first_orbax_restore_fn is None:
+                    first_orbax_restore_fn = text_value
+                if dangerous_orbax_restore_fn is None and self._DANGEROUS_RESTORE_FN_PATTERN.search(text_value):
+                    dangerous_orbax_restore_fn = text_value
             self._add_suspicious_pattern_checks(
                 text_value,
                 context=context,
@@ -695,9 +729,13 @@ class JaxCheckpointScanner(BaseScanner):
                 result=result,
                 finding_budget=finding_budget,
             )
+        if dangerous_orbax_restore_fn is not None:
+            self._add_orbax_restore_fn_check(dangerous_orbax_restore_fn, path, result)
+        elif first_orbax_restore_fn is not None:
+            self._add_orbax_restore_fn_check(first_orbax_restore_fn, path, result)
         self._add_metadata_traversal_depth_limit_checks(
             contexts=depth_cap_contexts,
-            check_name=depth_check_name,
+            check_name=depth_limit_check_name,
             location=path,
             result=result,
         )
@@ -750,16 +788,26 @@ class JaxCheckpointScanner(BaseScanner):
         path_obj = Path(path)
 
         # Orbax checkpoint indicators
-        orbax_files = ["checkpoint", "checkpoint_0", "metadata.json", "_CHECKPOINT", "orbax_checkpoint_metadata.json"]
+        orbax_files = ["metadata.json", "_CHECKPOINT", "orbax_checkpoint_metadata.json"]
 
         # Check for Orbax files
         for orbax_file in orbax_files:
             if (path_obj / orbax_file).exists():
                 return True
 
-        # Check for JAX checkpoint patterns
-        jax_patterns = ["step_*", "params_*", "state_*", "model_*"]
-        return any(list(path_obj.glob(pattern)) for pattern in jax_patterns)
+        # Probe once and route oversized directories into the scanner's
+        # fail-closed entry-limit handling.
+        for entry_index, entry in enumerate(path_obj.iterdir(), start=1):
+            if entry_index > cls.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES:
+                return True
+            if cls._is_orbax_checkpoint_entry_name(entry.name):
+                return True
+        return False
+
+    @classmethod
+    def _is_orbax_checkpoint_entry_name(cls, name: str) -> bool:
+        """Return whether a top-level entry has a recognized Orbax/JAX checkpoint name."""
+        return name == "checkpoint" or name.startswith(("checkpoint_", *cls._ORBAX_CHECKPOINT_ENTRY_PREFIXES))
 
     @classmethod
     def _header_starts_with_legacy_pickle_opcode(cls, header: bytes) -> bool:
@@ -957,9 +1005,112 @@ class JaxCheckpointScanner(BaseScanner):
             for _, text_value in cls._iter_bounded_json_prefix_strings(prefix_text)
         )
 
-    def _scan_orbax_checkpoint(self, path: str, result: ScanResult) -> None:
+    def _add_orbax_metadata_read_failure(
+        self,
+        *,
+        result: ScanResult,
+        metadata_path: Path,
+        metadata_file: str,
+        error: Exception | str,
+    ) -> None:
+        """Record incomplete Orbax metadata coverage without treating it as a security finding."""
+        error_message = str(error)
+        mark_inconclusive_scan_result(result, "jax_orbax_metadata_read_failed")
+        result.add_check(
+            name="Orbax Metadata Read Check",
+            passed=False,
+            message=f"Error reading Orbax metadata: {error_message}",
+            severity=IssueSeverity.INFO,
+            location=str(metadata_path),
+            rule_code="S902",
+            details={
+                "error": error_message,
+                "file": metadata_file,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "jax_orbax_metadata_read_failed",
+            },
+        )
+
+    def _add_uninspected_orbax_checkpoint_entry(
+        self,
+        *,
+        result: ScanResult,
+        entry_path: Path,
+        entry_type: str,
+    ) -> None:
+        """Fail closed when a recognized checkpoint entry is not a regular file."""
+        mark_inconclusive_scan_result(result, self._ORBAX_CHECKPOINT_ENTRY_UNINSPECTED_REASON)
+        result.add_check(
+            name="Orbax Checkpoint Entry Coverage",
+            passed=False,
+            message="Recognized Orbax/JAX checkpoint entry is not a regular file and was not inspected",
+            severity=IssueSeverity.INFO,
+            location=str(entry_path),
+            rule_code="S902",
+            details={
+                "entry": entry_path.name,
+                "entry_type": entry_type,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": self._ORBAX_CHECKPOINT_ENTRY_UNINSPECTED_REASON,
+            },
+        )
+
+    def _handle_oversized_orbax_metadata(
+        self,
+        *,
+        metadata_path: Path,
+        metadata_file: str,
+        file_size: int,
+        result: ScanResult,
+    ) -> None:
+        """Fail closed on oversized Orbax metadata while scanning a bounded visible prefix."""
+        mark_inconclusive_scan_result(result, self._ORBAX_METADATA_ANALYSIS_SIZE_LIMIT_REASON)
+        result.add_check(
+            name="Orbax Metadata Analysis Limit",
+            passed=False,
+            message="Orbax metadata analysis incomplete because the file exceeds the bounded parsing limit",
+            severity=IssueSeverity.INFO,
+            location=str(metadata_path),
+            rule_code="S902",
+            details={
+                "file": metadata_file,
+                "file_size": file_size,
+                "max_json_analysis_bytes": JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": self._ORBAX_METADATA_ANALYSIS_SIZE_LIMIT_REASON,
+            },
+        )
+        try:
+            self._scan_bounded_json_prefix_patterns(
+                str(metadata_path),
+                result,
+                root_context="orbax_metadata_bounded_prefix",
+                check_name="Orbax Pattern Security Check",
+                message_prefix="Suspicious pattern in bounded Orbax metadata prefix",
+                depth_limit_check_name="Orbax Metadata Traversal Depth Limit",
+                detect_orbax_restore_fn=True,
+            )
+        except OSError as e:
+            mark_operational_scan_error(result, self._ORBAX_METADATA_PREFIX_PATTERN_READ_FAILED_REASON)
+            result.add_check(
+                name="Orbax Metadata Bounded Prefix Pattern Scan",
+                passed=False,
+                message=f"Unable to inspect bounded Orbax metadata prefix: {e}",
+                severity=IssueSeverity.INFO,
+                location=str(metadata_path),
+                details={
+                    "file": metadata_file,
+                    "error_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self._ORBAX_METADATA_PREFIX_PATTERN_READ_FAILED_REASON,
+                },
+                rule_code="S902",
+            )
+
+    def _scan_orbax_checkpoint(self, path: str, result: ScanResult) -> _OrbaxDirectoryAccounting:
         """Scan Orbax checkpoint directory."""
         path_obj = Path(path)
+        accounting = _OrbaxDirectoryAccounting()
 
         # Check metadata files
         metadata_files = ["metadata.json", "orbax_checkpoint_metadata.json", "_CHECKPOINT"]
@@ -967,42 +1118,38 @@ class JaxCheckpointScanner(BaseScanner):
         for metadata_file in metadata_files:
             metadata_path = path_obj / metadata_file
             if metadata_path.exists():
+                if not metadata_path.is_file():
+                    self._add_orbax_metadata_read_failure(
+                        result=result,
+                        metadata_path=metadata_path,
+                        metadata_file=metadata_file,
+                        error="metadata path is not a regular file",
+                    )
+                    continue
                 try:
-                    metadata_size = metadata_path.stat().st_size
-                    if metadata_size > JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
-                        mark_inconclusive_scan_result(result, self._ORBAX_METADATA_SIZE_LIMIT_REASON)
-                        result.add_check(
-                            name="Orbax Metadata Analysis Limit",
-                            passed=False,
-                            message=(
-                                "Orbax metadata analysis incomplete because the file exceeds the bounded parsing limit"
-                            ),
-                            severity=IssueSeverity.INFO,
-                            location=str(metadata_path),
-                            rule_code="S902",
-                            details={
-                                "file": metadata_file,
-                                "file_size": metadata_size,
-                                "max_json_analysis_bytes": JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
-                                "analysis_incomplete": True,
-                                "scan_outcome_reason": self._ORBAX_METADATA_SIZE_LIMIT_REASON,
-                            },
-                        )
-                        self._scan_bounded_json_prefix_patterns(
-                            str(metadata_path),
-                            result,
-                            context_root="orbax_metadata_bounded_prefix",
-                            check_name="Orbax Pattern Security Check",
-                            message_prefix="Suspicious pattern in bounded Orbax metadata prefix",
-                            depth_check_name="Orbax Metadata Traversal Depth Limit",
-                            on_string_value=partial(
-                                self._check_bounded_orbax_restore_fn,
-                                path=str(metadata_path),
-                                result=result,
-                            ),
-                        )
-                        continue
+                    file_size = metadata_path.stat().st_size
+                except OSError as e:
+                    self._add_orbax_metadata_read_failure(
+                        result=result,
+                        metadata_path=metadata_path,
+                        metadata_file=metadata_file,
+                        error=e,
+                    )
+                    continue
 
+                accounting.files_scanned += 1
+                accounting.bytes_scanned += min(file_size, JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES)
+
+                if file_size > JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+                    self._handle_oversized_orbax_metadata(
+                        metadata_path=metadata_path,
+                        metadata_file=metadata_file,
+                        file_size=file_size,
+                        result=result,
+                    )
+                    continue
+
+                try:
                     with open(metadata_path, encoding="utf-8") as f:
                         metadata = json.load(f)
 
@@ -1026,47 +1173,92 @@ class JaxCheckpointScanner(BaseScanner):
                         },
                     )
                 except Exception as e:
-                    mark_inconclusive_scan_result(result, "jax_orbax_metadata_read_failed")
-                    result.add_check(
-                        name="Orbax Metadata Read Check",
-                        passed=False,
-                        message=f"Error reading Orbax metadata: {e}",
-                        severity=IssueSeverity.INFO,
-                        location=str(metadata_path),
-                        rule_code="S902",
-                        details={
-                            "error": str(e),
-                            "analysis_incomplete": True,
-                            "scan_outcome_reason": "jax_orbax_metadata_read_failed",
-                        },
+                    self._add_orbax_metadata_read_failure(
+                        result=result,
+                        metadata_path=metadata_path,
+                        metadata_file=metadata_file,
+                        error=e,
                     )
 
         # Scan checkpoint files
-        checkpoint_files = list(path_obj.glob("checkpoint*"))
-        for checkpoint_file in checkpoint_files:
-            if checkpoint_file.is_file():
-                self._scan_checkpoint_file(
-                    str(checkpoint_file),
-                    result,
-                    treat_legacy_pickle_header_as_checkpoint=True,
+        directory_entries_seen = 0
+        checkpoint_files_seen = 0
+        uninspected_checkpoint_entry_reported = False
+        for checkpoint_file in path_obj.iterdir():
+            directory_entries_seen += 1
+            if directory_entries_seen > self.max_orbax_directory_entries:
+                mark_inconclusive_scan_result(result, self._ORBAX_DIRECTORY_ENTRY_COUNT_LIMIT_REASON)
+                result.add_check(
+                    name="Orbax Directory Entry Count Limit",
+                    passed=False,
+                    message=(
+                        "Reached the maximum number of Orbax directory entries to inspect; "
+                        "additional entries were skipped"
+                    ),
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "max_orbax_directory_entries": self.max_orbax_directory_entries,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": self._ORBAX_DIRECTORY_ENTRY_COUNT_LIMIT_REASON,
+                    },
+                    rule_code="S902",
                 )
+                break
+            if not self._is_orbax_checkpoint_entry_name(checkpoint_file.name):
+                continue
+            if checkpoint_file.is_symlink() or not checkpoint_file.is_file():
+                if not uninspected_checkpoint_entry_reported:
+                    entry_type = (
+                        "symlink"
+                        if checkpoint_file.is_symlink()
+                        else "directory"
+                        if checkpoint_file.is_dir()
+                        else "non_regular"
+                    )
+                    self._add_uninspected_orbax_checkpoint_entry(
+                        result=result,
+                        entry_path=checkpoint_file,
+                        entry_type=entry_type,
+                    )
+                    uninspected_checkpoint_entry_reported = True
+                continue
+            checkpoint_files_seen += 1
+            if checkpoint_files_seen > self.max_orbax_checkpoint_files:
+                mark_inconclusive_scan_result(result, self._ORBAX_CHECKPOINT_FILE_COUNT_LIMIT_REASON)
+                result.add_check(
+                    name="Orbax Checkpoint File Count Limit",
+                    passed=False,
+                    message=(
+                        "Reached the maximum number of Orbax checkpoint files to inspect; "
+                        "additional checkpoint entries were skipped"
+                    ),
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "max_orbax_checkpoint_files": self.max_orbax_checkpoint_files,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": self._ORBAX_CHECKPOINT_FILE_COUNT_LIMIT_REASON,
+                    },
+                    rule_code="S902",
+                )
+                break
+            with suppress(OSError):
+                accounting.bytes_scanned += checkpoint_file.stat().st_size
+            accounting.files_scanned += 1
+            self._scan_checkpoint_file(
+                str(checkpoint_file),
+                result,
+                treat_legacy_pickle_header_as_checkpoint=True,
+            )
 
-    def _check_bounded_orbax_restore_fn(
-        self,
-        context: str,
-        text_value: str,
-        *,
-        path: str,
-        result: ScanResult,
-    ) -> None:
-        """Run the dedicated restore-function check when the root value is visible."""
-        if context == "orbax_metadata_bounded_prefix.restore_fn":
-            self._add_orbax_restore_fn_check(text_value, path, result)
+        result.metadata["orbax_files_inspected"] = accounting.files_scanned
+        result.metadata["directory_accounting_scope"] = "orbax_selected_files"
+        return accounting
 
-    def _add_orbax_restore_fn_check(self, restore_fn_value: Any, path: str, result: ScanResult) -> None:
-        """Report a visible Orbax restore function with dangerous values promoted."""
-        restore_fn_text = str(restore_fn_value)
-        restore_fn_is_dangerous = bool(self._DANGEROUS_RESTORE_FN_PATTERN.search(restore_fn_text))
+    def _add_orbax_restore_fn_check(self, restore_fn_value: str, path: str, result: ScanResult) -> None:
+        """Preserve Orbax restore hook reporting for full and bounded-prefix metadata scans."""
+        restore_fn_is_dangerous = bool(self._DANGEROUS_RESTORE_FN_PATTERN.search(restore_fn_value))
         result.add_check(
             name="Orbax Restore Function Check",
             passed=False,
@@ -1077,7 +1269,7 @@ class JaxCheckpointScanner(BaseScanner):
             ),
             severity=IssueSeverity.CRITICAL if restore_fn_is_dangerous else IssueSeverity.WARNING,
             location=path,
-            details={"restore_fn": restore_fn_text[:200]},
+            details={"restore_fn": restore_fn_value[:200]},
             rule_code="S302",
         )
 
@@ -1086,7 +1278,7 @@ class JaxCheckpointScanner(BaseScanner):
 
         # Check for suspicious restore functions
         if "restore_fn" in metadata:
-            self._add_orbax_restore_fn_check(metadata["restore_fn"], path, result)
+            self._add_orbax_restore_fn_check(str(metadata["restore_fn"]), path, result)
 
         # Check for code injection in metadata
         pattern_finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
@@ -1633,12 +1825,9 @@ class JaxCheckpointScanner(BaseScanner):
                 result.metadata["checkpoint_type"] = "directory"
                 result.metadata["path_type"] = "directory"
 
-                self._scan_orbax_checkpoint(path, result)
-
-                # Calculate total size
-                total_size = sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file())
-                result.bytes_scanned = total_size
-                result.metadata["total_size"] = total_size
+                accounting = self._scan_orbax_checkpoint(path, result)
+                result.bytes_scanned = accounting.bytes_scanned
+                result.metadata["total_size"] = accounting.bytes_scanned
 
             else:
                 # Scan single file checkpoint
