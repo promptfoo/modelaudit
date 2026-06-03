@@ -279,7 +279,7 @@ def check_lambda_dict_function(
                 "layer_class": "Lambda",
                 "function_format": "dict",
                 "parse_status": "invalid_config",
-                "function_dict": redact_evidence_value(function_dict),
+                "function_payload_omitted": "malformed_lambda_config_may_contain_sensitive_payload",
             },
             why="Malformed dict-format Lambda metadata is suspicious and prevents bytecode inspection.",
         )

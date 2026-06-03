@@ -12,6 +12,7 @@ REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 STRUCTURED_REDACTION_PARSE_LIMIT: Final[int] = 10 * 1024
 MAX_URL_QUERY_REDACTION_DEPTH: Final[int] = 8
+MAX_REDACTION_VALUE_DEPTH: Final[int] = 100
 
 URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://[^\s\"'<>]+")
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
@@ -373,8 +374,10 @@ def _is_sensitive_detail_key(key: str) -> bool:
     )
 
 
-def redact_evidence_value(value: Any, max_string_chars: int = 180) -> Any:
+def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: int = 0) -> Any:
     """Recursively redact credentials from scanner detail values."""
+    if _depth >= MAX_REDACTION_VALUE_DEPTH:
+        return REDACTED_EVIDENCE_VALUE
     if isinstance(value, str):
         return redact_evidence_string(value, max_chars=max_string_chars)
     if isinstance(value, (bytes, bytearray)):
@@ -386,6 +389,7 @@ def redact_evidence_value(value: Any, max_string_chars: int = 180) -> Any:
                 redacted_items[f"<{type(key).__name__}-key>"] = redact_evidence_value(
                     child,
                     max_string_chars=max_string_chars,
+                    _depth=_depth + 1,
                 )
                 continue
 
@@ -393,12 +397,25 @@ def redact_evidence_value(value: Any, max_string_chars: int = 180) -> Any:
             if _is_sensitive_detail_key(key):
                 redacted_items[redacted_key] = REDACTED_EVIDENCE_VALUE
             else:
-                redacted_items[redacted_key] = redact_evidence_value(child, max_string_chars=max_string_chars)
+                redacted_items[redacted_key] = redact_evidence_value(
+                    child,
+                    max_string_chars=max_string_chars,
+                    _depth=_depth + 1,
+                )
         return redacted_items
     if isinstance(value, list):
-        return [redact_evidence_value(child, max_string_chars=max_string_chars) for child in value]
+        if len(value) == 2 and isinstance(value[0], str) and _is_sensitive_detail_key(value[0]):
+            return [redact_evidence_string(value[0], max_chars=max_string_chars), REDACTED_EVIDENCE_VALUE]
+        return [redact_evidence_value(child, max_string_chars=max_string_chars, _depth=_depth + 1) for child in value]
     if isinstance(value, tuple):
-        return tuple(redact_evidence_value(child, max_string_chars=max_string_chars) for child in value)
+        if len(value) == 2 and isinstance(value[0], str) and _is_sensitive_detail_key(value[0]):
+            return (redact_evidence_string(value[0], max_chars=max_string_chars), REDACTED_EVIDENCE_VALUE)
+        return tuple(
+            redact_evidence_value(child, max_string_chars=max_string_chars, _depth=_depth + 1) for child in value
+        )
     if isinstance(value, set):
-        return [redact_evidence_value(child, max_string_chars=max_string_chars) for child in sorted(value, key=repr)]
+        return [
+            redact_evidence_value(child, max_string_chars=max_string_chars, _depth=_depth + 1)
+            for child in sorted(value, key=repr)
+        ]
     return value

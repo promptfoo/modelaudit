@@ -1900,6 +1900,7 @@ __import__('pickle').loads(data)
         escaped_assignment_secret = "ZIP_ESCAPED_ASSIGNMENT_SECRET"
         json_container_secret = "ZIP_JSON_CONTAINER_SECRET"
         container_assignment_secret = "ZIP_CONTAINER_ASSIGNMENT_SECRET"
+        malformed_lambda_config_secret = "ZIP_MALFORMED_LAMBDA_CONFIG_SECRET"
 
         def direct_lambda_code(x: Any) -> Any:
             token = "ZIP_DIRECT_SECRET"
@@ -1927,6 +1928,16 @@ __import__('pickle').loads(data)
                             "function": {
                                 "class_name": "__lambda__",
                                 "config": {"code": base64.b64encode(marshal.dumps(dict_lambda_code.__code__)).decode()},
+                            },
+                        },
+                    },
+                    {
+                        "class_name": "Lambda",
+                        "name": "malformed_dict_lambda",
+                        "config": {
+                            "function": {
+                                "class_name": "__lambda__",
+                                "config": f"token={malformed_lambda_config_secret}",
                             },
                         },
                     },
@@ -2007,6 +2018,7 @@ __import__('pickle').loads(data)
             escaped_assignment_secret,
             json_container_secret,
             container_assignment_secret,
+            malformed_lambda_config_secret,
         ]
 
         model_path = create_configured_keras_zip(

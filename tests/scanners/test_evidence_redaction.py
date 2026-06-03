@@ -245,6 +245,29 @@ def test_redacts_json_string_container_credential_values() -> None:
     assert '"safe":["ok"]' in redacted_text
 
 
+def test_redacts_pair_shaped_credential_lists_and_bounds_value_recursion() -> None:
+    """Parsed list/tuple evidence should redact key/value pairs and bound recursion."""
+    pair_secret = "PAIR_LIST_SECRET"
+    nested_pair_secret = "NESTED_PAIR_LIST_SECRET"
+    deep_secret = "DEEP_VALUE_SECRET"
+
+    redacted_pairs = redact_evidence_value(
+        [["api_key", pair_secret], {"params": [("token", nested_pair_secret)]}],
+        max_string_chars=500,
+    )
+    deep_value: object = deep_secret
+    for _ in range(150):
+        deep_value = [deep_value]
+    redacted_deep = redact_evidence_value(deep_value, max_string_chars=500)
+
+    serialized_pairs = json.dumps(redacted_pairs, default=str)
+    assert pair_secret not in serialized_pairs
+    assert nested_pair_secret not in serialized_pairs
+    assert ["api_key", REDACTED_EVIDENCE_VALUE] in redacted_pairs
+    assert deep_secret not in str(redacted_deep)
+    assert REDACTED_EVIDENCE_VALUE in str(redacted_deep)
+
+
 def test_redacts_sensitive_container_assignments() -> None:
     """Credential assignments should consume array and object values before redaction."""
     array_secret = "CONTAINER_ASSIGNMENT_ARRAY_SECRET"
@@ -333,4 +356,5 @@ def test_redacts_oversized_and_deep_structured_evidence() -> None:
 
     assert large_secret not in large_redacted
     assert large_redacted == REDACTED_EVIDENCE_VALUE
-    assert deep_redacted == REDACTED_EVIDENCE_VALUE
+    assert REDACTED_EVIDENCE_VALUE in deep_redacted
+    assert len(deep_redacted) <= 500
