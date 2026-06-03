@@ -134,7 +134,7 @@ def _redact_url(match: re.Match[str]) -> str:
         netloc = f"{REDACTED_URL_CREDENTIALS}@{netloc.rsplit('@', 1)[1]}"
 
     query_items = []
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+    for key, value in parse_qsl(parsed.query.replace(";", "&"), keep_blank_values=True):
         if _is_sensitive_detail_key(key):
             query_items.append((key, REDACTED_EVIDENCE_VALUE))
         else:
@@ -229,6 +229,13 @@ def _redact_container_assignments(text: str) -> str:
             redacted_chunks.append(text[last_index : match.start()])
             redacted_chunks.append(f"{match.group('key')}{match.group('separator')}{REDACTED_EVIDENCE_VALUE}")
             last_index = container_end
+        else:
+            container_text = text[container_start:container_end]
+            redacted_container = _redact_structured_evidence(container_text, max_chars=len(container_text))
+            if redacted_container is not None and redacted_container != container_text:
+                redacted_chunks.append(text[last_index:container_start])
+                redacted_chunks.append(redacted_container)
+                last_index = container_end
 
         search_index = container_end
 
@@ -247,27 +254,43 @@ def _truncate(text: str, max_chars: int) -> str:
     return f"{text[: max_chars - 3]}..."
 
 
+def _serialize_redacted_structured_value(value: Any, max_chars: int) -> str:
+    redacted_value = redact_evidence_value(value)
+    try:
+        serialized_value = json.dumps(redacted_value, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        serialized_value = repr(redacted_value)
+    return _truncate(serialized_value, max_chars)
+
+
+def _redact_structured_evidence(text: str, max_chars: int) -> str | None:
+    stripped = text.strip()
+    if not stripped.startswith(("{", "[")):
+        return None
+    if len(stripped) > STRUCTURED_REDACTION_PARSE_LIMIT:
+        return _truncate(REDACTED_EVIDENCE_VALUE, max_chars)
+
+    try:
+        parsed = json.loads(stripped)
+    except (MemoryError, RecursionError, json.JSONDecodeError):
+        try:
+            parsed = ast.literal_eval(stripped)
+        except (MemoryError, RecursionError, SyntaxError, ValueError):
+            parsed = None
+
+    if isinstance(parsed, (dict, list, tuple, set)):
+        try:
+            return _serialize_redacted_structured_value(parsed, max_chars)
+        except (MemoryError, RecursionError):
+            return _truncate(REDACTED_EVIDENCE_VALUE, max_chars)
+    return None
+
+
 def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
-    stripped = text.strip()
-    if stripped.startswith(("{", "[")) and len(stripped) <= STRUCTURED_REDACTION_PARSE_LIMIT:
-        try:
-            parsed = json.loads(stripped)
-        except json.JSONDecodeError:
-            try:
-                parsed = ast.literal_eval(stripped)
-            except (MemoryError, RecursionError, SyntaxError, ValueError):
-                parsed = None
-
-        if isinstance(parsed, (dict, list, tuple)):
-            redacted_value = redact_evidence_value(parsed)
-            try:
-                serialized_value = json.dumps(redacted_value, separators=(",", ":"), default=str)
-            except (TypeError, ValueError):
-                serialized_value = repr(redacted_value)
-            return _truncate(serialized_value, max_chars)
-        else:
-            parsed = None
+    structured_redaction = _redact_structured_evidence(text, max_chars=max_chars)
+    if structured_redaction is not None:
+        return structured_redaction
 
     redacted = URL_RE.sub(_redact_url, text)
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
@@ -303,7 +326,10 @@ def redact_evidence_value(value: Any, max_string_chars: int = 180) -> Any:
         redacted_items: dict[Any, Any] = {}
         for key, child in value.items():
             if not isinstance(key, str):
-                redacted_items[key] = redact_evidence_value(child, max_string_chars=max_string_chars)
+                redacted_items[f"<{type(key).__name__}-key>"] = redact_evidence_value(
+                    child,
+                    max_string_chars=max_string_chars,
+                )
                 continue
 
             redacted_key = redact_evidence_string(key, max_chars=max_string_chars)
@@ -316,4 +342,6 @@ def redact_evidence_value(value: Any, max_string_chars: int = 180) -> Any:
         return [redact_evidence_value(child, max_string_chars=max_string_chars) for child in value]
     if isinstance(value, tuple):
         return tuple(redact_evidence_value(child, max_string_chars=max_string_chars) for child in value)
+    if isinstance(value, set):
+        return [redact_evidence_value(child, max_string_chars=max_string_chars) for child in sorted(value, key=repr)]
     return value

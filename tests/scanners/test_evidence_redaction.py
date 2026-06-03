@@ -33,9 +33,10 @@ def test_redacts_compound_credential_assignments() -> None:
 
 def test_redacts_compound_sensitive_query_parameters() -> None:
     """Compound query credential keys should be redacted in URL evidence."""
+    semicolon_secret = "SEMICOLON_QUERY_SECRET"
     text = (
         "url=https://example.com/callback?client_secret=CLIENTSECRET123&refresh_token=REFRESHTOKEN456"
-        "&aws_access_key_id=AWSACCESSKEY789&ok=1"
+        f"&aws_access_key_id=AWSACCESSKEY789&ok=1;token={semicolon_secret}"
     )
 
     redacted = redact_evidence_string(text, max_chars=500)
@@ -43,9 +44,11 @@ def test_redacts_compound_sensitive_query_parameters() -> None:
     assert "CLIENTSECRET123" not in redacted
     assert "REFRESHTOKEN456" not in redacted
     assert "AWSACCESSKEY789" not in redacted
+    assert semicolon_secret not in redacted
     assert "client_secret=<redacted>" in redacted
     assert "refresh_token=<redacted>" in redacted
     assert "aws_access_key_id=<redacted>" in redacted
+    assert "token=<redacted>" in redacted
     assert "ok=1" in redacted
 
 
@@ -229,12 +232,14 @@ def test_redacts_sensitive_container_assignments() -> None:
     array_secret = "CONTAINER_ASSIGNMENT_ARRAY_SECRET"
     object_secret = "CONTAINER_ASSIGNMENT_OBJECT_SECRET"
     nested_secret = "CONTAINER_ASSIGNMENT_NESTED_SECRET"
+    outer_secret = "CONTAINER_ASSIGNMENT_OUTER_SECRET"
 
     redacted_text = redact_evidence_string(
         (
             f'awsSecretAccessKey=["{array_secret}"] '
             f'token={{"nested":"{object_secret}"}} '
             f'api_key=[[],"{nested_secret}"] '
+            f'metadata={{"api_key":["{outer_secret}"]}} '
             'safe=["visible"]'
         ),
         max_chars=500,
@@ -243,9 +248,11 @@ def test_redacts_sensitive_container_assignments() -> None:
     assert array_secret not in redacted_text
     assert object_secret not in redacted_text
     assert nested_secret not in redacted_text
+    assert outer_secret not in redacted_text
     assert f"awsSecretAccessKey={REDACTED_EVIDENCE_VALUE}" in redacted_text
     assert f"token={REDACTED_EVIDENCE_VALUE}" in redacted_text
     assert f"api_key={REDACTED_EVIDENCE_VALUE}" in redacted_text
+    assert f'"api_key":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert 'safe=["visible"]' in redacted_text
 
 
@@ -253,14 +260,36 @@ def test_redacts_repr_style_container_credential_values() -> None:
     """Python repr-style container strings should redact sensitive nested values."""
     array_secret = "REPR_ARRAY_SECRET"
     object_secret = "REPR_OBJECT_SECRET"
+    tuple_key_secret = "REPR_TUPLE_KEY_SECRET"
+    set_secret = "REPR_SET_SECRET"
 
     redacted_text = redact_evidence_string(
-        f"{{'api_key':['{array_secret}'],'token':{{'nested':'{object_secret}'}},'safe':['ok']}}",
+        (
+            f"{{'api_key':['{array_secret}'],'token':{{'nested':'{object_secret}'}},"
+            f"('api_key','{tuple_key_secret}'):'x','metadata':{{'token={set_secret}'}},'safe':['ok']}}"
+        ),
         max_chars=500,
     )
 
     assert array_secret not in redacted_text
     assert object_secret not in redacted_text
+    assert tuple_key_secret not in redacted_text
+    assert set_secret not in redacted_text
     assert f'"api_key":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert f'"token":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
+    assert '"<tuple-key>":"x"' in redacted_text
+    assert f'"metadata":["token={REDACTED_EVIDENCE_VALUE}"]' in redacted_text
     assert '"safe":["ok"]' in redacted_text
+
+
+def test_redacts_oversized_and_deep_structured_evidence() -> None:
+    """Oversized or deeply nested structured evidence should fail closed."""
+    large_secret = "LARGE_STRUCTURED_SECRET"
+    large_text = f'{{"api_key":["{large_secret}"],"pad":"{"x" * 11000}"}}'
+
+    large_redacted = redact_evidence_string(large_text, max_chars=500)
+    deep_redacted = redact_evidence_string("[" * 1200 + "]" * 1200, max_chars=500)
+
+    assert large_secret not in large_redacted
+    assert large_redacted == REDACTED_EVIDENCE_VALUE
+    assert deep_redacted == REDACTED_EVIDENCE_VALUE
