@@ -11,6 +11,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 STRUCTURED_REDACTION_PARSE_LIMIT: Final[int] = 10 * 1024
+MAX_URL_QUERY_REDACTION_DEPTH: Final[int] = 8
 
 URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://[^\s\"'<>]+")
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
@@ -82,7 +83,7 @@ GENERIC_QUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
 )
 GENERIC_CONTAINER_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)"
-    r"(?P<opener>[\[{])"
+    r"(?P<opener>[\[({])"
 )
 GENERIC_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)[^\s\"';&|]+"
@@ -122,7 +123,22 @@ def _redact_malformed_url(raw_url: str) -> str:
     return f"{scheme}{REDACTED_URL_CREDENTIALS}@{rest.rsplit('@', 1)[1]}"
 
 
-def _redact_url(match: re.Match[str]) -> str:
+def _redact_url_query_value(value: str, url_depth: int) -> str:
+    if not value:
+        return value
+    if url_depth >= MAX_URL_QUERY_REDACTION_DEPTH:
+        return REDACTED_EVIDENCE_VALUE
+    try:
+        return redact_evidence_string(
+            value,
+            max_chars=max(len(value), len(REDACTED_EVIDENCE_VALUE)),
+            _url_depth=url_depth + 1,
+        )
+    except RecursionError:
+        return REDACTED_EVIDENCE_VALUE
+
+
+def _redact_url(match: re.Match[str], *, url_depth: int = 0) -> str:
     raw_url = match.group(0)
     try:
         parsed = urlsplit(raw_url)
@@ -138,9 +154,7 @@ def _redact_url(match: re.Match[str]) -> str:
         if _is_sensitive_detail_key(key):
             query_items.append((key, REDACTED_EVIDENCE_VALUE))
         else:
-            query_items.append(
-                (key, redact_evidence_string(value, max_chars=max(len(value), len(REDACTED_EVIDENCE_VALUE))))
-            )
+            query_items.append((key, _redact_url_query_value(value, url_depth=url_depth)))
 
     return urlunsplit(
         (
@@ -182,10 +196,10 @@ def _redact_generic_assignment(match: re.Match[str]) -> str:
 
 
 def _find_balanced_container_end(text: str, start: int) -> int | None:
-    if start >= len(text) or text[start] not in "[{":
+    if start >= len(text) or text[start] not in "[{(":
         return None
 
-    matching_closer = {"[": "]", "{": "}"}
+    matching_closer = {"[": "]", "{": "}", "(": ")"}
     stack = [text[start]]
     quote: str | None = None
     escaped = False
@@ -205,7 +219,7 @@ def _find_balanced_container_end(text: str, start: int) -> int | None:
             quote = char
         elif char in matching_closer:
             stack.append(char)
-        elif char in "]}":
+        elif char in "])}":
             if not stack or matching_closer[stack[-1]] != char:
                 return None
             stack.pop()
@@ -326,13 +340,13 @@ def _redact_structured_evidence(text: str, max_chars: int, *, fail_closed: bool 
     return None
 
 
-def redact_evidence_string(text: str, max_chars: int = 180) -> str:
+def redact_evidence_string(text: str, max_chars: int = 180, *, _url_depth: int = 0) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
     structured_redaction = _redact_structured_evidence(text, max_chars=max_chars)
     if structured_redaction is not None:
         return structured_redaction
 
-    redacted = URL_RE.sub(_redact_url, text)
+    redacted = URL_RE.sub(lambda match: _redact_url(match, url_depth=_url_depth), text)
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
@@ -363,6 +377,8 @@ def redact_evidence_value(value: Any, max_string_chars: int = 180) -> Any:
     """Recursively redact credentials from scanner detail values."""
     if isinstance(value, str):
         return redact_evidence_string(value, max_chars=max_string_chars)
+    if isinstance(value, (bytes, bytearray)):
+        return redact_evidence_string(repr(value), max_chars=max_string_chars)
     if isinstance(value, dict):
         redacted_items: dict[Any, Any] = {}
         for key, child in value.items():

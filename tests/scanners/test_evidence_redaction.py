@@ -1,6 +1,7 @@
 """Tests for scanner evidence redaction helpers."""
 
 import json
+from urllib.parse import quote
 
 from modelaudit.scanners._evidence_redaction import (
     REDACTED_EVIDENCE_VALUE,
@@ -54,6 +55,19 @@ def test_redacts_compound_sensitive_query_parameters() -> None:
     assert "token=<redacted>" in redacted
     assert REDACTED_URL_CREDENTIALS in redacted
     assert "ok=1" in redacted
+
+
+def test_caps_recursive_url_query_redaction() -> None:
+    """Nested URL query values should not recurse without bound."""
+    recursive_secret = "RECURSIVE_QUERY_SECRET"
+    nested_url = f"https://evil.test/?token={recursive_secret}"
+    for _ in range(20):
+        nested_url = f"https://example.test/?r={quote(nested_url, safe='')}"
+
+    redacted = redact_evidence_string(nested_url, max_chars=2000)
+
+    assert recursive_secret not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
 
 
 def test_redacts_malformed_userinfo_url() -> None:
@@ -237,6 +251,7 @@ def test_redacts_sensitive_container_assignments() -> None:
     object_secret = "CONTAINER_ASSIGNMENT_OBJECT_SECRET"
     nested_secret = "CONTAINER_ASSIGNMENT_NESTED_SECRET"
     outer_secret = "CONTAINER_ASSIGNMENT_OUTER_SECRET"
+    parenthesized_secret = "CONTAINER_ASSIGNMENT_PAREN_SECRET"
 
     redacted_text = redact_evidence_string(
         (
@@ -244,6 +259,7 @@ def test_redacts_sensitive_container_assignments() -> None:
             f'token={{"nested":"{object_secret}"}} '
             f'api_key=[[],"{nested_secret}"] '
             f'metadata={{"api_key":["{outer_secret}"]}} '
+            f'awsSecretAccessKey=("{parenthesized_secret}") '
             'safe=["visible"]'
         ),
         max_chars=500,
@@ -253,6 +269,7 @@ def test_redacts_sensitive_container_assignments() -> None:
     assert object_secret not in redacted_text
     assert nested_secret not in redacted_text
     assert outer_secret not in redacted_text
+    assert parenthesized_secret not in redacted_text
     assert f"awsSecretAccessKey={REDACTED_EVIDENCE_VALUE}" in redacted_text
     assert f"token={REDACTED_EVIDENCE_VALUE}" in redacted_text
     assert f"api_key={REDACTED_EVIDENCE_VALUE}" in redacted_text
@@ -282,11 +299,13 @@ def test_redacts_repr_style_container_credential_values() -> None:
     object_secret = "REPR_OBJECT_SECRET"
     tuple_key_secret = "REPR_TUPLE_KEY_SECRET"
     set_secret = "REPR_SET_SECRET"
+    bytes_secret = "REPR_BYTES_SECRET"
 
     redacted_text = redact_evidence_string(
         (
             f"{{'api_key':['{array_secret}'],'token':{{'nested':'{object_secret}'}},"
-            f"('api_key','{tuple_key_secret}'):'x','metadata':{{'token={set_secret}'}},'safe':['ok']}}"
+            f"('api_key','{tuple_key_secret}'):'x','metadata':{{'token={set_secret}'}},"
+            f"'bytes':b'token={bytes_secret}','safe':['ok']}}"
         ),
         max_chars=500,
     )
@@ -295,10 +314,12 @@ def test_redacts_repr_style_container_credential_values() -> None:
     assert object_secret not in redacted_text
     assert tuple_key_secret not in redacted_text
     assert set_secret not in redacted_text
+    assert bytes_secret not in redacted_text
     assert f'"api_key":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert f'"token":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert '"<tuple-key>":"x"' in redacted_text
     assert f'"metadata":["token={REDACTED_EVIDENCE_VALUE}"]' in redacted_text
+    assert f'"bytes":"b\'token={REDACTED_EVIDENCE_VALUE}\'"' in redacted_text
     assert '"safe":["ok"]' in redacted_text
 
 
