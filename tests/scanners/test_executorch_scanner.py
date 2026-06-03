@@ -1,4 +1,5 @@
 import pickle
+import struct
 import zipfile
 from pathlib import Path
 
@@ -42,6 +43,31 @@ def _pickle_payload_with_eval(source: str) -> bytes:
             return (eval, (source,))
 
     return pickle.dumps(EvalPayload())
+
+
+def _corrupt_zip_member_crc(zip_path: Path, member_index: int) -> None:
+    """Patch one ZIP member's local and central-directory CRC fields."""
+    with zipfile.ZipFile(zip_path, "r") as zip_file:
+        member_info = zip_file.infolist()[member_index]
+        central_directory_offset = zip_file.start_dir
+
+    archive_bytes = bytearray(zip_path.read_bytes())
+    local_crc_offset = member_info.header_offset + 14
+    original_crc = struct.unpack_from("<I", archive_bytes, local_crc_offset)[0]
+    corrupt_crc = (original_crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+    struct.pack_into("<I", archive_bytes, local_crc_offset, corrupt_crc)
+
+    cursor = central_directory_offset
+    while cursor < len(archive_bytes) and archive_bytes[cursor : cursor + 4] == b"PK\x01\x02":
+        local_header_offset = struct.unpack_from("<I", archive_bytes, cursor + 42)[0]
+        filename_len, extra_len, comment_len = struct.unpack_from("<HHH", archive_bytes, cursor + 28)
+        if local_header_offset == member_info.header_offset:
+            struct.pack_into("<I", archive_bytes, cursor + 16, corrupt_crc)
+            zip_path.write_bytes(archive_bytes)
+            return
+        cursor += 46 + filename_len + extra_len + comment_len
+
+    raise AssertionError(f"Unable to locate central directory entry at offset {member_info.header_offset}")
 
 
 def test_executorch_scanner_can_handle(tmp_path: Path) -> None:
@@ -339,6 +365,45 @@ def test_renamed_executorch_archive_duplicate_members_route_and_detect_shadowed_
     assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
 
 
+def test_renamed_executorch_archive_unreadable_duplicate_version_does_not_hide_valid_marker(tmp_path: Path) -> None:
+    model_path = tmp_path / "duplicate-version-model.jpg"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "corrupt")
+        zipf.writestr("bytecode.pkl", _pickle_payload_with_eval("print('evil')"))
+        zipf.writestr("version", "1")
+    _corrupt_zip_member_crc(model_path, 0)
+
+    assert ExecuTorchScanner.can_handle(str(model_path))
+
+    result = core.scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "executorch"
+    assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
+
+
+def test_renamed_executorch_archive_case_insensitive_members_route_and_detect_payload(tmp_path: Path) -> None:
+    model_path = tmp_path / "uppercase-members.jpg"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("VERSION", "1")
+        zipf.writestr("BYTECODE.PKL", _pickle_payload_with_eval("print('evil')"))
+
+    assert ExecuTorchScanner.can_handle(str(model_path))
+
+    result = core.scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "executorch"
+    assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
+
+
+def test_renamed_executorch_archive_case_insensitive_near_match_does_not_route(tmp_path: Path) -> None:
+    model_path = tmp_path / "uppercase-near-match.jpg"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("VERSION", "not-a-version")
+        zipf.writestr("BYTECODE.PKL", pickle.dumps({"weights": [1, 2, 3]}))
+
+    assert not ExecuTorchScanner.can_handle(str(model_path))
+
+
 def test_executorch_duplicate_pickle_members_scan_malicious_last_entry(tmp_path: Path) -> None:
     model_path = tmp_path / "duplicate-model-reversed.ptl"
     with zipfile.ZipFile(model_path, "w") as zipf:
@@ -349,6 +414,21 @@ def test_executorch_duplicate_pickle_members_scan_malicious_last_entry(tmp_path:
     result = ExecuTorchScanner().scan(str(model_path))
 
     assert result.metadata["pickle_files"] == ["model.pkl", "model.pkl"]
+    assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
+
+
+def test_executorch_unreadable_duplicate_pickle_is_inconclusive_and_scans_later_member(tmp_path: Path) -> None:
+    model_path = tmp_path / "duplicate-corrupt-model.ptl"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("model.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("model.pkl", _pickle_payload_with_eval("print('evil')"))
+    _corrupt_zip_member_crc(model_path, 1)
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
 
 
@@ -364,3 +444,15 @@ def test_executorch_benign_duplicate_pickle_members_stay_clean(tmp_path: Path) -
     assert result.success is True
     assert result.metadata["pickle_files"] == ["model.pkl", "model.pkl"]
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_executorch_case_insensitive_python_suffix_is_flagged(tmp_path: Path) -> None:
+    model_path = tmp_path / "uppercase-python.ptl"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("bytecode.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("hooks.PY", "print('evil')")
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert any(issue.rule_code == "S104" and issue.details.get("file") == "hooks.PY" for issue in result.issues)

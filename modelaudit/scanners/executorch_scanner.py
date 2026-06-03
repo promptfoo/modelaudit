@@ -151,7 +151,7 @@ class ExecuTorchScanner(BaseScanner):
                         continue
                     safe_entries.append(entry)
 
-                pickle_entries = [entry for entry in safe_entries if entry.filename.endswith(".pkl")]
+                pickle_entries = [entry for entry in safe_entries if entry.filename.casefold().endswith(".pkl")]
                 pickle_files = [entry.filename for entry in pickle_entries]
                 result.metadata["pickle_files"] = pickle_files
                 bytes_scanned = 0
@@ -180,7 +180,7 @@ class ExecuTorchScanner(BaseScanner):
 
                 for entry in safe_entries:
                     name = entry.filename
-                    if name.endswith(".py"):
+                    if name.casefold().endswith(".py"):
                         result.add_check(
                             name="Python File Detection",
                             passed=False,

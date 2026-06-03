@@ -1856,7 +1856,7 @@ def _read_zip_member_text(
     try:
         data = _read_zip_member_bounded(archive, member_info, max_bytes)
         return data.decode("utf-8", errors="strict").strip()
-    except (OSError, RuntimeError, UnicodeDecodeError, ValueError):
+    except (OSError, RuntimeError, UnicodeDecodeError, ValueError, zipfile.BadZipFile):
         return None
 
 
@@ -2020,7 +2020,7 @@ def is_executorch_archive(path: str) -> bool:
             for info in archive.infolist():
                 if not info.filename or info.is_dir():
                     continue
-                name = _normalize_archive_member_name(info.filename)
+                name = _normalize_archive_member_name(info.filename).casefold()
                 members_by_name.setdefault(name, []).append(info)
 
             for name in members_by_name:
