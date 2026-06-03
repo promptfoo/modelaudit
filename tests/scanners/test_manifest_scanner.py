@@ -808,6 +808,33 @@ def test_manifest_scanner_ignores_plain_nested_chat_template_container_strings(t
     assert not any(check.name.startswith("Jinja2") or check.name == "Template Size Limit" for check in result.checks)
 
 
+def test_manifest_scanner_template_path_collision_does_not_hide_malicious_candidate(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    malicious = "{{ lipsum.__globals__.os.popen('id') }}"
+    benign = "{{ message['content'] }}"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": {
+                    "a.b": malicious,
+                    "a": {"b": benign},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner().scan(str(config_path))
+
+    failed_checks = [check for check in result.checks if check.name == "Jinja2 Template Injection Detection"]
+    assert failed_checks
+    assert any(check.details.get("template_location") == "chat_template.a.b" for check in failed_checks)
+    summary = [check for check in result.checks if check.name == "Jinja2 SSTI Analysis Summary"]
+    assert len(summary) == 1
+    assert summary[0].details["templates_analyzed"] == 2
+
+
 def test_manifest_scanner_keeps_benign_chat_templates_clean(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text(

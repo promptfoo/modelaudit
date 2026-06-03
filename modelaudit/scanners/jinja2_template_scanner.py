@@ -19,6 +19,7 @@ Key Features:
 """
 
 import json
+import operator
 import os
 import re
 import warnings
@@ -531,47 +532,85 @@ class Jinja2TemplateScanner(BaseScanner):
 
         try:
             reader = GGUFReader(path)
+        except Exception as exc:
+            logger.debug("Error opening GGUF for template extraction: %s", exc)
+            extraction_failures.append(self._template_extraction_failure("gguf", "jinja2_gguf_parse_failed", exc))
+            return templates, extraction_failures
 
-            # Look for tokenizer.chat_template in metadata
-            for key, field in reader.fields.items():
-                if key == "tokenizer.chat_template" and hasattr(field, "parts") and hasattr(field, "data"):
-                    value = field.parts[field.data[0]]
-                    template_str = self._gguf_template_value_to_string(value, extraction_failures)
+        for key, field in reader.fields.items():
+            if not self._is_gguf_chat_template_key(key):
+                continue
 
-                    if template_str:
-                        self._add_template_candidate(
-                            template_str,
-                            templates,
-                            "tokenizer.chat_template",
-                            extraction_failures,
-                            "gguf",
-                        )
+            try:
+                if not hasattr(field, "parts") or not hasattr(field, "data") or len(field.data) == 0:
+                    raise ValueError("GGUF chat template field does not expose readable value data")
 
-        except Exception as e:
-            logger.debug(f"Error extracting GGUF templates: {e}")
+                value = field.parts[field.data[0]]
+                template_str = self._gguf_template_value_to_string(value, extraction_failures, key)
+                if template_str:
+                    self._add_template_candidate(
+                        template_str,
+                        templates,
+                        key,
+                        extraction_failures,
+                        "gguf",
+                    )
+            except Exception as exc:
+                logger.debug("Error extracting GGUF chat template %s: %s", key, exc)
+                self._add_gguf_template_decode_failure(extraction_failures, key, field, exc)
 
         return templates, extraction_failures
+
+    @staticmethod
+    def _is_gguf_chat_template_key(key: Any) -> bool:
+        return isinstance(key, str) and (key == "tokenizer.chat_template" or key.startswith("tokenizer.chat_template."))
+
+    @staticmethod
+    def _add_gguf_template_decode_failure(
+        extraction_failures: list[dict[str, Any]],
+        template_location: str,
+        value: Any,
+        error: Exception | None = None,
+    ) -> None:
+        if any(
+            failure.get("reason") == "jinja2_gguf_template_decode_failed"
+            and failure.get("template_location") == template_location
+            for failure in extraction_failures
+        ):
+            return
+
+        failure = {
+            "format": "gguf",
+            "reason": "jinja2_gguf_template_decode_failed",
+            "template_location": template_location,
+            "value_type": type(value).__name__,
+        }
+        if error is not None:
+            failure["exception"] = str(error)
+            failure["exception_type"] = type(error).__name__
+        extraction_failures.append(failure)
 
     def _gguf_template_value_to_string(
         self,
         value: Any,
         extraction_failures: list[dict[str, Any]],
+        template_location: str,
     ) -> str | None:
         if isinstance(value, str):
             return value
 
         if isinstance(value, list | tuple):
-            return self._gguf_integer_sequence_to_string(value, extraction_failures)
+            return self._gguf_integer_sequence_to_string(value, extraction_failures, template_location)
 
         if isinstance(value, bytes | bytearray | memoryview):
-            return self._gguf_template_bytes_to_string(bytes(value), extraction_failures)
+            return self._gguf_template_bytes_to_string(bytes(value), extraction_failures, template_location)
 
         declared_size = self._gguf_declared_template_size(value)
         if declared_size is not None and declared_size > self.max_template_size:
             self._add_template_size_failure(
                 extraction_failures,
                 "gguf",
-                "tokenizer.chat_template",
+                template_location,
                 declared_size,
             )
             return None
@@ -584,7 +623,11 @@ class Jinja2TemplateScanner(BaseScanner):
                 logger.debug("Error decoding GGUF chat template bytes: %s", exc)
             else:
                 if isinstance(raw_value, bytes | bytearray | memoryview):
-                    return self._gguf_template_bytes_to_string(bytes(raw_value), extraction_failures)
+                    return self._gguf_template_bytes_to_string(
+                        bytes(raw_value),
+                        extraction_failures,
+                        template_location,
+                    )
 
         tolist = getattr(value, "tolist", None)
         if callable(tolist):
@@ -594,40 +637,62 @@ class Jinja2TemplateScanner(BaseScanner):
                 logger.debug("Error decoding GGUF chat template list: %s", exc)
             else:
                 if list_value is not value:
-                    recursive_value = self._gguf_template_value_to_string(list_value, extraction_failures)
+                    recursive_value = self._gguf_template_value_to_string(
+                        list_value,
+                        extraction_failures,
+                        template_location,
+                    )
                     if recursive_value is not None:
                         return recursive_value
 
-        return str(value)
+        self._add_gguf_template_decode_failure(extraction_failures, template_location, value)
+        return None
 
     def _gguf_integer_sequence_to_string(
         self,
         value: list[Any] | tuple[Any, ...],
         extraction_failures: list[dict[str, Any]],
+        template_location: str,
     ) -> str | None:
         if len(value) > self.max_template_size:
             self._add_template_size_failure(
                 extraction_failures,
                 "gguf",
-                "tokenizer.chat_template",
+                template_location,
                 len(value),
             )
             return None
 
-        return "".join(
-            chr(code_point) for code_point in value if isinstance(code_point, int) and 0 <= code_point <= 1114111
-        )
+        characters: list[str] = []
+        for raw_code_point in value:
+            if isinstance(raw_code_point, bool):
+                self._add_gguf_template_decode_failure(extraction_failures, template_location, value)
+                return None
+
+            try:
+                code_point = operator.index(raw_code_point)
+            except TypeError:
+                self._add_gguf_template_decode_failure(extraction_failures, template_location, value)
+                return None
+
+            if not 0 <= code_point <= 1114111:
+                self._add_gguf_template_decode_failure(extraction_failures, template_location, value)
+                return None
+            characters.append(chr(code_point))
+
+        return "".join(characters)
 
     def _gguf_template_bytes_to_string(
         self,
         value: bytes,
         extraction_failures: list[dict[str, Any]],
+        template_location: str,
     ) -> str | None:
         if len(value) > self.max_template_size:
             self._add_template_size_failure(
                 extraction_failures,
                 "gguf",
-                "tokenizer.chat_template",
+                template_location,
                 len(value),
             )
             return None
@@ -755,7 +820,7 @@ class Jinja2TemplateScanner(BaseScanner):
         config_format: str,
     ) -> None:
         if len(value) <= self.max_template_size:
-            templates[template_path] = value
+            self._record_template_candidate(templates, template_path, value)
             return
 
         self._add_template_size_failure(
@@ -764,6 +829,19 @@ class Jinja2TemplateScanner(BaseScanner):
             template_path,
             len(value),
         )
+
+    @staticmethod
+    def _record_template_candidate(templates: dict[str, str], template_path: str, value: str) -> None:
+        if template_path not in templates:
+            templates[template_path] = value
+            return
+
+        duplicate_index = len(templates) + 1
+        unique_path = f"{template_path} [duplicate {duplicate_index}]"
+        while unique_path in templates:
+            duplicate_index += 1
+            unique_path = f"{template_path} [duplicate {duplicate_index}]"
+        templates[unique_path] = value
 
     def _add_template_size_failure(
         self,
