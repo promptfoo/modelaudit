@@ -257,15 +257,18 @@ def _get_with_jfrog_redirect_policy(
     timeout: int,
     stream: bool = False,
 ) -> requests.Response:
-    """GET a JFrog URL while stripping credentials from untrusted redirects."""
+    """GET a JFrog URL while isolating credentials from untrusted redirects."""
     current_url = url
     current_headers = headers
-    redirect_cookies = requests.cookies.RequestsCookieJar()
+    current_is_trusted = _is_trusted_jfrog_auth_target(url)
+    trusted_redirect_cookies = requests.cookies.RequestsCookieJar()
+    untrusted_redirect_cookies = requests.cookies.RequestsCookieJar()
     for _redirect_count in range(_MAX_JFROG_REDIRECTS + 1):
+        current_cookies = trusted_redirect_cookies if current_is_trusted else untrusted_redirect_cookies
         response = requests.get(
             current_url,
             headers=current_headers,
-            cookies=redirect_cookies,
+            cookies=current_cookies,
             timeout=timeout,
             stream=stream,
             allow_redirects=False,
@@ -276,7 +279,7 @@ def _get_with_jfrog_redirect_policy(
         location = response.headers.get("Location")
         response_cookies = getattr(response, "cookies", None)
         if isinstance(response_cookies, CookieJar):
-            requests.cookies.merge_cookies(redirect_cookies, response_cookies)
+            requests.cookies.merge_cookies(current_cookies, response_cookies)
         response.close()
         if not location:
             raise requests.exceptions.RequestException(
@@ -284,7 +287,8 @@ def _get_with_jfrog_redirect_policy(
             )
 
         current_url = urljoin(current_url, location)
-        current_headers = headers if _is_trusted_jfrog_auth_target(current_url) else {}
+        current_is_trusted = _is_trusted_jfrog_auth_target(current_url)
+        current_headers = headers if current_is_trusted else {}
 
     raise requests.exceptions.TooManyRedirects(
         f"Exceeded {_MAX_JFROG_REDIRECTS} redirects for JFrog URL {redact_jfrog_url_for_display(url)}"

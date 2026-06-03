@@ -317,6 +317,46 @@ class TestJFrogDownload:
         assert second_cookie_jar.get("ROUTEID") == "backend-a"
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_redirect_isolates_cookies_across_trust_boundaries(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Trusted JFrog cookies must not cross an untrusted redirect hop."""
+        trusted_redirect = MagicMock(spec=requests.Response)
+        trusted_redirect.status_code = 302
+        trusted_redirect.headers = {"Location": "https://evil.example/artifacts/model.bin"}
+        trusted_redirect.cookies = requests.cookies.cookiejar_from_dict({"JFROG_SESSION": "trusted-session"})
+        untrusted_redirect = MagicMock(spec=requests.Response)
+        untrusted_redirect.status_code = 302
+        untrusted_redirect.headers = {"Location": "https://company.jfrog.io/artifactory/repo/model.bin?node=1"}
+        untrusted_redirect.cookies = requests.cookies.cookiejar_from_dict({"EVIL_SESSION": "untrusted-session"})
+        final_response = MagicMock(spec=requests.Response)
+        final_response.status_code = 200
+        final_response.headers = {}
+        final_response.raise_for_status.return_value = None
+        final_response.iter_content.return_value = [b"data"]
+        mock_get.side_effect = [trusted_redirect, untrusted_redirect, final_response]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        result = download_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            cache_dir=tmp_path,
+            api_token="test-token",
+        )
+
+        assert result.read_bytes() == b"data"
+        trusted_cookie_jar = mock_get.call_args_list[0].kwargs["cookies"]
+        untrusted_cookie_jar = mock_get.call_args_list[1].kwargs["cookies"]
+        returning_trusted_cookie_jar = mock_get.call_args_list[2].kwargs["cookies"]
+        assert trusted_cookie_jar is returning_trusted_cookie_jar
+        assert trusted_cookie_jar is not untrusted_cookie_jar
+        assert trusted_cookie_jar.get("JFROG_SESSION") == "trusted-session"
+        assert trusted_cookie_jar.get("EVIL_SESSION") is None
+        assert untrusted_cookie_jar.get("JFROG_SESSION") is None
+        assert untrusted_cookie_jar.get("EVIL_SESSION") == "untrusted-session"
+        assert mock_get.call_args_list[1].kwargs["headers"] == {}
+        assert mock_get.call_args_list[2].kwargs["headers"] == {"X-JFrog-Art-Api": "test-token"}
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_download_redirect_without_location_fails_closed(
         self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -462,7 +502,12 @@ class TestJFrogDownload:
         assert mock_get.call_args[1]["headers"] == {"Authorization": "Bearer explicit-access-token"}
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
-    def test_no_authentication(self, mock_get, tmp_path, caplog):
+    def test_no_authentication(
+        self,
+        mock_get: MagicMock,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         """Test anonymous access when no authentication is provided."""
         mock_response = mock_get.return_value
         mock_response.status_code = 200
