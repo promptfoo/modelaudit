@@ -108,11 +108,7 @@ def _redact_url_for_display(url: str) -> str:
         hostname = f"[{hostname}]"
 
     netloc = f"{hostname}:{port}" if port is not None else hostname
-    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
-
-
-def _redact_urls_for_display(text: str) -> str:
-    return _URL_PATTERN.sub(lambda match: _redact_url_for_display(match.group(0)), text)
+    return urlunsplit((parsed.scheme, netloc, "", "", ""))
 
 
 class LightGBMScanner(BaseScanner):

