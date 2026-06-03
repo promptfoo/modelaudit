@@ -7,6 +7,7 @@ import struct
 from collections.abc import Iterator
 from dataclasses import dataclass
 from glob import escape as escape_glob_pattern
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -283,6 +284,163 @@ def _detect_huggingface_xgboost_ubjson_route(
     return _detect_extensionless_xgboost_ubjson_route(xgboost_probe)
 
 
+def _detect_huggingface_llamafile_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
+    """Return a bounded Llamafile route for a suffix-skipped remote executable."""
+    from modelaudit.utils.file.detection import (
+        LLAMAFILE_MARKER,
+        LLAMAFILE_ROUTE_SCAN_BYTES,
+        LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
+        _is_supported_llamafile_executable_header,
+    )
+
+    if not _is_supported_llamafile_executable_header(prefix[:4]):
+        return None
+
+    max_probe_size = LLAMAFILE_ROUTE_SCAN_BYTES + 1
+    probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, max_probe_size)
+    if LLAMAFILE_MARKER in probe[:LLAMAFILE_ROUTE_SCAN_BYTES].lower():
+        return "llamafile"
+    if len(probe) > LLAMAFILE_ROUTE_SCAN_BYTES:
+        return LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT
+    return None
+
+
+def _detect_huggingface_torch7_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
+    """Return a bounded Torch7 route for a suffix-skipped remote file."""
+    from modelaudit.utils.file.detection import (
+        _TORCH7_SIGNATURE_READ_BYTES,
+        _allows_renamed_binary_content_route,
+        _is_torch7_signature,
+    )
+
+    if not _allows_renamed_binary_content_route(Path(filename)):
+        return None
+    probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, _TORCH7_SIGNATURE_READ_BYTES)
+    return "torch7" if _is_torch7_signature(probe) else None
+
+
+def _is_complete_huggingface_text_or_json(probe: bytes, *, sample_is_prefix: bool) -> bool:
+    """Return whether a complete bounded probe is owned by benign text or JSON."""
+    if sample_is_prefix:
+        return False
+
+    from modelaudit.utils.file.detection import _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES
+
+    if not probe.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES):
+        return True
+    normalized = probe.lstrip()
+    if normalized.startswith(b"\xef\xbb\xbf"):
+        normalized = normalized[3:].lstrip()
+    if not normalized.startswith((b"{", b"[")):
+        return False
+    try:
+        return isinstance(json.loads(normalized.decode("utf-8")), (dict, list))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return False
+
+
+def _detect_huggingface_protobuf_model_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
+    """Return a bounded TensorFlow, CoreML, ONNX, or unresolved protobuf model route."""
+    from modelaudit.utils.file.detection import (
+        _COREML_PROTO_SIGNATURE_READ_BYTES,
+        PROTOBUF_MODEL_CANDIDATE_FORMAT,
+        TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+        _classify_bounded_tensorflow_protobuf_stream,
+        _could_start_coreml_model_proto,
+        _looks_like_coreml_model_proto_prefix,
+        _looks_like_onnx_model_proto_stream,
+    )
+
+    if not _could_start_coreml_model_proto(prefix):
+        return None
+
+    max_probe_size = _COREML_PROTO_SIGNATURE_READ_BYTES
+    raw_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, max_probe_size + 1)
+    sample_is_prefix = len(raw_probe) > max_probe_size
+    probe = raw_probe[:max_probe_size]
+    if _is_complete_huggingface_text_or_json(probe, sample_is_prefix=sample_is_prefix):
+        return None
+
+    coreml_status = _looks_like_coreml_model_proto_prefix(probe, sample_is_prefix=sample_is_prefix)
+    if coreml_status is True:
+        return "coreml"
+
+    onnx_status = _looks_like_onnx_model_proto_stream(BytesIO(probe), len(probe))
+    if onnx_status is True:
+        return "onnx"
+
+    tensorflow_route = _classify_bounded_tensorflow_protobuf_stream(BytesIO(probe), len(probe))
+    if tensorflow_route in {"tf_metagraph", "tf_savedmodel"}:
+        return tensorflow_route
+    if tensorflow_route == "oversized":
+        return "tf_metagraph"
+    if tensorflow_route in {"oversized_candidate", "inconclusive"}:
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    if sample_is_prefix or coreml_status is None or onnx_status is None:
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
+    return None
+
+
+def _detect_huggingface_flax_msgpack_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
+    """Return a bounded Flax MessagePack route for a suffix-skipped remote file."""
+    from modelaudit.utils.file.detection import (
+        FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+        _has_bounded_flax_msgpack_routing_key_stream,
+    )
+
+    if Path(filename).suffix.lower() in {".py", ".pyw"}:
+        return None
+
+    initial_probe_state = _has_bounded_flax_msgpack_routing_key_stream(
+        BytesIO(prefix),
+        len(prefix),
+        sample_is_prefix=len(prefix) >= _HF_CONTENT_SNIFF_BYTES,
+    )
+    if initial_probe_state is True:
+        return "flax_msgpack"
+    if initial_probe_state is False or len(prefix) < _HF_CONTENT_SNIFF_BYTES:
+        return None
+
+    max_probe_size = FLAX_MSGPACK_STRUCTURE_READ_BYTES
+    raw_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, max_probe_size + 1)
+    sample_is_prefix = len(raw_probe) > max_probe_size
+    probe = raw_probe[:max_probe_size]
+    if _is_complete_huggingface_text_or_json(probe, sample_is_prefix=sample_is_prefix):
+        return None
+    probe_state = _has_bounded_flax_msgpack_routing_key_stream(
+        BytesIO(probe),
+        len(probe),
+        sample_is_prefix=sample_is_prefix,
+    )
+    if probe_state is not False:
+        return "flax_msgpack"
+    return None
+
+
 def _detect_huggingface_content_route_format(
     repo_id: str,
     filename: str,
@@ -304,6 +462,10 @@ def _detect_huggingface_content_route_format(
         _looks_like_uncompressed_tar_header,
         detect_format_from_magic_bytes,
     )
+
+    llamafile_route = _detect_huggingface_llamafile_route(repo_id, filename, revision, budget, prefix)
+    if llamafile_route is not None:
+        return llamafile_route
 
     if _looks_like_safetensors_prefix(repo_id, filename, revision, budget, prefix):
         return "safetensors"
@@ -340,6 +502,10 @@ def _detect_huggingface_content_route_format(
     if _is_executorch_binary_signature(prefix):
         return "executorch"
 
+    torch7_route = _detect_huggingface_torch7_route(repo_id, filename, revision, budget, prefix)
+    if torch7_route is not None:
+        return torch7_route
+
     detected_format = detect_format_from_magic_bytes(
         prefix[:4],
         prefix[:8],
@@ -352,7 +518,14 @@ def _detect_huggingface_content_route_format(
         and prefix[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + len(_TFLITE_MAGIC_BYTES)] == _TFLITE_MAGIC_BYTES
     ):
         return "tflite"
-    return None if detected_format == "unknown" else detected_format
+    if detected_format != "unknown":
+        return detected_format
+
+    protobuf_route = _detect_huggingface_protobuf_model_route(repo_id, filename, revision, budget, prefix)
+    if protobuf_route is not None:
+        return protobuf_route
+
+    return _detect_huggingface_flax_msgpack_route(repo_id, filename, revision, budget, prefix)
 
 
 def _select_huggingface_model_files(

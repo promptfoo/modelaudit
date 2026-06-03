@@ -2755,105 +2755,110 @@ def _skip_proto_stream_value(
     return True
 
 
-def _classify_bounded_tensorflow_protobuf(path: Path, file_size: int) -> _TensorFlowProtoRoute:
+def _classify_bounded_tensorflow_protobuf_stream(stream: BinaryIO, file_size: int) -> _TensorFlowProtoRoute:
     """Seek past top-level protobuf values while looking for TensorFlow graph content."""
-    try:
-        remaining_fields = [_TF_METAGRAPH_MAX_ROUTING_FIELDS]
-        parsed_payload_bytes = 0
-        outer_hint: _TensorFlowOuterHint = "unknown"
-        saw_tensorflow_wrapper_hint = False
-        saw_tensorflow_candidate = False
-        saw_structured_unknown = False
-        with path.open("rb") as stream:
-            while remaining_fields[0] > 0:
-                remaining_fields[0] -= 1
-                if stream.tell() >= file_size:
-                    return "unknown"
-                tag = _read_proto_varint_stream(stream)
-                if tag is None:
-                    return "unknown"
-                field_number = tag >> 3
-                wire_type = tag & 0x07
-                if field_number == 0:
-                    return "unknown"
-                if wire_type in {2, 3}:
-                    saw_structured_unknown = True
-                if field_number == 1 and wire_type == 0:
-                    if _read_proto_varint_stream(stream) is None:
-                        return "unknown"
-                    # SavedModel stores its version here, but field 1 varints
-                    # are common in unrelated protobuf messages. Keep this as
-                    # an interpretation hint until a TensorFlow structure is seen.
-                    saw_tensorflow_wrapper_hint = True
-                    outer_hint = "tf_savedmodel"
-                    continue
-                if field_number == 1 and wire_type == 2:
-                    length = _read_proto_varint_stream(stream)
-                    if length is None or stream.tell() + length > file_size:
-                        return "unknown"
-                    if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
-                        return "oversized" if saw_tensorflow_candidate else "inconclusive"
-                    payload = stream.read(length)
-                    if len(payload) != length:
-                        return "unknown"
-                    if _is_tensorflow_metainfo_payload(payload):
-                        saw_tensorflow_wrapper_hint = True
-                        saw_tensorflow_candidate = True
-                        outer_hint = "tf_metagraph"
-                    continue
-                if field_number == 2 and wire_type == 2:
-                    length = _read_proto_varint_stream(stream)
-                    if length is None or stream.tell() + length > file_size:
-                        return "unknown"
-                    if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
-                        # Field 2 is graph_def on MetaGraphDef and meta_graphs on SavedModel.
-                        return "oversized" if saw_tensorflow_candidate else "oversized_candidate"
-                    if parsed_payload_bytes + length > _TF_METAGRAPH_MAX_ROUTING_PAYLOAD_BYTES:
-                        return "inconclusive"
-                    parsed_payload_bytes += length
-                    payload = stream.read(length)
-                    if len(payload) != length:
-                        return "unknown"
-                    payload_route = _classify_tensorflow_field_two_payload(payload, outer_hint=outer_hint)
-                    if payload_route != "unknown":
-                        return payload_route
-                    continue
-                if field_number == 4 and wire_type == 2:
-                    length = _read_proto_varint_stream(stream)
-                    if length is None or stream.tell() + length > file_size:
-                        return "unknown"
-                    if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
-                        return "oversized" if saw_tensorflow_candidate else "oversized_candidate"
-                    if parsed_payload_bytes + length > _TF_METAGRAPH_MAX_ROUTING_PAYLOAD_BYTES:
-                        return "inconclusive"
-                    parsed_payload_bytes += length
-                    payload = stream.read(length)
-                    if len(payload) != length:
-                        return "unknown"
-                    if _is_tensorflow_collection_payload(payload):
-                        return "tf_metagraph"
-                    continue
-                if not _skip_proto_stream_value(
-                    stream,
-                    wire_type,
-                    file_size,
-                    field_number=field_number,
-                    remaining_fields=remaining_fields,
-                ):
-                    if remaining_fields[0] <= 0:
-                        return (
-                            "inconclusive"
-                            if saw_tensorflow_wrapper_hint or saw_tensorflow_candidate or saw_structured_unknown
-                            else "unknown"
-                        )
-                    return "unknown"
-    except OSError:
-        return "unknown"
+    remaining_fields = [_TF_METAGRAPH_MAX_ROUTING_FIELDS]
+    parsed_payload_bytes = 0
+    outer_hint: _TensorFlowOuterHint = "unknown"
+    saw_tensorflow_wrapper_hint = False
+    saw_tensorflow_candidate = False
+    saw_structured_unknown = False
+    while remaining_fields[0] > 0:
+        remaining_fields[0] -= 1
+        if stream.tell() >= file_size:
+            return "unknown"
+        tag = _read_proto_varint_stream(stream)
+        if tag is None:
+            return "unknown"
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return "unknown"
+        if wire_type in {2, 3}:
+            saw_structured_unknown = True
+        if field_number == 1 and wire_type == 0:
+            if _read_proto_varint_stream(stream) is None:
+                return "unknown"
+            # SavedModel stores its version here, but field 1 varints
+            # are common in unrelated protobuf messages. Keep this as
+            # an interpretation hint until a TensorFlow structure is seen.
+            saw_tensorflow_wrapper_hint = True
+            outer_hint = "tf_savedmodel"
+            continue
+        if field_number == 1 and wire_type == 2:
+            length = _read_proto_varint_stream(stream)
+            if length is None or stream.tell() + length > file_size:
+                return "unknown"
+            if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+                return "oversized" if saw_tensorflow_candidate else "inconclusive"
+            payload = stream.read(length)
+            if len(payload) != length:
+                return "unknown"
+            if _is_tensorflow_metainfo_payload(payload):
+                saw_tensorflow_wrapper_hint = True
+                saw_tensorflow_candidate = True
+                outer_hint = "tf_metagraph"
+            continue
+        if field_number == 2 and wire_type == 2:
+            length = _read_proto_varint_stream(stream)
+            if length is None or stream.tell() + length > file_size:
+                return "unknown"
+            if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+                # Field 2 is graph_def on MetaGraphDef and meta_graphs on SavedModel.
+                return "oversized" if saw_tensorflow_candidate else "oversized_candidate"
+            if parsed_payload_bytes + length > _TF_METAGRAPH_MAX_ROUTING_PAYLOAD_BYTES:
+                return "inconclusive"
+            parsed_payload_bytes += length
+            payload = stream.read(length)
+            if len(payload) != length:
+                return "unknown"
+            payload_route = _classify_tensorflow_field_two_payload(payload, outer_hint=outer_hint)
+            if payload_route != "unknown":
+                return payload_route
+            continue
+        if field_number == 4 and wire_type == 2:
+            length = _read_proto_varint_stream(stream)
+            if length is None or stream.tell() + length > file_size:
+                return "unknown"
+            if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+                return "oversized" if saw_tensorflow_candidate else "oversized_candidate"
+            if parsed_payload_bytes + length > _TF_METAGRAPH_MAX_ROUTING_PAYLOAD_BYTES:
+                return "inconclusive"
+            parsed_payload_bytes += length
+            payload = stream.read(length)
+            if len(payload) != length:
+                return "unknown"
+            if _is_tensorflow_collection_payload(payload):
+                return "tf_metagraph"
+            continue
+        if not _skip_proto_stream_value(
+            stream,
+            wire_type,
+            file_size,
+            field_number=field_number,
+            remaining_fields=remaining_fields,
+        ):
+            if remaining_fields[0] <= 0:
+                return (
+                    "inconclusive"
+                    if saw_tensorflow_wrapper_hint or saw_tensorflow_candidate or saw_structured_unknown
+                    else "unknown"
+                )
+            return "unknown"
     return (
         "inconclusive"
         if saw_tensorflow_wrapper_hint or saw_tensorflow_candidate or saw_structured_unknown
         else "unknown"
     )
+
+
+def _classify_bounded_tensorflow_protobuf(path: Path, file_size: int) -> _TensorFlowProtoRoute:
+    """Classify bounded TensorFlow protobuf structure from a local file."""
+    try:
+        with path.open("rb") as stream:
+            return _classify_bounded_tensorflow_protobuf_stream(stream, file_size)
+    except OSError:
+        return "unknown"
 
 
 def _has_bounded_non_source_control_signal(file_path: Path, file_size: int) -> bool:
@@ -3260,6 +3265,10 @@ class _MsgpackProbeInvalid(ValueError):
     """Raised when bounded MessagePack structure probing sees invalid data."""
 
 
+class _MsgpackProbeIncomplete(_MsgpackProbeInvalid):
+    """Raised when a bounded MessagePack prefix ends inside a valid value."""
+
+
 class _MsgpackProbeLimit(ValueError):
     """Raised when bounded MessagePack structure probing cannot finish safely."""
 
@@ -3267,7 +3276,7 @@ class _MsgpackProbeLimit(ValueError):
 def _read_msgpack_probe_bytes(stream: BinaryIO, size: int) -> bytes:
     data = stream.read(size)
     if len(data) != size:
-        raise _MsgpackProbeInvalid
+        raise _MsgpackProbeIncomplete
     return data
 
 
@@ -3277,7 +3286,7 @@ def _read_msgpack_probe_uint(stream: BinaryIO, size: int) -> int:
 
 def _skip_msgpack_probe_bytes(stream: BinaryIO, size: int, file_size: int) -> None:
     if size < 0 or stream.tell() + size > file_size:
-        raise _MsgpackProbeInvalid
+        raise _MsgpackProbeIncomplete
     stream.seek(size, 1)
 
 
@@ -3410,54 +3419,67 @@ def _has_bounded_flax_msgpack_state_root(
     return has_checkpoint_root
 
 
-def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | None:
+def _has_bounded_flax_msgpack_routing_key_stream(
+    stream: BinaryIO,
+    file_size: int,
+    *,
+    sample_is_prefix: bool = False,
+) -> bool | None:
     """Inspect streamed maps, returning None when safe routing cannot complete."""
     remaining_nodes = [_FLAX_MSGPACK_PROBE_MAX_NODES]
     inline_scalars_seen = 0
     recognized_checkpoint_root = [False]
     try:
-        with path.open("rb") as stream:
-            while stream.tell() < file_size:
-                marker = _read_msgpack_probe_bytes(stream, 1)[0]
-                map_count = _read_msgpack_probe_map_count_after_marker(stream, marker)
-                if map_count is None and _is_inline_msgpack_probe_scalar(marker):
-                    inline_scalars_seen += 1
-                    if inline_scalars_seen > _FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS:
-                        raise _MsgpackProbeLimit
-                    continue
+        while stream.tell() < file_size:
+            marker = _read_msgpack_probe_bytes(stream, 1)[0]
+            map_count = _read_msgpack_probe_map_count_after_marker(stream, marker)
+            if map_count is None and _is_inline_msgpack_probe_scalar(marker):
+                inline_scalars_seen += 1
+                if inline_scalars_seen > _FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS:
+                    raise _MsgpackProbeLimit
+                continue
 
-                _consume_msgpack_probe_node(remaining_nodes)
-                if map_count is None:
-                    _skip_msgpack_probe_value_after_marker(stream, marker, file_size, remaining_nodes, 0)
-                    continue
-                has_checkpoint_root = False
-                for _ in range(map_count):
-                    key = _read_msgpack_probe_key(stream, file_size, remaining_nodes)
-                    if key in _FLAX_MSGPACK_ROUTING_KEYS:
-                        recognized_checkpoint_root[0] = True
-                        _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
+            _consume_msgpack_probe_node(remaining_nodes)
+            if map_count is None:
+                _skip_msgpack_probe_value_after_marker(stream, marker, file_size, remaining_nodes, 0)
+                continue
+            has_checkpoint_root = False
+            for _ in range(map_count):
+                key = _read_msgpack_probe_key(stream, file_size, remaining_nodes)
+                if key in _FLAX_MSGPACK_ROUTING_KEYS:
+                    recognized_checkpoint_root[0] = True
+                    _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
+                    has_checkpoint_root = True
+                if key == _FLAX_MSGPACK_STATE_WRAPPER_KEY:
+                    if _has_bounded_flax_msgpack_state_root(
+                        stream,
+                        file_size,
+                        remaining_nodes,
+                        recognized_checkpoint_root,
+                    ):
                         has_checkpoint_root = True
-                    if key == _FLAX_MSGPACK_STATE_WRAPPER_KEY:
-                        if _has_bounded_flax_msgpack_state_root(
-                            stream,
-                            file_size,
-                            remaining_nodes,
-                            recognized_checkpoint_root,
-                        ):
-                            has_checkpoint_root = True
-                    elif key not in _FLAX_MSGPACK_ROUTING_KEYS:
-                        _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
-                if has_checkpoint_root:
-                    return True
+                elif key not in _FLAX_MSGPACK_ROUTING_KEYS:
+                    _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
+            if has_checkpoint_root:
+                return True
     except _MsgpackProbeLimit:
         # Once a root is recognized, run the scanner so it can analyze sibling
         # security fields even if routing validation exhausts its budget.
         return True if recognized_checkpoint_root[0] else None
-    except OSError:
-        return None
+    except _MsgpackProbeIncomplete:
+        return None if sample_is_prefix else False
     except _MsgpackProbeInvalid:
         return False
-    return False
+    return None if sample_is_prefix else False
+
+
+def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | None:
+    """Inspect a local MessagePack stream for bounded Flax routing keys."""
+    try:
+        with path.open("rb") as stream:
+            return _has_bounded_flax_msgpack_routing_key_stream(stream, file_size)
+    except OSError:
+        return None
 
 
 def _probe_flax_msgpack_checkpoint_file(file_path: Path) -> bool | None:

