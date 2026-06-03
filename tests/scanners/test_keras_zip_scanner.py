@@ -1894,6 +1894,7 @@ __import__('pickle').loads(data)
         custom_layer_class_secret = "ZIP_CUSTOM_LAYER_CLASS_SECRET"
         custom_layer_name_secret = "ZIP_CUSTOM_LAYER_NAME_SECRET"
         json_string_secret = "ZIP_JSON_STRING_SECRET"
+        lambda_function_name_secret = "ZIP_LAMBDA_FUNCTION_NAME_SECRET"
 
         def direct_lambda_code(x: Any) -> Any:
             token = "ZIP_DIRECT_SECRET"
@@ -1945,6 +1946,14 @@ __import__('pickle').loads(data)
                         "name": f"token={custom_layer_name_secret}",
                         "config": {"units": 4},
                     },
+                    {
+                        "class_name": "Lambda",
+                        "name": "module_lambda",
+                        "config": {
+                            "module": "os",
+                            "function_name": {"token": lambda_function_name_secret},
+                        },
+                    },
                 ]
             },
             "compile_config": {
@@ -1974,6 +1983,7 @@ __import__('pickle').loads(data)
             custom_layer_class_secret,
             custom_layer_name_secret,
             json_string_secret,
+            lambda_function_name_secret,
         ]
 
         scanner_result = KerasZipScanner().scan(str(model_path))
@@ -2008,6 +2018,33 @@ __import__('pickle').loads(data)
         }
 
         result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config, file_name="numeric.keras")))
+
+        assert not any(check.name == "Keras ZIP File Scan" for check in result.checks)
+
+    def test_malformed_layer_identifiers_do_not_abort_redaction(self, tmp_path: Path) -> None:
+        """Malformed names and Lambda module metadata should not crash evidence redaction."""
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "CustomRegisteredLayer",
+                        "registered_name": "CustomRegisteredLayer",
+                        "name": 123,
+                        "config": {},
+                    },
+                    {
+                        "class_name": "Lambda",
+                        "name": "malformed_module",
+                        "config": {"module": ["os"], "function_name": "system"},
+                    },
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(
+            str(create_configured_keras_zip(tmp_path, config, file_name="malformed_identifiers.keras"))
+        )
 
         assert not any(check.name == "Keras ZIP File Scan" for check in result.checks)
 

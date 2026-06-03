@@ -892,7 +892,6 @@ class KerasZipScanner(BaseScanner):
 
             # Check for custom objects
             if self._should_flag_registered_object(layer):
-                redacted_layer_name = redact_evidence_string(layer_name)
                 redacted_registered_name = redact_evidence_string(layer["registered_name"])
                 result.add_check(
                     name="Custom Object Detection",
@@ -1965,15 +1964,14 @@ class KerasZipScanner(BaseScanner):
             # Lambda layer without encoded function - check other fields
             module_name = layer_config.get("module")
             function_name = layer_config.get("function_name")
+            module_name_text = module_name if isinstance(module_name, str) else ""
 
-            if module_name or function_name:
+            if module_name_text or function_name:
                 # Module/function reference - check for dangerous imports
                 dangerous_modules = ["os", "sys", "subprocess", "eval", "exec", "__builtins__"]
-                if module_name and any(dangerous in module_name for dangerous in dangerous_modules):
-                    redacted_module_name = redact_evidence_string(module_name)
-                    redacted_function_name = (
-                        redact_evidence_string(function_name) if isinstance(function_name, str) else function_name
-                    )
+                if module_name_text and any(dangerous in module_name_text for dangerous in dangerous_modules):
+                    redacted_module_name = redact_evidence_string(module_name_text)
+                    redacted_function_name = redact_evidence_value(function_name)
                     result.add_check(
                         name="Lambda Layer Module Reference Check",
                         passed=False,
