@@ -9,6 +9,7 @@ import json
 import os
 import pickle
 import struct
+import subprocess
 import sys
 import zipfile
 from collections.abc import Callable, Iterator
@@ -166,6 +167,114 @@ def _build_malicious_pickle(*, protocol: int | None = None) -> bytes:
 def _require_tf_protos() -> None:
     if not _has_tf_protos():
         pytest.skip("TensorFlow protobuf stubs unavailable")
+
+
+def test_tensorflow_protobuf_bootstrap_avoids_shadow_package(tmp_path: Path) -> None:
+    shadow_root = tmp_path / "shadow"
+    shadow_tensorflow = shadow_root / "tensorflow"
+    shadow_google = shadow_root / "google"
+    shadow_tensorflow.mkdir(parents=True)
+    shadow_google.mkdir()
+    tensorflow_sentinel = tmp_path / "shadow_tensorflow_imported.txt"
+    google_sentinel = tmp_path / "shadow_google_imported.txt"
+    (shadow_tensorflow / "__init__.py").write_text(
+        "\n".join(
+            [
+                "import os",
+                "from pathlib import Path",
+                "Path(os.environ['SHADOW_TENSORFLOW_SENTINEL']).write_text('imported', encoding='utf-8')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (shadow_google / "__init__.py").write_text(
+        "\n".join(
+            [
+                "import os",
+                "from pathlib import Path",
+                "Path(os.environ['SHADOW_GOOGLE_SENTINEL']).write_text('imported', encoding='utf-8')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    project_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    pythonpath_entries = [str(shadow_root), str(project_root)]
+    existing_pythonpath = env.get("PYTHONPATH")
+    if existing_pythonpath:
+        pythonpath_entries.append(existing_pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+    env["SHADOW_TENSORFLOW_SENTINEL"] = str(tensorflow_sentinel)
+    env["SHADOW_GOOGLE_SENTINEL"] = str(google_sentinel)
+
+    script = """
+import importlib
+import json
+import modelaudit.protos
+
+tensorflow_module = importlib.import_module("tensorflow")
+saved_model_cls = modelaudit.protos.get_saved_model_class()
+print(json.dumps({
+    "available": modelaudit.protos._check_vendored_protos(),
+    "using_vendored": modelaudit.protos.is_using_vendored_protos(),
+    "tensorflow_file": getattr(tensorflow_module, "__file__", ""),
+    "saved_model_class": saved_model_cls.__name__,
+}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not tensorflow_sentinel.exists()
+    assert not google_sentinel.exists()
+    payload = json.loads(result.stdout)
+    assert payload["available"] is True
+    assert payload["saved_model_class"] == "SavedModel"
+    tensorflow_file = Path(payload["tensorflow_file"]).resolve()
+    assert not tensorflow_file.is_relative_to(shadow_root)
+    if payload["using_vendored"]:
+        assert tensorflow_file.is_relative_to(project_root / "modelaudit" / "protos")
+
+
+@pytest.mark.parametrize(
+    ("enable_user_site", "expected_trusted"),
+    [
+        pytest.param(False, False, id="disabled"),
+        pytest.param(None, False, id="security-disabled"),
+        pytest.param(True, True, id="enabled"),
+    ],
+)
+def test_tensorflow_trusted_root_honors_user_site_enablement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    enable_user_site: bool | None,
+    expected_trusted: bool,
+) -> None:
+    import modelaudit.protos
+
+    user_site = tmp_path / "user-site"
+    shadow_tensorflow = user_site / "tensorflow"
+    shadow_tensorflow.mkdir(parents=True)
+    (shadow_tensorflow / "__init__.py").write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(modelaudit.protos.sysconfig, "get_paths", lambda: {})
+    monkeypatch.setattr(modelaudit.protos.site, "getsitepackages", lambda: [])
+    monkeypatch.setattr(modelaudit.protos.site, "getusersitepackages", lambda: str(user_site))
+    monkeypatch.setattr(modelaudit.protos.site, "ENABLE_USER_SITE", enable_user_site)
+
+    trusted_root = modelaudit.protos._trusted_tensorflow_root()
+
+    if expected_trusted:
+        assert trusted_root == user_site.resolve()
+    else:
+        assert trusted_root is None
 
 
 def _build_malicious_tf_metagraph() -> bytes:
