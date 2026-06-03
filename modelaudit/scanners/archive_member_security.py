@@ -2304,6 +2304,22 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         registry_binding, registry_found = _lookup_bound_alias(
             f"{_SYS_MODULES_BINDING_PREFIX}{import_name}", self.alias_scopes
         )
+        module_name, separator, member_name = import_name.partition(".")
+        module_registry_binding, module_registry_found = (
+            _lookup_bound_alias(f"{_SYS_MODULES_BINDING_PREFIX}{module_name}", self.alias_scopes)
+            if separator
+            else (None, False)
+        )
+        known_module_registry_replacement = isinstance(
+            module_registry_binding, frozenset
+        ) and module_registry_binding != frozenset({module_name})
+        if known_module_registry_replacement:
+            assert isinstance(module_registry_binding, frozenset)
+            self._bind_name(local_name, frozenset(f"{module}.{member_name}" for module in module_registry_binding))
+            return
+        if module_registry_found and module_registry_binding is None:
+            self._bind_name(local_name, None)
+            return
         known_registry_replacement = isinstance(registry_binding, frozenset) and registry_binding != frozenset(
             {import_name}
         )

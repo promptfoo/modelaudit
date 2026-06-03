@@ -427,6 +427,8 @@ def _bounded_priority_embedded_python_candidate_at_offset(
         else ([], frozenset())
     )
     for usage_line in usage_lines:
+        for header_start, header_end in _enclosing_compound_header_segments(candidate, usage_line[0]):
+            add_segment(header_start, header_end)
         add_segment(*usage_line)
 
     tail_start = max(bounded_end, len(candidate) - _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
@@ -2408,6 +2410,16 @@ def _priority_alias_usage_lines(
         if line_end > search_start:
             binding_name = _simple_late_binding_name(code_line)
             if binding_name is not None:
+                same_line_priority_endpoint = False
+                if b";" in code_line:
+                    same_line_suffix = code_line.split(b";", maxsplit=1)[1]
+                    same_line_suffix_names = _python_identifier_names(same_line_suffix)
+                    same_line_relevant_names = same_line_suffix_names.intersection(
+                        relevant_binding_names | {alias.decode("utf-8") for alias in aliases}
+                    )
+                    if same_line_relevant_names:
+                        same_line_aliases = frozenset(name.encode("utf-8") for name in same_line_relevant_names)
+                        same_line_priority_endpoint = _line_uses_priority_alias(same_line_suffix, same_line_aliases)
                 may_bind_namespace_update = (
                     b"__dict__" in line
                     or b"vars" in line
@@ -3063,9 +3075,10 @@ def _priority_alias_usage_lines(
                         relevant_binding_names.add(binding_name)
                         forwarded_state_sizes[binding_name] = conditional_state_size
                         forwarded_safe_names.discard(binding_name)
-                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
-                    line_start = line_end
-                    continue
+                    if not same_line_priority_endpoint:
+                        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                        line_start = line_end
+                        continue
                 if (
                     (guard_value is None or statement[:1].isspace())
                     and not has_evaluated_annotation
@@ -3075,16 +3088,17 @@ def _priority_alias_usage_lines(
                     relevant_binding_names.add(binding_name)
                     forwarded_state_sizes[binding_name] = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES + 1
                     forwarded_safe_names.discard(binding_name)
-                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
-                    line_start = line_end
-                    continue
+                    if not same_line_priority_endpoint:
+                        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                        line_start = line_end
+                        continue
                 if forwarded_dependency is not None:
                     if forwarded_dependency in fail_closed_dangerous_names:
                         fail_closed_dangerous_names.add(binding_name)
                         relevant_binding_names.add(binding_name)
                         forwarded_state_sizes[binding_name] = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES + 1
                         forwarded_safe_names.discard(binding_name)
-                        if not has_evaluated_annotation:
+                        if not has_evaluated_annotation and not same_line_priority_endpoint:
                             multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
                             line_start = line_end
                             continue
@@ -3096,7 +3110,7 @@ def _priority_alias_usage_lines(
                             relevant_binding_names.add(binding_name)
                             forwarded_state_sizes[binding_name] = forwarded_size
                             forwarded_safe_names.discard(binding_name)
-                            if not has_evaluated_annotation:
+                            if not has_evaluated_annotation and not same_line_priority_endpoint:
                                 multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
                                 line_start = line_end
                                 continue
@@ -3112,6 +3126,7 @@ def _priority_alias_usage_lines(
                             not has_evaluated_annotation
                             and binding_name not in retained_alias_names
                             and binding_name not in late_definitions
+                            and not same_line_priority_endpoint
                         ):
                             relevant_binding_names.discard(binding_name)
                             multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
@@ -3120,7 +3135,11 @@ def _priority_alias_usage_lines(
                 elif not alias_dependencies:
                     forwarded_state_sizes.pop(binding_name, None)
                     forwarded_safe_names.add(binding_name)
-                    if binding_name not in retained_alias_names and binding_name not in late_definitions:
+                    if (
+                        binding_name not in retained_alias_names
+                        and binding_name not in late_definitions
+                        and not same_line_priority_endpoint
+                    ):
                         relevant_binding_names.discard(binding_name)
                         multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
                         line_start = line_end
@@ -3540,11 +3559,13 @@ def _priority_alias_usage_lines(
             else frozenset()
         )
         tracked_priority_aliases = aliases | priority_aliases
-        has_canonical_getattr_use = has_priority_reference_syntax and not _python_identifier_names(line).isdisjoint(
+        has_canonical_namespace_helper_use = has_priority_reference_syntax and not _python_identifier_names(
+            line
+        ).isdisjoint(
             {
                 name
                 for name, helper_name in canonical_builtin_helper_aliases.items()
-                if helper_name == "getattr" and name not in shadowed_builtin_helper_names
+                if helper_name in {"getattr", "vars"} and name not in shadowed_builtin_helper_names
             }
         )
         getattr_member = (
@@ -3554,7 +3575,8 @@ def _priority_alias_usage_lines(
                 shadowed_builtin_helper_names,
                 canonical_builtin_helper_aliases,
             )
-            if has_priority_reference_syntax and (b"getattr" in line or has_canonical_getattr_use)
+            if has_priority_reference_syntax
+            and (b"getattr" in line or b"vars" in line or has_canonical_namespace_helper_use)
             else None
         )
         is_getattr_priority_call = getattr_member is not None
@@ -7455,6 +7477,10 @@ def _line_uses_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bo
             rb"(?<![A-Za-z0-9_.])(?:builtins\.)?getattr\s*\(\s*" + re.escape(alias) + rb"\s*,",
             code_line,
         )
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?vars\s*\(\s*" + re.escape(alias) + rb"\s*\)\s*\[",
+            code_line,
+        )
         for alias in aliases
     )
 
@@ -7476,26 +7502,41 @@ def _priority_getattr_alias_member(
         "builtins.getattr": "getattr",
     }
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Call):
+        if not isinstance(node, ast.Call):
             continue
-        getter = node.func
-        getter_name = _simple_reference_name(getter.func)
-        if (
-            canonical_helpers.get(getter_name or "") != "getattr"
-            or getter_name in (shadowed_builtin_helper_names or set())
-            or ("." in (getter_name or "") and "builtins.getattr" in (shadowed_builtin_helper_names or set()))
-        ):
+        member_node: ast.AST | None = None
+        target_node: ast.AST | None = None
+        if isinstance(node.func, ast.Call):
+            getter = node.func
+            getter_name = _simple_reference_name(getter.func)
+            if (
+                canonical_helpers.get(getter_name or "") != "getattr"
+                or getter_name in (shadowed_builtin_helper_names or set())
+                or ("." in (getter_name or "") and "builtins.getattr" in (shadowed_builtin_helper_names or set()))
+            ):
+                continue
+            if getter.keywords or len(getter.args) < 2:
+                continue
+            target_node = getter.args[0]
+            member_node = getter.args[1]
+        elif isinstance(node.func, ast.Subscript) and isinstance(node.func.value, ast.Call):
+            getter = node.func.value
+            getter_name = _simple_reference_name(getter.func)
+            if (
+                canonical_helpers.get(getter_name or "") != "vars"
+                or getter_name in (shadowed_builtin_helper_names or set())
+                or ("." in (getter_name or "") and "builtins.vars" in (shadowed_builtin_helper_names or set()))
+            ):
+                continue
+            if getter.keywords or len(getter.args) != 1:
+                continue
+            target_node = getter.args[0]
+            member_node = node.func.slice
+        else:
             continue
-        if getter.keywords or len(getter.args) < 2:
+        if target_node is None or member_node is None or not isinstance(target_node, ast.Name):
             continue
-        target_node = getter.args[0]
-        member_node = getter.args[1]
-        if (
-            target_node is None
-            or member_node is None
-            or not isinstance(target_node, ast.Name)
-            or target_node.id not in alias_names
-        ):
+        if target_node.id not in alias_names:
             continue
         member_name = _static_getattr_member_name(member_node)
         if isinstance(member_name, str) and re.fullmatch(r"[A-Za-z_]\w*", member_name) is not None:
