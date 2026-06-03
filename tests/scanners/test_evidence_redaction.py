@@ -193,6 +193,16 @@ def test_redacts_escaped_sensitive_mapping_keys() -> None:
     assert f"'client\\x5fsecret': '{REDACTED_EVIDENCE_VALUE}'" in redacted
 
 
+def test_redacts_escaped_sensitive_keys_in_unterminated_mapping_values() -> None:
+    """Truncated quoted-key credentials should decode escaped key names."""
+    secret = "ESCAPEDTRUNCATEDSECRET"
+
+    redacted = redact_evidence_string(f'json={{"api\\u005fkey": "{secret}', max_chars=500)
+
+    assert secret not in redacted
+    assert f'"api\\u005fkey": "{REDACTED_EVIDENCE_VALUE}"' in redacted
+
+
 def test_redacts_sensitive_call_and_container_assignment_values() -> None:
     """Sensitive assignments should consume call and container-shaped values."""
     call_secret = "CALLSECRET123"
@@ -235,6 +245,33 @@ def test_redacts_unterminated_multiword_quoted_assignments() -> None:
     assert "BEGIN" not in redacted
     assert "PRIVATE KEY" not in redacted
     assert redacted == f'api_key="{REDACTED_EVIDENCE_VALUE}"'
+
+
+def test_redacts_escaped_delimiters_in_unterminated_quoted_assignments() -> None:
+    """Escaped quote delimiters should not split truncated credential values."""
+    redacted = redact_evidence_string(r'api_key="abc\"TAILSECRET', max_chars=500)
+
+    assert "abc" not in redacted
+    assert "TAILSECRET" not in redacted
+    assert redacted == f'api_key="{REDACTED_EVIDENCE_VALUE}"'
+
+
+def test_redacts_escaped_delimiters_in_unterminated_quoted_key_values() -> None:
+    """Escaped quote delimiters should not split truncated mapping values."""
+    redacted = redact_evidence_string(r'json={"api_key": "abc\"TAILSECRET', max_chars=500)
+
+    assert "abc" not in redacted
+    assert "TAILSECRET" not in redacted
+    assert f'"api_key": "{REDACTED_EVIDENCE_VALUE}"' in redacted
+
+
+def test_redacts_unterminated_triple_quoted_assignments_atomically() -> None:
+    """Truncated triple-quoted credentials should not be partially matched."""
+    redacted = redact_evidence_string('api_key="""TRIPLETRUNCATEDSECRET""TAIL', max_chars=500)
+
+    assert "TRIPLETRUNCATEDSECRET" not in redacted
+    assert "TAIL" not in redacted
+    assert redacted == f'api_key="""{REDACTED_EVIDENCE_VALUE}"""'
 
 
 @pytest.mark.parametrize(

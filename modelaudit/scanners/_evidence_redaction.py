@@ -62,13 +62,13 @@ SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
 )
 QUOTED_SENSITIVE_KEY: Final[str] = SENSITIVE_ASSIGNMENT_KEY
 PYTHON_STRING_PREFIX: Final[str] = r"[rubf]*"
-PYTHON_QUOTE_DELIMITER: Final[str] = r"(?:'''|\"\"\"|[\"'])"
+PYTHON_QUOTE_DELIMITER: Final[str] = r"(?:'''|\"\"\"|\"(?!\")|'(?!'))"
 PYTHON_STRING_LITERAL: Final[str] = (
     rf"{PYTHON_STRING_PREFIX}(?:"
     r"'''(?:\\.|(?!''')[\s\S])*'''|"
     r'"""(?:\\.|(?!""")[\s\S])*"""|'
-    r'"(?:\\.|[^"\\])*"|'
-    r"'(?:\\.|[^'\\])*'"
+    r'"(?!")(?:\\.|[^"\\])*"|'
+    r"'(?!')(?:\\.|[^'\\])*'"
     r")"
 )
 PYTHON_STRING_LITERAL_SEQUENCE: Final[str] = rf"{PYTHON_STRING_LITERAL}(?:\s+{PYTHON_STRING_LITERAL})*"
@@ -77,7 +77,7 @@ STRING_LITERAL_START_RE: Final[re.Pattern[str]] = re.compile(
 )
 QUOTED_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(\bauthorization\s*[:=]\s*)({PYTHON_STRING_PREFIX})"
-    rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\3)[\s\S])*\3"
+    rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\3)[^\\])*\3"
 )
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(\b(?:proxy[-_]?authorization|authorization)\s*[:=]\s*)(?!\s*[rubf]*[\"'])"
@@ -90,7 +90,7 @@ SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
 )
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)({PYTHON_STRING_PREFIX})"
-    rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\4)[\s\S])*\4"
+    rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\4)[^\\])*\4"
 )
 CONCATENATED_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(?P<prefix>({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)"
@@ -103,23 +103,28 @@ SENSITIVE_CALL_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
 )
 QUOTED_SENSITIVE_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)([\"']{QUOTED_SENSITIVE_KEY}[\"']\s*:\s*)({PYTHON_STRING_PREFIX})"
-    rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\3)[\s\S])*\3"
+    rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\3)[^\\])*\3"
 )
 GENERIC_QUOTED_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)(?P<key_quote>[\"'])(?P<key>(?:\\.|(?!(?P=key_quote))[\s\S]){{1,120}})(?P=key_quote)"
+    rf"(?i)(?P<key_quote>[\"'])(?P<key>(?:\\.|(?!(?P=key_quote))[^\\]){{1,120}})(?P=key_quote)"
     rf"(?P<separator>\s*:\s*)(?P<value>{PYTHON_STRING_LITERAL_SEQUENCE})"
+)
+GENERIC_UNTERMINATED_QUOTED_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(?P<key_quote>[\"'])(?P<key>(?:\\.|(?!(?P=key_quote))[^\\]){{1,120}})(?P=key_quote)"
+    rf"(?P<separator>\s*:\s*)(?P<prefix>{PYTHON_STRING_PREFIX})(?P<quote>{PYTHON_QUOTE_DELIMITER})"
+    r"(?:(?:\\.)|(?!(?P=quote))[^\\;&|])*(?=$|[;&|])"
 )
 UNTERMINATED_QUOTED_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(\bauthorization\s*[:=]\s*)({PYTHON_STRING_PREFIX})"
-    rf"({PYTHON_QUOTE_DELIMITER})(?:(?!\3)[^;&|])*(?=$|[;&|])"
+    rf"({PYTHON_QUOTE_DELIMITER})(?:(?:\\.)|(?!\3)[^\\;&|])*(?=$|[;&|])"
 )
 UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)({PYTHON_STRING_PREFIX})"
-    rf"({PYTHON_QUOTE_DELIMITER})(?:(?!\4)[^;&|])*(?=$|[;&|])"
+    rf"({PYTHON_QUOTE_DELIMITER})(?:(?:\\.)|(?!\4)[^\\;&|])*(?=$|[;&|])"
 )
 UNTERMINATED_QUOTED_SENSITIVE_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)([\"']{QUOTED_SENSITIVE_KEY}[\"']\s*:\s*)({PYTHON_STRING_PREFIX})"
-    rf"({PYTHON_QUOTE_DELIMITER})(?:(?!\3)[^;&|])*(?=$|[;&|])"
+    rf"({PYTHON_QUOTE_DELIMITER})(?:(?:\\.)|(?!\3)[^\\;&|])*(?=$|[;&|])"
 )
 
 
@@ -211,6 +216,17 @@ def _redact_generic_quoted_key_value(match: re.Match[str]) -> str:
     )
 
 
+def _redact_generic_unterminated_quoted_key_value(match: re.Match[str]) -> str:
+    decoded_key = _decode_quoted_key(match.group("key_quote"), match.group("key"))
+    if decoded_key is None or re.fullmatch(QUOTED_SENSITIVE_KEY, decoded_key, re.IGNORECASE) is None:
+        return match.group(0)
+    return (
+        f"{match.group('key_quote')}{match.group('key')}{match.group('key_quote')}"
+        f"{match.group('separator')}{match.group('prefix')}{match.group('quote')}"
+        f"{REDACTED_EVIDENCE_VALUE}{match.group('quote')}"
+    )
+
+
 def _find_balanced_container_end(text: str, start: int) -> int | None:
     if start >= len(text) or text[start] not in "[{(":
         return None
@@ -284,6 +300,7 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = QUOTED_SENSITIVE_KEY_VALUE_RE.sub(_redact_quoted_key_value, redacted)
     redacted = QUOTED_AUTHORIZATION_VALUE_RE.sub(_redact_quoted_authorization, redacted)
+    redacted = GENERIC_UNTERMINATED_QUOTED_KEY_VALUE_RE.sub(_redact_generic_unterminated_quoted_key_value, redacted)
     redacted = UNTERMINATED_QUOTED_SENSITIVE_KEY_VALUE_RE.sub(_redact_quoted_key_value, redacted)
     redacted = UNTERMINATED_QUOTED_AUTHORIZATION_VALUE_RE.sub(_redact_quoted_authorization, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
