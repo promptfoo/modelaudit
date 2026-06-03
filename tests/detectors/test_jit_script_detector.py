@@ -271,6 +271,201 @@ class TestJITScriptDetector:
 
         assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
 
+    def test_extract_embedded_python_marks_byte_budget_incomplete(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"# pad\n" * ((jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT // len(b"# pad\n")) + 1)
+        data = padding + b"import os\nos.system('id')\n"
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "late_payload.pt")
+
+        incomplete = [
+            finding
+            for finding in findings
+            if finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_BYTE_LIMIT_REASON
+        ]
+        assert len(incomplete) == 1
+        assert incomplete[0].details["max_scan_bytes"] == jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+        assert not any(finding.type == "dangerous_import" and finding.import_ == "os" for finding in findings)
+
+    def test_scan_model_ignores_large_tensorflow_function_metadata_without_python(self) -> None:
+        detector = JITScriptDetector()
+        data = b"SavedFunction function_spec\n" + b"A" * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT + 100)
+
+        findings = detector.scan_model(data, "tensorflow", "saved_model.pb")
+
+        assert not any(finding.type == "analysis_incomplete" for finding in findings)
+
+    def test_scan_model_marks_late_tensorflow_function_source_incomplete(self) -> None:
+        detector = JITScriptDetector()
+        data = (
+            b"SavedFunction function_spec\n"
+            + b"A" * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT + 100)
+            + b"\nimport os\nos.system('id')\n"
+        )
+
+        findings = detector.scan_model(data, "tensorflow", "saved_model.pb")
+
+        assert any(
+            finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_BYTE_LIMIT_REASON
+            for finding in findings
+        )
+
+    def test_extract_embedded_python_marks_boundary_spanning_source_incomplete(self) -> None:
+        detector = JITScriptDetector()
+        data = (
+            b"A" * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT - len(b"\nimport "))
+            + b"\nimport os\nos.system('id')\n"
+        )
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "boundary_payload.pt")
+
+        assert any(
+            finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_BYTE_LIMIT_REASON
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            b"def payload():\n    values = (\n",
+            b"class Payload:\n    values = (\n",
+        ],
+    )
+    def test_extract_embedded_python_marks_long_unparseable_definition_incomplete(self, header: bytes) -> None:
+        detector = JITScriptDetector()
+        continuation = b"        1,\n"
+        data = (
+            header
+            + continuation * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT // len(continuation) + 1)
+            + b"    )\n"
+        )
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "long_definition.pt")
+
+        assert any(
+            finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_BYTE_LIMIT_REASON
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            b"def payload is described here\n",
+            b"class Payload is described here\n",
+        ],
+    )
+    def test_scan_model_ignores_large_definition_like_prose(self, prose: bytes) -> None:
+        detector = JITScriptDetector()
+        data = prose + b"A" * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT + 100)
+
+        findings = detector.scan_model(data, "pytorch", "definition_prose.pt")
+
+        assert not any(finding.type == "analysis_incomplete" for finding in findings)
+
+    def test_scan_model_does_not_duplicate_import_only_pytorch_source_findings(self) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(b'import os\nos.system("id")\n', "pytorch", "payload.pt")
+
+        finding_signatures = {
+            (finding.type, finding.pattern, finding.import_, finding.operation, finding.message) for finding in findings
+        }
+        assert len(findings) == 3
+        assert len(finding_signatures) == len(findings)
+
+    def test_scan_model_marks_import_only_omitted_middle_incomplete(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"A" * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT + 100)
+        data = b"\x00\xff" + padding + b"\nimport harmless_middle\n" + padding
+
+        findings = detector.scan_model(data, "pytorch", "middle_import.pt")
+
+        assert any(
+            finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_BYTE_LIMIT_REASON
+            for finding in findings
+        )
+
+    def test_scan_model_ignores_large_prose_import_in_omitted_middle(self) -> None:
+        detector = JITScriptDetector()
+        padding = b"A" * (jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT + 100)
+        prose = b"\ninstructions import numpy for setup\nimport numpy is required by this model\n"
+        data = b"\x00\xff" + padding + prose + padding
+
+        findings = detector.scan_model(data, "pytorch", "prose_import.pt")
+
+        assert not any(finding.type == "analysis_incomplete" for finding in findings)
+
+    def test_scan_model_ignores_large_import_near_match(self) -> None:
+        detector = JITScriptDetector()
+        data = b"metadata_import harmless\n" * (
+            jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT // len(b"metadata_import harmless\n") + 1
+        )
+
+        findings = detector.scan_model(data, "pytorch", "metadata.pt")
+
+        assert not any(finding.type == "analysis_incomplete" for finding in findings)
+
+    def test_scan_model_fails_closed_after_source_start_probe_budget(self) -> None:
+        detector = JITScriptDetector()
+        data = b"\n".join(
+            f"import harmless_{index} is prose".encode()
+            for index in range(jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 1)
+        )
+
+        findings = detector.scan_model(data, "pytorch", "many_ambiguous_imports.pt")
+
+        assert any(finding.type == "analysis_incomplete" for finding in findings)
+
+    def test_extract_embedded_python_marks_snippet_budget_incomplete(self) -> None:
+        detector = JITScriptDetector()
+        data = b"\x00".join(
+            f"import harmless_{index}".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "many_snippets.pt")
+
+        incomplete = [
+            finding
+            for finding in findings
+            if finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON
+        ]
+        assert len(incomplete) == 1
+        assert incomplete[0].details["omitted_snippets"] > 0
+        assert incomplete[0].details["candidate_snippets"] > jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS
+
+    def test_extract_embedded_python_keeps_fully_covered_over_budget_source_clean(self) -> None:
+        detector = JITScriptDetector()
+        data = b"\n".join(
+            f"import harmless_{index}".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+        )
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "covered_snippets.pt")
+
+        assert not any(
+            finding.type == "analysis_incomplete"
+            and finding.details.get("reason") == jit_script_module._EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON
+            for finding in findings
+        )
+
+    def test_extract_embedded_python_keeps_benign_within_budgets_clean(self) -> None:
+        detector = JITScriptDetector()
+        data = b"\n".join(
+            f"import harmless_{index}".encode()
+            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
+        )
+
+        findings = detector._extract_and_check_python_code(data, "TorchScript", "benign_snippets.pt")
+
+        assert findings == []
+
     def test_scan_model_detects_unmarked_from_import_source(self) -> None:
         detector = JITScriptDetector()
 
@@ -1658,136 +1853,28 @@ class TestJITScriptDetector:
 
         assert len(windows) <= 3 + (2 * jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
 
-    def test_embedded_python_middle_priority_probe_is_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 64)
-        monkeypatch.setattr(jit_script_module, "_MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES", 32)
-        original_priority_import_offsets = jit_script_module._priority_import_offsets
-        inspected_lengths: list[int] = []
+    def test_single_window_prefix_context_is_extracted_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        original_is_priority_context = jit_script_module._is_priority_prefix_context_statement
+        priority_context_checks = 0
 
-        def recording_priority_import_offsets(bounded: bytes) -> list[int]:
-            inspected_lengths.append(len(bounded))
-            return original_priority_import_offsets(bounded)
+        def recording_is_priority_context(context: bytes, statement: bytes) -> bool:
+            nonlocal priority_context_checks
+            priority_context_checks += 1
+            return original_is_priority_context(context, statement)
 
-        monkeypatch.setattr(jit_script_module, "_priority_import_offsets", recording_priority_import_offsets)
-        data = (
-            b"\x00\xffdef prefix():\n    return 1\n"
-            + b"# middle\n" * 40
-            + b"import runpy as rp\n"
-            + b"# more middle\n" * 40
-            + b"def payload():\n    return rp.run_path('payload.py')\n"
+        monkeypatch.setattr(
+            jit_script_module,
+            "_is_priority_prefix_context_statement",
+            recording_is_priority_context,
+        )
+        data = b"\x00\xffsink = eval\n" + b"".join(
+            f"def benign_{index}():\n    return {index}\n}}\x00".encode() for index in range(128)
         )
 
         windows = jit_script_module._embedded_python_extraction_windows(data)
 
         assert windows
-        assert len(data) > 2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES
-        assert inspected_lengths
-        assert max(inspected_lengths) < len(data)
-        assert max(inspected_lengths) <= 2 * jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES
-
-    def test_scan_model_reports_incomplete_coverage_for_middle_window_omission(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        detector = JITScriptDetector()
-        monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 256)
-        prefix = b"\x00\xffdef prelude():\n    return 1\n" + b"# prefix\n" * 80
-        hidden_middle = b"\x00\xffdef payload():\n    sink = eval\n    return sink('1+1')\n"
-        tail = b"# tail\n" * 80 + b"\x00\xffdef postlude():\n    return 2\n"
-
-        findings = detector.scan_model(prefix + hidden_middle + tail, "pytorch", "payload.bin")
-
-        incomplete = [finding for finding in findings if finding.type == "analysis_incomplete"]
-        assert len(incomplete) == 1
-        assert incomplete[0].details["scan_outcome_reason"] == (
-            jit_script_module.JIT_EMBEDDED_PYTHON_WINDOW_TRUNCATION_REASON
-        )
-        assert incomplete[0].details["omitted_bytes"] > 0
-        assert not any(finding.severity == "CRITICAL" for finding in findings)
-
-    def test_scan_model_reports_incomplete_when_only_middle_has_framed_python(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        detector = JITScriptDetector()
-        monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 64)
-        hidden_middle = b"\x00\xffdef payload():\n    return eval('1+1')\n"
-        data = (b"A" * 64) + hidden_middle + (b"B" * 64)
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        incomplete = [finding for finding in findings if finding.type == "analysis_incomplete"]
-        assert len(incomplete) == 1
-        assert incomplete[0].details["scan_outcome_reason"] == (
-            jit_script_module.JIT_EMBEDDED_PYTHON_WINDOW_TRUNCATION_REASON
-        )
-        assert incomplete[0].details["omitted_bytes"] > 0
-        assert not any(finding.severity == "CRITICAL" for finding in findings)
-
-    def test_scan_model_does_not_report_incomplete_for_visible_window_marker_noise(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        detector = JITScriptDetector()
-        monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 64)
-        prefix = (b"\x00\xffdef \x00" + (b"A" * 64))[:64]
-        data = prefix + (b"B" * 80) + (b"C" * 64)
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert not any(finding.type == "analysis_incomplete" for finding in findings)
-        assert not any(finding.severity == "CRITICAL" for finding in findings)
-
-    def test_scan_model_reports_incomplete_coverage_when_snippet_budget_drops_candidates(self) -> None:
-        detector = JITScriptDetector()
-        leading_blocks = b"".join(
-            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
-            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
-        )
-        hidden_payload = b"def payload():\n    sink = eval\n    return sink('1+1')\n"
-        source = b"\x00\xff" + leading_blocks + hidden_payload
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        incomplete = [finding for finding in findings if finding.type == "analysis_incomplete"]
-        assert len(incomplete) == 1
-        assert incomplete[0].details["scan_outcome_reason"] == (
-            jit_script_module.JIT_EMBEDDED_PYTHON_SNIPPET_BUDGET_REASON
-        )
-        assert incomplete[0].details["candidate_count"] > incomplete[0].details["selected_candidate_count"]
-        assert not any(finding.severity == "CRITICAL" for finding in findings)
-
-    def test_scan_model_benign_within_budget_stays_clean(self) -> None:
-        detector = JITScriptDetector()
-        source = b"\x00\xff" + b"".join(
-            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
-            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert findings == []
-
-    def test_scan_model_benign_over_budget_is_incomplete_without_security_finding(self) -> None:
-        detector = JITScriptDetector()
-        source = b"\x00\xff" + b"".join(
-            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
-            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(finding.type == "analysis_incomplete" for finding in findings)
-        assert not any(finding.severity in {"CRITICAL", "WARNING"} for finding in findings)
-
-    def test_scan_model_does_not_mark_onnx_marker_noise_incomplete(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        detector = JITScriptDetector()
-        monkeypatch.setattr(jit_script_module, "_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES", 128)
-        marker_noise = b"\x00\xffdef benign_weight_marker():\n    opened = 1\n    return opened\n"
-        data = b"ONNX" + b"\x00" * 160 + marker_noise + b"\x00" * 160
-
-        findings = detector.scan_model(data, "onnx", "model.onnx")
-
-        assert not any(finding.type == "analysis_incomplete" for finding in findings)
-        assert not any(finding.severity == "CRITICAL" for finding in findings)
+        assert priority_context_checks == 1
 
     def test_scan_model_does_not_flag_builtin_substring_inside_identifier(self) -> None:
         detector = JITScriptDetector()
@@ -1814,6 +1901,39 @@ class TestJITScriptDetector:
 
         assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
 
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "return __builtins__.eval(value)",
+            "return __builtin__.eval(value)",
+            "return __builtins__['eval'](value)",
+            "return __builtin__.__dict__['eval'](value)",
+            "return getattr(__builtins__, 'eval')(value)",
+            "return __builtins__.get('eval')(value)",
+            "return __builtins__.__getitem__('eval')(value)",
+            "return __builtins__['ev' + 'al'](value)",
+            "return globals()['__builtins__']['eval'](value)",
+            "return globals().get('__builtins__').eval(value)",
+            "return eval.__call__(value)",
+            "sink = eval.__call__\n    return sink(value)",
+            "return getattr(eval, '__call__')(value)",
+            "return __builtins__.eval.__call__(value)",
+            "return __builtins__.__getattribute__('eval')(value)",
+            "module = __builtins__\n    return module.eval(value)",
+            "module = __builtins__ if value else object()\n    return module.eval(value)",
+            "import __builtin__ as module\n    return module.eval(value)",
+            "namespace = __builtins__.__dict__\n    return namespace['eval'](value)",
+            "namespace = vars(__builtins__)\n    return namespace.get('eval')(value)",
+        ],
+    )
+    def test_scan_model_detects_dangerous_dunder_builtins_access(self, body: str) -> None:
+        detector = JITScriptDetector()
+        data = f"\x00\xffdef payload(value):\n    {body}\n".encode()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
     def test_scan_model_preserves_builtin_alias_across_dead_rebind_branch(self) -> None:
         detector = JITScriptDetector()
         data = b"\x00\xffdef payload():\n    sink = eval\n    if False:\n        sink = len\n    return sink('1+1')\n"
@@ -1825,8 +1945,275 @@ class TestJITScriptDetector:
     @pytest.mark.parametrize(
         "data",
         [
+            (
+                b"\x00\xffdef payload():\n"
+                b"    sink = eval\n"
+                b"    for _ in []:\n"
+                b"        sink = len\n"
+                b"    return sink('1+1')\n"
+            ),
+            (
+                b"\x00\xffdef payload():\n"
+                b"    sink = eval\n"
+                b"    while False:\n"
+                b"        sink = len\n"
+                b"    return sink('1+1')\n"
+            ),
+            b"\x00\xffdef payload(flag):\n    sink = eval if flag else len\n    return sink('1+1')\n",
+            (
+                b"\x00\xffdef payload():\n"
+                b"    sink = eval\n"
+                b"    try:\n"
+                b"        raise RuntimeError()\n"
+                b"        sink = len\n"
+                b"    except RuntimeError:\n"
+                b"        pass\n"
+                b"    return sink('1+1')\n"
+            ),
+            (
+                b"\x00\xffdef payload():\n"
+                b"    sink = eval\n"
+                b"    try:\n"
+                b"        may_raise()\n"
+                b"        sink = len\n"
+                b"    except Exception:\n"
+                b"        pass\n"
+                b"    return sink('1+1')\n"
+            ),
+            (
+                b"\x00\xffdef payload():\n"
+                b"    sink = eval\n"
+                b"    try:\n"
+                b"        sink = unresolved_name\n"
+                b"    except Exception:\n"
+                b"        pass\n"
+                b"    return sink('1+1')\n"
+            ),
+            b"\x00\xffdef payload():\n    for sink in [eval]:\n        return sink('1+1')\n",
+            b"\x00\xffdef payload():\n    for sink in [len, eval]:\n        sink('1+1')\n",
+            b"\x00\xffdef payload():\n    for sink, _ in [(eval, 1)]:\n        return sink('1+1')\n",
+            b"\x00\xffdef payload():\n    for module in [__builtins__]:\n        return module.eval('1+1')\n",
+            b"\x00\xffdef payload():\n    return [sink('1+1') for sink in [eval]]\n",
+            b"\x00\xffdef payload():\n    return list(sink('1+1') for sink in [eval])\n",
+            b"\x00\xffdef payload():\n    return (sink := eval)('1+1')\n",
+            b"\x00\xffdef payload():\n    return (eval or len)('1+1')\n",
+            b"\x00\xffdef payload(sink=eval):\n    return sink('1+1')\n",
+            (b"\x00\xffsink = eval\ndef payload(value: sink('1+1')):\n    return value\n"),
+            b"\x00\xffsink = eval\ndef payload():\n    return sink('1+1')\n",
+            b"\x00\xffmodule = __builtins__\ndef payload():\n    return module.eval('1+1')\n",
+            b"\x00\xffsink = eval\ndef sink(value=sink('1+1')):\n    return value\n",
+            b"\x00\xffsink = eval\nclass sink(sink('1+1')):\n    pass\n",
+            (
+                b"\x00\xffdef outer():\n"
+                b"    sink = eval\n"
+                b"    def inner():\n"
+                b"        return sink('1+1')\n"
+                b"    return inner()\n"
+            ),
+            b"\x00\xffclass Payload:\n    sink = eval\n    result = sink('1+1')\n",
+            b"\x00\xffdef payload():\n    [sink := eval for _ in [1]]\n    return sink('1+1')\n",
+            (b"\x00\xffclass Payload:\n    sink = eval\n    values = [value for value in sink('[1]')]\n"),
+            (b"\x00\xffsink = eval\nclass Payload:\n    sink = len\n    def run(self):\n        return sink('1+1')\n"),
+            (b"\x00\xffdef payload():\n    match [eval]:\n        case [sink]:\n            return sink('1+1')\n"),
+            (
+                b"\x00\xffdef payload(value):\n"
+                b"    sink = len\n"
+                b"    match value:\n"
+                b"        case 0:\n"
+                b"            sink = eval\n"
+                b"        case _:\n"
+                b"            sink = len\n"
+                b"    return sink('1+1')\n"
+            ),
+        ],
+    )
+    def test_scan_model_preserves_builtin_alias_across_dead_control_flow(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
             (b"\x00\xffdef benign():\n    import builtins as b\n    b = object()\n    return b.eval('1')\n"),
             b"\x00\xffdef benign(builtins):\n    return builtins.eval('1')\n",
+            b"\x00\xffdef benign(__builtins__):\n    return __builtins__.eval('1')\n",
+            b"\x00\xffdef benign(eval):\n    return eval.__call__('1')\n",
+            b"\x00\xffdef benign():\n    __builtins__ = object()\n    return __builtins__.eval('1')\n",
+            (
+                b"\x00\xffdef benign():\n"
+                b"    getattr = lambda _value, _name: len\n"
+                b"    return getattr(__builtins__, 'eval')('1')\n"
+            ),
+            (
+                b"\x00\xffdef benign():\n"
+                b"    vars = lambda _value: {'eval': len}\n"
+                b"    return vars(__builtins__)['eval']('1')\n"
+            ),
+            (
+                b"\x00\xffdef benign():\n"
+                b"    globals = lambda: {'__builtins__': {'eval': len}}\n"
+                b"    return globals()['__builtins__']['eval']('1')\n"
+            ),
+            (b"\x00\xffdef benign():\n    __builtins__ = {'eval': len}\n    return __builtins__['eval']('1')\n"),
+            (b"\x00\xffdef benign():\n    sink = eval\n    for _ in [1]:\n        sink = len\n    return sink('1')\n"),
+            (
+                b"\x00\xffdef benign():\n"
+                b"    sink = eval\n"
+                b"    while True:\n"
+                b"        sink = len\n"
+                b"        break\n"
+                b"    return sink('1')\n"
+            ),
+            b"\x00\xffdef benign():\n    sink = eval if False else len\n    return sink('1')\n",
+            (
+                b"\x00\xffdef benign():\n"
+                b"    sink = eval\n"
+                b"    try:\n"
+                b"        sink = len\n"
+                b"    except Exception:\n"
+                b"        sink = str\n"
+                b"    return sink('1')\n"
+            ),
+            (
+                b"\x00\xffdef benign():\n"
+                b"    sink = eval\n"
+                b"    try:\n"
+                b"        sink = len\n"
+                b"    except Exception:\n"
+                b"        pass\n"
+                b"    return sink('1')\n"
+            ),
+            (
+                b"\x00\xffdef benign():\n"
+                b"    safe_alias = len\n"
+                b"    sink = eval\n"
+                b"    try:\n"
+                b"        sink = safe_alias\n"
+                b"    except Exception:\n"
+                b"        pass\n"
+                b"    return sink('1')\n"
+            ),
+            (
+                b"\x00\xffdef benign():\n"
+                b"    sink = eval\n"
+                b"    try:\n"
+                b"        sink = len\n"
+                b"        may_raise()\n"
+                b"    except Exception:\n"
+                b"        pass\n"
+                b"    return sink('1')\n"
+            ),
+            (b"\x00\xffdef benign():\n    for sink in [eval, len]:\n        pass\n    return sink('1')\n"),
+            (b"\x00\xffdef benign():\n    for sink in [len, eval]:\n        break\n    return sink('1')\n"),
+            (
+                b"\x00\xffdef benign():\n"
+                b"    sink = eval\n"
+                b"    for _ in [1]:\n"
+                b"        pass\n"
+                b"    else:\n"
+                b"        sink = len\n"
+                b"    return sink('1')\n"
+            ),
+            b"\x00\xffdef benign():\n    return [sink('1') for sink in [eval] if False]\n",
+            b"\x00\xffdef benign():\n    return [sink('1') for sink in [eval] for _ in []]\n",
+            b"\x00\xffdef benign():\n    return [sink('1') for sink in [len]]\n",
+            b"\x00\xffdef benign(holder):\n    return holder.__builtins__.eval('1')\n",
+            b"\x00\xffdef benign():\n    return (eval and len)('1')\n",
+            b"\x00\xffdef benign():\n    return (len or eval)('1')\n",
+            b"\x00\xffdef benign():\n    return (lambda eval: eval('1'))(len)\n",
+            b"\x00\xffdef benign():\n    module = __builtins__ if False else object()\n    return module.eval('1')\n",
+            b"\x00\xffsink = eval\nsink = len\ndef benign():\n    return sink('1')\n",
+            (b"\x00\xffmodule = __builtins__\nmodule = object()\ndef benign():\n    return module.eval('1')\n"),
+            b"\x00\xffsink = eval\ndef benign():\n    sink('1')\n    sink = len\n",
+            (b"\x00\xffclass Container:\n    sink = eval\n    def benign(self):\n        return sink('1')\n"),
+            (b"\x00\xffclass Outer:\n    sink = eval\n    class Inner:\n        result = sink('1')\n"),
+            (b"\x00\xffclass Benign:\n    sink = eval\n    values = [sink('1') for _ in [1]]\n"),
+            (b"\x00\xffsink = eval\ndef benign():\n    global sink\n    sink = len\n    return sink('1')\n"),
+            (
+                b"\x00\xffdef outer():\n"
+                b"    sink = eval\n"
+                b"    def benign():\n"
+                b"        nonlocal sink\n"
+                b"        sink = len\n"
+                b"        return sink('1')\n"
+                b"    return benign()\n"
+            ),
+            (
+                b"\x00\xffsink = eval\n"
+                b"def benign():\n"
+                b"    sink('1')\n"
+                b"    def inner(value=(sink := len)):\n"
+                b"        return value\n"
+            ),
+            (b"\x00\xffsink = eval\ndef benign(manager):\n    with manager() as sink:\n        return sink('1')\n"),
+            b"\x00\xffdef benign():\n    sink = eval\n    del sink\n    return sink('1')\n",
+            (
+                b"\x00\xffdef benign():\n"
+                b"    for sink in [eval, len]:\n"
+                b"        for _ in [1]:\n"
+                b"            break\n"
+                b"    return sink('1')\n"
+            ),
+            (
+                b"\x00\xffdef benign(value):\n"
+                b"    sink = eval\n"
+                b"    match value:\n"
+                b"        case 0:\n"
+                b"            sink = len\n"
+                b"        case _:\n"
+                b"            sink = str\n"
+                b"    return sink('1')\n"
+            ),
+            (
+                b"\x00\xffdef benign(flag):\n"
+                b"    sink = eval\n"
+                b"    if flag:\n"
+                b"        return 0\n"
+                b"    else:\n"
+                b"        sink = len\n"
+                b"    return sink('1')\n"
+            ),
+            (
+                b"\x00\xffdef benign(flag):\n"
+                b"    sink = eval\n"
+                b"    try:\n"
+                b"        if flag:\n"
+                b"            raise RuntimeError()\n"
+                b"        sink = len\n"
+                b"    except RuntimeError:\n"
+                b"        return 0\n"
+                b"    return sink('1')\n"
+            ),
+            (
+                b"\x00\xffdef benign(value):\n"
+                b"    sink = len\n"
+                b"    match value:\n"
+                b"        case _ if False:\n"
+                b"            sink = eval\n"
+                b"    return sink('1')\n"
+            ),
+            (
+                b"\x00\xffdef benign(flag):\n"
+                b"    sink = eval\n"
+                b"    while flag:\n"
+                b"        sink = eval\n"
+                b"        flag = False\n"
+                b"    else:\n"
+                b"        sink = len\n"
+                b"    return sink('1')\n"
+            ),
+            (
+                b"\x00\xffdef benign(flag):\n"
+                b"    sink = eval\n"
+                b"    while flag:\n"
+                b"        sink = len\n"
+                b"    else:\n"
+                b"        sink = str\n"
+                b"    return sink('1')\n"
+            ),
             (
                 b"\x00\xffdef benign(condition):\n"
                 b"    sink = eval\n"
@@ -2323,6 +2710,17 @@ class TestJITScriptDetector:
         assert continued_runpy_candidate[0] in selected_candidates
         assert continued_from_runpy_candidate[0] in selected_candidates
         assert runpy_candidate[0] in selected_candidates
+
+    def test_prioritized_snippet_budget_counts_unique_spans(self) -> None:
+        duplicate = (b"import harmless\n", (0, 16), ((0, 16),))
+        unique = (b"import later\n", (20, 32), ((20, 32),))
+
+        selected, omitted_spans = jit_script_module._select_prioritized_embedded_python_snippets(
+            [*[duplicate] * jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS, unique]
+        )
+
+        assert selected == [duplicate, unique]
+        assert omitted_spans == []
 
     def test_priority_snippets_are_budgeted_and_bounded_after_default_cap(self) -> None:
         def candidate(

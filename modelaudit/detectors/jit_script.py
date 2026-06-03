@@ -10,6 +10,7 @@ Part of ModelAudit's critical security validation suite.
 """
 
 import ast
+import builtins as python_builtins
 import re
 import textwrap
 from bisect import bisect_left, bisect_right
@@ -28,56 +29,6 @@ def create_jit_finding(**kwargs: Any) -> "JITScriptFinding":
     if "import_" in kwargs:
         kwargs["import"] = kwargs.pop("import_")
     return JITScriptFinding(**kwargs)
-
-
-def _create_embedded_python_analysis_incomplete_finding(
-    *,
-    framework: str,
-    context: str,
-    reason: str,
-    message: str,
-    details: dict[str, Any],
-) -> "JITScriptFinding":
-    return create_jit_finding(
-        message=message,
-        severity="INFO",
-        context=context,
-        pattern=None,
-        recommendation="Treat JIT/script analysis as incomplete and inspect the embedded Python manually.",
-        confidence=1.0,
-        framework=framework,
-        code_snippet=None,
-        type="analysis_incomplete",
-        operation=None,
-        builtin=None,
-        import_=None,
-        details={
-            "analysis_incomplete": True,
-            "scan_outcome_reason": reason,
-            **details,
-        },
-    )
-
-
-def _dedupe_analysis_incomplete_findings(findings: list["JITScriptFinding"]) -> list["JITScriptFinding"]:
-    deduped: list[JITScriptFinding] = []
-    seen_incomplete: set[tuple[str, str, str, int | None, int | None]] = set()
-    for finding in findings:
-        if finding.type != "analysis_incomplete":
-            deduped.append(finding)
-            continue
-        key = (
-            finding.context,
-            str(finding.details.get("scan_outcome_reason", "")),
-            str(finding.details.get("incomplete_reason", "")),
-            finding.details.get("bounded_bytes") if isinstance(finding.details.get("bounded_bytes"), int) else None,
-            finding.details.get("data_size") if isinstance(finding.details.get("data_size"), int) else None,
-        )
-        if key in seen_incomplete:
-            continue
-        seen_incomplete.add(key)
-        deduped.append(finding)
-    return deduped
 
 
 # Dangerous TorchScript operations that can execute arbitrary code
@@ -141,6 +92,11 @@ DANGEROUS_BUILTINS = [
     "reload",
     "file",
 ]
+_BUILTINS_MODULE_NAMES = frozenset({"builtins", "__builtin__", "__builtins__"})
+_PYTHON_BUILTIN_NAMES = frozenset(dir(python_builtins))
+_BUILTIN_ALIAS_CONTEXT_MARKERS = tuple(
+    name.encode("utf-8") for name in sorted({*DANGEROUS_BUILTINS, *_BUILTINS_MODULE_NAMES, "globals", "locals"})
+)
 
 # Dangerous module imports
 DANGEROUS_IMPORTS = [
@@ -192,10 +148,12 @@ _MAX_PRIORITY_ASSIGNMENT_PROBES = 48
 # Bound nested ``:``-header recursion when extracting an embedded statement so a
 # crafted deeply-indented blob cannot exhaust the interpreter stack.
 _MAX_BODY_STATEMENT_NESTING = 100
+_MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES = 64
+_EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT = 1_000_000
 _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES = 1_000_000
-JIT_EMBEDDED_PYTHON_WINDOW_TRUNCATION_REASON = "jit_embedded_python_window_truncation"
-JIT_EMBEDDED_PYTHON_SNIPPET_BUDGET_REASON = "jit_embedded_python_snippet_budget_exceeded"
 _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES = 16_384
+_EMBEDDED_PYTHON_BYTE_LIMIT_REASON = "jit_embedded_python_byte_limit"
+_EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON = "jit_embedded_python_snippet_limit"
 _EMBEDDED_PYTHON_START_MARKERS = (b"def ", b"async def ", b"class ", b"import ", b"from ")
 _PRIORITY_EMBEDDED_PYTHON_MODULES = tuple(
     sorted(
@@ -230,6 +188,12 @@ _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"(?:(?:async\s+)?def\s+\w+|class\s+\w+|import\s+[A-Za-z_][\w.]*|"
     rb"from\s+[A-Za-z_][\w.]*(?:\s|\\\r?\n)+import)"
 )
+_UNAMBIGUOUS_EMBEDDED_PYTHON_START_PATTERN = re.compile(
+    rb"(?:(?:async\s+)?def\s+\w+\s*[\[(]|"
+    rb"class\s+\w+\s*[\[(:]|"
+    rb"import\s+[A-Za-z_][\w.]*(?:\s*(?:,|as\b|\\\r?\n|\r?\n|$))|"
+    rb"from\s+[A-Za-z_][\w.]*(?:\s|\\\r?\n)+import(?:\s|\\\r?\n)+(?:\(|[A-Za-z_*]))"
+)
 _EMBEDDED_PYTHON_CONTEXT_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])(?:if\s+True\s*:|import\s+[A-Za-z_][\w.]*|from\s+[A-Za-z_][\w.]*|"
     + _EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN
@@ -242,6 +206,27 @@ _COMPOUND_HEADER_MATCH_PATTERN = re.compile(
     rb"\b(?:async\s+def|if|elif|else|for|while|try|except|finally|with|class|def)\b"
 )
 _EmbeddedPythonCandidate = tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]
+
+
+def _has_source_like_embedded_python_start(data: bytes, *, start_offset: int = 0) -> bool:
+    """Return whether a Python start marker follows source indentation or binary framing."""
+    source_start_probes = 0
+    for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(data, start_offset):
+        cursor = match.start()
+        while cursor > 0 and data[cursor - 1] in b" \t\r":
+            cursor -= 1
+        if cursor > 0 and data[cursor - 1] != 0x0A and 0x20 <= data[cursor - 1] < 0x7F:
+            continue
+        source_start_probes += 1
+        if source_start_probes > _MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES:
+            return True
+        candidate = data[match.start() : match.start() + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES]
+        code_str, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
+        if _parse_embedded_python_snippet(code_str) is not None:
+            return True
+        if _UNAMBIGUOUS_EMBEDDED_PYTHON_START_PATTERN.match(candidate):
+            return True
+    return False
 
 
 def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
@@ -515,6 +500,8 @@ def _simple_reference_name(node: ast.AST) -> str | None:
 def _priority_assignment_probe_calls(target: str) -> list[str]:
     return [
         f"{target}()",
+        f"{target}.eval('1+1')",
+        f"{target}['eval']('1+1')",
         f"{target}.run_path('payload.py')",
         f"{target}.run_module('payload')",
         f"{target}._run_module_as_main('payload')",
@@ -1021,24 +1008,30 @@ def _compact_candidate_segments(candidate: bytes, segment_ranges: list[tuple[int
     return b"\n".join(candidate[start:end].rstrip(b"\n") for start, end in segment_ranges)
 
 
-def _prioritized_embedded_python_snippets(
+def _select_prioritized_embedded_python_snippets(
     candidates: list[_EmbeddedPythonCandidate],
     bounded: bytes | None = None,
-) -> list[_EmbeddedPythonCandidate]:
+) -> tuple[list[_EmbeddedPythonCandidate], list[tuple[int, int]]]:
     selected: list[_EmbeddedPythonCandidate] = []
     selected_spans: set[tuple[int, int]] = set()
     priority_offsets = _priority_import_offsets(bounded) if bounded is not None else []
+    selected_default_candidates = 0
     selected_priority_candidates = 0
-    for index, (candidate, span, real_ranges) in enumerate(candidates):
+    omitted_budgeted_spans: list[tuple[int, int]] = []
+    for candidate, span, real_ranges in candidates:
+        if span in selected_spans:
+            continue
         has_priority_marker = (
             _span_contains_priority_offset(span, priority_offsets)
             if bounded is not None
             else _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(candidate.lower()) is not None
         )
-        if index >= _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:
+        if selected_default_candidates >= _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:
             if not has_priority_marker:
+                omitted_budgeted_spans.append(span)
                 continue
             if selected_priority_candidates >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
+                omitted_budgeted_spans.append(span)
                 continue
             if bounded is not None:
                 candidate, span, real_ranges = _bounded_priority_embedded_python_candidate(
@@ -1048,37 +1041,22 @@ def _prioritized_embedded_python_snippets(
                 candidate = candidate[:_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES]
                 span = (span[0], span[0] + len(candidate))
                 real_ranges = (span,)
+            if span in selected_spans:
+                continue
             selected_priority_candidates += 1
-        if span in selected_spans:
-            continue
+        else:
+            selected_default_candidates += 1
         selected_spans.add(span)
         selected.append((candidate, span, real_ranges))
-    return selected
+    return selected, omitted_budgeted_spans
 
 
-def _embedded_python_snippet_budget_skipped_count(
+def _prioritized_embedded_python_snippets(
     candidates: list[_EmbeddedPythonCandidate],
     bounded: bytes | None = None,
-) -> int:
-    priority_offsets = _priority_import_offsets(bounded) if bounded is not None else []
-    selected_priority_candidates = 0
-    skipped_count = 0
-    for index, (candidate, span, _real_ranges) in enumerate(candidates):
-        if index < _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:
-            continue
-        has_priority_marker = (
-            _span_contains_priority_offset(span, priority_offsets)
-            if bounded is not None
-            else _PRIORITY_EMBEDDED_PYTHON_IMPORT_PATTERN.search(candidate.lower()) is not None
-        )
-        if not has_priority_marker:
-            skipped_count += 1
-            continue
-        if selected_priority_candidates >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
-            skipped_count += 1
-            continue
-        selected_priority_candidates += 1
-    return skipped_count
+) -> list[_EmbeddedPythonCandidate]:
+    selected, _omitted_budgeted_spans = _select_prioritized_embedded_python_snippets(candidates, bounded)
+    return selected
 
 
 def _complete_brace_truncated_line_candidate(
@@ -1099,36 +1077,6 @@ def _embedded_python_scan_windows(data: bytes) -> list[bytes]:
     if len(data) <= _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:
         return [data]
     return [data[:_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES], data[-_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES:]]
-
-
-def _embedded_python_middle_bytes_omitted(data: bytes) -> bool:
-    return len(data) > 2 * _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES
-
-
-def _omitted_middle_contains_embedded_python_marker(data: bytes) -> bool:
-    if not _embedded_python_middle_bytes_omitted(data):
-        return False
-    omitted_start = _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES
-    omitted_end = len(data) - _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES
-    return any(data.find(marker, omitted_start, omitted_end) >= 0 for marker in _EMBEDDED_PYTHON_START_MARKERS)
-
-
-def _bounded_middle_priority_import_offsets(data: bytes) -> list[int]:
-    if not _embedded_python_middle_bytes_omitted(data):
-        return []
-    omitted_start = _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES
-    omitted_end = len(data) - _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES
-    probe_bytes = 2 * _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES
-    probe_ranges = [
-        (omitted_start, min(omitted_end, omitted_start + probe_bytes)),
-        (max(omitted_start, omitted_end - probe_bytes), omitted_end),
-    ]
-    offsets: list[int] = []
-    for start, end in dict.fromkeys(probe_ranges):
-        if end <= start:
-            continue
-        offsets.extend(start + offset for offset in _priority_import_offsets(data[start:end]))
-    return offsets
 
 
 def _python_structural_line_bytes(line: bytes) -> bytes:
@@ -1295,7 +1243,10 @@ def _is_priority_assignment_context(context: bytes, statement: bytes) -> bool:
         probe_tree = ast.parse(probe)
     except (SyntaxError, ValueError):
         return False
-    return bool(_resolve_alias_aware_high_risk_calls(probe_tree))
+    return bool(
+        _resolve_alias_aware_high_risk_calls(probe_tree)
+        or JITScriptDetector._dangerous_builtin_calls_in_tree(probe_tree)
+    )
 
 
 def _tree_imports_priority_module(tree: ast.AST) -> bool:
@@ -1387,14 +1338,37 @@ def _prefix_context_binding_names(context: bytes) -> set[str]:
     return names
 
 
-def _extract_priority_prefix_context(data: bytes) -> bytes:
-    """Return bounded top-level dangerous imports and aliases from a prefix window."""
+def _priority_prefix_contexts_at_offsets(data: bytes, offsets: list[int]) -> dict[int, bytes]:
+    """Return top-level dangerous import and alias context at bounded offsets."""
+    requested_offsets = sorted({offset for offset in offsets if 0 <= offset <= len(data)})
+    if not requested_offsets:
+        return {}
+
+    contexts: dict[int, bytes] = {}
     context: list[bytes] = []
     context_size = 0
     lines = data.splitlines(keepends=True)
+    line_offsets: list[int] = []
+    current_offset = 0
+    for line in lines:
+        line_offsets.append(current_offset)
+        current_offset += len(line)
+
     index = 0
+    requested_index = 0
     multiline_quote: bytes | None = None
+
+    def capture_offsets_before(end: int) -> None:
+        nonlocal requested_index
+        snapshot: bytes | None = None
+        while requested_index < len(requested_offsets) and requested_offsets[requested_index] < end:
+            if snapshot is None:
+                snapshot = b"".join(context)
+            contexts[requested_offsets[requested_index]] = snapshot
+            requested_index += 1
+
     while index < len(lines):
+        capture_offsets_before(line_offsets[index] + len(lines[index]))
         start = _context_statement_start(lines[index])
         if start is None:
             multiline_quote = _multiline_string_state_after_line(lines[index], multiline_quote)
@@ -1410,6 +1384,7 @@ def _extract_priority_prefix_context(data: bytes) -> bytes:
         paren_depth = _line_parenthesis_delta(statement_lines[0])
         while (_line_has_explicit_continuation(statement_lines[-1]) or paren_depth > 0) and index + 1 < len(lines):
             index += 1
+            capture_offsets_before(line_offsets[index] + len(lines[index]))
             continuation = lines[index]
             statement_lines.append(continuation)
             paren_depth += _line_parenthesis_delta(continuation)
@@ -1434,55 +1409,63 @@ def _extract_priority_prefix_context(data: bytes) -> bytes:
         context_size += len(statement)
         index += 1
 
-    return b"".join(context)
+    final_context = b"".join(context)
+    for offset in requested_offsets[requested_index:]:
+        contexts[offset] = final_context
+    return contexts
 
 
-def _append_embedded_python_context_tail_windows(
+def _extract_priority_prefix_context(data: bytes) -> bytes:
+    """Return bounded top-level dangerous imports and aliases from a prefix window."""
+    return _priority_prefix_contexts_at_offsets(data, [len(data)]).get(len(data), b"")
+
+
+def _append_single_window_prefix_context_windows(
     extraction_windows: list[tuple[bytes, bool]],
-    import_context: bytes,
-    tail: bytes,
+    bounded: bytes,
 ) -> None:
-    if not import_context:
+    if not any(marker in bounded for marker in _BUILTIN_ALIAS_CONTEXT_MARKERS):
         return
-
-    extraction_windows.append((import_context + b"\n" + tail, True))
-    tail_starts = [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(tail) if match.start() > 0]
-    context_aliases = _priority_import_aliases(import_context)
-    priority_tail_starts = set(_tail_starts_for_priority_alias_uses(tail, tail_starts, context_aliases))
-    for priority_offset in _priority_import_offsets(tail):
-        insertion_index = bisect_right(tail_starts, priority_offset)
-        if insertion_index:
-            priority_tail_starts.add(tail_starts[insertion_index - 1])
-    priority_tail_start_list = _bounded_priority_tail_starts(sorted(priority_tail_starts))
+    starts = [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(bounded) if match.start() > 0]
     selected_starts = [
-        *tail_starts[:_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS],
-        *priority_tail_start_list,
-        *tail_starts[-_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:],
+        *starts[:_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS],
+        *starts[-_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:],
     ]
-    for start in dict.fromkeys(selected_starts):
-        extraction_windows.append((import_context + b"\n" + tail[start:], True))
+    selected_starts = list(dict.fromkeys(selected_starts))
+    contexts = _priority_prefix_contexts_at_offsets(bounded, selected_starts)
+    for start in selected_starts:
+        context = contexts.get(start, b"")
+        if context:
+            extraction_windows.append((context + b"\n" + bounded[start:], True))
 
 
 def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]:
     windows = _embedded_python_scan_windows(data)
     if len(windows) == 1:
-        return [(windows[0], False)]
+        extraction_windows = [(windows[0], False)]
+        _append_single_window_prefix_context_windows(extraction_windows, windows[0])
+        return extraction_windows
 
     prefix, tail = windows
     extraction_windows = [(prefix, False), (tail, False)]
     import_context = _extract_priority_prefix_context(prefix)
-    _append_embedded_python_context_tail_windows(extraction_windows, import_context, tail)
-    if _embedded_python_middle_bytes_omitted(data):
-        omitted_start = len(prefix)
-        omitted_end = len(data) - len(tail)
-        middle_priority_offsets = _bounded_middle_priority_import_offsets(data)
-        for priority_offset in _bounded_priority_tail_starts(middle_priority_offsets):
-            if not omitted_start <= priority_offset < omitted_end:
-                continue
-            context_start = max(omitted_start, priority_offset - _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES)
-            context_end = min(omitted_end, priority_offset + _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES)
-            middle_context = _extract_priority_prefix_context(data[context_start:context_end])
-            _append_embedded_python_context_tail_windows(extraction_windows, middle_context, tail)
+    if import_context:
+        extraction_windows.append((import_context + b"\n" + tail, True))
+        tail_starts = [match.start() for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(tail) if match.start() > 0]
+        context_aliases = _priority_import_aliases(import_context)
+        priority_tail_starts = set(_tail_starts_for_priority_alias_uses(tail, tail_starts, context_aliases))
+        for priority_offset in _priority_import_offsets(tail):
+            insertion_index = bisect_right(tail_starts, priority_offset)
+            if insertion_index:
+                priority_tail_starts.add(tail_starts[insertion_index - 1])
+        priority_tail_start_list = _bounded_priority_tail_starts(sorted(priority_tail_starts))
+        selected_starts = [
+            *tail_starts[:_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS],
+            *priority_tail_start_list,
+            *tail_starts[-_MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:],
+        ]
+        for start in dict.fromkeys(selected_starts):
+            extraction_windows.append((import_context + b"\n" + tail[start:], True))
     return extraction_windows
 
 
@@ -1492,6 +1475,44 @@ def _bounded_priority_tail_starts(tail_starts: list[int]) -> list[int]:
     head_count = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS // 2
     tail_count = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS - head_count
     return [*tail_starts[:head_count], *tail_starts[-tail_count:]]
+
+
+def _embedded_python_analysis_incomplete_finding(
+    *,
+    framework: str,
+    context: str,
+    reason: str,
+    message: str,
+    max_scan_bytes: int | None = None,
+    omitted_snippets: int | None = None,
+    candidates_count: int | None = None,
+) -> "JITScriptFinding":
+    details: dict[str, Any] = {
+        "analysis_incomplete": True,
+        "reason": reason,
+    }
+    if max_scan_bytes is not None:
+        details["max_scan_bytes"] = max_scan_bytes
+    if omitted_snippets is not None:
+        details["omitted_snippets"] = omitted_snippets
+    if candidates_count is not None:
+        details["candidate_snippets"] = candidates_count
+
+    return create_jit_finding(
+        message=message,
+        severity="INFO",
+        context=context,
+        pattern=None,
+        recommendation="Treat JIT/embedded Python coverage as inconclusive and review the model source.",
+        confidence=1.0,
+        details=details,
+        framework=framework,
+        code_snippet=None,
+        type="analysis_incomplete",
+        operation=None,
+        builtin=None,
+        import_=None,
+    )
 
 
 def _tail_starts_for_priority_alias_uses(
@@ -1684,20 +1705,6 @@ class JITScriptDetector:
         return False
 
     @staticmethod
-    def _has_parseable_framed_python_source(data: bytes) -> bool:
-        """Return whether bounded embedded-Python windows contain parseable source."""
-        if not any(marker in data for marker in _EMBEDDED_PYTHON_START_MARKERS):
-            return False
-        for window, include_full_source in _embedded_python_extraction_windows(data):
-            for candidate, _span, _real_ranges in _candidate_embedded_python_snippets(
-                window, include_full_source=include_full_source
-            ):
-                code_str, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
-                if _parse_embedded_python_snippet(code_str) is not None:
-                    return True
-        return False
-
-    @staticmethod
     def _ast_contains_dangerous_python(tree: ast.AST) -> bool:
         """Return whether parsed Python contains modeled dangerous operations."""
         if _resolve_alias_aware_high_risk_calls(tree):
@@ -1727,9 +1734,6 @@ class JITScriptDetector:
                 if node.module and is_dangerous_import(node.module):
                     return True
             elif isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id in DANGEROUS_BUILTINS:
-                    return True
-
                 operation = dotted_name(node.func)
                 if operation is None:
                     continue
@@ -1766,85 +1770,327 @@ class JITScriptDetector:
                 self.findings: set[str] = set()
                 self.alias_scopes: list[dict[str, str | None]] = [{}]
                 self.builtins_module_aliases: list[set[str]] = [set()]
+                self.defined_names: list[set[str]] = [set()]
+                self.scope_kinds = ["module"]
 
-            def _push_scope(self, arguments: ast.arguments | None = None) -> None:
+            def _push_scope(
+                self,
+                arguments: ast.arguments | None = None,
+                default_bindings: dict[str, tuple[str | None, bool]] | None = None,
+                local_names: set[str] | None = None,
+                *,
+                kind: str = "function",
+            ) -> None:
                 self.alias_scopes.append({})
                 self.builtins_module_aliases.append(set())
+                self.defined_names.append(set())
+                self.scope_kinds.append(kind)
+                for name in local_names or set():
+                    self._bind_name(name, None, defined=False)
                 if arguments is None:
                     return
                 for arg in [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs]:
-                    self.alias_scopes[-1][arg.arg] = None
+                    self._bind_name(arg.arg, None)
                 if arguments.vararg is not None:
-                    self.alias_scopes[-1][arguments.vararg.arg] = None
+                    self._bind_name(arguments.vararg.arg, None)
                 if arguments.kwarg is not None:
-                    self.alias_scopes[-1][arguments.kwarg.arg] = None
+                    self._bind_name(arguments.kwarg.arg, None)
+                for name, (builtin, builtins_module) in (default_bindings or {}).items():
+                    self._bind_name(name, builtin, builtins_module=builtins_module)
 
             def _pop_scope(self) -> None:
                 self.alias_scopes.pop()
                 self.builtins_module_aliases.pop()
+                self.defined_names.pop()
+                self.scope_kinds.pop()
+
+            def _visible_scope_indexes(self) -> Iterator[int]:
+                skip_class_scopes = False
+                for index in range(len(self.alias_scopes) - 1, -1, -1):
+                    if skip_class_scopes and self.scope_kinds[index] == "class":
+                        continue
+                    yield index
+                    if self.scope_kinds[index] in {"class", "comprehension", "function"}:
+                        skip_class_scopes = True
 
             def _lookup_alias(self, name: str) -> str | None:
-                for scope in reversed(self.alias_scopes):
+                for index in self._visible_scope_indexes():
+                    scope = self.alias_scopes[index]
                     if name in scope:
                         return scope[name]
                 return name if name in dangerous_builtins else None
 
-            def _is_builtins_module_name(self, name: str) -> bool:
-                for scope, module_aliases in zip(
-                    reversed(self.alias_scopes),
-                    reversed(self.builtins_module_aliases),
-                    strict=True,
-                ):
+            def _is_unshadowed_name(self, name: str) -> bool:
+                return all(name not in self.alias_scopes[index] for index in self._visible_scope_indexes())
+
+            def _is_guaranteed_resolvable_name(self, name: str) -> bool:
+                for index in self._visible_scope_indexes():
+                    scope = self.alias_scopes[index]
                     if name in scope:
-                        return name in module_aliases
-                return name == "builtins"
+                        return name in self.defined_names[index]
+                return name in _PYTHON_BUILTIN_NAMES
+
+            def _known_truth(self, node: ast.AST) -> bool | None:
+                truth = self._constant_truth(node)
+                if truth is not None:
+                    return truth
+                if self._resolve_builtin(node) is not None:
+                    return True
+                if (
+                    isinstance(node, ast.Name)
+                    and self._is_unshadowed_name(node.id)
+                    and node.id in _PYTHON_BUILTIN_NAMES
+                ):
+                    return True
+                return None
+
+            def _is_builtins_module_name(self, name: str) -> bool:
+                for index in self._visible_scope_indexes():
+                    scope = self.alias_scopes[index]
+                    if name in scope:
+                        return name in self.builtins_module_aliases[index]
+                return name in _BUILTINS_MODULE_NAMES
 
             def _is_builtins_module(self, node: ast.AST) -> bool:
-                return isinstance(node, ast.Name) and self._is_builtins_module_name(node.id)
+                if isinstance(node, ast.Name):
+                    return self._is_builtins_module_name(node.id)
+                if isinstance(node, ast.Subscript) and self._is_runtime_namespace(node.value):
+                    return self._constant_string(node.slice) == "__builtins__"
+                if (
+                    isinstance(node, ast.Call)
+                    and node.args
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"get", "__getitem__"}
+                    and self._is_runtime_namespace(node.func.value)
+                ):
+                    return self._constant_string(node.args[0]) == "__builtins__"
+                return False
+
+            def _is_runtime_namespace(self, node: ast.AST) -> bool:
+                return (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in {"globals", "locals"}
+                    and self._is_unshadowed_name(node.func.id)
+                    and not node.args
+                    and not node.keywords
+                )
+
+            def _is_builtins_namespace(self, node: ast.AST) -> bool:
+                if isinstance(node, ast.NamedExpr):
+                    return self._is_builtins_namespace(node.value)
+                if isinstance(node, ast.IfExp):
+                    truth = self._constant_truth(node.test)
+                    if truth is True:
+                        return self._is_builtins_namespace(node.body)
+                    if truth is False:
+                        return self._is_builtins_namespace(node.orelse)
+                    return self._is_builtins_namespace(node.body) or self._is_builtins_namespace(node.orelse)
+                if isinstance(node, ast.BoolOp):
+                    if isinstance(node.op, ast.Or):
+                        for value in node.values:
+                            if self._is_builtins_namespace(value):
+                                return True
+                            if self._known_truth(value) is True:
+                                return False
+                        return False
+                    for value in node.values[:-1]:
+                        if self._known_truth(value) is False:
+                            return self._is_builtins_namespace(value)
+                    return self._is_builtins_namespace(node.values[-1])
+                return (
+                    self._is_builtins_module(node)
+                    or (
+                        isinstance(node, ast.Attribute)
+                        and node.attr == "__dict__"
+                        and self._is_builtins_module(node.value)
+                    )
+                    or (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == "vars"
+                        and self._is_unshadowed_name("vars")
+                        and len(node.args) == 1
+                        and self._is_builtins_module(node.args[0])
+                    )
+                )
+
+            @staticmethod
+            def _constant_string(node: ast.AST) -> str | None:
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    return node.value
+                if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                    left = DangerousBuiltinCallVisitor._constant_string(node.left)
+                    right = DangerousBuiltinCallVisitor._constant_string(node.right)
+                    if left is not None and right is not None:
+                        return left + right
+                return None
 
             def _resolve_builtin(self, node: ast.AST) -> str | None:
                 if isinstance(node, ast.Name):
                     return self._lookup_alias(node.id)
+                if isinstance(node, ast.NamedExpr):
+                    return self._resolve_builtin(node.value)
+                if isinstance(node, ast.IfExp):
+                    truth = self._constant_truth(node.test)
+                    if truth is True:
+                        return self._resolve_builtin(node.body)
+                    if truth is False:
+                        return self._resolve_builtin(node.orelse)
+                    return self._resolve_builtin(node.body) or self._resolve_builtin(node.orelse)
+                if isinstance(node, ast.BoolOp):
+                    if isinstance(node.op, ast.Or):
+                        for value in node.values:
+                            if builtin := self._resolve_builtin(value):
+                                return builtin
+                            if self._known_truth(value) is True:
+                                return None
+                        return None
+                    for value in node.values[:-1]:
+                        if self._known_truth(value) is False:
+                            return None
+                    return self._resolve_builtin(node.values[-1])
                 if (
                     isinstance(node, ast.Attribute)
                     and node.attr in dangerous_builtins
-                    and self._is_builtins_module(node.value)
+                    and self._is_builtins_namespace(node.value)
                 ):
                     return node.attr
+                if isinstance(node, ast.Attribute) and node.attr == "__call__":
+                    return self._resolve_builtin(node.value)
+                if isinstance(node, ast.Subscript) and self._is_builtins_namespace(node.value):
+                    name = self._constant_string(node.slice)
+                    return name if name in dangerous_builtins else None
+                if isinstance(node, ast.Call):
+                    if (
+                        len(node.args) >= 2
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == "getattr"
+                        and self._is_unshadowed_name("getattr")
+                    ):
+                        name = self._constant_string(node.args[1])
+                        if name == "__call__":
+                            return self._resolve_builtin(node.args[0])
+                        if self._is_builtins_namespace(node.args[0]):
+                            return name if name in dangerous_builtins else None
+                    if (
+                        node.args
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in {"get", "__getattribute__", "__getitem__"}
+                        and self._is_builtins_namespace(node.func.value)
+                    ):
+                        name = self._constant_string(node.args[0])
+                        return name if name in dangerous_builtins else None
                 return None
 
-            def _bind_name(self, name: str, builtin: str | None, *, builtins_module: bool = False) -> None:
-                self.alias_scopes[-1][name] = builtin
-                if builtins_module:
-                    self.builtins_module_aliases[-1].add(name)
+            def _bind_name(
+                self,
+                name: str,
+                builtin: str | None,
+                *,
+                builtins_module: bool = False,
+                defined: bool = True,
+                scope_index: int = -1,
+            ) -> None:
+                self.alias_scopes[scope_index][name] = builtin
+                if defined:
+                    self.defined_names[scope_index].add(name)
                 else:
-                    self.builtins_module_aliases[-1].discard(name)
+                    self.defined_names[scope_index].discard(name)
+                if builtins_module:
+                    self.builtins_module_aliases[scope_index].add(name)
+                else:
+                    self.builtins_module_aliases[scope_index].discard(name)
 
-            def _bind_target(self, target: ast.AST, builtin: str | None, *, builtins_module: bool = False) -> None:
+            def _unbind_target(self, target: ast.AST) -> None:
                 if isinstance(target, ast.Name):
-                    self._bind_name(target.id, builtin, builtins_module=builtins_module)
+                    self._bind_name(target.id, None, defined=False)
                 elif isinstance(target, (ast.Tuple, ast.List)):
                     for element in target.elts:
-                        self._bind_target(element, None)
+                        self._unbind_target(element)
 
-            def _bind_target_from_value(self, target: ast.AST, value: ast.AST) -> None:
+            def _bind_target(
+                self,
+                target: ast.AST,
+                builtin: str | None,
+                *,
+                builtins_module: bool = False,
+                scope_index: int = -1,
+            ) -> None:
+                if isinstance(target, ast.Name):
+                    self._bind_name(
+                        target.id,
+                        builtin,
+                        builtins_module=builtins_module,
+                        scope_index=scope_index,
+                    )
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    for element in target.elts:
+                        self._bind_target(element, None, scope_index=scope_index)
+
+            def _bind_target_from_value(self, target: ast.AST, value: ast.AST, *, scope_index: int = -1) -> None:
                 if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
                     for index, element in enumerate(target.elts):
                         if index < len(value.elts):
-                            self._bind_target_from_value(element, value.elts[index])
+                            self._bind_target_from_value(element, value.elts[index], scope_index=scope_index)
                         else:
-                            self._bind_target(element, None)
+                            self._bind_target(element, None, scope_index=scope_index)
                     return
 
                 self._bind_target(
                     target,
                     self._resolve_builtin(value),
-                    builtins_module=self._is_builtins_module(value),
+                    builtins_module=self._is_builtins_namespace(value),
+                    scope_index=scope_index,
                 )
+
+            def _bind_target_from_values(self, target: ast.AST, values: list[ast.expr]) -> None:
+                if isinstance(target, (ast.Tuple, ast.List)):
+                    for index, element in enumerate(target.elts):
+                        child_values = [
+                            value.elts[index]
+                            for value in values
+                            if isinstance(value, (ast.Tuple, ast.List)) and index < len(value.elts)
+                        ]
+                        if child_values:
+                            self._bind_target_from_values(element, child_values)
+                        else:
+                            self._bind_target(element, None)
+                    return
+                self._bind_target(
+                    target,
+                    next((builtin for value in values if (builtin := self._resolve_builtin(value))), None),
+                    builtins_module=any(self._is_builtins_namespace(value) for value in values),
+                )
+
+            def _bind_loop_target_from_iterable(self, target: ast.AST, iterable: ast.AST) -> None:
+                elements = self._literal_iterable_elements(iterable)
+                if elements is None:
+                    self._bind_target(target, None)
+                    return
+                if len(elements) == 1:
+                    self._bind_target_from_value(target, elements[0])
+                    return
+                self._bind_target_from_values(target, elements)
+
+            @staticmethod
+            def _literal_iterable_elements(node: ast.AST) -> list[ast.expr] | None:
+                if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+                    return node.elts
+                if isinstance(node, ast.Dict):
+                    return [key for key in node.keys if key is not None]
+                return None
 
             @staticmethod
             def _constant_truth(node: ast.AST) -> bool | None:
                 if isinstance(node, ast.Constant) and isinstance(node.value, (bool, int, str, bytes, type(None))):
+                    return bool(node.value)
+                return None
+
+            def _constant_iterable_truth(self, node: ast.AST) -> bool | None:
+                if (elements := self._literal_iterable_elements(node)) is not None:
+                    return bool(elements)
+                if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes, tuple, frozenset)):
                     return bool(node.value)
                 return None
 
@@ -1856,40 +2102,97 @@ class JITScriptDetector:
             def _copy_builtins_module_aliases(aliases: list[set[str]]) -> list[set[str]]:
                 return [set(scope) for scope in aliases]
 
-            def _merge_branch_aliases(
+            @staticmethod
+            def _copy_defined_names(defined_names: list[set[str]]) -> list[set[str]]:
+                return [set(scope) for scope in defined_names]
+
+            def _snapshot_alias_state(
                 self,
-                original_scopes: list[dict[str, str | None]],
-                body_scopes: list[dict[str, str | None]],
-                orelse_scopes: list[dict[str, str | None]],
-            ) -> list[dict[str, str | None]]:
-                merged = self._copy_alias_scopes(original_scopes)
-                for index, scope in enumerate(merged):
-                    names = set(scope) | set(body_scopes[index]) | set(orelse_scopes[index])
+            ) -> tuple[list[dict[str, str | None]], list[set[str]], list[set[str]]]:
+                return (
+                    self._copy_alias_scopes(self.alias_scopes),
+                    self._copy_builtins_module_aliases(self.builtins_module_aliases),
+                    self._copy_defined_names(self.defined_names),
+                )
+
+            def _restore_alias_state(
+                self,
+                state: tuple[list[dict[str, str | None]], list[set[str]], list[set[str]]],
+            ) -> None:
+                self.alias_scopes = self._copy_alias_scopes(state[0])
+                self.builtins_module_aliases = self._copy_builtins_module_aliases(state[1])
+                self.defined_names = self._copy_defined_names(state[2])
+
+            def _merge_alias_state_variants(
+                self,
+                original: tuple[list[dict[str, str | None]], list[set[str]], list[set[str]]],
+                variants: list[tuple[list[dict[str, str | None]], list[set[str]], list[set[str]]]],
+            ) -> None:
+                merged_scopes = self._copy_alias_scopes(original[0])
+                for index, scope in enumerate(merged_scopes):
+                    names = set(scope)
+                    for variant_scopes, _variant_modules, _variant_defined_names in variants:
+                        names.update(variant_scopes[index])
                     for name in names:
                         candidates = [
-                            body_scopes[index].get(name, scope.get(name)),
-                            orelse_scopes[index].get(name, scope.get(name)),
+                            variant_scopes[index].get(name, original[0][index].get(name))
+                            for variant_scopes, _variant_modules, _variant_defined_names in variants
                         ]
                         scope[name] = next((candidate for candidate in candidates if candidate is not None), None)
-                return merged
-
-            @staticmethod
-            def _merge_branch_builtins_module_aliases(
-                body_aliases: list[set[str]],
-                orelse_aliases: list[set[str]],
-            ) -> list[set[str]]:
-                return [
-                    body_scope | orelse_scope
-                    for body_scope, orelse_scope in zip(body_aliases, orelse_aliases, strict=True)
+                self.alias_scopes = merged_scopes
+                self.builtins_module_aliases = [
+                    set().union(
+                        *(
+                            variant_modules[index]
+                            for _variant_scopes, variant_modules, _variant_defined_names in variants
+                        )
+                    )
+                    for index in range(len(original[1]))
                 ]
+                self.defined_names = [
+                    set.intersection(
+                        *(
+                            variant_defined_names[index]
+                            for _variant_scopes, _variant_modules, variant_defined_names in variants
+                        )
+                    )
+                    for index in range(len(original[2]))
+                ]
+
+            def _visit_statements(self, statements: list[ast.stmt]) -> ast.stmt | None:
+                for statement in statements:
+                    visit_result = self.visit(statement)
+                    if isinstance(statement, (ast.Break, ast.Continue, ast.Raise, ast.Return)):
+                        return statement
+                    if isinstance(visit_result, (ast.Break, ast.Continue, ast.Raise, ast.Return)):
+                        return visit_result
+                return None
+
+            def _statement_may_raise_before_completion(self, statement: ast.stmt) -> bool:
+                if isinstance(statement, ast.Pass):
+                    return False
+                if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+                    return False
+                if isinstance(statement, ast.Assign):
+                    return not (
+                        all(isinstance(target, ast.Name) for target in statement.targets)
+                        and (
+                            isinstance(statement.value, ast.Constant)
+                            or (
+                                isinstance(statement.value, ast.Name)
+                                and self._is_guaranteed_resolvable_name(statement.value.id)
+                            )
+                        )
+                    )
+                return True
 
             def visit_Import(self, node: ast.Import) -> None:
                 for alias in node.names:
                     local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
-                    self._bind_name(local_name, None, builtins_module=alias.name == "builtins")
+                    self._bind_name(local_name, None, builtins_module=alias.name in _BUILTINS_MODULE_NAMES)
 
             def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-                if node.module == "builtins":
+                if node.module in _BUILTINS_MODULE_NAMES:
                     for alias in node.names:
                         local_name = alias.asname or alias.name
                         self._bind_name(local_name, alias.name if alias.name in dangerous_builtins else None)
@@ -1915,18 +2218,176 @@ class JITScriptDetector:
 
             def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
                 self.visit(node.value)
-                self._bind_target_from_value(node.target, node.value)
+                scope_index = len(self.scope_kinds) - 1
+                while scope_index > 0 and self.scope_kinds[scope_index] == "comprehension":
+                    scope_index -= 1
+                self._bind_target_from_value(node.target, node.value, scope_index=scope_index)
+
+            def visit_Delete(self, node: ast.Delete) -> None:
+                for target in node.targets:
+                    self.visit(target)
+                    self._unbind_target(target)
+
+            @staticmethod
+            def _local_binding_names(nodes: list[ast.AST]) -> set[str]:
+                class LocalBindingVisitor(ast.NodeVisitor):
+                    def __init__(self) -> None:
+                        self.local_names: set[str] = set()
+                        self.outer_names: set[str] = set()
+
+                    def visit_Name(self, node: ast.Name) -> None:
+                        if isinstance(node.ctx, (ast.Store, ast.Del)):
+                            self.local_names.add(node.id)
+
+                    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                        self.local_names.add(node.name)
+                        for decorator in node.decorator_list:
+                            self.visit(decorator)
+                        self._visit_function_signature(node)
+
+                    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                        self.local_names.add(node.name)
+                        for decorator in node.decorator_list:
+                            self.visit(decorator)
+                        self._visit_function_signature(node)
+
+                    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                        self.local_names.add(node.name)
+                        for base in node.bases:
+                            self.visit(base)
+                        for keyword in node.keywords:
+                            self.visit(keyword.value)
+                        for decorator in node.decorator_list:
+                            self.visit(decorator)
+
+                    def visit_Lambda(self, node: ast.Lambda) -> None:
+                        for default in [*node.args.defaults, *node.args.kw_defaults]:
+                            if default is not None:
+                                self.visit(default)
+
+                    def _visit_function_signature(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+                        for argument in [
+                            *node.args.posonlyargs,
+                            *node.args.args,
+                            *node.args.kwonlyargs,
+                            node.args.vararg,
+                            node.args.kwarg,
+                        ]:
+                            if argument is not None and argument.annotation is not None:
+                                self.visit(argument.annotation)
+                        if node.returns is not None:
+                            self.visit(node.returns)
+                        for default in [*node.args.defaults, *node.args.kw_defaults]:
+                            if default is not None:
+                                self.visit(default)
+
+                    def visit_Global(self, node: ast.Global) -> None:
+                        self.outer_names.update(node.names)
+
+                    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+                        self.outer_names.update(node.names)
+
+                    def visit_Import(self, node: ast.Import) -> None:
+                        self.local_names.update(
+                            alias.asname or alias.name.split(".", maxsplit=1)[0] for alias in node.names
+                        )
+
+                    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+                        self.local_names.update(alias.asname or alias.name for alias in node.names)
+
+                    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+                        if node.name is not None:
+                            self.local_names.add(node.name)
+                        self.generic_visit(node)
+
+                    def visit_MatchAs(self, node: ast.MatchAs) -> None:
+                        if node.name is not None:
+                            self.local_names.add(node.name)
+                        self.generic_visit(node)
+
+                    def visit_MatchStar(self, node: ast.MatchStar) -> None:
+                        if node.name is not None:
+                            self.local_names.add(node.name)
+
+                    def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+                        if node.rest is not None:
+                            self.local_names.add(node.rest)
+                        self.generic_visit(node)
+
+                    def _visit_comprehension(
+                        self,
+                        generators: list[ast.comprehension],
+                        result_nodes: tuple[ast.AST, ...],
+                    ) -> None:
+                        for generator in generators:
+                            self.visit(generator.iter)
+                            for condition in generator.ifs:
+                                self.visit(condition)
+                        for result_node in result_nodes:
+                            self.visit(result_node)
+
+                    def visit_ListComp(self, node: ast.ListComp) -> None:
+                        self._visit_comprehension(node.generators, (node.elt,))
+
+                    def visit_SetComp(self, node: ast.SetComp) -> None:
+                        self._visit_comprehension(node.generators, (node.elt,))
+
+                    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+                        self._visit_comprehension(node.generators, (node.elt,))
+
+                    def visit_DictComp(self, node: ast.DictComp) -> None:
+                        self._visit_comprehension(node.generators, (node.key, node.value))
+
+                visitor = LocalBindingVisitor()
+                for node in nodes:
+                    visitor.visit(node)
+                return visitor.local_names - visitor.outer_names
+
+            def _argument_default_bindings(self, arguments: ast.arguments) -> dict[str, tuple[str | None, bool]]:
+                bindings: dict[str, tuple[str | None, bool]] = {}
+                positional_arguments = [*arguments.posonlyargs, *arguments.args]
+                if arguments.defaults:
+                    for argument, default in zip(
+                        positional_arguments[-len(arguments.defaults) :],
+                        arguments.defaults,
+                        strict=True,
+                    ):
+                        bindings[argument.arg] = (
+                            self._resolve_builtin(default),
+                            self._is_builtins_namespace(default),
+                        )
+                for argument, kw_default in zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True):
+                    if kw_default is not None:
+                        bindings[argument.arg] = (
+                            self._resolve_builtin(kw_default),
+                            self._is_builtins_namespace(kw_default),
+                        )
+                return bindings
+
+            def _visit_argument_annotations(self, arguments: ast.arguments, returns: ast.expr | None = None) -> None:
+                for argument in [
+                    *arguments.posonlyargs,
+                    *arguments.args,
+                    *arguments.kwonlyargs,
+                    arguments.vararg,
+                    arguments.kwarg,
+                ]:
+                    if argument is not None and argument.annotation is not None:
+                        self.visit(argument.annotation)
+                if returns is not None:
+                    self.visit(returns)
 
             def _visit_function_node(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-                self._bind_name(node.name, None)
                 for decorator in node.decorator_list:
                     self.visit(decorator)
+                self._visit_argument_annotations(node.args, node.returns)
+                default_bindings = self._argument_default_bindings(node.args)
                 for default in [*node.args.defaults, *node.args.kw_defaults]:
                     if default is not None:
                         self.visit(default)
-                self._push_scope(node.args)
-                for statement in node.body:
-                    self.visit(statement)
+                self._bind_name(node.name, None)
+                self._push_scope(node.args, default_bindings, self._local_binding_names(list(node.body)))
+                self._visit_statements(node.body)
                 self._pop_scope()
 
             def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -1935,53 +2396,417 @@ class JITScriptDetector:
             def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
                 self._visit_function_node(node)
 
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                default_bindings = self._argument_default_bindings(node.args)
+                for default in [*node.args.defaults, *node.args.kw_defaults]:
+                    if default is not None:
+                        self.visit(default)
+                self._push_scope(node.args, default_bindings, self._local_binding_names([node.body]))
+                self.visit(node.body)
+                self._pop_scope()
+
             def visit_ClassDef(self, node: ast.ClassDef) -> None:
-                self._bind_name(node.name, None)
                 for base in node.bases:
                     self.visit(base)
                 for keyword in node.keywords:
                     self.visit(keyword.value)
                 for decorator in node.decorator_list:
                     self.visit(decorator)
-                self._push_scope()
-                for statement in node.body:
-                    self.visit(statement)
+                self._push_scope(kind="class")
+                self._visit_statements(node.body)
                 self._pop_scope()
+                self._bind_name(node.name, None)
 
-            def visit_If(self, node: ast.If) -> None:
+            def visit_If(self, node: ast.If) -> ast.stmt | None:
                 self.visit(node.test)
                 truth = self._constant_truth(node.test)
                 if truth is True:
-                    for statement in node.body:
-                        self.visit(statement)
-                    return
+                    return self._visit_statements(node.body)
                 if truth is False:
-                    for statement in node.orelse:
-                        self.visit(statement)
+                    return self._visit_statements(node.orelse)
+
+                original = self._snapshot_alias_state()
+                body_terminal = self._visit_statements(node.body)
+                body = self._snapshot_alias_state()
+
+                self._restore_alias_state(original)
+                orelse_terminal = self._visit_statements(node.orelse)
+                orelse = self._snapshot_alias_state()
+
+                variants = []
+                if body_terminal is None:
+                    variants.append(body)
+                if orelse_terminal is None:
+                    variants.append(orelse)
+                if variants:
+                    self._merge_alias_state_variants(original, variants)
+                    return None
+                self._restore_alias_state(original)
+                return body_terminal or orelse_terminal
+
+            def _bind_match_pattern(self, pattern: ast.pattern, subject: ast.AST) -> None:
+                if isinstance(pattern, ast.MatchAs) and pattern.pattern is None and pattern.name is not None:
+                    self._bind_name(
+                        pattern.name,
+                        self._resolve_builtin(subject),
+                        builtins_module=self._is_builtins_namespace(subject),
+                    )
+                    return
+                if (
+                    isinstance(pattern, ast.MatchSequence)
+                    and isinstance(subject, (ast.List, ast.Tuple))
+                    and len(pattern.patterns) == len(subject.elts)
+                ):
+                    for child_pattern, child_subject in zip(pattern.patterns, subject.elts, strict=True):
+                        self._bind_match_pattern(child_pattern, child_subject)
+                    return
+                for candidate in ast.walk(pattern):
+                    name = None
+                    if isinstance(candidate, (ast.MatchAs, ast.MatchStar)):
+                        name = candidate.name
+                    elif isinstance(candidate, ast.MatchMapping):
+                        name = candidate.rest
+                    if name is not None:
+                        self._bind_name(name, None)
+
+            @staticmethod
+            def _match_case_is_irrefutable(case: ast.match_case, guard_truth: bool | None) -> bool:
+                return (
+                    (case.guard is None or guard_truth is True)
+                    and isinstance(case.pattern, ast.MatchAs)
+                    and case.pattern.pattern is None
+                )
+
+            def visit_Match(self, node: ast.Match) -> ast.stmt | None:
+                self.visit(node.subject)
+                original = self._snapshot_alias_state()
+                variants = []
+                has_irrefutable_case = False
+                terminal_cases = []
+                for case in node.cases:
+                    self._restore_alias_state(original)
+                    self.visit(case.pattern)
+                    self._bind_match_pattern(case.pattern, node.subject)
+                    guard_truth = None
+                    if case.guard is not None:
+                        self.visit(case.guard)
+                        guard_truth = self._constant_truth(case.guard)
+                        if guard_truth is False:
+                            continue
+                    terminal = self._visit_statements(case.body)
+                    if terminal is None:
+                        variants.append(self._snapshot_alias_state())
+                    else:
+                        terminal_cases.append(terminal)
+                    has_irrefutable_case = has_irrefutable_case or self._match_case_is_irrefutable(case, guard_truth)
+                if not has_irrefutable_case:
+                    variants.append(original)
+                if variants:
+                    self._merge_alias_state_variants(original, variants)
+                    return None
+                self._restore_alias_state(original)
+                return terminal_cases[0] if terminal_cases else None
+
+            @staticmethod
+            def _loop_body_rebinds_target(body: list[ast.stmt], target: ast.AST) -> bool:
+                target_names = {
+                    candidate.id
+                    for candidate in ast.walk(target)
+                    if isinstance(candidate, ast.Name) and isinstance(candidate.ctx, ast.Store)
+                }
+
+                class TargetRebindVisitor(ast.NodeVisitor):
+                    def __init__(self) -> None:
+                        self.found = False
+
+                    def visit_Name(self, node: ast.Name) -> None:
+                        if isinstance(node.ctx, (ast.Store, ast.Del)) and node.id in target_names:
+                            self.found = True
+
+                    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                        self.found = self.found or node.name in target_names
+                        self._visit_function_definition_expressions(node)
+
+                    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                        self.found = self.found or node.name in target_names
+                        self._visit_function_definition_expressions(node)
+
+                    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                        self.found = self.found or node.name in target_names
+                        for base in node.bases:
+                            self.visit(base)
+                        for keyword in node.keywords:
+                            self.visit(keyword.value)
+                        for decorator in node.decorator_list:
+                            self.visit(decorator)
+
+                    def visit_Lambda(self, node: ast.Lambda) -> None:
+                        for default in [*node.args.defaults, *node.args.kw_defaults]:
+                            if default is not None:
+                                self.visit(default)
+
+                    def _visit_function_definition_expressions(
+                        self,
+                        node: ast.FunctionDef | ast.AsyncFunctionDef,
+                    ) -> None:
+                        for decorator in node.decorator_list:
+                            self.visit(decorator)
+                        for argument in [
+                            *node.args.posonlyargs,
+                            *node.args.args,
+                            *node.args.kwonlyargs,
+                            node.args.vararg,
+                            node.args.kwarg,
+                        ]:
+                            if argument is not None and argument.annotation is not None:
+                                self.visit(argument.annotation)
+                        if node.returns is not None:
+                            self.visit(node.returns)
+                        for default in [*node.args.defaults, *node.args.kw_defaults]:
+                            if default is not None:
+                                self.visit(default)
+
+                    def _visit_comprehension(
+                        self,
+                        generators: list[ast.comprehension],
+                        result_nodes: tuple[ast.AST, ...],
+                    ) -> None:
+                        for generator in generators:
+                            self.visit(generator.iter)
+                            for condition in generator.ifs:
+                                self.visit(condition)
+                        for result_node in result_nodes:
+                            self.visit(result_node)
+
+                    def visit_ListComp(self, node: ast.ListComp) -> None:
+                        self._visit_comprehension(node.generators, (node.elt,))
+
+                    def visit_SetComp(self, node: ast.SetComp) -> None:
+                        self._visit_comprehension(node.generators, (node.elt,))
+
+                    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+                        self._visit_comprehension(node.generators, (node.elt,))
+
+                    def visit_DictComp(self, node: ast.DictComp) -> None:
+                        self._visit_comprehension(node.generators, (node.key, node.value))
+
+                visitor = TargetRebindVisitor()
+                for statement in body:
+                    visitor.visit(statement)
+                return visitor.found
+
+            @staticmethod
+            def _loop_body_may_break(body: list[ast.stmt]) -> bool:
+                class LoopBreakVisitor(ast.NodeVisitor):
+                    def __init__(self) -> None:
+                        self.found = False
+
+                    def visit_Break(self, node: ast.Break) -> None:
+                        self.found = True
+
+                    def visit_For(self, node: ast.For) -> None:
+                        return
+
+                    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+                        return
+
+                    def visit_While(self, node: ast.While) -> None:
+                        return
+
+                    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                        return
+
+                    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                        return
+
+                    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                        return
+
+                    def visit_Lambda(self, node: ast.Lambda) -> None:
+                        return
+
+                visitor = LoopBreakVisitor()
+                for statement in body:
+                    visitor.visit(statement)
+                return visitor.found
+
+            def _refine_known_loop_exit_target(
+                self,
+                node: ast.For | ast.AsyncFor,
+                body_terminal: ast.stmt | None,
+            ) -> None:
+                if self._loop_body_rebinds_target(node.body, node.target):
+                    return
+                elements = self._literal_iterable_elements(node.iter)
+                if not elements or not isinstance(node.iter, (ast.List, ast.Tuple)):
+                    return
+                if isinstance(body_terminal, ast.Break):
+                    self._bind_target_from_value(node.target, elements[0])
+                elif not self._loop_body_may_break(node.body):
+                    self._bind_target_from_value(node.target, elements[-1])
+
+            def _visit_loop(self, node: ast.For | ast.AsyncFor) -> None:
+                self.visit(node.iter)
+                iterable_truth = self._constant_iterable_truth(node.iter)
+                if iterable_truth is False:
+                    self._visit_statements(node.orelse)
                     return
 
-                original_scopes = self._copy_alias_scopes(self.alias_scopes)
-                original_builtins_aliases = self._copy_builtins_module_aliases(self.builtins_module_aliases)
+                original = self._snapshot_alias_state()
+                self._bind_loop_target_from_iterable(node.target, node.iter)
+                body_terminal = self._visit_statements(node.body)
+                self._refine_known_loop_exit_target(node, body_terminal)
+                body_state = self._snapshot_alias_state()
+                break_states = [body_state] if self._loop_body_may_break(node.body) else []
+                normal_states = []
+                if not isinstance(body_terminal, (ast.Return, ast.Raise, ast.Break)):
+                    normal_states.append(body_state)
+                if iterable_truth is None:
+                    normal_states.append(original)
 
-                self.alias_scopes = self._copy_alias_scopes(original_scopes)
-                self.builtins_module_aliases = self._copy_builtins_module_aliases(original_builtins_aliases)
+                variants = break_states
+                if normal_states:
+                    self._merge_alias_state_variants(original, normal_states)
+                    self._visit_statements(node.orelse)
+                    variants.append(self._snapshot_alias_state())
+                if not variants:
+                    variants.append(body_state)
+                self._merge_alias_state_variants(original, variants)
+
+            def visit_For(self, node: ast.For) -> None:
+                self._visit_loop(node)
+
+            def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+                self._visit_loop(node)
+
+            def visit_While(self, node: ast.While) -> ast.stmt | None:
+                self.visit(node.test)
+                truth = self._constant_truth(node.test)
+                if truth is False:
+                    return self._visit_statements(node.orelse)
+
+                original = self._snapshot_alias_state()
+                body_terminal = self._visit_statements(node.body)
+                body_state = self._snapshot_alias_state()
+                break_states = [body_state] if self._loop_body_may_break(node.body) else []
+                normal_states = []
+                if truth is not True and not isinstance(body_terminal, (ast.Return, ast.Raise, ast.Break)):
+                    normal_states.append(body_state)
+                if truth is None:
+                    normal_states.append(original)
+
+                variants = break_states
+                orelse_terminal = None
+                if normal_states:
+                    self._merge_alias_state_variants(original, normal_states)
+                    orelse_terminal = self._visit_statements(node.orelse)
+                    if orelse_terminal is None:
+                        variants.append(self._snapshot_alias_state())
+                if not variants:
+                    self._restore_alias_state(original)
+                    return body_terminal or orelse_terminal
+                self._merge_alias_state_variants(original, variants)
+                return None
+
+            def _visit_with(self, node: ast.With | ast.AsyncWith) -> ast.stmt | None:
+                for item in node.items:
+                    self.visit(item.context_expr)
+                    if item.optional_vars is not None:
+                        self._bind_target(item.optional_vars, None)
+                return self._visit_statements(node.body)
+
+            def visit_With(self, node: ast.With) -> ast.stmt | None:
+                return self._visit_with(node)
+
+            def visit_AsyncWith(self, node: ast.AsyncWith) -> ast.stmt | None:
+                return self._visit_with(node)
+
+            def visit_Try(self, node: ast.Try) -> ast.stmt | None:
+                original = self._snapshot_alias_state()
+                handler_entry_states = []
+                body_terminal: ast.stmt | None = None
                 for statement in node.body:
-                    self.visit(statement)
-                body_scopes = self._copy_alias_scopes(self.alias_scopes)
-                body_builtins_aliases = self._copy_builtins_module_aliases(self.builtins_module_aliases)
+                    entry_state = self._snapshot_alias_state()
+                    visit_result = self.visit(statement)
+                    if self._statement_may_raise_before_completion(statement):
+                        handler_entry_states.append(entry_state)
+                    if isinstance(statement, (ast.Break, ast.Continue, ast.Raise, ast.Return)):
+                        body_terminal = statement
+                        break
+                    if isinstance(visit_result, (ast.Break, ast.Continue, ast.Raise, ast.Return)):
+                        body_terminal = visit_result
+                        break
+                body_state = self._snapshot_alias_state()
+                variants = []
+                if body_terminal is None:
+                    orelse_terminal = self._visit_statements(node.orelse)
+                    if orelse_terminal is None:
+                        variants.append(self._snapshot_alias_state())
+                    else:
+                        body_terminal = orelse_terminal
+                for handler in node.handlers:
+                    for entry_state in handler_entry_states:
+                        self._restore_alias_state(entry_state)
+                        if handler.type is not None:
+                            self.visit(handler.type)
+                        if handler.name is not None:
+                            self._bind_name(handler.name, None)
+                        handler_terminal = self._visit_statements(handler.body)
+                        if handler_terminal is None:
+                            variants.append(self._snapshot_alias_state())
+                self._merge_alias_state_variants(original, variants or [body_state])
+                finally_terminal = self._visit_statements(node.finalbody)
+                if finally_terminal is not None:
+                    return finally_terminal
+                if not variants:
+                    return body_terminal
+                return None
 
-                self.alias_scopes = self._copy_alias_scopes(original_scopes)
-                self.builtins_module_aliases = self._copy_builtins_module_aliases(original_builtins_aliases)
-                for statement in node.orelse:
-                    self.visit(statement)
-                orelse_scopes = self._copy_alias_scopes(self.alias_scopes)
-                orelse_builtins_aliases = self._copy_builtins_module_aliases(self.builtins_module_aliases)
+            def _visit_comprehension(
+                self,
+                generators: list[ast.comprehension],
+                result_nodes: tuple[ast.AST, ...],
+            ) -> None:
+                if not generators:
+                    return
 
-                self.alias_scopes = self._merge_branch_aliases(original_scopes, body_scopes, orelse_scopes)
-                self.builtins_module_aliases = self._merge_branch_builtins_module_aliases(
-                    body_builtins_aliases,
-                    orelse_builtins_aliases,
-                )
+                first_generator, *remaining_generators = generators
+                self.visit(first_generator.iter)
+                if self._constant_iterable_truth(first_generator.iter) is False:
+                    return
+
+                self._push_scope(kind="comprehension")
+                try:
+                    self._bind_loop_target_from_iterable(first_generator.target, first_generator.iter)
+                    for condition in first_generator.ifs:
+                        self.visit(condition)
+                        if self._constant_truth(condition) is False:
+                            return
+                    for generator in remaining_generators:
+                        self.visit(generator.iter)
+                        if self._constant_iterable_truth(generator.iter) is False:
+                            return
+                        self._bind_loop_target_from_iterable(generator.target, generator.iter)
+                        for condition in generator.ifs:
+                            self.visit(condition)
+                            if self._constant_truth(condition) is False:
+                                return
+                    for result_node in result_nodes:
+                        self.visit(result_node)
+                finally:
+                    self._pop_scope()
+
+            def visit_ListComp(self, node: ast.ListComp) -> None:
+                self._visit_comprehension(node.generators, (node.elt,))
+
+            def visit_SetComp(self, node: ast.SetComp) -> None:
+                self._visit_comprehension(node.generators, (node.elt,))
+
+            def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+                self._visit_comprehension(node.generators, (node.elt,))
+
+            def visit_DictComp(self, node: ast.DictComp) -> None:
+                self._visit_comprehension(node.generators, (node.key, node.value))
 
             def visit_Call(self, node: ast.Call) -> None:
                 if builtin := self._resolve_builtin(node.func):
@@ -1991,6 +2816,21 @@ class JITScriptDetector:
         visitor = DangerousBuiltinCallVisitor()
         visitor.visit(tree)
         return visitor.findings
+
+    @staticmethod
+    def _contextual_dangerous_builtin_sources(data: bytes) -> dict[str, str]:
+        """Return builtin calls that require framed prefix alias context."""
+        sources: dict[str, str] = {}
+        for contextual_source, include_full_source in _embedded_python_extraction_windows(data):
+            if not include_full_source:
+                continue
+            code_str, _byte_offsets = _decode_utf8_with_byte_offsets(contextual_source)
+            parsed_snippet = _parse_embedded_python_snippet(code_str)
+            if parsed_snippet is None:
+                continue
+            for builtin in JITScriptDetector._dangerous_builtin_calls_in_tree(parsed_snippet[0]):
+                sources.setdefault(builtin, code_str)
+        return sources
 
     @staticmethod
     def _dangerous_imports_in_tree(tree: ast.AST) -> set[str]:
@@ -2068,7 +2908,7 @@ class JITScriptDetector:
         # Look for embedded Python code even when framework markers are absent.
         # Scanner callers can hand us raw code-bearing blobs, and an attacker can
         # remove marker strings without removing the executable payload.
-        if b"def " in data or b"class " in data:
+        if _has_source_like_embedded_python_start(data):
             code_findings = self._extract_and_check_python_code(data, "TorchScript", context)
             findings.extend(code_findings)
 
@@ -2091,7 +2931,7 @@ class JITScriptDetector:
                 )
             )
 
-        return _dedupe_analysis_incomplete_findings(findings)
+        return findings
 
     def scan_tensorflow(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Scan TensorFlow SavedModel for dangerous operations.
@@ -2175,7 +3015,7 @@ class JITScriptDetector:
                 )
             )
 
-        return _dedupe_analysis_incomplete_findings(findings)
+        return findings
 
     def scan_onnx(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Scan ONNX model for custom operators and dangerous patterns.
@@ -2279,35 +3119,42 @@ class JITScriptDetector:
         if not self.check_ast:
             return findings
 
-        bounded = data if include_full_source else data[:_EMBEDDED_PYTHON_SCAN_WINDOW_BYTES]
+        bounded = data if include_full_source else data[:_EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT]
         matches = _candidate_embedded_python_snippets(bounded, include_full_source=include_full_source)
-        selected_matches = _prioritized_embedded_python_snippets(matches, bounded=bounded)
-        skipped_candidate_count = _embedded_python_snippet_budget_skipped_count(matches, bounded=bounded)
-        if not include_full_source and skipped_candidate_count > 0:
+        prioritized_matches, omitted_budgeted_spans = _select_prioritized_embedded_python_snippets(
+            matches, bounded=bounded
+        )
+        has_bounded_source = _has_source_like_embedded_python_start(bounded)
+        has_source_beyond_bound = (
+            not include_full_source
+            and len(data) > _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+            and _has_source_like_embedded_python_start(
+                data,
+                start_offset=max(
+                    0,
+                    _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT - _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES,
+                ),
+            )
+        )
+        if (
+            not include_full_source
+            and len(data) > _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+            and (has_bounded_source or has_source_beyond_bound)
+        ):
             findings.append(
-                _create_embedded_python_analysis_incomplete_finding(
+                _embedded_python_analysis_incomplete_finding(
                     framework=framework,
                     context=context,
-                    reason=JIT_EMBEDDED_PYTHON_SNIPPET_BUDGET_REASON,
-                    message=(
-                        "JIT embedded Python analysis incomplete because candidate snippets exceeded "
-                        "the detector budget"
-                    ),
-                    details={
-                        "incomplete_reason": "embedded_python_snippet_budget_exceeded",
-                        "candidate_count": len(matches),
-                        "selected_candidate_count": len(selected_matches),
-                        "skipped_candidate_count": skipped_candidate_count,
-                        "max_default_snippets": _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS,
-                        "max_priority_snippets": _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS,
-                        "bounded_bytes": len(bounded),
-                    },
+                    reason=_EMBEDDED_PYTHON_BYTE_LIMIT_REASON,
+                    message=("Embedded Python/JIT analysis incomplete: payload exceeds the bounded byte scan window"),
+                    max_scan_bytes=_EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT,
                 )
             )
         bounded_high_risk_calls: set[tuple[str, str]] | None = None
         bounded_builtin_calls: set[str] | None = None
         snippet_high_risk_calls: set[tuple[str, str]] = set()
         snippet_builtin_calls: set[str] = set()
+        contextual_builtin_sources = self._contextual_dangerous_builtin_sources(bounded)
         parsed_snippet_spans: list[tuple[int, int]] = []
         try:
             bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
@@ -2319,7 +3166,7 @@ class JITScriptDetector:
             bounded_high_risk_calls = None
             bounded_builtin_calls = None
 
-        for match, span, real_ranges in selected_matches:
+        for match, span, real_ranges in prioritized_matches:
             try:
                 if _is_span_inside_parsed_spans(span, parsed_snippet_spans):
                     continue
@@ -2405,6 +3252,47 @@ class JITScriptDetector:
                 # Failed to process this code snippet
                 continue
 
+        reported_builtins = {
+            finding.builtin
+            for finding in findings
+            if finding.type == "dangerous_builtin" and finding.builtin is not None
+        }
+        for builtin, code_str in contextual_builtin_sources.items():
+            snippet_builtin_calls.add(builtin)
+            if builtin in reported_builtins:
+                continue
+            findings.append(
+                create_jit_finding(
+                    message=f"Dangerous builtin '{builtin}' used in embedded code",
+                    severity="CRITICAL",
+                    context=context,
+                    pattern=None,
+                    recommendation=f"Remove {builtin} usage - it can execute arbitrary code",
+                    confidence=0.9,
+                    framework=framework,
+                    code_snippet=code_str[:200],
+                    type="dangerous_builtin",
+                    operation=None,
+                    builtin=builtin,
+                    import_=None,
+                )
+            )
+
+        uncovered_omitted_spans = [
+            span for span in omitted_budgeted_spans if not _is_span_inside_parsed_spans(span, parsed_snippet_spans)
+        ]
+        if uncovered_omitted_spans:
+            findings.append(
+                _embedded_python_analysis_incomplete_finding(
+                    framework=framework,
+                    context=context,
+                    reason=_EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON,
+                    message=("Embedded Python/JIT analysis incomplete: candidate snippet budget was exceeded"),
+                    omitted_snippets=len(uncovered_omitted_spans),
+                    candidates_count=len(matches),
+                )
+            )
+
         # Check for common code execution patterns in binary
         resolved_high_risk_calls = (bounded_high_risk_calls or set()) | snippet_high_risk_calls
         resolved_builtin_calls = (bounded_builtin_calls or set()) | snippet_builtin_calls
@@ -2484,6 +3372,7 @@ class JITScriptDetector:
         from modelaudit.models import JITScriptFinding
 
         findings: list[JITScriptFinding] = []
+        resolved_dangerous_builtins = self._dangerous_builtin_calls_in_tree(tree)
 
         class DangerousNodeVisitor(ast.NodeVisitor):
             def __init__(self) -> None:
@@ -2532,7 +3421,7 @@ class JITScriptDetector:
 
             def visit_Call(self, node: ast.Call) -> None:
                 # Check for dangerous function calls
-                if isinstance(node.func, ast.Name) and node.func.id in DANGEROUS_BUILTINS:
+                if isinstance(node.func, ast.Name) and node.func.id in resolved_dangerous_builtins:
                     self.findings.append(
                         create_jit_finding(
                             message=f"AST analysis: Dangerous function call '{node.func.id}'",
@@ -2809,19 +3698,39 @@ class JITScriptDetector:
             elif b"onnx" in data or b"ai.onnx" in data:
                 model_type = "onnx"
 
+        source_like_embedded_python = (
+            _has_source_like_embedded_python_start(data)
+            if model_type == "pickle"
+            or (
+                model_type in ["pytorch", "torchscript", "unknown"] and len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+            )
+            else False
+        )
+        model_specific_embedded_python_fully_scanned = False
+
         # Scan based on model type
         if model_type in ["pytorch", "torchscript"]:
             findings.extend(self.scan_torchscript(data, context))
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
+            model_specific_embedded_python_fully_scanned = (
+                source_like_embedded_python and len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+            )
 
         if model_type in ["tensorflow", "tf", "keras"]:
             findings.extend(self.scan_tensorflow(data, context))
+            model_specific_embedded_python_fully_scanned = (
+                len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+                and (b"SavedFunction" in data or b"saved_model.pb" in data)
+                and (b"python_function" in data or b"function_spec" in data)
+                and _has_source_like_embedded_python_start(data)
+            )
 
         if model_type == "onnx":
             findings.extend(self.scan_onnx(data, context))
 
-        if model_type == "pickle" and (b"def " in data or b"class " in data):
+        if model_type == "pickle" and source_like_embedded_python:
             findings.extend(self._extract_and_check_python_code(data, "Generic Python", context))
+            model_specific_embedded_python_fully_scanned = len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
 
         # Always check for generic dangerous patterns
         # Only run fallback scanners if model type is truly unknown
@@ -2833,16 +3742,16 @@ class JITScriptDetector:
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
             findings.extend(self.scan_tensorflow(data, context))
             findings.extend(self.scan_onnx(data, context))
+            model_specific_embedded_python_fully_scanned = len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT and (
+                source_like_embedded_python
+                or (
+                    (b"SavedFunction" in data or b"saved_model.pb" in data)
+                    and (b"python_function" in data or b"function_spec" in data)
+                    and _has_source_like_embedded_python_start(data)
+                )
+            )
 
-        trusted_embedded_python_model = model_type in {"pytorch", "torchscript", "pickle"}
-        should_probe_embedded_python_coverage = trusted_embedded_python_model or model_type == "unknown"
-        has_parseable_framed_python_source = (
-            should_probe_embedded_python_coverage and self._has_parseable_framed_python_source(data)
-        )
-        has_trusted_omitted_python_marker = (
-            trusted_embedded_python_model and _omitted_middle_contains_embedded_python_marker(data)
-        )
-        if self._looks_like_dangerous_python_source(data):
+        if not model_specific_embedded_python_fully_scanned and self._looks_like_dangerous_python_source(data):
             findings.extend(
                 self._extract_and_check_python_code(
                     data,
@@ -2851,25 +3760,7 @@ class JITScriptDetector:
                     include_full_source=True,
                 )
             )
-        elif has_parseable_framed_python_source or has_trusted_omitted_python_marker:
-            if _embedded_python_middle_bytes_omitted(data):
-                findings.append(
-                    _create_embedded_python_analysis_incomplete_finding(
-                        framework="Generic Python",
-                        context=context,
-                        reason=JIT_EMBEDDED_PYTHON_WINDOW_TRUNCATION_REASON,
-                        message=(
-                            "JIT embedded Python analysis incomplete because the detector inspected only "
-                            "bounded prefix and tail windows"
-                        ),
-                        details={
-                            "incomplete_reason": "embedded_python_window_truncation",
-                            "data_size": len(data),
-                            "scan_window_bytes": _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES,
-                            "omitted_bytes": len(data) - (2 * _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES),
-                        },
-                    )
-                )
+        elif not model_specific_embedded_python_fully_scanned and self._looks_like_framed_dangerous_python_source(data):
             for window, include_full_source in _embedded_python_extraction_windows(data):
                 findings.extend(
                     self._extract_and_check_python_code(
@@ -2880,7 +3771,7 @@ class JITScriptDetector:
                     )
                 )
 
-        return _dedupe_analysis_incomplete_findings(findings)
+        return findings
 
 
 def detect_jit_script_risks(file_path: str, max_size: int = 500 * 1024 * 1024) -> list["JITScriptFinding"]:
