@@ -38,6 +38,8 @@ _CLOUD_CONTENT_SNIFF_BYTES = 8 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
 _MSGPACK_CONTAINER_MARKERS = frozenset((*range(0x80, 0x90), 0xDE, 0xDF))
+_MAX_CLOUD_METADATA_ERROR_SAMPLES = 3
+_MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS = 512
 
 
 def _run_coroutine_sync(coro_factory: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
@@ -91,6 +93,28 @@ def redact_cloud_error_for_display(message: object, source_url: str | None = Non
         redacted = redacted.replace(source_url, redact_url_for_display(source_url))
     redacted = _URL_USERINFO_RE.sub(r"\1<credentials-redacted>@", redacted)
     return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1<redacted>", redacted)
+
+
+def _redact_cloud_path_for_display(path: object) -> str:
+    """Redact credentials from cloud paths even when providers strip the protocol."""
+    path_text = str(path)
+    return redact_cloud_error_for_display(path_text, path_text)
+
+
+def _bound_cloud_metadata_error_display(message: str) -> str:
+    """Limit model-controlled cloud metadata diagnostics retained in memory."""
+    if len(message) <= _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS:
+        return message
+    return f"{message[: _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS - 3]}..."
+
+
+def _cloud_metadata_error_sample(path: object, error: object) -> dict[str, str]:
+    """Return a bounded, credential-safe metadata failure sample."""
+    path_text = str(path)
+    return {
+        "path": _bound_cloud_metadata_error_display(_redact_cloud_path_for_display(path_text)),
+        "error": _bound_cloud_metadata_error_display(redact_cloud_error_for_display(error, path_text)),
+    }
 
 
 def _cloud_error_sanitizer(source_url: str) -> Callable[[Exception], str]:
@@ -341,6 +365,8 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         # It's a directory, list contents
         files = []
         total_size = 0
+        metadata_error_count = 0
+        metadata_errors: list[dict[str, str]] = []
 
         # List all files recursively
         # Ensure URL ends with / for proper globbing
@@ -348,7 +374,10 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         for item in fs.glob(glob_pattern):
             try:
                 item_info = fs.info(item)
-                if item_info.get("type") == "file" or "size" in item_info:
+                item_type = item_info.get("type")
+                if item_type == "directory":
+                    continue
+                if item_type == "file" or "size" in item_info:
                     size = item_info.get("size", 0)
                     file_metadata = {
                         "path": item,
@@ -361,8 +390,28 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
                         file_metadata["etag"] = etag
                     files.append(file_metadata)
                     total_size += size
-            except Exception:
-                continue
+                else:
+                    raise ValueError("cloud provider returned incomplete metadata for listed object")
+            except Exception as exc:
+                metadata_error_count += 1
+                if len(metadata_errors) < _MAX_CLOUD_METADATA_ERROR_SAMPLES:
+                    metadata_errors.append(_cloud_metadata_error_sample(item, exc))
+
+        if metadata_error_count:
+            sample_errors = "; ".join(f"{entry['path']}: {entry['error']}" for entry in metadata_errors)
+            if metadata_error_count > len(metadata_errors):
+                sample_errors = f"{sample_errors}; ..."
+            return {
+                "type": "unknown",
+                "analysis_incomplete": True,
+                "metadata_error_count": metadata_error_count,
+                "metadata_errors": metadata_errors,
+                "error": (
+                    "Cloud directory analysis incomplete: metadata lookup failed for "
+                    f"{metadata_error_count} object(s) under {redact_url_for_display(url)}: "
+                    f"{sample_errors}"
+                ),
+            }
 
         directory_metadata: dict[str, Any] = {
             "type": "directory",
@@ -608,18 +657,28 @@ def filter_scannable_files(
     return scannable
 
 
+def _read_bounded_cloud_content(remote_file: Any, max_bytes: int) -> bytes:
+    """Read through short transport reads without exceeding the requested bound."""
+    payload = bytearray()
+    while len(payload) < max_bytes:
+        chunk = remote_file.read(max_bytes - len(payload))
+        if not isinstance(chunk, bytes):
+            raise TypeError("cloud filesystem returned non-bytes content")
+        if not chunk:
+            break
+        payload.extend(chunk)
+    return bytes(payload)
+
+
 def _read_cloud_content_prefix(fs: Any, file_url: str, max_bytes: int) -> bytes:
     """Read a bounded remote prefix or fail closed with a redacted error."""
     try:
         with fs.open(file_url, "rb") as remote_file:
-            prefix = remote_file.read(max_bytes)
-            if not isinstance(prefix, bytes):
-                raise TypeError("cloud filesystem returned non-bytes content")
-            return prefix
+            return _read_bounded_cloud_content(remote_file, max_bytes)
     except Exception as exc:
         raise ValueError(
             "Cloud directory selective filtering incomplete: unable to inspect skipped object "
-            f"{redact_url_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+            f"{_redact_cloud_path_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
         ) from exc
 
 
@@ -628,14 +687,24 @@ def _read_cloud_content_range(fs: Any, file_url: str, offset: int, max_bytes: in
     try:
         with fs.open(file_url, "rb") as remote_file:
             remote_file.seek(offset)
-            payload = remote_file.read(max_bytes)
-            if not isinstance(payload, bytes):
-                raise TypeError("cloud filesystem returned non-bytes content")
-            return payload
+            return _read_bounded_cloud_content(remote_file, max_bytes)
     except Exception as exc:
         raise ValueError(
             "Cloud directory selective filtering incomplete: unable to inspect skipped object "
-            f"{redact_url_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+            f"{_redact_cloud_path_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+        ) from exc
+
+
+def _get_cloud_content_size_for_routing(fs: Any, file_url: str) -> int:
+    """Read the remote object's actual size for tail-sensitive content routing."""
+    try:
+        with fs.open(file_url, "rb") as remote_file:
+            remote_file.seek(0, os.SEEK_END)
+            return _parse_size_value(remote_file.tell())
+    except Exception as exc:
+        raise ValueError(
+            "Cloud directory selective filtering incomplete: unable to inspect skipped object "
+            f"{_redact_cloud_path_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
         ) from exc
 
 
@@ -650,10 +719,12 @@ def _detect_cloud_shared_skip_filter_route(
     """Route skipped cloud objects through the same bounded detector as local skips."""
     from modelaudit.utils.file.detection import (
         _COREML_PROTO_SIGNATURE_READ_BYTES,
+        _XML_MODEL_SIGNATURE_READ_BYTES,
         FLAX_MSGPACK_STRUCTURE_READ_BYTES,
         LLAMAFILE_ROUTE_SCAN_BYTES,
         LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
         MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+        _could_be_xml_prefix,
         _could_start_coreml_model_proto,
         _is_executorch_binary_signature,
         _is_supported_llamafile_executable_header,
@@ -661,6 +732,7 @@ def _detect_cloud_shared_skip_filter_route(
     )
 
     probe_size = _CLOUD_CONTENT_SNIFF_BYTES
+    is_llamafile_candidate = _is_supported_llamafile_executable_header(prefix[:4])
     if prefix.lstrip().startswith((b"{", b"[")):
         probe_size = max(probe_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
     if prefix and prefix[0] in _MSGPACK_CONTAINER_MARKERS:
@@ -669,7 +741,11 @@ def _detect_cloud_shared_skip_filter_route(
         probe_size = max(probe_size, _COREML_PROTO_SIGNATURE_READ_BYTES)
     if _is_executorch_binary_signature(prefix[:8]):
         probe_size = max(probe_size, 64 * 1024)
-    if _is_supported_llamafile_executable_header(prefix[:4]):
+    if _could_be_xml_prefix(prefix):
+        probe_size = max(probe_size, _XML_MODEL_SIGNATURE_READ_BYTES)
+    if is_llamafile_candidate:
+        size = _get_cloud_content_size_for_routing(fs, file_url)
+        size_is_known = True
         probe_size = max(probe_size, LLAMAFILE_ROUTE_SCAN_BYTES)
 
     if size_is_known:
@@ -681,7 +757,7 @@ def _detect_cloud_shared_skip_filter_route(
 
     tail: bytes | None = None
     tail_offset: int | None = None
-    if size_is_known and size > LLAMAFILE_ROUTE_SCAN_BYTES and _is_supported_llamafile_executable_header(prefix[:4]):
+    if size_is_known and size > LLAMAFILE_ROUTE_SCAN_BYTES and is_llamafile_candidate:
         tail_size = min(size, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES)
         tail_offset = size - tail_size
         tail = _read_cloud_content_range(fs, file_url, tail_offset, tail_size)
@@ -770,18 +846,12 @@ def _detect_cloud_mxnet_symbol_route(
 def _detect_cloud_content_route_format(fs: Any, file_info: dict[str, Any]) -> str | None:
     """Return a content-routed model format for a remote object, if cheaply identifiable."""
     file_url = str(file_info["path"])
-    size_is_known = "size" in file_info
-    try:
-        size = _parse_size_value(file_info.get("size", _CLOUD_CONTENT_SNIFF_BYTES))
-    except (TypeError, ValueError):
-        size = _CLOUD_CONTENT_SNIFF_BYTES
-        size_is_known = False
-    if size <= 0:
-        return None
-
-    prefix = _read_cloud_content_prefix(fs, file_url, min(size, _CLOUD_CONTENT_SNIFF_BYTES))
+    prefix_limit = _CLOUD_CONTENT_SNIFF_BYTES
+    prefix = _read_cloud_content_prefix(fs, file_url, prefix_limit)
     if not prefix:
         return None
+    size = len(prefix)
+    size_is_known = size < prefix_limit
 
     from modelaudit.utils.file.detection import (
         PROTO0_1_MAX_PROBE_BYTES,
@@ -855,7 +925,7 @@ def _detect_cloud_content_route_format(fs: Any, file_info: dict[str, Any]) -> st
         except Exception as exc:
             raise ValueError(
                 "Cloud directory selective filtering incomplete: unable to classify skipped ZIP object "
-                f"{redact_url_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+                f"{_redact_cloud_path_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
             ) from exc
     if detected_format != "unknown":
         return detected_format
