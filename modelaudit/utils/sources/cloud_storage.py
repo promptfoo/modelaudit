@@ -685,6 +685,30 @@ def _clear_directory_contents(path: Path) -> None:
             child.unlink()
 
 
+def _cached_path_within_size_limit(path: Path, max_size: int) -> bool:
+    """Return whether a cached file or directory can be proven within a size limit."""
+    try:
+        if path.is_file():
+            return path.stat().st_size <= max_size
+        if not path.is_dir():
+            return False
+
+        total_size = 0
+        for child in path.rglob("*"):
+            if child.is_symlink():
+                return False
+            if child.is_dir():
+                continue
+            if not child.is_file():
+                return False
+            total_size += child.stat().st_size
+            if total_size > max_size:
+                return False
+        return True
+    except OSError:
+        return False
+
+
 def _selected_cloud_download_size(fs: Any, files: list[dict[str, Any]], max_size: int) -> int:
     """Return the late-bound size of selected objects, failing closed on unknown sizes."""
     total_size = 0
@@ -797,9 +821,16 @@ def download_from_cloud(
     if cache:
         cached_path = cache.get_cached_path(url, etag=etag)
         if cached_path:
-            if show_progress:
-                click.echo(f"✓ Using cached version from {cached_path}")
-            return cached_path
+            if max_size and not _cached_path_within_size_limit(cached_path, max_size):
+                logger.warning(
+                    "Ignoring cached version for %s because its local size exceeds or cannot be validated against "
+                    "the maximum download size",
+                    redact_url_for_display(url),
+                )
+            else:
+                if show_progress:
+                    click.echo(f"✓ Using cached version from {cached_path}")
+                return cached_path
 
     # Check if we can use streaming analysis
     if stream_analyze and metadata.get("type") == "file":

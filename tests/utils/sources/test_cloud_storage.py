@@ -392,13 +392,45 @@ def test_download_from_cloud_reuses_cache_with_matching_etag(mock_fs: MagicMock,
     mock_fs.side_effect = [first_meta, downloader, second_meta]
 
     first = download_from_cloud(url, cache_dir=tmp_path, show_progress=False)
-    second = download_from_cloud(url, cache_dir=tmp_path, show_progress=False)
+    second = download_from_cloud(url, cache_dir=tmp_path, max_size=4, show_progress=False)
 
     assert isinstance(first, Path)
     assert second == first
     assert first.read_bytes() == b"data"
     downloader.get.assert_called_once()
     assert mock_fs.call_count == 3
+
+
+@patch("fsspec.filesystem")
+def test_download_from_cloud_does_not_reuse_cached_file_over_max_size(mock_fs: MagicMock, tmp_path: Path) -> None:
+    url = "s3://bucket/model.pt"
+
+    first_meta = make_fs_mock()
+    first_meta.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+
+    first_downloader = make_fs_mock()
+    first_downloader.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+    first_downloader.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+
+    second_meta = make_fs_mock()
+    second_meta.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+
+    second_downloader = make_fs_mock()
+    second_downloader.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
+    second_downloader.open.return_value = BytesIO(b"data")
+
+    mock_fs.side_effect = [first_meta, first_downloader, second_meta, second_downloader]
+
+    first = download_from_cloud(url, cache_dir=tmp_path, show_progress=False)
+    assert isinstance(first, Path)
+    first.write_bytes(b"oversized")
+
+    second = download_from_cloud(url, cache_dir=tmp_path, max_size=4, show_progress=False)
+
+    assert second == first
+    assert second.read_bytes() == b"data"
+    second_downloader.open.assert_called_once_with(url, "rb")
+    assert mock_fs.call_count == 4
 
 
 @patch("fsspec.filesystem")
