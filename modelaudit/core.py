@@ -673,6 +673,10 @@ def _should_defer_hash_for_max_total_size(
     return hashed_bytes > max_total_size
 
 
+def _is_incomplete_aggregate_hash_placeholder(content_hash: str) -> bool:
+    return content_hash.startswith(("unhashable_max_file_size_", "unhashable_max_total_size_"))
+
+
 def _hash_files_by_path(file_paths: list[str], *, config: dict[str, Any] | None = None) -> dict[str, str]:
     """Hash files individually so scan results stay path-specific.
 
@@ -969,8 +973,9 @@ def scan_model_directory_or_file(
             shard_family_paths: dict[_ShardFamilyKey, set[str]] = {}
             complete_hf_shard_families: set[_ShardFamilyKey] = set()
             directory_discovery_started_at = _start_phase_timing(phase_timings)
-            for root, _, files in os.walk(path, followlinks=False):
-                for file in files:
+            for root, dirs, files in os.walk(path, followlinks=False):
+                dirs.sort()
+                for file in sorted(files):
                     file_path = os.path.join(root, file)
 
                     # HuggingFace cache bookkeeping files should never surface as
@@ -1140,7 +1145,7 @@ def scan_model_directory_or_file(
                 top_level_hashing_started_at = _start_phase_timing(phase_timings)
                 content_hashes = _hash_files_by_path(hash_paths, config=config)
                 if any(
-                    content_hash.startswith("unhashable_max_total_size_") for content_hash in content_hashes.values()
+                    _is_incomplete_aggregate_hash_placeholder(content_hash) for content_hash in content_hashes.values()
                 ):
                     aggregate_hash_complete = False
                 _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
@@ -1384,11 +1389,12 @@ def scan_model_directory_or_file(
                     config,
                     hashed_bytes=top_level_hashed_bytes,
                 )
-                if defer_hash_for_max_total_size:
+                defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(target, config)
+                if defer_hash_for_max_total_size or defer_hash_for_max_file_size:
                     aggregate_hash_complete = False
                 if (
                     not _should_defer_hash_for_safetensors_header_limit(target, config)
-                    and not _should_defer_hash_for_max_file_size(target, config)
+                    and not defer_hash_for_max_file_size
                     and not defer_hash_for_max_total_size
                 ):
                     try:
@@ -2343,11 +2349,12 @@ def scan_model_streaming(
                     scan_config,
                     hashed_bytes=top_level_hashed_bytes,
                 )
-                if defer_hash_for_max_total_size:
+                defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(str(scan_path), scan_config)
+                if defer_hash_for_max_total_size or defer_hash_for_max_file_size:
                     aggregate_hash_complete = False
                 if (
                     not _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config)
-                    and not _should_defer_hash_for_max_file_size(str(scan_path), scan_config)
+                    and not defer_hash_for_max_file_size
                     and not defer_hash_for_max_total_size
                 ):
                     if progress_callback:

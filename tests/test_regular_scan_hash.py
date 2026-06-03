@@ -4,6 +4,7 @@ import hashlib
 import os
 import pickle
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -404,9 +405,16 @@ class TestHashGenerationEdgeCases:
         second.write_bytes(b"B" * 33)
         third = tmp_path / "third.pkl"
         third.write_bytes(b"C")
+        original_walk = core.os.walk
 
         original_hash = core._calculate_file_hash
         hashed_paths: list[str] = []
+
+        def unsorted_walk(top: str, followlinks: bool = False) -> Iterator[tuple[str, list[str], list[str]]]:
+            if Path(top) == tmp_path:
+                yield str(tmp_path), [], ["third.pkl", "first.pkl", "second.pkl"]
+                return
+            yield from original_walk(top, followlinks=followlinks)
 
         def track_hash(path: str) -> str:
             hashed_paths.append(path)
@@ -418,6 +426,7 @@ class TestHashGenerationEdgeCases:
             scan_result.finish(success=True)
             return scan_result
 
+        monkeypatch.setattr(core.os, "walk", unsorted_walk)
         monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
         monkeypatch.setattr(core, "scan_file", successful_scan)
 
@@ -430,6 +439,26 @@ class TestHashGenerationEdgeCases:
         assert len(hashed_paths) == 2
         assert result.content_hash is None
         assert result.success is True
+
+    def test_directory_scan_omits_content_hash_when_max_file_size_hashing_incomplete(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Directory scans must not publish hashes that omit oversized rejected files."""
+        small = tmp_path / "small.pkl"
+        small.write_bytes(pickle.dumps(1))
+        oversized = tmp_path / "oversized.pkl"
+        oversized.write_bytes(pickle.dumps({"safe": True}) + b"X" * 128)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            max_file_size=64,
+            cache_enabled=False,
+        )
+
+        assert result.content_hash is None
+        assert determine_exit_code(result) == 2
+        assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
 
     def test_single_file_scan_fails_closed_after_max_total_size(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
