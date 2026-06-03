@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- avoid false inconclusive Flax overlap results for complete pickle payloads with no trailing data
 - scan ONNX external data references in sparse initializers, tensor-valued attributes, and function defaults
 - avoid false-positive process-launch findings for parsed framed Python string literals
 - detect dangerous Python calls retrieved through module namespace dictionaries in ZIP and TAR members
@@ -32,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- enforce direct Hugging Face file `--max-size` budgets before downloading
+- scan duplicate and case-varied ExecuTorch pickle ZIP members without shadowable-name or metadata-routing bypasses
+- refresh cloud cache entries that cannot be proven within the configured download size limit
+- enforce automatic cloud download size limits when remote size metadata is missing or late-bound
+- avoid importing attacker-shadowed TensorFlow protobuf packages during static scanning
 - inspect every parsed GGUF chat template when duplicate or trailing malformed metadata could otherwise hide SSTI payloads
 - bound GGUF declared metadata and tensor collections, and cap reported tensor summaries, so oversized structures fail closed without exhausting scanner resources
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
@@ -40,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
+- fail closed when cloud directory metadata cannot be read for every listed object
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
 - detect external references in weights-only Keras HDF5 layouts without Keras metadata
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
@@ -60,6 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve per-shard metadata when aggregating sharded model families
 - prevent picklescan call-graph alias cycles from hanging scans
 - preserve HuggingFace snapshot shard paths while grouping cache-backed families
+- fail closed when Hugging Face repository listings contain no recognized scannable files instead of downloading the full repository
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - classify unavailable manifest and ML text reads as inconclusive rather than security findings, including routing, preflight, and stale cache transitions
 - classify unavailable manifest cloud-reference inspection as inconclusive rather than reporting complete coverage
