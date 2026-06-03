@@ -55,6 +55,24 @@ def _make_tar_payload() -> bytes:
     return payload.getvalue()
 
 
+def _ubjson_key(key: bytes) -> bytes:
+    return b"U" + bytes([len(key)]) + key
+
+
+def _make_xgboost_ubjson_payload() -> bytes:
+    return (
+        b"{"
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + _ubjson_key(b"version")
+        + b"[]"
+        + b"}"
+    )
+
+
 class TestHuggingFaceURLDetection:
     """Test HuggingFace URL detection."""
 
@@ -437,10 +455,24 @@ class TestModelDownload:
                 b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\n"
                 b"max_feature_idx=0\ntree=0\nnum_leaves=1\nsplit_feature=0\nleaf_value=0\n"
             ),
+            b'<?xml version="1.0" encoding="UTF-8"?><PMML version="4.4"></PMML>',
+            b'{"orbax_version":"1.0","framework":"jax"}',
+            _make_xgboost_ubjson_payload(),
             b'{"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
             b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00",
         ],
-        ids=["safetensors", "protocol0-pickle", "tar", "cntk", "lightgbm", "mxnet", "executorch"],
+        ids=[
+            "safetensors",
+            "protocol0-pickle",
+            "tar",
+            "cntk",
+            "lightgbm",
+            "pmml-xml",
+            "jax-json",
+            "xgboost-ubjson",
+            "mxnet",
+            "executorch",
+        ],
     )
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
@@ -478,10 +510,22 @@ class TestModelDownload:
                 b"tree implementation notes\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\n"
                 b"max_feature_idx=0\nnum_leaves=1\nsplit_feature=0\nleaf_value=0\n"
             ),
+            b'<?xml version="1.0"?><project><PMML-not-root /></project>',
+            b'{"framework":"ajax","payload":"not a JAX checkpoint"}',
+            b"{" + _ubjson_key(b"learner") + b"{}" + _ubjson_key(b"metadata") + b"{}" + b"}",
             b'{"nodes":[{"op":"Custom"}],"arg_nodes":[],"heads":[[0,0,0]]}',
             b"\x0c\x00\x00\x00ETAA\x04\x00\x04\x00\x04\x00\x00\x00",
         ],
-        ids=["malformed-safetensors", "cntk-notes", "lightgbm-notes", "mxnet-notes", "executorch-near-match"],
+        ids=[
+            "malformed-safetensors",
+            "cntk-notes",
+            "lightgbm-notes",
+            "xml-notes",
+            "ajax-json",
+            "xgboost-ubjson-near-match",
+            "mxnet-notes",
+            "executorch-near-match",
+        ],
     )
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(

@@ -99,6 +99,13 @@ def _read_huggingface_prefix(repo_id: str, filename: str, max_bytes: int) -> byt
         ) from exc
 
 
+def _read_huggingface_probe(repo_id: str, filename: str, prefix: bytes, max_bytes: int) -> bytes:
+    """Return an existing or freshly expanded bounded remote prefix."""
+    if len(prefix) >= max_bytes:
+        return prefix[:max_bytes]
+    return _read_huggingface_prefix(repo_id, filename, max_bytes)
+
+
 def _looks_like_safetensors_prefix(repo_id: str, filename: str, prefix: bytes) -> bool:
     """Recognize bounded SafeTensors framing without requiring a local path."""
     if len(prefix) <= 8:
@@ -147,6 +154,80 @@ def _detect_huggingface_mxnet_symbol_route(repo_id: str, filename: str, prefix: 
     )
 
 
+def _detect_huggingface_xml_model_route(repo_id: str, filename: str, prefix: bytes) -> str | None:
+    """Return a bounded XML model route for a suffix-skipped remote file."""
+    from modelaudit.utils.file.detection import (
+        _XML_MODEL_SIGNATURE_READ_BYTES,
+        _could_be_xml_prefix,
+        _detect_xml_model_format,
+    )
+
+    if not _could_be_xml_prefix(prefix):
+        return None
+
+    xml_probe = _read_huggingface_probe(repo_id, filename, prefix, _XML_MODEL_SIGNATURE_READ_BYTES)
+    detected_format = _detect_xml_model_format(
+        xml_probe,
+        sample_is_prefix=len(xml_probe) >= _XML_MODEL_SIGNATURE_READ_BYTES,
+    )
+    return None if detected_format == "unknown" else detected_format
+
+
+def _detect_huggingface_jax_json_route(repo_id: str, filename: str, prefix: bytes) -> str | None:
+    """Return a bounded JAX JSON checkpoint route for a suffix-skipped remote file."""
+    from modelaudit.utils.file.detection import (
+        JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
+        _could_start_json_object,
+        has_jax_json_checkpoint_structure,
+    )
+
+    jax_probe = prefix
+    normalized_prefix = jax_probe.lstrip()
+    if normalized_prefix.startswith(b"\xef\xbb\xbf"):
+        normalized_prefix = normalized_prefix[3:].lstrip()
+
+    if not normalized_prefix:
+        max_probe_size = JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1
+        jax_probe = _read_huggingface_probe(repo_id, filename, prefix, max_probe_size)
+        normalized_prefix = jax_probe.lstrip()
+        if normalized_prefix.startswith(b"\xef\xbb\xbf"):
+            normalized_prefix = normalized_prefix[3:].lstrip()
+        if not normalized_prefix and len(jax_probe) > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
+            return "jax_checkpoint"
+
+    if not _could_start_json_object(jax_probe):
+        return None
+
+    max_probe_size = JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1
+    jax_probe = _read_huggingface_probe(repo_id, filename, jax_probe, max_probe_size)
+    try:
+        payload = json.loads(jax_probe.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        if len(jax_probe) > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
+            return "jax_checkpoint"
+        return None
+    return "jax_checkpoint" if has_jax_json_checkpoint_structure(payload) else None
+
+
+def _detect_huggingface_xgboost_ubjson_route(repo_id: str, filename: str, prefix: bytes) -> str | None:
+    """Return a bounded XGBoost UBJSON route for a suffix-skipped remote file."""
+    from modelaudit.utils.file.detection import (
+        _XGBOOST_UBJSON_ROUTE_READ_BYTES,
+        _detect_extensionless_xgboost_ubjson_route,
+    )
+
+    xgboost_route = _detect_extensionless_xgboost_ubjson_route(prefix)
+    if xgboost_route is not None:
+        return xgboost_route
+
+    normalized_prefix = prefix.lstrip(b"N")
+    if not normalized_prefix.startswith(b"{"):
+        return None
+
+    xgboost_probe = _read_huggingface_probe(repo_id, filename, prefix, _XGBOOST_UBJSON_ROUTE_READ_BYTES)
+    return _detect_extensionless_xgboost_ubjson_route(xgboost_probe)
+
+
 def _detect_huggingface_content_route_format(repo_id: str, filename: str) -> str | None:
     """Return a content-routed model format for a remote file, if cheaply identifiable."""
     prefix = _read_huggingface_prefix(repo_id, filename, _HF_CONTENT_SNIFF_BYTES)
@@ -172,6 +253,18 @@ def _detect_huggingface_content_route_format(repo_id: str, filename: str) -> str
         return "cntk"
     if _is_content_routed_lightgbm_signature(prefix):
         return "lightgbm"
+
+    xml_route = _detect_huggingface_xml_model_route(repo_id, filename, prefix)
+    if xml_route is not None:
+        return xml_route
+
+    xgboost_ubjson_route = _detect_huggingface_xgboost_ubjson_route(repo_id, filename, prefix)
+    if xgboost_ubjson_route is not None:
+        return xgboost_ubjson_route
+
+    jax_json_route = _detect_huggingface_jax_json_route(repo_id, filename, prefix)
+    if jax_json_route is not None:
+        return jax_json_route
 
     mxnet_route = _detect_huggingface_mxnet_symbol_route(repo_id, filename, prefix)
     if mxnet_route is not None:
