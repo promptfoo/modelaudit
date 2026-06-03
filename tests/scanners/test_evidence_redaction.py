@@ -127,6 +127,39 @@ def test_redacts_prefixed_quoted_assignments_without_second_pass_corruption() ->
     assert 'safe=f"value"' in redacted
 
 
+def test_redacts_concatenated_python_credential_literals() -> None:
+    """Adjacent Python string literals should be treated as one credential value."""
+    assignment_tail = "ASSIGNMENTTAILSECRET"
+    mapping_tail = "MAPPINGTAILSECRET"
+
+    redacted = redact_evidence_string(
+        f'api_key="sk-" "{assignment_tail}" config={{"client_secret": "cs-" "{mapping_tail}", "safe": "value"}}',
+        max_chars=500,
+    )
+
+    assert assignment_tail not in redacted
+    assert mapping_tail not in redacted
+    assert f'api_key="{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f'"client_secret": "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert '"safe": "value"' in redacted
+
+
+def test_redacts_escaped_sensitive_mapping_keys() -> None:
+    """Escaped credential key names should be decoded before matching."""
+    unicode_secret = "UNICODEKEYSECRET"
+    hex_secret = "HEXKEYSECRET"
+
+    redacted = redact_evidence_string(
+        f"json={{\"api\\u005fkey\": \"{unicode_secret}\"}} config={{'client\\x5fsecret': '{hex_secret}'}}",
+        max_chars=500,
+    )
+
+    assert unicode_secret not in redacted
+    assert hex_secret not in redacted
+    assert f'"api\\u005fkey": "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f"'client\\x5fsecret': '{REDACTED_EVIDENCE_VALUE}'" in redacted
+
+
 def test_redacts_sensitive_call_and_container_assignment_values() -> None:
     """Sensitive assignments should consume call and container-shaped values."""
     call_secret = "CALLSECRET123"

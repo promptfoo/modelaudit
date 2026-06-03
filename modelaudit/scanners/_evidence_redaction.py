@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 from typing import Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -62,6 +63,18 @@ SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
 QUOTED_SENSITIVE_KEY: Final[str] = SENSITIVE_ASSIGNMENT_KEY
 PYTHON_STRING_PREFIX: Final[str] = r"[rubf]*"
 PYTHON_QUOTE_DELIMITER: Final[str] = r"(?:'''|\"\"\"|[\"'])"
+PYTHON_STRING_LITERAL: Final[str] = (
+    rf"{PYTHON_STRING_PREFIX}(?:"
+    r"'''(?:\\.|(?!''')[\s\S])*'''|"
+    r'"""(?:\\.|(?!""")[\s\S])*"""|'
+    r'"(?:\\.|[^"\\])*"|'
+    r"'(?:\\.|[^'\\])*'"
+    r")"
+)
+PYTHON_STRING_LITERAL_SEQUENCE: Final[str] = rf"{PYTHON_STRING_LITERAL}(?:\s+{PYTHON_STRING_LITERAL})*"
+STRING_LITERAL_START_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(?P<prefix>{PYTHON_STRING_PREFIX})(?P<quote>{PYTHON_QUOTE_DELIMITER})"
+)
 QUOTED_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(\bauthorization\s*[:=]\s*)({PYTHON_STRING_PREFIX})"
     rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\3)[\s\S])*\3"
@@ -78,6 +91,10 @@ QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)({PYTHON_STRING_PREFIX})"
     rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\4)[\s\S])*\4"
 )
+CONCATENATED_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)\b(?P<prefix>({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)"
+    rf"(?P<value>{PYTHON_STRING_LITERAL}\s+{PYTHON_STRING_LITERAL}(?:\s+{PYTHON_STRING_LITERAL})*)"
+)
 SENSITIVE_CALL_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(?P<prefix>({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)"
     r"(?:(?P<callee>[A-Za-z_][A-Za-z0-9_.]{0,120})\s*)?"
@@ -86,6 +103,10 @@ SENSITIVE_CALL_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
 QUOTED_SENSITIVE_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)([\"']{QUOTED_SENSITIVE_KEY}[\"']\s*:\s*)({PYTHON_STRING_PREFIX})"
     rf"({PYTHON_QUOTE_DELIMITER})(?:\\.|(?!\3)[\s\S])*\3"
+)
+GENERIC_QUOTED_KEY_VALUE_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(?P<key_quote>[\"'])(?P<key>(?:\\.|(?!(?P=key_quote))[\s\S]){{1,120}})(?P=key_quote)"
+    rf"(?P<separator>\s*:\s*)(?P<value>{PYTHON_STRING_LITERAL_SEQUENCE})"
 )
 UNTERMINATED_QUOTED_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(\bauthorization\s*[:=]\s*)({PYTHON_STRING_PREFIX})"
@@ -159,6 +180,36 @@ def _redact_quoted_authorization(match: re.Match[str]) -> str:
     return f"{match.group(1)}{match.group(2)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
+def _redacted_literal_from_value(value: str) -> str:
+    match = STRING_LITERAL_START_RE.match(value)
+    if match is None:
+        return REDACTED_EVIDENCE_VALUE
+    quote = match.group("quote")
+    return f"{match.group('prefix')}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
+
+
+def _redact_concatenated_assignment(match: re.Match[str]) -> str:
+    return f"{match.group('prefix')}{_redacted_literal_from_value(match.group('value'))}"
+
+
+def _decode_quoted_key(quote: str, key: str) -> str | None:
+    try:
+        decoded = ast.literal_eval(f"{quote}{key}{quote}")
+    except (SyntaxError, ValueError):
+        return None
+    return decoded if isinstance(decoded, str) else None
+
+
+def _redact_generic_quoted_key_value(match: re.Match[str]) -> str:
+    decoded_key = _decode_quoted_key(match.group("key_quote"), match.group("key"))
+    if decoded_key is None or re.fullmatch(QUOTED_SENSITIVE_KEY, decoded_key, re.IGNORECASE) is None:
+        return match.group(0)
+    return (
+        f"{match.group('key_quote')}{match.group('key')}{match.group('key_quote')}"
+        f"{match.group('separator')}{_redacted_literal_from_value(match.group('value'))}"
+    )
+
+
 def _find_balanced_container_end(text: str, start: int) -> int | None:
     if start >= len(text) or text[start] not in "[{(":
         return None
@@ -227,6 +278,8 @@ def _truncate(text: str, max_chars: int) -> str:
 def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
     redacted = URL_RE.sub(_redact_url, text)
+    redacted = CONCATENATED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_concatenated_assignment, redacted)
+    redacted = GENERIC_QUOTED_KEY_VALUE_RE.sub(_redact_generic_quoted_key_value, redacted)
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = QUOTED_SENSITIVE_KEY_VALUE_RE.sub(_redact_quoted_key_value, redacted)
     redacted = QUOTED_AUTHORIZATION_VALUE_RE.sub(_redact_quoted_authorization, redacted)
