@@ -91,6 +91,7 @@ _DEFAULT_SANDBOX_RENDER_MAX_OUTPUT_CHARS = 64 * 1024
 _DEFAULT_SANDBOX_RENDER_MAX_MEMORY_BYTES = 512 * 1024 * 1024
 _SANDBOX_RENDER_SPAWN_STARTUP_GRACE_SECONDS = 2.0
 _SANDBOX_RENDER_BUDGET_REASON = "jinja2_sandbox_render_budget_exceeded"
+_STATIC_INT_EVAL_MAX_ABS = 1_000_000_000_000
 _EAGER_RANGE_ITERATION_FILTERS = frozenset({"groupby", "join", "list", "max", "min", "slice", "sort", "sum"})
 _LAZY_RANGE_ITERATION_FILTERS = frozenset(
     {"batch", "map", "reject", "rejectattr", "reverse", "select", "selectattr", "unique"}
@@ -1307,15 +1308,17 @@ class Jinja2TemplateScanner(BaseScanner):
         return detail == "empty_result" or detail.startswith("exitcode=")
 
     def _template_has_static_render_budget_risk(self, template_content: str) -> bool:
-        if re.search(r"(['\"])(?:\\.|(?!\1).){1,256}\1\s*\*\s*\d{5,}", template_content) or re.search(
-            r"\d{5,}\s*\*\s*(['\"])(?:\\.|(?!\1).){1,256}\1", template_content
-        ):
-            return True
         return self._template_ast_has_static_render_budget_risk(template_content)
 
     def _template_has_static_preflight_render_budget_risk(self, template_content: str) -> bool:
         parsed = self._parse_template_ast(template_content)
-        return parsed is not None and self._template_ast_has_static_range_list_budget_risk(parsed)
+        if parsed is None:
+            return False
+        return (
+            self._template_ast_has_static_range_list_budget_risk(parsed)
+            or self._template_ast_has_static_range_join_budget_risk(parsed)
+            or self._template_ast_has_static_repeated_sequence_budget_risk(parsed)
+        )
 
     def _template_has_static_sandbox_risk(self, template_content: str) -> bool:
         return bool(
@@ -1367,6 +1370,9 @@ class Jinja2TemplateScanner(BaseScanner):
         if self._template_ast_has_static_iterated_range_budget_risk(parsed):
             return True
 
+        return self._template_ast_has_static_repeated_sequence_budget_risk(parsed)
+
+    def _template_ast_has_static_repeated_sequence_budget_risk(self, parsed: Any) -> bool:
         for node in parsed.find_all(jinja2.nodes.Mul):
             projected_size = self._constant_repeated_sequence_size(node.left, node.right)
             if projected_size is not None and projected_size > self.sandbox_render_max_output_chars:
@@ -1398,6 +1404,20 @@ class Jinja2TemplateScanner(BaseScanner):
             if range_call is None:
                 continue
             projected_size = self._constant_range_rendered_list_size(range_call.args, range_threshold)
+            if projected_size is not None and projected_size > self.sandbox_render_max_output_chars:
+                return True
+
+        return False
+
+    def _template_ast_has_static_range_join_budget_risk(self, parsed: Any) -> bool:
+        range_threshold = max(1, self.sandbox_render_max_output_chars)
+        for node in parsed.find_all(jinja2.nodes.Filter):
+            if node.name != "join":
+                continue
+            range_call = self._iterable_range_call(node.node)
+            if range_call is None:
+                continue
+            projected_size = self._constant_range_joined_size(range_call.args, node.args, range_threshold)
             if projected_size is not None and projected_size > self.sandbox_render_max_output_chars:
                 return True
 
@@ -1514,6 +1534,36 @@ class Jinja2TemplateScanner(BaseScanner):
                 break
         return total + 1
 
+    def _constant_range_joined_size(
+        self,
+        args: list[Any],
+        join_args: list[Any],
+        cap: int,
+    ) -> int | None:
+        range_values = self._constant_range_values(args, cap)
+        if range_values is None:
+            return None
+
+        separator_size = 0
+        if join_args:
+            separator_arg = join_args[0]
+            if not isinstance(separator_arg, jinja2.nodes.Const) or not isinstance(separator_arg.value, str | bytes):
+                return None
+            separator_size = len(separator_arg.value)
+
+        start, stop, step = range_values
+        count = self._range_iteration_count(start, stop, step, cap)
+        total = 0
+        for checked, value in enumerate(range(start, stop, step), start=1):
+            if checked > 1:
+                total += separator_size
+            total += len(str(value))
+            if total > cap:
+                return cap + 1
+            if checked >= min(count, 100_000):
+                break
+        return total
+
     def _constant_int_expression_value(self, node: Any, cap: int) -> int | None:
         if isinstance(node, jinja2.nodes.Const):
             if isinstance(node.value, bool) or not isinstance(node.value, int):
@@ -1579,9 +1629,10 @@ class Jinja2TemplateScanner(BaseScanner):
         return min(((start - stop - 1) // abs(step)) + 1, cap + 1)
 
     def _cap_constant_int(self, value: int, cap: int) -> int:
-        if abs(value) <= cap:
+        magnitude_cap = max(abs(cap), _STATIC_INT_EVAL_MAX_ABS)
+        if abs(value) <= magnitude_cap:
             return value
-        return cap + 1 if value > 0 else -(cap + 1)
+        return magnitude_cap + 1 if value > 0 else -(magnitude_cap + 1)
 
     def _sandbox_render_budget_failure(
         self,

@@ -1179,6 +1179,23 @@ class TestJinja2TemplateScannerEdgeCases:
         assert len(budget_checks) == 1
         assert budget_checks[0].details["budget_type"] == "worker_unavailable"
 
+    def test_static_preflight_blocks_range_join_before_worker_start(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+
+        def fail_get_context(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("sandbox worker should not start")
+
+        monkeypatch.setattr(jinja2_template_scanner.mp, "get_context", fail_get_context)
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 1000})
+        status, detail = scanner._test_template_safety_with_budget("{{ range(100000, 200000)|join }}")
+
+        assert status == "budget_exceeded"
+        assert detail == "output"
+
     def test_unavailable_sandbox_worker_fails_closed_for_materialized_lazy_range_filter(
         self,
         tmp_path: Path,
@@ -1292,6 +1309,27 @@ class TestJinja2TemplateScannerEdgeCases:
         budget_checks = [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
         assert len(budget_checks) == 1
         assert budget_checks[0].details["budget_type"] == "worker_unavailable"
+
+    def test_unavailable_sandbox_worker_respects_configured_budget_for_string_repetition(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "bounded-amplify.jinja"
+        template_file.write_text("{{ 'A' * 10000 }}", encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 65536})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
 
     def test_unavailable_sandbox_worker_fails_closed_for_repeated_large_list_literal(
         self,
