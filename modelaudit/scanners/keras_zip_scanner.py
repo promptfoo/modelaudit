@@ -787,7 +787,11 @@ class KerasZipScanner(BaseScanner):
                 )
 
             # Update layer count
-            layer_count_key = redact_evidence_string(str(layer_class))
+            layer_count_key = (
+                redact_evidence_string(layer_class)
+                if isinstance(layer_class, str)
+                else f"<invalid:{type(layer_class).__name__}>"
+            )
             layer_counts[layer_count_key] = layer_counts.get(layer_count_key, 0) + 1
 
             # CVE-2025-49655: TorchModuleWrapper uses torch.load(weights_only=False)
@@ -860,6 +864,21 @@ class KerasZipScanner(BaseScanner):
                             "affected_versions": "Keras < 2.13.0",
                         },
                     )
+            elif "class_name" in layer and not isinstance(layer_class, str):
+                self._mark_inconclusive_scan_result(result, "keras_zip_layer_class_invalid_type")
+                result.add_check(
+                    name="Layer Class Type Validation",
+                    passed=False,
+                    message=f"Invalid layer class type: expected str, got {type(layer_class).__name__}",
+                    rule_code="S902",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{self.current_file_path} (layer: {redacted_layer_name})",
+                    details={
+                        "layer_name": redacted_layer_name,
+                        "actual_type": type(layer_class).__name__,
+                        "expected_type": "str",
+                    },
+                )
             elif layer_class in self.suspicious_layer_types:
                 result.add_check(
                     name="Suspicious Layer Type Detection",
@@ -871,20 +890,6 @@ class KerasZipScanner(BaseScanner):
                         "layer_class": layer_class,
                         "layer_name": redacted_layer_name,
                         "description": self.suspicious_layer_types[layer_class],
-                    },
-                )
-            elif "class_name" in layer and not isinstance(layer_class, str):
-                result.add_check(
-                    name="Layer Class Type Validation",
-                    passed=False,
-                    message=f"Invalid layer class type: expected str, got {type(layer_class).__name__}",
-                    rule_code="S902",
-                    severity=IssueSeverity.INFO,
-                    location=f"{self.current_file_path} (layer: {redacted_layer_name})",
-                    details={
-                        "layer_name": redacted_layer_name,
-                        "actual_type": type(layer_class).__name__,
-                        "expected_type": "str",
                     },
                 )
             elif isinstance(layer_class, str) and layer_class and not self._is_known_safe_serialized_layer(layer):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from typing import Any, Final
@@ -9,6 +10,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
+STRUCTURED_REDACTION_PARSE_LIMIT: Final[int] = 10 * 1024
 
 URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://[^\s\"'<>]+")
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
@@ -78,9 +80,9 @@ GENERIC_QUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)"
     r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
 )
-GENERIC_CONTAINER_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+GENERIC_CONTAINER_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)"
-    r"(?P<value>\[(?:\\.|[^\]\\])*\]|\{(?:\\.|[^}\\])*\})"
+    r"(?P<opener>[\[{])"
 )
 GENERIC_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?P<key>[A-Za-z][A-Za-z0-9_-]{0,80})(?P<separator>\s*[:=]\s*)[^\s\"';&|]+"
@@ -171,16 +173,70 @@ def _redact_generic_quoted_assignment(match: re.Match[str]) -> str:
     return f"{match.group('key')}{match.group('separator')}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
-def _redact_generic_container_assignment(match: re.Match[str]) -> str:
-    if not _is_sensitive_detail_key(match.group("key")):
-        return match.group(0)
-    return f"{match.group('key')}{match.group('separator')}{REDACTED_EVIDENCE_VALUE}"
-
-
 def _redact_generic_assignment(match: re.Match[str]) -> str:
     if not _is_sensitive_detail_key(match.group("key")):
         return match.group(0)
     return f"{match.group('key')}{match.group('separator')}{REDACTED_EVIDENCE_VALUE}"
+
+
+def _find_balanced_container_end(text: str, start: int) -> int | None:
+    if start >= len(text) or text[start] not in "[{":
+        return None
+
+    matching_closer = {"[": "]", "{": "}"}
+    stack = [text[start]]
+    quote: str | None = None
+    escaped = False
+
+    for index in range(start + 1, len(text)):
+        char = text[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+
+        if char in ("'", '"'):
+            quote = char
+        elif char in matching_closer:
+            stack.append(char)
+        elif char in "]}":
+            if not stack or matching_closer[stack[-1]] != char:
+                return None
+            stack.pop()
+            if not stack:
+                return index + 1
+
+    return None
+
+
+def _redact_container_assignments(text: str) -> str:
+    redacted_chunks: list[str] = []
+    last_index = 0
+    search_index = 0
+
+    while match := GENERIC_CONTAINER_ASSIGNMENT_START_RE.search(text, search_index):
+        container_start = match.start("opener")
+        container_end = _find_balanced_container_end(text, container_start)
+        if container_end is None:
+            search_index = match.end()
+            continue
+
+        if _is_sensitive_detail_key(match.group("key")):
+            redacted_chunks.append(text[last_index : match.start()])
+            redacted_chunks.append(f"{match.group('key')}{match.group('separator')}{REDACTED_EVIDENCE_VALUE}")
+            last_index = container_end
+
+        search_index = container_end
+
+    if not redacted_chunks:
+        return text
+
+    redacted_chunks.append(text[last_index:])
+    return "".join(redacted_chunks)
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -194,20 +250,30 @@ def _truncate(text: str, max_chars: int) -> str:
 def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
     stripped = text.strip()
-    if stripped.startswith(("{", "[")):
+    if stripped.startswith(("{", "[")) and len(stripped) <= STRUCTURED_REDACTION_PARSE_LIMIT:
         try:
             parsed = json.loads(stripped)
         except json.JSONDecodeError:
-            pass
+            try:
+                parsed = ast.literal_eval(stripped)
+            except (MemoryError, RecursionError, SyntaxError, ValueError):
+                parsed = None
+
+        if isinstance(parsed, (dict, list, tuple)):
+            redacted_value = redact_evidence_value(parsed)
+            try:
+                serialized_value = json.dumps(redacted_value, separators=(",", ":"), default=str)
+            except (TypeError, ValueError):
+                serialized_value = repr(redacted_value)
+            return _truncate(serialized_value, max_chars)
         else:
-            if isinstance(parsed, (dict, list)):
-                return _truncate(json.dumps(redact_evidence_value(parsed), separators=(",", ":")), max_chars)
+            parsed = None
 
     redacted = URL_RE.sub(_redact_url, text)
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
-    redacted = GENERIC_CONTAINER_ASSIGNMENT_RE.sub(_redact_generic_container_assignment, redacted)
+    redacted = _redact_container_assignments(redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = QUOTED_KEY_VALUE_RE.sub(_redact_quoted_key_value, redacted)
     redacted = GENERIC_QUOTED_ASSIGNMENT_RE.sub(_redact_generic_quoted_assignment, redacted)

@@ -228,14 +228,39 @@ def test_redacts_sensitive_container_assignments() -> None:
     """Credential assignments should consume array and object values before redaction."""
     array_secret = "CONTAINER_ASSIGNMENT_ARRAY_SECRET"
     object_secret = "CONTAINER_ASSIGNMENT_OBJECT_SECRET"
+    nested_secret = "CONTAINER_ASSIGNMENT_NESTED_SECRET"
 
     redacted_text = redact_evidence_string(
-        (f'awsSecretAccessKey=["{array_secret}"] token={{"nested":"{object_secret}"}} safe=["visible"]'),
+        (
+            f'awsSecretAccessKey=["{array_secret}"] '
+            f'token={{"nested":"{object_secret}"}} '
+            f'api_key=[[],"{nested_secret}"] '
+            'safe=["visible"]'
+        ),
         max_chars=500,
     )
 
     assert array_secret not in redacted_text
     assert object_secret not in redacted_text
+    assert nested_secret not in redacted_text
     assert f"awsSecretAccessKey={REDACTED_EVIDENCE_VALUE}" in redacted_text
     assert f"token={REDACTED_EVIDENCE_VALUE}" in redacted_text
+    assert f"api_key={REDACTED_EVIDENCE_VALUE}" in redacted_text
     assert 'safe=["visible"]' in redacted_text
+
+
+def test_redacts_repr_style_container_credential_values() -> None:
+    """Python repr-style container strings should redact sensitive nested values."""
+    array_secret = "REPR_ARRAY_SECRET"
+    object_secret = "REPR_OBJECT_SECRET"
+
+    redacted_text = redact_evidence_string(
+        f"{{'api_key':['{array_secret}'],'token':{{'nested':'{object_secret}'}},'safe':['ok']}}",
+        max_chars=500,
+    )
+
+    assert array_secret not in redacted_text
+    assert object_secret not in redacted_text
+    assert f'"api_key":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
+    assert f'"token":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
+    assert '"safe":["ok"]' in redacted_text

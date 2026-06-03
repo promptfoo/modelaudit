@@ -2033,23 +2033,35 @@ __import__('pickle').loads(data)
 
     def test_non_string_layer_class_reports_invalid_type_without_abort(self, tmp_path: Path) -> None:
         """Malformed non-string class names should fail closed without crashing redaction."""
+        class_secret = "ZIP_LAYER_CLASS_REPR_SECRET"
         config = {
             "class_name": "Sequential",
             "config": {
                 "layers": [
                     {
-                        "class_name": 123,
-                        "name": "numeric_class",
+                        "class_name": {"api_key": [class_secret]},
+                        "name": "structured_class",
                         "config": {},
                     }
                 ]
             },
         }
 
-        result = KerasZipScanner().scan(str(create_configured_keras_zip(tmp_path, config, file_name="numeric.keras")))
+        model_path = create_configured_keras_zip(tmp_path, config, file_name="structured_class.keras")
+        result = KerasZipScanner().scan(str(model_path))
 
         assert not any(check.name == "Keras ZIP File Scan" for check in result.checks)
-        assert any(check.name == "Layer Class Type Validation" for check in result.checks)
+        type_checks = [check for check in result.checks if check.name == "Layer Class Type Validation"]
+        assert any(check.severity == IssueSeverity.WARNING for check in type_checks)
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_layer_class_invalid_type" in result.metadata["scan_outcome_reasons"]
+        assert "<invalid:dict>" in result.metadata["layer_counts"]
+        assert class_secret not in json.dumps(result.metadata, default=str)
+        assert class_secret not in json.dumps([check.details for check in result.checks], default=str)
+
+        audit_result = scan_model_directory_or_file(str(model_path))
+        assert determine_exit_code(audit_result) != 0
+        assert class_secret not in audit_result.model_dump_json(exclude_none=True)
 
     def test_malformed_layer_identifiers_do_not_abort_redaction(self, tmp_path: Path) -> None:
         """Malformed names and Lambda module metadata should not crash evidence redaction."""
