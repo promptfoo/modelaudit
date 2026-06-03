@@ -117,6 +117,7 @@ def _has_get_file_reference(values: list[str]) -> bool:
 _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
+_MAX_STRING_LITERAL_EXTRACTION_DEPTH = 100
 _KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+_-]*)\s*$")
 _KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(r"(?i)^(?:a|alpha|b|beta|c|rc|pre|preview|dev)")
 
@@ -1722,8 +1723,11 @@ class KerasZipScanner(BaseScanner):
         *,
         include_dict_values: bool = False,
         include_dict_keys: bool = False,
+        _depth: int = 0,
     ) -> list[str]:
         """Extract string literals from simple container values."""
+        if _depth >= _MAX_STRING_LITERAL_EXTRACTION_DEPTH:
+            return []
         if isinstance(value, str):
             return [value]
         if isinstance(value, (list, tuple, set)):
@@ -1734,6 +1738,7 @@ class KerasZipScanner(BaseScanner):
                         item,
                         include_dict_values=include_dict_values,
                         include_dict_keys=include_dict_keys,
+                        _depth=_depth + 1,
                     )
                 )
             return values
@@ -1746,6 +1751,7 @@ class KerasZipScanner(BaseScanner):
                             key,
                             include_dict_values=include_dict_values,
                             include_dict_keys=True,
+                            _depth=_depth + 1,
                         )
                     )
             if include_dict_values:
@@ -1755,6 +1761,7 @@ class KerasZipScanner(BaseScanner):
                             item,
                             include_dict_values=True,
                             include_dict_keys=include_dict_keys,
+                            _depth=_depth + 1,
                         )
                     )
             return literals

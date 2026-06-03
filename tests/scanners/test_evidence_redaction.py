@@ -304,16 +304,20 @@ def test_redacts_embedded_structured_credential_literals() -> None:
     """Structured credential containers should redact even when embedded in prose."""
     json_secret = "EMBEDDED_JSON_SECRET"
     repr_secret = "EMBEDDED_REPR_SECRET"
+    escaped_secret = "ESCAPED_JSON_LITERAL_SECRET"
 
     redacted_text = redact_evidence_string(
         f"note {{\"api_key\":[\"{json_secret}\"]}} and repr {{'token':['{repr_secret}']}}",
         max_chars=500,
     )
+    redacted_escaped = redact_evidence_string(json.dumps(f'{{"api_key":["{escaped_secret}"]}}'), max_chars=500)
 
     assert json_secret not in redacted_text
     assert repr_secret not in redacted_text
+    assert escaped_secret not in redacted_escaped
     assert f'"api_key":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert f'"token":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
+    assert f'"api_key":"{REDACTED_EVIDENCE_VALUE}"' in redacted_escaped
 
 
 def test_redacts_repr_style_container_credential_values() -> None:
@@ -323,6 +327,7 @@ def test_redacts_repr_style_container_credential_values() -> None:
     tuple_key_secret = "REPR_TUPLE_KEY_SECRET"
     set_secret = "REPR_SET_SECRET"
     bytes_secret = "REPR_BYTES_SECRET"
+    tuple_string_secret = "REPR_TUPLE_STRING_SECRET"
 
     redacted_text = redact_evidence_string(
         (
@@ -332,18 +337,21 @@ def test_redacts_repr_style_container_credential_values() -> None:
         ),
         max_chars=500,
     )
+    redacted_tuple_text = redact_evidence_string(f"('api_key','{tuple_string_secret}')", max_chars=500)
 
     assert array_secret not in redacted_text
     assert object_secret not in redacted_text
     assert tuple_key_secret not in redacted_text
     assert set_secret not in redacted_text
     assert bytes_secret not in redacted_text
+    assert tuple_string_secret not in redacted_tuple_text
     assert f'"api_key":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert f'"token":"{REDACTED_EVIDENCE_VALUE}"' in redacted_text
     assert '"<tuple-key>":"x"' in redacted_text
     assert f'"metadata":["token={REDACTED_EVIDENCE_VALUE}"]' in redacted_text
     assert f'"bytes":"b\'token={REDACTED_EVIDENCE_VALUE}\'"' in redacted_text
     assert '"safe":["ok"]' in redacted_text
+    assert f'["api_key","{REDACTED_EVIDENCE_VALUE}"]' in redacted_tuple_text
 
 
 def test_redacts_oversized_and_deep_structured_evidence() -> None:

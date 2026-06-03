@@ -320,7 +320,7 @@ def _serialize_redacted_structured_value(value: Any, max_chars: int) -> str:
 
 def _redact_structured_evidence(text: str, max_chars: int, *, fail_closed: bool = True) -> str | None:
     stripped = text.strip()
-    if not stripped.startswith(("{", "[")):
+    if not stripped.startswith(("{", "[", "(")):
         return None
     if len(stripped) > STRUCTURED_REDACTION_PARSE_LIMIT:
         return _truncate(REDACTED_EVIDENCE_VALUE, max_chars)
@@ -341,11 +341,32 @@ def _redact_structured_evidence(text: str, max_chars: int, *, fail_closed: bool 
     return None
 
 
+def _redact_quoted_structured_literal(text: str, max_chars: int) -> str | None:
+    stripped = text.strip()
+    if not stripped.startswith(('"', "'")) or len(stripped) > STRUCTURED_REDACTION_PARSE_LIMIT:
+        return None
+
+    try:
+        unquoted = json.loads(stripped) if stripped.startswith('"') else ast.literal_eval(stripped)
+    except (MemoryError, RecursionError, json.JSONDecodeError, SyntaxError, ValueError):
+        return None
+    if not isinstance(unquoted, str):
+        return None
+
+    redacted_unquoted = redact_evidence_string(unquoted, max_chars=max(len(unquoted), len(REDACTED_EVIDENCE_VALUE)))
+    if redacted_unquoted == unquoted:
+        return None
+    return _truncate(redacted_unquoted, max_chars)
+
+
 def redact_evidence_string(text: str, max_chars: int = 180, *, _url_depth: int = 0) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
     structured_redaction = _redact_structured_evidence(text, max_chars=max_chars)
     if structured_redaction is not None:
         return structured_redaction
+    quoted_structured_redaction = _redact_quoted_structured_literal(text, max_chars=max_chars)
+    if quoted_structured_redaction is not None:
+        return quoted_structured_redaction
 
     redacted = URL_RE.sub(lambda match: _redact_url(match, url_depth=_url_depth), text)
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)

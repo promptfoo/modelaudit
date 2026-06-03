@@ -2077,6 +2077,10 @@ __import__('pickle').loads(data)
 
     def test_malformed_layer_identifiers_do_not_abort_redaction(self, tmp_path: Path) -> None:
         """Malformed names and Lambda module metadata should not crash evidence redaction."""
+        deeply_nested_module: object = "os"
+        for _ in range(150):
+            deeply_nested_module = [deeply_nested_module]
+
         config = {
             "class_name": "Sequential",
             "config": {
@@ -2101,6 +2105,11 @@ __import__('pickle').loads(data)
                         "class_name": "Lambda",
                         "name": "benign_cosine_module",
                         "config": {"module": ["cosine"], "function_name": "call"},
+                    },
+                    {
+                        "class_name": "Lambda",
+                        "name": "deeply_nested_module",
+                        "config": {"module": deeply_nested_module, "function_name": "system"},
                     },
                 ]
             },
