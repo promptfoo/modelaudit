@@ -10,8 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - omit raw SafeTensors custom metadata values from security-only output while retaining redacted risk flags and rejecting malformed metadata maps
+- block 7-Zip symlinks, junctions, and ambiguous duplicate member names before extraction
 - add aggregate file, byte, and depth budgets to directory metadata extraction and reject non-regular entries and symlink targets
 - redact and detect secrets in R serialized executable samples across native assignment syntax
+- redact authorization aliases across structured, malformed, subscripted, and R scanner evidence
 - scan padded TensorFlow SavedModel protobuf scalar and repeated string attributes past the legacy 10 KB injection-check window
 - mark malformed SavedModel `keras_metadata.pb` analysis as inconclusive instead of a clean scan
 - fail closed on pickle protocol 5 `NEXT_BUFFER` opcodes instead of reporting clean coverage
