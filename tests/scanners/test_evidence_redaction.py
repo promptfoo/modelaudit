@@ -6,6 +6,7 @@ from modelaudit.scanners import _evidence_redaction as evidence_redaction
 from modelaudit.scanners._evidence_redaction import (
     EVIDENCE_PREVIEW_LOOKAHEAD,
     REDACTED_EVIDENCE_VALUE,
+    REDACTED_URL_CREDENTIALS,
     redact_evidence_path,
     redact_evidence_preview,
     redact_evidence_string,
@@ -332,6 +333,39 @@ def test_evidence_preview_bounds_redaction_input(monkeypatch: pytest.MonkeyPatch
     assert seen_lengths == [200 + EVIDENCE_PREVIEW_LOOKAHEAD]
 
 
+def test_evidence_path_bounds_redaction_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Path evidence should not process attacker-controlled content beyond its emitted window."""
+    seen_lengths: list[int] = []
+
+    def record_path_redaction(scheme: str, hostname: str, path: str) -> str:
+        del scheme, hostname
+        seen_lengths.append(len(path))
+        return path
+
+    monkeypatch.setattr(evidence_redaction, "_redact_url_path_tokens", record_path_redaction)
+
+    redacted = redact_evidence_path("/" + "x" * 100_000, max_chars=200)
+
+    assert len(redacted) == 200
+    assert seen_lengths
+    assert max(seen_lengths) <= 200 + EVIDENCE_PREVIEW_LOOKAHEAD
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "gopher://user:" + "p" * (EVIDENCE_PREVIEW_LOOKAHEAD + 100) + "@loader.example/payload",
+        "//user:" + "p" * (EVIDENCE_PREVIEW_LOOKAHEAD + 100) + "@loader.example/payload",
+    ],
+)
+def test_evidence_path_fails_closed_for_authority_crossing_bound(path: str) -> None:
+    """Bounded URL and network-path authorities must not emit partial credentials."""
+    redacted = redact_evidence_path(path, max_chars=200)
+
+    assert "user:" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted or REDACTED_URL_CREDENTIALS in redacted
+
+
 def test_evidence_preview_fails_closed_for_url_crossing_bound() -> None:
     """A truncated credential-bearing URL must not expose its leading userinfo."""
     text = "x" * 180 + " gopher://user:" + "p" * (EVIDENCE_PREVIEW_LOOKAHEAD + 100) + "@loader.example/payload"
@@ -352,6 +386,46 @@ def test_evidence_preview_redacts_plain_path_capability_tokens() -> None:
 
     assert capability not in preview
     assert "/cache/<redacted>/key" in preview
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("cache/{capability}/key", "cache/<redacted>/key"),
+        ("file:/cache/{capability}/key", "file:/cache/<redacted>/key"),
+        ("//user:pass@host/cache/{capability}/key", "//<credentials-redacted>@host/cache/<redacted>/key"),
+    ],
+)
+def test_evidence_preview_redacts_additional_path_forms(path: str, expected: str) -> None:
+    """Relative, single-slash URI, and network paths must not leak capabilities."""
+    capability = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+    preview = redact_evidence_preview(
+        f"__import__('os').system('cat {path.format(capability=capability)}')",
+        max_chars=300,
+    )
+
+    assert capability not in preview
+    assert "user:pass" not in preview
+    assert expected in preview
+
+
+def test_evidence_preview_preserves_benign_relative_paths() -> None:
+    """Slash-delimited identifiers without secret-shaped components should remain useful."""
+    text = "module_path = package/layers/transformer.py"
+
+    assert redact_evidence_preview(text, max_chars=200) == text
+
+
+def test_deeply_nested_url_userinfo_fails_closed_without_recursion() -> None:
+    """Nested redirect parameters must not crash redaction or preserve terminal credentials."""
+    text = "gopher://user:pass@secret.invalid/payload"
+    for _ in range(600):
+        text = f"https://loader.invalid/?next={text}"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "user:pass" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
 
 
 def test_evidence_preview_preserves_high_entropy_non_path_text() -> None:

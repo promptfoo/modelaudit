@@ -11,6 +11,7 @@ from modelaudit.detectors.network_comm import _redact_url_path_tokens
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 EVIDENCE_PREVIEW_LOOKAHEAD: Final[int] = 4096
+MAX_NESTED_EVIDENCE_DEPTH: Final[int] = 16
 
 RFC_URL_PATTERN: Final[str] = r"[a-z][a-z0-9+.-]*://[^\s\"'<>]+"
 URL_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)\b{RFC_URL_PATTERN}")
@@ -158,6 +159,17 @@ PLAIN_PATH_IN_TEXT_RE: Final[re.Pattern[str]] = re.compile(
     r"(?:[A-Za-z]:[\\/]|~[\\/]|\.{1,2}[\\/]|[\\/])"
     r"[^\s\"'<>`|()[\]{},;]+"
 )
+RELATIVE_PATH_IN_TEXT_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![A-Za-z0-9_:/\\])"
+    r"(?:[A-Za-z0-9._~-]+[/\\])+"
+    r"[^\s\"'<>`|()[\]{},;]+"
+)
+SINGLE_SLASH_URI_PATH_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)\b(?P<prefix>[a-z][a-z0-9+.-]*:)(?P<path>[/\\](?![/\\])[^\s\"'<>`|()[\]{},;]+)"
+)
+NETWORK_PATH_USERINFO_RE: Final[re.Pattern[str]] = re.compile(
+    r"^(?P<prefix>[/\\]{2})(?P<userinfo>[^@/\\\s]+)@(?P<authority>[^/\\\s]+)(?P<suffix>.*)$"
+)
 
 
 def _redact_malformed_url(raw_url: str) -> str:
@@ -206,8 +218,11 @@ def _redact_url(match: re.Match[str]) -> str:
     return _redact_url_value(match.group(0))
 
 
-def _contains_nested_sensitive_query_assignment(value: str) -> bool:
+def _contains_nested_sensitive_query_assignment(value: str, *, depth: int = 0) -> bool:
     """Recognize credential assignments nested inside encoded query values."""
+    if depth >= MAX_NESTED_EVIDENCE_DEPTH:
+        return True
+
     decoded = value
     for _ in range(3):
         next_decoded = unquote_plus(decoded)
@@ -222,13 +237,13 @@ def _contains_nested_sensitive_query_assignment(value: str) -> bool:
         or ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
         or BRACKETED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
         or BLOCK_SENSITIVE_ASSIGNMENT_RE.search(decoded)
-        or _contains_nested_url_secret(decoded)
+        or _contains_nested_url_secret(decoded, depth=depth)
         or QUOTED_MAPPING_SENSITIVE_UNQUOTED_ASSIGNMENT_RE.search(decoded)
         or UNTERMINATED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
     )
 
 
-def _contains_nested_url_secret(value: str) -> bool:
+def _contains_nested_url_secret(value: str, *, depth: int) -> bool:
     """Detect credential-bearing URLs embedded inside decoded query values."""
     for match in URL_RE.finditer(value):
         raw_url = match.group(0)
@@ -247,7 +262,7 @@ def _contains_nested_url_secret(value: str) -> bool:
         normalized_query = SEMICOLON_QUERY_SEPARATOR_RE.sub("&", HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query))
         if any(
             _normalize_query_key(key) in SENSITIVE_QUERY_KEYS
-            or _contains_nested_sensitive_query_assignment(query_value)
+            or _contains_nested_sensitive_query_assignment(query_value, depth=depth + 1)
             for key, query_value in parse_qsl(normalized_query, keep_blank_values=True)
         ):
             return True
@@ -304,12 +319,44 @@ def _redact_unquoted_assignment(match: re.Match[str]) -> str:
     return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
 
 
+def _redact_single_slash_uri_path(match: re.Match[str]) -> str:
+    return f"{match.group('prefix')}{redact_evidence_path(match.group('path'), max_chars=None)}"
+
+
+def _redact_network_path_userinfo(path: str) -> str:
+    match = NETWORK_PATH_USERINFO_RE.match(path)
+    if match is None:
+        return path
+    return f"{match.group('prefix')}{REDACTED_URL_CREDENTIALS}@{match.group('authority')}{match.group('suffix')}"
+
+
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     if max_chars <= 3:
         return text[:max_chars]
     return f"{text[: max_chars - 3]}..."
+
+
+def _bounded_evidence_prefix(text: str, max_chars: int) -> str:
+    """Bound redaction work while hiding URL authorities that cross the limit."""
+    bounded_chars = max_chars + EVIDENCE_PREVIEW_LOOKAHEAD
+    if len(text) <= bounded_chars:
+        return text
+
+    bounded_text = text[:bounded_chars]
+    for match in URL_RE.finditer(bounded_text):
+        if match.start() >= max_chars or match.end() != len(bounded_text):
+            continue
+        scheme_end = bounded_text.find("://", match.start()) + 3
+        return f"{bounded_text[:scheme_end]}{REDACTED_EVIDENCE_VALUE}"
+
+    if bounded_text.startswith(("//", "\\\\")):
+        authority = bounded_text[2:]
+        if "/" not in authority and "\\" not in authority:
+            return f"{bounded_text[:2]}{REDACTED_EVIDENCE_VALUE}"
+
+    return bounded_text
 
 
 def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
@@ -336,17 +383,14 @@ def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
 
 def redact_evidence_preview(text: str, max_chars: int = 180) -> str:
     """Redact a bounded evidence prefix before emitting a short preview."""
-    bounded_chars = max_chars + EVIDENCE_PREVIEW_LOOKAHEAD
-    bounded_text = text[:bounded_chars]
-    if len(text) > bounded_chars:
-        for match in URL_RE.finditer(bounded_text):
-            if match.start() >= max_chars or match.end() != len(bounded_text):
-                continue
-            scheme_end = bounded_text.find("://", match.start()) + 3
-            bounded_text = f"{bounded_text[:scheme_end]}{REDACTED_EVIDENCE_VALUE}"
-            break
+    bounded_text = _bounded_evidence_prefix(text, max_chars)
     redacted = redact_evidence_string(bounded_text, max_chars=None)
+    redacted = SINGLE_SLASH_URI_PATH_RE.sub(_redact_single_slash_uri_path, redacted)
     redacted = PLAIN_PATH_IN_TEXT_RE.sub(
+        lambda match: redact_evidence_path(match.group(0), max_chars=None),
+        redacted,
+    )
+    redacted = RELATIVE_PATH_IN_TEXT_RE.sub(
         lambda match: redact_evidence_path(match.group(0), max_chars=None),
         redacted,
     )
@@ -356,12 +400,15 @@ def redact_evidence_preview(text: str, max_chars: int = 180) -> str:
 def redact_evidence_path(path: str, max_chars: int | None = 180) -> str:
     """Redact secrets and capability tokens from a path-like evidence value."""
     stripped_path = path.strip()
+    if max_chars is not None:
+        stripped_path = _bounded_evidence_prefix(stripped_path, max_chars)
     if RFC_URL_RE.fullmatch(stripped_path) is not None:
         redacted = _redact_url_value(stripped_path)
     else:
         plain_path, query_separator, query_and_fragment = stripped_path.partition("?")
         query, fragment_separator, fragment = query_and_fragment.partition("#")
         redacted_path = redact_evidence_string(plain_path, max_chars=None)
+        redacted_path = _redact_network_path_userinfo(redacted_path)
         components = PATH_SEPARATOR_RE.split(redacted_path)
         for index in range(0, len(components), 2):
             if components[index]:
