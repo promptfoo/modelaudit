@@ -1759,6 +1759,15 @@ class TorchServeMarScanner(BaseScanner):
                         set[str],
                     ]
                 ] = []
+                self.function_binding_state_stack: list[
+                    tuple[
+                        dict[str, frozenset[str]],
+                        dict[str, frozenset[str]],
+                        dict[str, frozenset[str]],
+                        dict[str, str],
+                        set[str],
+                    ]
+                ] = []
                 self.risky_calls: set[str] = set()
                 self.collecting_module_bindings = False
                 self.scope_depth = 0
@@ -1984,6 +1993,11 @@ class TorchServeMarScanner(BaseScanner):
                     "builtins.__import__",
                     "importlib.import_module",
                 }
+                import_helper_names |= callable_names & {
+                    "__import__",
+                    "builtins.__import__",
+                    "importlib.import_module",
+                }
 
                 self._invalidate_name(name)
                 if module_names:
@@ -2016,6 +2030,98 @@ class TorchServeMarScanner(BaseScanner):
                     for child_target in target.elts:
                         self._invalidate_target(child_target)
 
+            def _record_target_from_iterable(self, target: ast.AST, iterable: ast.AST) -> bool:
+                if not isinstance(iterable, ast.List | ast.Tuple | ast.Set) or not iterable.elts:
+                    self._invalidate_target(target)
+                    return False
+
+                initial_state = self._snapshot_state()
+                possible_states = []
+                for element in iterable.elts:
+                    self._restore_state(initial_state)
+                    self._record_target_assignment(target, element)
+                    possible_states.append(self._snapshot_state())
+
+                merged_state = possible_states[0]
+                for possible_state in possible_states[1:]:
+                    merged_state = self._merge_states(merged_state, possible_state)
+                self._restore_state(merged_state)
+                return True
+
+            def _record_pattern_assignment(self, pattern: ast.pattern, value: ast.AST) -> None:
+                if isinstance(pattern, ast.MatchAs):
+                    if pattern.pattern is not None:
+                        self._record_pattern_assignment(pattern.pattern, value)
+                    if pattern.name is not None:
+                        self._record_name_assignment(pattern.name, value)
+                elif isinstance(pattern, ast.MatchStar):
+                    if pattern.name is not None:
+                        self._invalidate_name(pattern.name)
+                elif isinstance(pattern, ast.MatchSequence):
+                    if isinstance(value, ast.List | ast.Tuple) and len(pattern.patterns) == len(value.elts):
+                        for child_pattern, child_value in zip(pattern.patterns, value.elts, strict=True):
+                            self._record_pattern_assignment(child_pattern, child_value)
+                    else:
+                        for child_pattern in pattern.patterns:
+                            self._invalidate_pattern(child_pattern)
+                elif isinstance(pattern, ast.MatchMapping):
+                    if (
+                        isinstance(value, ast.Dict)
+                        and len(pattern.keys) == len(pattern.patterns)
+                        and all(key is not None for key in value.keys)
+                    ):
+                        value_by_key = {
+                            ast.dump(key): child_value
+                            for key, child_value in zip(value.keys, value.values, strict=True)
+                            if key is not None
+                        }
+                        for key, child_pattern in zip(pattern.keys, pattern.patterns, strict=True):
+                            matched_value: ast.expr | None = value_by_key.get(ast.dump(key))
+                            if matched_value is None:
+                                self._invalidate_pattern(child_pattern)
+                            else:
+                                self._record_pattern_assignment(child_pattern, matched_value)
+                    else:
+                        for child_pattern in pattern.patterns:
+                            self._invalidate_pattern(child_pattern)
+                    if pattern.rest is not None:
+                        self._invalidate_name(pattern.rest)
+                elif isinstance(pattern, ast.MatchClass):
+                    for child_pattern in [*pattern.patterns, *pattern.kwd_patterns]:
+                        self._invalidate_pattern(child_pattern)
+                elif isinstance(pattern, ast.MatchOr):
+                    initial_state = self._snapshot_state()
+                    possible_states = []
+                    for child_pattern in pattern.patterns:
+                        self._restore_state(initial_state)
+                        self._record_pattern_assignment(child_pattern, value)
+                        possible_states.append(self._snapshot_state())
+                    merged_state = possible_states[0]
+                    for possible_state in possible_states[1:]:
+                        merged_state = self._merge_states(merged_state, possible_state)
+                    self._restore_state(merged_state)
+
+            def _invalidate_pattern(self, pattern: ast.pattern) -> None:
+                if isinstance(pattern, ast.MatchAs):
+                    if pattern.pattern is not None:
+                        self._invalidate_pattern(pattern.pattern)
+                    if pattern.name is not None:
+                        self._invalidate_name(pattern.name)
+                elif isinstance(pattern, ast.MatchStar):
+                    if pattern.name is not None:
+                        self._invalidate_name(pattern.name)
+                elif isinstance(pattern, ast.MatchMapping):
+                    for child_pattern in pattern.patterns:
+                        self._invalidate_pattern(child_pattern)
+                    if pattern.rest is not None:
+                        self._invalidate_name(pattern.rest)
+                elif isinstance(pattern, ast.MatchSequence | ast.MatchOr):
+                    for child_pattern in pattern.patterns:
+                        self._invalidate_pattern(child_pattern)
+                elif isinstance(pattern, ast.MatchClass):
+                    for child_pattern in [*pattern.patterns, *pattern.kwd_patterns]:
+                        self._invalidate_pattern(child_pattern)
+
             def _visit_function_definition(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
                 for decorator in node.decorator_list:
                     self.visit(decorator)
@@ -2030,15 +2136,23 @@ class TorchServeMarScanner(BaseScanner):
                 elif self.scope_kind_stack[-1] == "class":
                     inherited_state = self.class_parent_state_stack[-1]
                 else:
-                    inherited_state = None
+                    inherited_state = self.function_binding_state_stack[-1]
                 local_bindings = scanner._function_local_binding_names(node)
                 self._push_scope(
                     self._parameter_names(node.args) | local_bindings,
                     inherited_state,
                     scope_kind="function",
                 )
+                initial_state = self._snapshot_state()
+                self.collecting_module_bindings = True
                 for statement in node.body:
                     self.visit(statement)
+                self.collecting_module_bindings = False
+                self.function_binding_state_stack.append(self._snapshot_state())
+                self._restore_state(initial_state)
+                for statement in node.body:
+                    self.visit(statement)
+                self.function_binding_state_stack.pop()
                 self._pop_scope()
 
             def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -2079,7 +2193,7 @@ class TorchServeMarScanner(BaseScanner):
                     class_parent_state = self.class_parent_state_stack[-1]
                 else:
                     class_body_state = self._snapshot_state()
-                    class_parent_state = class_body_state
+                    class_parent_state = self.function_binding_state_stack[-1]
                 self.class_parent_state_stack.append(class_parent_state)
                 self._push_scope(set(), class_body_state, scope_kind="class")
                 for statement in node.body:
@@ -2114,10 +2228,7 @@ class TorchServeMarScanner(BaseScanner):
 
             def _visit_for(self, node: ast.For | ast.AsyncFor) -> None:
                 self.visit(node.iter)
-                if isinstance(node.iter, ast.List | ast.Tuple | ast.Set) and len(node.iter.elts) == 1:
-                    self._record_target_assignment(node.target, node.iter.elts[0])
-                else:
-                    self._invalidate_target(node.target)
+                self._record_target_from_iterable(node.target, node.iter)
                 for statement in node.body:
                     self.visit(statement)
                 for statement in node.orelse:
@@ -2128,6 +2239,33 @@ class TorchServeMarScanner(BaseScanner):
 
             def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
                 self._visit_for(node)
+
+            def _visit_comprehension(
+                self,
+                generators: list[ast.comprehension],
+                result_nodes: list[ast.AST],
+            ) -> None:
+                self._push_scope(set(), scope_kind="comprehension")
+                for generator in generators:
+                    self.visit(generator.iter)
+                    self._record_target_from_iterable(generator.target, generator.iter)
+                    for condition in generator.ifs:
+                        self.visit(condition)
+                for result_node in result_nodes:
+                    self.visit(result_node)
+                self._pop_scope()
+
+            def visit_ListComp(self, node: ast.ListComp) -> None:
+                self._visit_comprehension(node.generators, [node.elt])
+
+            def visit_SetComp(self, node: ast.SetComp) -> None:
+                self._visit_comprehension(node.generators, [node.elt])
+
+            def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+                self._visit_comprehension(node.generators, [node.elt])
+
+            def visit_DictComp(self, node: ast.DictComp) -> None:
+                self._visit_comprehension(node.generators, [node.key, node.value])
 
             def visit_If(self, node: ast.If) -> None:
                 self.visit(node.test)
@@ -2173,6 +2311,24 @@ class TorchServeMarScanner(BaseScanner):
                 self._restore_state(merged_state)
                 for statement in node.finalbody:
                     self.visit(statement)
+
+            def visit_Match(self, node: ast.Match) -> None:
+                self.visit(node.subject)
+                initial_state = self._snapshot_state()
+                possible_states = [initial_state]
+                for case in node.cases:
+                    self._restore_state(initial_state)
+                    self._record_pattern_assignment(case.pattern, node.subject)
+                    if case.guard is not None:
+                        self.visit(case.guard)
+                    for statement in case.body:
+                        self.visit(statement)
+                    possible_states.append(self._snapshot_state())
+
+                merged_state = possible_states[0]
+                for possible_state in possible_states[1:]:
+                    merged_state = self._merge_states(merged_state, possible_state)
+                self._restore_state(merged_state)
 
             @staticmethod
             def _nullcontext_enter_result(call: ast.Call) -> ast.expr | None:

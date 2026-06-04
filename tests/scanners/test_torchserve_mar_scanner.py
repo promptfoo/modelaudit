@@ -1186,6 +1186,69 @@ def test_dynamic_import_handler_analysis_preserves_enclosing_function_closures(
 
 
 @pytest.mark.parametrize(
+    "handler_source",
+    [
+        (b"def handle(data, context):\n    return [module.system('id') for module in [__import__('os')]]\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    match [__import__('os')]:\n"
+            b"        case [module]:\n"
+            b"            return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    load = getattr(__import__('importlib'), 'import_module')\n"
+            b"    return load('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in [__import__('os'), __import__('math')]:\n"
+            b"        module.system('id')\n"
+        ),
+        (
+            b"def outer():\n"
+            b"    def handle(data, context):\n"
+            b"        return load('os').system('id')\n"
+            b"\n"
+            b"    load = __import__\n"
+            b"    return handle\n"
+        ),
+        (
+            b"def outer():\n"
+            b"    class Handler:\n"
+            b"        def handle(self, data, context):\n"
+            b"            return load('os').system('id')\n"
+            b"\n"
+            b"    load = __import__\n"
+            b"    return Handler\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_closes_iterable_pattern_and_closure_bypasses(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_keeps_comprehension_targets_scoped() -> None:
+    handler_source = (
+        b"from importlib import import_module as module\n"
+        b"\n"
+        b"def handle(data, context):\n"
+        b"    [value for module in [len] for value in [module]]\n"
+        b"    return module('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
     ("handler_source", "dangerous_name"),
     [
         (b"import os\ndef handle(data, context):\n    return os.execvpe('/bin/sh', ['sh'], {})\n", "os.execvpe"),
