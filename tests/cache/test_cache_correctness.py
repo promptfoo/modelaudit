@@ -161,6 +161,41 @@ def test_cache_manager_cached_scan_does_not_cache_transient_clean_bytes(tmp_path
     assert calls["count"] == 2
 
 
+def test_cache_manager_cached_scan_does_not_cache_symlink_target_swap(tmp_path: Path) -> None:
+    malicious_path = _make_cacheable_file(tmp_path, name="malicious.dat")
+    clean_path = _make_cacheable_file(tmp_path, name="clean.dat")
+    malicious_path.write_bytes(b"evil!:" + (b"x" * 2042))
+    clean_path.write_bytes(b"clean:" + (b"y" * 2042))
+    model_path = tmp_path / "model.dat"
+    try:
+        model_path.symlink_to(malicious_path)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+
+    cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    version_context = build_cache_version_context({"timeout": 30})
+    calls = {"count": 0}
+
+    def scan(path: str) -> dict[str, Any]:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            model_path.unlink()
+            model_path.symlink_to(clean_path)
+            prefix = Path(path).read_bytes()[:6].decode("utf-8")
+            model_path.unlink()
+            model_path.symlink_to(malicious_path)
+            return {"payload_prefix": prefix}
+        return {"payload_prefix": Path(path).read_bytes()[:6].decode("utf-8")}
+
+    first = cache_manager.cached_scan(str(model_path), scan, version_context=version_context)
+    second = cache_manager.cached_scan(str(model_path), scan, version_context=version_context)
+
+    assert first["payload_prefix"] == "clean:"
+    assert second["payload_prefix"] == "evil!:"
+    assert calls["count"] == 2
+    assert cache_manager.get_stats()["total_entries"] == 0
+
+
 def test_cache_manager_cached_scan_runs_when_pre_scan_hashing_fails(tmp_path: Path) -> None:
     file_path = tmp_path / "empty.dat"
     file_path.write_bytes(b"")

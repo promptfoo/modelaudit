@@ -108,6 +108,10 @@ class ScanResultsCache:
         version_context: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Load and validate a cache entry using a caller-provided stat result."""
+        if os.path.islink(file_path):
+            logger.debug("Bypassing scan-result cache lookup for symlink path %s", file_path)
+            return None
+
         try:
             cache_key = self._generate_cache_key(file_path, file_stat=file_stat, version_context=version_context)
             if not cache_key:
@@ -166,6 +170,10 @@ class ScanResultsCache:
         file_stat: os.stat_result | None = None,
     ) -> dict[str, Any] | None:
         """Get a cached result using a precomputed key, optionally validating with caller-provided stat data."""
+        if file_path is not None and os.path.islink(file_path):
+            logger.debug("Bypassing scan-result cache lookup for symlink path %s", file_path)
+            return None
+
         try:
             cache_file_path = self._get_cache_file_path(cache_key)
 
@@ -231,6 +239,9 @@ class ScanResultsCache:
             True when a cache entry was persisted, False when storage was skipped or failed.
         """
         try:
+            if os.path.islink(file_path):
+                logger.debug("Skipping cache store for symlink path %s", file_path)
+                return False
             if (expected_file_stat is None) != (expected_file_hash is None):
                 logger.debug("Skipping cache store for %s: incomplete expected file identity", file_path)
                 return False
