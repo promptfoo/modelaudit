@@ -2186,6 +2186,23 @@ class TestJITScriptDetector:
                 b"Alias().run(eval)\n"
             ),
             (b"__builtins__.__dict__.pop('eval')('1+1')\n"),
+            (b"\x00\xffdef payload():\n    for _index, callback in enumerate([eval]):\n        callback('1+1')\n"),
+            (
+                b"\x00\xffasync def get_callback():\n"
+                b"    return eval\n"
+                b"async def payload():\n"
+                b"    (await get_callback())('1+1')\n"
+            ),
+            (b"\x00\xffdef payload():\n    return next(iter([eval]))('1+1')\n"),
+            (b"\x00\xffdef payload():\n    return next(iter([]), eval)('1+1')\n"),
+            (b"\x00\xffdef payload():\n    callbacks = list([eval])\n    return callbacks[0]('1+1')\n"),
+            (b"\x00\xffdef payload():\n    callbacks = dict(run=eval)\n    return callbacks['run']('1+1')\n"),
+            (
+                b"\x00\xffdef payload():\n"
+                b"    match [eval]:\n"
+                b"        case [callback] | (callback,):\n"
+                b"            callback('1+1')\n"
+            ),
             (b"callbacks = []\nalias = callbacks\ncallbacks += [eval]\nalias[0]('1+1')\n"),
             (b"\x00\xffdef run(g=getattr):\n    return g(__builtins__, 'eval')('1+1')\nrun()\n"),
             (
@@ -2425,6 +2442,35 @@ class TestJITScriptDetector:
                 b"unused = eval\n"
             ),
             (b"__builtins__.__dict__.pop('len')([])\nunused = eval\n"),
+            (
+                b"\x00\xffdef payload():\n"
+                b"    for _index, callback in enumerate([len]):\n"
+                b"        callback([])\n"
+                b"unused = eval\n"
+            ),
+            (
+                b"\x00\xffasync def get_callback():\n"
+                b"    return len\n"
+                b"async def payload():\n"
+                b"    (await get_callback())([])\n"
+                b"unused = eval\n"
+            ),
+            (b"\x00\xffdef payload():\n    return next(iter([len]))([])\nunused = eval\n"),
+            (b"\x00\xffdef payload():\n    return next(iter([]), len)([])\nunused = eval\n"),
+            (b"\x00\xffdef payload():\n    callbacks = list([len])\n    return callbacks[0]([])\nunused = eval\n"),
+            (
+                b"\x00\xffdef payload():\n"
+                b"    callbacks = dict(run=len)\n"
+                b"    return callbacks['run']([])\n"
+                b"unused = eval\n"
+            ),
+            (
+                b"\x00\xffdef payload():\n"
+                b"    match [len]:\n"
+                b"        case [callback] | (callback,):\n"
+                b"            callback([])\n"
+                b"unused = eval\n"
+            ),
             (b"callbacks = []\ncallbacks += [len]\ncallbacks[0]([])\nunused = eval\n"),
             (b"callbacks = (len,)\nalias = callbacks\ncallbacks += (eval,)\nalias[1]('1+1')\n"),
             (b"\x00\xffdef run(g=lambda *_args: len):\n    return g(__builtins__, 'eval')([])\nrun()\nunused = eval\n"),
