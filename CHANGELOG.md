@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- fail closed on pickle protocol 5 `NEXT_BUFFER` opcodes instead of reporting clean coverage
 - bound `keras_metadata.pb` parsing in SavedModel scans, fail closed when the budget is exceeded, and continue analysis when a system hash policy disables MD5
 - fail closed when structurally recognized Keras ZIP scanners are unavailable while retaining generic ZIP security findings
 - redact sensitive decoded previews in TensorFlow SavedModel collection, PyFunc, and Keras metadata findings
@@ -59,6 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
+- fail closed on unverified Keras ZIP `StringLookup` vocabulary paths and redact remote URL evidence
 - fail closed when cloud directory metadata cannot be read for every listed object
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
 - fail closed on interpolation-bearing NeMo Hydra `_target_` selectors whose resolved callable cannot be verified

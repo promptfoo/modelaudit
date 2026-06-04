@@ -542,6 +542,7 @@ pub(crate) struct ScanState<'a> {
     next_buffer_count: usize,
     readonly_buffer_count: usize,
     readonly_buffer_empty_stack_count: usize,
+    readonly_buffer_invalid_stack_count: usize,
     first_buffer_opcode_position: Option<usize>,
     persistent_id_count: usize,
     first_persistent_id_position: Option<usize>,
@@ -608,6 +609,7 @@ impl<'a> ScanState<'a> {
             next_buffer_count: 0,
             readonly_buffer_count: 0,
             readonly_buffer_empty_stack_count: 0,
+            readonly_buffer_invalid_stack_count: 0,
             first_buffer_opcode_position: None,
             persistent_id_count: 0,
             first_persistent_id_position: None,
@@ -1044,6 +1046,7 @@ impl<'a> ScanState<'a> {
                 type_name: None, ..
             }
             | StackValue::Mark
+            | StackValue::ExternalBuffer
             | StackValue::Other => 0,
         }
     }
@@ -1071,6 +1074,7 @@ impl<'a> ScanState<'a> {
             | StackValue::Bytes { .. }
             | StackValue::Primitive { .. }
             | StackValue::Mark
+            | StackValue::ExternalBuffer
             | StackValue::Other => false,
         }
     }
@@ -1263,11 +1267,16 @@ impl<'a> ScanState<'a> {
                 }
             }
             "NEXT_BUFFER" => {
-                self.record_buffer_opcode(opcode.name, position, false);
-                self.push_stack_value(StackValue::Other);
+                self.record_buffer_opcode(opcode.name, position, false, false);
+                self.push_stack_value(StackValue::ExternalBuffer);
             }
             "READONLY_BUFFER" => {
-                self.record_buffer_opcode(opcode.name, position, self.stack.is_empty());
+                self.record_buffer_opcode(
+                    opcode.name,
+                    position,
+                    self.stack.is_empty(),
+                    Self::readonly_buffer_operand_is_definitely_invalid(self.stack.last()),
+                );
             }
             "MARK" => self.push_stack_value(StackValue::Mark),
             "POP" => {
@@ -1590,7 +1599,20 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn record_buffer_opcode(&mut self, op_name: &'static str, position: usize, empty_stack: bool) {
+    fn readonly_buffer_operand_is_definitely_invalid(value: Option<&StackValue>) -> bool {
+        !matches!(
+            value,
+            Some(StackValue::Bytes { .. } | StackValue::ExternalBuffer)
+        )
+    }
+
+    fn record_buffer_opcode(
+        &mut self,
+        op_name: &'static str,
+        position: usize,
+        empty_stack: bool,
+        invalid_stack: bool,
+    ) {
         if self.first_buffer_opcode_position.is_none() {
             self.first_buffer_opcode_position = Some(position);
         }
@@ -1600,6 +1622,9 @@ impl<'a> ScanState<'a> {
                 self.readonly_buffer_count += 1;
                 if empty_stack {
                     self.readonly_buffer_empty_stack_count += 1;
+                }
+                if invalid_stack {
+                    self.readonly_buffer_invalid_stack_count += 1;
                 }
             }
             _ => {}
@@ -1611,11 +1636,25 @@ impl<'a> ScanState<'a> {
         if buffer_opcode_count == 0 {
             return;
         }
+        let requires_external_buffer_context = self.next_buffer_count > 0;
+        let analysis_incomplete =
+            requires_external_buffer_context || self.readonly_buffer_invalid_stack_count > 0;
+        if analysis_incomplete && self.status.is_complete() {
+            self.status = ScanStatus::Inconclusive;
+        }
         let position = self.first_buffer_opcode_position.unwrap_or(0);
         self.add_notice(Notice {
-            message: format!(
-                "Encountered {buffer_opcode_count} protocol 5 buffer opcode(s); external buffer context is opaque"
-            ),
+            message: if requires_external_buffer_context {
+                format!(
+                    "Encountered {buffer_opcode_count} protocol 5 buffer opcode(s); external buffer context is opaque"
+                )
+            } else if analysis_incomplete {
+                format!(
+                    "Encountered {buffer_opcode_count} malformed protocol 5 buffer opcode(s); stack context is opaque"
+                )
+            } else {
+                format!("Encountered {buffer_opcode_count} in-band protocol 5 buffer opcode(s)")
+            },
             severity: "info",
             location: Some(format!("{} (pos {})", self.source, position)),
             code: Some("buffer_opcode"),
@@ -1637,8 +1676,16 @@ impl<'a> ScanState<'a> {
                     DetailValue::UInt(self.readonly_buffer_empty_stack_count as u64),
                 ),
                 (
+                    "readonly_buffer_invalid_stack_count".to_string(),
+                    DetailValue::UInt(self.readonly_buffer_invalid_stack_count as u64),
+                ),
+                (
                     "requires_external_buffer_context".to_string(),
-                    DetailValue::Bool(true),
+                    DetailValue::Bool(requires_external_buffer_context),
+                ),
+                (
+                    "analysis_incomplete".to_string(),
+                    DetailValue::Bool(analysis_incomplete),
                 ),
             ],
         });
@@ -8526,7 +8573,7 @@ mod tests {
         );
         assert_eq!(
             detail_string(&finding.details, "name_operand").as_deref(),
-            Some("object")
+            Some("external_buffer")
         );
         assert!(scan
             .notices
@@ -8573,6 +8620,100 @@ mod tests {
             detail_usize(&notice.details, "readonly_buffer_count"),
             Some(2)
         );
+        assert!(notice
+            .details
+            .iter()
+            .any(|(key, value)| key == "analysis_incomplete"
+                && matches!(value, DetailValue::Bool(true))));
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.verdict, "unknown");
+    }
+
+    #[test]
+    fn in_band_readonly_buffer_preserves_complete_coverage() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x05\x96\x01\x00\x00\x00\x00\x00\x00\x00A\x98.";
+        let mut scan = ScanState::new(
+            "in-band-readonly-buffer.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let notice = scan
+            .notices
+            .iter()
+            .find(|notice| notice.code == Some("buffer_opcode"))
+            .expect("buffer opcode notice");
+        assert_eq!(scan.status, ScanStatus::Complete);
+        assert_eq!(scan.verdict, "clean");
+        assert_eq!(detail_usize(&notice.details, "next_buffer_count"), Some(0));
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_count"),
+            Some(1)
+        );
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_invalid_stack_count"),
+            Some(0)
+        );
+        assert!(notice.details.iter().any(|(key, value)| {
+            key == "requires_external_buffer_context" && matches!(value, DetailValue::Bool(false))
+        }));
+        assert!(notice.details.iter().any(|(key, value)| {
+            key == "analysis_incomplete" && matches!(value, DetailValue::Bool(false))
+        }));
+    }
+
+    #[test]
+    fn non_buffer_readonly_operand_fails_closed() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x05G\x00\x00\x00\x00\x00\x00\x00\x00\x98.";
+        let mut scan = ScanState::new(
+            "non-buffer-readonly.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let notice = scan
+            .notices
+            .iter()
+            .find(|notice| notice.code == Some("buffer_opcode"))
+            .expect("buffer opcode notice");
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.verdict, "unknown");
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_empty_stack_count"),
+            Some(0)
+        );
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_invalid_stack_count"),
+            Some(1)
+        );
     }
 
     #[test]
@@ -8616,10 +8757,21 @@ mod tests {
             .iter()
             .find(|notice| notice.code == Some("buffer_opcode"))
             .expect("buffer opcode notice");
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.verdict, "malicious");
         assert_eq!(
             detail_usize(&notice.details, "readonly_buffer_empty_stack_count"),
             Some(1)
         );
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_invalid_stack_count"),
+            Some(1)
+        );
+        assert!(notice
+            .details
+            .iter()
+            .any(|(key, value)| key == "analysis_incomplete"
+                && matches!(value, DetailValue::Bool(true))));
     }
 
     #[test]
