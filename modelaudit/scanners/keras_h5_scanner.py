@@ -3,6 +3,7 @@
 import json
 import os
 import re
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, ClassVar
@@ -22,12 +23,13 @@ from ..config.explanations import (
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
-from ._evidence_redaction import redact_evidence_string
+from ._evidence_redaction import redact_evidence_path, redact_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
     check_custom_metric_config,
     check_lambda_dict_function,
+    check_lambda_list_function,
     check_subclassed_model,
     is_known_safe_keras_layer_class,
 )
@@ -89,6 +91,10 @@ class KerasH5Scanner(BaseScanner):
     )
     _KERAS_WEIGHT_ROOT_GROUPS: ClassVar[frozenset[str]] = frozenset({"model_weights", "optimizer_weights"})
     _KERAS_WEIGHT_ROOT_ATTRS: ClassVar[frozenset[str]] = frozenset({"layer_names", "weight_names"})
+    _MAX_HDF5_LAYOUT_PROBE_ITEMS: ClassVar[int] = 4096
+    _MAX_HDF5_LINK_VISITS: ClassVar[int] = 4096
+    _MAX_HDF5_EXTERNAL_REFERENCE_REPORTS: ClassVar[int] = 20
+    _MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS: ClassVar[int] = 20
     _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
     _WRAPPED_LAYER_SCAN_MODEL: ClassVar[dict[str, Any]] = {"class_name": "Sequential", "config": {"layers": []}}
 
@@ -174,11 +180,7 @@ class KerasH5Scanner(BaseScanner):
                 # CVE-2026-1669 applies to weight loading too. Inspect full
                 # Keras files and weights-like HDF5 layouts while leaving
                 # unrelated generic HDF5 artifacts quiet.
-                if (
-                    "model_config" in f.attrs
-                    or "keras_version" in result.metadata
-                    or self._has_weights_like_hdf5_layout(f, path)
-                ):
+                if "model_config" in f.attrs or self._has_weights_like_hdf5_layout(f, path):
                     self._check_hdf5_external_references(f, result, path)
 
                 # Check if this is a Keras model file
@@ -210,7 +212,7 @@ class KerasH5Scanner(BaseScanner):
                             details={"format": "generic_h5"},
                             rule_code=None,  # Passing check
                         )
-                    result.finish(success=True)  # Still success, just not a Keras file
+                    self._finish_scan_result(result)
                     return result
 
                 # Parse model config
@@ -360,7 +362,10 @@ class KerasH5Scanner(BaseScanner):
         if not layer_names:
             return False
 
-        for layer_name in layer_names:
+        for index, layer_name in enumerate(layer_names):
+            if index >= cls._MAX_HDF5_LAYOUT_PROBE_ITEMS:
+                return True
+
             link = h5_file.get(layer_name, getlink=True)
             if isinstance(link, h5py.ExternalLink):
                 return True
@@ -389,7 +394,10 @@ class KerasH5Scanner(BaseScanner):
         if not isinstance(layers, h5py.Group):
             return False
 
-        for layer_name in layers:
+        for index, layer_name in enumerate(layers):
+            if index >= cls._MAX_HDF5_LAYOUT_PROBE_ITEMS:
+                return True
+
             layer_link = layers.get(layer_name, getlink=True)
             if isinstance(layer_link, h5py.ExternalLink):
                 return True
@@ -438,42 +446,83 @@ class KerasH5Scanner(BaseScanner):
     def _check_hdf5_external_references(self, h5_file: Any, result: ScanResult, source_path: str) -> None:
         """Detect HDF5 external links/storage before any Keras-specific parsing short-circuits."""
         findings: list[dict[str, Any]] = []
+        external_reference_count = 0
+        external_storage_segments_truncated = False
 
         def visit(name: str, link: Any) -> None:
+            nonlocal external_reference_count, external_storage_segments_truncated
             if isinstance(link, h5py.ExternalLink):
-                findings.append(
-                    {
-                        "kind": "ExternalLink",
-                        "hdf5_path": f"/{name}".replace("//", "/"),
-                        "filename": redact_evidence_string(link.filename, max_chars=200),
-                        "path": redact_evidence_string(link.path, max_chars=200),
-                    },
-                )
+                external_reference_count += 1
+                if len(findings) < self._MAX_HDF5_EXTERNAL_REFERENCE_REPORTS:
+                    findings.append(
+                        {
+                            "kind": "ExternalLink",
+                            "hdf5_path": f"/{name}".replace("//", "/"),
+                            "filename": redact_evidence_path(link.filename, max_chars=200),
+                            "path": redact_evidence_path(link.path, max_chars=200),
+                        },
+                    )
+                return
+
+            if not isinstance(link, h5py.HardLink):
                 return
 
             obj = h5_file.get(name, getlink=False)
             if isinstance(obj, h5py.Dataset):
                 external_storage = obj.external
                 if external_storage:
-                    findings.append(
+                    external_reference_count += 1
+                    if len(findings) >= self._MAX_HDF5_EXTERNAL_REFERENCE_REPORTS:
+                        return
+                    segments = [
                         {
-                            "kind": "external_storage",
-                            "hdf5_path": f"/{name}".replace("//", "/"),
-                            "segments": [
-                                {
-                                    "filename": redact_evidence_string(filename, max_chars=200),
-                                    "offset": int(offset),
-                                    "size": int(size),
-                                }
-                                for filename, offset, size in external_storage
-                            ],
-                        },
-                    )
+                            "filename": redact_evidence_path(filename, max_chars=200),
+                            "offset": int(offset),
+                            "size": int(size),
+                        }
+                        for filename, offset, size in external_storage[
+                            : self._MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS
+                        ]
+                    ]
+                    finding: dict[str, Any] = {
+                        "kind": "external_storage",
+                        "hdf5_path": f"/{name}".replace("//", "/"),
+                        "segments": segments,
+                    }
+                    if len(external_storage) > len(segments):
+                        external_storage_segments_truncated = True
+                        finding["segment_count"] = len(external_storage)
+                        finding["segments_truncated"] = True
+                    findings.append(finding)
 
-        if hasattr(h5_file, "visititems_links"):
-            h5_file.visititems_links(visit)
-        else:  # pragma: no cover - compatibility fallback for older h5py
-            h5_file.visititems(lambda name, _obj: visit(name, h5_file.get(name, getlink=True)))
+        visited_link_count, link_visits_truncated = self._visit_hdf5_links(
+            h5_file,
+            visit,
+            max_links=self._MAX_HDF5_LINK_VISITS,
+        )
+        external_references_truncated = external_reference_count > len(findings)
+        if link_visits_truncated or external_references_truncated or external_storage_segments_truncated:
+            reason = "keras_h5_external_reference_analysis_limit_exceeded"
+            self._mark_inconclusive_scan_result(result, reason)
+            result.add_check(
+                name="HDF5 External Reference Analysis Limit",
+                passed=False,
+                message="Keras H5 external-reference analysis reached a configured safety limit",
+                severity=IssueSeverity.INFO,
+                location=source_path,
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
+                    "visited_link_count": visited_link_count,
+                    "max_link_visits": self._MAX_HDF5_LINK_VISITS,
+                    "link_visits_truncated": link_visits_truncated,
+                    "external_reference_count": external_reference_count,
+                    "reported_external_reference_count": len(findings),
+                    "external_references_truncated": external_references_truncated,
+                    "external_storage_segments_truncated": external_storage_segments_truncated,
+                },
+                rule_code="S902",
+            )
 
         if not findings:
             return
@@ -491,6 +540,10 @@ class KerasH5Scanner(BaseScanner):
             "remediation": "Upgrade to Keras >= 3.12.1 or >= 3.13.2 and reject weights using HDF5 external references.",
             "external_references": findings,
         }
+        if external_references_truncated or external_storage_segments_truncated:
+            details["external_reference_count"] = external_reference_count
+            details["external_references_truncated"] = external_references_truncated
+            details["external_storage_segments_truncated"] = external_storage_segments_truncated
 
         vuln_status = self._is_vulnerable_to_cve_2026_1669(keras_version) if isinstance(keras_version, str) else None
         if vuln_status is True:
@@ -509,21 +562,28 @@ class KerasH5Scanner(BaseScanner):
             )
             return
 
-        if vuln_status is False and isinstance(keras_version, str):
-            result.add_check(
-                name="HDF5 External Weight Reference Version Check",
-                passed=True,
-                message=(
-                    f"HDF5 external references detected in weights, but Keras {keras_version} is outside the known "
-                    "CVE-2026-1669 vulnerable ranges"
-                ),
-                location=location,
-                details={"keras_version": keras_version, "external_references": findings},
-            )
-            return
-
         if isinstance(keras_version, str):
             details["keras_version"] = keras_version
+            if vuln_status is False:
+                details["parse_status"] = "untrusted_artifact_version"
+                details["version_source"] = "hdf5_file_attribute"
+                result.add_check(
+                    name="HDF5 External Weight Reference Risk (Untrusted Version Metadata)",
+                    passed=False,
+                    message=(
+                        "HDF5 external references detected in standalone Keras H5 weights; "
+                        f"the file claims Keras {keras_version}, but artifact-controlled version metadata "
+                        "cannot prove the loader runtime is outside the CVE-2026-1669 vulnerable ranges"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    location=location,
+                    details=details
+                    | {
+                        "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
+                    },
+                    why=get_cve_2026_1669_explanation("hdf5_external_reference"),
+                )
+                return
 
         result.add_check(
             name="HDF5 External Weight Reference Risk (Version Unknown)",
@@ -541,6 +601,49 @@ class KerasH5Scanner(BaseScanner):
                 "parse_status": "unknown",
             },
         )
+
+    @staticmethod
+    def _visit_hdf5_links(
+        h5_file: Any,
+        visit: Callable[[str, Any], None],
+        *,
+        max_links: int,
+    ) -> tuple[int, bool]:
+        """Visit links without resolving external targets on every supported h5py version."""
+        visited_link_count = 0
+
+        def bounded_visit(name: str, link: Any) -> bool | None:
+            nonlocal visited_link_count
+            visited_link_count += 1
+            if visited_link_count > max_links:
+                return True
+            visit(name, link)
+            return None
+
+        if hasattr(h5_file, "visititems_links"):
+            h5_file.visititems_links(bounded_visit)
+            return min(visited_link_count, max_links), visited_link_count > max_links
+
+        visited_group_ids = {h5_file.id}
+        groups_to_visit = [(h5_file, "")]
+        while groups_to_visit:
+            group, prefix = groups_to_visit.pop()
+            for child_name in group:
+                path = f"{prefix}/{child_name}" if prefix else str(child_name)
+                link = group.get(child_name, getlink=True)
+                if bounded_visit(path, link):
+                    return max_links, True
+                if not isinstance(link, h5py.HardLink):
+                    continue
+
+                obj = group.get(child_name, getlink=False)
+                if not isinstance(obj, h5py.Group) or obj.id in visited_group_ids:
+                    continue
+
+                visited_group_ids.add(obj.id)
+                groups_to_visit.append((obj, path))
+
+        return visited_link_count, False
 
     def _scan_training_config(self, training_config: Any, result: ScanResult) -> None:
         """Inspect training_config for custom metrics and losses."""
@@ -920,6 +1023,23 @@ class KerasH5Scanner(BaseScanner):
         module_name = layer_config.get("module")
         function_name = layer_config.get("function_name")
 
+        layer_name = layer_config.get("name", "lambda")
+        encoded_function_handled = False
+        if isinstance(function_str, dict):
+            encoded_function_handled = check_lambda_dict_function(
+                function_str,
+                result,
+                self.current_file_path,
+                layer_name,
+            )
+        elif isinstance(function_str, list):
+            encoded_function_handled = check_lambda_list_function(
+                function_str,
+                result,
+                self.current_file_path,
+                layer_name,
+            )
+
         # Check if there's actual Python code to validate
         if function_str and isinstance(function_str, str):
             # First check if it matches safe patterns
@@ -937,63 +1057,67 @@ class KerasH5Scanner(BaseScanner):
                     },
                     rule_code=None,  # Passing check
                 )
-                return
-
-            # This might be serialized Python code
-            is_valid, error = validate_python_syntax(function_str)
-
-            if is_valid:
-                # It's valid Python! Check if it's dangerous
-                is_dangerous, risk_desc = is_code_potentially_dangerous(function_str, "low")
-
-                # Check if code is dangerous
-                if is_dangerous:
-                    result.add_check(
-                        name="Lambda Layer Code Analysis",
-                        passed=False,
-                        message="Lambda layer contains dangerous Python code",
-                        severity=IssueSeverity.CRITICAL,
-                        location=self.current_file_path,
-                        details={
-                            "layer_class": "Lambda",
-                            "code_analysis": risk_desc,
-                            "code_preview": redact_evidence_string(function_str, max_chars=200),
-                        },
-                        rule_code="S507",  # Python embedded code
-                    )
-                else:
-                    # Valid Python but not dangerous - record as passed
-                    result.add_check(
-                        name="Lambda Layer Code Analysis",
-                        passed=True,
-                        message="Lambda layer contains safe Python code",
-                        location=self.current_file_path,
-                        details={
-                            "layer_class": "Lambda",
-                            "validation_status": "valid_python",
-                        },
-                        rule_code=None,  # Passing check
-                    )
             else:
-                # Not valid Python syntax - might be a configuration issue
-                # Only flag if it looks like attempted code execution
-                if any(keyword in str(layer_config) for keyword in ["eval", "exec", "compile", "__import__"]):
-                    result.add_check(
-                        name="Lambda Layer Suspicious Keywords Check",
-                        passed=False,
-                        message="Lambda layer contains suspicious configuration",
-                        severity=IssueSeverity.WARNING,
-                        location=self.current_file_path,
-                        details={
-                            "layer_class": "Lambda",
-                            "description": self.suspicious_layer_types["Lambda"],
-                            "layer_config": layer_config,
-                            "validation_error": error,
-                        },
-                        why=get_pattern_explanation("lambda_layer"),
-                        rule_code="S1103",
-                    )
-        elif module_name or function_name:
+                # This might be serialized Python code
+                is_valid, error = validate_python_syntax(function_str)
+
+                if is_valid:
+                    # It's valid Python! Check if it's dangerous
+                    is_dangerous, risk_desc = is_code_potentially_dangerous(function_str, "low")
+
+                    # Check if code is dangerous
+                    if is_dangerous:
+                        result.add_check(
+                            name="Lambda Layer Code Analysis",
+                            passed=False,
+                            message="Lambda layer contains dangerous Python code",
+                            severity=IssueSeverity.CRITICAL,
+                            location=self.current_file_path,
+                            details={
+                                "layer_class": "Lambda",
+                                "code_analysis": risk_desc,
+                                "code_preview": redact_evidence_string(function_str, max_chars=200),
+                            },
+                            rule_code="S507",  # Python embedded code
+                        )
+                    else:
+                        # Valid Python but not dangerous - record as passed
+                        result.add_check(
+                            name="Lambda Layer Code Analysis",
+                            passed=True,
+                            message="Lambda layer contains safe Python code",
+                            location=self.current_file_path,
+                            details={
+                                "layer_class": "Lambda",
+                                "validation_status": "valid_python",
+                            },
+                            rule_code=None,  # Passing check
+                        )
+                else:
+                    # Not valid Python syntax - might be a configuration issue
+                    # Only flag if it looks like attempted code execution
+                    if any(keyword in str(layer_config) for keyword in ["eval", "exec", "compile", "__import__"]):
+                        result.add_check(
+                            name="Lambda Layer Suspicious Keywords Check",
+                            passed=False,
+                            message="Lambda layer contains suspicious configuration",
+                            severity=IssueSeverity.WARNING,
+                            location=self.current_file_path,
+                            details={
+                                "layer_class": "Lambda",
+                                "description": self.suspicious_layer_types["Lambda"],
+                                "layer_config": layer_config,
+                                "validation_error": error,
+                            },
+                            why=get_pattern_explanation("lambda_layer"),
+                            rule_code="S1103",
+                        )
+        module_reference_values = (module_name, function_name)
+        has_invalid_module_reference = any(
+            value is not None and not isinstance(value, str) for value in module_reference_values
+        )
+        has_module_reference = any(isinstance(value, str) and bool(value.strip()) for value in module_reference_values)
+        if has_module_reference or has_invalid_module_reference:
             # Module/function reference - check for dangerous imports
             if self._is_lambda_module_reference_dangerous(module_name, function_name):
                 result.add_check(
@@ -1010,7 +1134,22 @@ class KerasH5Scanner(BaseScanner):
                     why=get_pattern_explanation("lambda_layer"),
                     rule_code="S1103",
                 )
-            else:
+            elif has_invalid_module_reference:
+                result.add_check(
+                    name="Lambda Layer Module Reference Check",
+                    passed=False,
+                    message="Lambda layer uses malformed module/function reference metadata",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={
+                        "layer_class": "Lambda",
+                        "module_type": type(module_name).__name__,
+                        "function_type": type(function_name).__name__,
+                    },
+                    why="Malformed Lambda module references cannot be safely classified.",
+                    rule_code="S1103",
+                )
+            elif not encoded_function_handled:
                 # Safe module reference - record as passed
                 result.add_check(
                     name="Lambda Layer Module Reference Check",
@@ -1024,9 +1163,6 @@ class KerasH5Scanner(BaseScanner):
                     },
                     rule_code=None,  # Passing check
                 )
-        elif isinstance(function_str, dict):
-            # Keras 3.x dict-format Lambda: {"class_name": "__lambda__", "config": {"code": ...}}
-            check_lambda_dict_function(function_str, result, self.current_file_path, layer_config.get("name", "lambda"))
         # Don't flag Lambda layers without code - they might just be placeholders
 
     @staticmethod
