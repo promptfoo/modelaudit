@@ -535,6 +535,150 @@ def test_pickle_report_to_scan_result_fails_closed_for_inconclusive_report_witho
     )
 
 
+@pytest.mark.parametrize(
+    ("report_status", "report_verdict"),
+    [
+        (ScanStatus.INCONCLUSIVE, SafetyVerdict.UNKNOWN),
+        (ScanStatus.COMPLETE, SafetyVerdict.CLEAN),
+    ],
+    ids=["native-inconclusive", "legacy-complete"],
+)
+def test_pickle_report_to_scan_result_fails_closed_for_protocol5_buffer_notice(
+    report_status: ScanStatus,
+    report_verdict: SafetyVerdict,
+) -> None:
+    report = PickleReport(
+        source="buffer.pkl",
+        status=report_status,
+        verdict=report_verdict,
+        notices=(
+            Notice(
+                message="Encountered 1 protocol 5 buffer opcode(s); external buffer context is opaque",
+                severity=Severity.INFO,
+                location="buffer.pkl (pos 2)",
+                code="buffer_opcode",
+                details={
+                    "buffer_opcode_count": 1,
+                    "next_buffer_count": 1,
+                    "readonly_buffer_count": 0,
+                    "requires_external_buffer_context": True,
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["protocol5_external_buffer_context"]
+    assert result.metadata["analysis_incomplete"] is True
+    assert any(
+        check.name == "Standalone Pickle Notice"
+        and check.status.value == "failed"
+        and check.rule_code == "S902"
+        and check.details["pickle_notice_code"] == "buffer_opcode"
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+
+
+def test_pickle_report_to_scan_result_preserves_complete_in_band_readonly_buffer_notice() -> None:
+    report = PickleReport(
+        source="in-band-readonly-buffer.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        notices=(
+            Notice(
+                message="Encountered 1 in-band protocol 5 buffer opcode(s)",
+                severity=Severity.INFO,
+                location="in-band-readonly-buffer.pkl (pos 12)",
+                code="buffer_opcode",
+                details={
+                    "buffer_opcode_count": 1,
+                    "next_buffer_count": 0,
+                    "readonly_buffer_count": 1,
+                    "readonly_buffer_empty_stack_count": 0,
+                    "readonly_buffer_invalid_stack_count": 0,
+                    "requires_external_buffer_context": False,
+                    "analysis_incomplete": False,
+                },
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    notice_check = next(check for check in result.checks if check.name == "Standalone Pickle Notice")
+    assert notice_check.status.value == "passed"
+
+
+def test_pickle_report_to_scan_result_fails_closed_for_legacy_invalid_readonly_buffer_notice() -> None:
+    report = PickleReport(
+        source="invalid-readonly-buffer.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        notices=(
+            Notice(
+                message="Encountered 1 malformed protocol 5 buffer opcode(s); stack context is opaque",
+                severity=Severity.INFO,
+                location="invalid-readonly-buffer.pkl (pos 3)",
+                code="buffer_opcode",
+                details={
+                    "buffer_opcode_count": 1,
+                    "next_buffer_count": 0,
+                    "readonly_buffer_count": 1,
+                    "readonly_buffer_empty_stack_count": 0,
+                    "readonly_buffer_invalid_stack_count": 1,
+                    "requires_external_buffer_context": False,
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["protocol5_external_buffer_context"]
+    assert result.metadata["analysis_incomplete"] is True
+
+
+def test_pickle_report_to_scan_result_fails_closed_for_legacy_missing_invalid_readonly_counter() -> None:
+    report = PickleReport(
+        source="legacy-invalid-readonly-buffer.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        notices=(
+            Notice(
+                message="Encountered 1 protocol 5 readonly buffer opcode(s)",
+                severity=Severity.INFO,
+                location="legacy-invalid-readonly-buffer.pkl (pos 3)",
+                code="buffer_opcode",
+                details={
+                    "buffer_opcode_count": 1,
+                    "next_buffer_count": 0,
+                    "readonly_buffer_count": 1,
+                    "readonly_buffer_empty_stack_count": 0,
+                    "requires_external_buffer_context": False,
+                    "analysis_incomplete": False,
+                },
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["protocol5_external_buffer_context"]
+    assert result.metadata["analysis_incomplete"] is True
+
+
 def test_pickle_report_to_scan_result_fails_closed_for_truncated_literal_scan_notice() -> None:
     report = PickleReport(
         source="large-string.pkl",
