@@ -4161,6 +4161,82 @@ class TestCVE202523304HydraTarget:
         )
 
     @pytest.mark.parametrize(
+        "target",
+        [
+            "ftplib.FTP",
+            "ftplib.FTP_TLS",
+            "imaplib.IMAP4",
+            "imaplib.IMAP4_SSL",
+            "nntplib.NNTP",
+            "nntplib.NNTP_SSL",
+            "poplib.POP3",
+            "poplib.POP3_SSL",
+            "smtplib.LMTP",
+            "smtplib.SMTP",
+            "smtplib.SMTP_SSL",
+            "telnetlib.Telnet",
+            "bz2.open",
+            "dbm.open",
+            "gzip.open",
+            "lzma.open",
+            "shelve.open",
+            "sqlite3.connect",
+            "tarfile.open",
+            "zipfile.ZipFile",
+            "_ctypes.dlopen",
+            "ctypes.OleDLL",
+            "ctypes.PyDLL",
+            "ctypes.WinDLL",
+            "ctypes._dlopen",
+            "ctypes.cdll.LoadLibrary",
+            "ctypes.oledll.LoadLibrary",
+            "ctypes.pydll.LoadLibrary",
+            "ctypes.windll.LoadLibrary",
+            "ctypes.cdll.attacker_library",
+            "numpy.ctypeslib.load_library",
+        ],
+    )
+    def test_reviewed_constructor_and_loader_aliases_are_dangerous(self, tmp_path: Path, target: str) -> None:
+        """Immediate network, file, and native-loader aliases must fail security review."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+        assert not any(
+            check.name == "Hydra _target_ Review" and check.details.get("target") == target for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "custom.ftplib.FTPFactory.SafeBuilder",
+            "custom.tarfile.open_safe.SafeBuilder",
+            "custom.ctypes.PyDLLFactory.SafeBuilder",
+        ],
+    )
+    def test_constructor_and_loader_near_matches_remain_review_only(self, tmp_path: Path, target: str) -> None:
+        """Exact alias coverage should not promote similarly named custom factories."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+        assert any(
+            check.name == "Hydra _target_ Review"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.INFO
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
         ("target", "target_config"),
         [
             (
@@ -4422,6 +4498,9 @@ class TestCVE202523304HydraTarget:
         [
             "http.client.HTTPConnection.endheaders",
             "socket.socket.sendfile",
+            "smtplib.SMTP",
+            "tarfile.open",
+            "ctypes.PyDLL",
             "os.path.realpath",
             "os.chmod",
             "pathlib.Path.resolve",
@@ -4529,6 +4608,7 @@ class TestCVE202523304HydraTarget:
             "httpx._client.Client.stream",
             "httpx.AsyncClient.get",
             "httpx._client.AsyncClient.request",
+            "ctypes.LibraryLoader",
             "glob.iglob",
             "os.walk",
             "pathlib.Path.glob",

@@ -134,6 +134,14 @@ _DANGEROUS_TARGETS = {
     "io.FileIO",
     "_io.FileIO",
     "codecs.open",
+    "bz2.open",
+    "dbm.open",
+    "gzip.open",
+    "lzma.open",
+    "shelve.open",
+    "sqlite3.connect",
+    "tarfile.open",
+    "zipfile.ZipFile",
     "pickle.loads",
     "pickle.load",
     "cloudpickle.loads",
@@ -264,6 +272,18 @@ _DANGEROUS_TARGETS = {
     "urllib.request.FancyURLopener.open_https",
     "urllib.request.FancyURLopener.open_local_file",
     "urllib.request.FancyURLopener.retrieve",
+    "ftplib.FTP",
+    "ftplib.FTP_TLS",
+    "imaplib.IMAP4",
+    "imaplib.IMAP4_SSL",
+    "nntplib.NNTP",
+    "nntplib.NNTP_SSL",
+    "poplib.POP3",
+    "poplib.POP3_SSL",
+    "smtplib.LMTP",
+    "smtplib.SMTP",
+    "smtplib.SMTP_SSL",
+    "telnetlib.Telnet",
     "http.client.HTTPConnection.request",
     "http.client.HTTPSConnection.request",
     "http.client.HTTPConnection.connect",
@@ -627,10 +647,26 @@ _DANGEROUS_TARGETS = {
     "pathlib.PosixPath.link_to",
     "pathlib.WindowsPath.link_to",
     "webbrowser.open",
+    "_ctypes.dlopen",
     "ctypes.CDLL",
+    "ctypes.OleDLL",
+    "ctypes.PyDLL",
+    "ctypes.WinDLL",
+    "ctypes._dlopen",
+    "ctypes.cdll.LoadLibrary",
+    "ctypes.oledll.LoadLibrary",
+    "ctypes.pydll.LoadLibrary",
+    "ctypes.windll.LoadLibrary",
+    "numpy.ctypeslib.load_library",
     "code.interact",
     "pty.spawn",
 }
+_DANGEROUS_TARGET_PREFIXES = (
+    "ctypes.cdll.",
+    "ctypes.oledll.",
+    "ctypes.pydll.",
+    "ctypes.windll.",
+)
 
 # Patterns in _target_ that are suspicious even if not exact matches
 _SUSPICIOUS_TARGET_PATTERNS = (
@@ -2752,7 +2788,11 @@ class NemoScanner(BaseScanner):
             return
 
         # Check against known dangerous targets (always flag, even if safe prefix)
-        if target in _DANGEROUS_TARGETS or (target == "numpy.load" and self._numpy_load_allows_pickle(target_config)):
+        if (
+            target in _DANGEROUS_TARGETS
+            or target.startswith(_DANGEROUS_TARGET_PREFIXES)
+            or (target == "numpy.load" and self._numpy_load_allows_pickle(target_config))
+        ):
             result.add_check(
                 name=f"{CVE_2025_23304_ID}: Dangerous Hydra _target_",
                 passed=False,
