@@ -1711,8 +1711,8 @@ impl<'a> ScanState<'a> {
                             unknown_key_values_overflowed = true;
                             entry_budget_exhausted = true;
                         }
-                    } else {
-                        self.insert_optional_tracked_dict_shadow_entry(&mut entries, key);
+                    } else if !self.insert_optional_tracked_dict_shadow_entry(&mut entries, key) {
+                        unknown_key_values_overflowed = true;
                     }
                 } else {
                     Self::insert_tracked_dict_unknown_key_value(
@@ -1776,10 +1776,17 @@ impl<'a> ScanState<'a> {
         let Some(mut tracked_dict) = self.current_top_tracked_dict_value(memo_index) else {
             return;
         };
-        if let StackValue::TrackedDict { entries, .. } = &mut tracked_dict {
+        if let StackValue::TrackedDict {
+            entries,
+            unknown_key_values_overflowed,
+            ..
+        } = &mut tracked_dict
+        {
             entries.retain(|(candidate, _)| candidate != key);
             if entries.len() < MAX_TRACKED_DICT_ENTRIES {
                 entries.push((key.to_string(), StackValue::Other));
+            } else {
+                *unknown_key_values_overflowed = true;
             }
         }
         self.commit_top_tracked_dict_value(memo_index, tracked_dict, "tracked_dict_shadow");
@@ -1864,11 +1871,15 @@ impl<'a> ScanState<'a> {
         &mut self,
         entries: &mut Vec<(String, StackValue)>,
         key: String,
-    ) {
+    ) -> bool {
         if let Some((_, value)) = entries.iter_mut().find(|(candidate, _)| candidate == &key) {
             *value = StackValue::Other;
+            true
         } else if entries.len() < MAX_TRACKED_DICT_ENTRIES {
             entries.push((key, StackValue::Other));
+            true
+        } else {
+            false
         }
     }
 
@@ -2512,10 +2523,17 @@ impl<'a> ScanState<'a> {
         let Some(mut tracked_dict) = self.memo.get(&memo_index).cloned() else {
             return;
         };
-        if let StackValue::TrackedDict { entries, .. } = &mut tracked_dict {
+        if let StackValue::TrackedDict {
+            entries,
+            unknown_key_values_overflowed,
+            ..
+        } = &mut tracked_dict
+        {
             entries.retain(|(candidate, _)| candidate != key);
             if entries.len() < MAX_TRACKED_DICT_ENTRIES {
                 entries.push((key.to_string(), StackValue::Other));
+            } else {
+                *unknown_key_values_overflowed = true;
             }
         }
         self.replace_memo_value(memo_index, tracked_dict, "tracked_dict_shadow");
@@ -3699,14 +3717,27 @@ impl<'a> ScanState<'a> {
             StackValue::TrackedDict {
                 entries,
                 memo_index,
+                unknown_key_values,
+                unknown_key_values_overflowed,
                 ..
             } => {
                 if memo_index.is_some_and(|index| !visited.insert(index)) {
                     return None;
                 }
                 let entries = self.current_tracked_dict_entries(entries, *memo_index);
+                let unknown_key_lookup_is_opaque = key.is_none()
+                    && !self
+                        .current_tracked_dict_unknown_key_values(unknown_key_values, *memo_index)
+                        .is_empty();
                 if key.is_some_and(|key| entries.iter().any(|(candidate, _)| candidate == key)) {
                     Some(MappingLookup::Shadowed)
+                } else if unknown_key_lookup_is_opaque
+                    || self.current_tracked_dict_unknown_key_values_overflowed(
+                        *unknown_key_values_overflowed,
+                        *memo_index,
+                    )
+                {
+                    Some(MappingLookup::BudgetExceeded)
                 } else {
                     None
                 }
@@ -3750,7 +3781,7 @@ impl<'a> ScanState<'a> {
         &'b self,
         mapping: &'b StackValue,
         path: &[Option<String>],
-        visited: &mut HashSet<i64>,
+        visited: &mut HashSet<(i64, usize)>,
         visited_nodes: &mut usize,
     ) -> Option<MappingLookup<'b>> {
         if *visited_nodes >= MAX_MAPPING_TRAVERSAL_NODES {
@@ -3764,25 +3795,62 @@ impl<'a> ScanState<'a> {
             StackValue::TrackedDict {
                 entries,
                 memo_index,
+                unknown_key_values,
+                unknown_key_values_overflowed,
                 ..
             } => {
-                if memo_index.is_some_and(|index| !visited.insert(index)) {
-                    return None;
+                let visit_key = memo_index.map(|index| (index, path.len()));
+                if visit_key.is_some_and(|key| !visited.insert(key)) {
+                    return Some(MappingLookup::BudgetExceeded);
                 }
                 let entries = self.current_tracked_dict_entries(entries, *memo_index);
-                let (key, remaining_path) = path.split_first()?;
-                let key = key.as_deref()?;
-                let (_, value) = entries.iter().find(|(candidate, _)| candidate == key)?;
-                if remaining_path.is_empty() {
-                    Some(MappingLookup::Shadowed)
+                let result = if let Some((key, remaining_path)) = path.split_first() {
+                    if let Some(key) = key.as_deref() {
+                        if let Some((_, value)) =
+                            entries.iter().find(|(candidate, _)| candidate == key)
+                        {
+                            if remaining_path.is_empty() {
+                                Some(MappingLookup::Shadowed)
+                            } else {
+                                self.mapping_lookup_default_factory_path_inner(
+                                    value,
+                                    remaining_path,
+                                    visited,
+                                    visited_nodes,
+                                )
+                                .or(Some(MappingLookup::Shadowed))
+                            }
+                        } else if self.current_tracked_dict_unknown_key_values_overflowed(
+                            *unknown_key_values_overflowed,
+                            *memo_index,
+                        ) {
+                            Some(MappingLookup::BudgetExceeded)
+                        } else {
+                            None
+                        }
+                    } else {
+                        let unknown_key_values = self.current_tracked_dict_unknown_key_values(
+                            unknown_key_values,
+                            *memo_index,
+                        );
+                        if unknown_key_values.is_empty()
+                            && !self.current_tracked_dict_unknown_key_values_overflowed(
+                                *unknown_key_values_overflowed,
+                                *memo_index,
+                            )
+                        {
+                            None
+                        } else {
+                            Some(MappingLookup::BudgetExceeded)
+                        }
+                    }
                 } else {
-                    self.mapping_lookup_default_factory_path_inner(
-                        value,
-                        remaining_path,
-                        visited,
-                        visited_nodes,
-                    )
+                    Some(MappingLookup::BudgetExceeded)
+                };
+                if let Some(visit_key) = visit_key {
+                    visited.remove(&visit_key);
                 }
+                result
             }
             StackValue::MappingWrapper {
                 reference,
@@ -5207,8 +5275,8 @@ impl<'a> ScanState<'a> {
                         unknown_key_values_overflowed = true;
                         entry_budget_exhausted = true;
                     }
-                } else {
-                    self.insert_optional_tracked_dict_shadow_entry(&mut entries, key);
+                } else if !self.insert_optional_tracked_dict_shadow_entry(&mut entries, key) {
+                    unknown_key_values_overflowed = true;
                 }
             } else {
                 Self::insert_tracked_dict_unknown_key_value(
@@ -7408,6 +7476,177 @@ mod tests {
         assert!(invocations.is_empty());
         assert_eq!(scan.status, ScanStatus::Inconclusive);
         assert!(has_notice_code(&scan, "tracked_state_budget"));
+    }
+
+    #[test]
+    fn dropped_inert_shadow_key_makes_missing_lookup_opaque() {
+        let options = default_test_options();
+        let payload = b".";
+        let mut scan = ScanState::new(
+            "dropped-inert-shadow.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+        let entries = (0..MAX_TRACKED_DICT_ENTRIES)
+            .map(|index| (format!("key{index:04}"), StackValue::Other))
+            .collect();
+        scan.push_stack_value(StackValue::TrackedDict {
+            entries,
+            unknown_key_values: Vec::new(),
+            unknown_key_values_overflowed: false,
+            memo_index: None,
+        });
+        scan.record_top_tracked_dict_shadow_entry("dropped", None);
+        let first_mapping = scan.stack.last().cloned().expect("tracked dictionary");
+        let StackValue::TrackedDict {
+            unknown_key_values_overflowed,
+            ..
+        } = &first_mapping
+        else {
+            panic!("tracked dictionary was replaced");
+        };
+        assert!(*unknown_key_values_overflowed);
+        let mapping = StackValue::MappingWrapper {
+            reference: GlobalRef {
+                module: "collections".to_string(),
+                name: "ChainMap".to_string(),
+                position: 0,
+                malformed: false,
+            },
+            mappings: vec![
+                first_mapping,
+                StackValue::DefaultDict {
+                    default_factory: GlobalRef {
+                        module: "os".to_string(),
+                        name: "system".to_string(),
+                        position: 0,
+                        malformed: false,
+                    },
+                },
+            ],
+        };
+
+        let invocations =
+            scan.mapping_lookup_invocations(Some(&mapping), Some("dropped"), "REDUCE", 0);
+
+        assert!(invocations.is_empty());
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert!(has_notice_code(&scan, "tracked_state_budget"));
+    }
+
+    #[test]
+    fn unknown_key_entry_makes_unresolved_lookup_opaque() {
+        let options = default_test_options();
+        let payload = b".";
+        let mut scan = ScanState::new(
+            "unknown-key-entry.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+        let mapping = StackValue::MappingWrapper {
+            reference: GlobalRef {
+                module: "collections".to_string(),
+                name: "ChainMap".to_string(),
+                position: 0,
+                malformed: false,
+            },
+            mappings: vec![
+                StackValue::TrackedDict {
+                    entries: Vec::new(),
+                    unknown_key_values: vec![StackValue::Other],
+                    unknown_key_values_overflowed: false,
+                    memo_index: None,
+                },
+                StackValue::DefaultDict {
+                    default_factory: GlobalRef {
+                        module: "os".to_string(),
+                        name: "system".to_string(),
+                        position: 0,
+                        malformed: false,
+                    },
+                },
+            ],
+        };
+
+        let invocations = scan.mapping_lookup_invocations(Some(&mapping), None, "REDUCE", 0);
+
+        assert!(invocations.is_empty());
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert!(has_notice_code(&scan, "tracked_state_budget"));
+    }
+
+    #[test]
+    fn finite_self_referential_mapping_path_does_not_fall_through_chainmap() {
+        let options = default_test_options();
+        let payload = b".";
+        let mut scan = ScanState::new(
+            "finite-self-referential-mapping-path.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+        scan.memo.insert(
+            0,
+            StackValue::TrackedDict {
+                entries: vec![
+                    (
+                        "a".to_string(),
+                        StackValue::TrackedDict {
+                            entries: Vec::new(),
+                            unknown_key_values: Vec::new(),
+                            unknown_key_values_overflowed: false,
+                            memo_index: Some(0),
+                        },
+                    ),
+                    ("x".to_string(), StackValue::Other),
+                ],
+                unknown_key_values: Vec::new(),
+                unknown_key_values_overflowed: false,
+                memo_index: Some(0),
+            },
+        );
+        let mapping = StackValue::MappingWrapper {
+            reference: GlobalRef {
+                module: "collections".to_string(),
+                name: "ChainMap".to_string(),
+                position: 0,
+                malformed: false,
+            },
+            mappings: vec![
+                StackValue::TrackedDict {
+                    entries: Vec::new(),
+                    unknown_key_values: Vec::new(),
+                    unknown_key_values_overflowed: false,
+                    memo_index: Some(0),
+                },
+                StackValue::DefaultDict {
+                    default_factory: GlobalRef {
+                        module: "os".to_string(),
+                        name: "system".to_string(),
+                        position: 0,
+                        malformed: false,
+                    },
+                },
+            ],
+        };
+        let path = [Some("a".to_string()), Some("x".to_string())];
+
+        let invocations = scan.mapping_lookup_path_invocations(Some(&mapping), &path, "REDUCE", 0);
+
+        assert!(invocations.is_empty());
+        assert_eq!(scan.status, ScanStatus::Complete);
+        assert!(!has_notice_code(&scan, "tracked_state_budget"));
     }
 
     #[test]

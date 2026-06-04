@@ -2,7 +2,15 @@ const MAX_DOTTED_GLOBAL_BYTES: usize = 4096;
 const MAX_DOTTED_GLOBAL_SEGMENTS: usize = 64;
 
 pub(crate) fn global_severity(module: &str, name: &str) -> Option<&'static str> {
-    direct_global_severity(module, name).or_else(|| dotted_global_tail_severity(name))
+    let direct = direct_global_severity(module, name);
+    if direct == Some("critical") {
+        return direct;
+    }
+    let tail = dotted_global_tail_severity(name);
+    if tail == Some("critical") {
+        return tail;
+    }
+    direct.or(tail)
 }
 
 pub(crate) fn callable_severity(module: &str, name: &str) -> Option<&'static str> {
@@ -122,20 +130,21 @@ fn dotted_global_tail_severity(name: &str) -> Option<&'static str> {
         return None;
     }
 
-    if dotted_global_policy_budget_exceeded(name) {
-        return Some("warning");
-    }
-    let parts = bounded_dotted_parts(name)?;
+    let parts = bounded_leading_dotted_parts(name);
+    let mut warning = None;
     for start in 0..parts.len().saturating_sub(1) {
         for split in start + 1..parts.len() {
             let candidate_module = parts[start..split].join(".");
             let candidate_name = parts[split..].join(".");
             if let Some(severity) = direct_global_severity(&candidate_module, &candidate_name) {
-                return Some(severity);
+                if severity == "critical" {
+                    return Some(severity);
+                }
+                warning = Some(severity);
             }
         }
     }
-    None
+    warning.or_else(|| dotted_global_policy_budget_exceeded(name).then_some("warning"))
 }
 
 fn dotted_global_policy_budget_exceeded(name: &str) -> bool {
@@ -143,12 +152,24 @@ fn dotted_global_policy_budget_exceeded(name: &str) -> bool {
         || name.split('.').take(MAX_DOTTED_GLOBAL_SEGMENTS + 1).count() > MAX_DOTTED_GLOBAL_SEGMENTS
 }
 
-fn bounded_dotted_parts(name: &str) -> Option<Vec<&str>> {
-    if dotted_global_policy_budget_exceeded(name) {
-        None
-    } else {
-        Some(name.split('.').collect())
+fn bounded_leading_dotted_parts(name: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut bytes: usize = 0;
+    for part in name.split('.') {
+        let separator_bytes = usize::from(!parts.is_empty());
+        let Some(next_bytes) = bytes
+            .checked_add(separator_bytes)
+            .and_then(|total| total.checked_add(part.len()))
+        else {
+            break;
+        };
+        if parts.len() >= MAX_DOTTED_GLOBAL_SEGMENTS || next_bytes > MAX_DOTTED_GLOBAL_BYTES {
+            break;
+        }
+        parts.push(part);
+        bytes = next_bytes;
     }
+    parts
 }
 
 #[derive(Clone, Copy)]
@@ -1175,6 +1196,17 @@ mod tests {
         assert_eq!(global_severity("safe", &long_dotted_name), Some("warning"));
         assert_eq!(
             global_severity("os", &format!("system.{long_dotted_name}")),
+            Some("critical")
+        );
+        let long_dotted_tail = format!("pkg.os.system.{long_dotted_name}");
+        let bounded_tail = bounded_leading_dotted_parts(&long_dotted_tail);
+        assert_eq!(&bounded_tail[..3], &["pkg", "os", "system"]);
+        assert_eq!(
+            direct_global_severity("os", &bounded_tail[2..].join(".")),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("safe", &format!("pkg.os.system.{long_dotted_name}")),
             Some("critical")
         );
         assert_eq!(
