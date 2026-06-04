@@ -3410,45 +3410,49 @@ def _has_bounded_flax_msgpack_state_root(
     return has_checkpoint_root
 
 
-def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | None:
-    """Inspect streamed maps, returning None when safe routing cannot complete."""
+def _probe_flax_msgpack_checkpoint_stream(
+    stream: BinaryIO,
+    file_size: int,
+    *,
+    sample_is_prefix: bool = False,
+) -> bool | None:
+    """Inspect streamed maps, preserving recognized roots in truncated prefixes."""
     remaining_nodes = [_FLAX_MSGPACK_PROBE_MAX_NODES]
     inline_scalars_seen = 0
     recognized_checkpoint_root = [False]
     try:
-        with path.open("rb") as stream:
-            while stream.tell() < file_size:
-                marker = _read_msgpack_probe_bytes(stream, 1)[0]
-                map_count = _read_msgpack_probe_map_count_after_marker(stream, marker)
-                if map_count is None and _is_inline_msgpack_probe_scalar(marker):
-                    inline_scalars_seen += 1
-                    if inline_scalars_seen > _FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS:
-                        raise _MsgpackProbeLimit
-                    continue
+        while stream.tell() < file_size:
+            marker = _read_msgpack_probe_bytes(stream, 1)[0]
+            map_count = _read_msgpack_probe_map_count_after_marker(stream, marker)
+            if map_count is None and _is_inline_msgpack_probe_scalar(marker):
+                inline_scalars_seen += 1
+                if inline_scalars_seen > _FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS:
+                    raise _MsgpackProbeLimit
+                continue
 
-                _consume_msgpack_probe_node(remaining_nodes)
-                if map_count is None:
-                    _skip_msgpack_probe_value_after_marker(stream, marker, file_size, remaining_nodes, 0)
-                    continue
-                has_checkpoint_root = False
-                for _ in range(map_count):
-                    key = _read_msgpack_probe_key(stream, file_size, remaining_nodes)
-                    if key in _FLAX_MSGPACK_ROUTING_KEYS:
-                        recognized_checkpoint_root[0] = True
-                        _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
+            _consume_msgpack_probe_node(remaining_nodes)
+            if map_count is None:
+                _skip_msgpack_probe_value_after_marker(stream, marker, file_size, remaining_nodes, 0)
+                continue
+            has_checkpoint_root = False
+            for _ in range(map_count):
+                key = _read_msgpack_probe_key(stream, file_size, remaining_nodes)
+                if key in _FLAX_MSGPACK_ROUTING_KEYS:
+                    recognized_checkpoint_root[0] = True
+                    _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
+                    has_checkpoint_root = True
+                if key == _FLAX_MSGPACK_STATE_WRAPPER_KEY:
+                    if _has_bounded_flax_msgpack_state_root(
+                        stream,
+                        file_size,
+                        remaining_nodes,
+                        recognized_checkpoint_root,
+                    ):
                         has_checkpoint_root = True
-                    if key == _FLAX_MSGPACK_STATE_WRAPPER_KEY:
-                        if _has_bounded_flax_msgpack_state_root(
-                            stream,
-                            file_size,
-                            remaining_nodes,
-                            recognized_checkpoint_root,
-                        ):
-                            has_checkpoint_root = True
-                    elif key not in _FLAX_MSGPACK_ROUTING_KEYS:
-                        _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
-                if has_checkpoint_root:
-                    return True
+                elif key not in _FLAX_MSGPACK_ROUTING_KEYS:
+                    _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
+            if has_checkpoint_root:
+                return True
     except _MsgpackProbeLimit:
         # Once a root is recognized, run the scanner so it can analyze sibling
         # security fields even if routing validation exhausts its budget.
@@ -3456,8 +3460,17 @@ def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | 
     except OSError:
         return None
     except _MsgpackProbeInvalid:
-        return False
+        return sample_is_prefix and recognized_checkpoint_root[0]
     return False
+
+
+def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | None:
+    """Inspect streamed maps, returning None when safe routing cannot complete."""
+    try:
+        with path.open("rb") as stream:
+            return _probe_flax_msgpack_checkpoint_stream(stream, file_size)
+    except OSError:
+        return None
 
 
 def _probe_flax_msgpack_checkpoint_file(file_path: Path) -> bool | None:
