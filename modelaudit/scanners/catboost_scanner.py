@@ -10,7 +10,7 @@ import struct
 from typing import Any, ClassVar
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
-from ._evidence_redaction import REDACTED_EVIDENCE_VALUE, REDACTED_URL_CREDENTIALS, redact_evidence_string
+from ._catboost_evidence_redaction import REDACTED_EVIDENCE_VALUE, REDACTED_URL_CREDENTIALS, redact_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 CATBOOST_MAGIC = b"CBM1"
