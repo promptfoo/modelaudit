@@ -791,6 +791,18 @@ def test_savedmodel_preview_redaction_does_not_expand_original_window() -> None:
     assert preview.endswith("...")
 
 
+def test_savedmodel_preview_redaction_redacts_boundary_crossing_tokens() -> None:
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    private_tail = "PRIVATE_AFTER_TOKEN_SHOULD_NOT_APPEAR"
+    preview = _safe_decoded_preview(f"padding{'x' * 62}/{github_token}/{private_tail}", 80)
+
+    assert "ghp_" not in preview
+    assert github_token not in preview
+    assert private_tail not in preview
+    assert "/<redacted>" in preview
+    assert preview.endswith("...")
+
+
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_collection_preview_redacts_sensitive_values(tmp_path: Path) -> None:
     raw_secret = "c081-collection-secret-value-00000000"

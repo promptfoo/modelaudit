@@ -129,6 +129,9 @@ _STANDALONE_KEY_SECRET_RE = re.compile(
     r"xox[baprs]-[0-9A-Za-z-]{20,}"
     r")\b"
 )
+_PREVIEW_TOKEN_LOOKAHEAD_CHARS = 512
+_PREVIEW_TOKEN_SUFFIX_RE = re.compile(r"([A-Za-z0-9._~+-]+)\Z")
+_PREVIEW_TOKEN_CONTINUATION_RE = re.compile(r"[A-Za-z0-9._~+=-]*")
 
 
 def _redact_sensitive_preview_text(text: str) -> str:
@@ -137,9 +140,24 @@ def _redact_sensitive_preview_text(text: str) -> str:
     return _STANDALONE_KEY_SECRET_RE.sub("<redacted>", redacted)
 
 
+def _redact_preview_boundary_token_prefix(text: str, limit: int) -> str:
+    preview_source = text[:limit]
+    suffix_match = _PREVIEW_TOKEN_SUFFIX_RE.search(preview_source)
+    if suffix_match is None:
+        return preview_source
+
+    lookahead = text[limit : limit + _PREVIEW_TOKEN_LOOKAHEAD_CHARS]
+    continuation_match = _PREVIEW_TOKEN_CONTINUATION_RE.match(lookahead)
+    candidate = suffix_match.group(1) + (continuation_match.group(0) if continuation_match else "")
+    if not _STANDALONE_KEY_SECRET_RE.fullmatch(candidate):
+        return preview_source
+
+    return f"{preview_source[: suffix_match.start(1)]}<redacted>"
+
+
 def _safe_decoded_preview(text: str, limit: int) -> str:
     """Return a bounded decoded preview safe for serialized findings."""
-    preview_source = text[:limit]
+    preview_source = _redact_preview_boundary_token_prefix(text, limit) if len(text) > limit else text
     redacted = _redact_sensitive_preview_text(preview_source)
     if len(text) <= limit and len(redacted) <= limit:
         return redacted
