@@ -129,6 +129,7 @@ _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
 _HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
 _HDF5_USERBLOCK_FIRST_OFFSET = 512
 _HDF5_SIGNATURE_SCAN_MAX_BYTES = 10 * 1024 * 1024
+_HDF5_USERBLOCK_MAX_CONCATENATED_ZIP_SEGMENTS = 16
 _ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x05\x06"
 _ZIP_END_OF_CENTRAL_DIRECTORY_FIXED_BYTES = 22
 _MAX_STRING_LITERAL_EXTRACTION_DEPTH = 100
@@ -174,6 +175,43 @@ def _zip_member_hdf5_signature_offset(archive: zipfile.ZipFile, member_info: zip
     return None
 
 
+def _split_concatenated_zip_payload(payload: bytes) -> tuple[bytes, ...]:
+    """Split bounded concatenated ZIP payloads so earlier archives remain visible."""
+    segments: list[bytes] = []
+    remaining = payload
+
+    while len(segments) < _HDF5_USERBLOCK_MAX_CONCATENATED_ZIP_SEGMENTS - 1:
+        split_offset: int | None = None
+        search_start = 0
+        while True:
+            eocd_offset = remaining.find(_ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE, search_start)
+            if eocd_offset < 0:
+                break
+            search_start = eocd_offset + 1
+
+            fixed_end = eocd_offset + _ZIP_END_OF_CENTRAL_DIRECTORY_FIXED_BYTES
+            if fixed_end > len(remaining):
+                continue
+            comment_length = int.from_bytes(remaining[eocd_offset + 20 : fixed_end], "little")
+            zip_end = fixed_end + comment_length
+            if zip_end >= len(remaining):
+                continue
+
+            first_archive = remaining[:zip_end]
+            later_archives = remaining[zip_end:]
+            if zipfile.is_zipfile(io.BytesIO(first_archive)) and zipfile.is_zipfile(io.BytesIO(later_archives)):
+                split_offset = zip_end
+                break
+
+        if split_offset is None:
+            break
+        segments.append(remaining[:split_offset])
+        remaining = remaining[split_offset:]
+
+    segments.append(remaining)
+    return tuple(segments)
+
+
 def _content_routable_hdf5_userblock_segments(prefix: bytes) -> tuple[bytes, ...]:
     """Split a user block into a valid ZIP prefix and later non-padding content."""
     search_end = len(prefix)
@@ -189,10 +227,11 @@ def _content_routable_hdf5_userblock_segments(prefix: bytes) -> tuple[bytes, ...
             if zip_end <= len(prefix):
                 candidate = prefix[:zip_end]
                 if zipfile.is_zipfile(io.BytesIO(candidate)):
+                    zip_segments = _split_concatenated_zip_payload(candidate)
                     trailing_content = prefix[zip_end:].rstrip(b"\x00")
                     if trailing_content:
-                        return candidate, trailing_content
-                    return (candidate,)
+                        return *zip_segments, trailing_content
+                    return zip_segments
         search_end = eocd_offset
 
     candidate = prefix.rstrip(b"\x00")

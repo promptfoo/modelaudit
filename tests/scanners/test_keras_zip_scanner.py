@@ -484,6 +484,61 @@ class TestKerasZipScanner:
         )
         assert not any(check.name == "H5PY Library Check" for check in result.checks)
 
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_userblock_embedded_weights_scans_concatenated_zip_archives(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        malicious: bool,
+    ) -> None:
+        """A benign trailing ZIP must not hide an earlier user-block archive."""
+        first_zip_path = tmp_path / "first.zip"
+        with zipfile.ZipFile(first_zip_path, "w") as first_zip:
+            if malicious:
+                first_zip.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+            else:
+                first_zip.writestr("README-first.txt", b"benign first archive")
+
+        second_zip_path = tmp_path / "second.zip"
+        with zipfile.ZipFile(second_zip_path, "w") as second_zip:
+            second_zip.writestr("README-second.txt", b"benign trailing archive")
+
+        hdf5_signature_offset = 1024
+        userblock_payload = first_zip_path.read_bytes() + second_zip_path.read_bytes()
+        assert len(userblock_payload) < hdf5_signature_offset
+        weights_path = tmp_path / "concatenated_zip_userblock.weights.h5"
+        weights_path.write_bytes(
+            userblock_payload + bytes(hdf5_signature_offset - len(userblock_payload)) + b"\x89HDF\r\n\x1a\n"
+        )
+
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.12.0",
+            weights_h5_path=weights_path,
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.metadata["embedded_weights_hdf5_signature_offset"] == hdf5_signature_offset
+        pickle_findings = [
+            issue
+            for issue in result.issues
+            if issue.rule_code == "S201"
+            and issue.details.get("zip_entry") == "model.weights.h5:payload.pkl"
+            and issue.details.get("embedded_weights_hdf5_userblock") is True
+            and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system", "nt.system"))
+        ]
+        assert bool(pickle_findings) is malicious
+        assert (
+            bool(
+                [issue for issue in result.issues if issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)]
+            )
+            is malicious
+        )
+
     def test_userblock_embedded_weights_does_not_pickle_scan_selection_skipped_zip(
         self,
         tmp_path: Path,
