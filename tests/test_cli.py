@@ -2017,6 +2017,27 @@ def test_scan_path_state_redacts_stream_fallback_for_sbom() -> None:
     assert path_state.scanned_paths == ["stream://https://bucket.s3.amazonaws.com/model.bin"]
 
 
+def test_scan_stream_unexpected_verbose_error_omits_raw_traceback(caplog: pytest.LogCaptureFixture) -> None:
+    """Verbose stream failures must not reintroduce signed URLs through exception tracebacks."""
+    url = "stream://https://bucket.s3.amazonaws.com/model.bin?X-Amz-Signature=deadbeef&token=secret-token"
+    runner = CliRunner()
+
+    with (
+        caplog.at_level(logging.ERROR, logger="modelaudit"),
+        patch(
+            "modelaudit.cli._resolve_scan_source_for_path",
+            side_effect=RuntimeError(f"unexpected failure for {url}"),
+        ),
+    ):
+        result = runner.invoke(cli, ["scan", "--verbose", url])
+
+    assert result.exit_code == 2
+    assert "stream://https://bucket.s3.amazonaws.com/model.bin" in caplog.text
+    assert "deadbeef" not in caplog.text
+    assert "secret-token" not in caplog.text
+    assert "X-Amz-Signature" not in caplog.text
+
+
 @patch("modelaudit.cli.is_cloud_url")
 @patch("modelaudit.cli.download_from_cloud")
 @patch("modelaudit.cli.scan_model_directory_or_file")

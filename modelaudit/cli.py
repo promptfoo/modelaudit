@@ -2409,7 +2409,10 @@ def scan_command(
             except Exception as exc:
                 display_path = _display_path(path)
                 display_error = _display_error(exc, path)
-                logger.error(f"Unexpected error processing {display_path}: {display_error}", exc_info=verbose)
+                logger.error(
+                    f"Unexpected error processing {display_path}: {display_error}",
+                    exc_info=verbose and not path.startswith("stream://"),
+                )
                 click.echo(f"Unexpected error processing {display_path}: {display_error}", err=True)
                 path_state.scanned_paths.append(_display_scan_path(source_result.actual_path))
                 audit_result.has_errors = True
