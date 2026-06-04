@@ -92,6 +92,36 @@ def _is_pickle_parse_only_overlap_issue(issue: Issue) -> bool:
     )
 
 
+def _pickle_result_consumes_entire_payload(path: str, result: ScanResult) -> bool:
+    """Return whether complete Pickle analysis proves no trailing Flax stream exists."""
+    if (
+        result.scanner_name != "pickle"
+        or result.metadata.get("pickle_report_status") != "complete"
+        or result.metadata.get("analysis_incomplete") is True
+    ):
+        return False
+
+    coverage = result.metadata.get("pickle_coverage")
+    if not isinstance(coverage, dict):
+        return False
+    if coverage.get("raw_scan_complete") is not True or coverage.get("opcode_scan_complete") is not True:
+        return False
+
+    positions = (
+        result.metadata.get("first_pickle_end_pos"),
+        coverage.get("bytes_scanned"),
+        coverage.get("bytes_total"),
+    )
+    if any(not isinstance(position, int) or isinstance(position, bool) for position in positions):
+        return False
+
+    try:
+        file_size = os.path.getsize(path)
+    except OSError:
+        return False
+    return positions[0] == positions[1] == positions[2] == file_size
+
+
 def _select_nested_scanner_id(path: str, header_format_override: str | None = None) -> str | None:
     """Select a scanner for extracted archive members using trusted file structure first."""
     header_format = header_format_override or detect_file_format(path)
@@ -433,6 +463,8 @@ def merge_inconclusive_flax_msgpack_outcome(
     """Preserve ambiguous Flax coverage when a strict overlapping owner is primary."""
     from . import _registry
 
+    if _pickle_result_consumes_entire_payload(path, result):
+        return
     if result.scanner_name not in detect_flax_msgpack_overlap_routes(
         path
     ) or not has_inconclusive_renamed_flax_msgpack_routing(path):
@@ -732,6 +764,7 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         else None
     )
     skipped_preferred_scanner_id: str | None = None
+    unavailable_preferred_scanner_id: str | None = None
     trusted_flax_overlap_scanner_id: str | None = None
     if scanner_id == "flax_msgpack" and not scanner_selection.allows(scanner_id):
         skipped_preferred_scanner_id = scanner_id
@@ -750,6 +783,12 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         or (scanner_id == "protobuf_model_candidate" and allows_protobuf_model_candidate_analysis(scanner_selection))
     ):
         scanner_class = _registry.load_scanner_by_id(scanner_id)
+        if (
+            scanner_class is None
+            and trusted_content_format != "unknown"
+            and scanner_id != PROTOBUF_MODEL_CANDIDATE_FORMAT
+        ):
+            unavailable_preferred_scanner_id = scanner_id
         if (
             scanner_class
             and scanner_id != trusted_flax_overlap_scanner_id
@@ -771,13 +810,21 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
             and scanner_selection.allows(pytorch_binary_supplemental_scanner_id)
         ):
             scanner_class = _registry.load_scanner_by_id(pytorch_binary_supplemental_scanner_id)
-        if scanner_class is None and scanner_selection.active:
+        if scanner_class is None and unavailable_preferred_scanner_id is not None:
+            fallback_scanner_id = _HEADER_FORMAT_TO_SCANNER_ID.get(trusted_content_format)
+            if (
+                fallback_scanner_id
+                and fallback_scanner_id != unavailable_preferred_scanner_id
+                and scanner_selection.allows(fallback_scanner_id)
+            ):
+                scanner_class = _registry.load_scanner_by_id(fallback_scanner_id)
+        elif scanner_class is None and scanner_selection.active:
             scanner_class = _registry.get_scanner_for_path(path, scanner_selection=scanner_selection)
         elif scanner_class is None:
             scanner_class = _registry.get_scanner_for_path(path)
 
     if scanner_class is None:
-        if scanner_selection.active:
+        if unavailable_preferred_scanner_id is None and scanner_selection.active:
             candidate_scanner_id = skipped_preferred_scanner_id
             if candidate_scanner_id is None:
                 candidate_scanner_class = _registry.get_scanner_for_path(path)
@@ -810,8 +857,21 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         format_validation["routed_format"] = PROTOBUF_MODEL_CANDIDATE_FORMAT
         scanner_config[FORMAT_VALIDATION_CONFIG_KEY] = format_validation
 
+    if unavailable_preferred_scanner_id is not None:
+        scanner_config["cache_enabled"] = False
     scanner = scanner_class(config=scanner_config)
-    result = scanner.scan_with_cache(path)
+    result = scanner.scan(path) if unavailable_preferred_scanner_id is not None else scanner.scan_with_cache(path)
+    if unavailable_preferred_scanner_id is not None:
+        result.merge(
+            _make_unavailable_recognized_format_result(
+                path,
+                unavailable_preferred_scanner_id,
+                unavailable_preferred_scanner_id,
+            )
+        )
+        # Refresh late metadata so incomplete coverage restores whitelist-downgraded findings.
+        mark_inconclusive_scan_result(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
+        mark_operational_scan_error(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
     if result.scanner_name == "flax_msgpack":
         merge_flax_msgpack_overlap_findings(
             path,
