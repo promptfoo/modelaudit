@@ -121,23 +121,23 @@ _MAX_STRING_LITERAL_EXTRACTION_DEPTH = 100
 _KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON = (
     "keras_zip_stringlookup_external_vocabulary_metadata_inconclusive"
 )
-_KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+_-]*)\s*$")
+_KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*([0-9]+)\.([0-9]+)(?:\.([0-9]+))?([A-Za-z0-9.+_-]*)\s*$")
 _KERAS_TORCHMODULE_VERSION_PATTERN = re.compile(
-    r"^\s*[vV]?(?:(\d+)!)?(\d+(?:\.\d+)+)"
+    r"^\s*[vV]?(?:([0-9]+)!)?([0-9]+(?:\.[0-9]+)*)"
     r"([A-Za-z+_-][A-Za-z0-9.+_-]*|\.[A-Za-z][A-Za-z0-9.+_-]*)?\s*$"
 )
 _KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(
     r"(?i)^[._-]?(?:"
-    r"(?:alpha|beta|preview|pre|rc|a|b|c)(?:[._-]?\d+)?"
-    r"(?:(?:[._-]?(?:post|rev|r)(?:[._-]?\d+)?)|-\d+)?"
-    r"(?:[._-]?dev(?:[._-]?\d+)?)?"
-    r"|dev(?:[._-]?\d+)?"
+    r"(?:alpha|beta|preview|pre|rc|a|b|c)(?:[._-]?[0-9]+)?"
+    r"(?:(?:[._-]?(?:post|rev|r)(?:[._-]?[0-9]+)?)|-[0-9]+)?"
+    r"(?:[._-]?dev(?:[._-]?[0-9]+)?)?"
+    r"|dev(?:[._-]?[0-9]+)?"
     r")(?:\+[a-z0-9]+(?:[._-][a-z0-9]+)*)?$"
 )
 _KERAS_LOCAL_VERSION_SUFFIX_PATTERN = re.compile(r"(?i)^\+[a-z0-9]+(?:[._-][a-z0-9]+)*$")
 _KERAS_POSTRELEASE_SUFFIX_PATTERN = re.compile(
-    r"(?i)^(?:(?:[._-]?(?:post|rev|r)(?:[._-]?\d+)?)|-\d+)"
-    r"(?:[._-]?dev(?:[._-]?\d+)?)?(?:\+[a-z0-9]+(?:[._-][a-z0-9]+)*)?$"
+    r"(?i)^(?:(?:[._-]?(?:post|rev|r)(?:[._-]?[0-9]+)?)|-[0-9]+)"
+    r"(?:[._-]?dev(?:[._-]?[0-9]+)?)?(?:\+[a-z0-9]+(?:[._-][a-z0-9]+)*)?$"
 )
 
 
@@ -1256,8 +1256,8 @@ class KerasZipScanner(BaseScanner):
     def _check_torch_module_wrapper(self, result: ScanResult, layer_name: str) -> None:
         """Check for CVE-2025-49655: TorchModuleWrapper deserialization RCE.
 
-        TorchModuleWrapper in Keras 3.11.0-3.11.2 and prereleases before
-        final 3.11.3 calls torch.load(weights_only=False) in from_config(),
+        TorchModuleWrapper in Keras >= 3.11.0 and < 3.11.3 calls
+        torch.load(weights_only=False) in from_config(),
         enabling arbitrary code execution via pickle deserialization.
         """
         keras_version = result.metadata.get("keras_version")
@@ -1271,7 +1271,7 @@ class KerasZipScanner(BaseScanner):
                 passed=False,
                 message=(
                     f"CVE-2025-49655: Layer '{layer_name}' is a TorchModuleWrapper in "
-                    f"Keras {keras_version} (3.11.0-3.11.2 and prereleases before 3.11.3) — "
+                    f"Keras {keras_version} (>= 3.11.0 and < 3.11.3) — "
                     "uses torch.load(weights_only=False) enabling arbitrary code execution"
                 ),
                 severity=IssueSeverity.CRITICAL,
@@ -1287,7 +1287,7 @@ class KerasZipScanner(BaseScanner):
                         "TorchModuleWrapper in vulnerable Keras versions can deserialize attacker-controlled "
                         "pickles via torch.load(weights_only=False), enabling RCE."
                     ),
-                    "affected_versions": "Keras 3.11.0-3.11.2 and prereleases before final 3.11.3",
+                    "affected_versions": "Keras >= 3.11.0 and < 3.11.3",
                     "remediation": "Upgrade Keras to >= 3.11.3",
                 },
                 why=get_cve_2025_49655_explanation("torch_module_wrapper"),
@@ -1299,7 +1299,7 @@ class KerasZipScanner(BaseScanner):
                 message=(
                     f"TorchModuleWrapper detected in Keras {keras_version}; "
                     "version metadata is outside known CVE-2025-49655 range "
-                    "(3.11.0-3.11.2 and prereleases before 3.11.3), "
+                    "(>= 3.11.0 and < 3.11.3), "
                     "but metadata-only assessment is inconclusive without runtime verification"
                 ),
                 severity=IssueSeverity.WARNING,
@@ -1339,7 +1339,7 @@ class KerasZipScanner(BaseScanner):
                         "TorchModuleWrapper may deserialize unsafe content, but version data was missing or "
                         "non-canonical so CVE attribution confidence is reduced."
                     ),
-                    "affected_versions": "Keras 3.11.0-3.11.2 and prereleases before final 3.11.3",
+                    "affected_versions": "Keras >= 3.11.0 and < 3.11.3",
                     "remediation": "Ensure model metadata includes keras_version and upgrade to >= 3.11.3",
                 },
                 why=get_cve_2025_49655_explanation("torch_module_wrapper"),
@@ -1370,12 +1370,15 @@ class KerasZipScanner(BaseScanner):
                 release = release[:-1]
             comparison_size = max(len(release), 3)
             normalized_release = release + (0,) * (comparison_size - len(release))
+            vulnerable_release = (3, 11, 0) + (0,) * (comparison_size - 3)
             fixed_release = (3, 11, 3) + (0,) * (comparison_size - 3)
-            if normalized_release < fixed_release:
-                return True
-            if normalized_release > fixed_release:
+            if normalized_release < vulnerable_release or normalized_release > fixed_release:
                 return False
-            return suffix_status
+            if normalized_release == vulnerable_release:
+                return not suffix_status
+            if normalized_release == fixed_release:
+                return suffix_status
+            return True
         except ValueError:
             return None
 
