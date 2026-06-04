@@ -1576,6 +1576,28 @@ def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
             b"        return []\n"
             b"    return module.system('id')\n"
         ),
+        (b"def handle(data, context):\n    while True:\n        return []\n    __import__('os').system('id')\n"),
+        (
+            b"class Handler:\n"
+            b"    def unused(self):\n"
+            b"        self.module = __import__('os')\n"
+            b"\n"
+            b"    def handle(self, data, context):\n"
+            b"        return self.module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    match [__import__('os'), 0]:\n"
+            b"        case [module, 1]:\n"
+            b"            module.system('id')\n"
+        ),
+        (b"from .builtins import __import__ as load\ndef handle(data, context):\n    return load('os').system('id')\n"),
+        (b"def handle(data, context):\n    runner = lambda: __import__('os').system('id')\n    return []\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('math'), __import__('os')])\n"
+            b"    return next(generator)\n"
+        ),
     ],
 )
 def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
@@ -1743,6 +1765,13 @@ def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
         ),
         (b"def handle(data, context):\n    return getattr(*[__import__('os'), 'system'])('id')\n"),
         (b"def handle(data, context):\n    return __import__('os').__dict__['system']('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    match [__import__('os'), 1]:\n"
+            b"        case [module, *rest]:\n"
+            b"            module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    runner = lambda: __import__('os').system('id')\n    return runner()\n"),
     ],
 )
 def test_dynamic_import_handler_analysis_preserves_reachable_aliases(

@@ -2458,6 +2458,8 @@ class TorchServeMarScanner(BaseScanner):
                     self.import_loader_aliases,
                     self.shadowed_names,
                 )
+                if isinstance(value, ast.Lambda):
+                    callable_names |= self._lambda_execution_calls(value)
 
                 value_name = scanner._resolve_call_name(value)
                 resolved_value_names = (
@@ -2666,9 +2668,43 @@ class TorchServeMarScanner(BaseScanner):
                     if pattern.name is not None:
                         self._invalidate_name(pattern.name)
                 elif isinstance(pattern, ast.MatchSequence):
-                    if isinstance(value, ast.List | ast.Tuple) and len(pattern.patterns) == len(value.elts):
-                        for child_pattern, child_value in zip(pattern.patterns, value.elts, strict=True):
+                    starred_indexes = [
+                        index
+                        for index, child_pattern in enumerate(pattern.patterns)
+                        if isinstance(child_pattern, ast.MatchStar)
+                    ]
+                    if (
+                        isinstance(value, ast.List | ast.Tuple)
+                        and not starred_indexes
+                        and len(pattern.patterns) == len(value.elts)
+                    ):
+                        for child_pattern, child_value in zip(
+                            pattern.patterns,
+                            value.elts,
+                            strict=True,
+                        ):
                             self._record_pattern_assignment(child_pattern, child_value)
+                    elif (
+                        isinstance(value, ast.List | ast.Tuple)
+                        and len(starred_indexes) == 1
+                        and len(value.elts) >= len(pattern.patterns) - 1
+                    ):
+                        starred_index = starred_indexes[0]
+                        trailing_count = len(pattern.patterns) - starred_index - 1
+                        for child_pattern, child_value in zip(
+                            pattern.patterns[:starred_index],
+                            value.elts[:starred_index],
+                            strict=True,
+                        ):
+                            self._record_pattern_assignment(child_pattern, child_value)
+                        self._invalidate_pattern(pattern.patterns[starred_index])
+                        if trailing_count:
+                            for child_pattern, child_value in zip(
+                                pattern.patterns[-trailing_count:],
+                                value.elts[-trailing_count:],
+                                strict=True,
+                            ):
+                                self._record_pattern_assignment(child_pattern, child_value)
                     else:
                         for child_pattern in pattern.patterns:
                             self._invalidate_pattern(child_pattern)
@@ -2708,6 +2744,79 @@ class TorchServeMarScanner(BaseScanner):
                     for possible_state in possible_states[1:]:
                         merged_state = self._merge_states(merged_state, possible_state)
                     self._restore_state(merged_state)
+
+            @staticmethod
+            def _pattern_definitely_does_not_match(pattern: ast.pattern, value: ast.AST) -> bool:
+                if isinstance(pattern, ast.MatchValue):
+                    if isinstance(pattern.value, ast.Constant) and isinstance(value, ast.Constant):
+                        return pattern.value.value != value.value
+                    return False
+                if isinstance(pattern, ast.MatchSingleton):
+                    return not isinstance(value, ast.Constant) or pattern.value is not value.value
+                if isinstance(pattern, ast.MatchAs):
+                    return (
+                        pattern.pattern is not None
+                        and DynamicImportExecutionVisitor._pattern_definitely_does_not_match(
+                            pattern.pattern,
+                            value,
+                        )
+                    )
+                if isinstance(pattern, ast.MatchOr):
+                    return all(
+                        DynamicImportExecutionVisitor._pattern_definitely_does_not_match(
+                            child_pattern,
+                            value,
+                        )
+                        for child_pattern in pattern.patterns
+                    )
+                if isinstance(pattern, ast.MatchSequence) and isinstance(value, ast.List | ast.Tuple):
+                    starred_indexes = [
+                        index
+                        for index, child_pattern in enumerate(pattern.patterns)
+                        if isinstance(child_pattern, ast.MatchStar)
+                    ]
+                    if not starred_indexes:
+                        if len(pattern.patterns) != len(value.elts):
+                            return True
+                        return any(
+                            DynamicImportExecutionVisitor._pattern_definitely_does_not_match(
+                                child_pattern,
+                                child_value,
+                            )
+                            for child_pattern, child_value in zip(
+                                pattern.patterns,
+                                value.elts,
+                                strict=True,
+                            )
+                        )
+                    if len(starred_indexes) != 1 or len(value.elts) < len(pattern.patterns) - 1:
+                        return True
+                    starred_index = starred_indexes[0]
+                    trailing_count = len(pattern.patterns) - starred_index - 1
+                    leading_mismatch = any(
+                        DynamicImportExecutionVisitor._pattern_definitely_does_not_match(
+                            child_pattern,
+                            child_value,
+                        )
+                        for child_pattern, child_value in zip(
+                            pattern.patterns[:starred_index],
+                            value.elts[:starred_index],
+                            strict=True,
+                        )
+                    )
+                    trailing_mismatch = trailing_count > 0 and any(
+                        DynamicImportExecutionVisitor._pattern_definitely_does_not_match(
+                            child_pattern,
+                            child_value,
+                        )
+                        for child_pattern, child_value in zip(
+                            pattern.patterns[-trailing_count:],
+                            value.elts[-trailing_count:],
+                            strict=True,
+                        )
+                    )
+                    return leading_mismatch or trailing_mismatch
+                return False
 
             def _invalidate_pattern(self, pattern: ast.pattern) -> None:
                 if isinstance(pattern, ast.MatchAs):
@@ -2778,20 +2887,19 @@ class TorchServeMarScanner(BaseScanner):
                 for default in [*node.args.defaults, *node.args.kw_defaults]:
                     if default is not None:
                         self.visit(default)
-                definition_state = self._snapshot_state()
-                if self.collecting_module_bindings:
-                    return
 
-                inherited_state = self._callable_inherited_state()
+            def _lambda_execution_calls(self, node: ast.Lambda) -> frozenset[str]:
+                initial_risky_calls = set(self.risky_calls)
                 self._push_scope(
                     self._parameter_names(node.args) | scanner._callable_local_binding_names(node),
-                    inherited_state,
+                    self._snapshot_state(),
                     scope_kind="function",
                 )
-                for parameter_name, default in self._parameter_default_bindings(node.args):
-                    self._record_default_parameter_assignment(parameter_name, default, definition_state)
                 self.visit(node.body)
                 self._pop_scope()
+                lambda_calls = frozenset(self.risky_calls - initial_risky_calls)
+                self.risky_calls = initial_risky_calls
+                return lambda_calls
 
             def visit_Import(self, node: ast.Import) -> None:
                 for alias in node.names:
@@ -2801,6 +2909,11 @@ class TorchServeMarScanner(BaseScanner):
 
             def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
                 if node.module is None:
+                    return
+                if node.level:
+                    for alias in node.names:
+                        if alias.name != "*":
+                            self._invalidate_name(alias.asname or alias.name)
                     return
                 for alias in node.names:
                     if alias.name == "*":
@@ -2833,7 +2946,10 @@ class TorchServeMarScanner(BaseScanner):
                 class_initial_state = self._snapshot_state()
                 self.collecting_class_attribute_bindings = True
                 for statement in node.body:
-                    if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
+                    if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef) and statement.name in {
+                        "__init__",
+                        "initialize",
+                    }:
                         self.visit(statement)
                 self.collecting_class_attribute_bindings = False
                 self._restore_state(class_initial_state)
@@ -2924,6 +3040,10 @@ class TorchServeMarScanner(BaseScanner):
                 if isinstance(statement, ast.For | ast.AsyncFor):
                     return scanner._static_iterable_truthiness(
                         statement.iter
+                    ) is True and self._statements_definitely_exit_scope(statement.body)
+                if isinstance(statement, ast.While):
+                    return self._resolved_static_truthiness(
+                        statement.test
                     ) is True and self._statements_definitely_exit_scope(statement.body)
                 if not isinstance(statement, ast.If):
                     return False
@@ -3129,14 +3249,19 @@ class TorchServeMarScanner(BaseScanner):
                     break_visitor.visit(statement)
                 return break_visitor.found
 
-            def _visit_consumed_generator_value(self, value: ast.AST) -> bool:
+            def _visit_consumed_generator_value(
+                self,
+                value: ast.AST,
+                *,
+                first_only: bool = False,
+            ) -> bool:
                 if isinstance(value, ast.GeneratorExp):
-                    self._visit_eager_generator_expression(value)
+                    self._visit_eager_generator_expression(value, first_only=first_only)
                     return True
                 if isinstance(value, ast.Name):
                     generators = self.lazy_generator_aliases.get(value.id, ())
                     for generator in generators:
-                        self._visit_eager_generator_expression(generator)
+                        self._visit_eager_generator_expression(generator, first_only=first_only)
                     return bool(generators)
                 return False
 
@@ -3175,15 +3300,32 @@ class TorchServeMarScanner(BaseScanner):
                 self,
                 generators: list[ast.comprehension],
                 result_nodes: list[ast.AST],
+                *,
+                first_only: bool = False,
             ) -> None:
                 self._push_scope(set(), scope_kind="comprehension")
-                for generator in generators:
+                literal_elements = self._literal_iterable_elements(generators[0].iter) if generators else None
+                model_first_item = False
+                if (
+                    first_only
+                    and len(generators) == 1
+                    and not generators[0].ifs
+                    and literal_elements
+                    and literal_elements[0] is not None
+                ):
+                    model_first_item = True
+                for generator_index, generator in enumerate(generators):
                     if not self._visit_consumed_generator_value(generator.iter):
                         self.visit(generator.iter)
                     if scanner._static_iterable_truthiness(generator.iter) is False:
                         self._pop_scope()
                         return
-                    self._record_target_from_iterable(generator.target, generator.iter)
+                    if model_first_item and generator_index == 0 and literal_elements is not None:
+                        first_element = literal_elements[0]
+                        if first_element is not None:
+                            self._record_target_assignment(generator.target, first_element)
+                    else:
+                        self._record_target_from_iterable(generator.target, generator.iter)
                     for condition in generator.ifs:
                         self.visit(condition)
                         if self._resolved_static_truthiness(condition) is False:
@@ -3199,8 +3341,17 @@ class TorchServeMarScanner(BaseScanner):
             def visit_SetComp(self, node: ast.SetComp) -> None:
                 self._visit_comprehension(node.generators, [node.elt])
 
-            def _visit_eager_generator_expression(self, node: ast.GeneratorExp) -> None:
-                self._visit_comprehension(node.generators, [node.elt])
+            def _visit_eager_generator_expression(
+                self,
+                node: ast.GeneratorExp,
+                *,
+                first_only: bool = False,
+            ) -> None:
+                self._visit_comprehension(
+                    node.generators,
+                    [node.elt],
+                    first_only=first_only,
+                )
 
             def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
                 if node.generators:
@@ -3311,6 +3462,8 @@ class TorchServeMarScanner(BaseScanner):
                 possible_states = [initial_state]
                 for case in node.cases:
                     self._restore_state(initial_state)
+                    if self._pattern_definitely_does_not_match(case.pattern, node.subject):
+                        continue
                     self._record_pattern_assignment(case.pattern, node.subject)
                     if case.guard is not None:
                         self.visit(case.guard)
@@ -3406,6 +3559,9 @@ class TorchServeMarScanner(BaseScanner):
                 return set()
 
             def visit_Call(self, node: ast.Call) -> None:
+                lambda_call_names = (
+                    self._lambda_execution_calls(node.func) if isinstance(node.func, ast.Lambda) else frozenset()
+                )
                 call_names = scanner._resolve_dynamic_import_execution_calls(
                     node.func,
                     self.import_aliases,
@@ -3414,6 +3570,7 @@ class TorchServeMarScanner(BaseScanner):
                     self.import_loader_aliases,
                     self.shadowed_names,
                 )
+                call_names |= lambda_call_names
                 self.risky_calls.update(call_names)
                 call_name = scanner._resolve_call_name(node.func)
                 resolved_call_names = (
@@ -3441,12 +3598,19 @@ class TorchServeMarScanner(BaseScanner):
                             resolved_call_name,
                         )
                     )
+                consume_first_only = bool(resolved_call_names) and all(
+                    resolved_call_name.removeprefix("builtins.") == "next" for resolved_call_name in resolved_call_names
+                )
                 if isinstance(node.func, ast.Attribute) and node.func.attr in {"__next__", "send"}:
-                    self._visit_consumed_generator_value(node.func.value)
+                    self._visit_consumed_generator_value(node.func.value, first_only=True)
                 self.visit(node.func)
                 for argument_index, argument in enumerate(node.args):
                     if not (
-                        argument_index in consumed_generator_indexes and self._visit_consumed_generator_value(argument)
+                        argument_index in consumed_generator_indexes
+                        and self._visit_consumed_generator_value(
+                            argument,
+                            first_only=consume_first_only,
+                        )
                     ):
                         self.visit(argument)
                 for keyword in node.keywords:
