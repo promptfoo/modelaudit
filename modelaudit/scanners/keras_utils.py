@@ -36,6 +36,8 @@ _LAMBDA_DANGEROUS_PATTERNS: list[str] = [
     "ctypes",
 ]
 _MARSHALLED_CODE_FILENAME_RE = re.compile(r"(?i)(?:[A-Za-z]:)?[\\/][^\x00-\x1f\x7f\"'`<>|]+?\.py[co]?")
+_MARSHALLED_NAME_SEPARATOR_RE = r"(?:\.|[\x00-\x1f\x7f\ufffd]{1,16})"
+_MAX_LAMBDA_CODE_B64_CHARS = 1024 * 1024
 
 _EXTRA_SAFE_KERAS_LOSS_IDENTIFIERS: frozenset[str] = frozenset(
     {
@@ -157,7 +159,16 @@ def find_case_insensitive_substrings(text: str, patterns: Iterable[str]) -> list
 
 def find_lambda_dangerous_patterns(text: str, patterns: Iterable[str]) -> list[str]:
     """Match dangerous Lambda bytecode text while ignoring marshalled source filenames."""
-    return find_case_insensitive_substrings(_MARSHALLED_CODE_FILENAME_RE.sub(" ", text), patterns)
+    sanitized = _MARSHALLED_CODE_FILENAME_RE.sub(" ", text)
+    return [
+        pattern for pattern in patterns if re.search(_lambda_dangerous_pattern_regex(pattern), sanitized, re.IGNORECASE)
+    ]
+
+
+def _lambda_dangerous_pattern_regex(pattern: str) -> str:
+    """Match dotted names across bounded marshal metadata without identifier substrings."""
+    pattern_body = _MARSHALLED_NAME_SEPARATOR_RE.join(re.escape(part) for part in pattern.split("."))
+    return rf"(?<![0-9A-Za-z_]){pattern_body}(?![0-9A-Za-z_])"
 
 
 def iter_keras_serialized_identifiers(value: Any) -> Iterator[tuple[str, Any]]:
@@ -289,7 +300,7 @@ def check_lambda_dict_function(
                 "layer_class": "Lambda",
                 "function_format": "dict",
                 "parse_status": "invalid_config",
-                "function_dict": function_dict,
+                "config_type": type(config).__name__,
             },
             why="Malformed dict-format Lambda metadata is suspicious and prevents bytecode inspection.",
         )
@@ -313,6 +324,118 @@ def check_lambda_dict_function(
         )
         return True
 
+    if len(code_b64) > _MAX_LAMBDA_CODE_B64_CHARS:
+        _add_lambda_code_size_limit_check(code_b64, result, location, layer_name, function_format="dict")
+        return True
+
+    _check_lambda_encoded_code(
+        code_b64,
+        result,
+        location,
+        layer_name,
+        function_format="dict",
+        bytecode_format="dict_bytecode",
+        format_label="dict-format",
+    )
+    return True
+
+
+def check_lambda_list_function(
+    function_data: list[Any],
+    result: ScanResult,
+    location: str,
+    layer_name: str,
+) -> bool:
+    """Check legacy Keras list-format Lambda function bytecode."""
+    if not function_data:
+        result.add_check(
+            name="Lambda Layer Detection",
+            passed=False,
+            message=f"Lambda layer '{layer_name}' uses list-format function with no encoded code field",
+            severity=IssueSeverity.WARNING,
+            location=location,
+            details={
+                "layer_name": layer_name,
+                "layer_class": "Lambda",
+                "function_format": "list",
+            },
+            why="Lambda layers with list-format functions indicate encoded bytecode serialisation.",
+        )
+        return True
+
+    code_b64 = function_data[0]
+    if not code_b64 or not isinstance(code_b64, str):
+        result.add_check(
+            name="Lambda Layer Detection",
+            passed=False,
+            message=f"Lambda layer '{layer_name}' uses list-format function with no encoded code field",
+            severity=IssueSeverity.WARNING,
+            location=location,
+            details={
+                "layer_name": layer_name,
+                "layer_class": "Lambda",
+                "function_format": "list",
+                "code_type": type(code_b64).__name__,
+            },
+            why="Lambda layers with list-format functions indicate encoded bytecode serialisation.",
+        )
+        return True
+
+    if len(code_b64) > _MAX_LAMBDA_CODE_B64_CHARS:
+        _add_lambda_code_size_limit_check(code_b64, result, location, layer_name, function_format="list")
+        return True
+
+    _check_lambda_encoded_code(
+        code_b64,
+        result,
+        location,
+        layer_name,
+        function_format="list",
+        bytecode_format="list_bytecode",
+        format_label="list-format",
+    )
+    return True
+
+
+def _add_lambda_code_size_limit_check(
+    code_b64: str,
+    result: ScanResult,
+    location: str,
+    layer_name: str,
+    *,
+    function_format: str,
+) -> None:
+    result.add_check(
+        name="Lambda Layer Detection",
+        passed=False,
+        message=(
+            f"Lambda layer '{layer_name}' contains {function_format}-format code "
+            "that exceeds the bounded analysis limit"
+        ),
+        severity=IssueSeverity.WARNING,
+        location=location,
+        details={
+            "layer_name": layer_name,
+            "layer_class": "Lambda",
+            "function_format": function_format,
+            "analysis_status": "code_size_limit_exceeded",
+            "encoded_code_chars": len(code_b64),
+            "max_encoded_code_chars": _MAX_LAMBDA_CODE_B64_CHARS,
+        },
+        why="Oversized Lambda bytecode was not decoded because it exceeds the bounded static-analysis limit.",
+    )
+
+
+def _check_lambda_encoded_code(
+    code_b64: str,
+    result: ScanResult,
+    location: str,
+    layer_name: str,
+    *,
+    function_format: str,
+    bytecode_format: str,
+    format_label: str,
+) -> None:
     try:
         decoded = base64.b64decode(code_b64)
         decoded_str = decoded.decode("utf-8", errors="replace")
@@ -320,17 +443,17 @@ def check_lambda_dict_function(
         result.add_check(
             name="Lambda Layer Detection",
             passed=False,
-            message=f"Lambda layer '{layer_name}' contains non-decodable dict-format code",
+            message=f"Lambda layer '{layer_name}' contains non-decodable {function_format}-format code",
             severity=IssueSeverity.WARNING,
             location=location,
             details={
                 "layer_name": layer_name,
                 "layer_class": "Lambda",
-                "function_format": "dict",
+                "function_format": function_format,
             },
             why="Unable to decode Lambda bytecode for security analysis.",
         )
-        return True
+        return
 
     found_patterns = find_lambda_dangerous_patterns(decoded_str, _LAMBDA_DANGEROUS_PATTERNS)
 
@@ -347,7 +470,7 @@ def check_lambda_dict_function(
                 "layer_name": layer_name,
                 "layer_class": "Lambda",
                 "dangerous_patterns": found_patterns,
-                "function_format": "dict_bytecode",
+                "function_format": bytecode_format,
                 "code_preview": decoded_str[:200] + "..." if len(decoded_str) > 200 else decoded_str,
             },
             why=(
@@ -360,7 +483,7 @@ def check_lambda_dict_function(
             name="Lambda Layer Code Analysis",
             passed=False,
             message=(
-                f"Lambda layer '{layer_name}' contains embedded bytecode (dict-format) with no dangerous "
+                f"Lambda layer '{layer_name}' contains embedded bytecode ({format_label}) with no dangerous "
                 "text patterns detected"
             ),
             severity=IssueSeverity.WARNING,
@@ -368,15 +491,14 @@ def check_lambda_dict_function(
             details={
                 "layer_name": layer_name,
                 "layer_class": "Lambda",
-                "function_format": "dict_bytecode",
+                "function_format": bytecode_format,
                 "analysis_status": "opaque_bytecode",
             },
             why=(
-                "Keras 3.x Lambda layers embed compiled bytecode that will execute "
+                "Keras Lambda layers embed compiled bytecode that will execute "
                 "during model loading or inference; no high-risk text patterns were detected."
             ),
         )
-    return True
 
 
 def check_subclassed_model(
