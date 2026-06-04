@@ -169,6 +169,7 @@ def test_expression_redaction_preserves_annotations_and_argument_boundaries() ->
     text = (
         "def payload():\n"
         '    client_secret: str = os.getenv("CLIENT_SECRET", "ANNOTATEDSECRET123")\n'
+        '    api_key: str = "ANNOTATEDLITERALSECRET456"\n'
         '    send(token=build_token("KEYWORDSECRET456"), safe="visible")\n'
         "    authorization_level = compute_level()\n"
         '    return eval("1 + 1")'
@@ -177,11 +178,68 @@ def test_expression_redaction_preserves_annotations_and_argument_boundaries() ->
     redacted = redact_evidence_string(text, max_chars=500)
 
     assert "ANNOTATEDSECRET123" not in redacted
+    assert "ANNOTATEDLITERALSECRET456" not in redacted
     assert "KEYWORDSECRET456" not in redacted
     assert "client_secret: str = <redacted>" in redacted
+    assert "api_key: str = <redacted>" in redacted
     assert 'send(token=<redacted>, safe="visible")' in redacted
     assert "authorization_level = compute_level()" in redacted
     assert 'return eval("1 + 1")' in redacted
+
+
+def test_unparseable_continued_sensitive_assignment_redacts_complete_rhs() -> None:
+    """Explicit continuations must keep the next-line secret inside the fallback span."""
+    secret = "CONTINUEDSECRET1234567890"
+    text = f'\x00 client_secret = \\\n    "{secret}"\neval("1 + 1")'
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert secret not in redacted
+    assert "client_secret = <redacted>" in redacted
+    assert 'eval("1 + 1")' in redacted
+
+
+def test_unparseable_annotated_sensitive_assignment_redacts_literal() -> None:
+    """Binary framing must not bypass annotated literal assignment redaction."""
+    secret = "FRAMEDANNOTATEDSECRET1234567890"
+    text = f'\x00 api_key: str = "{secret}"'
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert secret not in redacted
+    assert "api_key: str = <redacted>" in redacted
+
+
+def test_redacts_compound_sensitive_assignments() -> None:
+    """Augmented assignments must not serialize literal credential fragments."""
+    text = (
+        "def payload():\n"
+        '    token += "COMPOUNDTOKENSECRET123"\n'
+        '    headers["Authorization"] += "Bearer COMPOUNDAUTHSECRET456"\n'
+        "    authorization_level += 1\n"
+        '    tokenizer += "visible"'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "COMPOUNDTOKENSECRET123" not in redacted
+    assert "COMPOUNDAUTHSECRET456" not in redacted
+    assert "token += <redacted>" in redacted
+    assert 'headers["Authorization"] += <redacted>' in redacted
+    assert "authorization_level += 1" in redacted
+    assert 'tokenizer += "visible"' in redacted
+
+
+def test_unparseable_compound_sensitive_assignment_redacts_literal() -> None:
+    """Malformed framing must not bypass augmented assignment redaction."""
+    secret = "FRAMEDCOMPOUNDSECRET1234567890"
+    text = f'\x00 token += "{secret}"; eval("1 + 1")'
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert secret not in redacted
+    assert "token += <redacted>" in redacted
+    assert 'eval("1 + 1")' in redacted
 
 
 def test_redaction_bounds_expression_analysis_to_output_lookahead() -> None:

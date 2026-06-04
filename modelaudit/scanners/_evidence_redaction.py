@@ -31,6 +31,10 @@ SENSITIVE_ASSIGNMENT_TARGET_RE: Final[re.Pattern[str]] = re.compile(
     rf"{SENSITIVE_ASSIGNMENT_TARGET}\s*$",
     re.IGNORECASE,
 )
+ANNOTATED_SENSITIVE_ASSIGNMENT_TARGET_RE: Final[re.Pattern[str]] = re.compile(
+    rf"\b{SENSITIVE_ASSIGNMENT_KEY}\s*:\s*[^=\r\n]+\s*$",
+    re.IGNORECASE,
+)
 QUOTED_SENSITIVE_MAPPING_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?:[rubf]{{0,2}})?(?P<mapping_quote>[\"']){SENSITIVE_ASSIGNMENT_KEY}(?P=mapping_quote)\s*$",
     re.IGNORECASE,
@@ -80,14 +84,34 @@ MALFORMED_PYTHON_CONTAINER_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.
     rf"(?!{re.escape(REDACTED_EVIDENCE_VALUE)}(?P=malformed_container_quote)).*$",
     re.IGNORECASE | re.DOTALL,
 )
+PYTHON_COMPOUND_ASSIGNMENT_OPERATORS: Final[tuple[str, ...]] = (
+    "**=",
+    "//=",
+    "<<=",
+    ">>=",
+    "+=",
+    "-=",
+    "*=",
+    "/=",
+    "%=",
+    "@=",
+    "&=",
+    "|=",
+    "^=",
+)
+PYTHON_VALUE_ASSIGNMENT_OPERATORS: Final[frozenset[str]] = frozenset({"=", ":=", *PYTHON_COMPOUND_ASSIGNMENT_OPERATORS})
+PYTHON_ASSIGNMENT_OPERATORS: Final[frozenset[str]] = PYTHON_VALUE_ASSIGNMENT_OPERATORS | {":"}
+PYTHON_ASSIGNMENT_OPERATOR_PATTERN: Final[str] = "|".join(
+    re.escape(operator) for operator in (*PYTHON_COMPOUND_ASSIGNMENT_OPERATORS, ":=", "=")
+)
 SENSITIVE_EXPRESSION_ASSIGNMENT_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
-    rf"{SENSITIVE_ASSIGNMENT_TARGET}\s*(?:=|:=)",
+    rf"(?P<target>{SENSITIVE_ASSIGNMENT_TARGET})\s*(?P<operator>{PYTHON_ASSIGNMENT_OPERATOR_PATTERN})",
     re.IGNORECASE,
 )
 STRING_LITERAL_START_RE: Final[re.Pattern[str]] = re.compile(r"(?:[rubf]{0,2})?[\"']", re.IGNORECASE)
 GENERIC_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
     r"(?<![a-z0-9_])(?:[a-z_]\w*(?:\.[a-z_]\w*)*(?:\[\s*[\"'][^\"']+[\"']\s*\])?|[\"'][^\"']+[\"'])"
-    r"\s*(?:=|:(?![^\r\n=]*=))",
+    rf"\s*(?:{PYTHON_ASSIGNMENT_OPERATOR_PATTERN}|:(?![^\r\n=]*=))",
     re.IGNORECASE,
 )
 
@@ -258,19 +282,46 @@ def _is_simple_sensitive_assignment_value(value: str) -> bool:
     return len(significant) == 1 and significant[0].type in {tokenize.NAME, tokenize.NUMBER, tokenize.STRING}
 
 
+def _unparseable_assignment_value_end(text: str, value_start: int) -> tuple[int, bool]:
+    """Find a physical statement boundary, following explicit line continuations."""
+    cursor = value_start
+    had_continuation = False
+    while cursor < len(text):
+        newline = text.find("\n", cursor)
+        semicolon = text.find(";", cursor)
+        if semicolon >= 0 and (newline < 0 or semicolon < newline):
+            return semicolon, had_continuation
+        if newline < 0:
+            return len(text), had_continuation
+
+        backslash_index = newline - 1
+        if backslash_index >= cursor and text[backslash_index] == "\r":
+            backslash_index -= 1
+        backslash_count = 0
+        while backslash_index >= cursor and text[backslash_index] == "\\":
+            backslash_count += 1
+            backslash_index -= 1
+        if backslash_count % 2 == 0:
+            return newline, had_continuation
+
+        had_continuation = True
+        cursor = newline + 1
+
+    return len(text), had_continuation
+
+
 def _redact_unparseable_sensitive_expression_assignments(text: str) -> str:
     matches = list(SENSITIVE_EXPRESSION_ASSIGNMENT_PREFIX_RE.finditer(text))
-    assignment_starts = [match.start() for match in GENERIC_ASSIGNMENT_START_RE.finditer(text)]
+    assignment_starts = sorted(
+        {match.start() for match in matches} | {match.start() for match in GENERIC_ASSIGNMENT_START_RE.finditer(text)}
+    )
     replacements: list[tuple[int, int]] = []
     for match in matches:
         value_start = match.end()
         while value_start < len(text) and text[value_start] in " \t":
             value_start += 1
 
-        line_end_candidates = [
-            position for position in (text.find("\n", value_start), text.find(";", value_start)) if position >= 0
-        ]
-        value_end = min(line_end_candidates, default=len(text))
+        value_end, had_continuation = _unparseable_assignment_value_end(text, value_start)
         next_assignment_start = next(
             (assignment_start for assignment_start in assignment_starts if value_start < assignment_start < value_end),
             None,
@@ -281,7 +332,12 @@ def _redact_unparseable_sensitive_expression_assignments(text: str) -> str:
             value_end = next_assignment_start
 
         candidate = text[value_start:value_end].rstrip()
-        if not candidate or _is_simple_sensitive_assignment_value(candidate):
+        if not candidate:
+            continue
+        is_simple_value = _is_simple_sensitive_assignment_value(candidate)
+        is_annotated_target = ANNOTATED_SENSITIVE_ASSIGNMENT_TARGET_RE.search(match.group("target")) is not None
+        is_compound_assignment = match.group("operator") in PYTHON_COMPOUND_ASSIGNMENT_OPERATORS
+        if is_simple_value and not (had_continuation or is_annotated_target or is_compound_assignment):
             continue
 
         try:
@@ -329,7 +385,7 @@ def _redact_python_expression_assignments(text: str) -> str:
     ignored_value_tokens = {tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT, tokenize.COMMENT}
 
     for index, token in enumerate(tokens):
-        if token.type != tokenize.OP or token.string not in {"=", ":=", ":"}:
+        if token.type != tokenize.OP or token.string not in PYTHON_ASSIGNMENT_OPERATORS:
             continue
 
         operator_depth = depths[index]
@@ -358,7 +414,13 @@ def _redact_python_expression_assignments(text: str) -> str:
             text_length,
             offsets,
         )
-        if len(significant) == 1 and significant[0].type in {tokenize.NAME, tokenize.NUMBER, tokenize.STRING}:
+        is_simple_value = len(significant) == 1 and significant[0].type in {
+            tokenize.NAME,
+            tokenize.NUMBER,
+            tokenize.STRING,
+        }
+        is_annotated_target = ANNOTATED_SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is not None
+        if is_simple_value and token.string not in PYTHON_COMPOUND_ASSIGNMENT_OPERATORS and not is_annotated_target:
             continue
 
         value_start = _position_offset(offsets, tokens[value_index].start, text_length)
