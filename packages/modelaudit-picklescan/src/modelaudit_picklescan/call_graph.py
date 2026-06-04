@@ -177,11 +177,22 @@ def _installed_distribution_roots(top_level_name: str) -> tuple[Path, ...]:
             root = Path(str(installed_distribution.locate_file(""))).resolve()
         except Exception:
             continue
-        if not any(metadata_path.is_relative_to(path) for path in _TRUSTED_SITE_PACKAGE_PATHS):
+        if not _path_is_in_trusted_package_environment(metadata_path):
             continue
         if root not in roots:
             roots.append(root)
     return tuple(roots)
+
+
+def _path_is_in_trusted_package_environment(path: Path) -> bool:
+    if any(path.is_relative_to(trusted_path) for trusted_path in _TRUSTED_SITE_PACKAGE_PATHS):
+        return True
+    for environment_root in path.parents:
+        if not (environment_root / "pyvenv.cfg").is_file():
+            continue
+        relative_parts = path.relative_to(environment_root).parts
+        return "site-packages" in relative_parts
+    return False
 
 
 _CLASS_ENTRYPOINT_METHODS = (
