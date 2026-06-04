@@ -819,6 +819,7 @@ def test_scan_allows_replaced_runpy_handler_api(tmp_path: Path) -> None:
 
     result = TorchServeMarScanner().scan(str(mar_path))
 
+    assert result.success is True
     assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
 
 

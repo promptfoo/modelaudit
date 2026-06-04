@@ -449,6 +449,7 @@ class TestTarScanner:
 
         result = self.scanner.scan(str(archive_path))
 
+        assert result.success is True
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
 
     def test_scan_tar_allows_replaced_runpy_execution(self, tmp_path: Path) -> None:

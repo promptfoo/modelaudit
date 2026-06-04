@@ -837,6 +837,7 @@ def test_scan_zip_honors_safe_dynamic_member_aliases_and_method_overwrites(tmp_p
 
     result = ZipScanner().scan(str(archive_path))
 
+    assert result.success is True
     assert not any(
         check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
     )
