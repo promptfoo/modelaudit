@@ -52,6 +52,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - detect dynamic `type()` namespaces that can hide callable protocol hooks
+- bound native pickle state simulation for tracked dictionaries, memo clones,
+  dotted globals, and recursive mappings
 - fail closed when encoded nested-pickle probe candidates exhaust the analysis cap
 - avoid custom meta-path finder calls during pickle call-graph source probing
 - prevent call-graph alias cycles from hanging scans
@@ -62,6 +64,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - avoid false positives for inert metadata under dangerous dotted globals
 - detect dangerous positional lookups inside `str.format` replacement fields
 - recognize PyTorch ZIP archives that contain only hidden pickle members
+- fail closed when novel pickle import-reference metadata exceeds the reporting cap without penalizing repeated benign imports
 
 ### Performance Improvements
 

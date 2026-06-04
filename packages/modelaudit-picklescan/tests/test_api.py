@@ -27,6 +27,7 @@ import pytest
 import modelaudit_picklescan.api as package_api
 import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import (
+    CoverageSummary,
     Finding,
     PickleReport,
     PickleScanner,
@@ -1224,6 +1225,32 @@ def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
     assert report.coverage.bytes_total == archive_path.stat().st_size
     assert report.coverage.bytes_scanned > 0
+
+
+@pytest.mark.parametrize("metadata_key", ["import_references_truncated", "callable_invocations_truncated"])
+def test_combine_pytorch_zip_reports_preserves_member_truncation_metadata(metadata_key: str) -> None:
+    pickle_entry = zipfile.ZipInfo("archive/data.pkl")
+    member_report = PickleReport(
+        source="model.pt:archive/data.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        coverage=CoverageSummary(bytes_scanned=1, bytes_total=1),
+        metadata={"analysis_incomplete": True, metadata_key: True},
+    )
+
+    report = package_api._combine_pytorch_zip_reports(
+        source="model.pt",
+        size=1,
+        entry_count=1,
+        pickle_entries=[pickle_entry],
+        member_reports=[member_report],
+        extra_notices=(),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.metadata["analysis_incomplete"] is True
+    assert report.metadata[metadata_key] is True
 
 
 def test_scan_file_detects_hidden_pytorch_zip_pickle_member_with_data_pickle(tmp_path: Path) -> None:
@@ -4575,6 +4602,35 @@ def test_scan_bytes_records_oversized_frame_notice() -> None:
     notice = next(notice for notice in report.notices if notice.code == "oversized_frame")
     assert notice.details["frame_length"] == 0xFFFFFFFFFFFFFFFE
     assert notice.details["remaining_bytes"] == 2
+
+
+def test_scan_bytes_fails_closed_when_import_references_are_truncated() -> None:
+    payload = (b"cmath\nsin\n0" * 10_000) + b"cmath\ncos\n0."
+
+    report = scan_bytes(payload, source="import-reference-cap.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.metadata["analysis_incomplete"] is True
+    assert report.metadata["import_references_truncated"] is True
+    assert len(report.metadata["import_references"]) == 10_000
+    assert not any(reference["name"] == "cos" for reference in report.metadata["import_references"])
+    notice = next(notice for notice in report.notices if notice.code == "import_references_truncated")
+    assert notice.details["analysis_incomplete"] is True
+    assert notice.details["max_import_references"] == 10_000
+
+
+def test_scan_bytes_keeps_duplicate_import_reference_overflow_conclusive() -> None:
+    payload = (b"cmath\nsin\n0" * 10_001) + b"."
+
+    report = scan_bytes(payload, source="duplicate-import-reference-cap.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.metadata["import_references_truncated"] is False
+    assert "analysis_incomplete" not in report.metadata
+    assert len(report.metadata["import_references"]) == 10_000
+    assert all(notice.code != "import_references_truncated" for notice in report.notices)
 
 
 def test_scan_stream_preserves_absolute_offsets_from_current_stream_position() -> None:
