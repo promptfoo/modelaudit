@@ -117,7 +117,19 @@ _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
 _KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+_-]*)\s*$")
-_KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(r"(?i)^(?:alpha|beta|preview|pre|rc|dev|a|b|c)(?:[._-]?\d+)?(?:$|[.+_-])")
+_KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(
+    r"(?i)^[._-]?(?:"
+    r"(?:alpha|beta|preview|pre|rc|a|b|c)(?:[._-]?\d+)?"
+    r"(?:(?:[._-]?(?:post|rev|r)(?:[._-]?\d+)?)|-\d+)?"
+    r"(?:[._-]?dev(?:[._-]?\d+)?)?"
+    r"|dev(?:[._-]?\d+)?"
+    r")(?:\+[a-z0-9]+(?:[._-][a-z0-9]+)*)?$"
+)
+_KERAS_LOCAL_VERSION_SUFFIX_PATTERN = re.compile(r"(?i)^\+[a-z0-9]+(?:[._-][a-z0-9]+)*$")
+_KERAS_POSTRELEASE_SUFFIX_PATTERN = re.compile(
+    r"(?i)^(?:(?:[._-]?(?:post|rev|r)(?:[._-]?\d+)?)|-\d+)"
+    r"(?:[._-]?dev(?:[._-]?\d+)?)?(?:\+[a-z0-9]+(?:[._-][a-z0-9]+)*)?$"
+)
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -1616,7 +1628,10 @@ class KerasZipScanner(BaseScanner):
             "external_references": findings,
         }
 
-        if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2026_1669(keras_version):
+        cve_2026_1669_status = (
+            self._is_vulnerable_to_cve_2026_1669(keras_version) if isinstance(keras_version, str) else None
+        )
+        if cve_2026_1669_status is True:
             details["keras_version"] = keras_version
             result.add_check(
                 name="CVE-2026-1669: HDF5 External Weight Reference",
@@ -1632,7 +1647,7 @@ class KerasZipScanner(BaseScanner):
             )
             return
 
-        if isinstance(keras_version, str):
+        if cve_2026_1669_status is False:
             result.add_check(
                 name="HDF5 External Weight Reference Version Check",
                 passed=True,
@@ -1645,12 +1660,20 @@ class KerasZipScanner(BaseScanner):
             )
             return
 
+        version_context = (
+            f"keras_version '{keras_version}' is non-canonical"
+            if isinstance(keras_version, str)
+            else "keras_version is unavailable"
+        )
+        if isinstance(keras_version, str):
+            details["keras_version"] = keras_version
+            details["parse_status"] = "unknown"
         result.add_check(
             name="HDF5 External Weight Reference Risk (Version Unknown)",
             passed=False,
             message=(
-                "Embedded HDF5 external references detected in weights, but keras_version is unavailable; cannot "
-                "confidently attribute CVE-2026-1669 without version context"
+                f"Embedded HDF5 external references detected in weights, but {version_context}; cannot confidently "
+                "attribute CVE-2026-1669 without reliable version context"
             ),
             severity=IssueSeverity.WARNING,
             location=location,
@@ -2002,13 +2025,25 @@ class KerasZipScanner(BaseScanner):
         parsed = (major, minor, patch)
         if parsed < (2, 13, 0):
             return True
+
+        suffix_status = KerasZipScanner._classify_keras_release_suffix(suffix)
+        if suffix_status is None:
+            return None
         if parsed > (2, 13, 0):
             return False
-        if not suffix or suffix.startswith("+") or suffix.startswith(".post") or suffix.startswith("post"):
+        return suffix_status
+
+    @staticmethod
+    def _classify_keras_release_suffix(suffix: str) -> bool | None:
+        """Return True for prerelease, False for stable/post/local, or None for unknown."""
+        if not suffix:
+            return False
+        if _KERAS_LOCAL_VERSION_SUFFIX_PATTERN.fullmatch(suffix):
+            return False
+        if _KERAS_POSTRELEASE_SUFFIX_PATTERN.fullmatch(suffix):
             return False
 
-        public_suffix = suffix.lstrip("._-")
-        if _KERAS_PRERELEASE_SUFFIX_PATTERN.match(public_suffix):
+        if _KERAS_PRERELEASE_SUFFIX_PATTERN.fullmatch(suffix):
             return True
         return None
 
@@ -2036,23 +2071,24 @@ class KerasZipScanner(BaseScanner):
             return False
 
     @staticmethod
-    def _is_vulnerable_to_cve_2026_1669(version: str) -> bool:
-        """Return True for Keras versions in the known CVE-2026-1669 affected ranges."""
+    def _is_vulnerable_to_cve_2026_1669(version: str) -> bool | None:
+        """Return vulnerability status for Keras versions in the known CVE-2026-1669 ranges."""
         version_match = _KERAS_RELEASE_VERSION_PATTERN.match(version)
         if not version_match:
-            return False
+            return None
 
         try:
             major = int(version_match.group(1))
             minor = int(version_match.group(2))
             patch = int(version_match.group(3) or 0)
         except ValueError:
-            return False
+            return None
 
         suffix = (version_match.group(4) or "").strip().lower()
-        public_suffix = suffix.lstrip("._-")
-        is_prerelease = not suffix.startswith("+") and bool(_KERAS_PRERELEASE_SUFFIX_PATTERN.match(public_suffix))
+        suffix_status = KerasZipScanner._classify_keras_release_suffix(suffix)
         parsed = (major, minor, patch)
         if (3, 0, 0) <= parsed < (3, 12, 1) or (3, 13, 0) <= parsed < (3, 13, 2):
             return True
-        return parsed in {(3, 12, 1), (3, 13, 2)} and is_prerelease
+        if parsed in {(3, 12, 1), (3, 13, 2)}:
+            return suffix_status
+        return False
