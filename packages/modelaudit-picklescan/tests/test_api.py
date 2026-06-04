@@ -4593,7 +4593,7 @@ def test_scan_bytes_records_oversized_frame_notice() -> None:
 
 
 def test_scan_bytes_fails_closed_when_import_references_are_truncated() -> None:
-    payload = (b"cmath\nsin\n0" * 10_001) + b"."
+    payload = (b"cmath\nsin\n0" * 10_000) + b"cmath\ncos\n0."
 
     report = scan_bytes(payload, source="import-reference-cap.pkl")
 
@@ -4602,9 +4602,23 @@ def test_scan_bytes_fails_closed_when_import_references_are_truncated() -> None:
     assert report.metadata["analysis_incomplete"] is True
     assert report.metadata["import_references_truncated"] is True
     assert len(report.metadata["import_references"]) == 10_000
+    assert not any(reference["name"] == "cos" for reference in report.metadata["import_references"])
     notice = next(notice for notice in report.notices if notice.code == "import_references_truncated")
     assert notice.details["analysis_incomplete"] is True
     assert notice.details["max_import_references"] == 10_000
+
+
+def test_scan_bytes_keeps_duplicate_import_reference_overflow_conclusive() -> None:
+    payload = (b"cmath\nsin\n0" * 10_001) + b"."
+
+    report = scan_bytes(payload, source="duplicate-import-reference-cap.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.metadata["import_references_truncated"] is False
+    assert "analysis_incomplete" not in report.metadata
+    assert len(report.metadata["import_references"]) == 10_000
+    assert all(notice.code != "import_references_truncated" for notice in report.notices)
 
 
 def test_scan_stream_preserves_absolute_offsets_from_current_stream_position() -> None:

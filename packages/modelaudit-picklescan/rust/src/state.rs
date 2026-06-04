@@ -452,6 +452,7 @@ fn global_ref_details(
 }
 
 type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
+type ImportReferenceDedupeKey = (String, String, String);
 type CallableInvocationDedupeKey = (String, String, Option<usize>);
 
 #[derive(Clone)]
@@ -490,6 +491,7 @@ pub(crate) struct ScanState<'a> {
     errors: Vec<ScanError>,
     protocols: Vec<i64>,
     import_references: Vec<Vec<(String, DetailValue)>>,
+    import_reference_keys: HashSet<ImportReferenceDedupeKey>,
     callable_invocations: Vec<Vec<(String, DetailValue)>>,
     callable_invocation_keys: HashSet<CallableInvocationDedupeKey>,
     opcode_count: usize,
@@ -552,6 +554,7 @@ impl<'a> ScanState<'a> {
             errors: Vec::new(),
             protocols: Vec::new(),
             import_references: Vec::new(),
+            import_reference_keys: HashSet::new(),
             callable_invocations: Vec::new(),
             callable_invocation_keys: HashSet::new(),
             opcode_count: 0,
@@ -6080,11 +6083,32 @@ impl<'a> ScanState<'a> {
     }
 
     fn push_import_reference(&mut self, details: Vec<(String, DetailValue)>) {
+        let dedupe_key = Self::import_reference_detail_key(&details);
         if self.import_references.len() < MAX_IMPORT_REFERENCES {
+            if let Some(key) = dedupe_key.as_ref() {
+                self.import_reference_keys.insert(key.clone());
+            }
             self.import_references.push(details);
             return;
         }
+        if dedupe_key
+            .as_ref()
+            .is_some_and(|key| self.import_reference_keys.contains(key))
+        {
+            return;
+        }
         self.record_import_references_truncated_notice();
+    }
+
+    fn import_reference_detail_key(
+        details: &[(String, DetailValue)],
+    ) -> Option<ImportReferenceDedupeKey> {
+        let module = detail_string(details, "module")?;
+        let name = detail_string(details, "name")?;
+        if module == "torch" && name.ends_with("Storage") {
+            return None;
+        }
+        Some((module, name, detail_string(details, "opcode")?))
     }
 
     fn record_import_references_truncated_notice(&mut self) {
@@ -8706,6 +8730,110 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn duplicate_import_reference_over_cap_does_not_mark_metadata_truncated() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "duplicate-import-cap.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        for index in 0..=MAX_IMPORT_REFERENCES {
+            scan.push_import_reference(vec![
+                (
+                    "module".to_string(),
+                    DetailValue::String("cmath".to_string()),
+                ),
+                ("name".to_string(), DetailValue::String("sin".to_string())),
+                (
+                    "opcode".to_string(),
+                    DetailValue::String("GLOBAL".to_string()),
+                ),
+                ("position".to_string(), DetailValue::UInt(index as u64)),
+            ]);
+        }
+
+        assert_eq!(scan.import_references.len(), MAX_IMPORT_REFERENCES);
+        assert!(!scan.import_references_truncated);
+        assert_eq!(scan.status, ScanStatus::Complete);
+        assert!(scan
+            .notices
+            .iter()
+            .all(|notice| notice.code != Some("import_references_truncated")));
+    }
+
+    #[test]
+    fn security_distinct_import_reference_overflow_marks_metadata_truncated() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+
+        for (module, name, overflow_opcode) in [
+            ("cmath", "sin", "STACK_GLOBAL"),
+            ("torch", "FloatStorage", "GLOBAL"),
+        ] {
+            let mut scan = ScanState::new(
+                format!("{module}-{name}-import-cap.pkl"),
+                b"",
+                &options,
+                Some(0),
+                0,
+                0,
+                None,
+            );
+
+            for index in 0..MAX_IMPORT_REFERENCES {
+                scan.push_import_reference(vec![
+                    (
+                        "module".to_string(),
+                        DetailValue::String(module.to_string()),
+                    ),
+                    ("name".to_string(), DetailValue::String(name.to_string())),
+                    (
+                        "opcode".to_string(),
+                        DetailValue::String("GLOBAL".to_string()),
+                    ),
+                    ("position".to_string(), DetailValue::UInt(index as u64)),
+                ]);
+            }
+            scan.push_import_reference(vec![
+                (
+                    "module".to_string(),
+                    DetailValue::String(module.to_string()),
+                ),
+                ("name".to_string(), DetailValue::String(name.to_string())),
+                (
+                    "opcode".to_string(),
+                    DetailValue::String(overflow_opcode.to_string()),
+                ),
+                (
+                    "position".to_string(),
+                    DetailValue::UInt(MAX_IMPORT_REFERENCES as u64),
+                ),
+            ]);
+
+            assert!(scan.import_references_truncated, "{module}.{name}");
+            assert_eq!(scan.status, ScanStatus::Inconclusive, "{module}.{name}");
+        }
     }
 
     #[test]
