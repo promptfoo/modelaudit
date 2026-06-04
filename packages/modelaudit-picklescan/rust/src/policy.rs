@@ -17,9 +17,9 @@ pub(crate) fn callable_severity(module: &str, name: &str) -> Option<&'static str
     global_severity(module, name).or_else(|| pathlib_callable_severity(module, name))
 }
 
-pub(crate) fn global_import_requires_review(module: &str) -> bool {
+pub(crate) fn global_import_requires_review(module: &str, name: &str) -> bool {
     !IMPORT_ONLY_GLOBAL_ALLOWLIST_MODULES.contains(&module)
-        && !dangerous_global_module_is_listed(module)
+        && global_severity(module, name).is_none()
 }
 
 fn pathlib_callable_severity(module: &str, name: &str) -> Option<&'static str> {
@@ -200,12 +200,6 @@ fn dangerous_global_is_listed(module: &str, name: &str) -> bool {
                 ordering => ordering,
             }
         })
-        .is_ok()
-}
-
-fn dangerous_global_module_is_listed(module: &str) -> bool {
-    DANGEROUS_GLOBALS
-        .binary_search_by(|&(candidate_module, _)| candidate_module.cmp(module))
         .is_ok()
 }
 
@@ -1227,24 +1221,43 @@ mod tests {
 
     #[test]
     fn import_only_global_review_policy_preserves_allowlisted_modules() {
-        assert!(!global_import_requires_review("builtins"));
-        assert!(!global_import_requires_review("click"));
-        assert!(!global_import_requires_review("collections"));
-        assert!(!global_import_requires_review("collections.abc"));
-        assert!(!global_import_requires_review("numpy._core.multiarray"));
-        assert!(!global_import_requires_review("joblib.numpy_pickle"));
-        assert!(!global_import_requires_review("torch._utils"));
-        assert!(!global_import_requires_review("logging"));
-        assert!(!global_import_requires_review("mailbox"));
-        assert!(!global_import_requires_review("_pytest._py.path"));
-        assert!(!global_import_requires_review("_tkinter"));
-        assert!(!global_import_requires_review("_xxsubinterpreters"));
-        assert!(!global_import_requires_review("dotenv.main"));
-        assert!(!global_import_requires_review("random"));
-        assert!(global_import_requires_review("modelaudit_custom_payload"));
-        assert!(global_import_requires_review("numpy.evil"));
-        assert!(global_import_requires_review("torch.evil"));
-        assert!(global_import_requires_review("vendor.package"));
+        for module in [
+            "builtins",
+            "click",
+            "collections",
+            "collections.abc",
+            "numpy._core.multiarray",
+            "joblib.numpy_pickle",
+            "torch._utils",
+            "logging",
+            "mailbox",
+            "_pytest._py.path",
+            "_tkinter",
+            "random",
+        ] {
+            assert!(!global_import_requires_review(module, "KnownSafe"));
+        }
+        assert!(!global_import_requires_review(
+            "_xxsubinterpreters",
+            "run_string"
+        ));
+        assert!(!global_import_requires_review("dotenv.main", "set_key"));
+        assert!(global_import_requires_review(
+            "_xxsubinterpreters",
+            "create"
+        ));
+        assert!(global_import_requires_review(
+            "_xxsubinterpreters",
+            "Gadget"
+        ));
+        assert!(global_import_requires_review("dotenv.main", "Gadget"));
+        assert!(global_import_requires_review(
+            "modelaudit_custom_payload",
+            "Gadget"
+        ));
+        assert!(global_import_requires_review("numpy.evil", "Gadget"));
+        assert!(global_import_requires_review("torch.evil", "Gadget"));
+        assert!(global_import_requires_review("vendor.package", "Gadget"));
     }
 
     #[test]

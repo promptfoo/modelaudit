@@ -23,6 +23,8 @@ from typing import Any, Protocol, TypeVar, cast
 # growth; raising it improves completeness at a runtime cost, lowering it can
 # reduce detection coverage.
 _MAX_IMPORT_REFERENCES = 32
+_MAX_MODULE_NAME_CHARS = 1024
+_MAX_MODULE_COMPONENTS = 32
 # Limit per-module source reads to 1 MiB so AST parsing remains bounded on large
 # inputs. This is an explicit coverage/performance tradeoff and can be tuned if
 # scan precision or throughput needs change.
@@ -41,6 +43,39 @@ _MAX_SHORT_SINK_DEPTH = 2
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
 _IMPORT_EXECUTION_SINK = "builtins.__import__"
 _IMPORT_EXECUTION_SAFE_MODULES = frozenset(sys.builtin_module_names)
+_TRUSTED_STDLIB_PATHS = tuple(
+    Path(path).resolve() for name in ("stdlib", "platstdlib") if (path := sysconfig.get_path(name))
+)
+_TRUSTED_SITE_PACKAGE_PATHS = tuple(
+    Path(path).resolve() for name in ("purelib", "platlib") if (path := sysconfig.get_path(name))
+)
+_TRUSTED_IMPORT_ONLY_REFERENCES = frozenset(
+    {
+        ("_sitebuiltins", "_Helper"),
+        ("_xxsubinterpreters", "create"),
+        ("aiobotocore.credentials", "AioProcessProvider"),
+        ("botocore.credentials", "ProcessProvider"),
+        ("configparser", "ConfigParser"),
+        ("concurrent.futures", "Future"),
+        ("concurrent.futures", "Future.add_done_callback"),
+        ("dill", "dump"),
+        ("ipaddress", "IPv4Address"),
+        ("string", "Formatter"),
+        ("string", "Formatter._vformat"),
+        ("string", "Formatter.vformat"),
+        ("string", "Template"),
+        ("string", "Template.safe_substitute"),
+        ("string", "Template.substitute"),
+        ("tarfile", "TarInfo"),
+        ("tempfile", "gettempdir"),
+        ("tokenize", "generate_tokens"),
+        ("torch.serialization", "_get_layout"),
+        ("weakref", "WeakMethod"),
+        ("weakref", "proxy"),
+        ("weakref", "ref"),
+        ("zipfile", "ZipInfo"),
+    }
+)
 _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS = ("__new__", "__init__")
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS = ("__setstate__",)
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHOD_SET = frozenset(_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS)
@@ -564,6 +599,72 @@ def find_unanalyzed_callable_call_graph_references(
         if len(references) >= _MAX_IMPORT_REFERENCES:
             break
     return tuple(references)
+
+
+def module_initialization_is_proven_inert(module_name: str) -> bool:
+    """Return whether importing a source-backed module has no executable initialization."""
+    parts = _bounded_module_name_parts(module_name)
+    if parts is None:
+        return False
+    for index in range(1, len(parts) + 1):
+        context = _module_source_context(".".join(parts[:index]))
+        if context is None or (index < len(parts) and not context.is_package):
+            return False
+        if not _module_source_context_initialization_is_proven_inert(context):
+            return False
+    return True
+
+
+def _module_source_context_initialization_is_proven_inert(context: _ModuleSourceContext) -> bool:
+    return not any(
+        _module_statement_binds_name(statement, "__getattr__") for statement in context.module_statements
+    ) and all(_module_initialization_statement_is_inert(statement) for statement in context.module_statements)
+
+
+def import_only_reference_is_proven_trusted(module_name: str, name: str) -> bool:
+    """Return whether a known-safe reference resolves from a trusted runtime path."""
+    return (module_name, name) in _TRUSTED_IMPORT_ONLY_REFERENCES and _trusted_module_origin_kind(
+        module_name
+    ) is not None
+
+
+@_register_source_sensitive_cache
+@lru_cache(maxsize=4096)
+def _trusted_module_origin_kind(module_name: str) -> str | None:
+    parts = _bounded_module_name_parts(module_name)
+    if parts is None:
+        return None
+    _track_shared_source_candidates(parts)
+    try:
+        if BuiltinImporter.find_spec(module_name) is not None or FrozenImporter.find_spec(module_name) is not None:
+            return "stdlib"
+        spec = _find_module_spec_without_imports(module_name)
+    except Exception:
+        return None
+    if spec is None or spec.origin is None:
+        return None
+    try:
+        origin = Path(spec.origin).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if any(origin.is_relative_to(path) for path in _TRUSTED_SITE_PACKAGE_PATHS):
+        return "site_packages"
+    if any(origin.is_relative_to(path) for path in _TRUSTED_STDLIB_PATHS):
+        return "stdlib"
+    return None
+
+
+def _bounded_module_name_parts(module_name: str) -> tuple[str, ...] | None:
+    if len(module_name) > _MAX_MODULE_NAME_CHARS:
+        return None
+    parts = tuple(module_name.split("."))
+    if (
+        not parts
+        or len(parts) > _MAX_MODULE_COMPONENTS
+        or any(not part or "/" in part or "\\" in part for part in parts)
+    ):
+        return None
+    return parts
 
 
 @contextmanager
@@ -1512,6 +1613,109 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
 
 def _module_level_statements(tree: ast.Module) -> tuple[ast.stmt, ...]:
     return _definition_scope_statements(tree.body)
+
+
+def _module_initialization_statement_is_inert(statement: ast.stmt) -> bool:
+    if isinstance(statement, ast.Pass):
+        return True
+    if isinstance(statement, ast.Expr):
+        return isinstance(statement.value, ast.Constant)
+    if isinstance(statement, ast.Import):
+        return all(_trusted_module_origin_kind(alias.name) == "stdlib" for alias in statement.names)
+    if isinstance(statement, ast.ImportFrom):
+        return (
+            statement.level == 0
+            and statement.module is not None
+            and all(alias.name != "*" for alias in statement.names)
+            and _trusted_module_origin_kind(statement.module) == "stdlib"
+        )
+    if isinstance(statement, ast.Assign):
+        return all(_inert_assignment_target(target) for target in statement.targets) and _inert_definition_expression(
+            statement.value
+        )
+    if isinstance(statement, ast.AnnAssign):
+        return (
+            _inert_assignment_target(statement.target)
+            and _inert_definition_expression(statement.annotation)
+            and (statement.value is None or _inert_definition_expression(statement.value))
+        )
+    if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
+        return _inert_function_definition(statement)
+    if isinstance(statement, ast.ClassDef):
+        return (
+            not statement.bases
+            and not statement.keywords
+            and not statement.decorator_list
+            and not getattr(statement, "type_params", [])
+            and all(_module_initialization_statement_is_inert(item) for item in statement.body)
+        )
+    return False
+
+
+def _module_statement_binds_name(statement: ast.stmt, name: str) -> bool:
+    if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+        return statement.name == name
+    if isinstance(statement, ast.Import):
+        return any((alias.asname or alias.name.split(".")[0]) == name for alias in statement.names)
+    if isinstance(statement, ast.ImportFrom):
+        return any((alias.asname or alias.name) == name for alias in statement.names)
+    if isinstance(statement, ast.Assign | ast.AnnAssign):
+        return name in _assignment_alias_target_names(statement)
+    return False
+
+
+def _inert_assignment_target(target: ast.expr) -> bool:
+    if isinstance(target, ast.Name):
+        return True
+    if isinstance(target, ast.Tuple | ast.List):
+        return all(_inert_assignment_target(item) for item in target.elts)
+    return False
+
+
+def _inert_function_definition(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    if node.decorator_list or getattr(node, "type_params", []):
+        return False
+    argument_annotations = (
+        *(argument.annotation for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)),
+        node.args.vararg.annotation if node.args.vararg is not None else None,
+        node.args.kwarg.annotation if node.args.kwarg is not None else None,
+        node.returns,
+    )
+    return all(
+        _inert_definition_expression(expression)
+        for expression in (
+            *node.args.defaults,
+            *(default for default in node.args.kw_defaults if default is not None),
+            *(annotation for annotation in argument_annotations if annotation is not None),
+        )
+    )
+
+
+def _inert_definition_expression(expression: ast.expr) -> bool:
+    if isinstance(expression, ast.Constant | ast.Name):
+        return True
+    if isinstance(expression, ast.Attribute):
+        return _inert_definition_expression(expression.value)
+    if isinstance(expression, ast.Tuple | ast.List | ast.Set):
+        return all(_inert_definition_expression(item) for item in expression.elts)
+    if isinstance(expression, ast.Dict):
+        return all(
+            key is not None and _inert_definition_expression(key) and _inert_definition_expression(value)
+            for key, value in zip(expression.keys, expression.values, strict=True)
+        )
+    if isinstance(expression, ast.UnaryOp):
+        return isinstance(expression.op, ast.UAdd | ast.USub | ast.Not | ast.Invert) and _inert_definition_expression(
+            expression.operand
+        )
+    if isinstance(expression, ast.Lambda):
+        return all(
+            _inert_definition_expression(default)
+            for default in (
+                *expression.args.defaults,
+                *(item for item in expression.args.kw_defaults if item is not None),
+            )
+        )
+    return False
 
 
 def _definition_scope_statements(nodes: Iterable[ast.stmt]) -> tuple[ast.stmt, ...]:

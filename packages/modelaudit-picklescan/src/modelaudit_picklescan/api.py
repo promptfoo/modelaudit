@@ -21,6 +21,8 @@ from .call_graph import (
     find_startup_hook_write_call_graphs,
     find_unanalyzed_callable_call_graph_references,
     has_unanalyzed_call_graph_import_references,
+    import_only_reference_is_proven_trusted,
+    module_initialization_is_proven_inert,
     shared_source_sensitive_caches,
 )
 from .options import ScanOptions
@@ -72,6 +74,7 @@ _PROTO0_1_TRIVIAL_LEADING_OPCODES = frozenset(
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
 _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES = 512 * 1024 * 1024
 _RUST_EXTENSION_MODULE = "modelaudit_picklescan._rust"
+_MAX_INERT_INITIALIZATION_MODULES = 32
 _ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
 _ZIP_EOCD_MIN_SIZE = 22
 _ZIP_MAX_COMMENT_SIZE = 0xFFFF
@@ -1011,6 +1014,10 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     import_references = report.metadata.get("import_references")
     callable_invocations = report.metadata.get("callable_invocations", ())
     enrichment_errors: list[tuple[str, Exception]] = []
+    inert_initialization_modules: frozenset[str] = frozenset()
+    trusted_import_references: frozenset[tuple[str, str]] = frozenset()
+    source_snapshot_stable = True
+    callable_invocations_complete = not bool(report.metadata.get("callable_invocations_truncated"))
     with shared_source_sensitive_caches():
         report_generation = _begin_shared_source_report()
         call_graph_limit_exceeded = has_unanalyzed_call_graph_import_references(import_references)
@@ -1039,10 +1046,29 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
             unanalyzed_references = ()
             enrichment_errors.append(("python_call_graph_source_unavailable", error))
         try:
+            inert_initialization_modules = _proven_inert_initialization_modules(report)
+        except Exception as error:
+            enrichment_errors.append(("python_import_initialization", error))
+        try:
+            trusted_import_references = _proven_trusted_import_references(report)
+        except Exception as error:
+            enrichment_errors.append(("python_import_reference_trust", error))
+        try:
             _ensure_shared_source_snapshot_stable(report_generation)
         except _CallGraphAnalysisLimitError as error:
+            source_snapshot_stable = False
             enrichment_errors.append(("python_call_graph_source_stability", error))
 
+    if (
+        source_snapshot_stable
+        and callable_invocations_complete
+        and (inert_initialization_modules or trusted_import_references)
+    ):
+        report = _without_proven_safe_import_findings(
+            report,
+            inert_initialization_modules,
+            trusted_import_references,
+        )
     updated_report = (
         _with_unanalyzed_call_graph_notices(report, unanalyzed_references) if unanalyzed_references else report
     )
@@ -1098,6 +1124,85 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     )
 
 
+def _proven_inert_initialization_modules(report: PickleReport) -> frozenset[str]:
+    modules: list[str] = []
+    seen: set[str] = set()
+    for finding in report.findings:
+        if finding.rule_code != "NON_ALLOWLISTED_GLOBAL":
+            continue
+        module = str(finding.details.get("module", ""))
+        if not module or module in seen:
+            continue
+        seen.add(module)
+        modules.append(module)
+        if len(modules) >= _MAX_INERT_INITIALIZATION_MODULES:
+            break
+    return frozenset(module for module in modules if module_initialization_is_proven_inert(module))
+
+
+def _proven_trusted_import_references(report: PickleReport) -> frozenset[tuple[str, str]]:
+    references: list[tuple[str, str]] = []
+    for finding in report.findings:
+        if finding.rule_code != "NON_ALLOWLISTED_GLOBAL":
+            continue
+        module = str(finding.details.get("module", ""))
+        name = str(finding.details.get("name", ""))
+        if not module or not name or not import_only_reference_is_proven_trusted(module, name):
+            continue
+        references.append((module, name))
+        if len(references) >= _MAX_INERT_INITIALIZATION_MODULES:
+            break
+    return frozenset(references)
+
+
+def _without_proven_safe_import_findings(
+    report: PickleReport,
+    inert_initialization_modules: frozenset[str],
+    trusted_import_references: frozenset[tuple[str, str]],
+) -> PickleReport:
+    findings = tuple(
+        finding
+        for finding in report.findings
+        if finding.rule_code != "NON_ALLOWLISTED_GLOBAL"
+        or not _non_allowlisted_import_finding_is_proven_safe(
+            finding,
+            inert_initialization_modules,
+            trusted_import_references,
+        )
+    )
+    if len(findings) == len(report.findings):
+        return report
+    verdict = report.verdict
+    if verdict == SafetyVerdict.SUSPICIOUS:
+        if findings:
+            verdict = SafetyVerdict.SUSPICIOUS
+        elif report.status == ScanStatus.COMPLETE:
+            verdict = SafetyVerdict.CLEAN
+        else:
+            verdict = SafetyVerdict.UNKNOWN
+    return PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=verdict,
+        findings=findings,
+        notices=report.notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=report.to_dict()["metadata"],
+        duration_s=report.duration_s,
+    )
+
+
+def _non_allowlisted_import_finding_is_proven_safe(
+    finding: Finding,
+    inert_initialization_modules: frozenset[str],
+    trusted_import_references: frozenset[tuple[str, str]],
+) -> bool:
+    module = str(finding.details.get("module", ""))
+    name = str(finding.details.get("name", ""))
+    return (module, name) in trusted_import_references or module in inert_initialization_modules
+
+
 def _with_call_graph_enrichment_errors(
     report: PickleReport,
     enrichment_errors: tuple[tuple[str, Exception], ...],
@@ -1119,7 +1224,7 @@ def _with_call_graph_enrichment_errors(
     return PickleReport(
         source=report.source,
         status=ScanStatus.INCONCLUSIVE if report.status == ScanStatus.COMPLETE else report.status,
-        verdict=SafetyVerdict.UNKNOWN if report.verdict == SafetyVerdict.CLEAN else report.verdict,
+        verdict=SafetyVerdict.MALICIOUS if report.verdict == SafetyVerdict.MALICIOUS else SafetyVerdict.UNKNOWN,
         findings=report.findings,
         notices=report.notices,
         errors=errors,
@@ -1155,12 +1260,8 @@ def _with_unanalyzed_call_graph_notices(
     metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
     return PickleReport(
         source=report.source,
-        status=(
-            ScanStatus.INCONCLUSIVE
-            if report.status == ScanStatus.COMPLETE and report.verdict == SafetyVerdict.CLEAN
-            else report.status
-        ),
-        verdict=SafetyVerdict.UNKNOWN if report.verdict == SafetyVerdict.CLEAN else report.verdict,
+        status=ScanStatus.INCONCLUSIVE if report.status == ScanStatus.COMPLETE else report.status,
+        verdict=SafetyVerdict.MALICIOUS if report.verdict == SafetyVerdict.MALICIOUS else SafetyVerdict.UNKNOWN,
         findings=report.findings,
         notices=notices,
         errors=report.errors,

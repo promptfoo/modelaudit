@@ -119,8 +119,18 @@ def test_shared_source_sensitive_caches_clears_once_per_scope(monkeypatch: pytes
     assert clear_count == 1
 
     call_graph._clear_source_sensitive_caches()
-
     assert clear_count == 2
+
+
+def test_module_initialization_inert_proof_rejects_unbounded_module_depth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_source_lookup(_module_name: str) -> object:
+        raise AssertionError("unbounded module names must be rejected before source lookup")
+
+    monkeypatch.setattr(call_graph, "_module_source_context", fail_source_lookup)
+
+    assert call_graph.module_initialization_is_proven_inert(".".join(["package"] * 33)) is False
 
 
 def test_shared_source_sensitive_caches_allows_inherited_worker_scopes(
@@ -2939,8 +2949,8 @@ def test_scan_bytes_ignores_nested_function_body_sink_when_outer_function_is_imp
 
     report = scan_bytes(payload, source=f"{module_name}.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
     assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
 
 

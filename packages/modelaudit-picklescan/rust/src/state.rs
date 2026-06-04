@@ -82,6 +82,7 @@ const MAX_TRACKED_FUTURE_CALLBACKS: usize = 1024;
 const MAX_TRACKED_MEMO_VALUES: usize = 65_536;
 const MAX_TRACKED_STACK_VALUES: usize = 65_536;
 const MAX_TRACKED_STATE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_NON_ALLOWLISTED_GLOBAL_IMPORT_BYTES: usize = MAX_TRACKED_STATE_BYTES;
 const MAX_TRACKED_VALUE_DEPTH: usize = 64;
 const MAX_MAPPING_TRAVERSAL_NODES: usize = 2048;
 const MAX_TRACKED_STR_JOIN_RESULT_BYTES: usize = 4096;
@@ -455,6 +456,36 @@ type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
 type CallableInvocationDedupeKey = (String, String, Option<usize>);
 type PendingGlobalImportFinding = (String, usize, Vec<(String, DetailValue)>);
 
+fn detail_value_content_bytes(value: &DetailValue) -> usize {
+    match value {
+        DetailValue::String(value) => value.len(),
+        DetailValue::List(values) => values.iter().fold(0, |total, value| {
+            total.saturating_add(detail_value_content_bytes(value))
+        }),
+        DetailValue::Dict(values) => values.iter().fold(0, |total, (key, value)| {
+            total
+                .saturating_add(key.len())
+                .saturating_add(detail_value_content_bytes(value))
+        }),
+        DetailValue::Int(_)
+        | DetailValue::UInt(_)
+        | DetailValue::Float(_)
+        | DetailValue::Bool(_)
+        | DetailValue::None => 0,
+    }
+}
+
+fn pending_global_import_finding_content_bytes(finding: &PendingGlobalImportFinding) -> usize {
+    finding
+        .2
+        .iter()
+        .fold(finding.0.len(), |total, (key, value)| {
+            total
+                .saturating_add(key.len())
+                .saturating_add(detail_value_content_bytes(value))
+        })
+}
+
 #[derive(Clone)]
 struct CallableInvocation {
     reference: GlobalRef,
@@ -522,6 +553,8 @@ pub(crate) struct ScanState<'a> {
     tracked_stack_value_bytes: Vec<usize>,
     tracked_stack_bytes: usize,
     tracked_state_budget_exhausted: bool,
+    non_allowlisted_global_import_bytes: usize,
+    non_allowlisted_global_imports_truncated: bool,
 }
 
 impl<'a> ScanState<'a> {
@@ -585,6 +618,8 @@ impl<'a> ScanState<'a> {
             tracked_stack_value_bytes: Vec::new(),
             tracked_stack_bytes: 0,
             tracked_state_budget_exhausted: false,
+            non_allowlisted_global_import_bytes: 0,
+            non_allowlisted_global_imports_truncated: false,
         }
     }
 
@@ -5969,9 +6004,8 @@ impl<'a> ScanState<'a> {
             return;
         }
 
-        if global_import_requires_review(&reference.module) {
-            self.non_allowlisted_global_imports
-                .push((symbol, reference.position, details));
+        if global_import_requires_review(&reference.module, &reference.name) {
+            self.push_non_allowlisted_global_import((symbol, reference.position, details));
         }
     }
 
@@ -6106,6 +6140,49 @@ impl<'a> ScanState<'a> {
                 (
                     "max_import_references".to_string(),
                     DetailValue::UInt(MAX_IMPORT_REFERENCES as u64),
+                ),
+                ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
+            ],
+        });
+    }
+
+    fn push_non_allowlisted_global_import(&mut self, finding: PendingGlobalImportFinding) {
+        let finding_bytes = pending_global_import_finding_content_bytes(&finding);
+        let observed_bytes = self
+            .non_allowlisted_global_import_bytes
+            .saturating_add(finding_bytes);
+        if self.non_allowlisted_global_imports.len() < MAX_IMPORT_REFERENCES
+            && observed_bytes <= MAX_NON_ALLOWLISTED_GLOBAL_IMPORT_BYTES
+        {
+            self.non_allowlisted_global_import_bytes = observed_bytes;
+            self.non_allowlisted_global_imports.push(finding);
+            return;
+        }
+        if self.non_allowlisted_global_imports_truncated {
+            return;
+        }
+        if self.status.is_complete() {
+            self.status = ScanStatus::Inconclusive;
+        }
+        self.non_allowlisted_global_imports_truncated = true;
+        self.add_notice(Notice {
+            message: "Non-allowlisted global findings exceeded the scanner reporting limit"
+                .to_string(),
+            severity: "info",
+            location: Some(self.source.clone()),
+            code: Some("non_allowlisted_global_imports_truncated"),
+            details: vec![
+                (
+                    "max_non_allowlisted_global_imports".to_string(),
+                    DetailValue::UInt(MAX_IMPORT_REFERENCES as u64),
+                ),
+                (
+                    "max_non_allowlisted_global_import_bytes".to_string(),
+                    DetailValue::UInt(MAX_NON_ALLOWLISTED_GLOBAL_IMPORT_BYTES as u64),
+                ),
+                (
+                    "observed_non_allowlisted_global_import_bytes".to_string(),
+                    DetailValue::UInt(observed_bytes as u64),
                 ),
                 ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
             ],
@@ -6329,20 +6406,23 @@ impl<'a> ScanState<'a> {
             return;
         }
 
-        let mut invoked_global_keys = HashSet::new();
-        for invocation in &self.callable_invocations {
-            let import_reference = detail_string(invocation, "import_reference");
-            let global_position = detail_usize(invocation, "global_position");
+        let mut reported_dangerous_call_keys = HashSet::new();
+        for finding in &self.findings {
+            if finding.rule_code != Some("DANGEROUS_CALL") {
+                continue;
+            }
+            let import_reference = detail_string(&finding.details, "import_reference");
+            let global_position = detail_usize(&finding.details, "global_position");
             if let (Some(import_reference), Some(global_position)) =
                 (import_reference, global_position)
             {
-                invoked_global_keys.insert((import_reference, global_position));
+                reported_dangerous_call_keys.insert((import_reference, global_position));
             }
         }
 
         for (symbol, position, details) in std::mem::take(&mut self.non_allowlisted_global_imports)
         {
-            if invoked_global_keys.contains(&(symbol.clone(), position)) {
+            if reported_dangerous_call_keys.contains(&(symbol.clone(), position)) {
                 continue;
             }
             self.add_finding(Finding {
@@ -8720,6 +8800,95 @@ mod tests {
                 .filter(|notice| notice.code == Some("import_references_truncated"))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn non_allowlisted_global_findings_are_capped_with_notice() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "non-allowlisted-global-cap.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        for index in 0..=MAX_IMPORT_REFERENCES {
+            scan.push_non_allowlisted_global_import((
+                format!("custom.module.Gadget{index}"),
+                index,
+                vec![("position".to_string(), DetailValue::UInt(index as u64))],
+            ));
+        }
+
+        assert_eq!(
+            scan.non_allowlisted_global_imports.len(),
+            MAX_IMPORT_REFERENCES
+        );
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(
+            scan.notices
+                .iter()
+                .filter(|notice| notice.code == Some("non_allowlisted_global_imports_truncated"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn non_allowlisted_global_findings_are_byte_bounded_with_notice() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "non-allowlisted-global-byte-cap.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        scan.push_non_allowlisted_global_import((
+            "x".repeat(MAX_NON_ALLOWLISTED_GLOBAL_IMPORT_BYTES + 1),
+            0,
+            Vec::new(),
+        ));
+
+        assert!(scan.non_allowlisted_global_imports.is_empty());
+        assert_eq!(scan.non_allowlisted_global_import_bytes, 0);
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        let notice = scan
+            .notices
+            .iter()
+            .find(|notice| notice.code == Some("non_allowlisted_global_imports_truncated"))
+            .expect("byte budget exhaustion should emit a truncation notice");
+        assert_eq!(
+            detail_usize(&notice.details, "max_non_allowlisted_global_import_bytes"),
+            Some(MAX_NON_ALLOWLISTED_GLOBAL_IMPORT_BYTES)
+        );
+        assert_eq!(
+            detail_usize(
+                &notice.details,
+                "observed_non_allowlisted_global_import_bytes"
+            ),
+            Some(MAX_NON_ALLOWLISTED_GLOBAL_IMPORT_BYTES + 1)
         );
     }
 
