@@ -713,6 +713,8 @@ class FlaxMsgpackScanner(BaseScanner):
             # Try to decode as text to check for embedded code
             try:
                 decoded = value.decode("utf-8", errors="ignore")
+                if check_string_jax_transform:
+                    self._check_jax_transform("", decoded, location, result)
                 if len(decoded) > 50:  # Only check substantial text
                     self._check_suspicious_strings(
                         decoded,
@@ -1301,10 +1303,8 @@ class FlaxMsgpackScanner(BaseScanner):
                     depth=depth + 1,
                     state=state,
                 )
-                try:
-                    pair = {key: value}
-                except TypeError:
-                    pair = {str(key): value}
+                normalized_key = str(key) if isinstance(key, list | dict) else key
+                pair = {normalized_key: value}
                 pairs.append(pair)
                 if not value_complete:
                     return pairs, False
@@ -1459,12 +1459,11 @@ class FlaxMsgpackScanner(BaseScanner):
             if len(objects) > 1:
                 result.metadata["msgpack_object_count"] = len(objects)
 
-            max_nodes_per_object = max(1, self.max_structure_nodes // len(objects))
             preanalysis_complete = self._check_preanalysis_structure_budget(
                 obj,
                 result,
                 location="root",
-                max_nodes=max_nodes_per_object,
+                max_nodes=self.max_structure_nodes,
             )
             ml_analysis: dict[str, Any] | None = None
             if preanalysis_complete:
@@ -1476,16 +1475,17 @@ class FlaxMsgpackScanner(BaseScanner):
                 self._validate_flax_structure(obj, result, ml_analysis=ml_analysis)
 
             # Perform deep security analysis
-            traversal_state = self._new_content_traversal_state(max_nodes=max_nodes_per_object)
+            traversal_state = self._new_content_traversal_state(max_nodes=self.max_structure_nodes)
             self._analyze_content(obj, "root", result, traversal_state=traversal_state)
 
+            trailing_max_nodes_per_object = max(1, self.max_structure_nodes // max(1, len(objects) - 1))
             for object_index, stream_obj in enumerate(objects[1:], start=1):
                 stream_location = f"root[msgpack_object_{object_index}]"
                 self._analyze_content(
                     stream_obj,
                     stream_location,
                     result,
-                    traversal_state=self._new_content_traversal_state(max_nodes=max_nodes_per_object),
+                    traversal_state=self._new_content_traversal_state(max_nodes=trailing_max_nodes_per_object),
                 )
 
             result.bytes_scanned = file_size

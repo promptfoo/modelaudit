@@ -354,6 +354,24 @@ def test_flax_msgpack_preserves_trailing_scan_after_first_object_exhausts_node_b
     )
 
 
+def test_flax_msgpack_trailing_objects_do_not_dilute_primary_scan_budget(tmp_path: Path) -> None:
+    """Many trailing objects must not shrink the primary checkpoint's security traversal."""
+    path = tmp_path / "primary_before_many_trailing.msgpack"
+    payload = msgpack.packb({"params": ["safe", "eval('x')"]}, use_bin_type=True)
+    payload += b"".join(msgpack.packb("safe", use_bin_type=True) for _ in range(3))
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_structure_nodes": 4}).scan(str(path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == r"Suspicious code pattern detected: eval\s*\("
+        and issue.location == "root/params[1]"
+        for issue in result.issues
+    )
+
+
 def test_flax_msgpack_benign_trailing_dict_object_is_info_only(tmp_path: Path) -> None:
     """Valid trailing dict objects should be scanned without warning-level stream noise."""
     path = tmp_path / "benign_two_objects.msgpack"
@@ -536,6 +554,23 @@ def test_flax_msgpack_decode_limit_scans_visible_jax_transform_prefix(tmp_path: 
         and check.details["transform"] == "jit_compile"
     ]
     assert len(jax_checks) == 1
+
+
+def test_flax_msgpack_scans_byte_encoded_jax_transform_metadata(tmp_path: Path) -> None:
+    """Byte-valued JAX metadata must retain the dedicated transform check."""
+    path = tmp_path / "byte_jax_transform.msgpack"
+    create_msgpack_file(path, {"params": {"x": b"jit_compile"}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        check.name == "JAX Transform Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["transform"] == "jit_compile"
+        for check in result.checks
+    )
 
 
 def test_flax_msgpack_decode_limit_does_not_join_adjacent_jax_transform_parts(tmp_path: Path) -> None:
