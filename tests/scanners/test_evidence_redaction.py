@@ -660,6 +660,52 @@ def test_redacts_parsed_python_literal_sensitive_keys() -> None:
     assert 'safe: "api_key" = "visible"' in redacted
 
 
+def test_redacts_concatenated_keys_and_literal_credential_pairs() -> None:
+    """Static key concatenation and neutral key/value containers must be covered."""
+    text = (
+        'value = os.getenv("CLIENT_" "SECRET", "CONCATGETSECRET1234567890"); '
+        'fvalue = os.getenv(f"CLIENT_SECRET", "FSTRINGGETSECRET1234567890"); '
+        'os.putenv("AWS_" "SECRET_ACCESS_KEY", build("CONCATSETSECRET1234567890")); '
+        'headers = [("X-API-Key", "PAIRSECRET1234567890"), ("Region", "visible")]; '
+        'credentials = "client_secret", "BAREPAIRSECRET1234567890"; '
+        'f_pair = (f"api_key", "FSTRINGPAIRSECRET1234567890"); '
+        'authorization_pair = ("Authorization", build("AUTHPAIRSECRET1234567890")); '
+        'labels = ["tokenizer", "visible"]; emit("api_key", "visible"); eval("1 + 1")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "CONCATGETSECRET1234567890" not in redacted
+    assert "FSTRINGGETSECRET1234567890" not in redacted
+    assert "CONCATSETSECRET1234567890" not in redacted
+    assert "PAIRSECRET1234567890" not in redacted
+    assert "BAREPAIRSECRET1234567890" not in redacted
+    assert "FSTRINGPAIRSECRET1234567890" not in redacted
+    assert "AUTHPAIRSECRET1234567890" not in redacted
+    assert 'os.getenv("CLIENT_" "SECRET", <redacted>)' in redacted
+    assert 'os.getenv(f"CLIENT_SECRET", <redacted>)' in redacted
+    assert 'os.putenv("AWS_" "SECRET_ACCESS_KEY", <redacted>)' in redacted
+    assert '("X-API-Key", <redacted>)' in redacted
+    assert 'credentials = "client_secret", <redacted>' in redacted
+    assert 'f_pair = (f"api_key", <redacted>)' in redacted
+    assert 'authorization_pair = ("Authorization", <redacted>)' in redacted
+    assert '("Region", "visible")' in redacted
+    assert 'labels = ["tokenizer", "visible"]' in redacted
+    assert 'emit("api_key", "visible")' in redacted
+    assert 'eval("1 + 1")' in redacted
+
+
+def test_unparseable_literal_credential_pairs_fail_closed() -> None:
+    """Framed evidence should still redact literal credential pairs."""
+    text = '\x00 pairs = [("api_key", "FRAMEDPAIRSECRET1234567890"), ("region", "visible")]'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "FRAMEDPAIRSECRET1234567890" not in redacted
+    assert '("api_key", <redacted>)' in redacted
+    assert '("region", "visible")' in redacted
+
+
 def test_redaction_bounds_expression_analysis_to_output_lookahead() -> None:
     """Very large evidence strings should still redact secrets near the visible prefix."""
     secret = "BOUNDEDSECRET1234567890"

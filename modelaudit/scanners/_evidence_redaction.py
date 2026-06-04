@@ -670,24 +670,35 @@ def _token_depths(tokens: list[tokenize.TokenInfo]) -> list[int]:
     return depths
 
 
+def _delimited_item_ranges(
+    tokens: list[tokenize.TokenInfo],
+    depths: list[int],
+    open_index: int,
+) -> list[tuple[int, int]]:
+    closing_token = {"(": ")", "[": "]"}.get(tokens[open_index].string)
+    if closing_token is None:
+        return []
+    item_depth = depths[open_index] + 1
+    item_start = open_index + 1
+    ranges: list[tuple[int, int]] = []
+    for index in range(item_start, len(tokens)):
+        token = tokens[index]
+        if token.type == tokenize.OP and token.string == closing_token and depths[index] == item_depth:
+            if item_start < index:
+                ranges.append((item_start, index))
+            return ranges
+        if token.type == tokenize.OP and token.string == "," and depths[index] == item_depth:
+            ranges.append((item_start, index))
+            item_start = index + 1
+    return []
+
+
 def _call_argument_ranges(
     tokens: list[tokenize.TokenInfo],
     depths: list[int],
     open_paren_index: int,
 ) -> list[tuple[int, int]]:
-    argument_depth = depths[open_paren_index] + 1
-    argument_start = open_paren_index + 1
-    ranges: list[tuple[int, int]] = []
-    for index in range(argument_start, len(tokens)):
-        token = tokens[index]
-        if token.type == tokenize.OP and token.string == ")" and depths[index] == argument_depth:
-            if argument_start < index:
-                ranges.append((argument_start, index))
-            return ranges
-        if token.type == tokenize.OP and token.string == "," and depths[index] == argument_depth:
-            ranges.append((argument_start, index))
-            argument_start = index + 1
-    return []
+    return _delimited_item_ranges(tokens, depths, open_paren_index)
 
 
 def _significant_tokens(tokens: list[tokenize.TokenInfo]) -> list[tokenize.TokenInfo]:
@@ -729,15 +740,28 @@ def _is_sensitive_literal_key(key: object) -> bool:
     return isinstance(key, str) and SENSITIVE_CONTAINER_KEY_RE.fullmatch(key) is not None
 
 
+def _static_string_literal_value(expression: ast.expr) -> str | bytes | None:
+    if isinstance(expression, ast.Constant) and isinstance(expression.value, (str, bytes)):
+        return expression.value
+    if isinstance(expression, ast.JoinedStr):
+        parts: list[str] = []
+        for value in expression.values:
+            if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+                return None
+            parts.append(value.value)
+        return "".join(parts)
+    return None
+
+
 def _literal_sensitive_key(tokens: list[tokenize.TokenInfo]) -> bool:
     significant = _significant_tokens(tokens)
-    if len(significant) != 1 or significant[0].type != tokenize.STRING:
+    if not significant:
         return False
     try:
-        key = ast.literal_eval(significant[0].string)
+        expression = ast.parse("".join(token.string for token in significant), mode="eval").body
     except (SyntaxError, ValueError):
         return False
-    return _is_sensitive_literal_key(key)
+    return _is_sensitive_literal_key(_static_string_literal_value(expression))
 
 
 def _target_contains_sensitive_literal_key(target: str) -> bool:
@@ -745,27 +769,118 @@ def _target_contains_sensitive_literal_key(target: str) -> bool:
         expression = ast.parse(target.strip(), mode="eval").body
     except (SyntaxError, ValueError):
         return False
-    if isinstance(expression, ast.Constant):
-        return _is_sensitive_literal_key(expression.value)
+    if _is_sensitive_literal_key(_static_string_literal_value(expression)):
+        return True
     for node in ast.walk(expression):
-        if (
-            isinstance(node, ast.Subscript)
-            and isinstance(node.slice, ast.Constant)
-            and _is_sensitive_literal_key(node.slice.value)
-        ):
+        if isinstance(node, ast.Subscript) and _is_sensitive_literal_key(_static_string_literal_value(node.slice)):
             return True
     return False
 
 
 def _literal_sensitive_option(tokens: list[tokenize.TokenInfo]) -> bool:
     significant = _significant_tokens(tokens)
-    if len(significant) != 1 or significant[0].type != tokenize.STRING:
+    if not significant:
         return False
     try:
-        option = ast.literal_eval(significant[0].string)
+        expression = ast.parse("".join(token.string for token in significant), mode="eval").body
     except (SyntaxError, ValueError):
         return False
+    option = _static_string_literal_value(expression)
     return isinstance(option, str) and SENSITIVE_OPTION_KEY_RE.fullmatch(option.lstrip("-")) is not None
+
+
+def _ast_position_offset(text: str, offsets: list[int], lineno: int, byte_column: int) -> int:
+    line_start = offsets[lineno - 1]
+    line_end = offsets[lineno] if lineno < len(offsets) else len(text)
+    line = text[line_start:line_end]
+    character_column = len(line.encode("utf-8")[:byte_column].decode("utf-8"))
+    return line_start + character_column
+
+
+def _is_literal_container_open(tokens: list[tokenize.TokenInfo], open_index: int) -> bool:
+    prefix_keywords = {
+        "and",
+        "assert",
+        "case",
+        "elif",
+        "else",
+        "for",
+        "if",
+        "in",
+        "lambda",
+        "not",
+        "or",
+        "return",
+        "while",
+        "yield",
+    }
+    for token in reversed(tokens[:open_index]):
+        if not _significant_tokens([token]):
+            continue
+        if token.type == tokenize.NAME:
+            return token.string in prefix_keywords
+        if token.type in {tokenize.NUMBER, tokenize.STRING}:
+            return False
+        return token.type != tokenize.OP or token.string not in {")", "]", "}"}
+    return True
+
+
+def _redact_sensitive_literal_pairs(text: str) -> str:
+    """Redact values in literal two-item containers headed by a credential key."""
+    offsets = _line_offsets(text)
+    replacements: list[tuple[int, int]] = []
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        tree = None
+
+    if tree is not None:
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.List, ast.Tuple)) or len(node.elts) != 2:
+                continue
+            key_node, value_node = node.elts
+            if not _is_sensitive_literal_key(_static_string_literal_value(key_node)):
+                continue
+            if value_node.end_lineno is None or value_node.end_col_offset is None:
+                continue
+            replacements.append(
+                (
+                    _ast_position_offset(text, offsets, value_node.lineno, value_node.col_offset),
+                    _ast_position_offset(text, offsets, value_node.end_lineno, value_node.end_col_offset),
+                )
+            )
+    else:
+        token_input = text.replace("\x00", " ")
+        try:
+            tokens = list(tokenize.generate_tokens(io.StringIO(token_input).readline))
+        except (IndentationError, tokenize.TokenError):
+            return text
+        depths = _token_depths(tokens)
+        for open_index, token in enumerate(tokens):
+            if token.type != tokenize.OP or token.string not in {"(", "["}:
+                continue
+            if not _is_literal_container_open(tokens, open_index):
+                continue
+            item_ranges = _delimited_item_ranges(tokens, depths, open_index)
+            if len(item_ranges) != 2:
+                continue
+            key_start, key_end = item_ranges[0]
+            value_start, value_end = item_ranges[1]
+            if not _literal_sensitive_key(tokens[key_start:key_end]):
+                continue
+            value_tokens = _significant_tokens(tokens[value_start:value_end])
+            if not value_tokens:
+                continue
+            replacements.append(
+                (
+                    _position_offset(offsets, value_tokens[0].start, len(text)),
+                    _position_offset(offsets, value_tokens[-1].end, len(text)),
+                )
+            )
+
+    for start, end in reversed(_merge_replacement_ranges(replacements)):
+        text = f"{text[:start]}{REDACTED_EVIDENCE_VALUE}{text[end:]}"
+    return text
 
 
 def _comparison_target_start(
@@ -1101,7 +1216,8 @@ def _truncate(text: str, max_chars: int) -> str:
 def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
     redaction_input = text if max_chars is None else text[: max(0, max_chars) + REDACTION_LOOKAHEAD_CHARS]
-    redacted = URL_RE.sub(_redact_url, redaction_input)
+    redacted = _redact_sensitive_literal_pairs(redaction_input)
+    redacted = URL_RE.sub(_redact_url, redacted)
     redacted = _redact_python_expression_assignments(redacted)
     redacted = ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_escaped_quoted_mapping_assignment, redacted)
     redacted = BRACKETED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
