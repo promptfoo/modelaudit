@@ -23,6 +23,31 @@ def _write_chunk_boundary_payload(
     path.write_bytes(b"\x00" * (chunk_size - prefix_len) + pattern[:prefix_len] + pattern[prefix_len:] + suffix)
 
 
+def _valid_elf64_header() -> bytes:
+    header = bytearray(b"\x00" * 64)
+    header[:4] = b"\x7fELF"
+    header[4] = 2
+    header[5] = 1
+    header[6] = 1
+    header[16:18] = (2).to_bytes(2, "little")
+    header[18:20] = (62).to_bytes(2, "little")
+    header[20:24] = (1).to_bytes(4, "little")
+    return bytes(header)
+
+
+def _valid_macho32_little_header() -> bytes:
+    header = bytearray(b"\x00" * 36)
+    header[:4] = b"\xce\xfa\xed\xfe"
+    header[4:8] = (7).to_bytes(4, "little")
+    header[8:12] = (3).to_bytes(4, "little")
+    header[12:16] = (2).to_bytes(4, "little")
+    header[16:20] = (1).to_bytes(4, "little")
+    header[20:24] = (8).to_bytes(4, "little")
+    header[28:32] = (1).to_bytes(4, "little")
+    header[32:36] = (8).to_bytes(4, "little")
+    return bytes(header)
+
+
 def test_pytorch_binary_scanner_can_handle(tmp_path):
     """Test that the scanner correctly identifies pytorch binary files."""
     scanner = PyTorchBinaryScanner()
@@ -490,14 +515,16 @@ def test_pytorch_binary_scanner_detects_executable_signature_after_first_chunk(t
     binary_file = tmp_path / "late_elf.bin"
     chunk_size = 1024 * 1024
     elf_offset = chunk_size + 10
-    binary_file.write_bytes(b"\x00" * elf_offset + b"\x7fELF" + b"\x00" * 128)
+    binary_file.write_bytes(b"\x00" * elf_offset + _valid_elf64_header() + b"\x00" * 128)
 
     result = scanner.scan(str(binary_file))
+    aggregate = scan_model_directory_or_file(str(binary_file), cache_scan_results=False)
 
     assert any(
         issue.rule_code == "S501" and "Linux executable" in issue.message and issue.details.get("offset") == elf_offset
         for issue in result.issues
     )
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_pytorch_binary_scanner_detects_late_executable_signature_across_chunk_boundary(tmp_path: Path) -> None:
@@ -505,7 +532,7 @@ def test_pytorch_binary_scanner_detects_late_executable_signature_across_chunk_b
     binary_file = tmp_path / "late_boundary_elf.bin"
     chunk_size = 1024 * 1024
     elf_offset = 2 * chunk_size - 2
-    binary_file.write_bytes(b"\x00" * elf_offset + b"\x7fELF" + b"\x00" * 128)
+    binary_file.write_bytes(b"\x00" * elf_offset + _valid_elf64_header() + b"\x00" * 128)
 
     result = scanner.scan(str(binary_file))
 
@@ -524,6 +551,83 @@ def test_pytorch_binary_scanner_ignores_invalid_mz_after_first_chunk(tmp_path: P
     result = scanner.scan(str(binary_file))
 
     assert not any(issue.rule_code == "S501" and "Windows executable" in issue.message for issue in result.issues)
+
+
+def test_pytorch_binary_scanner_ignores_late_elf_magic_without_valid_header(tmp_path: Path) -> None:
+    binary_file = tmp_path / "late_invalid_elf.bin"
+    chunk_size = 1024 * 1024
+    binary_file.write_bytes(b"\xff" * (chunk_size + 512) + b"\x7fELF" + b"\xff" * 128)
+
+    result = PyTorchBinaryScanner().scan(str(binary_file))
+
+    assert not any(issue.rule_code == "S501" and "Linux executable" in issue.message for issue in result.issues)
+
+
+def test_pytorch_binary_scanner_detects_late_little_endian_macho32(tmp_path: Path) -> None:
+    binary_file = tmp_path / "late_macho32.bin"
+    chunk_size = 1024 * 1024
+    macho_offset = chunk_size + 512
+    binary_file.write_bytes(b"\xff" * macho_offset + _valid_macho32_little_header() + b"\xff" * 128)
+
+    result = PyTorchBinaryScanner().scan(str(binary_file))
+
+    assert any(
+        issue.rule_code == "S501"
+        and "Mach-O 32-bit" in issue.message
+        and issue.details.get("offset") == macho_offset
+        and issue.details.get("signature") == b"\xce\xfa\xed\xfe".hex()
+        for issue in result.issues
+    )
+
+
+def test_pytorch_binary_scanner_ignores_late_macho_magic_without_valid_header(tmp_path: Path) -> None:
+    binary_file = tmp_path / "late_invalid_macho32.bin"
+    chunk_size = 1024 * 1024
+    binary_file.write_bytes(b"\xff" * (chunk_size + 512) + b"\xce\xfa\xed\xfe" + b"\xff" * 128)
+
+    result = PyTorchBinaryScanner().scan(str(binary_file))
+
+    assert not any(issue.rule_code == "S501" and "Mach-O" in issue.message for issue in result.issues)
+
+
+def test_pytorch_binary_scanner_defers_ml_context_without_executable_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary_file = tmp_path / "no_executable_candidates.bin"
+    binary_file.write_bytes(b"\xff" * (3 * 1024 * 1024))
+
+    def fail_analysis(*_args: object, **_kwargs: object) -> dict[str, Any]:
+        pytest.fail("ML context analysis must be deferred until an executable candidate exists")
+
+    monkeypatch.setattr(
+        "modelaudit.utils.helpers.ml_context.analyze_binary_for_ml_context",
+        fail_analysis,
+    )
+
+    PyTorchBinaryScanner().scan(str(binary_file))
+
+
+def test_pytorch_binary_scanner_caps_executable_findings_across_file(tmp_path: Path) -> None:
+    binary_file = tmp_path / "many_executables.bin"
+    chunk_size = 1024 * 1024
+    payload = bytearray(b"\xff" * (2 * chunk_size + 1024))
+    offsets = [
+        *(128 + index * 128 for index in range(6)),
+        *(chunk_size + 128 + index * 128 for index in range(6)),
+    ]
+    header = _valid_elf64_header()
+    for executable_offset in offsets:
+        payload[executable_offset : executable_offset + len(header)] = header
+    binary_file.write_bytes(payload)
+
+    result = PyTorchBinaryScanner().scan(str(binary_file))
+
+    executable_issues = [
+        issue for issue in result.issues if issue.rule_code == "S501" and "Linux executable" in issue.message
+    ]
+    assert len(executable_issues) == PyTorchBinaryScanner.MAX_EXECUTABLE_SIGNATURE_FINDINGS
+    assert [issue.details["offset"] for issue in executable_issues] == offsets[:10]
 
 
 def test_pytorch_binary_scanner_rejects_out_of_bounds_embedded_pe_without_opening_file(
@@ -642,7 +746,7 @@ def test_pytorch_binary_scanner_longer_signatures_still_detected(tmp_path):
     # Create a binary file with longer signatures in the middle
     binary_file = tmp_path / "with_elf.bin"
     # ELF signature is 4 bytes - should still be detected even in middle
-    data = b"\x00" * 100 + b"\x7fELF" + b"\x00" * 100
+    data = b"\x00" * 100 + _valid_elf64_header() + b"\x00" * 100
     binary_file.write_bytes(data)
 
     result = scanner.scan(str(binary_file))
