@@ -37,8 +37,16 @@ _HF_TEST_REVISION = "a" * 40
 
 
 class _FakeRangeResponse:
-    def __init__(self, payload: bytes) -> None:
+    def __init__(
+        self,
+        payload: bytes,
+        *,
+        headers: dict[str, str] | None = None,
+        status_code: int = 206,
+    ) -> None:
         self.payload = payload
+        self.headers = headers or {}
+        self.status_code = status_code
 
     def __enter__(self) -> "_FakeRangeResponse":
         return self
@@ -891,6 +899,86 @@ class TestModelDownload:
         download_model("https://huggingface.co/test/model")
 
         assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin"]
+
+    @pytest.mark.parametrize(
+        ("response_headers", "response_status_code"),
+        [
+            ({"Content-Range": f"bytes 0-8191/{8 + 1 + (9 * 1024)}"}, 206),
+            ({"Content-Length": str(8 + 1 + (9 * 1024))}, 200),
+        ],
+        ids=["partial-content-range", "full-content-length"],
+    )
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "metadata.payload"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_uses_remote_size_to_reject_truncated_oversized_safetensors(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+        response_headers: dict[str, str],
+        response_status_code: int,
+    ) -> None:
+        """A disclosed short file must not satisfy an attacker-sized SafeTensors header."""
+        payload = struct.pack("<Q", (16 * 1024 * 1024) + 1) + b"{" + b"\x00" * (9 * 1024)
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "pytorch_model.bin").write_bytes(b"weights")
+        mock_snapshot_download.return_value = str(download_path)
+        mock_requests_get.return_value = _FakeRangeResponse(
+            payload,
+            headers=response_headers,
+            status_code=response_status_code,
+        )
+
+        download_model("https://huggingface.co/test/model")
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin"]
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "weights.payload"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_preserves_disclosed_oversized_safetensors(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A plausible oversized header should remain scannable when it fits the remote file."""
+        header_len = (16 * 1024 * 1024) + 1
+        payload = struct.pack("<Q", header_len) + b"{" + b"\x00" * (9 * 1024)
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "pytorch_model.bin").write_bytes(b"weights")
+        safetensors_path = download_path / "weights.payload"
+        with safetensors_path.open("wb") as handle:
+            handle.write(payload)
+            handle.truncate(8 + header_len)
+        mock_snapshot_download.return_value = str(download_path)
+        mock_requests_get.return_value = _FakeRangeResponse(
+            payload,
+            headers={"Content-Range": f"bytes 0-8191/{8 + header_len}"},
+        )
+
+        download_model("https://huggingface.co/test/model")
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == [
+            "pytorch_model.bin",
+            "weights.payload",
+        ]
+        assert detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(

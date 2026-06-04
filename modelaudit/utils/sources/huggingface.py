@@ -5,7 +5,7 @@ import logging
 import os
 import struct
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from glob import escape as escape_glob_pattern
 from io import BytesIO
 from pathlib import Path
@@ -50,6 +50,7 @@ __all__ = [
 @dataclass
 class _HuggingFaceProbeBudget:
     remaining_bytes: int
+    file_sizes: dict[str, int] = field(default_factory=dict)
 
     def reserve(self, repo_id: str, max_bytes: int) -> None:
         """Reserve a bounded remote read or fail closed before issuing it."""
@@ -59,6 +60,59 @@ class _HuggingFaceProbeBudget:
                 f"for {repo_id} ({_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES} bytes)"
             )
         self.remaining_bytes -= max_bytes
+
+    def record_file_size(self, repo_id: str, filename: str, file_size: int) -> None:
+        """Record immutable remote size evidence and reject inconsistent responses."""
+        previous_size = self.file_sizes.get(filename)
+        if previous_size is not None and previous_size != file_size:
+            raise ValueError(
+                f"Hugging Face selective filtering incomplete: inconsistent skipped file size for {repo_id}/{filename}"
+            )
+        self.file_sizes[filename] = file_size
+
+
+def _parse_huggingface_response_file_size(response: Any, bytes_read: int, max_bytes: int) -> int | None:
+    """Return the total remote file size when the bounded response proves it."""
+    headers = getattr(response, "headers", {})
+    content_range = headers.get("Content-Range", "")
+    if "/" in content_range:
+        total = content_range.rsplit("/", 1)[1]
+        if total != "*":
+            try:
+                total_size = int(total)
+            except ValueError:
+                pass
+            else:
+                if total_size >= bytes_read:
+                    return total_size
+
+    if getattr(response, "status_code", None) == 200:
+        content_length = headers.get("Content-Length")
+        if content_length is not None:
+            try:
+                total_size = int(content_length)
+            except ValueError:
+                pass
+            else:
+                if total_size >= bytes_read:
+                    return total_size
+
+    if bytes_read < max_bytes:
+        return bytes_read
+    return None
+
+
+def _huggingface_sample_is_prefix(
+    budget: _HuggingFaceProbeBudget,
+    filename: str,
+    probe: bytes,
+    fallback_limit: int,
+) -> bool:
+    """Return whether a bounded probe is known or conservatively assumed to be partial."""
+    file_size = budget.file_sizes.get(filename)
+    if file_size is not None:
+        return file_size > len(probe)
+    return len(probe) >= fallback_limit
 
 
 def _get_model_extensions() -> set[str]:
@@ -106,7 +160,11 @@ def _read_huggingface_prefix(
                 total += len(chunk)
                 if total >= max_bytes:
                     break
-        return b"".join(chunks)[:max_bytes]
+            prefix = b"".join(chunks)[:max_bytes]
+            file_size = _parse_huggingface_response_file_size(response, len(prefix), max_bytes)
+            if file_size is not None:
+                budget.record_file_size(repo_id, filename, file_size)
+        return prefix
     except Exception as exc:
         raise ValueError(
             "Hugging Face selective filtering incomplete: unable to inspect skipped file "
@@ -144,10 +202,16 @@ def _looks_like_safetensors_prefix(
     if header_len <= 0 or not header_prefix.startswith(b"{"):
         return False
 
+    file_size = budget.file_sizes.get(filename)
+    if file_size is not None and header_len > file_size - 8:
+        return False
+
     from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
 
     if header_len > SAFETENSORS_ROUTING_HEADER_PARSE_BYTES:
-        return len(prefix) >= _HF_CONTENT_SNIFF_BYTES or header_len <= len(prefix) - 8
+        return (file_size is None and len(prefix) >= _HF_CONTENT_SNIFF_BYTES) or header_len <= (
+            file_size if file_size is not None else len(prefix)
+        ) - 8
 
     header_probe = _read_huggingface_prefix(repo_id, filename, revision, budget, 8 + header_len)
     if len(header_probe) != 8 + header_len or header_probe[8:9] != b"{":
@@ -208,7 +272,12 @@ def _detect_huggingface_xml_model_route(
     xml_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, _XML_MODEL_SIGNATURE_READ_BYTES)
     detected_format = _detect_xml_model_format(
         xml_probe,
-        sample_is_prefix=len(xml_probe) >= _XML_MODEL_SIGNATURE_READ_BYTES,
+        sample_is_prefix=_huggingface_sample_is_prefix(
+            budget,
+            filename,
+            xml_probe,
+            _XML_MODEL_SIGNATURE_READ_BYTES,
+        ),
     )
     return None if detected_format == "unknown" else detected_format
 
@@ -466,7 +535,12 @@ def _detect_huggingface_flax_msgpack_route(
     initial_probe_state = _probe_flax_msgpack_checkpoint_stream(
         BytesIO(prefix),
         len(prefix),
-        sample_is_prefix=len(prefix) >= _HF_CONTENT_SNIFF_BYTES,
+        sample_is_prefix=_huggingface_sample_is_prefix(
+            budget,
+            filename,
+            prefix,
+            _HF_CONTENT_SNIFF_BYTES,
+        ),
         incomplete_prefix_is_inconclusive=True,
     )
     if initial_probe_state is True:
@@ -550,7 +624,12 @@ def _detect_huggingface_content_route_format(
             return "pickle"
     executorch_state = _probe_huggingface_executorch_prefix(
         prefix,
-        sample_is_prefix=len(prefix) >= _HF_CONTENT_SNIFF_BYTES,
+        sample_is_prefix=_huggingface_sample_is_prefix(
+            budget,
+            filename,
+            prefix,
+            _HF_CONTENT_SNIFF_BYTES,
+        ),
     )
     if executorch_state is not False:
         return "executorch"
