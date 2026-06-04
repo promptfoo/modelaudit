@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- run secret and network-content checks for ML text sidecars and prefer strict LightGBM content over native Flax suffixes
+- run bounded secret and network-content checks for ML text sidecars and prefer strict LightGBM content over native Flax suffixes
 - bound Flax MessagePack decoding/traversal and Orbax metadata JSON parsing so oversized JAX/Flax checkpoints fail closed
 - avoid false inconclusive Flax overlap results for complete pickle payloads with no trailing data
 - scan ONNX external data references in sparse initializers, tensor-valued attributes, and function defaults

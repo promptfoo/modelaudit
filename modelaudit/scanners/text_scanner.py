@@ -1,6 +1,7 @@
 """Scanner for text-based ML files like README.md and vocab.txt."""
 
 import os
+import re
 from typing import Any, ClassVar
 
 from modelaudit.core_results import mark_operational_scan_error
@@ -9,7 +10,10 @@ from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, Sc
 
 TEXT_CONTENT_SECURITY_SCAN_INCOMPLETE_REASON = "text_content_security_scan_incomplete"
 TEXT_CONTENT_SECURITY_DETECTOR_FAILED_REASON = "text_content_security_detector_failed"
+TEXT_CONTENT_SECURITY_FINDING_LIMIT_REASON = "text_content_security_finding_limit"
 DEFAULT_TEXT_CONTENT_SECURITY_SCAN_BYTES = 100 * 1024 * 1024
+DEFAULT_TEXT_CONTENT_SECURITY_MAX_FINDINGS = 1024
+DETECTOR_FINDING_LIMIT_TYPE = "detector_finding_limit"
 DOCUMENTATION_TEXT_FILENAMES = frozenset(
     {
         "license.md",
@@ -18,10 +22,9 @@ DOCUMENTATION_TEXT_FILENAMES = frozenset(
         "readme.md",
         "readme.markdown",
         "readme.txt",
-        "requirements.txt",
     }
 )
-PASSIVE_DOCUMENTATION_NETWORK_FINDING_TYPES = frozenset(
+PASSIVE_NETWORK_FINDING_TYPES = frozenset(
     {
         "cloud_storage_url",
         "domain",
@@ -31,6 +34,9 @@ PASSIVE_DOCUMENTATION_NETWORK_FINDING_TYPES = frozenset(
         "url_detected",
     }
 )
+PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt"})
+PASSIVE_DATA_TEXT_PREFIXES = ("label", "token", "vocab")
+BARE_NETWORK_URL_TOKEN_PATTERN = re.compile(rb"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 
 
 class TextScanner(BaseScanner):
@@ -82,6 +88,12 @@ class TextScanner(BaseScanner):
             DEFAULT_TEXT_CONTENT_SECURITY_SCAN_BYTES,
         )
 
+    def _get_content_security_max_findings(self) -> int:
+        return self._normalize_positive_int_config(
+            self.config.get("text_content_max_findings", DEFAULT_TEXT_CONTENT_SECURITY_MAX_FINDINGS),
+            DEFAULT_TEXT_CONTENT_SECURITY_MAX_FINDINGS,
+        )
+
     @staticmethod
     def _is_documentation_sidecar(path: str) -> bool:
         filename = os.path.basename(path).lower()
@@ -91,17 +103,70 @@ class TextScanner(BaseScanner):
             ".rst",
         }
 
+    @staticmethod
+    def _is_passive_data_sidecar(path: str) -> bool:
+        filename = os.path.basename(path).lower()
+        return filename in PASSIVE_DATA_TEXT_FILENAMES or filename.startswith(PASSIVE_DATA_TEXT_PREFIXES)
+
+    @staticmethod
+    def _finding_line(payload: bytes, finding: dict[str, Any]) -> bytes | None:
+        position = finding.get("position")
+        if not isinstance(position, int) or position < 0 or position > len(payload):
+            return None
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        line_end = payload.find(b"\n", position)
+        if line_end < 0:
+            line_end = len(payload)
+        return payload[line_start:line_end].strip()
+
     @classmethod
-    def _downgrade_passive_documentation_network_findings(
+    def _is_bare_data_network_token(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        line = cls._finding_line(payload, finding)
+        if not line or b"@" in line:
+            return False
+        if BARE_NETWORK_URL_TOKEN_PATTERN.fullmatch(line):
+            return True
+        line_text = line.decode("utf-8", errors="ignore").casefold()
+        return any(
+            isinstance(value, str) and line_text == value.casefold()
+            for value in (finding.get("domain"), finding.get("ip"))
+        )
+
+    @staticmethod
+    def _split_detector_finding_limit(
+        findings: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        limit_finding = next(
+            (finding for finding in findings if finding.get("type") == DETECTOR_FINDING_LIMIT_TYPE),
+            None,
+        )
+        return (
+            [finding for finding in findings if finding.get("type") != DETECTOR_FINDING_LIMIT_TYPE],
+            limit_finding,
+        )
+
+    @classmethod
+    def _passive_documentation_network_limit(cls, path: str, finding_limit: dict[str, Any]) -> bool:
+        return (
+            cls._is_documentation_sidecar(path)
+            and finding_limit.get("truncated_finding_type") in PASSIVE_NETWORK_FINDING_TYPES
+        )
+
+    @classmethod
+    def _downgrade_passive_network_findings(
         cls,
         path: str,
+        payload: bytes,
         findings: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        if not cls._is_documentation_sidecar(path):
+        documentation_sidecar = cls._is_documentation_sidecar(path)
+        passive_data_sidecar = cls._is_passive_data_sidecar(path)
+        if not documentation_sidecar and not passive_data_sidecar:
             return findings
         return [
             {**finding, "severity": "INFO"}
-            if finding.get("type") in PASSIVE_DOCUMENTATION_NETWORK_FINDING_TYPES
+            if finding.get("type") in PASSIVE_NETWORK_FINDING_TYPES
+            and (documentation_sidecar or (passive_data_sidecar and cls._is_bare_data_network_token(payload, finding)))
             else finding
             for finding in findings
         ]
@@ -165,6 +230,7 @@ class TextScanner(BaseScanner):
             return 0
 
         read_limit = self._get_content_security_scan_bytes()
+        max_findings = self._get_content_security_max_findings()
         try:
             with open(path, "rb") as file_obj:
                 payload = file_obj.read(read_limit + 1)
@@ -187,17 +253,28 @@ class TextScanner(BaseScanner):
         inspected_payload = payload[:read_limit]
         inspected_bytes = len(inspected_payload)
 
-        detector_failed = False
+        detector_incomplete = False
         if check_secrets:
             try:
                 secret_findings = self.collect_embedded_secret_findings(
                     inspected_payload,
                     path,
                     raise_on_error=True,
+                    max_findings=max_findings,
                 )
+                secret_findings, finding_limit = self._split_detector_finding_limit(secret_findings)
                 self.add_embedded_secret_findings(secret_findings, result, context=path)
+                if finding_limit is not None:
+                    detector_incomplete = True
+                    self._mark_content_security_scan_incomplete(
+                        result,
+                        path,
+                        reason=TEXT_CONTENT_SECURITY_FINDING_LIMIT_REASON,
+                        message="Embedded secret findings exceeded the configured reporting limit",
+                        details=finding_limit,
+                    )
             except Exception as error:
-                detector_failed = True
+                detector_incomplete = True
                 self._mark_content_security_scan_incomplete(
                     result,
                     path,
@@ -216,11 +293,36 @@ class TextScanner(BaseScanner):
                     inspected_payload,
                     path,
                     raise_on_error=True,
+                    max_findings=max_findings,
                 )
-                network_findings = self._downgrade_passive_documentation_network_findings(path, network_findings)
+                network_findings, finding_limit = self._split_detector_finding_limit(network_findings)
+                network_findings = self._downgrade_passive_network_findings(path, inspected_payload, network_findings)
                 self.add_network_communication_findings(network_findings, result, context=path)
+                if finding_limit is not None:
+                    if self._passive_documentation_network_limit(path, finding_limit):
+                        result.add_check(
+                            name="Network Communication Reporting Limit",
+                            passed=False,
+                            message="Passive documentation network references exceeded the reporting limit",
+                            severity=IssueSeverity.INFO,
+                            location=path,
+                            details={
+                                **finding_limit,
+                                "analysis_incomplete": False,
+                                "reporting_incomplete": True,
+                            },
+                        )
+                    else:
+                        detector_incomplete = True
+                        self._mark_content_security_scan_incomplete(
+                            result,
+                            path,
+                            reason=TEXT_CONTENT_SECURITY_FINDING_LIMIT_REASON,
+                            message="Network communication findings exceeded the configured reporting limit",
+                            details=finding_limit,
+                        )
             except Exception as error:
-                detector_failed = True
+                detector_incomplete = True
                 self._mark_content_security_scan_incomplete(
                     result,
                     path,
@@ -250,7 +352,7 @@ class TextScanner(BaseScanner):
                     ],
                 },
             )
-        elif not detector_failed:
+        elif not detector_incomplete:
             result.add_check(
                 name="Text Content Security Coverage",
                 passed=True,

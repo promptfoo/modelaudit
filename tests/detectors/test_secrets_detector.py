@@ -395,3 +395,15 @@ class TestDetectSecretsInFile:
         assert len(findings) == 1
         assert findings[0]["type"] == "info"
         assert "too large" in findings[0]["message"]
+
+
+def test_secret_finding_limit_is_explicit() -> None:
+    detector = SecretsDetector({"max_findings": 2})
+
+    findings = detector.scan_model_weights(b"AKIAABCDEFGHIJKLMNOP\n" * 10, "vocab.txt")
+
+    reported = [finding for finding in findings if finding["type"] != "detector_finding_limit"]
+    assert len(reported) == 2
+    assert findings[-1]["type"] == "detector_finding_limit"
+    assert findings[-1]["max_findings"] == 2
+    assert findings[-1]["analysis_incomplete"] is True
