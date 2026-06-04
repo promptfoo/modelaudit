@@ -122,6 +122,10 @@ _KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON = (
     "keras_zip_stringlookup_external_vocabulary_metadata_inconclusive"
 )
 _KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+_-]*)\s*$")
+_KERAS_TORCHMODULE_VERSION_PATTERN = re.compile(
+    r"^\s*[vV]?(?:(\d+)!)?(\d+(?:\.\d+)+)"
+    r"([A-Za-z+_-][A-Za-z0-9.+_-]*|\.[A-Za-z][A-Za-z0-9.+_-]*)?\s*$"
+)
 _KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(
     r"(?i)^[._-]?(?:"
     r"(?:alpha|beta|preview|pre|rc|a|b|c)(?:[._-]?\d+)?"
@@ -1344,25 +1348,32 @@ class KerasZipScanner(BaseScanner):
     @staticmethod
     def _is_vulnerable_keras_3_11_x(version: str) -> bool | None:
         """Return True for vulnerable Keras 3.11 TorchModuleWrapper versions."""
-        version_match = _KERAS_RELEASE_VERSION_PATTERN.match(version)
+        version_match = _KERAS_TORCHMODULE_VERSION_PATTERN.match(version)
         if not version_match:
             return None
 
         try:
-            major = int(version_match.group(1))
-            minor = int(version_match.group(2))
-            patch = int(version_match.group(3) or 0)
-            suffix = (version_match.group(4) or "").strip().lower()
+            epoch = int(version_match.group(1) or 0)
+            release = tuple(int(part) for part in version_match.group(2).split("."))
+            suffix = (version_match.group(3) or "").strip().lower()
 
             suffix_status = KerasZipScanner._classify_keras_release_suffix(suffix)
             if suffix_status is None:
                 return None
-
-            if major != 3 or minor != 11:
+            if epoch != 0:
                 return False
-            if 0 <= patch <= 2:
+
+            if release[:2] != (3, 11):
+                return False
+
+            while len(release) > 3 and release[-1] == 0:
+                release = release[:-1]
+            comparison_size = max(len(release), 3)
+            normalized_release = release + (0,) * (comparison_size - len(release))
+            fixed_release = (3, 11, 3) + (0,) * (comparison_size - 3)
+            if normalized_release < fixed_release:
                 return True
-            if patch != 3:
+            if normalized_release > fixed_release:
                 return False
             return suffix_status
         except ValueError:
