@@ -2324,6 +2324,16 @@ def test_scan_bytes_allows_benign_pathlib_path_constructor() -> None:
     assert report.findings == ()
 
 
+def test_scan_bytes_allows_python313_pathlib_local_pure_path_constructor() -> None:
+    payload = b"\x80\x04cpathlib._local\nPurePosixPath\n" + _binunicode(b"model.bin") + b"\x85R."
+
+    report = scan_bytes(payload, source="python313-pathlib-local-constructor.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
 @pytest.mark.parametrize(
     ("module", "name", "expected_reference"),
     [
