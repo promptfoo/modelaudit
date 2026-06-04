@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - skip scan-result caching for sampled large-file fingerprints
+- classify high-confidence active code patterns in PyTorch binary artifacts as security findings so scan exits reflect them
 - run bounded secret and network-content checks for ML text sidecars and prefer strict LightGBM content over native Flax suffixes
 - bound Flax MessagePack decoding/traversal and Orbax metadata JSON parsing so oversized JAX/Flax checkpoints fail closed
 - avoid false inconclusive Flax overlap results for complete pickle payloads with no trailing data
