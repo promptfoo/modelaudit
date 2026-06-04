@@ -37,6 +37,18 @@ PASSIVE_NETWORK_FINDING_TYPES = frozenset(
 PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt"})
 PASSIVE_DATA_TEXT_PREFIXES = ("label", "token", "vocab")
 BARE_NETWORK_URL_TOKEN_PATTERN = re.compile(rb"[A-Za-z][A-Za-z0-9+.-]*://\S+")
+BARE_NETWORK_IPV4_TOKEN_PATTERN = re.compile(
+    rb"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}"
+    rb"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)"
+)
+BARE_NETWORK_IPV6_TOKEN_PATTERN = re.compile(rb"(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}")
+BARE_NETWORK_DOMAIN_TOKEN_PATTERN = re.compile(rb"(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}")
+BARE_NETWORK_TOKEN_PATTERNS = (
+    BARE_NETWORK_URL_TOKEN_PATTERN,
+    BARE_NETWORK_IPV4_TOKEN_PATTERN,
+    BARE_NETWORK_IPV6_TOKEN_PATTERN,
+    BARE_NETWORK_DOMAIN_TOKEN_PATTERN,
+)
 
 
 class TextScanner(BaseScanner):
@@ -97,11 +109,7 @@ class TextScanner(BaseScanner):
     @staticmethod
     def _is_documentation_sidecar(path: str) -> bool:
         filename = os.path.basename(path).lower()
-        return filename in DOCUMENTATION_TEXT_FILENAMES or os.path.splitext(filename)[1] in {
-            ".markdown",
-            ".md",
-            ".rst",
-        }
+        return filename in DOCUMENTATION_TEXT_FILENAMES
 
     @staticmethod
     def _is_passive_data_sidecar(path: str) -> bool:
@@ -133,6 +141,16 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
+    def _all_network_candidate_lines_are_bare(payload: bytes) -> bool:
+        for line in payload.splitlines():
+            stripped = line.strip()
+            if not stripped or not any(pattern.search(stripped) for pattern in BARE_NETWORK_TOKEN_PATTERNS):
+                continue
+            if b"@" in stripped or not any(pattern.fullmatch(stripped) for pattern in BARE_NETWORK_TOKEN_PATTERNS):
+                return False
+        return True
+
+    @staticmethod
     def _split_detector_finding_limit(
         findings: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
@@ -146,10 +164,24 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
-    def _passive_documentation_network_limit(cls, path: str, finding_limit: dict[str, Any]) -> bool:
+    def _passive_network_reporting_limit(
+        cls,
+        path: str,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+        finding_limit: dict[str, Any],
+    ) -> bool:
+        if finding_limit.get("truncated_finding_type") not in PASSIVE_NETWORK_FINDING_TYPES:
+            return False
+        if cls._is_documentation_sidecar(path):
+            return True
+        truncated_finding = finding_limit.get("truncated_finding")
         return (
-            cls._is_documentation_sidecar(path)
-            and finding_limit.get("truncated_finding_type") in PASSIVE_NETWORK_FINDING_TYPES
+            cls._is_passive_data_sidecar(path)
+            and all(finding.get("severity") == "INFO" for finding in findings)
+            and isinstance(truncated_finding, dict)
+            and cls._is_bare_data_network_token(payload, truncated_finding)
+            and cls._all_network_candidate_lines_are_bare(payload)
         )
 
     @classmethod
@@ -263,7 +295,8 @@ class TextScanner(BaseScanner):
                     max_findings=max_findings,
                 )
                 secret_findings, finding_limit = self._split_detector_finding_limit(secret_findings)
-                self.add_embedded_secret_findings(secret_findings, result, context=path)
+                if secret_findings or not truncated:
+                    self.add_embedded_secret_findings(secret_findings, result, context=path)
                 if finding_limit is not None:
                     detector_incomplete = True
                     self._mark_content_security_scan_incomplete(
@@ -297,13 +330,19 @@ class TextScanner(BaseScanner):
                 )
                 network_findings, finding_limit = self._split_detector_finding_limit(network_findings)
                 network_findings = self._downgrade_passive_network_findings(path, inspected_payload, network_findings)
-                self.add_network_communication_findings(network_findings, result, context=path)
+                if network_findings or not truncated:
+                    self.add_network_communication_findings(network_findings, result, context=path)
                 if finding_limit is not None:
-                    if self._passive_documentation_network_limit(path, finding_limit):
+                    if self._passive_network_reporting_limit(
+                        path,
+                        inspected_payload,
+                        network_findings,
+                        finding_limit,
+                    ):
                         result.add_check(
                             name="Network Communication Reporting Limit",
                             passed=False,
-                            message="Passive documentation network references exceeded the reporting limit",
+                            message="Passive network references exceeded the reporting limit",
                             severity=IssueSeverity.INFO,
                             location=path,
                             details={

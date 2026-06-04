@@ -1397,3 +1397,4 @@ def test_network_finding_limit_preserves_high_signal_before_noisy_urls() -> None
     assert findings[-1]["type"] == "detector_finding_limit"
     assert findings[-1]["max_findings"] == 2
     assert findings[-1]["analysis_incomplete"] is True
+    assert findings[-1]["truncated_finding"]["type"] == "url_detected"

@@ -955,6 +955,7 @@ class NetworkCommDetector:
         )
         self.findings_truncated = False
         self.truncated_finding_type: str | None = None
+        self.truncated_finding: dict[str, Any] | None = None
 
         # Clone class-level patterns to avoid cross-instance leakage
         self.cc_patterns: list[bytes] = self.CC_PATTERNS.copy()
@@ -982,6 +983,7 @@ class NetworkCommDetector:
         self.findings = []
         self.findings_truncated = False
         self.truncated_finding_type = None
+        self.truncated_finding = None
 
         scanners = (
             (
@@ -1022,6 +1024,7 @@ class NetworkCommDetector:
                     "message": "Network communication findings exceeded the configured reporting limit",
                     "max_findings": self.max_findings,
                     "truncated_finding_type": self.truncated_finding_type,
+                    "truncated_finding": self.truncated_finding,
                     "analysis_incomplete": True,
                     "context": context,
                 }
@@ -1034,6 +1037,7 @@ class NetworkCommDetector:
             self.findings_truncated = True
             finding_type = finding.get("type")
             self.truncated_finding_type = finding_type if isinstance(finding_type, str) else None
+            self.truncated_finding = dict(finding)
             return False
         self.findings.append(finding)
         return True

@@ -125,6 +125,21 @@ def test_text_scanner_vocabulary_url_assignments_remain_actionable(tmp_path: Pat
     )
 
 
+def test_text_scanner_markdown_vocabulary_url_assignments_remain_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "tokens.md"
+    text_path.write_text("endpoint=https://evil.example/payload\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+
+
 def test_text_scanner_disabled_detectors_do_not_report_clean_coverage(tmp_path: Path) -> None:
     text_path = tmp_path / "vocab.txt"
     text_path.write_text("token\n", encoding="utf-8")
@@ -177,6 +192,11 @@ def test_text_scanner_fails_closed_when_content_detector_coverage_is_truncated(t
     assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert direct.metadata.get("operational_error_reason") == "text_content_security_scan_incomplete"
     assert "text_content_security_scan_incomplete" in direct.metadata.get("scan_outcome_reasons", [])
+    assert not any(
+        check.name in {"Embedded Secrets Detection", "Network Communication Detection"}
+        and check.status == CheckStatus.PASSED
+        for check in direct.checks
+    )
     assert any(
         check.name == "Text Content Security Coverage"
         and check.status == CheckStatus.FAILED
@@ -247,6 +267,79 @@ def test_text_scanner_passive_documentation_network_limit_is_informational(tmp_p
     )
     assert not any(
         check.name == "Text Content Security Coverage"
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_passive_vocabulary_network_limit_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text("https://docs.example.com/reference\n" * 10, encoding="utf-8")
+
+    result = TextScanner(
+        config={
+            "check_secrets": False,
+            "text_content_max_findings": 2,
+        }
+    ).scan(str(text_path))
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        check.name == "Network Communication Reporting Limit"
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("truncated_finding_type") == "url_detected"
+        and check.details.get("analysis_incomplete") is False
+        and check.details.get("reporting_incomplete") is True
+        for check in result.checks
+    )
+
+
+def test_text_scanner_active_vocabulary_url_limit_fails_closed(tmp_path: Path) -> None:
+    text_path = tmp_path / "tokens.txt"
+    text_path.write_text(
+        ("https://docs.example.com/reference\n" * 2) + "endpoint=https://evil.example/payload\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner(
+        config={
+            "check_secrets": False,
+            "text_content_max_findings": 2,
+        }
+    ).scan(str(text_path))
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("truncated_finding", {}).get("type") == "url_detected"
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_active_vocabulary_url_after_limit_fails_closed(tmp_path: Path) -> None:
+    text_path = tmp_path / "tokens.txt"
+    text_path.write_text(
+        ("https://docs.example.com/reference\n" * 3) + "endpoint=https://evil.example/payload\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner(
+        config={
+            "check_secrets": False,
+            "text_content_max_findings": 2,
+        }
+    ).scan(str(text_path))
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("truncated_finding", {}).get("type") == "url_detected"
         and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
         for check in result.checks
     )
