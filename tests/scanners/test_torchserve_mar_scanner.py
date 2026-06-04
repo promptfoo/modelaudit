@@ -1511,6 +1511,21 @@ def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
             b"    generator = (module.system('id') for module in [__import__('os')])\n"
             b"    return next(generator, None, None)\n"
         ),
+        (b"def handle(data, context):\n    return getattr(object=__import__('os'), name='system')('id')\n"),
+        (b"def handle(data, context):\n    return getattr(__import__('os'), 'system', None, None)('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os')\n"
+            b"    module += []\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    module, *rest, final = [__import__('os')]\n"
+            b"    return module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    for module in [*[]]:\n        __import__('os').system('id')\n"),
+        (b"def handle(data, context):\n    return [__import__('os').system('id') for module in {**{}}]\n"),
     ],
 )
 def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
@@ -1634,6 +1649,19 @@ def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
             b"        raise RuntimeError()\n"
             b"    except RuntimeError:\n"
             b"        return __import__('os').system('id')\n"
+        ),
+        (b"def handle(data, context):\n    for module in [*[__import__('os')]]:\n        module.system('id')\n"),
+        (b"def handle(data, context):\n    for module in {**{__import__('os'): 1}}:\n        module.system('id')\n"),
+        (b"def handle(data, context):\n    module, *rest = [__import__('os'), 1, 2]\n    return module.system('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    first, *rest, module = [1, 2, __import__('os')]\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    (module := __import__('os')) if context else (module := __import__('math'))\n"
+            b"    return module.system('id')\n"
         ),
     ],
 )

@@ -1511,9 +1511,25 @@ class TorchServeMarScanner(BaseScanner):
     @staticmethod
     def _static_iterable_truthiness(node: ast.AST) -> bool | None:
         if isinstance(node, ast.List | ast.Tuple | ast.Set):
-            return bool(node.elts)
+            has_unknown_unpack = False
+            for element in node.elts:
+                if not isinstance(element, ast.Starred):
+                    return True
+                unpacked_truthiness = TorchServeMarScanner._static_iterable_truthiness(element.value)
+                if unpacked_truthiness is True:
+                    return True
+                has_unknown_unpack |= unpacked_truthiness is None
+            return None if has_unknown_unpack else False
         if isinstance(node, ast.Dict):
-            return bool(node.keys)
+            has_unknown_unpack = False
+            for key, value in zip(node.keys, node.values, strict=True):
+                if key is not None:
+                    return True
+                unpacked_truthiness = TorchServeMarScanner._static_iterable_truthiness(value)
+                if unpacked_truthiness is True:
+                    return True
+                has_unknown_unpack |= unpacked_truthiness is None
+            return None if has_unknown_unpack else False
         if isinstance(node, ast.Constant) and isinstance(node.value, str | bytes):
             return bool(node.value)
         return None
@@ -1842,16 +1858,11 @@ class TorchServeMarScanner(BaseScanner):
             )
         if not resolved_helper_names & _DYNAMIC_GETATTR_HELPERS:
             return frozenset()
-
-        target_node: ast.AST | None = node.args[0] if node.args else None
-        attr_node: ast.AST | None = node.args[1] if len(node.args) >= 2 else None
-        for keyword in node.keywords:
-            if keyword.arg == "object" and target_node is None:
-                target_node = keyword.value
-            elif keyword.arg == "name" and attr_node is None:
-                attr_node = keyword.value
-        if target_node is None or attr_node is None:
+        if len(node.args) not in {2, 3} or node.keywords:
             return frozenset()
+
+        target_node = node.args[0]
+        attr_node = node.args[1]
 
         module_names = self._resolve_dynamic_import_roots(
             target_node,
@@ -2330,11 +2341,42 @@ class TorchServeMarScanner(BaseScanner):
                     self._invalidate_target(target.value)
                     return
                 if isinstance(target, ast.Tuple | ast.List):
-                    if isinstance(value, ast.Tuple | ast.List) and len(target.elts) == len(value.elts):
-                        for child_target, child_value in zip(target.elts, value.elts, strict=True):
-                            self._record_target_assignment(child_target, child_value)
-                    else:
+                    if not isinstance(value, ast.Tuple | ast.List):
                         self._invalidate_target(target)
+                        return
+
+                    values = self._literal_iterable_elements(value)
+                    if values is None or any(child_value is None for child_value in values):
+                        self._invalidate_target(target)
+                        return
+                    resolved_values = [child_value for child_value in values if child_value is not None]
+                    starred_indexes = [
+                        index for index, child_target in enumerate(target.elts) if isinstance(child_target, ast.Starred)
+                    ]
+                    if not starred_indexes and len(target.elts) == len(resolved_values):
+                        for child_target, child_value in zip(target.elts, resolved_values, strict=True):
+                            self._record_target_assignment(child_target, child_value)
+                        return
+                    if len(starred_indexes) != 1 or len(resolved_values) < len(target.elts) - 1:
+                        self._invalidate_target(target)
+                        return
+
+                    starred_index = starred_indexes[0]
+                    trailing_count = len(target.elts) - starred_index - 1
+                    for child_target, child_value in zip(
+                        target.elts[:starred_index],
+                        resolved_values[:starred_index],
+                        strict=True,
+                    ):
+                        self._record_target_assignment(child_target, child_value)
+                    self._invalidate_target(target.elts[starred_index])
+                    if trailing_count:
+                        for child_target, child_value in zip(
+                            target.elts[-trailing_count:],
+                            resolved_values[-trailing_count:],
+                            strict=True,
+                        ):
+                            self._record_target_assignment(child_target, child_value)
 
             def _invalidate_target(self, target: ast.AST) -> None:
                 if isinstance(target, ast.Name):
@@ -2372,12 +2414,32 @@ class TorchServeMarScanner(BaseScanner):
                 if name in self.shadowed_names:
                     self.shadowed_name_stack[destination_index].add(name)
 
-            @staticmethod
-            def _literal_iterable_elements(iterable: ast.AST) -> list[ast.expr] | None:
+            @classmethod
+            def _literal_iterable_elements(cls, iterable: ast.AST) -> list[ast.expr | None] | None:
                 if isinstance(iterable, ast.List | ast.Tuple | ast.Set):
-                    return list(iterable.elts)
+                    elements: list[ast.expr | None] = []
+                    for element in iterable.elts:
+                        if not isinstance(element, ast.Starred):
+                            elements.append(element)
+                            continue
+                        unpacked_elements = cls._literal_iterable_elements(element.value)
+                        if unpacked_elements is None:
+                            elements.append(None)
+                        else:
+                            elements.extend(unpacked_elements)
+                    return elements
                 if isinstance(iterable, ast.Dict):
-                    return [key for key in iterable.keys if key is not None]
+                    elements = []
+                    for key, value in zip(iterable.keys, iterable.values, strict=True):
+                        if key is not None:
+                            elements.append(key)
+                            continue
+                        unpacked_elements = cls._literal_iterable_elements(value)
+                        if unpacked_elements is None:
+                            elements.append(None)
+                        else:
+                            elements.extend(unpacked_elements)
+                    return elements
                 return None
 
             def _record_target_from_iterable(self, target: ast.AST, iterable: ast.AST) -> bool:
@@ -2390,7 +2452,10 @@ class TorchServeMarScanner(BaseScanner):
                 possible_states = []
                 for element in elements:
                     self._restore_state(initial_state)
-                    self._record_target_assignment(target, element)
+                    if element is None:
+                        self._invalidate_target(target)
+                    else:
+                        self._record_target_assignment(target, element)
                     possible_states.append(self._snapshot_state())
 
                 merged_state = possible_states[0]
@@ -2588,6 +2653,11 @@ class TorchServeMarScanner(BaseScanner):
                     self.visit(node.value)
                     self._record_target_assignment(node.target, node.value)
 
+            def visit_AugAssign(self, node: ast.AugAssign) -> None:
+                self.visit(node.target)
+                self.visit(node.value)
+                self._invalidate_target(node.target)
+
             def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
                 self.visit(node.value)
                 self._record_target_assignment(node.target, node.value)
@@ -2616,8 +2686,12 @@ class TorchServeMarScanner(BaseScanner):
                 if truthiness is False:
                     self.visit(node.orelse)
                     return
+                initial_state = self._snapshot_state()
                 self.visit(node.body)
+                body_state = self._snapshot_state()
+                self._restore_state(initial_state)
                 self.visit(node.orelse)
+                self._restore_state(self._merge_states(body_state, self._snapshot_state()))
 
             def _statement_definitely_terminates(self, statement: ast.stmt) -> bool:
                 if isinstance(statement, ast.Return | ast.Raise | ast.Break | ast.Continue):
@@ -2804,10 +2878,13 @@ class TorchServeMarScanner(BaseScanner):
                 if (
                     isinstance(node.iter, ast.List | ast.Tuple | ast.Dict)
                     and literal_elements
+                    and all(element is not None for element in literal_elements)
                     and not self._loop_body_rebinds_target(node.target, node.body)
                     and not self._loop_body_may_break(node.body)
                 ):
-                    self._record_target_assignment(node.target, literal_elements[-1])
+                    last_element = literal_elements[-1]
+                    if last_element is not None:
+                        self._record_target_assignment(node.target, last_element)
                 self._visit_statement_block(node.orelse)
 
             def visit_For(self, node: ast.For) -> None:
