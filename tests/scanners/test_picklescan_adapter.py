@@ -630,6 +630,41 @@ def test_pickle_report_to_scan_result_fails_closed_for_legacy_complete_truncated
     assert should_cache_scan_result(result.to_dict()) is False
 
 
+def test_pickle_report_to_scan_result_keeps_legacy_truncated_findings_successful() -> None:
+    report = PickleReport(
+        source="legacy-import-reference-cap-finding.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(
+            Finding(
+                message="Dangerous global reference found: posix.system",
+                severity=Severity.WARNING,
+                location="legacy-import-reference-cap-finding.pkl (pos 0)",
+                rule_code="DANGEROUS_GLOBAL",
+                details={"module": "posix", "name": "system"},
+            ),
+        ),
+        notices=(
+            Notice(
+                message="Import reference metadata exceeded the scanner reporting limit",
+                severity=Severity.INFO,
+                location="legacy-import-reference-cap-finding.pkl",
+                code="import_references_truncated",
+                details={"analysis_incomplete": True, "max_import_references": 10_000},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["import_references_truncated"]
+    assert result.metadata["analysis_incomplete"] is True
+    assert should_cache_scan_result(result.to_dict()) is False
+    assert any(issue.rule_code == "S101" for issue in result.issues)
+
+
 def test_pickle_report_to_scan_result_fails_closed_for_legacy_complete_truncated_callable_invocations() -> None:
     report = PickleReport(
         source="legacy-callable-invocation-cap.pkl",
