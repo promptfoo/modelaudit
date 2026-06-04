@@ -813,6 +813,32 @@ def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -
     _assert_inconclusive_exit2(aggregate, "jinja2_template_size_limit_exceeded")
 
 
+def test_gguf_scanner_propagates_jinja_sandbox_budget_inconclusive(tmp_path: Path) -> None:
+    pytest.importorskip("jinja2.sandbox")
+    path = create_mock_gguf(
+        tmp_path / "sandbox-budget.gguf",
+        metadata={"tokenizer.chat_template": "{{ 'A' * 1000000 }}"},
+    )
+    config = {
+        "sandbox_render_max_output_chars": 16,
+        "sandbox_render_timeout_seconds": 2,
+    }
+
+    direct = GgufScanner(config=config).scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), config={**config, "cache_scan_results": False})
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jinja2_sandbox_render_budget_exceeded" in direct.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Template Sandbox Safety Probe"
+        and check.status == CheckStatus.FAILED
+        and check.details["template_location"].endswith(":tokenizer.chat_template")
+        for check in direct.checks
+    )
+    _assert_inconclusive_exit2(aggregate, "jinja2_sandbox_render_budget_exceeded")
+
+
 def test_gguf_scanner_preserves_duplicate_reason_with_oversized_chat_template(tmp_path: Path) -> None:
     path = tmp_path / "duplicate-large-template.gguf"
     _write_gguf_string_metadata_entries(

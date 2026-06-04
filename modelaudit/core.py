@@ -1912,6 +1912,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         detect_pytorch_binary_supplemental_format(path) if ext == ".bin" and header_format == "pytorch_binary" else None
     )
     skipped_preferred_scanner_id: str | None = None
+    unavailable_preferred_scanner_id: str | None = None
     trusted_flax_overlap_scanner_id: str | None = None
     if scanner_id == "flax_msgpack" and not scanner_selection.allows(scanner_id):
         skipped_preferred_scanner_id = scanner_id
@@ -1930,6 +1931,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         or (scanner_id == "protobuf_model_candidate" and allows_protobuf_model_candidate_analysis(scanner_selection))
     ):
         preferred_scanner = _registry.load_scanner_by_id(scanner_id)
+        if preferred_scanner is None and magic_format != "unknown" and scanner_id != PROTOBUF_MODEL_CANDIDATE_FORMAT:
+            unavailable_preferred_scanner_id = scanner_id
     elif scanner_id:
         skipped_preferred_scanner_id = scanner_id
 
@@ -2007,14 +2010,26 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             and scanner_selection.allows(pytorch_binary_supplemental_scanner_id)
         ):
             scanner_class = _registry.load_scanner_by_id(pytorch_binary_supplemental_scanner_id)
-        if scanner_class is None:
+        if scanner_class is None and unavailable_preferred_scanner_id is not None:
+            fallback_scanner_id = HEADER_FORMAT_TO_SCANNER_ID.get(magic_format)
+            if (
+                fallback_scanner_id
+                and fallback_scanner_id != unavailable_preferred_scanner_id
+                and scanner_selection.allows(fallback_scanner_id)
+            ):
+                scanner_class = _registry.load_scanner_by_id(fallback_scanner_id)
+        elif scanner_class is None:
             scanner_class = _registry.get_scanner_for_path(
                 path,
                 scanner_selection=scanner_selection if scanner_selection.active else None,
             )
         if scanner_class:
             logger.debug(f"Using {scanner_class.name} scanner for {path}")
-            scanner = scanner_class(config=config)
+            scanner_config = config
+            if unavailable_preferred_scanner_id is not None:
+                scanner_config = dict(config)
+                scanner_config["cache_enabled"] = False
+            scanner = scanner_class(config=scanner_config)
 
             try:
                 # Record scanner usage telemetry
@@ -2032,7 +2047,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 elif use_large_handler:
                     logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                     result = scan_large_file(path, scanner, progress_callback, timeout)
-                elif is_xgboost_pickle_spoof:
+                elif unavailable_preferred_scanner_id is not None or is_xgboost_pickle_spoof:
                     result = scanner.scan(path)
                 else:
                     result = scanner.scan_with_cache(path)
@@ -2053,6 +2068,17 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 )
                 _mark_operational_scan_error(result, "scan_timeout")
                 result.finish(success=False)
+            if unavailable_preferred_scanner_id is not None:
+                result.merge(
+                    _make_unavailable_recognized_format_result(
+                        path,
+                        unavailable_preferred_scanner_id,
+                        unavailable_preferred_scanner_id,
+                    )
+                )
+                # Refresh late metadata so incomplete coverage restores whitelist-downgraded findings.
+                _mark_inconclusive_scan_outcome(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
+                _mark_operational_scan_error(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
             if skipped_preferred_scanner_id and result is not None:
                 add_scanner_selection_skip_check(
                     result,
@@ -2063,7 +2089,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     kind=SCANNER_SELECTION_PREFERRED_KIND,
                 )
         else:
-            if scanner_selection.active:
+            if unavailable_preferred_scanner_id is None and scanner_selection.active:
                 candidate_scanner_id = skipped_preferred_scanner_id
                 if candidate_scanner_id is None:
                     candidate_scanner_class = _registry.get_scanner_for_path(path)
@@ -2078,7 +2104,13 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                         result.bytes_scanned = file_size
                     return result
 
-            if format_probe_error is not None and magic_format == "unknown":
+            if unavailable_preferred_scanner_id is not None:
+                sr = _make_unavailable_recognized_format_result(
+                    path,
+                    unavailable_preferred_scanner_id,
+                    unavailable_preferred_scanner_id,
+                )
+            elif format_probe_error is not None and magic_format == "unknown":
                 sr = _make_incomplete_format_detection_read_result(path, format_probe_error)
             elif magic_format == XML_MODEL_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_xml_model_result(path)

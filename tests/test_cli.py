@@ -13,7 +13,7 @@ from click.testing import CliRunner
 
 from modelaudit import __version__
 from modelaudit.cache.trusted_config_store import TrustedConfigStore
-from modelaudit.cli import _summarize_progress_tree, cli, expand_paths, format_text_output
+from modelaudit.cli import _resolve_scan_runtime_config, _summarize_progress_tree, cli, expand_paths, format_text_output
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
@@ -778,6 +778,43 @@ def test_scan_max_file_size(tmp_path):
     assert "500" in result.output or "File too large" in result.output  # Should mention the max file size or error
 
 
+@pytest.mark.parametrize(
+    "cloud_url",
+    [
+        "s3://bucket/model.bin",
+        "r2://bucket/model.bin",
+        "gcs://bucket/model.bin",
+        "https://bucket.s3.amazonaws.com/model.bin",
+        "https://storage.googleapis.com/bucket/model.bin",
+        "https://account.r2.cloudflarestorage.com/bucket/model.bin",
+    ],
+)
+def test_cloud_auto_size_limit_applies_to_download_budget(tmp_path: Path, cloud_url: str) -> None:
+    runtime = _resolve_scan_runtime_config(
+        [cloud_url],
+        format="json",
+        output=None,
+        timeout=None,
+        max_size=None,
+        cache_dir=str(tmp_path / "cache"),
+        progress=False,
+        no_cache=False,
+        no_whitelist=False,
+        stream=False,
+        strict=False,
+        verbose=False,
+        quiet=True,
+        scanners=(),
+        exclude_scanners=(),
+        suppress=(),
+        severity=(),
+        scan_start_time=0.0,
+    )
+
+    assert runtime.max_file_size == 50 * 1024 * 1024 * 1024
+    assert runtime.max_download_bytes == runtime.max_file_size
+
+
 def test_format_text_output():
     """Test the format_text_output function."""
     # Create a sample results dictionary
@@ -984,6 +1021,33 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
 
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_url_passes_max_size_to_download(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Repository HuggingFace downloads should receive the parsed acquisition budget."""
+    mock_is_hf_url.return_value = True
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "model.bin").write_bytes(b"weights")
+    mock_download.return_value = downloaded_dir
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--quiet", "--no-cache", "--max-size", "2KB", "hf://test/model"])
+
+    assert result.exit_code == 0
+    assert mock_download.call_args.kwargs["max_size"] == 2048
+    mock_rmtree.assert_called()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.download_model")
 def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
     """Test handling of download failure for HuggingFace URL."""
     # Setup mocks
@@ -997,6 +1061,67 @@ def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
     assert result.exit_code == 2
     assert "Error processing model" in result.output or "Error downloading model" in result.output
     assert "Download failed" in result.output
+
+
+@patch("modelaudit.utils.sources.huggingface.get_model_size", return_value=None)
+@patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={"", ".bin"})
+@patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=(["notes.unknown"], None))
+@patch("huggingface_hub.snapshot_download")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_no_scannable_listing_fails_closed(
+    mock_scan: MagicMock,
+    mock_snapshot_download: MagicMock,
+    _mock_list_repo_files: MagicMock,
+    _mock_get_extensions: MagicMock,
+    _mock_get_model_size: MagicMock,
+) -> None:
+    """Unsupported-only repositories should exit 2 without downloading or scanning."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", "--no-cache", "--format", "json", "https://huggingface.co/test/model"],
+    )
+
+    parsed = parse_click_json_output(result.output)
+    assert result.exit_code == 2
+    assert parsed["has_errors"] is True
+    assert parsed["files_scanned"] == 0
+    assert "repository listing contains no recognized ModelAudit-scannable files" in result.output
+    mock_snapshot_download.assert_not_called()
+    mock_scan.assert_not_called()
+
+
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_file_passes_max_size_and_cleans_temp_dir(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download_file: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Direct HuggingFace file downloads should receive the parsed acquisition budget."""
+    downloaded_file = tmp_path / "model.bin"
+    downloaded_file.write_bytes(b"weights")
+    mock_download_file.return_value = downloaded_file
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "--quiet",
+            "--no-cache",
+            "--max-size",
+            "2KB",
+            "https://huggingface.co/test/model/resolve/main/model.bin",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert mock_download_file.call_args.kwargs["max_size"] == 2048
+    mock_rmtree.assert_called()
 
 
 @patch("modelaudit.cli.download_file_from_hf")
@@ -1017,6 +1142,49 @@ def test_scan_huggingface_file_download_failure_redacts_url(mock_download_file):
     assert "hf_secret" not in output
     assert "token=" not in output
     assert "https://huggingface.co/test/model/resolve/main/file.bin" in output
+
+
+@pytest.mark.parametrize(("max_size", "expected_bytes"), [("2KB", 2048), ("0", 0)])
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_file_passes_max_size_to_download(
+    mock_scan: MagicMock,
+    mock_download_file: MagicMock,
+    tmp_path: Path,
+    max_size: str,
+    expected_bytes: int,
+) -> None:
+    """Direct HuggingFace file downloads should receive the CLI download budget before fetch."""
+    downloaded_file = tmp_path / "model.bin"
+    downloaded_file.write_bytes(b"model")
+    mock_download_file.return_value = downloaded_file
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=4,
+        issues=[],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["test_scanner"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "--no-cache",
+            "--format",
+            "json",
+            "--max-size",
+            max_size,
+            "https://huggingface.co/test/model/resolve/main/model.bin",
+        ],
+    )
+
+    assert result.exit_code == 0
+    mock_download_file.assert_called_once()
+    assert mock_download_file.call_args.kwargs["max_size"] == expected_bytes
+    assert mock_scan.call_args.args[0] == str(downloaded_file)
 
 
 @patch("modelaudit.cli.is_huggingface_url")
@@ -1316,6 +1484,30 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_passes_max_size_to_download(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Streaming HuggingFace downloads should receive the parsed acquisition budget."""
+    mock_is_hf_url.return_value = True
+
+    test_file = tmp_path / "model.bin"
+    test_file.write_bytes(b"weights")
+    mock_download_streaming.return_value = iter([(test_file, True)])
+    mock_scan_streaming.return_value = create_mock_scan_result(bytes_scanned=7, files_scanned=1, has_errors=False)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream", "--quiet", "--max-size", "2KB", "hf://test/model"])
+
+    assert result.exit_code == 0
+    assert mock_download_streaming.call_args.kwargs["max_size"] == 2048
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
 @patch("shutil.rmtree")
 def test_scan_huggingface_strict_streaming_uses_ephemeral_cache_dir(
     mock_rmtree: MagicMock,
@@ -1547,6 +1739,29 @@ def test_scan_huggingface_streaming_download_failure(mock_download_streaming, mo
     # Should fail with error code 2
     assert result.exit_code == 2
     assert "Error" in result.output
+
+
+@patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={"", ".bin"})
+@patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=(["notes.unknown"], None))
+@patch("huggingface_hub.hf_hub_download")
+def test_scan_huggingface_streaming_no_scannable_listing_fails_closed(
+    mock_hf_hub_download: MagicMock,
+    _mock_list_repo_files: MagicMock,
+    _mock_get_extensions: MagicMock,
+) -> None:
+    """Lazy streaming listing failures should exit 2 instead of reporting a clean scan."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", "--stream", "--no-cache", "--format", "json", "hf://test/model"],
+    )
+
+    parsed = parse_click_json_output(result.output)
+    assert result.exit_code == 2
+    assert parsed["has_errors"] is True
+    assert parsed["files_scanned"] == 0
+    assert "repository listing contains no recognized ModelAudit-scannable files" in result.output
+    mock_hf_hub_download.assert_not_called()
 
 
 @patch("modelaudit.cli.is_huggingface_url")
@@ -1832,6 +2047,21 @@ def test_scan_jfrog_url_download_failure_redacts_sensitive_url(mock_scan_jfrog, 
 
     assert result.exit_code == 2
     assert "https://<credentials-redacted>@company.jfrog.io/artifactory/repo/model.bin" in result.output
+    assert "user:leaky-pass" not in result.output
+    assert "leaky-token" not in result.output
+    assert "?token=" not in result.output
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_scan_rejected_jfrog_url_redacts_sensitive_url(scheme: str) -> None:
+    """Rejected local or plaintext JFrog URLs must be redacted in generic path errors."""
+    raw_url = f"{scheme}://user:leaky-pass@localhost/artifactory/repo/model.bin?token=leaky-token"
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", raw_url])
+
+    assert result.exit_code == 2
+    assert f"{scheme}://<credentials-redacted>@localhost/artifactory/repo/model.bin" in result.output
     assert "user:leaky-pass" not in result.output
     assert "leaky-token" not in result.output
     assert "?token=" not in result.output
