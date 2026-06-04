@@ -771,10 +771,10 @@ def test_scan_detects_aliased_getattr_wrapped_handler_execution_primitive(
             b"from runpy import run_path as run\ndef handle(data, context):\n    return run('payload.py')\n",
             "runpy.run_path",
         ),
-        (b"import ctypes\ndef handle(data, context):\n    return ctypes.CDLL('/tmp/libpayload.so')\n", "ctypes.CDLL"),
+        (b"import ctypes\ndef handle(data, context):\n    return ctypes.CDLL(LIBRARY_PATH)\n", "ctypes.CDLL"),
         (
             b"from ctypes import cdll as loader\ndef handle(data, context):\n"
-            b"    return loader.LoadLibrary('/tmp/libpayload.so')\n",
+            b"    return loader.LoadLibrary(LIBRARY_PATH)\n",
             "ctypes.cdll.LoadLibrary",
         ),
         (
@@ -789,6 +789,7 @@ def test_scan_detects_aliased_getattr_wrapped_handler_execution_primitive(
     ],
 )
 def test_scan_detects_handler_execution_primitive(tmp_path: Path, handler_source: bytes, dangerous_name: str) -> None:
+    handler_source = handler_source.replace(b"LIBRARY_PATH", repr(str(tmp_path / "libpayload.so")).encode())
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
         tmp_path,

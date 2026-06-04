@@ -878,8 +878,8 @@ class TestTarScanner:
             (b"import subprocess\nsubprocess.run(['echo'], check=False)\n", "S103", "subprocess.run"),
             (b"import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
             (b"import runpy\nrunpy.run_path('payload.py')\n", "S108", "runpy.run_path"),
-            (b"import ctypes\nctypes.CDLL('/tmp/libpayload.so')\n", "S110", "ctypes.CDLL"),
-            (b"from ctypes import CDLL as load\nload('/tmp/libpayload.so')\n", "S110", "ctypes.CDLL"),
+            (b"import ctypes\nctypes.CDLL(LIBRARY_PATH)\n", "S110", "ctypes.CDLL"),
+            (b"from ctypes import CDLL as load\nload(LIBRARY_PATH)\n", "S110", "ctypes.CDLL"),
             (b"import webbrowser\nwebbrowser.open('https://example.invalid')\n", "S109", "webbrowser.open"),
             (
                 b"from webbrowser import open_new_tab as launch\nlaunch('https://example.invalid')\n",
@@ -895,6 +895,7 @@ class TestTarScanner:
     ) -> None:
         """Each risk category must surface its own rule code (os.system as S101, etc.)."""
         archive_path = tmp_path / "model_bundle.tar"
+        source = source.replace(b"LIBRARY_PATH", repr(str(tmp_path / "libpayload.so")).encode())
 
         with tarfile.open(archive_path, "w") as archive:
             info = tarfile.TarInfo("handler.py")

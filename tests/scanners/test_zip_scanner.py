@@ -582,8 +582,8 @@ def test_scan_zip_flags_runpy_execution_python_member(tmp_path: Path, source: st
 @pytest.mark.parametrize(
     ("source", "rule_code", "dangerous_name"),
     [
-        ("import ctypes\nctypes.CDLL('/tmp/libpayload.so')\n", "S110", "ctypes.CDLL"),
-        ("from ctypes import CDLL as load_library\nload_library('/tmp/libpayload.so')\n", "S110", "ctypes.CDLL"),
+        ("import ctypes\nctypes.CDLL(LIBRARY_PATH)\n", "S110", "ctypes.CDLL"),
+        ("from ctypes import CDLL as load_library\nload_library(LIBRARY_PATH)\n", "S110", "ctypes.CDLL"),
         ("import webbrowser\nwebbrowser.open('https://example.invalid')\n", "S109", "webbrowser.open"),
         (
             "from webbrowser import open_new_tab as launch\nlaunch('https://example.invalid')\n",
@@ -596,6 +596,7 @@ def test_scan_zip_flags_direct_imported_python_member_primitives(
     tmp_path: Path, source: str, rule_code: str, dangerous_name: str
 ) -> None:
     archive_path = tmp_path / "model_bundle.zip"
+    source = source.replace("LIBRARY_PATH", repr(str(tmp_path / "libpayload.so")))
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
 
