@@ -11,7 +11,7 @@ from modelaudit.detectors.network_comm import _redact_url_path_tokens
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 
-URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|wss?|ftp|tcp|udp|s3|gs|file)://[^\s\"'<>]+")
+URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s\"'<>]+")
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "access_key",
@@ -23,9 +23,11 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
         "apikey",
         "auth_token",
         "auth-token",
+        "awsaccesskeyid",
         "client_secret",
         "client-secret",
         "credential",
+        "googleaccessid",
         "password",
         "passwd",
         "pwd",
@@ -49,8 +51,9 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
 )
 SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[_.-])*"
-    r"(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|credential|"
-    r"password|passwd|private[_-]?key|pwd|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
+    r"(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|aws[_-]?access[_-]?key[_-]?id|"
+    r"client[_-]?secret|credential|google[_-]?access[_-]?id|password|passwd|private[_-]?key|pwd|"
+    r"refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
     r"(?:[_.-][a-z0-9]+)*"
 )
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(

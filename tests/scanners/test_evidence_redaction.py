@@ -91,6 +91,61 @@ def test_redacts_token_only_userinfo_across_network_url_schemes() -> None:
     assert redacted.count("<credentials-redacted>@") == 3
 
 
+def test_redacts_credentials_across_extended_network_url_schemes() -> None:
+    """All URL schemes recognized by network scanners should sanitize evidence."""
+    path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+    text = (
+        f"ftps://user:FTPSPASSWORD@files.example/{path_token}/model.so "
+        f"ssh://SSHTOKEN@host.example/{path_token}/model.so "
+        f"telnet://TELNETTOKEN@host.example/{path_token}/model.so "
+        f"az://AZTOKEN@account.example/{path_token}/model.so "
+        f"wasbs://container@account.blob.core.windows.net/{path_token}/model.so "
+        f"abfss://container@account.dfs.core.windows.net/{path_token}/model.so "
+        f"gcs://model-bucket/{path_token}/model.so "
+        f"r2://model-bucket/{path_token}/model.so "
+        f"custom+transport://host.example/{path_token}/model.so"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "FTPSPASSWORD" not in redacted
+    assert "SSHTOKEN" not in redacted
+    assert "TELNETTOKEN" not in redacted
+    assert "AZTOKEN" not in redacted
+    assert path_token not in redacted
+    assert redacted.count("<credentials-redacted>@") == 6
+
+
+def test_redacts_legacy_signed_url_access_identifiers() -> None:
+    """Legacy AWS and Google signed URL identifiers should not persist."""
+    text = (
+        "https://storage.example/model.so?"
+        "AWSAccessKeyId=AKIAEXAMPLEACCESSKEY&Signature=AWSSECRET&"
+        "GoogleAccessId=service-account%40example.iam.gserviceaccount.com"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "AKIAEXAMPLEACCESSKEY" not in redacted
+    assert "AWSSECRET" not in redacted
+    assert "service-account" not in redacted
+    assert "AWSAccessKeyId=<redacted>" in redacted
+    assert "Signature=<redacted>" in redacted
+    assert "GoogleAccessId=<redacted>" in redacted
+
+
+def test_redacts_legacy_access_identifier_assignments() -> None:
+    """Legacy access identifiers should also be sanitized outside URLs."""
+    text = "AWSAccessKeyId=AKIAEXAMPLEACCESSKEY google_access_id=service-account@example.iam.gserviceaccount.com"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "AKIAEXAMPLEACCESSKEY" not in redacted
+    assert "service-account" not in redacted
+    assert "AWSAccessKeyId=<redacted>" in redacted
+    assert "google_access_id=<redacted>" in redacted
+
+
 def test_existing_token_assignment_redaction_still_applies() -> None:
     """Canonical token assignments should keep their existing redaction behavior."""
     redacted = redact_evidence_string("token=CANONICALTOKEN123", max_chars=500)
