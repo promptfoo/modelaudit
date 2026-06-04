@@ -1967,6 +1967,101 @@ class TestJITScriptDetector:
     @pytest.mark.parametrize(
         "data",
         [
+            b"\x00\xffclass H:\n    sink = eval\nH().sink('1+1')\n",
+            b"\x00\xffclass H:\n    sink = eval\nholder = H()\nholder.sink('1+1')\n",
+            (b"\x00\xffdef payload(holder):\n    holder.__dict__['sink'] = eval\n    return holder.sink('1+1')\n"),
+            (b"\x00\xffdef payload(holder):\n    vars(holder)['sink'] = eval\n    return holder.sink('1+1')\n"),
+            (b"\x00\xffdef framing():\n    return None\nglobals()['sink'] = eval\nsink('1+1')\n"),
+            (b"\x00\xffsink = None\ndef configure():\n    global sink\n    sink = eval\nconfigure()\nsink('1+1')\n"),
+            (
+                b"\x00\xffdef outer():\n"
+                b"    sink = None\n"
+                b"    def configure():\n"
+                b"        nonlocal sink\n"
+                b"        sink = eval\n"
+                b"    configure()\n"
+                b"    return sink('1+1')\n"
+                b"outer()\n"
+            ),
+            (
+                b"\x00\xffdef payload():\n"
+                b"    match {'run': eval}:\n"
+                b"        case {'run': sink}:\n"
+                b"            return sink('1+1')\n"
+            ),
+            (
+                b"\x00\xffdef payload():\n"
+                b"    callbacks = {'run': eval}\n"
+                b"    match callbacks:\n"
+                b"        case {'run': sink}:\n"
+                b"            return sink('1+1')\n"
+            ),
+            (b"\x00\xffeval = lambda value: value\nfrom builtins import *\neval('1+1')\n"),
+        ],
+    )
+    def test_scan_model_detects_dangerous_builtins_across_extended_alias_transfers(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"\x00\xffclass H:\n    sink = eval\n    sink = len\nH().sink([])\n",
+            (b"\x00\xffclass H:\n    sink = eval\nholder = H()\nholder.sink = len\nholder.sink([])\n"),
+            (
+                b"\x00\xffdef benign(holder):\n"
+                b"    holder.__dict__['sink'] = eval\n"
+                b"    holder.__dict__['sink'] = len\n"
+                b"    return holder.sink([])\n"
+            ),
+            (
+                b"\x00\xffdef benign(holder):\n"
+                b"    vars = lambda value: value.storage\n"
+                b"    vars(holder)['sink'] = eval\n"
+                b"    return holder.sink([])\n"
+            ),
+            (
+                b"\x00\xffdef framing():\n"
+                b"    return None\n"
+                b"globals = lambda: {}\n"
+                b"globals()['sink'] = eval\n"
+                b"sink = len\n"
+                b"sink([])\n"
+            ),
+            (b"\x00\xffsink = len\ndef configure():\n    global sink\n    sink = eval\nsink([])\n"),
+            (b"\x00\xffsink = eval\ndef configure():\n    global sink\n    sink = len\nconfigure()\nsink([])\n"),
+            (
+                b"\x00\xffdef benign():\n"
+                b"    sink = eval\n"
+                b"    def configure():\n"
+                b"        nonlocal sink\n"
+                b"        sink = len\n"
+                b"    configure()\n"
+                b"    return sink([])\n"
+            ),
+            (
+                b"\x00\xffdef benign():\n"
+                b"    match {'safe': len, 'unused': eval}:\n"
+                b"        case {'safe': sink}:\n"
+                b"            return sink([])\n"
+            ),
+            b"\x00\xfffrom helpers import *\ndef benign(eval):\n    return eval('1+1')\n",
+        ],
+    )
+    def test_scan_model_avoids_false_positives_across_extended_alias_transfers(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+        assert not any(finding.severity == "CRITICAL" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
             (
                 b"\x00\xffdef benign(value):\n"
                 b"    callbacks = [eval]\n"
