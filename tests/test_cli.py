@@ -1885,13 +1885,13 @@ def test_scan_cloud_url_download_failure_sbom_redacts_signed_url(
 
 def test_display_path_redacts_signed_stream_url() -> None:
     """stream:// display values should keep routing context without signed query material."""
-    url = "stream://https://bucket.s3.amazonaws.com/model.bin?X-Amz-Signature=secret&token=hidden"
+    url = "stream://https://models.example/model.bin?X-Amz-Signature=secret&token=hidden"
 
     display_path = _display_path(url)
     display_error = _display_error(f"Forbidden while opening {url}", url)
 
-    assert display_path == "stream://https://bucket.s3.amazonaws.com/model.bin"
-    assert "stream://https://bucket.s3.amazonaws.com/model.bin" in display_error
+    assert display_path == "stream://https://models.example/model.bin"
+    assert "stream://https://models.example/model.bin" in display_error
     assert "X-Amz-Signature" not in display_error
     assert "hidden" not in display_error
 

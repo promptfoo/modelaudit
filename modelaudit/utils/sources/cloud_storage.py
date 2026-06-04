@@ -27,7 +27,7 @@ _CLOUD_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 _SENSITIVE_QUERY_PARAM_RE = re.compile(
     (
-        r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|"
+        r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|accesskey|token|"
         r"secret|api-key|api_key|apikey|sig|sas)[^=\s&]*=)[^\s&#]+"
     ),
     re.IGNORECASE,

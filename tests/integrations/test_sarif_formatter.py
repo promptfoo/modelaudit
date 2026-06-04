@@ -75,9 +75,17 @@ class TestFormatSarifOutput:
                 message=f"Test security issue from {raw_path}",
                 severity=IssueSeverity.WARNING,
                 location=raw_path,
-                details={"source": raw_path, raw_path: {"nested": [raw_path]}},
+                details={
+                    "source": raw_path,
+                    raw_path.encode(): {"nested": [raw_path]},
+                    "source_set": {raw_path},
+                    "source_bytes": raw_path.encode(),
+                    "nested_model": Issue(message=raw_path, details={"source_bytes": raw_path.encode()}),
+                },
                 why=f"Why contains {raw_path}",
                 recommendation=f"Retry with {raw_path}",
+                type=raw_path,
+                rule_code=raw_path,
                 timestamp=time.time(),
             )
         ]

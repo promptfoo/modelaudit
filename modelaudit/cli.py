@@ -92,7 +92,7 @@ logger = logging.getLogger("modelaudit")
 def _display_path(path: str) -> str:
     """Return a path safe for user-facing CLI output."""
     if path.startswith("stream://"):
-        return f"stream://{_display_path(path[9:])}"
+        return f"stream://{redact_url_for_display(path[9:])}"
     if is_cloud_url(path):
         return redact_url_for_display(path)
     if is_jfrog_url_like(path):
@@ -102,8 +102,6 @@ def _display_path(path: str) -> str:
 
 def _display_scan_path(path: str) -> str:
     """Return a persisted scan path safe for generated reports."""
-    if path.startswith("stream://"):
-        return f"stream://{_display_path(path[9:])}"
     return _display_path(path)
 
 

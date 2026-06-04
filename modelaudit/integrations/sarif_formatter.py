@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from pydantic import BaseModel
+
 from modelaudit import __version__
 from modelaudit.core_results import (
     determine_exit_code,
@@ -261,7 +263,7 @@ def _create_results(
         if rule_code:
             properties["rule_code"] = rule_code
         if hasattr(issue, "type") and issue.type:
-            properties["issue_type"] = issue.type
+            properties["issue_type"] = _redact_text_for_sarif(issue.type)
         if properties:
             result["properties"] = properties
 
@@ -326,7 +328,8 @@ def _get_rule_id(issue: Any) -> str:
         return rule_code
 
     if hasattr(issue, "type") and issue.type:
-        return f"MA{str(issue.type).replace(' ', '-').upper()}"
+        redacted_type = _redact_text_for_sarif(str(issue.type))
+        return f"MA{redacted_type.replace(' ', '-').upper()}"
 
     # Generate from message if no type
     redacted_message = _redact_text_for_sarif(issue.message)
@@ -340,14 +343,14 @@ def _get_issue_rule_code(issue: Any) -> str | None:
     """Return the stable ModelAudit rule code for an issue when available."""
     rule_code = getattr(issue, "rule_code", None)
     if isinstance(rule_code, str) and rule_code:
-        return rule_code
+        return _redact_text_for_sarif(rule_code)
     return None
 
 
 def _get_rule_name(issue: Any) -> str:
     """Get a human-readable rule name from an issue."""
     if hasattr(issue, "type") and issue.type:
-        return str(issue.type).replace("_", " ").title()
+        return _redact_text_for_sarif(str(issue.type)).replace("_", " ").title()
 
     # Extract from message
     redacted_message = _redact_text_for_sarif(issue.message)
@@ -460,18 +463,31 @@ def _redact_text_for_sarif(text: str) -> str:
 
 
 def _redact_value_for_sarif(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return _redact_value_for_sarif(value.model_dump(mode="python"))
     if isinstance(value, str):
         return _redact_text_for_sarif(value)
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return _redact_text_for_sarif(bytes(value).decode("utf-8"))
+        except UnicodeDecodeError:
+            return "<binary data>"
     if isinstance(value, dict):
-        return {
-            _redact_text_for_sarif(key) if isinstance(key, str) else key: _redact_value_for_sarif(item)
-            for key, item in value.items()
-        }
+        return {_redact_mapping_key_for_sarif(key): _redact_value_for_sarif(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_redact_value_for_sarif(item) for item in value]
     if isinstance(value, tuple):
         return tuple(_redact_value_for_sarif(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return sorted((_redact_value_for_sarif(item) for item in value), key=repr)
     return value
+
+
+def _redact_mapping_key_for_sarif(value: Any) -> str | int | float | bool | None:
+    redacted = _redact_value_for_sarif(value)
+    if isinstance(redacted, (str, int, float, bool)) or redacted is None:
+        return redacted
+    return str(redacted)
 
 
 def _get_mime_type(file_type: str) -> str:

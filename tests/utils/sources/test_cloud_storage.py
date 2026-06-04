@@ -128,6 +128,19 @@ class TestCloudURLRedaction:
         assert "secret" not in redacted
         assert "abc123" not in redacted
 
+    def test_redact_cloud_error_for_display_redacts_legacy_aws_access_key_id(self) -> None:
+        message = (
+            "provider failed: https://bucket.s3.amazonaws.com/model.bin?"
+            "AWSAccessKeyId=AKIASECRET&Expires=123456&Signature=deadbeef"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "AWSAccessKeyId=<redacted>" in redacted
+        assert "Signature=<redacted>" in redacted
+        assert "AKIASECRET" not in redacted
+        assert "deadbeef" not in redacted
+
 
 @patch("modelaudit.utils.helpers.retry.time.sleep")
 @patch("fsspec.filesystem")

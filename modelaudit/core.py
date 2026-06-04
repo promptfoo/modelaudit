@@ -10,6 +10,8 @@ from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel
+
 try:
     from modelaudit_picklescan import shared_source_sensitive_caches
 except ImportError:
@@ -180,8 +182,22 @@ def _redacted_scan_error_for_reporting(error: object, path: str) -> str:
 
 
 def _redact_stream_value_for_reporting(value: Any, stream_url: str, report_url: str) -> Any:
+    if isinstance(value, BaseModel):
+        return _redact_stream_value_for_reporting(value.model_dump(mode="python"), stream_url, report_url)
     if isinstance(value, str):
         return _redact_cloud_error_for_display(value.replace(stream_url, report_url))
+    if isinstance(value, bytes):
+        try:
+            decoded = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value
+        return _redact_stream_value_for_reporting(decoded, stream_url, report_url).encode("utf-8")
+    if isinstance(value, bytearray):
+        try:
+            decoded = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value
+        return bytearray(_redact_stream_value_for_reporting(decoded, stream_url, report_url), "utf-8")
     if isinstance(value, dict):
         return {
             _redact_stream_value_for_reporting(key, stream_url, report_url): _redact_stream_value_for_reporting(
@@ -193,6 +209,10 @@ def _redact_stream_value_for_reporting(value: Any, stream_url: str, report_url: 
         return [_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value]
     if isinstance(value, tuple):
         return tuple(_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value)
+    if isinstance(value, set):
+        return {_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value}
+    if isinstance(value, frozenset):
+        return frozenset(_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value)
     return value
 
 

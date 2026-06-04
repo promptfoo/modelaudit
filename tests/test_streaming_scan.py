@@ -16,7 +16,7 @@ import pytest
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners import safetensors_scanner
-from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
@@ -167,9 +167,22 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
     )
     safe_url = "https://bucket.s3.amazonaws.com/model.pkl"
     related_url = "https://collector.example/upload?visible=yes&token=secondary-secret"
+    legacy_signed_url = (
+        "https://bucket.s3.amazonaws.com/related.pkl?"
+        "AWSAccessKeyId=AKIARELATED&Expires=123456&Signature=related-signature"
+    )
     scan_result = ScanResult(scanner_name="streaming")
     scan_result.bytes_scanned = 128
-    scan_result.metadata.update({"source_url": stream_url, "related_url": related_url})
+    scan_result.metadata.update(
+        {
+            "source_url": stream_url,
+            "related_url": related_url,
+            "source_set": {stream_url, related_url},
+            "source_bytes": stream_url.encode(),
+            "legacy_signed_url": legacy_signed_url,
+            "nested_model": Issue(message=stream_url, details={"source_bytes": stream_url.encode()}),
+        }
+    )
     scan_result.add_issue(
         f"Dangerous payload from {stream_url}",
         severity=IssueSeverity.CRITICAL,
@@ -179,6 +192,10 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
             "nested": [stream_url],
             stream_url: {"source": stream_url},
             "related_url": related_url,
+            "source_set": {stream_url, related_url},
+            "source_bytes": stream_url.encode(),
+            "legacy_signed_url": legacy_signed_url,
+            "nested_model": Issue(message=stream_url, details={"source_bytes": stream_url.encode()}),
         },
     )
     scan_result.add_check(
@@ -208,7 +225,15 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
     json_text = result.model_dump_json(exclude_none=True)
     sarif_text = format_sarif_output(result, [f"stream://{stream_url}"])
 
-    for leaked in ("AKIASECRET", "deadbeef", "secret-token", "secondary-secret", "X-Amz-Signature"):
+    for leaked in (
+        "AKIASECRET",
+        "deadbeef",
+        "secret-token",
+        "secondary-secret",
+        "AKIARELATED",
+        "related-signature",
+        "X-Amz-Signature",
+    ):
         assert leaked not in json_text
         assert leaked not in sarif_text
     assert stream_url not in json_text
