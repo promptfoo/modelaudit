@@ -2130,6 +2130,85 @@ class TestJITScriptDetector:
         assert not any(finding.type == "dangerous_builtin" for finding in findings)
 
     @pytest.mark.parametrize(
+        "body",
+        [
+            "callbacks = [eval]\n    (sink,) = callbacks\n    return sink(value)",
+            "callbacks = [[eval]]\n    ((sink,),) = callbacks\n    return sink(value)",
+            "callbacks = [eval]\n    for sink in callbacks:\n        return sink(value)",
+            "callbacks = [(eval, 1)]\n    for sink, _ in callbacks:\n        return sink(value)",
+        ],
+    )
+    def test_scan_model_resolves_dangerous_builtins_from_tracked_sequence_state(self, body: str) -> None:
+        detector = JITScriptDetector()
+        data = f"\x00\xffdef payload(value):\n    {body}\n".encode()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "callbacks = [eval]\n    callbacks[0] = len\n    (sink,) = callbacks\n    return sink(value)",
+            "callbacks = [eval]\n    callbacks[0] = len\n    for sink in callbacks:\n        return sink(value)",
+            "callbacks = {0: eval}\n    (sink,) = callbacks\n    return sink(value)",
+            "callbacks = {'run': eval}\n    for sink in callbacks:\n        return sink(value)",
+        ],
+    )
+    def test_scan_model_avoids_stale_tracked_sequence_state(self, body: str) -> None:
+        detector = JITScriptDetector()
+        data = f"\x00\xffdef benign(value):\n    {body}\n".encode()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "name = 'eval'\n    return getattr(__builtins__, name)(value)",
+            "name = 'ev' + 'al'\n    return __builtins__[name](value)",
+            "name = 'eval'\n    return __builtins__.get(name)(value)",
+            "name = 'eval'\n    return object.__getattribute__(__builtins__, name)(value)",
+            "callbacks = {'run': eval}\n    name = 'run'\n    return callbacks[name](value)",
+            "def inner(name='eval'):\n        return getattr(__builtins__, name)(value)\n    return inner()",
+        ],
+    )
+    def test_scan_model_resolves_constant_string_aliases_for_builtin_lookup(self, body: str) -> None:
+        detector = JITScriptDetector()
+        data = f"\x00\xffdef payload(value):\n    {body}\n".encode()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "name = 'eval'\n    name = 'len'\n    return getattr(__builtins__, name)(value)",
+            (
+                "name = 'eval'\n    if False:\n        name = 'len'\n"
+                "    name = 'len'\n    return __builtins__[name](value)"
+            ),
+            (
+                "callbacks = {'run': eval}\n    name = 'run'\n    name = 'safe'\n"
+                "    callbacks['safe'] = len\n    return callbacks[name](value)"
+            ),
+            (
+                "def inner(name='eval'):\n        name = 'len'\n"
+                "        return getattr(__builtins__, name)(value)\n    return inner()"
+            ),
+        ],
+    )
+    def test_scan_model_avoids_stale_constant_string_aliases(self, body: str) -> None:
+        detector = JITScriptDetector()
+        data = f"\x00\xffdef benign(value):\n    {body}\n".encode()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+
+    @pytest.mark.parametrize(
         "data",
         [
             (
@@ -2710,6 +2789,40 @@ class TestJITScriptDetector:
         assert any(
             f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
         )
+
+    @pytest.mark.parametrize(
+        ("assignment", "call"),
+        [
+            (b"callbacks = [eval]\n", b"callbacks[0]('1+1')"),
+            (b"callbacks = {'run': eval}\n", b"callbacks['run']('1+1')"),
+        ],
+    )
+    def test_scan_model_detects_tail_builtin_call_from_prefix_container_context(
+        self,
+        assignment: bytes,
+        call: bytes,
+    ) -> None:
+        detector = JITScriptDetector()
+        filler_line = b"# filler\n"
+        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        source = b"\x00\xff" + assignment + filler + b"def payload():\n    return " + call + b"\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    def test_scan_model_ignores_overwritten_prefix_container_context(self) -> None:
+        detector = JITScriptDetector()
+        filler_line = b"# filler\n"
+        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+        source = (
+            b"\x00\xffcallbacks = [eval]\n"
+            b"callbacks[0] = len\n" + filler + b"def benign():\n    return callbacks[0]('1+1')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert not any(finding.type == "dangerous_builtin" for finding in findings)
 
     def test_scan_model_detects_tail_call_from_prefix_module_alias_context(self) -> None:
         detector = JITScriptDetector()
