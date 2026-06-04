@@ -6,7 +6,7 @@ from typing import ClassVar
 from urllib.parse import unquote, urlparse
 
 from ..core_results import mark_operational_scan_error
-from ..detectors.network_comm import _redact_url_for_finding
+from ..detectors.network_comm import redact_url_for_finding
 from ..scanner_results import mark_inconclusive_scan_result, scan_result_has_inconclusive_outcome
 from .base import BaseScanner, CheckStatus, Issue, IssueSeverity, ScanResult
 
@@ -30,7 +30,7 @@ _REDACTED_SECRET_PREVIEW = "<redacted>"
 
 
 def _redact_url_for_display(url: str) -> str:
-    return _redact_url_for_finding(url)
+    return redact_url_for_finding(url)
 
 
 class MetadataScanner(BaseScanner):
