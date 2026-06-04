@@ -2,6 +2,7 @@ import importlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
+import modelaudit.cli as cli_module
 from modelaudit import __version__
 from modelaudit.cache.trusted_config_store import TrustedConfigStore
 from modelaudit.cli import _resolve_scan_runtime_config, _summarize_progress_tree, cli, expand_paths, format_text_output
@@ -711,6 +713,16 @@ def test_cli_report_writers_reject_symlink_outputs(tmp_path: Path, requires_syml
             tmp_path / "victim_report.txt",
         ),
         (
+            ["scan", str(test_file), "--format", "text", "--output", str(model_tree / "report.txt"), "--no-cache"],
+            model_tree / "report.txt",
+            tmp_path / "victim_report_text.txt",
+        ),
+        (
+            ["scan", str(test_file), "--format", "sarif", "--output", str(model_tree / "report.sarif"), "--no-cache"],
+            model_tree / "report.sarif",
+            tmp_path / "victim_report_sarif.txt",
+        ),
+        (
             ["scan", str(test_file), "--sbom", str(model_tree / "sbom.json"), "--no-cache"],
             model_tree / "sbom.json",
             tmp_path / "victim_sbom.txt",
@@ -734,7 +746,7 @@ def test_cli_report_writers_reject_symlink_outputs(tmp_path: Path, requires_syml
 
         result = runner.invoke(cli, args)
 
-        assert result.exit_code != 0
+        assert result.exit_code == 2
         assert "Refusing to write output through symlink" in result.output
         assert victim_path.read_text() == sentinel
         assert symlink_path.is_symlink()
@@ -753,9 +765,306 @@ def test_cli_report_writers_reject_symlinked_parent_directory(tmp_path: Path, re
         ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
     )
 
-    assert result.exit_code != 0
+    assert result.exit_code == 2
     assert "Refusing to write output through symlink" in result.output
     assert not (outside_dir / "scanners.json").exists()
+
+
+def test_cli_report_writers_allow_protected_parent_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """A parent link in a non-replaceable directory may resolve to a stable target."""
+    protected_dir = tmp_path / "protected"
+    protected_dir.mkdir()
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    linked_dir = protected_dir / "linked"
+    linked_dir.symlink_to(target_dir, target_is_directory=True)
+    monkeypatch.setattr(cli_module, "_directory_can_replace_entries", lambda _path: False)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(linked_dir / "scanners.json")],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads((target_dir / "scanners.json").read_text())["scanners"]
+
+
+def test_link_detection_ignores_nonredirecting_windows_reparse_points() -> None:
+    """Cloud placeholders must not be treated like symlinks or junctions."""
+    path = MagicMock(spec=Path)
+    path_stat = MagicMock()
+    path_stat.st_mode = stat.S_IFREG
+    path_stat.st_file_attributes = stat.FILE_ATTRIBUTE_REPARSE_POINT
+    path_stat.st_reparse_tag = 0x9000001A
+    path.lstat.return_value = path_stat
+
+    assert not cli_module._is_link_like_path(path)
+
+    path_stat.st_reparse_tag = 0xA000000C
+    assert cli_module._is_link_like_path(path)
+
+
+def test_cli_report_writers_reject_symlink_before_dotdot(tmp_path: Path, requires_symlinks: None) -> None:
+    """Lexical normalization must not change symlink-aware kernel path resolution."""
+    safe_dir = tmp_path / "safe"
+    safe_dir.mkdir()
+    outside_parent = tmp_path / "outside"
+    outside_child = outside_parent / "child"
+    outside_child.mkdir(parents=True)
+    (safe_dir / "redirected").symlink_to(outside_child, target_is_directory=True)
+    output_path = safe_dir / "redirected" / ".." / "victim.json"
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 2
+    assert "Refusing to write output through symlink" in result.output
+    assert not (safe_dir / "victim.json").exists()
+    assert not (outside_parent / "victim.json").exists()
+
+
+def test_cli_report_writers_allow_dotdot_without_links(tmp_path: Path) -> None:
+    """Ordinary parent traversal should retain normal filesystem semantics."""
+    output_dir = tmp_path / "output"
+    child_dir = output_dir / "child"
+    child_dir.mkdir(parents=True)
+    output_path = child_dir / ".." / "scanners.json"
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads((output_dir / "scanners.json").read_text())["scanners"]
+
+
+def test_cli_report_writers_reject_hard_link_output(tmp_path: Path) -> None:
+    """A report path must not truncate another name for the same inode."""
+    victim_path = tmp_path / "victim.txt"
+    output_path = tmp_path / "scanners.json"
+    victim_path.write_text("sentinel")
+    output_path.hardlink_to(victim_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 2
+    assert "Refusing to overwrite hard-linked output" in result.output
+    assert victim_path.read_text() == "sentinel"
+
+
+def test_cli_report_writers_recheck_parent_links_on_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Fallback platforms must validate a parent swapped after the initial check."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    original_output_dir = tmp_path / "original-output"
+    redirected_dir = tmp_path / "redirected"
+    redirected_dir.mkdir()
+    victim_path = redirected_dir / "scanners.json"
+    victim_path.write_text("sentinel")
+    output_path = output_dir / victim_path.name
+    original_open = cli_module._open_output_parent_directory
+
+    def swap_parent_then_open(path: str) -> tuple[Path, int | None]:
+        opened_path = original_open(path)
+        output_dir.rename(original_output_dir)
+        output_dir.symlink_to(redirected_dir, target_is_directory=True)
+        return opened_path
+
+    monkeypatch.setattr(cli_module.os, "O_NOFOLLOW", 0, raising=False)
+    monkeypatch.setattr(cli_module.os, "O_DIRECTORY", 0, raising=False)
+    monkeypatch.setattr(cli_module, "_open_output_parent_directory", swap_parent_then_open)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 2
+    assert "Refusing to write output through symlink" in result.output
+    assert victim_path.read_text() == "sentinel"
+    assert not list(redirected_dir.glob(".scanners.json.*.tmp"))
+
+
+def test_cli_report_writers_do_not_truncate_late_hard_link_on_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A destination replaced after validation must not expose its inode to writes."""
+    output_path = tmp_path / "scanners.json"
+    victim_path = tmp_path / "victim.txt"
+    victim_path.write_text("sentinel")
+    original_validate = cli_module._validated_absolute_output_path
+    validation_count = 0
+
+    def install_hard_link_after_validation(path: str) -> Path:
+        nonlocal validation_count
+        validated_path = original_validate(path)
+        validation_count += 1
+        if validation_count == 2:
+            output_path.hardlink_to(victim_path)
+        return validated_path
+
+    monkeypatch.setattr(cli_module.os, "O_NOFOLLOW", 0, raising=False)
+    monkeypatch.setattr(cli_module.os, "O_DIRECTORY", 0, raising=False)
+    monkeypatch.setattr(cli_module, "_validated_absolute_output_path", install_hard_link_after_validation)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 2
+    assert victim_path.read_text() == "sentinel"
+    assert output_path.samefile(victim_path)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory modes are required")
+def test_cli_report_writers_support_write_only_parent_on_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fallback opening must not require read access when write and search suffice."""
+    output_dir = tmp_path / "write-only"
+    output_dir.mkdir()
+    output_path = output_dir / "scanners.json"
+    monkeypatch.setattr(cli_module.os, "O_PATH", 0, raising=False)
+    monkeypatch.setattr(cli_module.os, "O_SEARCH", 0, raising=False)
+    output_dir.chmod(0o333)
+    try:
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+        )
+    finally:
+        output_dir.chmod(0o700)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(output_path.read_text())["scanners"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX component limits are required")
+def test_cli_report_writers_support_long_valid_output_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The private temporary name must not make a valid destination too long."""
+    output_path = tmp_path / f"{'r' * 240}.json"
+    monkeypatch.setattr(cli_module.os, "O_PATH", 0, raising=False)
+    monkeypatch.setattr(cli_module.os, "O_SEARCH", 0, raising=False)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(output_path.read_text())["scanners"]
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or getattr(os, "geteuid", lambda: 0)() == 0,
+    reason="An unprivileged POSIX user is required",
+)
+def test_cli_report_writers_preserve_read_only_output(tmp_path: Path) -> None:
+    """Atomic replacement must not bypass an existing file's write permission."""
+    output_path = tmp_path / "scanners.json"
+    output_path.write_text("sentinel")
+    output_path.chmod(0o444)
+    try:
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+        )
+    finally:
+        output_path.chmod(0o600)
+
+    assert result.exit_code == 2
+    assert "Permission denied" in result.output
+    assert output_path.read_text() == "sentinel"
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or getattr(os, "geteuid", lambda: 0)() == 0,
+    reason="An unprivileged POSIX user is required",
+)
+def test_cli_report_writers_fail_closed_in_read_only_directory(tmp_path: Path) -> None:
+    """Atomic installation must not fall back to truncating the destination inode."""
+    output_dir = tmp_path / "read-only-directory"
+    output_dir.mkdir()
+    output_path = output_dir / "scanners.json"
+    output_path.write_text("sentinel")
+    output_path.chmod(0o600)
+    output_dir.chmod(0o500)
+    try:
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+        )
+    finally:
+        output_dir.chmod(0o700)
+
+    assert result.exit_code == 2
+    assert output_path.read_text() == "sentinel"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are unavailable on this platform")
+def test_cli_report_writers_reject_fifo_output_without_blocking(tmp_path: Path) -> None:
+    """A special-file output must fail closed instead of blocking or writing to it."""
+    output_path = tmp_path / "report.fifo"
+    os.mkfifo(output_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 2
+    assert "Unable to write output" in result.output or "non-regular file" in result.output
+
+
+def test_scan_cleans_temp_artifacts_when_sbom_output_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An output refusal must not bypass deferred scan cleanup."""
+    test_file = tmp_path / "test_file.dat"
+    test_file.write_bytes(b"test content")
+    cleanup = MagicMock()
+    record_failure = MagicMock()
+    flush = MagicMock()
+
+    def reject_sbom(*_args: object, **_kwargs: object) -> None:
+        raise cli_module._OutputWriteError("refused test SBOM")
+
+    monkeypatch.setattr(cli_module, "_write_scan_sbom", reject_sbom)
+    monkeypatch.setattr(cli_module, "_cleanup_temp_artifacts", cleanup)
+    monkeypatch.setattr(cli_module, "record_scan_failed", record_failure)
+    monkeypatch.setattr(cli_module, "flush_telemetry", flush)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", str(test_file), "--sbom", str(tmp_path / "sbom.json"), "--no-cache"],
+    )
+
+    assert result.exit_code == 2
+    assert "refused test SBOM" in result.output
+    cleanup.assert_called_once()
+    record_failure.assert_called_once()
+    flush.assert_called_once()
 
 
 def test_cli_report_writers_create_regular_output_files(tmp_path: Path) -> None:
@@ -793,6 +1102,23 @@ def test_cli_report_writers_create_regular_output_files(tmp_path: Path) -> None:
     assert json.loads(sbom_file.read_text())["bomFormat"] == "CycloneDX"
     assert json.loads(metadata_file.read_text())["file"] == test_file.name
     assert json.loads(catalog_file.read_text())["scanners"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes are required")
+def test_cli_report_writers_atomically_overwrite_regular_file_and_preserve_mode(tmp_path: Path) -> None:
+    """A normal existing output should be replaced without changing its access mode."""
+    output_path = tmp_path / "scanners.json"
+    output_path.write_text("stale")
+    output_path.chmod(0o640)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--list-scanners", "--format", "json", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(output_path.read_text())["scanners"]
+    assert stat.S_IMODE(output_path.stat().st_mode) == 0o640
 
 
 def test_scan_output_utf8_locale(tmp_path):

@@ -1,18 +1,18 @@
 """Command-line interface for ModelAudit security scanner."""
 
 import contextlib
-import errno
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
+import stat
 import sys
 import time
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, NoReturn, TextIO
+from typing import Any, NoReturn
 
 import click
 from yaspin import yaspin
@@ -105,66 +105,229 @@ def _display_error(error: object, path: str) -> str:
     return redact_cloud_error_for_display(error, path) if is_cloud_url(path) else str(error)
 
 
-def _output_path_has_symlink_component(output_path: str) -> bool:
-    """Return whether any existing component in an output path is a symlink."""
-    absolute_path = Path(os.path.abspath(output_path))
+class _OutputWriteError(click.ClickException):
+    """Report output failures using the scan command's documented error code."""
+
+    exit_code = 2
+
+
+def _absolute_output_path(output_path: str) -> Path:
+    """Build an absolute path without collapsing symlink-sensitive ``..`` parts."""
+    path = Path(output_path)
+    if path.is_absolute():
+        return path
+    if path.drive:
+        raise _OutputWriteError(f"Refusing drive-relative output path: {_display_path(output_path)}")
+    return Path.cwd() / path
+
+
+def _is_link_like_path(path: Path) -> bool:
+    """Return whether an existing path is a symlink or Windows reparse point."""
+    try:
+        path_stat = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+
+    if stat.S_ISLNK(path_stat.st_mode):
+        return True
+
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(path_stat, "st_file_attributes", 0)
+    if not reparse_attribute or not file_attributes & reparse_attribute:
+        return False
+
+    reparse_tag = getattr(path_stat, "st_reparse_tag", 0)
+    name_surrogate_flag = 0x20000000
+    return not reparse_tag or bool(reparse_tag & name_surrogate_flag)
+
+
+def _directory_can_replace_entries(path: Path) -> bool:
+    """Return whether an untrusted user could replace names in a directory."""
+    try:
+        path_stat = path.stat()
+    except OSError:
+        return True
+
+    if os.name != "posix":
+        return True
+
+    writable_by_others = bool(path_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+    if path_stat.st_uid != 0 or writable_by_others:
+        return True
+
+    get_effective_uid = getattr(os, "geteuid", None)
+    if get_effective_uid is None or get_effective_uid() == 0:
+        return False
+
+    access_kwargs = {"effective_ids": True} if os.access in os.supports_effective_ids else {}
+    return os.access(path, os.W_OK, **access_kwargs)
+
+
+def _validated_absolute_output_path(output_path: str) -> Path:
+    """Resolve protected parent links and reject attacker-replaceable ones."""
+    absolute_path = _absolute_output_path(output_path)
     current_path = Path(absolute_path.anchor)
-    for part in absolute_path.parts[1:]:
-        current_path /= part
-        if current_path.is_symlink():
-            return True
-    return False
+    path_parts = absolute_path.parts[1:]
+    for index, part in enumerate(path_parts):
+        candidate_path = current_path / part
+        if not _is_link_like_path(candidate_path):
+            current_path = candidate_path
+            continue
+
+        if index == len(path_parts) - 1 or _directory_can_replace_entries(current_path):
+            raise _OutputWriteError(
+                f"Refusing to write output through symlink or reparse point: {_display_path(output_path)}"
+            )
+        current_path = candidate_path.resolve(strict=True)
+
+    return current_path
 
 
-def _open_output_file_descriptor(output_path: str, flags: int) -> int:
-    """Open an output descriptor without racing symlink swaps in parent directories."""
+def _open_output_parent_directory(output_path: str) -> tuple[Path, int | None]:
+    """Open the validated output parent without following replaceable links."""
+    absolute_path = _validated_absolute_output_path(output_path)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory = getattr(os, "O_DIRECTORY", 0)
-    if not nofollow or not directory or os.open not in os.supports_dir_fd:
-        return os.open(output_path, flags, 0o666)
+    directory_access = getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0)
+    dir_fd_functions = (os.open, os.stat, os.rename, os.unlink)
+    if (
+        not nofollow
+        or not directory
+        or not directory_access
+        or any(function not in os.supports_dir_fd for function in dir_fd_functions)
+    ):
+        return absolute_path, None
 
-    absolute_path = Path(os.path.abspath(output_path))
-    directory_flags = getattr(os, "O_PATH", os.O_RDONLY) | directory | nofollow
+    directory_flags = directory_access | directory | nofollow
     directory_fd = os.open(absolute_path.anchor, directory_flags)
     try:
         for part in absolute_path.parts[1:-1]:
             next_directory_fd = os.open(part, directory_flags, dir_fd=directory_fd)
             os.close(directory_fd)
             directory_fd = next_directory_fd
-        return os.open(absolute_path.name, flags, 0o666, dir_fd=directory_fd)
-    finally:
+        return absolute_path, directory_fd
+    except Exception:
         os.close(directory_fd)
-
-
-@contextlib.contextmanager
-def _open_output_text_file(output_path: str) -> Iterator[TextIO]:
-    """Open a CLI output file without following symlink path components."""
-    output_display = _display_path(output_path)
-    if _output_path_has_symlink_component(output_path):
-        raise click.ClickException(f"Refusing to write output through symlink: {output_display}")
-
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    if nofollow:
-        flags |= nofollow
-
-    try:
-        fd = _open_output_file_descriptor(output_path, flags)
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            raise click.ClickException(f"Refusing to write output through symlink: {output_display}") from exc
         raise
 
-    with os.fdopen(fd, "w", encoding="utf-8") as output_file:
-        yield output_file
+
+def _validate_existing_output_path(
+    output_path: str,
+    absolute_path: Path,
+    *,
+    parent_fd: int | None,
+) -> os.stat_result | None:
+    """Reject unsafe existing outputs before opening devices or special files."""
+    try:
+        if parent_fd is None:
+            path_stat = absolute_path.lstat()
+        else:
+            path_stat = os.stat(absolute_path.name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+    output_display = _display_path(output_path)
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise _OutputWriteError(f"Refusing to write output to non-regular file: {output_display}")
+    if path_stat.st_nlink != 1:
+        raise _OutputWriteError(f"Refusing to overwrite hard-linked output: {output_display}")
+    access_kwargs = {"effective_ids": True} if os.access in os.supports_effective_ids else {}
+    if not os.access(absolute_path, os.W_OK, **access_kwargs):
+        raise _OutputWriteError(f"Unable to write output {output_display}: Permission denied")
+    return path_stat
+
+
+def _validate_fallback_temporary_file(
+    output_path: str,
+    absolute_path: Path,
+    temp_path: Path,
+    temp_fd: int,
+) -> None:
+    """Ensure fallback path resolution did not redirect temporary-file creation."""
+    output_display = _display_path(output_path)
+    if _validated_absolute_output_path(output_path) != absolute_path:
+        raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+
+    try:
+        path_stat = temp_path.lstat()
+    except OSError as exc:
+        raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}") from exc
+
+    opened_stat = os.fstat(temp_fd)
+    if (
+        not stat.S_ISREG(opened_stat.st_mode)
+        or opened_stat.st_nlink != 1
+        or not os.path.samestat(opened_stat, path_stat)
+    ):
+        raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
 
 
 def _write_output_text_file(output_path: str, output_text: str, *, trailing_newline: bool = False) -> None:
-    """Write CLI output while preserving normal create/truncate behavior."""
-    with _open_output_text_file(output_path) as output_file:
-        output_file.write(output_text)
-        if trailing_newline:
-            output_file.write("\n")
+    """Write CLI output without following attacker-controlled path entries."""
+    output_display = _display_path(output_path)
+    absolute_path: Path | None = None
+    parent_fd: int | None = None
+    temp_fd: int | None = None
+    temp_path: Path | None = None
+    temp_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
+    try:
+        absolute_path, parent_fd = _open_output_parent_directory(output_path)
+        initial_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if nofollow:
+            flags |= nofollow
+
+        if parent_fd is None:
+            temp_path = absolute_path.parent / temp_name
+            temp_fd = os.open(temp_path, flags, 0o666)
+            _validate_fallback_temporary_file(output_path, absolute_path, temp_path, temp_fd)
+        else:
+            temp_fd = os.open(temp_name, flags, 0o666, dir_fd=parent_fd)
+
+        if initial_stat is not None and hasattr(os, "fchmod"):
+            os.fchmod(temp_fd, stat.S_IMODE(initial_stat.st_mode))
+
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as output_file:
+            temp_fd = None
+            output_file.write(output_text)
+            if trailing_newline:
+                output_file.write("\n")
+
+        if parent_fd is None:
+            current_path = _validated_absolute_output_path(output_path)
+            if current_path != absolute_path:
+                raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+        current_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
+        if initial_stat is None:
+            if current_stat is not None:
+                raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+        elif current_stat is None or not os.path.samestat(initial_stat, current_stat):
+            raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+
+        if parent_fd is None:
+            assert temp_path is not None
+            os.replace(temp_path, absolute_path)
+            temp_path = None
+        else:
+            os.rename(temp_name, absolute_path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            temp_name = ""
+    except _OutputWriteError:
+        raise
+    except OSError as exc:
+        raise _OutputWriteError(f"Unable to write output {output_display}: {exc.strerror or exc}") from exc
+    finally:
+        if temp_fd is not None:
+            os.close(temp_fd)
+        if parent_fd is not None:
+            if temp_name:
+                with contextlib.suppress(OSError):
+                    os.unlink(temp_name, dir_fd=parent_fd)
+            os.close(parent_fd)
+        elif temp_path is not None:
+            with contextlib.suppress(OSError):
+                temp_path.unlink()
 
 
 @dataclass
@@ -2487,31 +2650,39 @@ def scan_command(
     audit_result.finalize_statistics()
     audit_result.deduplicate_issues()
 
-    _write_scan_sbom(
-        sbom,
-        audit_result,
-        expanded_paths,
-        path_state,
-        scan_and_delete=runtime.scan_and_delete,
-    )
-    _cleanup_temp_artifacts(path_state.temp_cleanup_entries, verbose=verbose)
+    try:
+        try:
+            _write_scan_sbom(
+                sbom,
+                audit_result,
+                expanded_paths,
+                path_state,
+                scan_and_delete=runtime.scan_and_delete,
+            )
+        finally:
+            _cleanup_temp_artifacts(path_state.temp_cleanup_entries, verbose=verbose)
 
-    suppressions = _record_suppressed_preferred_scanners(audit_result)
-    if suppressions:
-        _announce_suppressed_preferred_scanners(suppressions)
-    output_text = _format_scan_output(
-        audit_result,
-        expanded_paths,
-        output_format=runtime.output_format,
-        verbose=verbose,
-    )
-    _emit_scan_output(
-        output_text,
-        audit_result,
-        output=output,
-        output_format=runtime.output_format,
-        verbose=verbose,
-    )
+        suppressions = _record_suppressed_preferred_scanners(audit_result)
+        if suppressions:
+            _announce_suppressed_preferred_scanners(suppressions)
+        output_text = _format_scan_output(
+            audit_result,
+            expanded_paths,
+            output_format=runtime.output_format,
+            verbose=verbose,
+        )
+        _emit_scan_output(
+            output_text,
+            audit_result,
+            output=output,
+            output_format=runtime.output_format,
+            verbose=verbose,
+        )
+    except _OutputWriteError:
+        record_scan_failed(time.time() - scan_start_time, "Unable to write scan output")
+        flush_telemetry()
+        raise
+
     _record_scan_end_and_exit(audit_result, scan_start_time)
 
 
@@ -3013,6 +3184,15 @@ def metadata(path: str, output_format: str, output: str | None, security_only: b
             output_file=bool(output),
         )
 
+    except _OutputWriteError as e:
+        record_command_used(
+            "metadata",
+            duration=time.time() - start_time,
+            success=False,
+            format=output_format,
+            error_type=type(e).__name__,
+        )
+        raise
     except Exception as e:
         record_command_used(
             "metadata",
