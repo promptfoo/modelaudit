@@ -5003,6 +5003,18 @@ def test_scan_bytes_records_slightly_oversized_frame_notice() -> None:
     assert notice.details["remaining_bytes"] == 2
 
 
+def test_scan_bytes_accepts_exact_frame_length() -> None:
+    payload = b"\x80\x04\x95\x02\x00\x00\x00\x00\x00\x00\x00}."
+
+    report = scan_bytes(payload, source="exact-frame.pkl")
+
+    assert pickle.loads(payload) == {}
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(finding.details.get("tamper_type") == "oversized_frame" for finding in report.findings)
+    assert not any(notice.code == "oversized_frame" for notice in report.notices)
+
+
 def test_scan_bytes_fails_closed_when_import_references_are_truncated() -> None:
     payload = (b"cmath\nsin\n0" * 10_000) + b"cmath\ncos\n0."
 
