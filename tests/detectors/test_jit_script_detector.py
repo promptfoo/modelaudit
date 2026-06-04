@@ -2063,6 +2063,95 @@ class TestJITScriptDetector:
         "data",
         [
             (
+                b"\x00\xffsink = None\n"
+                b"def configure():\n"
+                b"    global sink\n"
+                b"    sink = eval\n"
+                b"run = configure\n"
+                b"run()\n"
+                b"sink('1+1')\n"
+            ),
+            (b"\x00\xffdef get_callback():\n    return eval\nsink = get_callback()\nsink('1+1')\n"),
+            b"\x00\xffdef get_callback():\n    return eval\nget_callback()('1+1')\n",
+            (
+                b"\x00\xffcallbacks = None\n"
+                b"def configure():\n"
+                b"    global callbacks\n"
+                b"    callbacks = [eval]\n"
+                b"configure()\n"
+                b"callbacks[0]('1+1')\n"
+            ),
+            (
+                b"\x00\xffmodule = None\n"
+                b"def configure():\n"
+                b"    global module\n"
+                b"    module = __builtins__\n"
+                b"configure()\n"
+                b"module.eval('1+1')\n"
+            ),
+            b"\x00\xffdef payload():\n    runner = map\n    return list(runner(eval, ['1+1']))\n",
+            (b"\x00\xffdef payload(values):\n    order = sorted\n    return order(values, key=eval)\n"),
+            b"\x00\xffdef payload():\n    return eval.__getattribute__('__call__')('1+1')\n",
+            b"\x00\xffdef payload():\n    return object.__getattribute__(eval, '__call__')('1+1')\n",
+        ],
+    )
+    def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            (
+                b"\x00\xffsink = len\n"
+                b"def configure():\n"
+                b"    global sink\n"
+                b"    sink = eval\n"
+                b"run = configure\n"
+                b"run = lambda: None\n"
+                b"run()\n"
+                b"sink([])\n"
+            ),
+            b"\x00\xffdef get_callback():\n    return eval\nget_callback()\n",
+            b"\x00\xffdef get_callback():\n    return len\nget_callback()([])\n",
+            (
+                b"\x00\xffcallbacks = [eval]\n"
+                b"def configure():\n"
+                b"    global callbacks\n"
+                b"    callbacks = [len]\n"
+                b"configure()\n"
+                b"callbacks[0]([])\n"
+            ),
+            (b"\x00\xffdef benign():\n    runner = map\n    runner = len\n    return runner([])\n"),
+            (
+                b"\x00\xffdef benign():\n"
+                b"    map = lambda callback, values: values\n"
+                b"    runner = map\n"
+                b"    return runner(eval, ['1+1'])\n"
+            ),
+            b"\x00\xffdef benign(eval):\n    return eval.__getattribute__('__call__')('1+1')\n",
+            (
+                b"\x00\xffdef benign():\n"
+                b"    object = type('Safe', (), {'__getattribute__': lambda *_args: len})\n"
+                b"    return object.__getattribute__(eval, '__call__')([])\n"
+            ),
+        ],
+    )
+    def test_scan_model_avoids_false_positives_across_callable_summaries(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+        assert not any(finding.severity == "CRITICAL" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            (
                 b"\x00\xffdef benign(value):\n"
                 b"    callbacks = [eval]\n"
                 b"    callbacks[0] = len\n"

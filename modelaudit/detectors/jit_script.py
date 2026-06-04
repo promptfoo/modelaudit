@@ -11,6 +11,7 @@ Part of ModelAudit's critical security validation suite.
 
 import ast
 import builtins as python_builtins
+import json
 import re
 import textwrap
 from bisect import bisect_left, bisect_right
@@ -19,6 +20,15 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from modelaudit.models import JITScriptFinding
+
+_BuiltinAliasBinding = tuple[
+    str | None,
+    bool,
+    dict[tuple[object, ...], str | None],
+    set[str],
+    dict[tuple[str, ...], str | None],
+]
+_FunctionAliasSummary = tuple[list[tuple[str, str, _BuiltinAliasBinding]], _BuiltinAliasBinding | None]
 
 
 def create_jit_finding(**kwargs: Any) -> "JITScriptFinding":
@@ -1825,6 +1835,7 @@ class JITScriptDetector:
             _FUNCTOOLS_PARTIAL_MARKER = "__modelaudit_functools_partial__:"
             _CONSTANT_STRING_MARKER = "__modelaudit_constant_string__:"
             _FUNCTION_EFFECT_MARKER = "__modelaudit_function_effect__:"
+            _CALLBACK_INVOKER_MARKER = "__modelaudit_callback_invoker__:"
             _MAX_CONSTANT_STRING_CANDIDATES = 16
 
             def __init__(self) -> None:
@@ -1837,6 +1848,7 @@ class JITScriptDetector:
                 self.attribute_alias_scopes: list[dict[tuple[str, ...], str | None]] = [{}]
                 self.scope_kinds = ["module"]
                 self.next_container_identity = 1
+                self.return_binding_stack: list[list[_BuiltinAliasBinding]] = []
 
             def _push_scope(
                 self,
@@ -1959,6 +1971,10 @@ class JITScriptDetector:
             def _function_effect_marker_prefix(cls, name: str) -> str:
                 return f"{cls._FUNCTION_EFFECT_MARKER}{name}\0"
 
+            @classmethod
+            def _callback_invoker_marker_prefix(cls, name: str) -> str:
+                return f"{cls._CALLBACK_INVOKER_MARKER}{name}\0"
+
             def _lookup_constant_strings(self, name: str) -> set[str]:
                 marker_prefix = self._constant_string_marker_prefix(name)
                 for index in self._visible_scope_indexes():
@@ -1970,40 +1986,197 @@ class JITScriptDetector:
                         }
                 return set()
 
-            def _register_function_effects(
-                self,
-                function_name: str,
-                effects: list[tuple[str, str, str | None]],
-            ) -> None:
-                prefix = self._function_effect_marker_prefix(function_name)
-                self.builtins_module_aliases[-1] = {
-                    marker for marker in self.builtins_module_aliases[-1] if not marker.startswith(prefix)
+            def _lookup_callback_invoker(self, name: str) -> str | None:
+                marker_prefix = self._callback_invoker_marker_prefix(name)
+                for index in self._visible_scope_indexes():
+                    if name in self.alias_scopes[index]:
+                        return next(
+                            (
+                                marker.removeprefix(marker_prefix)
+                                for marker in self.builtins_module_aliases[index]
+                                if marker.startswith(marker_prefix)
+                            ),
+                            None,
+                        )
+                return None
+
+            def _resolve_callback_invoker(self, node: ast.AST) -> str | None:
+                if not isinstance(node, ast.Name):
+                    return None
+                if node.id in {"filter", "map", "max", "min", "sorted"} and self._is_unshadowed_name(node.id):
+                    return node.id
+                return self._lookup_callback_invoker(node.id)
+
+            @staticmethod
+            def _freeze_json_value(value: Any) -> object:
+                if isinstance(value, list):
+                    return tuple(DangerousBuiltinCallVisitor._freeze_json_value(item) for item in value)
+                return value
+
+            @staticmethod
+            def _binding_payload(binding: _BuiltinAliasBinding) -> dict[str, Any]:
+                builtin, builtins_module, container_aliases, constant_strings, attribute_aliases = binding
+                return {
+                    "builtin": builtin,
+                    "builtins_module": builtins_module,
+                    "container_aliases": [
+                        [list(path), nested_builtin] for path, nested_builtin in container_aliases.items()
+                    ],
+                    "constant_strings": sorted(constant_strings),
+                    "attribute_aliases": [
+                        [list(path), nested_builtin] for path, nested_builtin in attribute_aliases.items()
+                    ],
                 }
-                self.builtins_module_aliases[-1].update(
-                    f"{prefix}{kind}\0{name}\0{builtin or ''}" for kind, name, builtin in effects
+
+            @classmethod
+            def _binding_from_payload(cls, payload: dict[str, Any]) -> _BuiltinAliasBinding:
+                return (
+                    payload.get("builtin"),
+                    bool(payload.get("builtins_module")),
+                    {
+                        tuple(cls._freeze_json_value(item) for item in path): builtin
+                        for path, builtin in payload.get("container_aliases", [])
+                    },
+                    set(payload.get("constant_strings", [])),
+                    {
+                        tuple(str(item) for item in path): builtin
+                        for path, builtin in payload.get("attribute_aliases", [])
+                    },
                 )
 
-            def _lookup_function_effects(self, name: str) -> tuple[int, list[tuple[str, str, str | None]]]:
+            def _register_function_summary(
+                self,
+                function_name: str,
+                summary: _FunctionAliasSummary,
+                *,
+                scope_index: int = -1,
+            ) -> None:
+                prefix = self._function_effect_marker_prefix(function_name)
+                self.builtins_module_aliases[scope_index] = {
+                    marker for marker in self.builtins_module_aliases[scope_index] if not marker.startswith(prefix)
+                }
+                effects, return_binding = summary
+                payload = {
+                    "effects": [
+                        {
+                            "kind": kind,
+                            "name": name,
+                            "binding": self._binding_payload(binding),
+                        }
+                        for kind, name, binding in effects
+                    ],
+                    "return_binding": (self._binding_payload(return_binding) if return_binding is not None else None),
+                }
+                self.builtins_module_aliases[scope_index].add(
+                    f"{prefix}{json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
+                )
+
+            def _lookup_function_summary(self, name: str) -> tuple[int, _FunctionAliasSummary | None]:
                 prefix = self._function_effect_marker_prefix(name)
                 for index in self._visible_scope_indexes():
                     if name not in self.alias_scopes[index]:
                         continue
-                    effects = []
+                    effect_bindings: dict[tuple[str, str], list[_BuiltinAliasBinding]] = {}
+                    return_bindings: list[_BuiltinAliasBinding] = []
                     for marker in self.builtins_module_aliases[index]:
-                        if not marker.startswith(prefix):
-                            continue
-                        kind, target_name, builtin = marker.removeprefix(prefix).split("\0", maxsplit=2)
-                        effects.append((kind, target_name, builtin or None))
-                    return index, effects
-                return -1, []
+                        if marker.startswith(prefix):
+                            payload = json.loads(marker.removeprefix(prefix))
+                            for effect in payload.get("effects", []):
+                                effect_bindings.setdefault((effect["kind"], effect["name"]), []).append(
+                                    self._binding_from_payload(effect["binding"])
+                                )
+                            return_payload = payload.get("return_binding")
+                            if return_payload is not None:
+                                return_bindings.append(self._binding_from_payload(return_payload))
+                    if effect_bindings or return_bindings:
+                        effects = [
+                            (kind, target_name, binding)
+                            for (kind, target_name), bindings in effect_bindings.items()
+                            if (binding := self._merge_bindings(bindings)) is not None
+                        ]
+                        return index, (effects, self._merge_bindings(return_bindings))
+                    return index, None
+                return -1, None
+
+            def _function_summary_for_node(self, node: ast.AST) -> _FunctionAliasSummary | None:
+                if isinstance(node, ast.Name):
+                    return self._lookup_function_summary(node.id)[1]
+                return None
+
+            def _function_return_binding(self, node: ast.AST) -> _BuiltinAliasBinding | None:
+                if not isinstance(node, ast.Call):
+                    return None
+                summary = self._function_summary_for_node(node.func)
+                return summary[1] if summary is not None else None
+
+            def _binding_from_expression(self, node: ast.AST) -> _BuiltinAliasBinding:
+                return (
+                    self._resolve_builtin(node),
+                    self._is_builtins_namespace(node),
+                    self._resolve_builtin_container(node),
+                    self._constant_strings(node),
+                    self._resolve_attribute_aliases(node),
+                )
+
+            def _binding_from_name(self, name: str, scope_index: int) -> _BuiltinAliasBinding:
+                marker_prefix = self._constant_string_marker_prefix(name)
+                return (
+                    self.alias_scopes[scope_index].get(name),
+                    name in self.builtins_module_aliases[scope_index],
+                    dict(self.container_alias_scopes[scope_index].get(name, {})),
+                    {
+                        marker.removeprefix(marker_prefix)
+                        for marker in self.builtins_module_aliases[scope_index]
+                        if marker.startswith(marker_prefix)
+                    },
+                    {
+                        key[1:]: builtin
+                        for key, builtin in self.attribute_alias_scopes[scope_index].items()
+                        if key and key[0] == name
+                    },
+                )
+
+            def _merge_bindings(self, bindings: list[_BuiltinAliasBinding]) -> _BuiltinAliasBinding | None:
+                if not bindings:
+                    return None
+                merged_attributes: dict[tuple[str, ...], str | None] = {}
+                for binding in bindings:
+                    for path, builtin in binding[4].items():
+                        if builtin is not None or path not in merged_attributes:
+                            merged_attributes[path] = builtin
+                return (
+                    next((binding[0] for binding in bindings if binding[0] is not None), None),
+                    any(binding[1] for binding in bindings),
+                    self._merge_container_aliases(*(binding[2] for binding in bindings)),
+                    set().union(*(binding[3] for binding in bindings)),
+                    merged_attributes,
+                )
+
+            def _apply_binding(self, name: str, binding: _BuiltinAliasBinding, *, scope_index: int) -> None:
+                builtin, builtins_module, container_aliases, constant_strings, attribute_aliases = binding
+                self._bind_name(
+                    name,
+                    builtin,
+                    builtins_module=builtins_module,
+                    container_aliases=container_aliases,
+                    container_identity=self._new_container_identity() if container_aliases else None,
+                    constant_strings=constant_strings,
+                    scope_index=scope_index,
+                )
+                self.attribute_alias_scopes[scope_index].update(
+                    {(name, *path): nested_builtin for path, nested_builtin in attribute_aliases.items()}
+                )
 
             def _apply_function_effects(self, node: ast.AST) -> None:
                 if not isinstance(node, ast.Name):
                     return
-                owner_index, effects = self._lookup_function_effects(node.id)
-                for kind, target_name, builtin in effects:
+                owner_index, summary = self._lookup_function_summary(node.id)
+                if summary is None:
+                    return
+                effects, _return_binding = summary
+                for kind, target_name, binding in effects:
                     target_scope = 0 if kind == "global" else owner_index
-                    self._bind_name(target_name, builtin, scope_index=target_scope)
+                    self._apply_binding(target_name, binding, scope_index=target_scope)
 
             def _is_functools_partial(self, node: ast.AST) -> bool:
                 if isinstance(node, ast.Name):
@@ -2050,6 +2223,8 @@ class JITScriptDetector:
             def _container_expression_identity(self, node: ast.AST) -> int | None:
                 if isinstance(node, ast.Name):
                     return self._lookup_container_identity(node.id)
+                if return_binding := self._function_return_binding(node):
+                    return self._new_container_identity() if return_binding[2] else None
                 if isinstance(node, ast.NamedExpr):
                     return self._container_expression_identity(node.value)
                 if isinstance(node, (ast.List, ast.Tuple, ast.Dict)):
@@ -2133,6 +2308,8 @@ class JITScriptDetector:
                 return False, None
 
             def _resolve_builtin_container(self, node: ast.AST) -> dict[tuple[object, ...], str | None]:
+                if return_binding := self._function_return_binding(node):
+                    return dict(return_binding[2])
                 if isinstance(node, ast.Name):
                     return dict(self._lookup_container_alias(node.id))
                 if isinstance(node, ast.NamedExpr):
@@ -2225,6 +2402,8 @@ class JITScriptDetector:
                 return False, None
 
             def _resolve_attribute_aliases(self, node: ast.AST) -> dict[tuple[str, ...], str | None]:
+                if (return_binding := self._function_return_binding(node)) and return_binding[4]:
+                    return dict(return_binding[4])
                 key = self._attribute_alias_key(node)
                 if key is None:
                     return {}
@@ -2285,6 +2464,8 @@ class JITScriptDetector:
                 )
 
             def _is_builtins_namespace(self, node: ast.AST) -> bool:
+                if return_binding := self._function_return_binding(node):
+                    return return_binding[1]
                 if isinstance(node, ast.NamedExpr):
                     return self._is_builtins_namespace(node.value)
                 if isinstance(node, ast.IfExp):
@@ -2324,6 +2505,8 @@ class JITScriptDetector:
                 )
 
             def _constant_strings(self, node: ast.AST) -> set[str]:
+                if return_binding := self._function_return_binding(node):
+                    return set(return_binding[3])
                 if isinstance(node, ast.Constant) and isinstance(node.value, str):
                     return {node.value}
                 if isinstance(node, ast.Name):
@@ -2400,6 +2583,8 @@ class JITScriptDetector:
                             None,
                         )
                 if isinstance(node, ast.Call):
+                    if (return_binding := self._function_return_binding(node)) and return_binding[0] is not None:
+                        return return_binding[0]
                     if self._is_functools_partial(node.func) and node.args:
                         return self._resolve_builtin(node.args[0])
                     if (
@@ -2420,6 +2605,13 @@ class JITScriptDetector:
                         and self._is_builtins_namespace(node.func.value)
                     ):
                         return self._dangerous_constant_string(node.args[0])
+                    if (
+                        node.args
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "__getattribute__"
+                        and "__call__" in self._constant_strings(node.args[0])
+                    ):
+                        return self._resolve_builtin(node.func.value)
                     if node.args and isinstance(node.func, ast.Attribute) and node.func.attr in {"get", "__getitem__"}:
                         key_resolved, key = self._constant_container_key(node.args[0])
                         if key_resolved:
@@ -2436,8 +2628,11 @@ class JITScriptDetector:
                         and isinstance(node.func.value, ast.Name)
                         and node.func.value.id == "object"
                         and self._is_unshadowed_name("object")
-                        and self._is_builtins_namespace(node.args[0])
                     ):
+                        if "__call__" in self._constant_strings(node.args[1]):
+                            return self._resolve_builtin(node.args[0])
+                        if not self._is_builtins_namespace(node.args[0]):
+                            return None
                         return self._dangerous_constant_string(node.args[1])
                 return None
 
@@ -2450,6 +2645,7 @@ class JITScriptDetector:
                 container_aliases: dict[tuple[object, ...], str | None] | None = None,
                 container_identity: int | None = None,
                 constant_strings: set[str] | None = None,
+                callback_invoker: str | None = None,
                 defined: bool = True,
                 scope_index: int = -1,
             ) -> None:
@@ -2460,14 +2656,19 @@ class JITScriptDetector:
                 self.builtins_module_aliases[scope_index].discard(f"{self._FUNCTOOLS_PARTIAL_MARKER}{name}")
                 constant_string_prefix = self._constant_string_marker_prefix(name)
                 function_effect_prefix = self._function_effect_marker_prefix(name)
+                callback_invoker_prefix = self._callback_invoker_marker_prefix(name)
                 self.builtins_module_aliases[scope_index] = {
                     marker
                     for marker in self.builtins_module_aliases[scope_index]
-                    if not marker.startswith(constant_string_prefix) and not marker.startswith(function_effect_prefix)
+                    if not marker.startswith(constant_string_prefix)
+                    and not marker.startswith(function_effect_prefix)
+                    and not marker.startswith(callback_invoker_prefix)
                 }
                 self.builtins_module_aliases[scope_index].update(
                     f"{constant_string_prefix}{value}" for value in (constant_strings or set())
                 )
+                if callback_invoker is not None:
+                    self.builtins_module_aliases[scope_index].add(f"{callback_invoker_prefix}{callback_invoker}")
                 attribute_aliases = self.attribute_alias_scopes[scope_index]
                 for key in tuple(attribute_aliases):
                     if key[0] == name:
@@ -2502,6 +2703,8 @@ class JITScriptDetector:
                 container_identity: int | None = None,
                 constant_strings: set[str] | None = None,
                 attribute_aliases: dict[tuple[str, ...], str | None] | None = None,
+                callback_invoker: str | None = None,
+                function_summary: _FunctionAliasSummary | None = None,
                 scope_index: int = -1,
             ) -> None:
                 if isinstance(target, ast.Name):
@@ -2512,6 +2715,7 @@ class JITScriptDetector:
                         container_aliases=container_aliases,
                         container_identity=container_identity,
                         constant_strings=constant_strings,
+                        callback_invoker=callback_invoker,
                         scope_index=scope_index,
                     )
                     self.attribute_alias_scopes[scope_index].update(
@@ -2520,6 +2724,12 @@ class JITScriptDetector:
                             for path, nested_builtin in (attribute_aliases or {}).items()
                         }
                     )
+                    if function_summary is not None:
+                        self._register_function_summary(
+                            target.id,
+                            function_summary,
+                            scope_index=scope_index,
+                        )
                 elif isinstance(target, ast.Attribute):
                     attribute_key = self._attribute_alias_key(target)
                     if attribute_key is not None:
@@ -2714,6 +2924,8 @@ class JITScriptDetector:
                     container_identity=self._container_expression_identity(value),
                     constant_strings=self._constant_strings(value),
                     attribute_aliases=self._resolve_attribute_aliases(value),
+                    callback_invoker=self._resolve_callback_invoker(value),
+                    function_summary=self._function_summary_for_node(value),
                     scope_index=scope_index,
                 )
 
@@ -2998,6 +3210,8 @@ class JITScriptDetector:
                     container_identity = self._container_expression_identity(node.value)
                     constant_strings = self._constant_strings(node.value)
                     attribute_aliases = self._resolve_attribute_aliases(node.value)
+                    callback_invoker = self._resolve_callback_invoker(node.value)
+                    function_summary = self._function_summary_for_node(node.value)
                     for target in node.targets:
                         self._bind_target(
                             target,
@@ -3007,6 +3221,8 @@ class JITScriptDetector:
                             container_identity=container_identity,
                             constant_strings=constant_strings,
                             attribute_aliases=attribute_aliases,
+                            callback_invoker=callback_invoker,
+                            function_summary=function_summary,
                         )
                     return
                 for target in node.targets:
@@ -3029,6 +3245,12 @@ class JITScriptDetector:
                 while scope_index > 0 and self.scope_kinds[scope_index] == "comprehension":
                     scope_index -= 1
                 self._bind_target_from_value(node.target, node.value, scope_index=scope_index)
+
+            def visit_Return(self, node: ast.Return) -> None:
+                if node.value is not None:
+                    if self.return_binding_stack:
+                        self.return_binding_stack[-1].append(self._binding_from_expression(node.value))
+                    self.visit(node.value)
 
             def visit_Delete(self, node: ast.Delete) -> None:
                 for target in node.targets:
@@ -3252,19 +3474,21 @@ class JITScriptDetector:
                 self._bind_name(node.name, None)
                 global_names, nonlocal_names = self._outer_binding_declarations(list(node.body))
                 self._push_scope(node.args, default_bindings, self._local_binding_names(list(node.body)))
+                self.return_binding_stack.append([])
                 self._visit_statements(node.body)
+                return_binding = self._merge_bindings(self.return_binding_stack.pop())
                 effects = [
-                    ("global", name, self.alias_scopes[-1][name])
+                    ("global", name, self._binding_from_name(name, -1))
                     for name in global_names
                     if name in self.alias_scopes[-1]
                 ]
                 effects.extend(
-                    ("nonlocal", name, self.alias_scopes[-1][name])
+                    ("nonlocal", name, self._binding_from_name(name, -1))
                     for name in nonlocal_names
                     if name in self.alias_scopes[-1]
                 )
                 self._pop_scope()
-                self._register_function_effects(node.name, effects)
+                self._register_function_summary(node.name, (effects, return_binding))
 
             def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
                 self._visit_function_node(node)
@@ -3740,18 +3964,10 @@ class JITScriptDetector:
 
             def _dangerous_callback_builtins(self, node: ast.Call) -> set[str]:
                 callbacks: list[ast.AST] = []
-                if (
-                    isinstance(node.func, ast.Name)
-                    and self._is_unshadowed_name(node.func.id)
-                    and node.func.id in {"filter", "map"}
-                    and node.args
-                ):
+                callback_invoker = self._resolve_callback_invoker(node.func)
+                if callback_invoker in {"filter", "map"} and node.args:
                     callbacks.append(node.args[0])
-                if (
-                    isinstance(node.func, ast.Name)
-                    and self._is_unshadowed_name(node.func.id)
-                    and node.func.id in {"max", "min", "sorted"}
-                ):
+                if callback_invoker in {"max", "min", "sorted"}:
                     callbacks.extend(keyword.value for keyword in node.keywords if keyword.arg == "key")
                 return {builtin for callback in callbacks if (builtin := self._resolve_builtin(callback)) is not None}
 
