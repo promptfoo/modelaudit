@@ -1,10 +1,39 @@
 """Scanner for TensorFlow Lite model files (.tflite)."""
 
+import mmap
 import os
 from typing import Any, ClassVar
 
 from ..scanner_results import mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
+
+
+def _memory_map(path: str, file_size: int) -> Any:
+    """Memory-map a TFLite file read-only for zero-copy FlatBuffer parsing.
+
+    ``GetRootAsModel`` indexes into the buffer lazily without copying it, so an
+    mmap keeps resident memory bounded to the pages actually touched during
+    traversal instead of loading the whole (potentially multi-GB) file into RAM.
+    The caller — and the parsed model, which references the buffer — keeps the
+    mapping alive for the scan's duration. Empty files return ``b""`` because
+    ``mmap`` rejects a zero-length mapping.
+
+    ``file_size`` is the size the caller already validated against the configured
+    read limit. We re-``fstat`` the opened descriptor and map only
+    ``min(file_size, current_size)`` rather than the whole file: if the file grew
+    after the caller's check we must not map past the validated size (a TOCTOU
+    bypass of the limit that the previous chunked read caught), and if it shrank
+    we must not map past EOF.
+    """
+    if file_size <= 0:
+        return b""
+    with open(path, "rb") as f:
+        # The mapping outlives the file descriptor (POSIX), so closing f is fine.
+        length = min(file_size, os.fstat(f.fileno()).st_size)
+        if length <= 0:
+            return b""
+        return mmap.mmap(f.fileno(), length, access=mmap.ACCESS_READ)
+
 
 try:
     import tflite
@@ -114,7 +143,11 @@ class TFLiteScanner(BaseScanner):
             return result
 
         try:
-            data = self._read_file_safely(path)
+            file_size = self.get_file_size(path)
+            max_read = self.max_file_read_size
+            if max_read and max_read > 0 and file_size > max_read:
+                raise ValueError(f"File too large: {file_size} bytes (max: {max_read})")
+            data = _memory_map(path, file_size)
         except (OSError, ValueError) as e:
             _mark_operational_inconclusive_scan_result(result, TFLITE_READ_INCONCLUSIVE_REASON)
             result.add_check(
@@ -275,8 +308,10 @@ class TFLiteScanner(BaseScanner):
                 metadata["error"] = f"File too large for metadata extraction ({file_size} bytes)"
                 return metadata
 
-            with open(file_path, "rb") as f:
-                model_data = f.read()
+            # Zero-copy mmap: GetRootAsModel indexes into the buffer lazily, so
+            # this avoids loading the whole file into RAM (bounded already by the
+            # 2GB guard above, but mmap keeps actual RSS far lower).
+            model_data = _memory_map(file_path, file_size)
 
             model = tflite.Model.GetRootAsModel(model_data, 0)
 
