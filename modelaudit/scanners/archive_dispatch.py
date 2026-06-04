@@ -92,6 +92,36 @@ def _is_pickle_parse_only_overlap_issue(issue: Issue) -> bool:
     )
 
 
+def _pickle_result_consumes_entire_payload(path: str, result: ScanResult) -> bool:
+    """Return whether complete Pickle analysis proves no trailing Flax stream exists."""
+    if (
+        result.scanner_name != "pickle"
+        or result.metadata.get("pickle_report_status") != "complete"
+        or result.metadata.get("analysis_incomplete") is True
+    ):
+        return False
+
+    coverage = result.metadata.get("pickle_coverage")
+    if not isinstance(coverage, dict):
+        return False
+    if coverage.get("raw_scan_complete") is not True or coverage.get("opcode_scan_complete") is not True:
+        return False
+
+    positions = (
+        result.metadata.get("first_pickle_end_pos"),
+        coverage.get("bytes_scanned"),
+        coverage.get("bytes_total"),
+    )
+    if any(not isinstance(position, int) or isinstance(position, bool) for position in positions):
+        return False
+
+    try:
+        file_size = os.path.getsize(path)
+    except OSError:
+        return False
+    return positions[0] == positions[1] == positions[2] == file_size
+
+
 def _select_nested_scanner_id(path: str, header_format_override: str | None = None) -> str | None:
     """Select a scanner for extracted archive members using trusted file structure first."""
     header_format = header_format_override or detect_file_format(path)
@@ -431,6 +461,8 @@ def merge_inconclusive_flax_msgpack_outcome(
     """Preserve ambiguous Flax coverage when a strict overlapping owner is primary."""
     from . import _registry
 
+    if _pickle_result_consumes_entire_payload(path, result):
+        return
     if result.scanner_name not in detect_flax_msgpack_overlap_routes(
         path
     ) or not has_inconclusive_renamed_flax_msgpack_routing(path):
