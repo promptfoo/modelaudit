@@ -3129,6 +3129,28 @@ def test_scan_bytes_does_not_flag_dill_dump_as_dangerous() -> None:
     assert report.findings == ()
 
 
+def test_scan_bytes_warns_when_invoked_dill_dump_resolves_to_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed-dill-dump-marker"
+    (tmp_path / "dill.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\ndef dump():\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = scan_bytes(b"\x80\x02cdill\ndump\n(tR.", source="shadowed-dill-dump.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "dill.dump"
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_flags_dill_loads_as_dangerous() -> None:
     payload = b"cdill\nloads\n."
 

@@ -27,6 +27,7 @@ from .call_graph import (
     module_initialization_is_proven_inert,
     shared_source_sensitive_caches,
     trusted_import_reference_requires_invocation_analysis,
+    unresolved_trusted_import_reference_is_safe_when_invoked,
 )
 from .options import ScanOptions
 from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
@@ -1024,6 +1025,7 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     enrichment_errors: list[tuple[str, Exception]] = []
     inert_initialization_modules: frozenset[str] = frozenset()
     trusted_import_references: frozenset[tuple[str, str]] = frozenset()
+    unresolved_trusted_invocation_positions: frozenset[int] = frozenset()
     analyzed_invocation_global_positions: frozenset[int] = frozenset()
     source_snapshot_stable = True
     callable_invocations_complete = not bool(report.metadata.get("callable_invocations_truncated"))
@@ -1081,6 +1083,13 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         except Exception as error:
             enrichment_errors.append(("python_import_reference_trust", error))
         try:
+            unresolved_trusted_invocation_positions = _proven_unresolved_trusted_invocation_positions(
+                report,
+                invoked_global_positions,
+            )
+        except Exception as error:
+            enrichment_errors.append(("python_import_unresolved_invocation_trust", error))
+        try:
             _ensure_shared_source_snapshot_stable(report_generation)
         except _CallGraphAnalysisLimitError as error:
             source_snapshot_stable = False
@@ -1089,12 +1098,13 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     if (
         source_snapshot_stable
         and callable_invocations_complete
-        and (inert_initialization_modules or trusted_import_references)
+        and (inert_initialization_modules or trusted_import_references or unresolved_trusted_invocation_positions)
     ):
         report = _without_proven_safe_import_findings(
             report,
             inert_initialization_modules,
             trusted_import_references,
+            unresolved_trusted_invocation_positions,
             invoked_global_positions,
             analyzed_invocation_global_positions,
             trusted_reconstruction_global_positions,
@@ -1250,10 +1260,32 @@ def _proven_trusted_import_references(report: PickleReport) -> frozenset[tuple[s
     return frozenset(references)
 
 
+def _proven_unresolved_trusted_invocation_positions(
+    report: PickleReport,
+    invoked_global_positions: frozenset[int],
+) -> frozenset[int]:
+    positions: list[int] = []
+    for finding in report.findings:
+        if finding.rule_code != "NON_ALLOWLISTED_GLOBAL":
+            continue
+        module = str(finding.details.get("module", ""))
+        name = str(finding.details.get("name", ""))
+        position = _optional_int(finding.details.get("position"))
+        if (
+            position is None
+            or position not in invoked_global_positions
+            or not unresolved_trusted_import_reference_is_safe_when_invoked(module, name)
+        ):
+            continue
+        positions.append(position)
+    return frozenset(positions)
+
+
 def _without_proven_safe_import_findings(
     report: PickleReport,
     inert_initialization_modules: frozenset[str],
     trusted_import_references: frozenset[tuple[str, str]],
+    unresolved_trusted_invocation_positions: frozenset[int],
     invoked_global_positions: frozenset[int],
     analyzed_invocation_global_positions: frozenset[int],
     trusted_reconstruction_global_positions: frozenset[int],
@@ -1266,6 +1298,7 @@ def _without_proven_safe_import_findings(
             finding,
             inert_initialization_modules,
             trusted_import_references,
+            unresolved_trusted_invocation_positions,
             invoked_global_positions,
             analyzed_invocation_global_positions,
             trusted_reconstruction_global_positions,
@@ -1298,6 +1331,7 @@ def _non_allowlisted_import_finding_is_proven_safe(
     finding: Finding,
     inert_initialization_modules: frozenset[str],
     trusted_import_references: frozenset[tuple[str, str]],
+    unresolved_trusted_invocation_positions: frozenset[int],
     invoked_global_positions: frozenset[int],
     analyzed_invocation_global_positions: frozenset[int],
     trusted_reconstruction_global_positions: frozenset[int],
@@ -1315,9 +1349,10 @@ def _non_allowlisted_import_finding_is_proven_safe(
         or position in analyzed_invocation_global_positions
         or position in trusted_reconstruction_global_positions
     )
-    return (trusted_reference_is_proven_safe and (module, name) in trusted_import_references) or (
-        inert_reference_is_proven_safe and module in inert_initialization_modules
-    )
+    return (
+        trusted_reference_is_proven_safe
+        and ((module, name) in trusted_import_references or position in unresolved_trusted_invocation_positions)
+    ) or (inert_reference_is_proven_safe and module in inert_initialization_modules)
 
 
 def _invoked_global_positions(callable_invocations: object) -> frozenset[int]:

@@ -15,6 +15,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib.machinery import EXTENSION_SUFFIXES, BuiltinImporter, FrozenImporter, ModuleSpec, PathFinder
+from importlib.metadata import distribution, packages_distributions
 from importlib.util import MAGIC_NUMBER, cache_from_source
 from pathlib import Path
 from typing import Any, Protocol, TypeVar, cast
@@ -41,6 +42,7 @@ _MAX_INHERITED_CLASS_METHODS = 128
 _MAX_WILDCARD_IMPORTS = 16
 _MAX_WILDCARD_REEXPORT_DEPTH = 4
 _MAX_SHORT_SINK_DEPTH = 2
+_MAX_DISTRIBUTIONS_PER_TOP_LEVEL = 16
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
 _IMPORT_EXECUTION_SINK = "builtins.__import__"
 _IMPORT_EXECUTION_SAFE_MODULES = frozenset(sys.builtin_module_names)
@@ -139,6 +141,30 @@ class _SharedSourceSnapshot:
 def _register_source_sensitive_cache(function: _CachedFunctionT) -> _CachedFunctionT:
     _SOURCE_SENSITIVE_CACHED_FUNCTIONS.add(cast(_CacheClearable, function))
     return function
+
+
+@_register_source_sensitive_cache
+@lru_cache(maxsize=1)
+def _installed_package_distributions() -> Mapping[str, list[str]]:
+    try:
+        return packages_distributions()
+    except Exception:
+        return {}
+
+
+@_register_source_sensitive_cache
+@lru_cache(maxsize=256)
+def _installed_distribution_roots(top_level_name: str) -> tuple[Path, ...]:
+    roots: list[Path] = []
+    distribution_names = _installed_package_distributions().get(top_level_name, ())
+    for distribution_name in distribution_names[:_MAX_DISTRIBUTIONS_PER_TOP_LEVEL]:
+        try:
+            root = Path(str(distribution(distribution_name).locate_file(""))).resolve()
+        except Exception:
+            continue
+        if root not in roots:
+            roots.append(root)
+    return tuple(roots)
 
 
 _CLASS_ENTRYPOINT_METHODS = (
@@ -655,6 +681,15 @@ def trusted_import_reference_requires_invocation_analysis(module_name: str, name
     return (module_name, name) in _TRUSTED_REFERENCES_REQUIRING_INVOCATION_ANALYSIS
 
 
+def unresolved_trusted_import_reference_is_safe_when_invoked(module_name: str, name: str) -> bool:
+    """Return whether an unresolved, reviewed callable has safe invocation semantics."""
+    return (
+        (module_name, name) in _TRUSTED_IMPORT_ONLY_REFERENCES
+        and not trusted_import_reference_requires_invocation_analysis(module_name, name)
+        and _trusted_module_origin_kind(module_name) == "unresolved"
+    )
+
+
 def import_only_module_requires_origin_review(module_name: str) -> bool:
     """Return whether a module resolves outside trusted install paths."""
     if module_name in {"__builtin__", "__builtins__"}:
@@ -684,6 +719,9 @@ def _trusted_module_origin_kind(module_name: str) -> str | None:
     except (OSError, RuntimeError, ValueError):
         return None
     if any(origin.is_relative_to(path) for path in _TRUSTED_SITE_PACKAGE_PATHS):
+        return "site_packages"
+    top_level_name = parts[0]
+    if any(origin.is_relative_to(path) for path in _installed_distribution_roots(top_level_name)):
         return "site_packages"
     if any(origin.is_relative_to(path) for path in _TRUSTED_STDLIB_PATHS):
         return "stdlib"

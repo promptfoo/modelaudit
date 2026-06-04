@@ -146,6 +146,37 @@ def test_import_only_reference_trust_rejects_reviewed_unavailable_optional_modul
         call_graph._trusted_module_origin_kind.cache_clear()
 
 
+def test_trusted_origin_recognizes_installed_overlay_without_trusting_local_shadow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    overlay = tmp_path / "overlay"
+    package_dir = overlay / "_pytest" / "_py"
+    package_dir.mkdir(parents=True)
+    (overlay / "_pytest" / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "path.py").write_text("class LocalPath:\n    pass\n", encoding="utf-8")
+    dist_info = overlay / "pytest-1.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text("Name: pytest\nVersion: 1.0\n", encoding="utf-8")
+    (dist_info / "top_level.txt").write_text("_pytest\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(overlay))
+    call_graph._clear_source_sensitive_caches()
+
+    assert call_graph._trusted_module_origin_kind("_pytest._py.path") == "site_packages"
+
+    shadow_root = tmp_path / "shadow"
+    shadow_package_dir = shadow_root / "_pytest" / "_py"
+    shadow_package_dir.mkdir(parents=True)
+    (shadow_root / "_pytest" / "__init__.py").write_text("", encoding="utf-8")
+    (shadow_package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (shadow_package_dir / "path.py").write_text("class LocalPath:\n    pass\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(shadow_root))
+    call_graph._clear_source_sensitive_caches()
+
+    assert call_graph._trusted_module_origin_kind("_pytest._py.path") is None
+
+
 def test_shared_source_sensitive_caches_allows_inherited_worker_scopes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
