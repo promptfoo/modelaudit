@@ -69,11 +69,58 @@ _EXTRA_SAFE_KERAS_METRIC_IDENTIFIERS: frozenset[str] = frozenset(
         "tp",
     }
 )
+_TRUSTED_KERAS_ROOT_CLASS_MODULES: frozenset[str] = frozenset(
+    {
+        "keras",
+        "tensorflow.keras",
+        "tensorflow.python.keras",
+        "tf.keras",
+        "tf_keras",
+    }
+)
+_TRUSTED_KERAS_LAYER_CLASS_MODULES: frozenset[str] = frozenset(
+    {
+        "keras.layers",
+        "tensorflow.keras.layers",
+        "tensorflow.python.keras.layers",
+        "tf.keras.layers",
+        "tf_keras.layers",
+    }
+)
+_TRUSTED_KERAS_MODEL_CLASS_MODULES: frozenset[str] = frozenset(
+    {
+        "keras.models",
+        "tensorflow.keras.models",
+        "tensorflow.python.keras.models",
+        "tf.keras.models",
+        "tf_keras.models",
+    }
+)
 
 
 def _normalize_keras_identifier(value: str) -> str:
     """Normalize serialized Keras identifiers for allowlist lookups."""
     return value.strip().lower()
+
+
+def normalize_keras_layer_class(value: str) -> str:
+    """Normalize Keras layer class names while preserving custom namespaces."""
+    normalized = value.strip()
+    module_path, _, class_name = normalized.rpartition(".")
+    normalized_module_path = module_path.lower()
+    if class_name and (
+        (
+            class_name in KNOWN_SAFE_MODEL_CLASSES
+            and normalized_module_path in (_TRUSTED_KERAS_ROOT_CLASS_MODULES | _TRUSTED_KERAS_MODEL_CLASS_MODULES)
+        )
+        or (
+            class_name in KNOWN_SAFE_KERAS_LAYER_CLASSES
+            and class_name not in KNOWN_SAFE_MODEL_CLASSES
+            and normalized_module_path in _TRUSTED_KERAS_LAYER_CLASS_MODULES
+        )
+    ):
+        return class_name
+    return normalized
 
 
 def _camel_to_snake(value: str) -> str:
@@ -119,7 +166,10 @@ _SAFE_KERAS_METRIC_IDENTIFIERS = _build_safe_identifier_index(
 
 def is_known_safe_keras_layer_class(layer_class: Any) -> bool:
     """Return True when a serialized Keras layer class is known-safe."""
-    return isinstance(layer_class, str) and _normalize_keras_identifier(layer_class) in _SAFE_KERAS_LAYER_CLASSES
+    return (
+        isinstance(layer_class, str)
+        and _normalize_keras_identifier(normalize_keras_layer_class(layer_class)) in _SAFE_KERAS_LAYER_CLASSES
+    )
 
 
 def is_known_safe_keras_loss(identifier: Any) -> bool:
@@ -497,7 +547,8 @@ def check_subclassed_model(
         result: ScanResult to add the check to.
         location: File path for the check location.
     """
-    if model_class and model_class not in KNOWN_SAFE_MODEL_CLASSES:
+    normalized_model_class = normalize_keras_layer_class(model_class)
+    if model_class and normalized_model_class not in KNOWN_SAFE_MODEL_CLASSES:
         result.add_check(
             name="Subclassed Model Detection",
             passed=False,
@@ -516,7 +567,7 @@ def check_subclassed_model(
                 "Functional, Model) use declarative layer configurations and load without custom code."
             ),
         )
-    elif model_class in KNOWN_SAFE_MODEL_CLASSES:
+    elif normalized_model_class in KNOWN_SAFE_MODEL_CLASSES:
         result.add_check(
             name="Subclassed Model Detection",
             passed=True,
