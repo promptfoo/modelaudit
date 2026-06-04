@@ -11,6 +11,7 @@ import pytest
 from modelaudit import core
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners import get_scanner_for_file
+from modelaudit.scanners._evidence_redaction import REDACTED_EVIDENCE_VALUE
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.r_serialized_scanner import RSerializedScanner
 from modelaudit.utils.file.detection import (
@@ -632,6 +633,26 @@ def test_scan_redacts_and_detects_rightward_assignment_expressions(tmp_path: Pat
     assert "RIGHTWARD_SECRET" not in sample
 
 
+def test_scan_redacts_and_detects_leftward_assignment_expressions(tmp_path: Path) -> None:
+    path = tmp_path / "leftward-expression-sample-leak.rds"
+    _write_raw_r_serialized(
+        path,
+        'expression\nlanguage\nbase::system("curl"); token <- paste0("LEFTWARD_SECRET", "TAIL")',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    sample = symbol_checks[0].details["examples"][0]["sample"]
+    assert 'base::system("curl")' in sample
+    assert f"token <- {REDACTED_EVIDENCE_VALUE}" in sample
+    assert "LEFTWARD_SECRET" not in sample
+    assert "TAIL" not in sample
+
+
 @pytest.mark.parametrize(
     ("assignment", "secret"),
     [
@@ -644,6 +665,11 @@ def test_scan_redacts_and_detects_rightward_assignment_expressions(tmp_path: Pat
         ('dbPassword <- "CAMEL_PASSWORD_SECRET"', "CAMEL_PASSWORD_SECRET"),
         ('sessionToken <<- "CAMEL_TOKEN_SECRET"', "CAMEL_TOKEN_SECRET"),
         ('`dbPassword` <- "BACKTICK_CAMEL_SECRET"', "BACKTICK_CAMEL_SECRET"),
+        ('token[1] <- "INDEXED_TOKEN_SECRET"', "INDEXED_TOKEN_SECRET"),
+        ('config$token <- "MEMBER_TOKEN_SECRET"', "MEMBER_TOKEN_SECRET"),
+        ('config@password <- "SLOT_PASSWORD_SECRET"', "SLOT_PASSWORD_SECRET"),
+        ('config[["api_key"]] <- "SUBSCRIPT_API_SECRET"', "SUBSCRIPT_API_SECRET"),
+        ('"RIGHT_MEMBER_SECRET" -> config$token', "RIGHT_MEMBER_SECRET"),
         ('pwd <- "PWD_SECRET_VALUE"', "PWD_SECRET_VALUE"),
         ('token <- r"(RAW_LEFT_SECRET)"', "RAW_LEFT_SECRET"),
         ('R"---{RAW_RIGHT_SECRET}---" -> client.secret', "RAW_RIGHT_SECRET"),
@@ -691,6 +717,11 @@ def test_scan_redacts_complex_r_assignment_payload_samples(tmp_path: Path, assig
         "dbPassword <- 'CAMEL_PASSWORD_SECRET'",
         "sessionToken <<- 'CAMEL_TOKEN_SECRET'",
         "`dbPassword` <- 'BACKTICK_CAMEL_SECRET'",
+        "token[1] <- 'INDEXED_TOKEN_SECRET'",
+        "config$token <- 'MEMBER_TOKEN_SECRET'",
+        "config@password <- 'SLOT_PASSWORD_SECRET'",
+        'config[["api_key"]] <- "SUBSCRIPT_API_SECRET"',
+        "'RIGHT_MEMBER_SECRET' -> config$token",
         "pwd <- 'PWD_SECRET_VALUE'",
         'token <- r"(RAW_LEFT_SECRET)"',
         'R"---{RAW_RIGHT_SECRET}---" -> client.secret',
@@ -818,7 +849,9 @@ def test_scan_allows_benign_r_assignment_key_near_matches(tmp_path: Path) -> Non
         "`not a tokenizer` <- 'BENIGN_VALUE'; signature <- 'gaussian'; credential <- 'standard'; "
         "sas <- 'dataset-value'; sig <- 'benign-value'; token.count <- 'BENIGN_VALUE'; "
         "api.keyboard <- 'BENIGN_VALUE'; `not.a.tokenizer` <- 'BENIGN_VALUE'; "
-        '"tokenizer" <- "BENIGN_VALUE"; "not a tokenizer" <- "BENIGN_VALUE"',
+        '"tokenizer" <- "BENIGN_VALUE"; "not a tokenizer" <- "BENIGN_VALUE"; '
+        "tokenizer[1] <- 'BENIGN_VALUE'; config$tokenizer <- 'BENIGN_VALUE'; "
+        'config[["tokenizer"]] <- "BENIGN_VALUE"',
     )
 
     result = RSerializedScanner().scan(str(path))
@@ -855,6 +888,8 @@ def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None
         "'token <- r\"(NOT_A_SECRET)\"'",
         '# r"{BROKEN; token <- r"(NOT_A_SECRET)"',
         '\'r"{BROKEN; token <- r"(NOT_A_SECRET)"\'',
+        'list(token = "standard")',
+        'function(token = "standard") NULL',
     ],
 )
 def test_scan_allows_assignment_examples_inside_benign_metadata(tmp_path: Path, metadata: str) -> None:

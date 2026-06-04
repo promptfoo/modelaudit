@@ -8,6 +8,7 @@ import ipaddress
 import lzma
 import os
 import re
+from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Any, ClassVar
 from urllib.parse import urlsplit, urlunsplit
@@ -54,27 +55,32 @@ _R_QUOTED_CREDENTIAL_KEY_PATTERN = (
 _R_UNQUOTED_CREDENTIAL_IDENTIFIER = rf"(?:`{_R_QUOTED_CREDENTIAL_KEY_PATTERN}`|\b{_R_CREDENTIAL_KEY_PATTERN}\b)"
 _R_QUOTED_CREDENTIAL_IDENTIFIER = rf"""(?:"{_R_QUOTED_CREDENTIAL_KEY_PATTERN}"|'{_R_QUOTED_CREDENTIAL_KEY_PATTERN}')"""
 _R_CREDENTIAL_IDENTIFIER = rf"(?:{_R_UNQUOTED_CREDENTIAL_IDENTIFIER}|{_R_QUOTED_CREDENTIAL_IDENTIFIER})"
+_R_ASSIGNMENT_INDEX_SUFFIX = r"(?:\s*(?:\[\[[^\]\r\n]{1,120}\]\]|\[[^\]\r\n]{1,120}\]))*"
+_R_MEMBER_CREDENTIAL_TARGET = (
+    rf"\b[a-z.][a-z0-9._]*\s*(?:\$|@)\s*{_R_UNQUOTED_CREDENTIAL_IDENTIFIER}{_R_ASSIGNMENT_INDEX_SUFFIX}"
+)
+_R_QUOTED_SUBSCRIPT_CREDENTIAL_TARGET = (
+    rf"\b[a-z.][a-z0-9._]*\s*(?:\[\[\s*|\[\s*){_R_QUOTED_CREDENTIAL_IDENTIFIER}"
+    rf"\s*(?:\]\]|\]){_R_ASSIGNMENT_INDEX_SUFFIX}"
+)
+_R_CREDENTIAL_TARGET = (
+    rf"(?:{_R_MEMBER_CREDENTIAL_TARGET}|{_R_QUOTED_SUBSCRIPT_CREDENTIAL_TARGET}|"
+    rf"{_R_CREDENTIAL_IDENTIFIER}{_R_ASSIGNMENT_INDEX_SUFFIX})"
+)
 _R_QUOTED_CREDENTIAL_VALUE = r"""(?:"(?:\\.|[^"\\]){6,}"|'(?:\\.|[^'\\]){6,}')"""
 _R_QUOTED_CREDENTIAL_VALUE_RE = re.compile(_R_QUOTED_CREDENTIAL_VALUE)
 _R_LEFTWARD_QUOTED_CREDENTIAL_ASSIGNMENT_RE = re.compile(
-    rf"""(?ix)(?:
-        {_R_UNQUOTED_CREDENTIAL_IDENTIFIER}\s*(?P<unquoted_operator>=|<{{1,2}}-)
-        |
-        {_R_QUOTED_CREDENTIAL_IDENTIFIER}\s*(?P<quoted_operator>=|<{{1,2}}-)
-    )\s*{_R_QUOTED_CREDENTIAL_VALUE}"""
+    rf"""(?ix){_R_CREDENTIAL_TARGET}\s*(?P<operator>=|<{{1,2}}-)\s*{_R_QUOTED_CREDENTIAL_VALUE}"""
 )
 _R_RIGHTWARD_QUOTED_CREDENTIAL_ASSIGNMENT_RE = re.compile(
-    rf"""(?ix){_R_QUOTED_CREDENTIAL_VALUE}\s*(?P<operator>->{{1,2}})\s*{_R_CREDENTIAL_IDENTIFIER}"""
+    rf"""(?ix){_R_QUOTED_CREDENTIAL_VALUE}\s*(?P<operator>->{{1,2}})\s*{_R_CREDENTIAL_TARGET}"""
 )
 _R_LEFTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE = re.compile(
-    rf"""(?ix)(?:
-        {_R_UNQUOTED_CREDENTIAL_IDENTIFIER}
-        |
-        {_R_QUOTED_CREDENTIAL_IDENTIFIER}
-    )\s*(?P<operator>=|<{{1,2}}-)\s*$"""
+    rf"""(?ix){_R_CREDENTIAL_TARGET}\s*(?P<operator>=|<{{1,2}}-)\s*$"""
 )
-_R_RIGHTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE = re.compile(rf"(?i)\s*(?P<operator>->{{1,2}})\s*{_R_CREDENTIAL_IDENTIFIER}")
-_R_RIGHTWARD_CREDENTIAL_TARGET_RE = re.compile(rf"(?i)->{{1,2}}\s*{_R_CREDENTIAL_IDENTIFIER}")
+_R_RIGHTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE = re.compile(rf"(?i)\s*(?P<operator>->{{1,2}})\s*{_R_CREDENTIAL_TARGET}")
+_R_LEFTWARD_CREDENTIAL_TARGET_RE = re.compile(rf"(?i){_R_CREDENTIAL_TARGET}\s*(?P<operator>=|<{{1,2}}-)\s*")
+_R_RIGHTWARD_CREDENTIAL_TARGET_RE = re.compile(rf"(?i)->{{1,2}}\s*{_R_CREDENTIAL_TARGET}")
 
 
 def _position_is_in_r_suppressing_non_code_span(
@@ -88,6 +94,29 @@ def _position_is_in_r_suppressing_non_code_span(
         if position < span_end:
             return span_start not in malformed_raw_span_starts
     return False
+
+
+def _r_innermost_code_delimiter(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> str | None:
+    stack: list[str] = []
+    cursor = 0
+    span_index = 0
+    while cursor < position:
+        if span_index < len(non_code_spans) and cursor == non_code_spans[span_index][0]:
+            cursor = non_code_spans[span_index][1]
+            span_index += 1
+            continue
+
+        character = text[cursor]
+        if character in "([{":
+            stack.append(character)
+        elif character in ")]}" and stack:
+            stack.pop()
+        cursor += 1
+    return stack[-1] if stack else None
 
 
 def _contains_r_raw_credential_assignment(text: str) -> bool:
@@ -125,11 +154,15 @@ def _contains_r_raw_credential_assignment(text: str) -> bool:
 def _contains_r_quoted_credential_assignment(text: str) -> bool:
     non_code_spans = _r_non_code_spans(text)
     for assignment_match in _R_LEFTWARD_QUOTED_CREDENTIAL_ASSIGNMENT_RE.finditer(text):
-        operator_start = assignment_match.start("unquoted_operator")
-        if operator_start < 0:
-            operator_start = assignment_match.start("quoted_operator")
-        if not _position_is_in_spans(operator_start, non_code_spans):
-            return True
+        operator_start = assignment_match.start("operator")
+        if _position_is_in_spans(operator_start, non_code_spans):
+            continue
+        if text[operator_start] == "=" and _r_innermost_code_delimiter(text, operator_start, non_code_spans) in {
+            "(",
+            "[",
+        }:
+            continue
+        return True
 
     for assignment_match in _R_RIGHTWARD_QUOTED_CREDENTIAL_ASSIGNMENT_RE.finditer(text):
         if not _position_is_in_spans(assignment_match.start("operator"), non_code_spans):
@@ -137,10 +170,36 @@ def _contains_r_quoted_credential_assignment(text: str) -> bool:
     return False
 
 
+def _r_expression_contains_credential_literal(expression: str) -> bool:
+    if _R_QUOTED_CREDENTIAL_VALUE_RE.search(expression):
+        return True
+    return any(
+        is_terminated and content_end - content_start >= 6
+        for _start, _end, content_start, content_end, is_terminated in _iter_r_raw_string_spans(expression)
+    )
+
+
 def _contains_r_expression_credential_assignment(text: str) -> bool:
-    previous_target_end = 0
     non_code_spans = _r_non_code_spans(text)
     statement_starts = _r_statement_starts(text, non_code_spans)
+    for target_match in _R_LEFTWARD_CREDENTIAL_TARGET_RE.finditer(text):
+        operator_start = target_match.start("operator")
+        if _position_is_in_spans(operator_start, non_code_spans):
+            continue
+        if text[operator_start] == "=" and _r_innermost_code_delimiter(text, operator_start, non_code_spans) in {
+            "(",
+            "[",
+        }:
+            continue
+
+        statement_index = bisect_right(statement_starts, target_match.start()) - 1
+        expression_end = (
+            statement_starts[statement_index + 1] - 1 if statement_index + 1 < len(statement_starts) else len(text)
+        )
+        if _r_expression_contains_credential_literal(text[target_match.end() : expression_end]):
+            return True
+
+    previous_target_end = 0
     for target_match in _R_RIGHTWARD_CREDENTIAL_TARGET_RE.finditer(text):
         if _position_is_in_spans(target_match.start(), non_code_spans):
             continue
@@ -150,11 +209,8 @@ def _contains_r_expression_credential_assignment(text: str) -> bool:
             previous_target_end,
         )
         expression = text[statement_start : target_match.start()]
-        if _R_QUOTED_CREDENTIAL_VALUE_RE.search(expression):
+        if _r_expression_contains_credential_literal(expression):
             return True
-        for _start, _end, content_start, content_end, is_terminated in _iter_r_raw_string_spans(expression):
-            if is_terminated and content_end - content_start >= 6:
-                return True
         previous_target_end = target_match.end()
     return False
 
