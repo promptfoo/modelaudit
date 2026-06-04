@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 from modelaudit.cache.cache_manager import reset_cache_manager
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
+from modelaudit.scanners.base import BaseScanner
 from modelaudit.utils.file.handlers import (
     MAX_RECORDED_MISSING_SHARD_INDICES,
     AdvancedFileHandler,
@@ -57,6 +58,15 @@ class IncompleteShardScanner:
         )
         result.finish(success=False)
         return result
+
+
+class RawDetectorMemoryMappedScanner(BaseScanner):
+    """Minimal scanner that exercises BaseScanner's raw detector helpers."""
+
+    name = "raw_detector_mmap"
+
+    def scan(self, path: str) -> ScanResult:
+        raise NotImplementedError
 
 
 _SHARD_SCAN_CONTEXT: ContextVar[str] = ContextVar("_SHARD_SCAN_CONTEXT", default="missing")
@@ -258,6 +268,25 @@ class TestMemoryMappedHandler:
 
         finally:
             os.unlink(temp_path)
+
+    def test_mmap_raw_detector_failure_is_unsuccessful(self, tmp_path: Path) -> None:
+        model_path = tmp_path / "detector-error.bin"
+        model_path.write_bytes(b"benign model content")
+        scanner = RawDetectorMemoryMappedScanner()
+
+        with patch(
+            "modelaudit.detectors.secrets.SecretsDetector.scan_model_weights",
+            side_effect=RuntimeError("detector failed"),
+        ):
+            result = MemoryMappedHandler(str(model_path), scanner).scan_with_mmap()
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "raw_detector_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Raw Detector Analysis Coverage" and check.details.get("detector") == "embedded_secrets"
+            for check in result.checks
+        )
 
 
 class TestAdvancedFileHandler:

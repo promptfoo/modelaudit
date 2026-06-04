@@ -243,7 +243,11 @@ class MemoryMappedHandler:
         Returns:
             ScanResult with findings
         """
-        from ...scanner_results import IssueSeverity, ScanResult
+        from ...scanner_results import (
+            IssueSeverity,
+            ScanResult,
+            scan_result_has_inconclusive_outcome,
+        )
 
         result = ScanResult(scanner_name=self.scanner.name)
         bytes_scanned = 0
@@ -292,9 +296,10 @@ class MemoryMappedHandler:
             )
 
         result.finish(
-            success=not any(
+            success=not scan_result_has_inconclusive_outcome(result)
+            and not any(
                 check.name == "Memory-Mapped Scan" and check.status.value == "failed" for check in result.checks
-            )
+            ),
         )
         return result
 
