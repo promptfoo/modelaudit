@@ -1150,6 +1150,7 @@ def test_lambda_safe_normalization_pattern_still_passes(tmp_path: Path) -> None:
     "function_str",
     [
         "lambda x: x * 2",
+        "lambda x: x / 255.0",
         "lambda x: tf.nn.softmax(x)",
         "lambda x: K.softmax(x)",
         "lambda x: (x - 128) / 128",
@@ -1423,6 +1424,64 @@ def test_lambda_malformed_source_fails_closed_without_echoing_source(tmp_path: P
     assert len(malformed_checks) == 1
     assert malformed_checks[0].severity == IssueSeverity.WARNING
     assert malformed_source not in str(malformed_checks[0].details)
+
+
+@pytest.mark.parametrize("malformed_source", ["lambda x: x / \u0661", "lambda\nx: x / 255"])
+def test_lambda_malformed_safe_pattern_lookalike_fails_closed(tmp_path: Path, malformed_source: str) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "malformed_safe_pattern_model",
+                "layers": [{"class_name": "Lambda", "config": {"function": malformed_source}}],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("validation_status") == "invalid_python"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("pattern_type") == "safe_normalization"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("unsafe_source", ["lambda x: x / 0", "lambda x: (x - 128) / 0"])
+def test_lambda_zero_divisor_is_not_allowlisted(tmp_path: Path, unsafe_source: str) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "zero_divisor_model",
+                "layers": [{"class_name": "Lambda", "config": {"function": unsafe_source}}],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("allowlist_status") == "not_allowlisted"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("pattern_type") == "safe_normalization"
+        for check in result.checks
+    )
 
 
 @pytest.mark.parametrize("function_value", [7, True])
@@ -2301,7 +2360,7 @@ def test_lambda_allowlisted_framework_module_reference_still_passes(tmp_path: Pa
                     {
                         "class_name": "Lambda",
                         "config": {
-                            "module": "Keras.layers",
+                            "module": "keras.ops",
                             "function_name": "normalize",
                         },
                     }
@@ -2318,6 +2377,143 @@ def test_lambda_allowlisted_framework_module_reference_still_passes(tmp_path: Pa
         check.name == "Lambda Layer Module Reference Check"
         and check.status == CheckStatus.PASSED
         and check.details.get("allowlist_status") == "allowlisted"
+        for check in result.checks
+    )
+
+
+def test_lambda_legacy_named_framework_function_still_passes(tmp_path: Path) -> None:
+    """Canonical legacy H5 named-callable metadata should use the reference allowlist."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "legacy_named_function_reference",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "function": "relu",
+                            "function_type": "function",
+                            "module": "keras.activations",
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="legacy_named_function_reference.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("function") == "relu"
+        and check.details.get("allowlist_status") == "allowlisted"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("allowlist_status") == "not_allowlisted"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("module_name", "function_name", "expected_severity"),
+    [
+        ("os", "system", IssueSeverity.CRITICAL),
+        ("custom_package.transforms", "normalize", IssueSeverity.WARNING),
+    ],
+)
+def test_lambda_legacy_named_function_reference_fails_closed(
+    tmp_path: Path,
+    module_name: str,
+    function_name: str,
+    expected_severity: IssueSeverity,
+) -> None:
+    """Legacy named callables outside the narrow allowlist must remain findings."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "legacy_named_function_reference",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "function": function_name,
+                            "function_type": "function",
+                            "module": module_name,
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="legacy_named_function_reference.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("module") == module_name
+        and check.details.get("function") == function_name
+    ]
+    assert len(matching_checks) == 1
+    assert matching_checks[0].severity == expected_severity
+    assert not any(
+        check.name == "Lambda Layer Module Reference Check" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("module_name", "function_name"),
+    [("keras.attacker", "identity"), ("math", "softmax"), ("Keras.ops", "normalize")],
+)
+def test_lambda_trusted_looking_module_reference_is_not_allowlisted(
+    tmp_path: Path,
+    module_name: str,
+    function_name: str,
+) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "trusted_looking_module_reference",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {"module": module_name, "function_name": function_name},
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="trusted_looking_module_reference.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        and check.details.get("allowlist_status") == "not_allowlisted"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Lambda Layer Module Reference Check" and check.status == CheckStatus.PASSED
         for check in result.checks
     )
 

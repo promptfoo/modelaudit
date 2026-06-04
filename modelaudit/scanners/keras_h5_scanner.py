@@ -1,6 +1,8 @@
 """Scanner for Keras HDF5 model files (.h5, .keras, .hdf5)."""
 
+import ast
 import json
+import math
 import os
 import re
 from collections.abc import Callable
@@ -49,33 +51,38 @@ class KerasH5Scanner(BaseScanner):
     description = "Scans Keras H5 model files for suspicious layer configurations"
     supported_extensions: ClassVar[list[str]] = [".h5", ".hdf5", ".keras"]
     _JSON_ATTRIBUTE_PARSE_FAILED: ClassVar[object] = object()
-    _SAFE_K_BACKEND_LAMBDA_FUNCTIONS_RE: ClassVar[str] = (
-        r"(?:abs|elu|hard_sigmoid|l2_normalize|relu|sigmoid|softmax|softplus|softsign|tanh)"
+    _SAFE_K_BACKEND_LAMBDA_FUNCTIONS: ClassVar[frozenset[str]] = frozenset(
+        {"abs", "elu", "hard_sigmoid", "l2_normalize", "relu", "sigmoid", "softmax", "softplus", "softsign", "tanh"}
     )
-    _SAFE_TF_NN_LAMBDA_FUNCTIONS_RE: ClassVar[str] = (
-        r"(?:elu|gelu|leaky_relu|l2_normalize|log_softmax|relu|relu6|selu|sigmoid|softmax|softplus|softsign|swish|tanh)"
-    )
-    _SAFE_LAMBDA_PATTERNS: ClassVar[tuple[re.Pattern[str], ...]] = (
-        re.compile(r"^lambda\s+x\s*:\s*x\s*/\s*\d+$"),
-        re.compile(r"^lambda\s+x\s*:\s*x\s*\*\s*\d+$"),
-        re.compile(rf"^lambda\s+x\s*:\s*tf\.nn\.{_SAFE_TF_NN_LAMBDA_FUNCTIONS_RE}\(x\)$"),
-        re.compile(rf"^lambda\s+x\s*:\s*K\.{_SAFE_K_BACKEND_LAMBDA_FUNCTIONS_RE}\(x\)$"),
-        re.compile(r"^lambda\s+x\s*:\s*\(x\s*-\s*\d+\)\s*/\s*\d+$"),
-    )
-    _SAFE_LAMBDA_MODULE_ROOTS: ClassVar[frozenset[str]] = frozenset(
-        {"keras", "tensorflow", "tf_keras", "tf", "numpy", "math"}
-    )
-    _SAFE_LAMBDA_FUNCTION_NAMES: ClassVar[frozenset[str]] = frozenset(
+    _SAFE_TF_NN_LAMBDA_FUNCTIONS: ClassVar[frozenset[str]] = frozenset(
         {
-            "abs",
-            "identity",
-            "normalize",
+            "elu",
+            "gelu",
+            "l2_normalize",
+            "leaky_relu",
+            "log_softmax",
             "relu",
+            "relu6",
+            "selu",
             "sigmoid",
             "softmax",
+            "softplus",
+            "softsign",
+            "swish",
             "tanh",
         }
     )
+    _SAFE_LAMBDA_MODULE_FUNCTIONS: ClassVar[dict[str, frozenset[str]]] = {
+        "keras.backend": _SAFE_K_BACKEND_LAMBDA_FUNCTIONS,
+        "keras.activations": frozenset(
+            {"elu", "gelu", "hard_sigmoid", "relu", "selu", "sigmoid", "softmax", "softplus", "softsign", "tanh"}
+        ),
+        "keras.ops": frozenset({"abs", "identity", "normalize", "relu", "sigmoid", "softmax", "tanh"}),
+        "tensorflow": frozenset({"abs", "identity", "sigmoid", "tanh"}),
+        "tensorflow.math": frozenset({"abs", "sigmoid", "tanh"}),
+        "tensorflow.nn": _SAFE_TF_NN_LAMBDA_FUNCTIONS,
+        "tf_keras.backend": _SAFE_K_BACKEND_LAMBDA_FUNCTIONS,
+    }
     _DANGEROUS_LAMBDA_MODULE_TOKENS: ClassVar[frozenset[str]] = frozenset(
         {
             "__builtin__",
@@ -1059,8 +1066,16 @@ class KerasH5Scanner(BaseScanner):
 
         # Extract potential Python code from Lambda config
         function_str = layer_config.get("function")
+        function_type = layer_config.get("function_type")
         module_name = layer_config.get("module")
         function_name = layer_config.get("function_name")
+
+        # Legacy Keras H5 stores named callables in `function` and distinguishes
+        # them from serialized Lambda code with `function_type="function"`.
+        is_named_function_reference = function_type == "function"
+        reference_function_name = function_name
+        if reference_function_name is None and is_named_function_reference:
+            reference_function_name = function_str
 
         layer_name = layer_config.get("name", "lambda")
         encoded_function_handled = False
@@ -1097,9 +1112,9 @@ class KerasH5Scanner(BaseScanner):
             )
 
         # Check if there's actual Python code to validate
-        if function_str and isinstance(function_str, str):
-            # First check if it matches safe patterns
-            is_safe_pattern = any(pattern.match(function_str.strip()) for pattern in self._SAFE_LAMBDA_PATTERNS)
+        if function_str and isinstance(function_str, str) and not is_named_function_reference:
+            is_valid, error = validate_python_syntax(function_str)
+            is_safe_pattern = is_valid and self._is_lambda_source_allowlisted(function_str)
 
             if is_safe_pattern:
                 result.add_check(
@@ -1114,9 +1129,6 @@ class KerasH5Scanner(BaseScanner):
                     rule_code=None,  # Passing check
                 )
             else:
-                # This might be serialized Python code
-                is_valid, error = validate_python_syntax(function_str)
-
                 if is_valid:
                     # It's valid Python! Check if it's dangerous
                     is_dangerous, risk_desc = is_code_potentially_dangerous(function_str, "low")
@@ -1170,7 +1182,11 @@ class KerasH5Scanner(BaseScanner):
                         rule_code="S507",
                     )
                     function_requires_review = True
-        elif function_str is not None and not isinstance(function_str, (dict, list)):
+        elif (
+            function_str is not None
+            and not isinstance(function_str, (dict, list))
+            and not (is_named_function_reference and isinstance(function_str, str))
+        ):
             result.add_check(
                 name="Lambda Layer Code Analysis",
                 passed=False,
@@ -1186,14 +1202,14 @@ class KerasH5Scanner(BaseScanner):
             )
             function_requires_review = True
 
-        module_reference_values = (module_name, function_name)
+        module_reference_values = (module_name, reference_function_name)
         has_invalid_module_reference = any(
             value is not None and not isinstance(value, str) for value in module_reference_values
         )
         has_module_reference = any(isinstance(value, str) and bool(value.strip()) for value in module_reference_values)
         if has_module_reference or has_invalid_module_reference:
             # Module/function reference - check for dangerous imports
-            if self._is_lambda_module_reference_dangerous(module_name, function_name):
+            if self._is_lambda_module_reference_dangerous(module_name, reference_function_name):
                 result.add_check(
                     name="Lambda Layer Module Reference Check",
                     passed=False,
@@ -1203,7 +1219,7 @@ class KerasH5Scanner(BaseScanner):
                     details={
                         "layer_class": "Lambda",
                         "module": module_name,
-                        "function": function_name,
+                        "function": reference_function_name,
                     },
                     why=get_pattern_explanation("lambda_layer"),
                     rule_code="S1103",
@@ -1218,14 +1234,14 @@ class KerasH5Scanner(BaseScanner):
                     details={
                         "layer_class": "Lambda",
                         "module_type": type(module_name).__name__,
-                        "function_type": type(function_name).__name__,
+                        "function_type": type(reference_function_name).__name__,
                     },
                     why="Malformed Lambda module references cannot be safely classified.",
                     rule_code="S1103",
                 )
             elif encoded_function_handled or function_requires_review:
                 pass
-            elif self._is_lambda_module_reference_allowlisted(module_name, function_name):
+            elif self._is_lambda_module_reference_allowlisted(module_name, reference_function_name):
                 result.add_check(
                     name="Lambda Layer Module Reference Check",
                     passed=True,
@@ -1234,7 +1250,7 @@ class KerasH5Scanner(BaseScanner):
                     details={
                         "layer_class": "Lambda",
                         "module": module_name,
-                        "function": function_name,
+                        "function": reference_function_name,
                         "allowlist_status": "allowlisted",
                     },
                     rule_code=None,  # Passing check
@@ -1249,7 +1265,7 @@ class KerasH5Scanner(BaseScanner):
                     details={
                         "layer_class": "Lambda",
                         "module": module_name,
-                        "function": function_name,
+                        "function": reference_function_name,
                         "allowlist_status": "not_allowlisted",
                     },
                     why=get_pattern_explanation("lambda_layer"),
@@ -1373,6 +1389,75 @@ class KerasH5Scanner(BaseScanner):
         module_tokens = {token.strip().lower() for token in re.split(r"[^0-9A-Za-z_]+", module_name) if token.strip()}
         return bool(module_tokens & cls._DANGEROUS_LAMBDA_MODULE_TOKENS)
 
+    @staticmethod
+    def _safe_lambda_number(node: ast.AST, *, allow_zero: bool = True) -> bool:
+        if (
+            not isinstance(node, ast.Constant)
+            or isinstance(node.value, bool)
+            or not isinstance(node.value, (int, float))
+        ):
+            return False
+        if isinstance(node.value, float) and not math.isfinite(node.value):
+            return False
+        return allow_zero or node.value != 0
+
+    @classmethod
+    def _is_lambda_source_allowlisted(cls, source: str) -> bool:
+        """Accept only simple normalization or framework activation Lambda expressions."""
+        try:
+            expression = ast.parse(source.strip(), mode="eval")
+        except SyntaxError:
+            return False
+
+        lambda_node = expression.body
+        if not isinstance(lambda_node, ast.Lambda):
+            return False
+        args = lambda_node.args
+        if (
+            len(args.args) != 1
+            or args.args[0].arg != "x"
+            or args.posonlyargs
+            or args.kwonlyargs
+            or args.vararg is not None
+            or args.kwarg is not None
+            or args.defaults
+            or args.kw_defaults
+        ):
+            return False
+
+        body = lambda_node.body
+        if isinstance(body, ast.BinOp) and isinstance(body.left, ast.Name) and body.left.id == "x":
+            if isinstance(body.op, ast.Mult):
+                return cls._safe_lambda_number(body.right)
+            if isinstance(body.op, ast.Div):
+                return cls._safe_lambda_number(body.right, allow_zero=False)
+
+        if (
+            isinstance(body, ast.BinOp)
+            and isinstance(body.op, ast.Div)
+            and cls._safe_lambda_number(body.right, allow_zero=False)
+            and isinstance(body.left, ast.BinOp)
+            and isinstance(body.left.op, ast.Sub)
+            and isinstance(body.left.left, ast.Name)
+            and body.left.left.id == "x"
+        ):
+            return cls._safe_lambda_number(body.left.right)
+
+        if not isinstance(body, ast.Call) or body.keywords or len(body.args) != 1:
+            return False
+        if not isinstance(body.args[0], ast.Name) or body.args[0].id != "x" or not isinstance(body.func, ast.Attribute):
+            return False
+
+        if isinstance(body.func.value, ast.Name) and body.func.value.id == "K":
+            return body.func.attr in cls._SAFE_K_BACKEND_LAMBDA_FUNCTIONS
+        return (
+            isinstance(body.func.value, ast.Attribute)
+            and body.func.value.attr == "nn"
+            and isinstance(body.func.value.value, ast.Name)
+            and body.func.value.value.id == "tf"
+            and body.func.attr in cls._SAFE_TF_NN_LAMBDA_FUNCTIONS
+        )
+
     @classmethod
     def _is_lambda_module_reference_allowlisted(cls, module_name: Any, function_name: Any) -> bool:
         """Return True for explicitly safe functions from trusted framework roots."""
@@ -1383,9 +1468,11 @@ class KerasH5Scanner(BaseScanner):
             or not function_name.strip()
         ):
             return False
-        module_root = module_name.strip().split(".")[0].lower()
+        normalized_module = module_name.strip()
+        if normalized_module != normalized_module.lower():
+            return False
         normalized_function = function_name.strip().lower()
-        return module_root in cls._SAFE_LAMBDA_MODULE_ROOTS and normalized_function in cls._SAFE_LAMBDA_FUNCTION_NAMES
+        return normalized_function in cls._SAFE_LAMBDA_MODULE_FUNCTIONS.get(normalized_module, frozenset())
 
     def _check_config_for_suspicious_strings(
         self,
