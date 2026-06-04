@@ -3121,8 +3121,15 @@ def test_scan_bytes_detects_copyreg_dispatch_table_erasure() -> None:
         copyreg.dispatch_table.update(original_dispatch_table)
 
 
-def test_scan_bytes_does_not_flag_dill_dump_as_dangerous() -> None:
+def test_scan_bytes_does_not_flag_trusted_dill_dump_as_dangerous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     payload = b"\x80\x02cdill\ndump\n(tR."
+    monkeypatch.setattr(
+        package_api,
+        "import_only_reference_is_proven_trusted",
+        lambda module, name: (module, name) == ("dill", "dump"),
+    )
 
     report = scan_bytes(payload, source="dill-dump.pkl")
 
