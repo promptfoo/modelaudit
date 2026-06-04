@@ -58,7 +58,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - warn on import-only pickle globals that reference non-allowlisted custom modules,
   shadow trusted modules, rewrite package import paths, or rely on unchecked bytecode caches
 - preserve reviewed safe callable references in dependency-minimal environments and
-  recognize package-manager overlay installs without trusting project-local shadows
+  recognize active-environment package overlays without trusting project-local shadows
 - prevent call-graph alias cycles from hanging scans
 - detect nested brace-format lookups that reach tracked `defaultdict` factories
 - avoid `str.format` false positives when a `ChainMap` shadows a `defaultdict`

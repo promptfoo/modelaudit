@@ -48,6 +48,9 @@ _MAX_WILDCARD_IMPORTS = 16
 _MAX_WILDCARD_REEXPORT_DEPTH = 4
 _MAX_SHORT_SINK_DEPTH = 2
 _MAX_DISTRIBUTIONS_PER_TOP_LEVEL = 16
+_MAX_TRUSTED_PTH_FILES = 64
+_MAX_TRUSTED_PTH_BYTES = 64 * 1024
+_MAX_TRUSTED_PTH_PATHS = 64
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
 _IMPORT_EXECUTION_SINK = "builtins.__import__"
 _IMPORT_EXECUTION_SAFE_MODULES = frozenset(sys.builtin_module_names)
@@ -58,6 +61,97 @@ _TRUSTED_STDLIB_PATHS = tuple(
 _TRUSTED_SITE_PACKAGE_PATHS = tuple(
     Path(path).resolve() for name in ("purelib", "platlib") if (path := sysconfig.get_path(name))
 )
+
+
+def _site_package_root_from_pth_value(value: str, trusted_root: Path) -> Path | None:
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = trusted_root / candidate
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if resolved.name not in {"site-packages", "dist-packages"}:
+        return None
+    try:
+        return resolved if resolved.is_dir() else None
+    except OSError:
+        return None
+
+
+def _pth_delegated_site_package_paths(pth_path: Path, trusted_root: Path) -> tuple[Path, ...]:
+    try:
+        if pth_path.stat().st_size > _MAX_TRUSTED_PTH_BYTES:
+            return ()
+        content = pth_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return ()
+
+    paths: list[Path] = []
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        values: list[str] = []
+        if line.startswith(("import ", "import\t")):
+            try:
+                tree = ast.parse(line, filename=str(pth_path))
+            except SyntaxError:
+                continue
+            for statement in tree.body:
+                if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+                    continue
+                node = statement.value
+                if len(node.args) != 1 or node.keywords:
+                    continue
+                function = node.func
+                argument = node.args[0]
+                if not (
+                    isinstance(function, ast.Attribute)
+                    and isinstance(function.value, ast.Name)
+                    and function.value.id == "site"
+                    and function.attr == "addsitedir"
+                    and isinstance(argument, ast.Constant)
+                    and isinstance(argument.value, str)
+                ):
+                    continue
+                values.append(argument.value)
+        else:
+            values.append(line)
+
+        for value in values:
+            path = _site_package_root_from_pth_value(value, trusted_root)
+            if path is not None and path not in paths:
+                paths.append(path)
+                if len(paths) >= _MAX_TRUSTED_PTH_PATHS:
+                    return tuple(paths)
+    return tuple(paths)
+
+
+def _trusted_delegated_site_package_paths() -> tuple[Path, ...]:
+    paths: list[Path] = []
+    files_seen = 0
+    for trusted_root in _TRUSTED_SITE_PACKAGE_PATHS:
+        try:
+            pth_paths = trusted_root.glob("*.pth")
+            for pth_path in pth_paths:
+                if files_seen >= _MAX_TRUSTED_PTH_FILES:
+                    return tuple(paths)
+                files_seen += 1
+                for path in _pth_delegated_site_package_paths(pth_path, trusted_root):
+                    if path not in paths:
+                        paths.append(path)
+                        if len(paths) >= _MAX_TRUSTED_PTH_PATHS:
+                            return tuple(paths)
+        except OSError:
+            continue
+    return tuple(paths)
+
+
+# Active-environment .pth files are trusted startup configuration. They may
+# delegate additional installed-package roots without making every venv-shaped
+# directory on sys.path trusted.
+_TRUSTED_DELEGATED_SITE_PACKAGE_PATHS = _trusted_delegated_site_package_paths()
 _IMPORT_AFFECTING_MODULE_NAMES = frozenset({"__loader__", "__package__", "__path__", "__spec__"})
 _TRUSTED_IMPORT_ONLY_REFERENCES = frozenset(
     {
@@ -188,14 +282,8 @@ def _installed_distribution_roots(top_level_name: str) -> tuple[Path, ...]:
 
 
 def _path_is_in_trusted_package_environment(path: Path) -> bool:
-    if any(path.is_relative_to(trusted_path) for trusted_path in _TRUSTED_SITE_PACKAGE_PATHS):
-        return True
-    for environment_root in path.parents:
-        if not (environment_root / "pyvenv.cfg").is_file():
-            continue
-        relative_parts = path.relative_to(environment_root).parts
-        return "site-packages" in relative_parts
-    return False
+    trusted_paths = (*_TRUSTED_SITE_PACKAGE_PATHS, *_TRUSTED_DELEGATED_SITE_PACKAGE_PATHS)
+    return any(path.is_relative_to(trusted_path) for trusted_path in trusted_paths)
 
 
 _CLASS_ENTRYPOINT_METHODS = (

@@ -186,7 +186,7 @@ def test_trusted_origin_rejects_local_distribution_metadata_outside_trusted_inst
     assert call_graph._trusted_module_origin_kind("_pytest._py.path") is None
 
 
-def test_trusted_origin_recognizes_uv_environment_overlay(
+def test_trusted_origin_rejects_inactive_lookalike_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -203,7 +203,63 @@ def test_trusted_origin_recognizes_uv_environment_overlay(
     monkeypatch.syspath_prepend(str(site_packages))
     call_graph._clear_source_sensitive_caches()
 
+    assert call_graph._trusted_module_origin_kind("_pytest._py.path") is None
+
+
+def test_trusted_origin_recognizes_active_environment_delegated_overlay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active_site_packages = tmp_path / "active" / "lib" / "python" / "site-packages"
+    active_site_packages.mkdir(parents=True)
+    overlay_site_packages = tmp_path / "overlay" / "lib" / "python" / "site-packages"
+    package_dir = overlay_site_packages / "_pytest" / "_py"
+    package_dir.mkdir(parents=True)
+    (overlay_site_packages / "_pytest" / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "path.py").write_text("class LocalPath:\n    pass\n", encoding="utf-8")
+    (active_site_packages / "_uv_ephemeral_overlay.pth").write_text(
+        f"import site; site.addsitedir({str(overlay_site_packages)!r})\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(call_graph, "_TRUSTED_SITE_PACKAGE_PATHS", (active_site_packages.resolve(),))
+    monkeypatch.setattr(
+        call_graph,
+        "_TRUSTED_DELEGATED_SITE_PACKAGE_PATHS",
+        call_graph._trusted_delegated_site_package_paths(),
+    )
+    monkeypatch.syspath_prepend(str(overlay_site_packages))
+    call_graph._clear_source_sensitive_caches()
+
     assert call_graph._trusted_module_origin_kind("_pytest._py.path") == "site_packages"
+
+
+def test_trusted_origin_ignores_nonexecuted_pth_addsitedir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active_site_packages = tmp_path / "active" / "lib" / "python" / "site-packages"
+    active_site_packages.mkdir(parents=True)
+    overlay_site_packages = tmp_path / "overlay" / "lib" / "python" / "site-packages"
+    package_dir = overlay_site_packages / "_pytest" / "_py"
+    package_dir.mkdir(parents=True)
+    (overlay_site_packages / "_pytest" / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "path.py").write_text("class LocalPath:\n    pass\n", encoding="utf-8")
+    (active_site_packages / "deferred-overlay.pth").write_text(
+        f"import site; deferred = lambda: site.addsitedir({str(overlay_site_packages)!r})\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(call_graph, "_TRUSTED_SITE_PACKAGE_PATHS", (active_site_packages.resolve(),))
+    monkeypatch.setattr(
+        call_graph,
+        "_TRUSTED_DELEGATED_SITE_PACKAGE_PATHS",
+        call_graph._trusted_delegated_site_package_paths(),
+    )
+    monkeypatch.syspath_prepend(str(overlay_site_packages))
+    call_graph._clear_source_sensitive_caches()
+
+    assert call_graph._trusted_module_origin_kind("_pytest._py.path") is None
 
 
 def test_legacy_builtin_module_alias_does_not_require_origin_review() -> None:

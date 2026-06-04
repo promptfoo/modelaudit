@@ -4205,22 +4205,29 @@ def test_scan_bytes_warns_when_known_safe_reference_resolves_to_shadow_module(
     )
 
 
-def test_scan_bytes_warns_when_allowlisted_module_resolves_to_shadow_module(
+def test_scan_bytes_warns_when_allowlisted_module_resolves_from_inactive_fake_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    environment_root = tmp_path / "fakeenv"
+    site_packages = (
+        environment_root / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    )
+    site_packages.mkdir(parents=True)
+    (environment_root / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
     marker = tmp_path / "shadowed_allowlisted_module_marker"
-    (tmp_path / "numpy.py").write_text(
+    (site_packages / "numpy.py").write_text(
         f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
         encoding="utf-8",
     )
-    dist_info = tmp_path / "numpy-1.0.dist-info"
+    dist_info = site_packages / "numpy-1.0.dist-info"
     dist_info.mkdir()
     (dist_info / "METADATA").write_text("Name: numpy\nVersion: 1.0\n", encoding="utf-8")
     (dist_info / "top_level.txt").write_text("numpy\n", encoding="utf-8")
-    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.syspath_prepend(str(site_packages))
+    payload = b"cnumpy\nGadget\n."
 
-    report = scan_bytes(b"cnumpy\nGadget\n.", source="shadowed-numpy-gadget.pkl")
+    report = scan_bytes(payload, source="shadowed-numpy-gadget.pkl")
 
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.SUSPICIOUS
@@ -4229,6 +4236,9 @@ def test_scan_bytes_warns_when_allowlisted_module_resolves_to_shadow_module(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.Gadget"
         for finding in report.findings
     )
+    load_payload = f"import pickle, sys; sys.path.insert(0, {str(site_packages)!r}); pickle.loads({payload!r})"
+    subprocess.run([sys.executable, "-c", load_payload], check=True)
+    assert marker.read_text(encoding="utf-8") == "owned"
 
 
 def test_scan_bytes_preserves_origin_review_when_call_graph_enrichment_is_disabled(
