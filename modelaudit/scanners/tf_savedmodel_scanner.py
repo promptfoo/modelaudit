@@ -23,6 +23,7 @@ from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
+from ._evidence_redaction import REDACTED_URL_CREDENTIALS, redact_evidence_string
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .keras_utils import find_case_insensitive_substrings, find_lambda_dangerous_patterns
 
@@ -120,6 +121,80 @@ _COLLECTION_COMMAND_RE = re.compile(
 _COLLECTION_NETWORK_RE = re.compile(
     r"(?i)(?:https?://|wss?://|ftp://|tcp://|udp://|\bsocket\b|\b(?:\d{1,3}\.){3}\d{1,3}\b)"
 )
+_STANDALONE_KEY_SECRET_RE = re.compile(
+    r"\b(?:"
+    r"AKIA[0-9A-Z]{16}|"
+    r"gh[ps]_[A-Za-z0-9]{36}|"
+    r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|"
+    r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_.+/=-]*|"
+    r"sk-(?:proj-)?[A-Za-z0-9]{24,}|"
+    r"xox[baprs]-[0-9A-Za-z-]{20,}"
+    r")\b"
+)
+_PREVIEW_TOKEN_LOOKAHEAD_CHARS = 512
+_PREVIEW_TOKEN_SUFFIX_RE = re.compile(r"([A-Za-z0-9._~+-]+)\Z")
+_PREVIEW_TOKEN_CONTINUATION_RE = re.compile(r"[A-Za-z0-9._~+=-]*")
+_PREVIEW_URL_SUFFIX_RE = re.compile(
+    r"(?i)(?P<scheme>(?:https?|ftp|ftps|ssh|telnet|wss?|tcp|udp|s3|gs|az|wasbs?|abfss?|file)://)"
+    r"[^\s\"'<>]*\Z"
+)
+_PREVIEW_URL_CONTINUATION_RE = re.compile(r"[^\s\"'<>]*")
+_URL_AUTHORITY_TERMINATOR_RE = re.compile(r"[/?#]")
+
+
+def _redact_sensitive_preview_text(text: str) -> str:
+    """Redact secret-shaped values from attacker-controlled evidence previews."""
+    redacted = redact_evidence_string(text, max_chars=None)
+    return _STANDALONE_KEY_SECRET_RE.sub("<redacted>", redacted)
+
+
+def _url_authority_contains_userinfo(url_text: str) -> bool:
+    rest = url_text.split("://", 1)[1]
+    authority = _URL_AUTHORITY_TERMINATOR_RE.split(rest, maxsplit=1)[0]
+    return "@" in authority
+
+
+def _redact_preview_boundary_url_userinfo_prefix(text: str, limit: int) -> str:
+    preview_source = text[:limit]
+    suffix_match = _PREVIEW_URL_SUFFIX_RE.search(preview_source)
+    if suffix_match is None:
+        return preview_source
+
+    lookahead = text[limit : limit + _PREVIEW_TOKEN_LOOKAHEAD_CHARS]
+    continuation_match = _PREVIEW_URL_CONTINUATION_RE.match(lookahead)
+    candidate = suffix_match.group(0) + (continuation_match.group(0) if continuation_match else "")
+    if not _url_authority_contains_userinfo(candidate) or _url_authority_contains_userinfo(suffix_match.group(0)):
+        return preview_source
+
+    return f"{preview_source[: suffix_match.start()]}{suffix_match.group('scheme')}{REDACTED_URL_CREDENTIALS}"
+
+
+def _redact_preview_boundary_secret_prefix(text: str, limit: int) -> str:
+    preview_source = text[:limit]
+    url_redacted = _redact_preview_boundary_url_userinfo_prefix(text, limit)
+    if url_redacted != preview_source:
+        return url_redacted
+
+    suffix_match = _PREVIEW_TOKEN_SUFFIX_RE.search(preview_source)
+    if suffix_match is None:
+        return preview_source
+
+    lookahead = text[limit : limit + _PREVIEW_TOKEN_LOOKAHEAD_CHARS]
+    continuation_match = _PREVIEW_TOKEN_CONTINUATION_RE.match(lookahead)
+    candidate = suffix_match.group(1) + (continuation_match.group(0) if continuation_match else "")
+    if not _STANDALONE_KEY_SECRET_RE.fullmatch(candidate):
+        return preview_source
+
+    return f"{preview_source[: suffix_match.start(1)]}<redacted>"
+
+
+def _safe_decoded_preview(text: str, limit: int) -> str:
+    """Return a bounded decoded preview safe for serialized findings."""
+    preview_source = _redact_preview_boundary_secret_prefix(text, limit) if len(text) > limit else text
+    redacted = _redact_sensitive_preview_text(preview_source)
+    if len(text) <= limit and len(redacted) <= limit:
+        return redacted
+    return f"{redacted[:limit]}..."
 
 
 def _looks_like_pe_executable(content_head: bytes) -> bool:
@@ -974,7 +1049,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             details={
                                 "collection_key": key,
                                 "index": index,
-                                "value_preview": decoded[:200],
+                                "value_preview": _safe_decoded_preview(decoded, 200),
                                 "meta_graph": meta_graph_tag,
                             },
                         )
@@ -1260,7 +1335,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         {
                             "op_type": node.op,
                             "code_analysis": risk_desc if is_dangerous else "Contains executable code",
-                            "code_preview": python_code[:200] + "..." if len(python_code) > 200 else python_code,
+                            "code_preview": _safe_decoded_preview(python_code, 200),
                             "validation_status": "valid_python",
                         },
                     ),
@@ -1280,7 +1355,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         {
                             "op_type": node.op,
                             "validation_error": error,
-                            "data_preview": python_code[:100] + "..." if len(python_code) > 100 else python_code,
+                            "data_preview": _safe_decoded_preview(python_code, 100),
                         },
                     ),
                     why=get_tf_op_explanation(node.op),
@@ -1371,9 +1446,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     details={
                                         "layer_type": "Lambda",
                                         "dangerous_patterns": found_patterns,
-                                        "code_preview": decoded_str[:200] + "..."
-                                        if len(decoded_str) > 200
-                                        else decoded_str,
+                                        "code_preview": _safe_decoded_preview(decoded_str, 200),
                                         "encoding": "base64",
                                     },
                                     why=(
@@ -1391,9 +1464,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     location=path,
                                     details={
                                         "layer_type": "Lambda",
-                                        "code_preview": decoded_str[:100] + "..."
-                                        if len(decoded_str) > 100
-                                        else decoded_str,
+                                        "code_preview": _safe_decoded_preview(decoded_str, 100),
                                     },
                                     why=(
                                         "Lambda layers can execute arbitrary Python code. "
