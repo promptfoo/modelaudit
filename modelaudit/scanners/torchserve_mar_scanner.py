@@ -62,6 +62,10 @@ SAFE_IMPORT_TIME_CALLS = {
     "logging.getLogger",
 }
 
+_DYNAMIC_IMPORT_HELPERS = frozenset({"__import__", "builtins.__import__", "importlib.import_module"})
+_DYNAMIC_GETATTR_HELPERS = frozenset({"getattr", "builtins.getattr"})
+_DYNAMIC_ASSIGNABLE_HELPERS = _DYNAMIC_IMPORT_HELPERS | _DYNAMIC_GETATTR_HELPERS
+
 
 def redact_manifest_url_reference(value: str) -> str:
     """Return a display-safe URL reference for scan output."""
@@ -1381,8 +1385,10 @@ class TorchServeMarScanner(BaseScanner):
         return None
 
     @staticmethod
-    def _function_local_binding_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
-        """Return names Python treats as local bindings in a function body."""
+    def _callable_local_binding_names(
+        node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+    ) -> set[str]:
+        """Return names Python treats as local bindings in a callable body."""
 
         class LocalBindingVisitor(ast.NodeVisitor):
             def __init__(self) -> None:
@@ -1514,30 +1520,18 @@ class TorchServeMarScanner(BaseScanner):
                 return
 
         collector = LocalBindingVisitor()
-        for statement in node.body:
-            collector.visit(statement)
+        if isinstance(node, ast.Lambda):
+            collector.visit(node.body)
+        else:
+            for statement in node.body:
+                collector.visit(statement)
         return collector.bound_names - collector.global_names - collector.nonlocal_names
 
-    def _dynamic_import_module_names(
+    def _module_names_for_import_helpers(
         self,
-        node: ast.AST,
-        aliases: dict[str, str],
-        import_loader_aliases: dict[str, frozenset[str]],
-        shadowed_names: set[str],
+        node: ast.Call,
+        import_helpers: frozenset[str],
     ) -> frozenset[str]:
-        if not isinstance(node, ast.Call):
-            return frozenset()
-
-        helper_name = self._resolve_call_name(node.func)
-        if helper_name is None:
-            return frozenset()
-
-        resolved_helper_names = import_loader_aliases.get(helper_name)
-        if resolved_helper_names is None:
-            if helper_name.split(".", maxsplit=1)[0] in shadowed_names:
-                return frozenset()
-            resolved_helper_names = frozenset({self._apply_alias(helper_name, aliases)})
-        import_helpers = resolved_helper_names & {"__import__", "builtins.__import__", "importlib.import_module"}
         if not import_helpers:
             return frozenset()
 
@@ -1568,6 +1562,27 @@ class TorchServeMarScanner(BaseScanner):
                 module_names.update({module_name, module_name.split(".", maxsplit=1)[0]})
         return frozenset(module_names)
 
+    def _dynamic_import_module_names(
+        self,
+        node: ast.AST,
+        aliases: dict[str, str],
+        import_loader_aliases: dict[str, frozenset[str]],
+        shadowed_names: set[str],
+    ) -> frozenset[str]:
+        if not isinstance(node, ast.Call):
+            return frozenset()
+
+        helper_name = self._resolve_call_name(node.func)
+        if helper_name is None:
+            return frozenset()
+
+        resolved_helper_names = import_loader_aliases.get(helper_name)
+        if resolved_helper_names is None:
+            if helper_name.split(".", maxsplit=1)[0] in shadowed_names:
+                return frozenset()
+            resolved_helper_names = frozenset({self._apply_alias(helper_name, aliases)})
+        return self._module_names_for_import_helpers(node, resolved_helper_names & _DYNAMIC_IMPORT_HELPERS)
+
     def _resolve_dynamic_import_roots(
         self,
         node: ast.AST,
@@ -1578,6 +1593,14 @@ class TorchServeMarScanner(BaseScanner):
     ) -> frozenset[str]:
         if isinstance(node, ast.Name):
             return module_aliases.get(node.id, frozenset())
+        if isinstance(node, ast.NamedExpr):
+            return self._resolve_dynamic_import_roots(
+                node.value,
+                aliases,
+                module_aliases,
+                import_loader_aliases,
+                shadowed_names,
+            )
         if isinstance(node, ast.Attribute):
             parents = self._resolve_dynamic_import_roots(
                 node.value,
@@ -1600,7 +1623,8 @@ class TorchServeMarScanner(BaseScanner):
                 import_loader_aliases,
                 shadowed_names,
             )
-            retained_roots = {root for root in factory_roots if root == "webbrowser.get"}
+            retained_roots = set(self._module_names_for_import_helpers(node, factory_roots & _DYNAMIC_IMPORT_HELPERS))
+            retained_roots.update(root for root in factory_roots if root == "webbrowser.get")
             if "ctypes.LibraryLoader" in factory_roots:
                 dlltype_node: ast.AST | None = node.args[0] if node.args else None
                 for keyword in node.keywords:
@@ -1627,14 +1651,39 @@ class TorchServeMarScanner(BaseScanner):
         import_loader_aliases: dict[str, frozenset[str]],
         shadowed_names: set[str],
     ) -> frozenset[str]:
-        helper_name = self._resolve_call_name(node.func)
-        if helper_name is None:
-            return frozenset()
+        roots = self._resolve_dynamic_import_getattr_roots(
+            node,
+            aliases,
+            module_aliases,
+            import_loader_aliases,
+            shadowed_names,
+        )
+        return frozenset(
+            call_name for root in roots if (call_name := _normalized_high_risk_python_call_name(root)) is not None
+        )
 
-        if helper_name.split(".", maxsplit=1)[0] in shadowed_names:
-            return frozenset()
-        resolved_helper_name = self._apply_alias(helper_name, aliases)
-        if resolved_helper_name not in {"getattr", "builtins.getattr"}:
+    def _resolve_dynamic_import_getattr_roots(
+        self,
+        node: ast.Call,
+        aliases: dict[str, str],
+        module_aliases: dict[str, frozenset[str]],
+        import_loader_aliases: dict[str, frozenset[str]],
+        shadowed_names: set[str],
+    ) -> frozenset[str]:
+        helper_name = self._resolve_call_name(node.func)
+        if helper_name is not None:
+            if helper_name.split(".", maxsplit=1)[0] in shadowed_names:
+                return frozenset()
+            resolved_helper_names = frozenset({self._apply_alias(helper_name, aliases)})
+        else:
+            resolved_helper_names = self._resolve_dynamic_import_roots(
+                node.func,
+                aliases,
+                module_aliases,
+                import_loader_aliases,
+                shadowed_names,
+            )
+        if not resolved_helper_names & _DYNAMIC_GETATTR_HELPERS:
             return frozenset()
 
         target_node: ast.AST | None = node.args[0] if node.args else None
@@ -1658,11 +1707,7 @@ class TorchServeMarScanner(BaseScanner):
         if not module_names or attr_name is None:
             return frozenset()
 
-        return frozenset(
-            call_name
-            for module_name in module_names
-            if (call_name := _normalized_high_risk_python_call_name(f"{module_name}.{attr_name}")) is not None
-        )
+        return frozenset(f"{module_name}.{attr_name}" for module_name in module_names)
 
     def _resolve_dynamic_import_execution_calls(
         self,
@@ -1936,6 +1981,41 @@ class TorchServeMarScanner(BaseScanner):
                     parameters.add(args.kwarg.arg)
                 return parameters
 
+            @staticmethod
+            def _parameter_default_bindings(args: ast.arguments) -> list[tuple[str, ast.expr]]:
+                positional_args = [*args.posonlyargs, *args.args]
+                positional_defaults = zip(
+                    positional_args[len(positional_args) - len(args.defaults) :],
+                    args.defaults,
+                    strict=True,
+                )
+                keyword_defaults = (
+                    (arg.arg, default)
+                    for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True)
+                    if default is not None
+                )
+                return [
+                    *((arg.arg, default) for arg, default in positional_defaults),
+                    *keyword_defaults,
+                ]
+
+            def _callable_inherited_state(
+                self,
+            ) -> tuple[
+                dict[str, frozenset[str]],
+                dict[str, frozenset[str]],
+                dict[str, frozenset[str]],
+                dict[str, str],
+                set[str],
+            ]:
+                if self.scope_kind_stack[-1] == "module":
+                    return self.module_binding_state or self._snapshot_state()
+                if self.scope_kind_stack[-1] == "class":
+                    return self.class_parent_state_stack[-1]
+                if self.scope_kind_stack[-1] == "function":
+                    return self.function_binding_state_stack[-1]
+                return self._snapshot_state()
+
             def _invalidate_name(self, name: str) -> None:
                 self.module_aliases.pop(name, None)
                 self.callable_aliases.pop(name, None)
@@ -1951,6 +2031,48 @@ class TorchServeMarScanner(BaseScanner):
                 else:
                     self.import_loader_aliases.pop(name, None)
                 self.import_aliases[name] = resolved_name
+                self.shadowed_names.discard(name)
+
+            def _record_default_parameter_assignment(
+                self,
+                name: str,
+                value: ast.AST,
+                inherited_state: tuple[
+                    dict[str, frozenset[str]],
+                    dict[str, frozenset[str]],
+                    dict[str, frozenset[str]],
+                    dict[str, str],
+                    set[str],
+                ],
+            ) -> None:
+                if not isinstance(value, ast.Name):
+                    self._record_name_assignment(name, value)
+                    return
+
+                source_name = value.id
+                if source_name in inherited_state[4]:
+                    self._invalidate_name(name)
+                    return
+
+                inherited_bindings = (
+                    inherited_state[0].get(source_name),
+                    inherited_state[1].get(source_name),
+                    inherited_state[2].get(source_name),
+                    inherited_state[3].get(source_name),
+                )
+                if not any(binding is not None for binding in inherited_bindings):
+                    self._record_name_assignment(name, value)
+                    return
+
+                self._invalidate_name(name)
+                if inherited_bindings[0] is not None:
+                    self.module_aliases[name] = inherited_bindings[0]
+                if inherited_bindings[1] is not None:
+                    self.callable_aliases[name] = inherited_bindings[1]
+                if inherited_bindings[2] is not None:
+                    self.import_loader_aliases[name] = inherited_bindings[2]
+                if inherited_bindings[3] is not None:
+                    self.import_aliases[name] = inherited_bindings[3]
                 self.shadowed_names.discard(name)
 
             def _record_name_assignment(self, name: str, value: ast.AST) -> None:
@@ -1988,16 +2110,23 @@ class TorchServeMarScanner(BaseScanner):
                     and value_name.split(".", maxsplit=1)[0] not in self.shadowed_names
                 ):
                     resolved_value_names = frozenset({scanner._apply_alias(value_name, self.import_aliases)})
-                import_helper_names = resolved_value_names & {
-                    "__import__",
-                    "builtins.__import__",
-                    "importlib.import_module",
-                }
-                import_helper_names |= callable_names & {
-                    "__import__",
-                    "builtins.__import__",
-                    "importlib.import_module",
-                }
+                resolved_value_names |= scanner._resolve_dynamic_import_roots(
+                    value,
+                    self.import_aliases,
+                    self.module_aliases,
+                    self.import_loader_aliases,
+                    self.shadowed_names,
+                )
+                if isinstance(value, ast.Call):
+                    resolved_value_names |= scanner._resolve_dynamic_import_getattr_roots(
+                        value,
+                        self.import_aliases,
+                        self.module_aliases,
+                        self.import_loader_aliases,
+                        self.shadowed_names,
+                    )
+                helper_names = (resolved_value_names | callable_names) & _DYNAMIC_ASSIGNABLE_HELPERS
+                import_helper_names = helper_names & _DYNAMIC_IMPORT_HELPERS
 
                 self._invalidate_name(name)
                 if module_names:
@@ -2006,6 +2135,9 @@ class TorchServeMarScanner(BaseScanner):
                     self.callable_aliases[name] = callable_names
                 if import_helper_names:
                     self.import_loader_aliases[name] = import_helper_names
+                if len(helper_names) == 1:
+                    self.import_aliases[name] = next(iter(helper_names))
+                    self.shadowed_names.discard(name)
 
             def _record_target_assignment(self, target: ast.AST, value: ast.AST) -> None:
                 if isinstance(target, ast.Name):
@@ -2029,6 +2161,27 @@ class TorchServeMarScanner(BaseScanner):
                 elif isinstance(target, ast.Tuple | ast.List):
                     for child_target in target.elts:
                         self._invalidate_target(child_target)
+
+            def _copy_name_binding_to_containing_scope(self, name: str) -> None:
+                destination_index = len(self.scope_kind_stack) - 2
+                while destination_index > 0 and self.scope_kind_stack[destination_index] == "comprehension":
+                    destination_index -= 1
+
+                self.module_alias_stack[destination_index].pop(name, None)
+                if name in self.module_aliases:
+                    self.module_alias_stack[destination_index][name] = self.module_aliases[name]
+                self.callable_alias_stack[destination_index].pop(name, None)
+                if name in self.callable_aliases:
+                    self.callable_alias_stack[destination_index][name] = self.callable_aliases[name]
+                self.import_loader_alias_stack[destination_index].pop(name, None)
+                if name in self.import_loader_aliases:
+                    self.import_loader_alias_stack[destination_index][name] = self.import_loader_aliases[name]
+                self.import_alias_stack[destination_index].pop(name, None)
+                if name in self.import_aliases:
+                    self.import_alias_stack[destination_index][name] = self.import_aliases[name]
+                self.shadowed_name_stack[destination_index].discard(name)
+                if name in self.shadowed_names:
+                    self.shadowed_name_stack[destination_index].add(name)
 
             def _record_target_from_iterable(self, target: ast.AST, iterable: ast.AST) -> bool:
                 if not isinstance(iterable, ast.List | ast.Tuple | ast.Set) or not iterable.elts:
@@ -2131,18 +2284,15 @@ class TorchServeMarScanner(BaseScanner):
                 self._invalidate_name(node.name)
                 if self.collecting_module_bindings:
                     return
-                if self.scope_kind_stack[-1] == "module":
-                    inherited_state = self.module_binding_state
-                elif self.scope_kind_stack[-1] == "class":
-                    inherited_state = self.class_parent_state_stack[-1]
-                else:
-                    inherited_state = self.function_binding_state_stack[-1]
-                local_bindings = scanner._function_local_binding_names(node)
+                inherited_state = self._callable_inherited_state()
+                local_bindings = scanner._callable_local_binding_names(node)
                 self._push_scope(
                     self._parameter_names(node.args) | local_bindings,
                     inherited_state,
                     scope_kind="function",
                 )
+                for parameter_name, default in self._parameter_default_bindings(node.args):
+                    self._record_default_parameter_assignment(parameter_name, default, inherited_state)
                 initial_state = self._snapshot_state()
                 self.collecting_module_bindings = True
                 for statement in node.body:
@@ -2160,6 +2310,24 @@ class TorchServeMarScanner(BaseScanner):
 
             def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
                 self._visit_function_definition(node)
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                for default in [*node.args.defaults, *node.args.kw_defaults]:
+                    if default is not None:
+                        self.visit(default)
+                if self.collecting_module_bindings:
+                    return
+
+                inherited_state = self._callable_inherited_state()
+                self._push_scope(
+                    self._parameter_names(node.args) | scanner._callable_local_binding_names(node),
+                    inherited_state,
+                    scope_kind="function",
+                )
+                for parameter_name, default in self._parameter_default_bindings(node.args):
+                    self._record_default_parameter_assignment(parameter_name, default, inherited_state)
+                self.visit(node.body)
+                self._pop_scope()
 
             def visit_Import(self, node: ast.Import) -> None:
                 for alias in node.names:
@@ -2225,6 +2393,12 @@ class TorchServeMarScanner(BaseScanner):
             def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
                 self.visit(node.value)
                 self._record_target_assignment(node.target, node.value)
+                if self.scope_kind_stack[-1] == "comprehension" and isinstance(node.target, ast.Name):
+                    self._copy_name_binding_to_containing_scope(node.target.id)
+
+            def visit_Delete(self, node: ast.Delete) -> None:
+                for target in node.targets:
+                    self._invalidate_target(target)
 
             def _visit_for(self, node: ast.For | ast.AsyncFor) -> None:
                 self.visit(node.iter)
