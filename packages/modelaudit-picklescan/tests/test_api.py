@@ -26,7 +26,6 @@ from typing import cast
 import pytest
 
 import modelaudit_picklescan.api as package_api
-import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import (
     CoverageSummary,
     Finding,
@@ -44,6 +43,7 @@ from modelaudit_picklescan.call_graph import (
     StartupHookWriteFinding,
     UnanalyzedCallGraphReference,
     _CallGraphAnalysisLimitError,
+    _clear_source_sensitive_caches,
     find_startup_hook_write_call_graphs,
 )
 
@@ -3631,6 +3631,71 @@ def test_scan_bytes_warns_when_unchecked_hash_cache_overrides_inert_source(
         sys.modules.pop(module_name, None)
 
 
+def test_scan_bytes_warns_when_timestamp_cache_overrides_inert_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_timestamp_cache_{uuid.uuid4().hex}"
+    marker = tmp_path / "timestamp_cache_marker"
+    source_path = tmp_path / f"{module_name}.py"
+    malicious_source = f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n"
+    benign_source = "class Gadget:\n    pass\n"
+    benign_source += "#" * (len(malicious_source.encode()) - len(benign_source.encode()))
+    fixed_mtime = 1_700_000_000
+    source_path.write_text(malicious_source, encoding="utf-8")
+    os.utime(source_path, (fixed_mtime, fixed_mtime))
+    py_compile.compile(
+        str(source_path),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+    )
+    source_path.write_text(benign_source, encoding="utf-8")
+    os.utime(source_path, (fixed_mtime, fixed_mtime))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    try:
+        report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert marker.exists() is False
+        assert any(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and finding.details.get("import_reference") == f"{module_name}.Gadget"
+            for finding in report.findings
+        )
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_scan_bytes_allows_inert_source_with_stale_timestamp_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_stale_timestamp_cache_{uuid.uuid4().hex}"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text("raise RuntimeError('stale cache executed')\nclass Gadget:\n    pass\n", encoding="utf-8")
+    fixed_mtime = 1_700_000_000
+    os.utime(source_path, (fixed_mtime, fixed_mtime))
+    py_compile.compile(
+        str(source_path),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+    )
+    source_path.write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    os.utime(source_path, (fixed_mtime + 2, fixed_mtime + 2))
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    report = scan_bytes(f"c{module_name}\nGadget\n.".encode(), source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code != "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
 def test_scan_bytes_allows_inert_source_with_checked_hash_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3914,6 +3979,10 @@ def test_scan_bytes_warns_when_allowlisted_module_resolves_to_shadow_module(
         f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
         encoding="utf-8",
     )
+    dist_info = tmp_path / "numpy-1.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text("Name: numpy\nVersion: 1.0\n", encoding="utf-8")
+    (dist_info / "top_level.txt").write_text("numpy\n", encoding="utf-8")
     monkeypatch.syspath_prepend(str(tmp_path))
 
     report = scan_bytes(b"cnumpy\nGadget\n.", source="shadowed-numpy-gadget.pkl")
@@ -3927,13 +3996,45 @@ def test_scan_bytes_warns_when_allowlisted_module_resolves_to_shadow_module(
     )
 
 
+def test_scan_bytes_warns_when_dunder_builtins_resolves_to_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed_dunder_builtins_marker"
+    (tmp_path / "__builtins__.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"c__builtins__\nGadget\n."
+
+    try:
+        report = scan_bytes(payload, source="shadowed-dunder-builtins-gadget.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert marker.exists() is False
+        assert any(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and finding.details.get("import_reference") == "__builtins__.Gadget"
+            for finding in report.findings
+        )
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop("__builtins__", None)
+
+
 def test_scan_bytes_warns_when_allowlisted_module_is_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(call_graph, "_find_module_spec_without_imports", lambda _module_name: None)
-    call_graph._trusted_module_origin_kind.cache_clear()
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._find_module_spec_without_imports",
+        lambda _module_name: None,
+    )
+    _clear_source_sensitive_caches()
     try:
         report = scan_bytes(b"cnumpy\nGadget\n.", source="unresolved-numpy-gadget.pkl")
     finally:
-        call_graph._trusted_module_origin_kind.cache_clear()
+        _clear_source_sensitive_caches()
 
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.SUSPICIOUS

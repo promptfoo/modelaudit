@@ -146,7 +146,7 @@ def test_import_only_reference_trust_rejects_reviewed_unavailable_optional_modul
         call_graph._trusted_module_origin_kind.cache_clear()
 
 
-def test_trusted_origin_recognizes_installed_overlay_without_trusting_local_shadow(
+def test_trusted_origin_rejects_local_distribution_metadata_outside_trusted_install_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -163,6 +163,15 @@ def test_trusted_origin_recognizes_installed_overlay_without_trusting_local_shad
     monkeypatch.syspath_prepend(str(overlay))
     call_graph._clear_source_sensitive_caches()
 
+    assert call_graph._trusted_module_origin_kind("_pytest._py.path") is None
+
+    monkeypatch.setattr(
+        call_graph,
+        "_TRUSTED_SITE_PACKAGE_PATHS",
+        (*call_graph._TRUSTED_SITE_PACKAGE_PATHS, overlay.resolve()),
+    )
+    call_graph._clear_source_sensitive_caches()
+
     assert call_graph._trusted_module_origin_kind("_pytest._py.path") == "site_packages"
 
     shadow_root = tmp_path / "shadow"
@@ -175,6 +184,10 @@ def test_trusted_origin_recognizes_installed_overlay_without_trusting_local_shad
     call_graph._clear_source_sensitive_caches()
 
     assert call_graph._trusted_module_origin_kind("_pytest._py.path") is None
+
+
+def test_legacy_builtin_module_alias_does_not_require_origin_review() -> None:
+    assert call_graph.import_only_module_requires_origin_review("__builtin__", "set") is False
 
 
 def test_shared_source_sensitive_caches_allows_inherited_worker_scopes(

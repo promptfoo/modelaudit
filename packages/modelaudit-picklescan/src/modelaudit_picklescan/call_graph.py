@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import marshal
 import os
 import sys
 import sysconfig
@@ -31,6 +32,7 @@ _MAX_MODULE_COMPONENTS = 32
 # inputs. This is an explicit coverage/performance tradeoff and can be tuned if
 # scan precision or throughput needs change.
 _MAX_SOURCE_BYTES = 1024 * 1024
+_MAX_BYTECODE_CACHE_BYTES = 4 * _MAX_SOURCE_BYTES
 _MAX_CALL_GRAPH_DEPTH = 4
 _MAX_VISITED_FUNCTIONS = 64
 _MAX_CALLS_PER_FUNCTION = 128
@@ -167,8 +169,15 @@ def _installed_distribution_roots(top_level_name: str) -> tuple[Path, ...]:
     distribution_names = _installed_package_distributions().get(top_level_name, ())
     for distribution_name in distribution_names[:_MAX_DISTRIBUTIONS_PER_TOP_LEVEL]:
         try:
-            root = Path(str(distribution(distribution_name).locate_file(""))).resolve()
+            installed_distribution = distribution(distribution_name)
+            metadata_location = getattr(installed_distribution, "_path", None)
+            if metadata_location is None:
+                continue
+            metadata_path = Path(str(metadata_location)).resolve()
+            root = Path(str(installed_distribution.locate_file(""))).resolve()
         except Exception:
+            continue
+        if not any(metadata_path.is_relative_to(path) for path in _TRUSTED_SITE_PACKAGE_PATHS):
             continue
         if root not in roots:
             roots.append(root)
@@ -700,7 +709,7 @@ def unresolved_trusted_import_reference_is_safe_when_invoked(module_name: str, n
 
 def import_only_module_requires_origin_review(module_name: str, name: str) -> bool:
     """Return whether a module resolves outside trusted install paths."""
-    if module_name in {"__builtin__", "__builtins__"}:
+    if module_name == "__builtin__":
         return False
     origin_kind = _trusted_module_origin_kind(module_name)
     return origin_kind not in {"stdlib", "site_packages"} and not (
@@ -1714,11 +1723,14 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
     if source_path is None:
         return None
     try:
-        if _source_has_importable_unchecked_hash_cache(source_path):
-            return None
         if source_path.stat().st_size > _MAX_SOURCE_BYTES:
             return None
         source = source_path.read_text(encoding="utf-8")
+        if _trusted_module_origin_kind(module_name) not in {
+            "stdlib",
+            "site_packages",
+        } and _source_has_importable_untrusted_cache(source_path, source):
+            return None
         tree = ast.parse(source, filename=str(source_path))
     except Exception:
         return None
@@ -1728,19 +1740,21 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
     return _ModuleSourceContext(source_path=source_path, module_statements=module_statements, is_package=is_package)
 
 
-def _source_has_importable_unchecked_hash_cache(source_path: Path) -> bool:
+def _source_has_importable_untrusted_cache(source_path: Path, source: str) -> bool:
     try:
         cache_path = Path(cache_from_source(str(source_path)))
     except (NotImplementedError, ValueError):
         return True
-    _track_shared_source_paths((cache_path,), read_limit=16, require_complete=False)
+    _track_shared_source_paths((cache_path,), read_limit=_MAX_BYTECODE_CACHE_BYTES)
     if not cache_path.is_file():
         return False
     try:
-        with cache_path.open("rb") as cache_file:
-            header = cache_file.read(8)
+        if cache_path.stat().st_size > _MAX_BYTECODE_CACHE_BYTES:
+            return True
+        cache_bytes = cache_path.read_bytes()
     except OSError:
         return True
+    header = cache_bytes[:16]
     if len(header) < 8:
         return False
     if header[:4] != MAGIC_NUMBER:
@@ -1748,7 +1762,17 @@ def _source_has_importable_unchecked_hash_cache(source_path: Path) -> bool:
     flags = int.from_bytes(header[4:8], "little")
     if flags & ~0x03:
         return False
-    return bool(flags & 0x01) and not bool(flags & 0x02)
+    if flags & 0x01:
+        return not bool(flags & 0x02)
+    if len(header) < 16:
+        return False
+    source_stat = source_path.stat()
+    cached_mtime = int.from_bytes(header[8:12], "little")
+    cached_size = int.from_bytes(header[12:16], "little")
+    if cached_mtime != int(source_stat.st_mtime) & 0xFFFFFFFF or cached_size != source_stat.st_size & 0xFFFFFFFF:
+        return False
+    source_code = compile(source, str(source_path), "exec", dont_inherit=True, optimize=-1)
+    return cache_bytes[16:] != marshal.dumps(source_code)
 
 
 def _module_level_statements(tree: ast.Module) -> tuple[ast.stmt, ...]:
