@@ -41,6 +41,7 @@ from .keras_utils import (
     check_subclassed_model,
     find_lambda_dangerous_patterns,
     is_known_safe_keras_layer_class,
+    normalize_keras_layer_class,
 )
 from .zip_scanner import ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY
 
@@ -184,9 +185,11 @@ class KerasZipScanner(BaseScanner):
     MAX_EMBEDDED_WEIGHTS_BYTES: ClassVar[int] = 100 * 1024 * 1024
     MAX_DUPLICATE_MEMBER_COMPARE_CANDIDATES: ClassVar[int] = 16
     MAX_NESTED_LAYER_DEPTH: ClassVar[int] = 64
+    MAX_NESTED_LAYER_ITEMS: ClassVar[int] = 1_000
     _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
     _NESTED_LAYER_CONFIG_KEYS: ClassVar[tuple[str, ...]] = ("layer", "backward_layer", "cell", "cells")
     _NESTED_LAYER_LIST_CONFIG_KEYS: ClassVar[frozenset[str]] = frozenset({"cell", "cells"})
+    _OPTIONAL_NESTED_LAYER_CONFIG_KEYS: ClassVar[frozenset[str]] = frozenset({"backward_layer"})
     _NESTED_LAYER_CONFIG_KEYS_BY_CLASS: ClassVar[dict[str, frozenset[str]]] = {
         "Bidirectional": frozenset({"layer", "backward_layer"}),
         "RNN": frozenset({"cell"}),
@@ -219,6 +222,7 @@ class KerasZipScanner(BaseScanner):
         if self.max_file_read_size > 0:
             configured_embedded_limit = min(configured_embedded_limit, self.max_file_read_size)
         self.max_embedded_weights_bytes = configured_embedded_limit
+        self._nested_layer_items_scanned = 0
 
     @staticmethod
     def _is_allowlisted_keras_module(module_value: Any) -> bool:
@@ -438,6 +442,7 @@ class KerasZipScanner(BaseScanner):
         """Scan a ZIP-based Keras model file for suspicious configurations"""
         # Initialize context for this file
         self._initialize_context(path)
+        self._nested_layer_items_scanned = 0
 
         # Check if path is valid
         path_check_result = self._check_path(path)
@@ -957,10 +962,16 @@ class KerasZipScanner(BaseScanner):
                 )
 
             # Recursively check nested models
-            if layer_class in self._MODEL_CONTAINER_CLASSES and "config" in layer:
+            normalized_layer_class = (
+                normalize_keras_layer_class(layer_class) if isinstance(layer_class, str) else layer_class
+            )
+            nested_model_class = (
+                normalized_layer_class.rsplit(".", 1)[-1] if isinstance(normalized_layer_class, str) else None
+            )
+            if nested_model_class in self._MODEL_CONTAINER_CLASSES and "config" in layer:
                 nested_config = layer["config"]
                 if isinstance(nested_config, dict):
-                    self._scan_model_config(layer, result, nested_layer_depth + 1)
+                    self._scan_model_config_preserving_metadata(layer, result, nested_layer_depth + 1)
                 else:
                     self._mark_inconclusive_scan_result(result, "keras_zip_nested_model_config_invalid_type")
                     result.add_check(
@@ -990,16 +1001,35 @@ class KerasZipScanner(BaseScanner):
         if not isinstance(layer_config, dict):
             return
 
-        required_config_keys = self._nested_layer_config_keys_for_class(layer_class)
-        if not required_config_keys:
+        nested_config_keys, require_layer_shape = self._nested_layer_config_for_class(layer_class)
+        if not nested_config_keys:
             return
 
+        if require_layer_shape:
+            missing_required_keys = nested_config_keys.difference(
+                layer_config,
+                self._OPTIONAL_NESTED_LAYER_CONFIG_KEYS,
+            )
+            for config_key in sorted(missing_required_keys):
+                self._mark_inconclusive_scan_result(result, "keras_zip_wrapped_layer_required_config_missing")
+                result.add_check(
+                    name="Wrapped Layer Config Validation",
+                    passed=False,
+                    message=f"Wrapped Keras layer is missing required config key '{config_key}'",
+                    rule_code="S902",
+                    severity=IssueSeverity.INFO,
+                    location=f"{self.current_file_path} (layer: {layer_name}, config: {config_key})",
+                    details={"config_key": config_key, "required": True},
+                )
+
         for config_key in self._NESTED_LAYER_CONFIG_KEYS:
-            if config_key not in required_config_keys or config_key not in layer_config:
+            if config_key not in nested_config_keys or config_key not in layer_config:
                 continue
 
             nested_layer = layer_config.get(config_key)
-            if nested_layer is None:
+            if nested_layer is None and config_key == "backward_layer":
+                continue
+            if not require_layer_shape and not isinstance(nested_layer, (dict, list)):
                 continue
 
             if isinstance(nested_layer, list) and config_key in self._NESTED_LAYER_LIST_CONFIG_KEYS:
@@ -1009,30 +1039,30 @@ class KerasZipScanner(BaseScanner):
                     layer_name,
                     config_key,
                     nested_layer_depth,
-                    require_layer_shape=True,
+                    require_layer_shape=require_layer_shape,
                 )
                 continue
 
+            if self._reserve_nested_layer_items(result, layer_name, config_key, 1) == 0:
+                continue
             self._scan_wrapped_layer_value(
                 nested_layer,
                 result,
                 layer_name,
                 config_key,
                 nested_layer_depth,
-                require_layer_shape=True,
+                require_layer_shape=require_layer_shape,
             )
 
     @classmethod
-    def _nested_layer_config_keys_for_class(cls, layer_class: Any) -> frozenset[str]:
+    def _nested_layer_config_for_class(cls, layer_class: Any) -> tuple[frozenset[str], bool]:
         if not isinstance(layer_class, str):
-            return frozenset()
+            return frozenset(), False
 
-        normalized_class = layer_class.strip()
-        if "." in normalized_class and not normalized_class.lower().startswith(
-            ("keras.", "tensorflow.keras.", "tensorflow.python.keras.", "tf.keras.", "tf_keras.")
-        ):
-            return frozenset()
-        return cls._NESTED_LAYER_CONFIG_KEYS_BY_CLASS.get(normalized_class.rsplit(".", 1)[-1], frozenset())
+        normalized_class = normalize_keras_layer_class(layer_class)
+        require_layer_shape = "." not in normalized_class
+        class_name = normalized_class if require_layer_shape else normalized_class.rsplit(".", 1)[-1]
+        return cls._NESTED_LAYER_CONFIG_KEYS_BY_CLASS.get(class_name, frozenset()), require_layer_shape
 
     def _scan_wrapped_layer_list(
         self,
@@ -1044,7 +1074,11 @@ class KerasZipScanner(BaseScanner):
         *,
         require_layer_shape: bool,
     ) -> None:
-        for index, nested_layer in enumerate(nested_layers):
+        candidate_layers = (
+            nested_layers if require_layer_shape else [layer for layer in nested_layers if isinstance(layer, dict)]
+        )
+        items_to_scan = self._reserve_nested_layer_items(result, layer_name, config_key, len(candidate_layers))
+        for index, nested_layer in enumerate(candidate_layers[:items_to_scan]):
             self._scan_wrapped_layer_value(
                 nested_layer,
                 result,
@@ -1053,6 +1087,47 @@ class KerasZipScanner(BaseScanner):
                 nested_layer_depth,
                 require_layer_shape=require_layer_shape,
             )
+
+    def _reserve_nested_layer_items(
+        self,
+        result: ScanResult,
+        layer_name: str,
+        config_key: str,
+        requested_items: int,
+    ) -> int:
+        if requested_items <= 0:
+            return 0
+
+        items_scanned_before = self._nested_layer_items_scanned
+        remaining_items = max(self.MAX_NESTED_LAYER_ITEMS - items_scanned_before, 0)
+        allowed_items = min(requested_items, remaining_items)
+        self._nested_layer_items_scanned += allowed_items
+
+        if allowed_items < requested_items:
+            reason = "keras_zip_nested_layer_item_limit_exceeded"
+            existing_reasons = result.metadata.get("scan_outcome_reasons")
+            already_reported = isinstance(existing_reasons, list) and reason in existing_reasons
+            self._mark_inconclusive_scan_result(result, "keras_zip_nested_layer_item_limit_exceeded")
+            if not already_reported:
+                result.add_check(
+                    name="Nested Layer Item Limit",
+                    passed=False,
+                    message=(
+                        f"Wrapped Keras nested-layer traversal exceeds maximum of {self.MAX_NESTED_LAYER_ITEMS} items"
+                    ),
+                    rule_code="S902",
+                    severity=IssueSeverity.INFO,
+                    location=f"{self.current_file_path} (layer: {layer_name}, config: {config_key})",
+                    details={
+                        "config_key": config_key,
+                        "actual_items": requested_items,
+                        "allowed_items": allowed_items,
+                        "items_scanned_before": items_scanned_before,
+                        "max_nested_layer_items": self.MAX_NESTED_LAYER_ITEMS,
+                    },
+                )
+
+        return allowed_items
 
     def _scan_wrapped_layer_value(
         self,
@@ -1100,18 +1175,28 @@ class KerasZipScanner(BaseScanner):
         result: ScanResult,
         nested_layer_depth: int,
     ) -> None:
-        metadata_snapshot = {
-            key: result.metadata[key] for key in ("model_class", "layer_counts") if key in result.metadata
-        }
-        missing_metadata_keys = {key for key in ("model_class", "layer_counts") if key not in result.metadata}
         synthetic_model_config = {
             "class_name": self._WRAPPED_LAYER_SCAN_MODEL["class_name"],
             "config": {"layers": [nested_layer]},
         }
-        self._scan_model_config(synthetic_model_config, result, nested_layer_depth + 1)
-        for key in missing_metadata_keys:
-            result.metadata.pop(key, None)
-        result.metadata.update(metadata_snapshot)
+        self._scan_model_config_preserving_metadata(synthetic_model_config, result, nested_layer_depth + 1)
+
+    def _scan_model_config_preserving_metadata(
+        self,
+        model_config: dict[str, Any],
+        result: ScanResult,
+        nested_layer_depth: int,
+    ) -> None:
+        metadata_snapshot = {
+            key: result.metadata[key] for key in ("model_class", "layer_counts") if key in result.metadata
+        }
+        missing_metadata_keys = {key for key in ("model_class", "layer_counts") if key not in result.metadata}
+        try:
+            self._scan_model_config(model_config, result, nested_layer_depth)
+        finally:
+            for key in missing_metadata_keys:
+                result.metadata.pop(key, None)
+            result.metadata.update(metadata_snapshot)
 
     def _scan_compile_config(self, compile_config: Any, result: ScanResult) -> None:
         """Inspect compile_config for custom metrics and losses."""

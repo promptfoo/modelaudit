@@ -1833,6 +1833,7 @@ __import__('pickle').loads(data)
                 break
 
         assert import_found, "Should detect __import__ in nested Lambda"
+        assert result.metadata["model_class"] == "Model"
 
     def test_wrapped_layer_config_layer_scans_nested_lambda(self, tmp_path: Path) -> None:
         """Wrapper layers with `config.layer` must not hide nested Lambda payloads."""
@@ -2065,6 +2066,163 @@ __import__('pickle').loads(data)
         assert not any(check.name == "Custom Layer Class Detection" for check in result.checks)
         assert determine_exit_code(audit_result) == 0
 
+    @pytest.mark.parametrize("wrapper_class", ["keras.evil.TimeDistributed", "keras.src.layers.evil.TimeDistributed"])
+    def test_untrusted_qualified_wrapper_remains_custom_without_wrapper_noise(
+        self,
+        tmp_path: Path,
+        wrapper_class: str,
+    ) -> None:
+        """Custom namespaces that resemble Keras wrappers must not inherit trusted wrapper semantics."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": wrapper_class,
+                            "name": "custom_wrapper",
+                            "config": {"layer": "ordinary custom metadata"},
+                        }
+                    ]
+                },
+            },
+            file_name="untrusted_qualified_wrapper.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        audit_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        assert any(
+            check.name == "Custom Layer Class Detection" and check.details.get("layer_class") == wrapper_class
+            for check in result.checks
+        )
+        assert not any(check.name == "Wrapped Layer Type Validation" for check in result.checks)
+        assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        assert determine_exit_code(audit_result) == 1
+
+    def test_untrusted_qualified_wrapper_still_scans_nested_lambda(self, tmp_path: Path) -> None:
+        """Custom wrapper namespaces remain warned while structured nested payloads are inspected."""
+        encoded_code = base64.b64encode(b"exec('print(1)')").decode()
+        wrapper_class = "keras.src.layers.evil.TimeDistributed"
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": wrapper_class,
+                            "name": "custom_wrapper",
+                            "config": {
+                                "layer": {
+                                    "class_name": "Lambda",
+                                    "name": "nested_lambda",
+                                    "config": {"function": [encoded_code, None, None]},
+                                }
+                            },
+                        }
+                    ]
+                },
+            },
+            keras_version="2.10.0",
+            file_name="untrusted_qualified_wrapper_lambda.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert any(
+            check.name == "Custom Layer Class Detection" and check.details.get("layer_class") == wrapper_class
+            for check in result.checks
+        )
+        assert any(
+            issue.details.get("cve_id") == "CVE-2024-3660" and issue.details.get("layer_name") == "nested_lambda"
+            for issue in result.issues
+        )
+        assert not any(check.name == "Wrapped Layer Type Validation" for check in result.checks)
+
+    def test_qualified_nested_model_scans_nested_lambda(self, tmp_path: Path) -> None:
+        """Trusted qualified model containers must not hide nested Lambda payloads."""
+        encoded_code = base64.b64encode(b"exec('print(1)')").decode()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "keras.models.Sequential",
+                            "name": "qualified_nested_model",
+                            "config": {
+                                "layers": [
+                                    {
+                                        "class_name": "Lambda",
+                                        "name": "nested_lambda",
+                                        "config": {"function": [encoded_code, None, None]},
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                },
+            },
+            keras_version="2.10.0",
+            file_name="qualified_nested_model.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        audit_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        assert any(
+            issue.details.get("cve_id") == "CVE-2024-3660" and issue.details.get("layer_name") == "nested_lambda"
+            for issue in result.issues
+        )
+        assert not any(
+            check.name == "Subclassed Model Detection" and check.status == CheckStatus.FAILED for check in result.checks
+        )
+        assert determine_exit_code(audit_result) == 1
+
+    def test_untrusted_qualified_nested_model_still_scans_nested_lambda(self, tmp_path: Path) -> None:
+        """Custom model namespaces remain warned while model-shaped nested payloads are inspected."""
+        encoded_code = base64.b64encode(b"exec('print(1)')").decode()
+        model_class = "keras.src.engine.evil.Sequential"
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": model_class,
+                            "name": "custom_nested_model",
+                            "config": {
+                                "layers": [
+                                    {
+                                        "class_name": "Lambda",
+                                        "name": "nested_lambda",
+                                        "config": {"function": [encoded_code, None, None]},
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                },
+            },
+            keras_version="2.10.0",
+            file_name="untrusted_qualified_nested_model.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert any(
+            check.name == "Custom Layer Class Detection" and check.details.get("layer_class") == model_class
+            for check in result.checks
+        )
+        assert any(
+            issue.details.get("cve_id") == "CVE-2024-3660" and issue.details.get("layer_name") == "nested_lambda"
+            for issue in result.issues
+        )
+
     def test_wrapped_layer_config_missing_class_name_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
         """Wrapper-owned layer dictionaries require a class name for complete nested analysis."""
         keras_path = create_configured_keras_zip(
@@ -2091,6 +2249,100 @@ __import__('pickle').loads(data)
         assert "keras_zip_wrapped_layer_structure_invalid" in result.metadata["scan_outcome_reasons"]
         assert any(
             check.name == "Wrapped Layer Structure Validation" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+        assert determine_exit_code(audit_result) == 2
+
+    @pytest.mark.parametrize(
+        ("wrapper_class", "config_key"),
+        [
+            ("TimeDistributed", "layer"),
+            ("SpectralNormalization", "layer"),
+            ("RNN", "cell"),
+            ("StackedRNNCells", "cells"),
+        ],
+    )
+    def test_required_wrapped_layer_null_fails_closed(
+        self,
+        tmp_path: Path,
+        wrapper_class: str,
+        config_key: str,
+    ) -> None:
+        """Required wrapper-owned nested layer values cannot be silently skipped."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": wrapper_class,
+                            "name": "broken_wrapper",
+                            "config": {config_key: None},
+                        }
+                    ]
+                },
+            },
+            file_name=f"null_{wrapper_class}.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        audit_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_wrapped_layer_invalid_type" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Wrapped Layer Type Validation"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("config_key") == config_key
+            and check.details.get("actual_type") == "NoneType"
+            for check in result.checks
+        )
+        assert determine_exit_code(audit_result) == 2
+
+    @pytest.mark.parametrize(
+        ("wrapper_class", "config_key"),
+        [
+            ("TimeDistributed", "layer"),
+            ("SpectralNormalization", "layer"),
+            ("Bidirectional", "layer"),
+            ("RNN", "cell"),
+            ("StackedRNNCells", "cells"),
+        ],
+    )
+    def test_required_wrapped_layer_config_missing_fails_closed(
+        self,
+        tmp_path: Path,
+        wrapper_class: str,
+        config_key: str,
+    ) -> None:
+        """Known wrappers missing required nested payloads make coverage incomplete."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": wrapper_class,
+                            "name": "broken_wrapper",
+                            "config": {},
+                        }
+                    ]
+                },
+            },
+            file_name=f"missing_{wrapper_class}.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        audit_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_wrapped_layer_required_config_missing" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Wrapped Layer Config Validation"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("config_key") == config_key
             for check in result.checks
         )
         assert determine_exit_code(audit_result) == 2
@@ -2272,6 +2524,102 @@ __import__('pickle').loads(data)
         assert "keras_zip_nested_layer_depth_exceeded" in result.metadata["scan_outcome_reasons"]
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         assert determine_exit_code(audit_result) == 1
+
+    def test_wrapped_layer_list_item_budget_returns_inconclusive_exit2(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Oversized recurrent-cell lists must stop at a bounded item budget and fail closed."""
+        monkeypatch.setattr(KerasZipScanner, "MAX_NESTED_LAYER_ITEMS", 2)
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "StackedRNNCells",
+                            "name": "oversized_cells",
+                            "config": {
+                                "cells": [
+                                    {"class_name": "LSTMCell", "config": {}},
+                                    {"class_name": "GRUCell", "config": {}},
+                                    {"class_name": "SimpleRNNCell", "config": {}},
+                                ]
+                            },
+                        }
+                    ]
+                },
+            },
+            file_name="oversized_wrapped_cells.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        audit_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_nested_layer_item_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Nested Layer Item Limit"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("actual_items") == 3
+            and check.details.get("max_nested_layer_items") == 2
+            for check in result.checks
+        )
+        assert determine_exit_code(audit_result) == 2
+        _assert_inconclusive_keras_zip_scan_not_cached(
+            keras_path,
+            "keras_zip_nested_layer_item_limit_exceeded",
+            tmp_path / "nested-layer-item-cache",
+        )
+
+    def test_wrapped_layer_item_budget_is_global_across_nested_lists(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Nested wrapper lists must share one traversal budget instead of multiplying it."""
+        monkeypatch.setattr(KerasZipScanner, "MAX_NESTED_LAYER_ITEMS", 3)
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "RNN",
+                            "name": "outer_rnn",
+                            "config": {
+                                "cell": {
+                                    "class_name": "StackedRNNCells",
+                                    "name": "nested_cells",
+                                    "config": {
+                                        "cells": [
+                                            {"class_name": "LSTMCell", "config": {}},
+                                            {"class_name": "GRUCell", "config": {}},
+                                            {"class_name": "SimpleRNNCell", "config": {}},
+                                        ]
+                                    },
+                                }
+                            },
+                        }
+                    ]
+                },
+            },
+            file_name="global_nested_layer_budget.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        audit_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        limit_check = next(check for check in result.checks if check.name == "Nested Layer Item Limit")
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_nested_layer_item_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert limit_check.details["actual_items"] == 3
+        assert limit_check.details["allowed_items"] == 2
+        assert limit_check.details["items_scanned_before"] == 1
+        assert determine_exit_code(audit_result) == 2
 
     def test_invalid_json_config(self, tmp_path: Path) -> None:
         """Test handling of invalid JSON in config."""
