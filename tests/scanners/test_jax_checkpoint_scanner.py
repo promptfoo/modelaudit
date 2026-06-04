@@ -121,12 +121,16 @@ def test_orbax_dangerous_restore_fn_is_flagged_as_critical(tmp_path: Path) -> No
 def test_orbax_restore_fn_redacts_secret_assignments_in_details(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "orbax_checkpoint"
     secret = "SECRETKEY1234567890"
+    fallback_secret = "FALLBACKSECRET1234567890"
     _write_orbax_metadata(
         checkpoint_dir,
         {
             "version": "0.1.0",
             "type": "orbax_checkpoint",
-            "restore_fn": f"lambda x: eval(x.decode()); credentials={{'client_secret': '{secret}'}}",
+            "restore_fn": (
+                f"lambda x: eval(x.decode()); credentials={{'client_secret': '{secret}'}}; "
+                f'client_secret = os.getenv("CLIENT_SECRET", "{fallback_secret}")'
+            ),
         },
     )
 
@@ -140,8 +144,10 @@ def test_orbax_restore_fn_redacts_secret_assignments_in_details(tmp_path: Path) 
     serialized = result.to_json()
     assert check.severity == IssueSeverity.CRITICAL
     assert secret not in serialized
+    assert fallback_secret not in serialized
     assert "eval(x.decode())" in check.details["restore_fn"]
     assert "'client_secret': '<redacted>'" in check.details["restore_fn"]
+    assert "client_secret = <redacted>" in check.details["restore_fn"]
 
 
 def test_orbax_benign_restore_fn_is_flagged_as_warning(tmp_path: Path) -> None:
@@ -348,12 +354,13 @@ def test_oversized_orbax_metadata_reports_visible_bounded_pattern_before_failing
 def test_oversized_orbax_metadata_preserves_visible_restore_fn_detection(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "oversized_orbax_restore_fn"
     checkpoint_dir.mkdir()
+    secret = "OVERSIZEDFALLBACKSECRET123"
     (checkpoint_dir / "metadata.json").write_text(
         json.dumps(
             {
                 "framework": "jax",
                 "type": "orbax_checkpoint",
-                "restore_fn": "lambda x: eval(x)",
+                "restore_fn": f'lambda x: eval(x); client_secret = os.getenv("KEY", "{secret}")',
                 "padding": "x" * JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
             }
         ),
@@ -365,13 +372,14 @@ def test_oversized_orbax_metadata_preserves_visible_restore_fn_detection(tmp_pat
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "jax_orbax_metadata_analysis_size_limit" in result.metadata["scan_outcome_reasons"]
-    assert any(
-        check.name == "Orbax Restore Function Check"
-        and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.CRITICAL
-        and check.details["restore_fn"] == "lambda x: eval(x)"
+    restore_check = next(
+        check
         for check in result.checks
+        if check.name == "Orbax Restore Function Check" and check.status == CheckStatus.FAILED
     )
+    assert secret not in result.to_json()
+    assert restore_check.severity == IssueSeverity.CRITICAL
+    assert restore_check.details["restore_fn"] == "lambda x: eval(x); client_secret = <redacted>"
 
 
 def test_oversized_orbax_metadata_preserves_visible_nested_restore_fn_detection(tmp_path: Path) -> None:

@@ -167,9 +167,11 @@ class TestJITScriptDetector:
     def test_embedded_python_code_snippets_redact_secret_assignments(self) -> None:
         detector = JITScriptDetector()
         secret = "SECRETKEY1234567890"
+        fallback_secret = "FALLBACKSECRET1234567890"
         data = f"""
         def payload():
             os.environ["AWS_SECRET_ACCESS_KEY"] = "{secret}"
+            client_secret = os.getenv("CLIENT_SECRET", "{fallback_secret}")
             return eval("1 + 1")
         """.encode()
 
@@ -180,9 +182,11 @@ class TestJITScriptDetector:
             finding for finding in findings if finding.type == "dangerous_builtin" and finding.builtin == "eval"
         )
         assert secret not in serialized
+        assert fallback_secret not in serialized
         assert builtin_finding.code_snippet is not None
         assert "AWS_SECRET_ACCESS_KEY" in builtin_finding.code_snippet
         assert 'os.environ["AWS_SECRET_ACCESS_KEY"] = "<redacted>"' in builtin_finding.code_snippet
+        assert "client_secret = <redacted>" in builtin_finding.code_snippet
         assert 'eval("1 + 1")' in builtin_finding.code_snippet
 
     def test_detect_code_execution_patterns(self):

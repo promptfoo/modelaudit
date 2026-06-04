@@ -2,72 +2,56 @@
 
 from __future__ import annotations
 
+import ast
+import io
 import re
+import textwrap
+import tokenize
 from typing import Final
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from modelaudit.detectors.network_comm import _redact_url_path_tokens
+from modelaudit.detectors.network_comm import redact_url_for_finding
 
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
+REDACTION_LOOKAHEAD_CHARS: Final[int] = 4096
 
-URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|wss?|ftp|tcp|udp|s3|gs|file)://[^\s\"'<>]+")
-SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "access_key",
-        "access-key",
-        "access_token",
-        "access-token",
-        "api_key",
-        "api-key",
-        "apikey",
-        "auth_token",
-        "auth-token",
-        "client_secret",
-        "client-secret",
-        "credential",
-        "password",
-        "passwd",
-        "pwd",
-        "private_key",
-        "private-key",
-        "refresh_token",
-        "refresh-token",
-        "sas",
-        "secret",
-        "secret_key",
-        "secret-key",
-        "sig",
-        "signature",
-        "token",
-        "x-amz-credential",
-        "x-amz-security-token",
-        "x-amz-signature",
-        "x-goog-credential",
-        "x-goog-signature",
-    }
-)
+URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s\"'<>]+")
 SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
-    r"(?:[a-z0-9]+[_.-])*"
-    r"(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|credential|"
-    r"password|passwd|private[_-]?key|pwd|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
-    r"(?:[_.-][a-z0-9]+)*"
+    r"(?:(?:[a-z0-9]+[_.-])*authorization|"
+    r"(?:[a-z0-9]+[_.-])*(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|"
+    r"client[_-]?secret|credential|password|passwd|private[_-]?key|pwd|refresh[_-]?token|sas|secret|"
+    r"secret[_-]?key|signature|sig|token)(?:[_.-][a-z0-9]+)*)"
+)
+SENSITIVE_ASSIGNMENT_TARGET: Final[str] = (
+    rf"(?:\b{SENSITIVE_ASSIGNMENT_KEY}(?:\s*:\s*[^=\r\n]+)?|"
+    rf"\[\s*(?:[rubf]{{0,2}})?[\"']{SENSITIVE_ASSIGNMENT_KEY}[\"']\s*\])"
+)
+SENSITIVE_ASSIGNMENT_TARGET_RE: Final[re.Pattern[str]] = re.compile(
+    rf"{SENSITIVE_ASSIGNMENT_TARGET}\s*$",
+    re.IGNORECASE,
+)
+QUOTED_SENSITIVE_MAPPING_KEY_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?:[rubf]{{0,2}})?(?P<mapping_quote>[\"']){SENSITIVE_ASSIGNMENT_KEY}(?P=mapping_quote)\s*$",
+    re.IGNORECASE,
 )
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?)" r"[^\s\"';&|]+"
+    r"(?i)(\bauthorization\s*(?:=|:(?![^\r\n=]*=))\s*(?:(?:bearer|basic|token)\s+)?)"
+    r"[^\s\"';&|,\)\]\}]+"
 )
 AUTH_SCHEME_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\b(?:bearer|basic|token)\s+)[A-Za-z0-9._~+/=-]{8,}")
 SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)[^\s\"';&|]+"
+    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*(?:=|:(?![^\r\n=]*=))\s*)[^\s\"';&|,\)\]\}}]+"
 )
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)(?P<assignment_quote>[\"']{{1,3}})(?![\"'])"
+    rf"\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)(?P<assignment_prefix>[rubf]{{0,2}})"
+    rf"(?P<assignment_quote>[\"']{{1,3}})(?![\"'])"
     rf"(?:\\.|(?!(?P=assignment_quote)).)*(?P=assignment_quote)",
     re.IGNORECASE | re.DOTALL,
 )
 PYTHON_CONTAINER_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)((?:\[\s*[\"']{SENSITIVE_ASSIGNMENT_KEY}[\"']\s*\]|[\"']{SENSITIVE_ASSIGNMENT_KEY}[\"'])"
-    rf"\s*[:=]\s*)(?P<container_quote>[\"']{{1,3}})(?![\"'])(?:\\.|(?!(?P=container_quote)).)*"
+    rf"\s*[:=]\s*)(?P<container_prefix>[rubf]{{0,2}})(?P<container_quote>[\"']{{1,3}})(?![\"'])"
+    rf"(?:\\.|(?!(?P=container_quote)).)*"
     rf"(?P=container_quote)",
     re.IGNORECASE | re.DOTALL,
 )
@@ -95,6 +79,11 @@ MALFORMED_PYTHON_CONTAINER_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.
     rf"(?!{re.escape(REDACTED_EVIDENCE_VALUE)}(?P=malformed_container_quote)).*$",
     re.IGNORECASE | re.DOTALL,
 )
+SENSITIVE_EXPRESSION_ASSIGNMENT_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
+    rf"{SENSITIVE_ASSIGNMENT_TARGET}\s*(?:=|:=)",
+    re.IGNORECASE,
+)
+STRING_LITERAL_START_RE: Final[re.Pattern[str]] = re.compile(r"(?:[rubf]{0,2})?[\"']", re.IGNORECASE)
 
 
 def _redact_malformed_url(raw_url: str) -> str:
@@ -113,41 +102,22 @@ def _redact_malformed_url(raw_url: str) -> str:
 
 def _redact_url(match: re.Match[str]) -> str:
     raw_url = match.group(0)
-    try:
-        parsed = urlsplit(raw_url)
-    except ValueError:
+    safe_url = redact_url_for_finding(raw_url)
+    if safe_url == "[invalid-url]":
         return _redact_malformed_url(raw_url)
-
-    netloc = parsed.netloc
-    if "@" in netloc:
-        netloc = f"{REDACTED_URL_CREDENTIALS}@{netloc.rsplit('@', 1)[1]}"
-
-    query_items = []
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if key.lower() in SENSITIVE_QUERY_KEYS:
-            query_items.append((key, REDACTED_EVIDENCE_VALUE))
-        else:
-            query_items.append((key, value))
-
-    return urlunsplit(
-        (
-            parsed.scheme,
-            netloc,
-            _redact_url_path_tokens(parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.path),
-            urlencode(query_items, doseq=True, safe="<>"),
-            "",
-        )
-    )
+    return safe_url
 
 
 def _redact_quoted_assignment(match: re.Match[str]) -> str:
+    prefix = match.group("assignment_prefix")
     quote = match.group("assignment_quote")
-    return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
+    return f"{match.group(1)}{prefix}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
 def _redact_python_container_assignment(match: re.Match[str]) -> str:
+    prefix = match.group("container_prefix")
     quote = match.group("container_quote")
-    return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
+    return f"{match.group(1)}{prefix}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
 def _redact_multiline_malformed_quoted_assignment(match: re.Match[str]) -> str:
@@ -170,6 +140,174 @@ def _redact_malformed_python_container_assignment(match: re.Match[str]) -> str:
     return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
+def _line_offsets(text: str) -> list[int]:
+    offsets = [0]
+    for line in text.splitlines(keepends=True):
+        offsets.append(offsets[-1] + len(line))
+    return offsets
+
+
+def _position_offset(offsets: list[int], position: tuple[int, int], text_length: int) -> int:
+    row, column = position
+    if row <= 0:
+        return 0
+    if row > len(offsets):
+        return text_length
+    return min(offsets[row - 1] + column, text_length)
+
+
+def _assignment_target_start(
+    tokens: list[tokenize.TokenInfo],
+    depths: list[int],
+    operator_index: int,
+    operator_depth: int,
+) -> int:
+    for index in range(operator_index - 1, -1, -1):
+        token = tokens[index]
+        if depths[index] < operator_depth:
+            return index + 1
+        if depths[index] != operator_depth:
+            continue
+        if token.type in {tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT}:
+            return index + 1
+        if token.type == tokenize.OP and token.string in {",", ";"}:
+            return index + 1
+    return 0
+
+
+def _assignment_value_end(
+    tokens: list[tokenize.TokenInfo],
+    depths: list[int],
+    value_index: int,
+    operator: str,
+    operator_depth: int,
+    text_length: int,
+    offsets: list[int],
+) -> tuple[int, list[tokenize.TokenInfo]]:
+    significant: list[tokenize.TokenInfo] = []
+    for index in range(value_index, len(tokens)):
+        token = tokens[index]
+        depth = depths[index]
+        if token.type == tokenize.ENDMARKER:
+            return text_length, significant
+        if token.type == tokenize.NEWLINE and depth == operator_depth:
+            return _position_offset(offsets, token.start, text_length), significant
+        if token.type == tokenize.OP and depth == operator_depth:
+            if token.string == ";" or token.string in ")]}":
+                return _position_offset(offsets, token.start, text_length), significant
+            if token.string == "," and (operator == ":" or operator_depth > 0):
+                return _position_offset(offsets, token.start, text_length), significant
+        if token.type not in {
+            tokenize.NL,
+            tokenize.NEWLINE,
+            tokenize.INDENT,
+            tokenize.DEDENT,
+            tokenize.COMMENT,
+        }:
+            significant.append(token)
+    return text_length, significant
+
+
+def _redact_malformed_sensitive_expression_assignment(text: str) -> str:
+    for match in SENSITIVE_EXPRESSION_ASSIGNMENT_PREFIX_RE.finditer(text):
+        value_start = match.end()
+        while value_start < len(text) and text[value_start] in " \t":
+            value_start += 1
+        if STRING_LITERAL_START_RE.match(text, value_start):
+            continue
+
+        line_end_candidates = [
+            position for position in (text.find("\n", value_start), text.find(";", value_start)) if position >= 0
+        ]
+        line_end = min(line_end_candidates, default=len(text))
+        if not any(delimiter in text[value_start:line_end] for delimiter in "([{"):
+            continue
+        return f"{text[:value_start]}{REDACTED_EVIDENCE_VALUE}"
+    return text
+
+
+def _redact_python_expression_assignments(text: str) -> str:
+    """Redact expression-valued sensitive assignments while preserving nearby code."""
+    try:
+        ast.parse(textwrap.dedent(text))
+    except SyntaxError:
+        return _redact_malformed_sensitive_expression_assignment(text)
+
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except (IndentationError, tokenize.TokenError):
+        return _redact_malformed_sensitive_expression_assignment(text)
+
+    depths: list[int] = []
+    depth = 0
+    for token in tokens:
+        depths.append(depth)
+        if token.type != tokenize.OP:
+            continue
+        if token.string in "([{":
+            depth += 1
+        elif token.string in ")]}":
+            depth = max(0, depth - 1)
+
+    offsets = _line_offsets(text)
+    text_length = len(text)
+    replacements: list[tuple[int, int]] = []
+    ignored_value_tokens = {tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT, tokenize.COMMENT}
+
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.OP or token.string not in {"=", ":=", ":"}:
+            continue
+
+        operator_depth = depths[index]
+        target_start_index = _assignment_target_start(tokens, depths, index, operator_depth)
+        target_start = _position_offset(offsets, tokens[target_start_index].start, text_length)
+        target_end = _position_offset(offsets, token.start, text_length)
+        target = text[target_start:target_end]
+        if token.string == ":":
+            if QUOTED_SENSITIVE_MAPPING_KEY_RE.search(target) is None:
+                continue
+        elif SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is None:
+            continue
+
+        value_index = index + 1
+        while value_index < len(tokens) and tokens[value_index].type in ignored_value_tokens:
+            value_index += 1
+        if value_index >= len(tokens) or tokens[value_index].type == tokenize.ENDMARKER:
+            continue
+
+        value_end, significant = _assignment_value_end(
+            tokens,
+            depths,
+            value_index,
+            token.string,
+            operator_depth,
+            text_length,
+            offsets,
+        )
+        if len(significant) == 1 and significant[0].type in {tokenize.NAME, tokenize.NUMBER, tokenize.STRING}:
+            continue
+
+        value_start = _position_offset(offsets, tokens[value_index].start, text_length)
+        while value_end > value_start and text[value_end - 1].isspace():
+            value_end -= 1
+        if value_end > value_start:
+            replacements.append((value_start, value_end))
+
+    non_overlapping_replacements: list[tuple[int, int]] = []
+    for start, end in sorted(replacements):
+        if non_overlapping_replacements and end <= non_overlapping_replacements[-1][1]:
+            continue
+        if non_overlapping_replacements and start < non_overlapping_replacements[-1][1]:
+            previous_start, _previous_end = non_overlapping_replacements[-1]
+            non_overlapping_replacements[-1] = (previous_start, end)
+            continue
+        non_overlapping_replacements.append((start, end))
+
+    for start, end in reversed(non_overlapping_replacements):
+        text = f"{text[:start]}{REDACTED_EVIDENCE_VALUE}{text[end:]}"
+    return text
+
+
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
@@ -180,7 +318,8 @@ def _truncate(text: str, max_chars: int) -> str:
 
 def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
-    redacted = URL_RE.sub(_redact_url, text)
+    redacted = URL_RE.sub(_redact_url, text[: max(0, max_chars) + REDACTION_LOOKAHEAD_CHARS])
+    redacted = _redact_python_expression_assignments(redacted)
     redacted = MULTILINE_MALFORMED_PYTHON_CONTAINER_SENSITIVE_ASSIGNMENT_RE.sub(
         _redact_multiline_malformed_python_container_assignment,
         redacted,
