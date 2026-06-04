@@ -1450,6 +1450,10 @@ def test_lambda_dict_bytecode_without_dangerous_patterns_stays_warning(tmp_path:
         for issue in result.issues
         if "safe_dict_lambda" in issue.message and issue.severity == IssueSeverity.CRITICAL
     ]
+    assert not any(
+        check.name == "Lambda Layer Code Analysis" and check.message == "Lambda layer uses malformed function metadata"
+        for check in result.checks
+    )
 
 
 def test_lambda_dict_bytecode_with_dangerous_pattern_still_critical(tmp_path: Path) -> None:
@@ -1686,6 +1690,10 @@ def test_lambda_list_bytecode_with_benign_module_fields_stays_warning(tmp_path: 
         check.name == "Lambda Layer Module Reference Check"
         and check.status == CheckStatus.PASSED
         and check.details.get("module") == "keras.ops"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Lambda Layer Code Analysis" and check.message == "Lambda layer uses malformed function metadata"
         for check in result.checks
     )
 

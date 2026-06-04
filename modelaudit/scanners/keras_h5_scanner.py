@@ -1164,7 +1164,7 @@ class KerasH5Scanner(BaseScanner):
                         rule_code="S507",
                     )
                     function_requires_review = True
-        elif function_str is not None:
+        elif function_str is not None and not isinstance(function_str, (dict, list)):
             result.add_check(
                 name="Lambda Layer Code Analysis",
                 passed=False,
