@@ -13,6 +13,7 @@ import h5py
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners import keras_utils
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 
@@ -237,16 +238,27 @@ def test_keras_h5_scanner_detects_cve_2026_1669_external_storage(tmp_path: Path)
     ]
 
 
-def test_keras_h5_scanner_skips_cve_2026_1669_on_fixed_version(tmp_path: Path) -> None:
-    """Fixed Keras versions should not emit warning-level CVE-2026-1669 findings."""
-    model_path = create_h5_with_external_link(tmp_path, keras_version="3.13.2")
+@pytest.mark.parametrize(
+    "fixture_factory",
+    [create_h5_with_external_link, create_h5_with_external_storage],
+)
+def test_keras_h5_scanner_flags_external_references_despite_fixed_file_version(
+    tmp_path: Path,
+    fixture_factory: Any,
+) -> None:
+    """Standalone H5 files cannot use artifact-controlled keras_version to suppress external refs."""
+    model_path = fixture_factory(tmp_path, keras_version="3.13.2")
 
     scanner = KerasH5Scanner()
     result = scanner.scan(str(model_path))
 
-    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
-    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
-    assert any(
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].severity == IssueSeverity.WARNING
+    assert cve_issues[0].details["keras_version"] == "3.13.2"
+    assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
+    assert cve_issues[0].details["version_source"] == "hdf5_file_attribute"
+    assert not any(
         check.name == "HDF5 External Weight Reference Version Check" and check.status == CheckStatus.PASSED
         for check in result.checks
     )
@@ -624,6 +636,44 @@ def test_keras_h5_scanner_skips_generic_hdf5_external_links_without_keras_metada
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
+def test_keras_h5_scanner_skips_generic_hdf5_external_link_with_only_keras_version(tmp_path: Path) -> None:
+    """A keras_version attribute alone must not classify a generic HDF5 file as Keras weights."""
+    generic_path = tmp_path / "generic_with_version.h5"
+    with h5py.File(generic_path, "w") as f:
+        f.attrs["keras_version"] = "3.13.2"
+        f["linked"] = h5py.ExternalLink("external_source.h5", "/payload")
+
+    result = KerasH5Scanner().scan(str(generic_path))
+
+    assert result.success is True
+    assert result.metadata["keras_version"] == "3.13.2"
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def test_keras_h5_scanner_skips_generic_hdf5_external_storage_with_only_keras_version(tmp_path: Path) -> None:
+    """Artifact-controlled version metadata should not turn generic external storage into a Keras CVE."""
+    raw_storage = tmp_path / "generic.raw"
+    raw_storage.write_bytes(b"\x00" * 8)
+
+    generic_path = tmp_path / "generic_with_external_storage.h5"
+    with h5py.File(generic_path, "w") as f:
+        f.attrs["keras_version"] = "3.13.2"
+        f.create_dataset(
+            "external_values",
+            shape=(2,),
+            dtype="float32",
+            external=[(raw_storage.name, 0, 8)],
+        )
+
+    result = KerasH5Scanner().scan(str(generic_path))
+
+    assert result.success is True
+    assert result.metadata["keras_version"] == "3.13.2"
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
 def test_keras_h5_scanner_skips_generic_nested_weight_like_groups(tmp_path: Path) -> None:
     """Nested generic groups named vars/weights must not imply a Keras weights file."""
     generic_path = tmp_path / "generic_nested.h5"
@@ -666,6 +716,61 @@ def test_keras_h5_scanner_skips_generic_layer_names_attr_without_weight_groups(t
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
+def test_keras_h5_scanner_bounds_legacy_layout_probe_before_external_reference_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oversized legacy layout probes must route into bounded external-reference analysis."""
+    weights_path = tmp_path / "legacy_probe.h5"
+    with h5py.File(weights_path, "w") as f:
+        f.attrs["layer_names"] = [b"layer_0", b"layer_1", b"layer_2"]
+        for index in range(3):
+            f.create_group(f"layer_{index}")
+        f["external_payload"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_LAYOUT_PROBE_ITEMS", 2)
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/external_payload",
+            "filename": "missing_external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
+@pytest.mark.parametrize("layout", ["legacy", "keras3"])
+def test_keras_h5_scanner_layout_probe_limit_without_external_references_stays_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+) -> None:
+    """Layout probe exhaustion alone must not become a security finding or incomplete scan."""
+    weights_path = tmp_path / ("model.weights.h5" if layout == "keras3" else "legacy_probe.h5")
+    with h5py.File(weights_path, "w") as f:
+        if layout == "legacy":
+            f.attrs["layer_names"] = [b"layer_0", b"layer_1", b"layer_2"]
+            group = f
+        else:
+            group = f.create_group("layers")
+        for index in range(3):
+            group.create_group(f"layer_{index}")
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_LAYOUT_PROBE_ITEMS", 2)
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
 def test_keras_h5_scanner_flags_weights_only_external_link_without_keras_metadata(tmp_path: Path) -> None:
     """Weights-only HDF5 files can still be Keras load inputs and must not skip external references."""
     external_source = tmp_path / "external_source.h5"
@@ -674,6 +779,7 @@ def test_keras_h5_scanner_flags_weights_only_external_link_without_keras_metadat
 
     weights_path = tmp_path / "weights_only.h5"
     with h5py.File(weights_path, "w") as f:
+        f.attrs["keras_version"] = "3.13.2"
         f.attrs["layer_names"] = [b"dense"]
         dense = f.create_group("dense")
         dense.attrs["weight_names"] = [b"kernel:0"]
@@ -684,7 +790,8 @@ def test_keras_h5_scanner_flags_weights_only_external_link_without_keras_metadat
     cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
     assert len(cve_issues) == 1
     assert cve_issues[0].severity == IssueSeverity.WARNING
-    assert cve_issues[0].details["parse_status"] == "unknown"
+    assert cve_issues[0].details["keras_version"] == "3.13.2"
+    assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
     assert cve_issues[0].details["external_references"] == [
         {
             "kind": "ExternalLink",
@@ -703,6 +810,7 @@ def test_keras_h5_scanner_flags_keras3_weights_external_link_without_legacy_attr
 
     weights_path = tmp_path / "model.weights.h5"
     with h5py.File(weights_path, "w") as f:
+        f.attrs["keras_version"] = "3.13.2"
         vars_group = f.create_group("layers").create_group("dense").create_group("vars")
         vars_group["0"] = h5py.ExternalLink(external_source.name, "/payload")
 
@@ -710,12 +818,41 @@ def test_keras_h5_scanner_flags_keras3_weights_external_link_without_legacy_attr
 
     cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
     assert len(cve_issues) == 1
-    assert cve_issues[0].details["parse_status"] == "unknown"
+    assert cve_issues[0].details["keras_version"] == "3.13.2"
+    assert cve_issues[0].details["parse_status"] == "untrusted_artifact_version"
     assert cve_issues[0].details["external_references"] == [
         {
             "kind": "ExternalLink",
             "hdf5_path": "/layers/dense/vars/0",
             "filename": "external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
+def test_keras_h5_scanner_bounds_keras3_layout_probe_before_external_reference_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oversized Keras 3 layout probes must route into bounded external-reference analysis."""
+    weights_path = tmp_path / "model.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        layers = f.create_group("layers")
+        for index in range(3):
+            layers.create_group(f"layer_{index}")
+        f["external_payload"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_LAYOUT_PROBE_ITEMS", 2)
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/external_payload",
+            "filename": "missing_external_source.h5",
             "path": "/payload",
         },
     ]
@@ -740,6 +877,166 @@ def test_keras_h5_scanner_flags_keras3_weights_external_link_without_resolving_i
             "path": "/payload",
         },
     ]
+
+
+def test_keras_h5_scanner_legacy_h5py_traversal_flags_dangling_external_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """h5py before 3.11 must still inspect external links without resolving them."""
+    weights_path = tmp_path / "legacy.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        layers = f.create_group("layers")
+        layers["dense"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+
+    monkeypatch.delattr(h5py.Group, "visititems_links")
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/layers/dense",
+            "filename": "missing_external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
+def test_keras_h5_scanner_external_reference_collection_does_not_resolve_soft_links(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SoftLink aliases must not be dereferenced while collecting external references."""
+    weights_path = tmp_path / "soft_alias.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        vars_group = f.create_group("layers").create_group("dense").create_group("vars")
+        vars_group["external_kernel"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+        vars_group["soft_alias"] = h5py.SoftLink("/layers/dense/vars/external_kernel")
+
+    original_get = h5py.Group.get
+
+    def guarded_get(
+        self: Any,
+        name: Any,
+        default: Any = None,
+        getclass: bool = False,
+        getlink: bool = False,
+    ) -> Any:
+        if str(name).endswith("soft_alias") and not getlink:
+            raise AssertionError("SoftLink target was followed")
+        return original_get(self, name, default=default, getclass=getclass, getlink=getlink)
+
+    monkeypatch.setattr(h5py.Group, "get", guarded_get)
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/layers/dense/vars/external_kernel",
+            "filename": "missing_external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
+@pytest.mark.parametrize("legacy_h5py", [False, True])
+def test_keras_h5_scanner_external_reference_traversal_limit_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_h5py: bool,
+) -> None:
+    """External-reference traversal limits must fail closed without caching partial scans."""
+    weights_path = tmp_path / "traversal_limit.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        f.create_group("layers").create_group("dense").create_group("vars")
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_LINK_VISITS", 2)
+    if legacy_h5py:
+        monkeypatch.delattr(h5py.Group, "visititems_links")
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    reason = "keras_h5_external_reference_analysis_limit_exceeded"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in result.metadata["scan_outcome_reasons"]
+    limit_checks = [check for check in result.checks if check.name == "HDF5 External Reference Analysis Limit"]
+    assert len(limit_checks) == 1
+    assert limit_checks[0].status == CheckStatus.FAILED
+    assert limit_checks[0].message == "Keras H5 external-reference analysis reached a configured safety limit"
+    assert limit_checks[0].details["visited_link_count"] == 2
+    assert limit_checks[0].details["link_visits_truncated"] is True
+
+    audit_result = scan_model_directory_or_file(str(weights_path), cache_enabled=False)
+    assert determine_exit_code(audit_result) == 2
+    _assert_inconclusive_keras_h5_scan_not_cached(weights_path, reason, tmp_path / f"cache-{legacy_h5py}")
+
+
+def test_keras_h5_scanner_external_reference_reports_are_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reference reporting must stay bounded while preserving the security finding."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {"class_name": "Sequential", "config": {"layers": []}},
+    )
+    with h5py.File(model_path, "a") as f:
+        weights = f.require_group("model_weights")
+        for index in range(3):
+            weights[f"linked_{index}"] = h5py.ExternalLink("missing_external_source.h5", f"/payload/{index}")
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_EXTERNAL_REFERENCE_REPORTS", 2)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    reason = "keras_h5_external_reference_analysis_limit_exceeded"
+    assert reason in result.metadata["scan_outcome_reasons"]
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert len(cve_issues[0].details["external_references"]) == 2
+    assert cve_issues[0].details["external_reference_count"] == 3
+    assert cve_issues[0].details["external_references_truncated"] is True
+
+    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    assert determine_exit_code(audit_result) == 1
+
+
+def test_keras_h5_scanner_external_storage_segment_reports_are_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """External-storage diagnostics must not retain every attacker-controlled segment."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {"class_name": "Sequential", "config": {"layers": []}},
+    )
+    with h5py.File(model_path, "a") as f:
+        weights = f.require_group("model_weights")
+        weights.create_dataset(
+            "external_kernel",
+            shape=(3,),
+            dtype="float32",
+            external=[(f"weights-{index}.raw", 0, 4) for index in range(3)],
+        )
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS", 2)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    reason = "keras_h5_external_reference_analysis_limit_exceeded"
+    assert reason in result.metadata["scan_outcome_reasons"]
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    external_reference = cve_issues[0].details["external_references"][0]
+    assert len(external_reference["segments"]) == 2
+    assert external_reference["segment_count"] == 3
+    assert external_reference["segments_truncated"] is True
 
 
 def test_keras_h5_scanner_malicious_model(tmp_path):
@@ -1047,7 +1344,8 @@ def test_lambda_dict_bytecode_without_dangerous_patterns_stays_warning(tmp_path:
 
 
 def test_lambda_dict_bytecode_with_dangerous_pattern_still_critical(tmp_path: Path) -> None:
-    encoded_code = base64.b64encode(b"import os\nos.system('id')\neval('__import__(\"os\")')").decode()
+    code = compile("import os\nos.system('id')\neval('__import__(\"os\")')", "<lambda>", "exec")
+    encoded_code = base64.b64encode(marshal.dumps(code)).decode()
     model_path = create_custom_h5_file(
         tmp_path,
         {
@@ -1079,6 +1377,534 @@ def test_lambda_dict_bytecode_with_dangerous_pattern_still_critical(tmp_path: Pa
     ]
     assert len(dangerous_checks) == 1
     assert {"eval", "__import__", "os.system"}.issubset(set(dangerous_checks[0].details["dangerous_patterns"]))
+
+
+def test_lambda_dict_bytecode_with_benign_module_fields_still_critical(tmp_path: Path) -> None:
+    """Dict-format Lambda bytecode must not be skipped by benign module/function metadata."""
+    code = compile("import os\nos.system('id')\neval('__import__(\"os\")')", "<lambda>", "exec")
+    encoded_code = base64.b64encode(marshal.dumps(code)).decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "mixed_dict_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "mixed_dict_lambda",
+                            "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                            "module": "keras.ops",
+                            "function_name": "identity",
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    dangerous_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("layer_name") == "mixed_dict_lambda"
+    ]
+    assert len(dangerous_checks) == 1
+    assert {"eval", "__import__", "os.system"}.issubset(set(dangerous_checks[0].details["dangerous_patterns"]))
+    assert not any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("module") == "keras.ops"
+        for check in result.checks
+    )
+
+
+def test_lambda_dict_bytecode_with_benign_module_fields_stays_warning(tmp_path: Path) -> None:
+    """Opaque dict-format Lambda bytecode should not become a passed module reference check."""
+    encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "mixed_safe_dict_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "mixed_safe_dict_lambda",
+                            "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                            "module": "keras.ops",
+                            "function_name": "identity",
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    bytecode_issues = [
+        issue
+        for issue in result.issues
+        if "embedded bytecode" in issue.message and "mixed_safe_dict_lambda" in issue.message
+    ]
+    assert len(bytecode_issues) == 1
+    assert bytecode_issues[0].severity == IssueSeverity.WARNING
+    assert not any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("module") == "keras.ops"
+        for check in result.checks
+    )
+
+
+def test_lambda_dict_malformed_config_does_not_echo_payload(tmp_path: Path) -> None:
+    """Malformed dict-format metadata should report its type without retaining attacker content."""
+    payload = "attacker-controlled-secret-payload"
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "malformed_dict_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "malformed_dict_lambda",
+                            "function": {"class_name": "__lambda__", "config": payload},
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    malformed_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("parse_status") == "invalid_config"
+    ]
+    assert len(malformed_checks) == 1
+    assert malformed_checks[0].details["config_type"] == "str"
+    assert payload not in str(malformed_checks[0].details)
+
+
+def test_lambda_list_bytecode_with_dangerous_pattern_is_critical(tmp_path: Path) -> None:
+    """Legacy list-format Lambda bytecode in H5 must be decoded and inspected."""
+    code = compile("import os\nos.system('id')\neval('__import__(\"os\")')", "<lambda>", "exec")
+    encoded_code = base64.b64encode(marshal.dumps(code)).decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "list_dict_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "dangerous_list_lambda",
+                            "function": [encoded_code, None, None],
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    dangerous_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("layer_name") == "dangerous_list_lambda"
+    ]
+    assert len(dangerous_checks) == 1
+    assert dangerous_checks[0].details["function_format"] == "list_bytecode"
+    assert {"eval", "__import__", "os.system"}.issubset(set(dangerous_checks[0].details["dangerous_patterns"]))
+
+
+def test_lambda_list_bytecode_with_benign_module_fields_stays_warning(tmp_path: Path) -> None:
+    """Opaque list-format Lambda bytecode should not become a passed module reference check."""
+    encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "mixed_safe_list_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "mixed_safe_list_lambda",
+                            "function": [encoded_code, None, None],
+                            "module": "keras.ops",
+                            "function_name": "identity",
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    bytecode_issues = [
+        issue
+        for issue in result.issues
+        if "embedded bytecode" in issue.message and "mixed_safe_list_lambda" in issue.message
+    ]
+    assert len(bytecode_issues) == 1
+    assert bytecode_issues[0].severity == IssueSeverity.WARNING
+    assert bytecode_issues[0].details["function_format"] == "list_bytecode"
+    assert not any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("module") == "keras.ops"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("function_data", [[], [None, None, None]])
+def test_lambda_list_missing_encoded_code_stays_warning(tmp_path: Path, function_data: list[Any]) -> None:
+    """Malformed list-format Lambda metadata must remain a security finding."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "malformed_list_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "malformed_list_lambda",
+                            "function": function_data,
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    malformed_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("function_format") == "list"
+    ]
+    assert len(malformed_checks) == 1
+    assert malformed_checks[0].severity == IssueSeverity.WARNING
+
+
+def test_unrecognized_lambda_function_dict_still_uses_module_reference_check(tmp_path: Path) -> None:
+    """Only recognized __lambda__ dictionaries should preempt module/function reference analysis."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "unrecognized_dict_module_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "unrecognized_dict_module",
+                            "function": {"class_name": "SomeCallable", "config": {}},
+                            "module": "os",
+                            "function_name": "system",
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("module") == "os"
+        and check.details.get("function") == "system"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("module_name", "function_name"),
+    [(["os"], None), (None, {"name": "system"})],
+)
+def test_lambda_malformed_module_reference_is_not_marked_safe(
+    tmp_path: Path,
+    module_name: Any,
+    function_name: Any,
+) -> None:
+    """Malformed mixed module/function metadata must not become a passed safety check."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "malformed_module_reference_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "malformed_module_reference",
+                            "function": {"class_name": "SomeCallable", "config": {}},
+                            "module": module_name,
+                            "function_name": function_name,
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    malformed_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("module_type") == type(module_name).__name__
+        and check.details.get("function_type") == type(function_name).__name__
+    ]
+    assert len(malformed_checks) == 1
+    assert malformed_checks[0].severity == IssueSeverity.WARNING
+    assert not any(
+        check.name == "Lambda Layer Module Reference Check" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+
+
+def test_lambda_dict_bytecode_with_dangerous_module_fields_still_checks_module_reference(tmp_path: Path) -> None:
+    """Opaque dict bytecode must not suppress a dangerous sibling module/function reference."""
+    encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "mixed_dangerous_module_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "mixed_dangerous_module",
+                            "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                            "module": "os",
+                            "function_name": "system",
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        issue.severity == IssueSeverity.WARNING
+        and "embedded bytecode" in issue.message
+        and "mixed_dangerous_module" in issue.message
+        for issue in result.issues
+    )
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("module") == "os"
+        and check.details.get("function") == "system"
+        for check in result.checks
+    )
+
+
+def test_lambda_safe_string_with_dangerous_module_fields_still_checks_module_reference(tmp_path: Path) -> None:
+    """Safe-looking inline Lambda code must not suppress a dangerous sibling module reference."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "mixed_safe_string_module_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "mixed_safe_string_module",
+                            "function": "lambda x: x / 255",
+                            "module": "os",
+                            "function_name": "system",
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("pattern_type") == "safe_normalization"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("module") == "os"
+        and check.details.get("function") == "system"
+        for check in result.checks
+    )
+
+
+def test_lambda_dict_bytecode_does_not_match_dangerous_substrings_inside_identifiers(tmp_path: Path) -> None:
+    """Benign identifiers such as `opened` must not become critical `open` bytecode findings."""
+    encoded_code = base64.b64encode(b"def benign():\n    opened = 1\n    return opened\n").decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "benign_identifier_dict_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "benign_identifier_dict_lambda",
+                            "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert not any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        and check.details.get("analysis_status") == "opaque_bytecode"
+        for check in result.checks
+    )
+
+
+def test_lambda_dict_oversized_code_is_not_decoded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Oversized encoded Lambda bytecode must fail closed before allocating a decoded copy."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "oversized_dict_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "oversized_dict_lambda",
+                            "function": {"class_name": "__lambda__", "config": {"code": "A" * 9}},
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    def fail_decode(_encoded: str) -> bytes:
+        raise AssertionError("oversized Lambda bytecode must not be decoded")
+
+    monkeypatch.setattr(keras_utils, "_MAX_LAMBDA_CODE_B64_CHARS", 8)
+    monkeypatch.setattr(keras_utils.base64, "b64decode", fail_decode)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    oversized_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("analysis_status") == "code_size_limit_exceeded"
+    ]
+    assert len(oversized_checks) == 1
+    assert oversized_checks[0].severity == IssueSeverity.WARNING
+    assert oversized_checks[0].details["encoded_code_chars"] == 9
+    assert oversized_checks[0].details["max_encoded_code_chars"] == 8
+
+
+def test_lambda_list_oversized_code_is_not_decoded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Oversized list-format Lambda bytecode must fail closed before allocating a decoded copy."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "oversized_list_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "oversized_list_lambda",
+                            "function": ["A" * 9, None, None],
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    def fail_decode(_encoded: str) -> bytes:
+        raise AssertionError("oversized Lambda bytecode must not be decoded")
+
+    monkeypatch.setattr(keras_utils, "_MAX_LAMBDA_CODE_B64_CHARS", 8)
+    monkeypatch.setattr(keras_utils.base64, "b64decode", fail_decode)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    oversized_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("analysis_status") == "code_size_limit_exceeded"
+    ]
+    assert len(oversized_checks) == 1
+    assert oversized_checks[0].severity == IssueSeverity.WARNING
+    assert oversized_checks[0].details["function_format"] == "list"
+    assert oversized_checks[0].details["encoded_code_chars"] == 9
+    assert oversized_checks[0].details["max_encoded_code_chars"] == 8
 
 
 def test_keras_h5_scanner_empty_file(tmp_path):
