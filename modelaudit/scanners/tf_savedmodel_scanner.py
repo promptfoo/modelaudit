@@ -12,6 +12,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
+from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+from google.protobuf.message import DecodeError, Message
+
 from modelaudit.config.explanations import get_tf_op_explanation
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, _looks_like_proto0_or_1_pickle
@@ -28,6 +31,96 @@ from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .keras_utils import find_case_insensitive_substrings, find_lambda_dangerous_patterns
 
 logger = logging.getLogger(__name__)
+
+
+def _add_keras_metadata_field(
+    message: Any,
+    *,
+    name: str,
+    number: int,
+    field_type: int,
+    label: int = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+    type_name: str | None = None,
+) -> None:
+    field = message.field.add()
+    field.name = name
+    field.number = number
+    field.type = field_type
+    field.label = label
+    if type_name is not None:
+        field.type_name = type_name
+
+
+def _build_keras_saved_metadata_message_type() -> type[Message]:
+    """Build the small Keras metadata schema missing from the vendored TensorFlow stubs."""
+    package = "third_party.tensorflow.python.keras.protobuf"
+    file_descriptor = descriptor_pb2.FileDescriptorProto(
+        name="modelaudit/keras_saved_metadata.proto",
+        package=package,
+        syntax="proto3",
+    )
+
+    version_def = file_descriptor.message_type.add()
+    version_def.name = "VersionDef"
+    _add_keras_metadata_field(
+        version_def, name="producer", number=1, field_type=descriptor_pb2.FieldDescriptorProto.TYPE_INT32
+    )
+    _add_keras_metadata_field(
+        version_def,
+        name="min_consumer",
+        number=2,
+        field_type=descriptor_pb2.FieldDescriptorProto.TYPE_INT32,
+    )
+    _add_keras_metadata_field(
+        version_def,
+        name="bad_consumers",
+        number=3,
+        field_type=descriptor_pb2.FieldDescriptorProto.TYPE_INT32,
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED,
+    )
+
+    saved_object = file_descriptor.message_type.add()
+    saved_object.name = "SavedObject"
+    reserved_range = saved_object.reserved_range.add()
+    reserved_range.start = 1
+    reserved_range.end = 2
+    _add_keras_metadata_field(
+        saved_object, name="node_id", number=2, field_type=descriptor_pb2.FieldDescriptorProto.TYPE_INT32
+    )
+    _add_keras_metadata_field(
+        saved_object, name="node_path", number=3, field_type=descriptor_pb2.FieldDescriptorProto.TYPE_STRING
+    )
+    _add_keras_metadata_field(
+        saved_object, name="identifier", number=4, field_type=descriptor_pb2.FieldDescriptorProto.TYPE_STRING
+    )
+    _add_keras_metadata_field(
+        saved_object, name="metadata", number=5, field_type=descriptor_pb2.FieldDescriptorProto.TYPE_STRING
+    )
+    _add_keras_metadata_field(
+        saved_object,
+        name="version",
+        number=6,
+        field_type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
+        type_name=f".{package}.VersionDef",
+    )
+
+    saved_metadata = file_descriptor.message_type.add()
+    saved_metadata.name = "SavedMetadata"
+    _add_keras_metadata_field(
+        saved_metadata,
+        name="nodes",
+        number=1,
+        field_type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED,
+        type_name=f".{package}.SavedObject",
+    )
+
+    pool = descriptor_pool.DescriptorPool()
+    pool.Add(file_descriptor)
+    return message_factory.GetMessageClass(pool.FindMessageTypeByName(f"{package}.SavedMetadata"))
+
+
+_KERAS_SAVED_METADATA_MESSAGE_TYPE = _build_keras_saved_metadata_message_type()
 
 # Derive from centralized list; keep severities unified here
 # Exclude Python ops (handled elsewhere) and pure decode ops from the generic pass
@@ -55,6 +148,10 @@ _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
 _MAX_PROTOBUF_PARSE_BYTES = 20 * 1024 * 1024
 _MAX_KERAS_METADATA_PARSE_BYTES = _MAX_PROTOBUF_PARSE_BYTES
 _MAX_COLLECTION_VALUE_BYTES = 256 * 1024
+_PROTOBUF_STRING_LENGTH_CHECK_THRESHOLD = 10_000
+_MAX_PROTOBUF_STRING_FULL_SCAN_CHARS = 32 * 1024
+_PROTOBUF_STRING_SCAN_WINDOW_CHARS = 16 * 1024
+_PROTOBUF_STRING_INCOMPLETE_REASON = "savedmodel_protobuf_string_scan_incomplete"
 _CORE_ROOT_MODEL_FILES = frozenset({"saved_model.pb", "keras_metadata.pb", "fingerprint.pb"})
 _CORE_ROOT_MODEL_DIRS = frozenset({"assets", "assets.extra", "variables"})
 _CORE_ROOT_ASSET_DIRS = frozenset({"assets", "assets.extra"})
@@ -302,6 +399,25 @@ class TensorFlowSavedModelScanner(BaseScanner):
         )
         result.finish(success=False)
         return result
+
+    @staticmethod
+    def _mark_keras_metadata_scan_failure(result: ScanResult, path: str, error: Exception) -> None:
+        reason = "keras_metadata_parse_failed"
+        mark_inconclusive_scan_result(result, reason)
+        mark_operational_scan_error(result, reason)
+        result.add_check(
+            name="Keras Metadata Parsing",
+            passed=False,
+            message=f"Unable to parse keras_metadata.pb: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+        )
 
     @staticmethod
     def _mark_keras_metadata_parse_budget_exceeded(result: ScanResult, path: str) -> None:
@@ -1396,6 +1512,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     return
                 if add_integrity_check:
                     self._add_bounded_file_integrity_check(path, result, content)
+                try:
+                    _KERAS_SAVED_METADATA_MESSAGE_TYPE().ParseFromString(content)
+                except DecodeError as e:
+                    self._mark_keras_metadata_scan_failure(result, path, e)
 
                 # Convert to string for pattern matching
                 content_str = content.decode("utf-8", errors="ignore")
@@ -1543,14 +1663,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         except OSError:
             raise
         except Exception as e:
-            result.add_check(
-                name="Keras Metadata Scan",
-                passed=False,
-                message=f"Error scanning keras_metadata.pb: {e!s}",
-                severity=IssueSeverity.DEBUG,
-                location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
-            )
+            self._mark_keras_metadata_scan_failure(result, path, e)
 
     def _scan_protobuf_vulnerabilities(self, saved_model: Any, result: ScanResult) -> None:
         """Enhanced protobuf vulnerability scanning for TensorFlow SavedModels"""
@@ -1562,6 +1675,39 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # Their thresholds are heuristic and currently lack regression
         # coverage, so wiring them in would expand SavedModel findings beyond
         # the narrowly-scoped function-definition fix until they are validated.
+
+    @staticmethod
+    def _protobuf_string_scan_windows(string_val: str) -> tuple[list[tuple[int, int, str]], bool]:
+        """Return bounded merged scan regions and whether they cover the whole string."""
+        string_length = len(string_val)
+        if string_length <= _MAX_PROTOBUF_STRING_FULL_SCAN_CHARS:
+            return [(0, string_length, string_val)], True
+
+        window_size = min(_PROTOBUF_STRING_SCAN_WINDOW_CHARS, string_length)
+        starts = [
+            0,
+            max(0, _PROTOBUF_STRING_LENGTH_CHECK_THRESHOLD - window_size // 4),
+            min(_PROTOBUF_STRING_LENGTH_CHECK_THRESHOLD, max(0, string_length - window_size)),
+            max(0, string_length // 2 - window_size // 2),
+            max(0, string_length - window_size),
+        ]
+        seen: set[tuple[int, int]] = set()
+        for start in starts:
+            end = min(string_length, start + window_size)
+            seen.add((start, end))
+
+        merged_intervals: list[tuple[int, int]] = []
+        for start, end in sorted(seen):
+            if not merged_intervals or start > merged_intervals[-1][1]:
+                merged_intervals.append((start, end))
+                continue
+
+            previous_start, previous_end = merged_intervals[-1]
+            merged_intervals[-1] = (previous_start, max(previous_end, end))
+
+        windows = [(start, end, string_val[start:end]) for start, end in merged_intervals]
+        scanned_entire_string = len(windows) == 1 and windows[0][0] == 0 and windows[0][1] >= string_length
+        return windows, scanned_entire_string
 
     def _check_protobuf_string_injection(self, saved_model: Any, result: ScanResult) -> None:
         """Check for string injection attacks in protobuf fields"""
@@ -1591,8 +1737,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
             # Base64 encoded payloads — require at least one trailing '=' pad
             # character to avoid matching normal TF node names that use '/'
             # as a hierarchical separator (e.g. "bidirectional/forward_lstm",
-            # "Adam/embedding/embeddings").
-            (r"[A-Za-z0-9+/]{20,}={1,2}", "encoded_payload", "potential base64 payload"),
+            # "Adam/embedding/embeddings"). Boundaries also prevent quadratic
+            # backtracking on long unpadded alphanumeric runs.
+            (
+                r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{20,}={1,2}(?![A-Za-z0-9+/=])",
+                "encoded_payload",
+                "potential base64 payload",
+            ),
         ]
 
         for node_context in self._iter_saved_model_node_contexts(saved_model):
@@ -1601,66 +1752,101 @@ class TensorFlowSavedModelScanner(BaseScanner):
             # Check string values in node attributes
             if hasattr(node, "attr"):
                 for attr_name, attr_value in node.attr.items():
-                    string_vals_to_check = []
+                    string_vals_to_check: list[str] = []
 
-                    # Extract string values from different attribute types
-                    if hasattr(attr_value, "s"):  # String attribute
+                    value_kind = attr_value.WhichOneof("value")
+                    if value_kind == "s":
+                        encoded_values = (attr_value.s,)
+                    elif value_kind == "list":
+                        encoded_values = attr_value.list.s
+                    else:
+                        continue
+
+                    for encoded_value in encoded_values:
                         try:
-                            string_vals_to_check.append(attr_value.s.decode("utf-8", errors="ignore"))
+                            string_vals_to_check.append(encoded_value.decode("utf-8", errors="ignore"))
                         except (UnicodeDecodeError, AttributeError):
                             continue
 
-                    elif hasattr(attr_value, "list") and hasattr(attr_value.list, "s"):  # String list
-                        for s_val in attr_value.list.s:
-                            try:
-                                string_vals_to_check.append(s_val.decode("utf-8", errors="ignore"))
-                            except (UnicodeDecodeError, AttributeError):
-                                continue
-
                     # Check each string value against injection patterns
                     for string_val in string_vals_to_check:
-                        if len(string_val) > 10000:  # Skip extremely long strings to avoid performance issues
+                        scan_windows, scanned_entire_string = self._protobuf_string_scan_windows(string_val)
+                        matched_injection: tuple[str, str, str, list[Any], int, int] | None = None
+                        for pattern, attack_type, description in injection_patterns:
+                            for window_start, window_end, scan_text in scan_windows:
+                                matches = re.findall(pattern, scan_text, re.IGNORECASE)
+                                if matches:
+                                    matched_injection = (
+                                        pattern,
+                                        attack_type,
+                                        description,
+                                        matches,
+                                        window_start,
+                                        window_end,
+                                    )
+                                    break
+                            if matched_injection is not None:
+                                break
+
+                        if len(string_val) > _PROTOBUF_STRING_LENGTH_CHECK_THRESHOLD:
+                            string_details = self._build_node_details(
+                                node_context,
+                                {
+                                    "attribute_name": attr_name,
+                                    "string_length": len(string_val),
+                                    "attack_type": "protobuf_string_bomb",
+                                    "string_scan_strategy": "full" if scanned_entire_string else "windowed",
+                                    "string_scan_window_count": len(scan_windows),
+                                    "max_full_scan_chars": _MAX_PROTOBUF_STRING_FULL_SCAN_CHARS,
+                                },
+                            )
+                            if not scanned_entire_string:
+                                mark_inconclusive_scan_result(result, _PROTOBUF_STRING_INCOMPLETE_REASON)
+                                mark_operational_scan_error(result, _PROTOBUF_STRING_INCOMPLETE_REASON)
+                                string_details.update(
+                                    {
+                                        "analysis_incomplete": True,
+                                        "scan_outcome_reason": _PROTOBUF_STRING_INCOMPLETE_REASON,
+                                        "window_size_chars": _PROTOBUF_STRING_SCAN_WINDOW_CHARS,
+                                    }
+                                )
                             result.add_check(
                                 name="Protobuf String Length Check",
                                 passed=False,
                                 message=f"Abnormally long string in node attribute (length: {len(string_val)})",
                                 severity=IssueSeverity.INFO,
                                 location=self._build_node_location(node_context, attr_name=attr_name),
-                                details=self._build_node_details(
-                                    node_context,
-                                    {
-                                        "attribute_name": attr_name,
-                                        "string_length": len(string_val),
-                                        "attack_type": "protobuf_string_bomb",
-                                    },
-                                ),
+                                details=string_details,
                             )
+
+                        if matched_injection is None:
                             continue
 
-                        for pattern, attack_type, description in injection_patterns:
-                            matches = re.findall(pattern, string_val, re.IGNORECASE)
-                            if matches:
-                                result.add_check(
-                                    name="Protobuf String Injection Check",
-                                    passed=False,
-                                    message=f"Potential {description} detected in protobuf string",
-                                    severity=IssueSeverity.CRITICAL
-                                    if attack_type in ["code_injection", "system_command"]
-                                    else IssueSeverity.WARNING,
-                                    location=self._build_node_location(node_context, attr_name=attr_name),
-                                    details=self._build_node_details(
-                                        node_context,
-                                        {
-                                            "attribute_name": attr_name,
-                                            "pattern_matched": pattern,
-                                            "matches": matches[:5],  # Limit to first 5 matches
-                                            "attack_type": attack_type,
-                                            "description": description,
-                                            "total_matches": len(matches),
-                                        },
-                                    ),
-                                )
-                                break  # Only report first match per string to avoid spam
+                        pattern, attack_type, description, matches, window_start, window_end = matched_injection
+                        result.add_check(
+                            name="Protobuf String Injection Check",
+                            passed=False,
+                            message=f"Potential {description} detected in protobuf string",
+                            severity=IssueSeverity.CRITICAL
+                            if attack_type in ["code_injection", "system_command"]
+                            else IssueSeverity.WARNING,
+                            location=self._build_node_location(node_context, attr_name=attr_name),
+                            details=self._build_node_details(
+                                node_context,
+                                {
+                                    "attribute_name": attr_name,
+                                    "pattern_matched": pattern,
+                                    "matches": matches[:5],  # Limit to first 5 matches
+                                    "attack_type": attack_type,
+                                    "description": description,
+                                    "total_matches": len(matches),
+                                    "string_length": len(string_val),
+                                    "string_scan_strategy": "full" if scanned_entire_string else "windowed",
+                                    "matched_window_start": window_start,
+                                    "matched_window_end": window_end,
+                                },
+                            ),
+                        )
 
     def _check_protobuf_buffer_overflow(self, saved_model: Any, result: ScanResult) -> None:
         """Check for potential buffer overflow patterns in protobuf data"""
