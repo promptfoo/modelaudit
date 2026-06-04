@@ -2187,22 +2187,50 @@ class TestJITScriptDetector:
             ),
             (b"__builtins__.__dict__.pop('eval')('1+1')\n"),
             b"\x00\xffcallbacks = []\ncallbacks += [eval]\ncallbacks[0]('1+1')\n",
+            b"callbacks = []\nalias = callbacks\ncallbacks += [eval]\nalias[0]('1+1')\n",
             b"\x00\xffdef run(g=getattr):\n    g(__builtins__, 'eval')('1+1')\nrun()\n",
+            (b"\x00\xffdef run(g=getattr):\n    return g(__builtins__, 'eval')('1+1')\nrun()\n"),
             (b"\x00\xffdef run(callback):\n    callback('1+1')\ndef outer(*funcs):\n    funcs[0](eval)\nouter(run)\n"),
+            (
+                b"\x00\xffdef run(callback):\n"
+                b"    return callback('1+1')\n"
+                b"def outer(*functions):\n"
+                b"    return functions[0](eval)\n"
+                b"outer(run)\n"
+            ),
             b"\x00\xff(lambda callback: callback('1+1'))(eval)\n",
+            b"(lambda callback: callback('1+1'))(eval)\n",
             b"\x00\xffglobals().update({'sink': eval})\nsink('1+1')\n",
             b"\x00\xffglobals().update(sink=eval)\nsink('1+1')\n",
             b"\x00\xfffor _index, callback in enumerate([eval]):\n    callback('1+1')\n",
+            (b"\x00\xffdef payload():\n    for _index, callback in enumerate([eval]):\n        callback('1+1')\n"),
             (
                 b"\x00\xffasync def get_callback():\n"
                 b"    return eval\n"
                 b"async def main():\n"
                 b"    (await get_callback())('1+1')\n"
             ),
+            (
+                b"\x00\xffasync def get_callback():\n"
+                b"    return eval\n"
+                b"async def payload():\n"
+                b"    (await get_callback())('1+1')\n"
+            ),
             b"\x00\xffnext(iter([eval]))('1+1')\n",
+            (b"\x00\xffdef payload():\n    return next(iter([eval]))('1+1')\n"),
+            (b"\x00\xffdef payload():\n    return next(iter([]), eval)('1+1')\n"),
             b"\x00\xffcallbacks = list([eval])\ncallbacks[0]('1+1')\n",
+            (b"\x00\xffdef payload():\n    callbacks = list([eval])\n    return callbacks[0]('1+1')\n"),
             b"\x00\xffcallbacks = dict(sink=eval)\ncallbacks['sink']('1+1')\n",
+            (b"\x00\xffdef payload():\n    callbacks = dict(run=eval)\n    return callbacks['run']('1+1')\n"),
             b"\x00\xffmatch [eval]:\n    case [sink] | (sink,):\n        sink('1+1')\n",
+            (
+                b"\x00\xffdef payload():\n"
+                b"    match [eval]:\n"
+                b"        case [callback] | (callback,):\n"
+                b"            callback('1+1')\n"
+            ),
+            (b"\x00\xffdef run(callbacks=[]):\n    callbacks.append(eval)\n    return callbacks[0]('1+1')\nrun()\n"),
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
@@ -2431,7 +2459,10 @@ class TestJITScriptDetector:
             ),
             (b"__builtins__.__dict__.pop('len')([])\nunused = eval\n"),
             b"\x00\xffcallbacks = []\ncallbacks += [len]\ncallbacks[0]([])\nunused = eval\n",
+            b"callbacks = []\ncallbacks += [len]\ncallbacks[0]([])\nunused = eval\n",
+            b"callbacks = (len,)\nalias = callbacks\ncallbacks += (eval,)\nalias[1]('1+1')\n",
             b"\x00\xffdef run(g=getattr):\n    g(__builtins__, 'len')([])\nrun()\nunused = eval\n",
+            b"\x00\xffdef run(g=lambda *_args: len):\n    return g(__builtins__, 'eval')([])\nrun()\nunused = eval\n",
             (
                 b"\x00\xffdef run(callback):\n"
                 b"    callback([])\n"
@@ -2440,10 +2471,26 @@ class TestJITScriptDetector:
                 b"outer(run)\n"
                 b"unused = eval\n"
             ),
+            (
+                b"\x00\xffdef run(callback):\n"
+                b"    return callback([])\n"
+                b"def outer(*functions):\n"
+                b"    return functions[0](len)\n"
+                b"outer(run)\n"
+                b"unused = eval\n"
+            ),
             b"\x00\xff(lambda callback: callback([]))(len)\nunused = eval\n",
+            b"(lambda callback: callback([]))(len)\nunused = eval\n",
             b"\x00\xffglobals().update({'sink': len})\nsink([])\nunused = eval\n",
             b"\x00\xffglobals().update(sink=len)\nsink([])\nunused = eval\n",
+            b"\x00\xffglobals().update({'sink': eval})\nglobals().update({'sink': len})\nsink([])\n",
             b"\x00\xfffor _index, callback in enumerate([len]):\n    callback([])\nunused = eval\n",
+            (
+                b"\x00\xffdef payload():\n"
+                b"    for _index, callback in enumerate([len]):\n"
+                b"        callback([])\n"
+                b"unused = eval\n"
+            ),
             (
                 b"\x00\xffasync def get_callback():\n"
                 b"    return len\n"
@@ -2451,10 +2498,40 @@ class TestJITScriptDetector:
                 b"    (await get_callback())([])\n"
                 b"unused = eval\n"
             ),
+            (
+                b"\x00\xffasync def get_callback():\n"
+                b"    return len\n"
+                b"async def payload():\n"
+                b"    (await get_callback())([])\n"
+                b"unused = eval\n"
+            ),
             b"\x00\xffnext(iter([len]))([])\nunused = eval\n",
+            b"\x00\xffdef payload():\n    return next(iter([len]))([])\nunused = eval\n",
+            b"\x00\xffdef payload():\n    return next(iter([]), len)([])\nunused = eval\n",
             b"\x00\xffcallbacks = list([len])\ncallbacks[0]([])\nunused = eval\n",
+            b"\x00\xffdef payload():\n    callbacks = list([len])\n    return callbacks[0]([])\nunused = eval\n",
             b"\x00\xffcallbacks = dict(sink=len)\ncallbacks['sink']([])\nunused = eval\n",
+            (
+                b"\x00\xffdef payload():\n"
+                b"    callbacks = dict(run=len)\n"
+                b"    return callbacks['run']([])\n"
+                b"unused = eval\n"
+            ),
             b"\x00\xffmatch [len]:\n    case [sink] | (sink,):\n        sink([])\nunused = eval\n",
+            (
+                b"\x00\xffdef payload():\n"
+                b"    match [len]:\n"
+                b"        case [callback] | (callback,):\n"
+                b"            callback([])\n"
+                b"unused = eval\n"
+            ),
+            (
+                b"\x00\xffdef run(callbacks=[]):\n"
+                b"    callbacks.append(len)\n"
+                b"    return callbacks[0]([])\n"
+                b"run()\n"
+                b"unused = eval\n"
+            ),
         ],
     )
     def test_scan_model_avoids_false_positives_across_callable_summaries(self, data: bytes) -> None:
