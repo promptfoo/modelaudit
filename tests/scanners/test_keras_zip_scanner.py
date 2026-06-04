@@ -190,7 +190,17 @@ class TestKerasZipScanner:
 
     @pytest.mark.parametrize(
         "keras_version",
-        ["3.12.1rc1", "3.12.1a0", "3.12.1.dev0", "3.13.2rc1", "3.13.2dev0"],
+        [
+            "3.12.1rc1",
+            "3.12.1rc.post",
+            "3.12.1rc1.post1",
+            "3.12.1rc1.post.dev",
+            "3.12.1rc1+cpu",
+            "3.12.1a0",
+            "3.12.1.dev0",
+            "3.13.2rc1",
+            "3.13.2dev0",
+        ],
     )
     def test_embedded_hdf5_external_references_prerelease_fixes_are_vulnerable(
         self, tmp_path: Path, keras_version: str
@@ -213,7 +223,58 @@ class TestKerasZipScanner:
 
     @pytest.mark.parametrize(
         "keras_version",
-        ["3.12.1", "3.12.1+cpu", "3.12.1+rc1", "3.13.2", "3.13.2.post1", "3.13.2+dev0"],
+        [
+            "3.12.1rc1evil",
+            "3.12.1rc1.evil",
+            "3.12.1rc1+cpu+cuda",
+            "3.12.1--rc1",
+            "3.12.1candidate",
+            "3.12.1+",
+            "3.12.1+cpu+cuda",
+            "3.13.2.postevil",
+            "keras-3.12.1",
+        ],
+    )
+    def test_cve_2026_1669_noncanonical_versions_fail_closed(self, tmp_path: Path, keras_version: str) -> None:
+        """Unknown versions must warn without emitting a passing or falsely attributed CVE check."""
+        assert KerasZipScanner._is_vulnerable_to_cve_2026_1669(keras_version) is None
+
+        scanner = KerasZipScanner()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version=keras_version,
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        unknown_checks = [
+            check for check in result.checks if check.name == "HDF5 External Weight Reference Risk (Version Unknown)"
+        ]
+        passed_version_checks = [
+            check for check in result.checks if check.name == "HDF5 External Weight Reference Version Check"
+        ]
+        assert len(unknown_checks) == 1
+        assert unknown_checks[0].status == CheckStatus.FAILED
+        assert unknown_checks[0].details["keras_version"] == keras_version
+        assert unknown_checks[0].details["parse_status"] == "unknown"
+        assert passed_version_checks == []
+
+    @pytest.mark.parametrize(
+        "keras_version",
+        [
+            "3.12.1",
+            "3.12.1+cpu",
+            "3.12.1+rc1",
+            "3.12.1.post",
+            "3.12.1rev",
+            "3.12.1-r",
+            "3.12.1.post.dev",
+            "3.13.2",
+            "3.13.2.post1",
+            "3.13.2+dev0",
+        ],
     )
     def test_embedded_hdf5_external_references_stable_fixed_versions_pass(
         self, tmp_path: Path, keras_version: str
@@ -3549,6 +3610,135 @@ class TestCVE20243660LambdaAttribution:
         result = scanner.scan(str(keras_path))
         cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
         assert len(cve_issues) == 0
+
+    @pytest.mark.parametrize(
+        "keras_version",
+        [
+            "2.13.0rc1",
+            "2.13.0rc.post",
+            "2.13.0rc1.post1",
+            "2.13.0rc1.post.dev",
+            "2.13.0rc1+cpu",
+            "2.13.0a0",
+            "2.13.0b1",
+            "2.13.0.dev0",
+            "2.13.0-rc1",
+            "2.13.0pre1",
+        ],
+    )
+    def test_cve_for_keras_213_prerelease_versions(self, tmp_path: Path, keras_version: str) -> None:
+        """Prereleases of the CVE-2024-3660 fixed Keras version should remain vulnerable."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"lambda x: x * 2").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "my_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        keras_path = self._make_keras_zip(config, tmp_path, keras_version=keras_version)
+
+        result = scanner.scan(keras_path)
+        audit_result = scan_model_directory_or_file(keras_path, config={"cache_scan_results": False})
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2024-3660"]
+        passed_version_checks = [check for check in result.checks if check.name == "Lambda Version Risk Check"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["keras_version"] == keras_version
+        assert passed_version_checks == []
+        assert determine_exit_code(audit_result) == 1
+
+    @pytest.mark.parametrize(
+        "keras_version",
+        [
+            "2.13.0+cpu",
+            "2.13.0+cpu.cuda_1",
+            "2.13.0.post1",
+            "2.13.0post1",
+            "2.13.0.post",
+            "2.13.0rev",
+            "2.13.0-r",
+            "2.13.0.post.dev",
+            "2.13.0-1",
+            "2.13.0.post1.dev0",
+            "2.13.1",
+            "2.13.1rc1",
+            "2.13.1.dev0",
+        ],
+    )
+    def test_no_cve_for_stable_keras_213_variants(self, tmp_path: Path, keras_version: str) -> None:
+        """Stable fixed Keras 2.13 variants should stay outside CVE-2024-3660 attribution."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"lambda x: x * 2").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "my_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path, keras_version=keras_version))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2024-3660"]
+        assert cve_issues == []
+
+    @pytest.mark.parametrize(
+        "keras_version",
+        [
+            "2.13.0cpu",
+            "2.13.0candidate",
+            "2.13.0rc1.evil",
+            "2.13.0rc1+cpu+cuda",
+            "2.13.0--rc1",
+            "2.13.0postevil",
+            "2.13.0.postevil",
+            "2.13.0+",
+            "2.13.0+cpu+cuda",
+            "2.13.1garbage",
+            "keras-2.13.0",
+        ],
+    )
+    def test_noncanonical_keras_213_versions_warn_instead_of_pass(self, tmp_path: Path, keras_version: str) -> None:
+        """Unrecognized fixed-boundary qualifiers must not suppress Lambda risk with a passing check."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"lambda x: x * 2").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "my_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        keras_path = self._make_keras_zip(config, tmp_path, keras_version=keras_version)
+
+        result = scanner.scan(keras_path)
+        audit_result = scan_model_directory_or_file(keras_path, config={"cache_scan_results": False})
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2024-3660"]
+        passed_version_checks = [check for check in result.checks if check.name == "Lambda Version Risk Check"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+        assert cve_issues[0].details["keras_version"] == keras_version
+        assert cve_issues[0].details["parse_status"] == "unknown"
+        assert passed_version_checks == []
+        assert determine_exit_code(audit_result) == 1
 
     def test_cve_for_two_part_keras_version(self, tmp_path: Path) -> None:
         """Lambda in Keras 2.10 (two-part version) should be CVE-attributed."""
