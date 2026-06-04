@@ -3419,13 +3419,14 @@ def _has_bounded_flax_msgpack_state_root(
     return has_checkpoint_root
 
 
-def _has_bounded_flax_msgpack_routing_key_stream(
+def _probe_flax_msgpack_checkpoint_stream(
     stream: BinaryIO,
     file_size: int,
     *,
     sample_is_prefix: bool = False,
+    incomplete_prefix_is_inconclusive: bool = False,
 ) -> bool | None:
-    """Inspect streamed maps, returning None when safe routing cannot complete."""
+    """Inspect streamed maps, preserving recognized roots in truncated prefixes."""
     remaining_nodes = [_FLAX_MSGPACK_PROBE_MAX_NODES]
     inline_scalars_seen = 0
     recognized_checkpoint_root = [False]
@@ -3466,18 +3467,22 @@ def _has_bounded_flax_msgpack_routing_key_stream(
         # Once a root is recognized, run the scanner so it can analyze sibling
         # security fields even if routing validation exhausts its budget.
         return True if recognized_checkpoint_root[0] else None
+    except OSError:
+        return None
     except _MsgpackProbeIncomplete:
-        return None if sample_is_prefix else False
+        if incomplete_prefix_is_inconclusive:
+            return None if sample_is_prefix else False
+        return sample_is_prefix and recognized_checkpoint_root[0]
     except _MsgpackProbeInvalid:
         return False
-    return None if sample_is_prefix else False
+    return False
 
 
 def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | None:
-    """Inspect a local MessagePack stream for bounded Flax routing keys."""
+    """Inspect streamed maps, returning None when safe routing cannot complete."""
     try:
         with path.open("rb") as stream:
-            return _has_bounded_flax_msgpack_routing_key_stream(stream, file_size)
+            return _probe_flax_msgpack_checkpoint_stream(stream, file_size)
     except OSError:
         return None
 
@@ -3652,17 +3657,35 @@ def detect_flax_msgpack_overlap_routes(path: str, *, include_unvalidated_pickle:
     except OSError:
         return ()
 
+    return _detect_trusted_flax_foreign_content_routes(
+        file_path,
+        size,
+        include_unvalidated_pickle=include_unvalidated_pickle,
+    )
+
+
+def _detect_trusted_flax_foreign_content_routes(
+    file_path: Path,
+    file_size: int,
+    *,
+    include_unvalidated_pickle: bool = False,
+) -> tuple[str, ...]:
+    """Return strict foreign content routes that can safely override or supplement Flax suffixes."""
     prefix = read_magic_bytes(
-        path, min(size, max(_TORCH7_SIGNATURE_READ_BYTES, _CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
+        str(file_path),
+        min(
+            file_size,
+            max(_TORCH7_SIGNATURE_READ_BYTES, _CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES),
+        ),
     )
     routes: list[str] = []
-    pickle_probe_sample = _read_pickle_probe_sample(file_path, size, prefix[:16])
+    pickle_probe_sample = _read_pickle_probe_sample(file_path, file_size, prefix[:16])
     if (
         (include_unvalidated_pickle and _looks_like_binary_pickle_protocol(prefix[:4]))
         or _has_bounded_binary_pickle_security_signal(pickle_probe_sample)
         or _looks_like_proto0_or_1_pickle(
             pickle_probe_sample,
-            sample_is_prefix=size > len(pickle_probe_sample),
+            sample_is_prefix=file_size > len(pickle_probe_sample),
         )
     ):
         routes.append("pickle")
@@ -3678,12 +3701,19 @@ def detect_flax_msgpack_overlap_routes(path: str, *, include_unvalidated_pickle:
 
 
 def _resolve_inconclusive_flax_foreign_overlap(file_path: Path) -> str | None:
-    """Prefer a proven foreign owner when renamed Flax routing is only ambiguous."""
-    if file_path.suffix.lower() in _FLAX_MSGPACK_NATIVE_SUFFIXES:
+    """Prefer a proven foreign owner when Flax ownership is not structurally confirmed."""
+    probe_state = _probe_flax_msgpack_checkpoint_file(file_path)
+    if probe_state is True:
         return None
-    if _probe_flax_msgpack_checkpoint_file(file_path) is not None:
+    if probe_state is False and file_path.suffix.lower() not in _FLAX_MSGPACK_NATIVE_SUFFIXES:
         return None
-    return next(iter(detect_flax_msgpack_overlap_routes(str(file_path))), None)
+    try:
+        if not file_path.is_file():
+            return None
+        size = file_path.stat().st_size
+    except OSError:
+        return None
+    return next(iter(_detect_trusted_flax_foreign_content_routes(file_path, size)), None)
 
 
 def detect_format_from_magic_bytes(

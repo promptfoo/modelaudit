@@ -90,7 +90,10 @@ def _read_huggingface_prefix(
         file_url = hf_hub_url(repo_id=repo_id, filename=filename, revision=revision)
         headers = build_hf_headers(
             token=None,
-            headers={"Range": f"bytes=0-{max_bytes - 1}"},
+            headers={
+                "Range": f"bytes=0-{max_bytes - 1}",
+                "Accept-Encoding": "identity",
+            },
         )
         with requests.get(file_url, headers=headers, stream=True, timeout=30, allow_redirects=True) as response:
             response.raise_for_status()
@@ -144,7 +147,7 @@ def _looks_like_safetensors_prefix(
     from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
 
     if header_len > SAFETENSORS_ROUTING_HEADER_PARSE_BYTES:
-        return True
+        return len(prefix) >= _HF_CONTENT_SNIFF_BYTES or header_len <= len(prefix) - 8
 
     header_probe = _read_huggingface_prefix(repo_id, filename, revision, budget, 8 + header_len)
     if len(header_probe) != 8 + header_len or header_probe[8:9] != b"{":
@@ -219,10 +222,14 @@ def _detect_huggingface_jax_json_route(
 ) -> str | None:
     """Return a bounded JAX JSON checkpoint route for a suffix-skipped remote file."""
     from modelaudit.utils.file.detection import (
+        _JAX_JSON_CHECKPOINT_CONTENT_ROUTE_EXCLUDED_SUFFIXES,
         JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
         _could_start_json_object,
         has_jax_json_checkpoint_structure,
     )
+
+    if Path(filename).suffix.lower() in _JAX_JSON_CHECKPOINT_CONTENT_ROUTE_EXCLUDED_SUFFIXES:
+        return None
 
     jax_probe = prefix
     normalized_prefix = jax_probe.lstrip()
@@ -260,6 +267,9 @@ def _detect_huggingface_xgboost_ubjson_route(
     prefix: bytes,
 ) -> str | None:
     """Return a bounded XGBoost UBJSON route for a suffix-skipped remote file."""
+    if Path(filename).suffix:
+        return None
+
     from modelaudit.utils.file.detection import (
         _XGBOOST_UBJSON_ROUTE_READ_BYTES,
         _detect_extensionless_xgboost_ubjson_route,
@@ -292,7 +302,10 @@ def _detect_huggingface_llamafile_route(
     prefix: bytes,
 ) -> str | None:
     """Return a bounded Llamafile route for a suffix-skipped remote executable."""
+    import zipfile
+
     from modelaudit.utils.file.detection import (
+        EXECUTABLE_ZIP_POLYGLOT_FORMAT,
         LLAMAFILE_MARKER,
         LLAMAFILE_ROUTE_SCAN_BYTES,
         LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
@@ -306,6 +319,8 @@ def _detect_huggingface_llamafile_route(
     probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, max_probe_size)
     if LLAMAFILE_MARKER in probe[:LLAMAFILE_ROUTE_SCAN_BYTES].lower():
         return "llamafile"
+    if zipfile.is_zipfile(BytesIO(probe)):
+        return EXECUTABLE_ZIP_POLYGLOT_FORMAT
     if len(probe) > LLAMAFILE_ROUTE_SCAN_BYTES:
         return LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT
     return None
@@ -329,6 +344,39 @@ def _detect_huggingface_torch7_route(
         return None
     probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, _TORCH7_SIGNATURE_READ_BYTES)
     return "torch7" if _is_torch7_signature(probe) else None
+
+
+def _probe_huggingface_executorch_prefix(prefix: bytes, *, sample_is_prefix: bool) -> bool | None:
+    """Validate bounded ExecuTorch FlatBuffers structure without a local file."""
+    from modelaudit.utils.file.detection import _is_executorch_binary_signature
+
+    if not _is_executorch_binary_signature(prefix):
+        return False
+    if len(prefix) < 16:
+        return None if sample_is_prefix else False
+
+    root_table_offset = struct.unpack("<I", prefix[:4])[0]
+    if root_table_offset < 12:
+        return False
+    if root_table_offset + 4 > len(prefix):
+        return None if sample_is_prefix else False
+
+    vtable_back_offset = struct.unpack("<i", prefix[root_table_offset : root_table_offset + 4])[0]
+    if vtable_back_offset <= 0 or vtable_back_offset > root_table_offset:
+        return False
+
+    vtable_offset = root_table_offset - vtable_back_offset
+    if vtable_offset < 8:
+        return False
+    if vtable_offset + 4 > len(prefix):
+        return None if sample_is_prefix else False
+
+    vtable_size, object_size = struct.unpack("<HH", prefix[vtable_offset : vtable_offset + 4])
+    if vtable_size < 4 or object_size < 4:
+        return False
+    return sample_is_prefix or not (
+        vtable_offset + vtable_size > len(prefix) or root_table_offset + object_size > len(prefix)
+    )
 
 
 def _is_complete_huggingface_text_or_json(probe: bytes, *, sample_is_prefix: bool) -> bool:
@@ -409,16 +457,17 @@ def _detect_huggingface_flax_msgpack_route(
     """Return a bounded Flax MessagePack route for a suffix-skipped remote file."""
     from modelaudit.utils.file.detection import (
         FLAX_MSGPACK_STRUCTURE_READ_BYTES,
-        _has_bounded_flax_msgpack_routing_key_stream,
+        _probe_flax_msgpack_checkpoint_stream,
     )
 
     if Path(filename).suffix.lower() in {".py", ".pyw"}:
         return None
 
-    initial_probe_state = _has_bounded_flax_msgpack_routing_key_stream(
+    initial_probe_state = _probe_flax_msgpack_checkpoint_stream(
         BytesIO(prefix),
         len(prefix),
         sample_is_prefix=len(prefix) >= _HF_CONTENT_SNIFF_BYTES,
+        incomplete_prefix_is_inconclusive=True,
     )
     if initial_probe_state is True:
         return "flax_msgpack"
@@ -431,10 +480,11 @@ def _detect_huggingface_flax_msgpack_route(
     probe = raw_probe[:max_probe_size]
     if _is_complete_huggingface_text_or_json(probe, sample_is_prefix=sample_is_prefix):
         return None
-    probe_state = _has_bounded_flax_msgpack_routing_key_stream(
+    probe_state = _probe_flax_msgpack_checkpoint_stream(
         BytesIO(probe),
         len(probe),
         sample_is_prefix=sample_is_prefix,
+        incomplete_prefix_is_inconclusive=True,
     )
     if probe_state is not False:
         return "flax_msgpack"
@@ -457,7 +507,6 @@ def _detect_huggingface_content_route_format(
         _could_start_proto0_or_1_pickle,
         _is_cntk_signature,
         _is_content_routed_lightgbm_signature,
-        _is_executorch_binary_signature,
         _looks_like_proto0_or_1_pickle,
         _looks_like_uncompressed_tar_header,
         detect_format_from_magic_bytes,
@@ -499,7 +548,11 @@ def _detect_huggingface_content_route_format(
             sample_is_prefix=len(pickle_probe) >= PROTO0_1_MAX_PROBE_BYTES,
         ):
             return "pickle"
-    if _is_executorch_binary_signature(prefix):
+    executorch_state = _probe_huggingface_executorch_prefix(
+        prefix,
+        sample_is_prefix=len(prefix) >= _HF_CONTENT_SNIFF_BYTES,
+    )
+    if executorch_state is not False:
         return "executorch"
 
     torch7_route = _detect_huggingface_torch7_route(repo_id, filename, revision, budget, prefix)
