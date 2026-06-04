@@ -81,29 +81,37 @@ _R_LEFTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE = re.compile(
 _R_RIGHTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE = re.compile(rf"(?i)\s*(?P<operator>->{{1,2}})\s*{_R_CREDENTIAL_TARGET}")
 _R_LEFTWARD_CREDENTIAL_TARGET_RE = re.compile(rf"(?i){_R_CREDENTIAL_TARGET}\s*(?P<operator>=|<{{1,2}}-)\s*")
 _R_RIGHTWARD_CREDENTIAL_TARGET_RE = re.compile(rf"(?i)->{{1,2}}\s*{_R_CREDENTIAL_TARGET}")
-_R_RESERVED_WORDS = frozenset(
+_R_CONTROL_WORDS = frozenset(
     {
         "break",
         "else",
-        "false",
         "for",
         "function",
         "if",
         "in",
-        "inf",
-        "na",
-        "na_character_",
-        "na_complex_",
-        "na_integer_",
-        "na_real_",
-        "nan",
         "next",
-        "null",
         "repeat",
-        "true",
         "while",
     }
 )
+_R_RESERVED_WORDS = _R_CONTROL_WORDS | frozenset(
+    {
+        "FALSE",
+        "Inf",
+        "NA",
+        "NA_character_",
+        "NA_complex_",
+        "NA_integer_",
+        "NA_real_",
+        "NULL",
+        "NaN",
+        "TRUE",
+    }
+)
+_R_SIMPLE_NUMERIC_TOKEN_RE = re.compile(
+    r"(?i)(?:0x[0-9a-f]+(?:p[+-]?[0-9]+)?|(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?)[li]?"
+)
+_R_DOT_ARGUMENT_TOKEN_RE = re.compile(r"\.\.[0-9]+")
 
 
 def _position_is_in_r_suppressing_non_code_span(
@@ -191,7 +199,12 @@ def _r_open_paren_starts_argument_list(
 
     character = text[cursor]
     if character == "]":
-        return not crossed_newline and _r_matching_open_delimiter_position(text, cursor, non_code_spans) is not None
+        opener_position = _r_matching_open_delimiter_position(text, cursor, non_code_spans)
+        return (
+            not crossed_newline
+            and opener_position is not None
+            and _r_open_bracket_starts_subscript(text, opener_position, non_code_spans)
+        )
     if character == ")":
         if crossed_newline:
             return False
@@ -199,7 +212,9 @@ def _r_open_paren_starts_argument_list(
         if opener_position is None:
             return False
         opener_prefix = _r_identifier_before_position(text, opener_position, non_code_spans)
-        return opener_prefix is None or _r_token_can_start_call(opener_prefix)
+        return opener_prefix is None or opener_prefix in {"else", "repeat"} or _r_token_can_start_call(opener_prefix)
+    if character == "}":
+        return not crossed_newline and _r_matching_open_delimiter_position(text, cursor, non_code_spans) is not None
     if character == "\\":
         return True
     if not (character.isalnum() or character in "._"):
@@ -208,7 +223,7 @@ def _r_open_paren_starts_argument_list(
     token_end = cursor + 1
     while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
         cursor -= 1
-    token = text[cursor + 1 : token_end].lower()
+    token = text[cursor + 1 : token_end]
     return not crossed_newline and _r_token_can_start_call(token, allow_function_keyword=True)
 
 
@@ -216,7 +231,27 @@ def _r_token_can_start_call(token: str, *, allow_function_keyword: bool = False)
     if token == "function":
         return allow_function_keyword
     token_starts_like_number = token[0].isdigit() or (token.startswith(".") and len(token) > 1 and token[1].isdigit())
-    return not token_starts_like_number and bool(token.strip(".")) and token not in _R_RESERVED_WORDS
+    return (
+        not token_starts_like_number
+        and not token.startswith("_")
+        and token != "..."
+        and _R_DOT_ARGUMENT_TOKEN_RE.fullmatch(token) is None
+        and token not in _R_RESERVED_WORDS
+    )
+
+
+def _r_token_can_start_subscript(token: str) -> bool:
+    if (
+        not token
+        or token.startswith("_")
+        or token == "..."
+        or _R_DOT_ARGUMENT_TOKEN_RE.fullmatch(token) is not None
+        or token in _R_CONTROL_WORDS
+    ):
+        return False
+    if token[0].isdigit() or (token.startswith(".") and len(token) > 1 and token[1].isdigit()):
+        return _R_SIMPLE_NUMERIC_TOKEN_RE.fullmatch(token) is not None
+    return True
 
 
 def _r_open_bracket_starts_subscript(
@@ -235,13 +270,16 @@ def _r_open_bracket_starts_subscript(
     if text[cursor] == "[":
         return _r_open_bracket_starts_subscript(text, cursor, non_code_spans)
     if text[cursor] == "]":
-        return _r_matching_open_delimiter_position(text, cursor, non_code_spans) is not None
+        opener_position = _r_matching_open_delimiter_position(text, cursor, non_code_spans)
+        return opener_position is not None and _r_open_bracket_starts_subscript(text, opener_position, non_code_spans)
     if text[cursor] == ")":
         opener_position = _r_matching_open_delimiter_position(text, cursor, non_code_spans)
         if opener_position is None:
             return False
         opener_prefix = _r_identifier_before_position(text, opener_position, non_code_spans)
-        return opener_prefix is None or _r_token_can_start_call(opener_prefix)
+        return opener_prefix is None or _r_token_can_start_subscript(opener_prefix)
+    if text[cursor] == "}":
+        return _r_matching_open_delimiter_position(text, cursor, non_code_spans) is not None
 
     span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
     if span_index >= 0 and cursor < non_code_spans[span_index][1]:
@@ -253,8 +291,8 @@ def _r_open_bracket_starts_subscript(
     token_end = cursor + 1
     while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
         cursor -= 1
-    token = text[cursor + 1 : token_end].lower()
-    return bool(token.strip(".")) and token not in _R_RESERVED_WORDS
+    token = text[cursor + 1 : token_end]
+    return _r_token_can_start_subscript(token)
 
 
 def _r_identifier_before_position(
@@ -263,8 +301,10 @@ def _r_identifier_before_position(
     non_code_spans: list[tuple[int, int]],
 ) -> str | None:
     cursor = position - 1
+    crossed_newline = False
     while cursor >= 0:
         while cursor >= 0 and text[cursor].isspace():
+            crossed_newline = crossed_newline or text[cursor] in "\r\n"
             cursor -= 1
         if cursor < 0:
             return None
@@ -282,7 +322,10 @@ def _r_identifier_before_position(
     token_end = cursor + 1
     while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
         cursor -= 1
-    return text[cursor + 1 : token_end].lower()
+    token = text[cursor + 1 : token_end]
+    if crossed_newline and token not in {"else", "for", "function", "if", "repeat", "while"}:
+        return None
+    return token
 
 
 def _r_matching_open_delimiter_position(
