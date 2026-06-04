@@ -1848,6 +1848,7 @@ class JITScriptDetector:
             _ATTRIBUTE_FUNCTION_MARKER = "__modelaudit_attribute_function__:"
             _CLASS_MARKER = "__modelaudit_class__:"
             _CONTAINER_FUNCTION_MARKER = "__modelaudit_container_function__:"
+            _GLOBAL_DELETE_MARKER = "__modelaudit_global_delete__:"
             _MAX_CONSTANT_STRING_CANDIDATES = 16
 
             def __init__(self) -> None:
@@ -1859,6 +1860,7 @@ class JITScriptDetector:
                 self.container_identity_scopes: list[dict[str, int | None]] = [{}]
                 self.attribute_alias_scopes: list[dict[tuple[str, ...], str | None]] = [{}]
                 self.scope_kinds = ["module"]
+                self.global_name_scopes: list[set[str]] = [set()]
                 self.next_container_identity = 1
                 self.return_binding_stack: list[list[_BuiltinAliasBinding]] = []
                 self.active_function_calls: set[str] = set()
@@ -1889,6 +1891,7 @@ class JITScriptDetector:
                 local_names: set[str] | None = None,
                 *,
                 kind: str = "function",
+                global_names: set[str] | None = None,
             ) -> None:
                 self.alias_scopes.append({})
                 self.builtins_module_aliases.append(set())
@@ -1897,6 +1900,7 @@ class JITScriptDetector:
                 self.container_identity_scopes.append({})
                 self.attribute_alias_scopes.append({})
                 self.scope_kinds.append(kind)
+                self.global_name_scopes.append(set(global_names or set()))
                 for name in local_names or set():
                     self._bind_name(name, None, defined=False)
                 if arguments is None:
@@ -1931,6 +1935,7 @@ class JITScriptDetector:
                 self.container_identity_scopes.pop()
                 self.attribute_alias_scopes.pop()
                 self.scope_kinds.pop()
+                self.global_name_scopes.pop()
 
             def _visible_scope_indexes(self) -> Iterator[int]:
                 skip_class_scopes = False
@@ -2004,6 +2009,10 @@ class JITScriptDetector:
             @classmethod
             def _class_marker(cls, name: str) -> str:
                 return f"{cls._CLASS_MARKER}{name}"
+
+            @classmethod
+            def _global_delete_marker(cls, name: str) -> str:
+                return f"{cls._GLOBAL_DELETE_MARKER}{name}"
 
             @classmethod
             def _container_function_marker_prefix(cls, name: str) -> str:
@@ -2093,6 +2102,17 @@ class JITScriptDetector:
                     if node.id in self.alias_scopes[index]:
                         return self._class_marker(node.id) in self.builtins_module_aliases[index]
                 return False
+
+            @staticmethod
+            def _has_named_decorator(
+                node: ast.FunctionDef | ast.AsyncFunctionDef,
+                name: str,
+            ) -> bool:
+                return any(
+                    (isinstance(decorator, ast.Name) and decorator.id == name)
+                    or (isinstance(decorator, ast.Attribute) and decorator.attr == name)
+                    for decorator in node.decorator_list
+                )
 
             @classmethod
             def _json_value_payload(cls, value: object) -> object:
@@ -2312,6 +2332,23 @@ class JITScriptDetector:
                 summary = self._function_summary_for_node(node.func)
                 return summary[1] if summary is not None else None
 
+            def _property_return_binding(self, node: ast.AST) -> _BuiltinAliasBinding | None:
+                if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Call):
+                    return None
+                summary = self._function_summary_for_node(node)
+                if summary is None:
+                    return None
+                if any(
+                    isinstance(
+                        function_node := self.function_nodes.get(function_id),
+                        (ast.FunctionDef, ast.AsyncFunctionDef),
+                    )
+                    and self._has_named_decorator(function_node, "property")
+                    for function_id, _positional_offset in summary[2]
+                ):
+                    return summary[1]
+                return None
+
             def _binding_from_expression(self, node: ast.AST) -> _BuiltinAliasBinding:
                 return (
                     self._resolve_builtin(node),
@@ -2427,7 +2464,10 @@ class JITScriptDetector:
                 effects, _return_binding, _functions = summary
                 for kind, target_name, binding in effects:
                     target_scope = 0 if kind == "global" else owner_index
-                    self._apply_binding(target_name, binding, scope_index=target_scope)
+                    if kind == "global_delete":
+                        self._remove_name_binding(target_name, scope_index=0)
+                    else:
+                        self._apply_binding(target_name, binding, scope_index=target_scope)
 
             def _is_functools_partial(self, node: ast.AST) -> bool:
                 if isinstance(node, ast.Name):
@@ -2954,6 +2994,10 @@ class JITScriptDetector:
                         attributes, _containers = self._constructor_call_instance_bindings(node.value)
                         if (node.attr,) in attributes:
                             return attributes[(node.attr,)]
+                    if (property_binding := self._property_return_binding(node)) is not None and property_binding[
+                        0
+                    ] is not None:
+                        return property_binding[0]
                     alias_found, alias = self._lookup_attribute_alias(node)
                     if alias_found:
                         return alias
@@ -2988,7 +3032,7 @@ class JITScriptDetector:
                     if (
                         node.args
                         and isinstance(node.func, ast.Attribute)
-                        and node.func.attr in {"get", "__getattribute__", "__getitem__"}
+                        and node.func.attr in {"get", "__getattribute__", "__getitem__", "pop"}
                         and self._is_builtins_namespace(node.func.value)
                     ):
                         return self._dangerous_constant_string(node.args[0])
@@ -3052,6 +3096,7 @@ class JITScriptDetector:
                 self.builtins_module_aliases[scope_index].discard(f"{self._FUNCTOOLS_MODULE_MARKER}{name}")
                 self.builtins_module_aliases[scope_index].discard(f"{self._FUNCTOOLS_PARTIAL_MARKER}{name}")
                 self.builtins_module_aliases[scope_index].discard(self._class_marker(name))
+                self.builtins_module_aliases[scope_index].discard(self._global_delete_marker(name))
                 constant_string_prefix = self._constant_string_marker_prefix(name)
                 function_effect_prefix = self._function_effect_marker_prefix(name)
                 callback_invoker_prefix = self._callback_invoker_marker_prefix(name)
@@ -3138,6 +3183,13 @@ class JITScriptDetector:
                 if isinstance(target, ast.Name):
                     if self.scope_kinds[-1] in {"class", "module"}:
                         self._remove_name_binding(target.id)
+                    elif target.id in self.global_name_scopes[-1]:
+                        self._bind_name(
+                            target.id,
+                            target.id if target.id in dangerous_builtins else None,
+                            defined=False,
+                        )
+                        self.builtins_module_aliases[-1].add(self._global_delete_marker(target.id))
                     else:
                         self._bind_name(target.id, None, defined=False)
                 elif isinstance(target, ast.Attribute):
@@ -3492,6 +3544,8 @@ class JITScriptDetector:
                         self._bind_target(target, None, scope_index=scope_index)
                     return
 
+                class_alias = self._is_class_name(value)
+                attribute_function_summaries = self._resolve_attribute_function_summaries(value)
                 self._bind_target(
                     target,
                     self._resolve_builtin(value),
@@ -3506,6 +3560,17 @@ class JITScriptDetector:
                     function_summary=self._function_summary_for_node(value),
                     scope_index=scope_index,
                 )
+                if isinstance(target, ast.Name):
+                    if class_alias:
+                        self.builtins_module_aliases[scope_index].add(self._class_marker(target.id))
+                    for path, summary in attribute_function_summaries.items():
+                        key = (target.id, *path)
+                        self._bind_attribute_key(
+                            key,
+                            self.attribute_alias_scopes[scope_index].get(key),
+                            function_summary=summary,
+                            scope_index=scope_index,
+                        )
 
             def _bind_target_from_values(self, target: ast.AST, values: list[ast.expr]) -> None:
                 if isinstance(target, (ast.Tuple, ast.List)):
@@ -4064,12 +4129,25 @@ class JITScriptDetector:
                         self.visit(default)
                 self._bind_name(node.name, None)
                 global_names, nonlocal_names = self._outer_binding_declarations(list(node.body))
-                self._push_scope(node.args, default_bindings, self._local_binding_names(list(node.body)))
+                self._push_scope(
+                    node.args,
+                    default_bindings,
+                    self._local_binding_names(list(node.body)),
+                    global_names=global_names,
+                )
                 self.return_binding_stack.append([])
                 self._visit_statements(node.body)
                 return_binding = self._merge_bindings(self.return_binding_stack.pop())
                 effects = [
-                    ("global", name, self._binding_from_name(name, -1))
+                    (
+                        (
+                            "global_delete"
+                            if self._global_delete_marker(name) in self.builtins_module_aliases[-1]
+                            else "global"
+                        ),
+                        name,
+                        self._binding_from_name(name, -1),
+                    )
                     for name in global_names
                     if name in self.alias_scopes[-1]
                 ]
@@ -4209,11 +4287,17 @@ class JITScriptDetector:
                         [function_node.body] if isinstance(function_node, ast.Lambda) else list(function_node.body)
                     )
                     default_bindings = self._argument_default_bindings(function_node.args)
+                    function_global_names = (
+                        set()
+                        if isinstance(function_node, ast.Lambda)
+                        else self._outer_binding_declarations(body_nodes)[0]
+                    )
                     self.active_function_calls.add(function_id)
                     self._push_scope(
                         function_node.args,
                         default_bindings,
                         self._local_binding_names(body_nodes),
+                        global_names=function_global_names,
                     )
                     try:
                         effective_offset = (
@@ -4221,6 +4305,10 @@ class JITScriptDetector:
                             if positional_offset
                             and isinstance(node.func, ast.Attribute)
                             and self._is_class_name(node.func.value)
+                            and not (
+                                isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                and self._has_named_decorator(function_node, "classmethod")
+                            )
                             else positional_offset
                         )
                         self._bind_call_arguments(
@@ -4272,10 +4360,12 @@ class JITScriptDetector:
 
                 receiver_name = positional_arguments[0].arg
                 default_bindings = self._argument_default_bindings(constructor.args)
+                global_names, _nonlocal_names = self._outer_binding_declarations(list(constructor.body))
                 self._push_scope(
                     constructor.args,
                     default_bindings,
                     self._local_binding_names(list(constructor.body)),
+                    global_names=global_names,
                 )
                 try:
                     if call is not None:
@@ -4400,11 +4490,7 @@ class JITScriptDetector:
                                 (
                                     0
                                     if (method := method_nodes.get(name)) is not None
-                                    and any(
-                                        (isinstance(decorator, ast.Name) and decorator.id == "staticmethod")
-                                        or (isinstance(decorator, ast.Attribute) and decorator.attr == "staticmethod")
-                                        for decorator in method.decorator_list
-                                    )
+                                    and self._has_named_decorator(method, "staticmethod")
                                     else 1
                                 ),
                             )
@@ -4441,6 +4527,19 @@ class JITScriptDetector:
                         instance_attributes.get(key),
                         container_aliases=instance_containers.get(key),
                     )
+                for decorator in reversed(node.decorator_list):
+                    decorator_call = ast.Call(
+                        func=decorator,
+                        args=[ast.Name(id=node.name, ctx=ast.Load())],
+                        keywords=[],
+                    )
+                    if builtin := self._resolve_builtin(decorator_call.func):
+                        self.findings.add(builtin)
+                    self._analyze_function_call(decorator_call)
+                    self._apply_function_effects(decorator_call.func)
+                    decorator_binding = self._binding_from_expression(decorator_call)
+                    if self._binding_has_tracked_value(decorator_binding):
+                        self._apply_binding(node.name, decorator_binding, scope_index=-1)
 
             def visit_If(self, node: ast.If) -> ast.stmt | None:
                 self.visit(node.test)
@@ -5064,10 +5163,12 @@ class JITScriptDetector:
             method_analysis = DangerousBuiltinCallVisitor()
             receiver_name = None if is_static_method(node) else method_receiver_name(node)
             default_bindings = method_analysis._argument_default_bindings(node.args)
+            global_names, _nonlocal_names = method_analysis._outer_binding_declarations(list(node.body))
             method_analysis._push_scope(
                 node.args,
                 default_bindings,
                 method_analysis._local_binding_names(list(node.body)),
+                global_names=global_names,
             )
             if receiver_name is not None:
                 for path, builtin in (instance_aliases or {}).items():
