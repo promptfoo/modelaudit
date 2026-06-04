@@ -80,8 +80,10 @@ CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"RefreshToken|refreshToken|SAS|Secret|SecretKey|secretKey|Signature|Sig|Token)"
     r"(?:[A-Z][A-Za-z0-9]*)?"
 )
-AUTHORIZATION_ALIAS_ASSIGNMENT_KEY: Final[str] = r"[a-z0-9_.-]*authorization(?:s|[_.-]?values?)?"
-AUTHORIZATION_ALIAS_R_QUOTED_IDENTIFIER_KEY: Final[str] = r"[a-z0-9\s._-]*authorization(?:s|[\s._-]*values?)?"
+AUTHORIZATION_ALIAS_ASSIGNMENT_KEY: Final[str] = r"[a-z0-9_.-]*authorization(?:s|[_.-]?(?:headers?|values?))?"
+AUTHORIZATION_ALIAS_R_QUOTED_IDENTIFIER_KEY: Final[str] = (
+    r"[a-z0-9\s._-]*authorization(?:s|[\s._-]*(?:headers?|values?))?"
+)
 SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     rf"(?:{SEPARATED_SENSITIVE_ASSIGNMENT_KEY}|(?-i:{CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY})|"
     rf"{AUTHORIZATION_ALIAS_ASSIGNMENT_KEY})"

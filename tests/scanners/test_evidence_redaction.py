@@ -829,13 +829,14 @@ def test_redacts_camel_case_authorization_key_aliases() -> None:
     secret = "CAMEL_AUTHORIZATION_SECRET"
 
     redacted_text = redact_evidence_string(
-        f"proxyAuthorization={secret} authorizationValue='{secret}'",
+        f"proxyAuthorization={secret} authorizationValue='{secret}' proxyAuthorizationHeader='{secret}'",
         max_chars=500,
     )
     redacted_value = redact_evidence_value(
         {
             "proxyAuthorization": secret,
             "authorizationValue": secret,
+            "proxyAuthorizationHeader": secret,
         },
         max_string_chars=500,
     )
@@ -844,9 +845,11 @@ def test_redacts_camel_case_authorization_key_aliases() -> None:
     assert secret not in json.dumps(redacted_value)
     assert f"proxyAuthorization={REDACTED_EVIDENCE_VALUE}" in redacted_text
     assert f"authorizationValue='{REDACTED_EVIDENCE_VALUE}'" in redacted_text
+    assert f"proxyAuthorizationHeader='{REDACTED_EVIDENCE_VALUE}'" in redacted_text
     assert redacted_value == {
         "proxyAuthorization": REDACTED_EVIDENCE_VALUE,
         "authorizationValue": REDACTED_EVIDENCE_VALUE,
+        "proxyAuthorizationHeader": REDACTED_EVIDENCE_VALUE,
     }
 
 
@@ -875,11 +878,15 @@ def test_redacts_authorization_aliases_in_specialized_string_contexts() -> None:
 
 def test_preserves_non_secret_authorization_metadata_keys() -> None:
     """Authorization-related status and method metadata should not be over-redacted."""
-    text = "authorizationStatus='allowed' proxyAuthorizationEnabled=true authorizationMethod='oauth'"
+    text = (
+        "authorizationStatus='allowed' proxyAuthorizationEnabled=true "
+        "authorizationMethod='oauth' authorizationHeaderName='Authorization'"
+    )
     structured = {
         "authorizationStatus": "allowed",
         "proxyAuthorizationEnabled": True,
         "authorizationMethod": "oauth",
+        "authorizationHeaderName": "Authorization",
     }
 
     assert redact_evidence_string(text, max_chars=None) == text
