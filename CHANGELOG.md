@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preflight and stream-enforce cumulative SevenZip extraction budgets before writing oversized archives
 - harden structured JSON/YAML/GGUF Jinja template extraction against oversized values, nested containers, and colliding template paths
 - redact capability tokens embedded in network URL path segments
+- redact secret previews and URL path credentials from metadata scanner findings
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
