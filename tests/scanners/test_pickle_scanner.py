@@ -1537,6 +1537,38 @@ def test_scan_stream_unknown_size_seekable_allows_exact_binary_tail_window() -> 
     assert stream.tell() == 0
 
 
+def test_scan_file_allows_exact_binary_tail_window(tmp_path: Path) -> None:
+    pickle_payload = pickle.dumps({"safe": True}, protocol=4)
+    path = tmp_path / "exact-tail.pt"
+    path.write_bytes(pickle_payload + (b"A" * _BINARY_TAIL_SCAN_BYTES))
+
+    result = PickleScanner().scan(str(path))
+
+    assert "pickle_binary_tail_scan_window_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "Pickle Binary Tail Coverage" for check in result.checks)
+
+
+def test_scan_stream_unknown_size_tail_timeout_is_inconclusive(monkeypatch: pytest.MonkeyPatch) -> None:
+    pickle_payload = pickle.dumps({"safe": True}, protocol=4)
+    stream = io.BytesIO(pickle_payload + (b"A" * (_BINARY_TAIL_SCAN_BYTES + 1)))
+    scanner = PickleScanner()
+    result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+    result.metadata["first_pickle_end_pos"] = len(pickle_payload)
+    monkeypatch.setattr(scanner, "_check_timeout", lambda allow_partial=False: True)
+
+    scanner._scan_seekable_stream_binary_tail_if_needed(stream, 0, None, result, "timeout-tail.pt")
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["pickle_binary_tail_scan_timeout"]
+    checks = [check for check in result.checks if check.name == "Pickle Binary Tail Coverage"]
+    assert len(checks) == 1
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].details["tail_bytes_scanned"] == 0
+    assert checks[0].details["tail_bytes_total"] is None
+    assert checks[0].details["timed_out"] is True
+    assert stream.tell() == 0
+
+
 def test_scan_file_detects_executable_tail_past_raw_scan_window(tmp_path: Path) -> None:
     pickle_payload = pickle.dumps({"pad": b"A" * 256}, protocol=4)
     path = tmp_path / "large-tail.bin"
