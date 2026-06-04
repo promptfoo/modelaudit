@@ -254,6 +254,7 @@ def test_validate_api_host_for_bearer_auth_accepts_configured_https_hosts(api_ho
         "https://api.promptfoo.app\\@attacker.example",
         "https://api.promptfoo.app%5c@attacker.example",
         "https://api.promptfoo.app\n.attacker.example",
+        "https://api.promptfoo.app\x7f.attacker.example",
         "https://api.promptfoo.app:0",
         "https://api.promptfoo.app:65536",
     ],
@@ -355,9 +356,11 @@ def test_validate_and_set_api_token_accepts_configured_host_and_stores_normalize
 ) -> None:
     fake_config = _FakeCloudConfig()
     requested_urls: list[str] = []
+    requested_kwargs: list[dict[str, Any]] = []
 
-    def fake_fetch(url: str, **_kwargs: Any) -> _FakeResponse:
+    def fake_fetch(url: str, **kwargs: Any) -> _FakeResponse:
         requested_urls.append(url)
+        requested_kwargs.append(kwargs)
         return _FakeResponse()
 
     monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
@@ -370,8 +373,51 @@ def test_validate_and_set_api_token_accepts_configured_host_and_stores_normalize
 
     assert result["user"].email == "user@example.com"
     assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]
+    assert requested_kwargs[0]["allow_redirects"] is False
     assert fake_config.api_host == "https://enterprise.example:8443"
     assert fake_config.api_key == "secret-token"
+
+
+def test_validate_and_set_api_token_does_not_store_token_when_host_persistence_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingHostConfig(_FakeCloudConfig):
+        def set_api_host(self, api_host: str) -> None:
+            raise OSError(f"cannot persist {api_host}")
+
+    fake_config = FailingHostConfig(api_host="https://old.example", api_key="old-token")
+    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", lambda _url, **_kwargs: _FakeResponse())
+
+    with pytest.raises(OSError, match="cannot persist"):
+        auth_client_module.AuthClient().validate_and_set_api_token(
+            "new-token",
+            "https://safe.example",
+        )
+
+    assert fake_config.api_host == "https://old.example"
+    assert fake_config.api_key == "old-token"
+
+
+def test_validate_and_set_api_token_rejects_redirect_response_without_persisting_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RedirectResponse(_FakeResponse):
+        status_code = 302
+        reason = "Found"
+
+    fake_config = _FakeCloudConfig(api_host="https://old.example", api_key="old-token")
+    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", lambda _url, **_kwargs: RedirectResponse())
+
+    with pytest.raises(Exception, match="Failed to validate API token: Found"):
+        auth_client_module.AuthClient().validate_and_set_api_token(
+            "new-token",
+            "https://safe.example",
+        )
+
+    assert fake_config.api_host == "https://old.example"
+    assert fake_config.api_key == "old-token"
 
 
 def test_get_user_info_rejects_non_https_config_host_before_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -391,9 +437,11 @@ def test_get_user_info_rejects_non_https_config_host_before_request(monkeypatch:
 def test_get_user_info_accepts_persisted_enterprise_https_host(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_config = _FakeCloudConfig(api_host="https://enterprise.example:8443", api_key="secret-token")
     requested_urls: list[str] = []
+    requested_kwargs: list[dict[str, Any]] = []
 
-    def fake_fetch(url: str, **_kwargs: Any) -> _FakeResponse:
+    def fake_fetch(url: str, **kwargs: Any) -> _FakeResponse:
         requested_urls.append(url)
+        requested_kwargs.append(kwargs)
         return _FakeResponse()
 
     monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
@@ -403,3 +451,4 @@ def test_get_user_info_accepts_persisted_enterprise_https_host(monkeypatch: pyte
     auth_client_module.AuthClient().get_user_info()
 
     assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]
+    assert requested_kwargs[0]["allow_redirects"] is False

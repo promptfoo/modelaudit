@@ -28,7 +28,7 @@ def validate_api_host_for_bearer_auth(api_host: str) -> str:
         not stripped_host
         or "\\" in stripped_host
         or "%" in stripped_host
-        or any(character.isspace() or ord(character) < 32 for character in stripped_host)
+        or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in stripped_host)
     ):
         raise ValueError("API host for bearer-token authentication must be a valid HTTPS URL")
 

@@ -84,9 +84,10 @@ class AuthClient:
                     "Authorization": f"Bearer {token}",
                     "User-Agent": "modelaudit-cli",
                 },
+                allow_redirects=False,
             )
 
-            if not response.ok:
+            if not 200 <= response.status_code < 300:
                 logger.error(
                     f"[Cloud] Failed to validate API token. HTTP Status: {response.status_code} - {response.reason}."
                 )
@@ -98,8 +99,8 @@ class AuthClient:
             app = data.get("app", {})
 
             # Set configuration exactly like promptfoo
-            cloud_config.set_api_key(token)
             cloud_config.set_api_host(host)
+            cloud_config.set_api_key(token)
             cloud_config.set_app_url(app.get("url", "https://www.promptfoo.app"))
 
             return {"user": CloudUser(user), "organization": CloudOrganization(organization), "app": CloudApp(app)}
@@ -133,9 +134,10 @@ class AuthClient:
                     "Authorization": f"Bearer {api_key}",
                     "User-Agent": "modelaudit-cli",
                 },
+                allow_redirects=False,
             )
 
-            if not response.ok:
+            if not 200 <= response.status_code < 300:
                 raise Exception(f"Failed to fetch user info: {response.reason}")
 
             return cast(dict[str, Any], response.json())
