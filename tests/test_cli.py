@@ -813,6 +813,7 @@ def test_cloud_auto_size_limit_applies_to_download_budget(tmp_path: Path, cloud_
 
     assert runtime.max_file_size == 50 * 1024 * 1024 * 1024
     assert runtime.max_download_bytes == runtime.max_file_size
+    assert runtime.explicit_max_download_bytes is None
 
 
 def test_format_text_output():
@@ -1960,6 +1961,49 @@ def test_scan_jfrog_url_with_max_size_forwards_download_budget(
     assert call_kwargs["max_download_size"] == 5
     assert call_kwargs["max_file_size"] == 5
     assert call_kwargs["max_total_size"] == 5
+
+
+@patch("modelaudit.cli.generate_auto_defaults")
+@patch("modelaudit.cli.is_jfrog_url")
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_does_not_forward_implicit_file_limit_as_total_budget(
+    mock_scan_jfrog: MagicMock,
+    mock_is_jfrog: MagicMock,
+    mock_auto_defaults: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Implicit per-file defaults must not become cumulative JFrog folder limits."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    mock_is_jfrog.return_value = True
+    mock_auto_defaults.return_value = {
+        "format": "json",
+        "max_file_size": 10,
+        "max_total_size": 0,
+        "selective_download": True,
+        "skip_non_model_files": True,
+        "timeout": 3600,
+        "use_cache": False,
+        "use_hf_whitelist": True,
+    }
+    mock_scan_jfrog.return_value = create_mock_scan_result(
+        bytes_scanned=16,
+        issues=[],
+        files_scanned=2,
+        assets=[],
+        has_errors=False,
+        scanners=["test_scanner"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "https://company.jfrog.io/artifactory/repo/models/"])
+
+    assert result.exit_code == 0
+    mock_scan_jfrog.assert_called_once()
+    call_kwargs = mock_scan_jfrog.call_args.kwargs
+    assert call_kwargs["max_file_size"] == 10
+    assert call_kwargs["max_total_size"] == 0
+    assert "max_download_size" not in call_kwargs
 
 
 @patch("modelaudit.cli.is_jfrog_url")

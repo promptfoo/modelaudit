@@ -118,6 +118,7 @@ class _ScanRuntimeConfig:
     strict_license: bool
     use_hf_whitelist: bool
     max_download_bytes: int | None
+    explicit_max_download_bytes: int | None
     jfrog_api_token: str | None
     jfrog_access_token: str | None
     mlflow_registry_uri: str | None
@@ -526,10 +527,12 @@ def _resolve_scan_runtime_config(
             click.echo(style_text(f"Using local ModelAudit config: {local_config_path}", fg="cyan"))
             click.echo(style_text("Scan result cache disabled for this run.", fg="yellow"))
 
+    explicit_max_download_bytes = None
     max_download_bytes = None
     if max_size is not None:
         with contextlib.suppress(ValueError):
-            max_download_bytes = parse_size_string(max_size)
+            explicit_max_download_bytes = parse_size_string(max_size)
+            max_download_bytes = explicit_max_download_bytes
     else:
         configured_max_file_size = config_values.get("max_file_size", 0)
         if isinstance(configured_max_file_size, int) and configured_max_file_size > 0:
@@ -558,6 +561,7 @@ def _resolve_scan_runtime_config(
         strict_license=config_values.get("strict_license", False),
         use_hf_whitelist=config_values.get("use_hf_whitelist", True),
         max_download_bytes=max_download_bytes,
+        explicit_max_download_bytes=explicit_max_download_bytes,
         jfrog_api_token=os.getenv("JFROG_API_TOKEN"),
         jfrog_access_token=os.getenv("JFROG_ACCESS_TOKEN"),
         mlflow_registry_uri=os.getenv("MLFLOW_TRACKING_URI"),
@@ -1650,8 +1654,8 @@ def _resolve_scan_source_for_path(
             jfrog_scan_kwargs: dict[str, Any] = {}
             if runtime.scannable_extensions is not None:
                 jfrog_scan_kwargs["scannable_extensions"] = runtime.scannable_extensions
-            if runtime.max_download_bytes is not None:
-                jfrog_scan_kwargs["max_download_size"] = runtime.max_download_bytes
+            if runtime.explicit_max_download_bytes is not None:
+                jfrog_scan_kwargs["max_download_size"] = runtime.explicit_max_download_bytes
             jfrog_results: ModelAuditResultModel = scan_jfrog_artifact(
                 path,
                 api_token=runtime.jfrog_api_token,
