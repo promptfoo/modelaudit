@@ -8,17 +8,211 @@ import ipaddress
 import lzma
 import os
 import re
+from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Any, ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
+from ._evidence_redaction import (
+    R_RAW_LEFT_ASSIGNMENT_CONTEXT_CHARS,
+    _iter_r_raw_string_spans,
+    _position_is_in_spans,
+    _r_non_code_spans,
+    _r_statement_start_before,
+    _r_statement_starts,
+    _unfinished_r_assignment_literal_closing_sequence,
+    redact_evidence_string,
+)
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 _DECODE_INCONCLUSIVE_REASON = "r_serialized_decode_incomplete"
 _READ_INCONCLUSIVE_REASON = "r_serialized_read_failed"
 _STRING_EXTRACTION_INCONCLUSIVE_REASON = "r_serialized_string_extraction_incomplete"
+_R_SEPARATED_CREDENTIAL_KEY_PATTERN = (
+    r"(?:[a-z0-9]+[._-])*"
+    r"(?:access[._-]?key|access[._-]?token|api[._-]?key|apikey|auth[._-]?token|client[._-]?secret|"
+    r"password|passwd|private[._-]?key|pwd|refresh[._-]?token|secret|secret[._-]?key|token)"
+)
+_R_CAMEL_CASE_CREDENTIAL_KEY_PATTERN = (
+    r"(?:[a-z][A-Za-z0-9]*)?"
+    r"(?:AccessKey|accessKey|AccessToken|accessToken|APIKey|ApiKey|apiKey|AuthToken|authToken|"
+    r"ClientSecret|clientSecret|Password|Passwd|PrivateKey|privateKey|Pwd|RefreshToken|refreshToken|"
+    r"Secret|SecretKey|secretKey|Token)"
+    r"(?:[A-Z][A-Za-z0-9]*)?"
+)
+_R_CREDENTIAL_KEY_PATTERN = rf"(?:{_R_SEPARATED_CREDENTIAL_KEY_PATTERN}|(?-i:{_R_CAMEL_CASE_CREDENTIAL_KEY_PATTERN}))"
+_R_SEPARATED_QUOTED_CREDENTIAL_KEY_PATTERN = (
+    r"(?:[a-z0-9]+[\s._-]+)*"
+    r"(?:access[\s._-]*key|access[\s._-]*token|api[\s._-]*key|apikey|auth[\s._-]*token|"
+    r"client[\s._-]*secret|password|passwd|private[\s._-]*key|pwd|refresh[\s._-]*token|secret|"
+    r"secret[\s._-]*key|token)"
+)
+_R_QUOTED_CREDENTIAL_KEY_PATTERN = (
+    rf"(?:{_R_SEPARATED_QUOTED_CREDENTIAL_KEY_PATTERN}|(?-i:{_R_CAMEL_CASE_CREDENTIAL_KEY_PATTERN}))"
+)
+_R_UNQUOTED_CREDENTIAL_IDENTIFIER = rf"(?:`{_R_QUOTED_CREDENTIAL_KEY_PATTERN}`|\b{_R_CREDENTIAL_KEY_PATTERN}\b)"
+_R_QUOTED_CREDENTIAL_IDENTIFIER = rf"""(?:"{_R_QUOTED_CREDENTIAL_KEY_PATTERN}"|'{_R_QUOTED_CREDENTIAL_KEY_PATTERN}')"""
+_R_CREDENTIAL_IDENTIFIER = rf"(?:{_R_UNQUOTED_CREDENTIAL_IDENTIFIER}|{_R_QUOTED_CREDENTIAL_IDENTIFIER})"
+_R_ASSIGNMENT_INDEX_SUFFIX = r"(?:\s*(?:\[\[[^\]\r\n]{1,120}\]\]|\[[^\]\r\n]{1,120}\]))*"
+_R_MEMBER_CREDENTIAL_TARGET = (
+    rf"\b[a-z.][a-z0-9._]*\s*(?:\$|@)\s*{_R_UNQUOTED_CREDENTIAL_IDENTIFIER}{_R_ASSIGNMENT_INDEX_SUFFIX}"
+)
+_R_QUOTED_SUBSCRIPT_CREDENTIAL_TARGET = (
+    rf"\b[a-z.][a-z0-9._]*\s*(?:\[\[\s*|\[\s*){_R_QUOTED_CREDENTIAL_IDENTIFIER}"
+    rf"\s*(?:\]\]|\]){_R_ASSIGNMENT_INDEX_SUFFIX}"
+)
+_R_CREDENTIAL_TARGET = (
+    rf"(?:{_R_MEMBER_CREDENTIAL_TARGET}|{_R_QUOTED_SUBSCRIPT_CREDENTIAL_TARGET}|"
+    rf"{_R_CREDENTIAL_IDENTIFIER}{_R_ASSIGNMENT_INDEX_SUFFIX})"
+)
+_R_QUOTED_CREDENTIAL_VALUE = r"""(?:"(?:\\.|[^"\\]){6,}"|'(?:\\.|[^'\\]){6,}')"""
+_R_QUOTED_CREDENTIAL_VALUE_RE = re.compile(_R_QUOTED_CREDENTIAL_VALUE)
+_R_LEFTWARD_QUOTED_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    rf"""(?ix){_R_CREDENTIAL_TARGET}\s*(?P<operator>=|<{{1,2}}-)\s*{_R_QUOTED_CREDENTIAL_VALUE}"""
+)
+_R_RIGHTWARD_QUOTED_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    rf"""(?ix){_R_QUOTED_CREDENTIAL_VALUE}\s*(?P<operator>->{{1,2}})\s*{_R_CREDENTIAL_TARGET}"""
+)
+_R_LEFTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    rf"""(?ix){_R_CREDENTIAL_TARGET}\s*(?P<operator>=|<{{1,2}}-)\s*$"""
+)
+_R_RIGHTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE = re.compile(rf"(?i)\s*(?P<operator>->{{1,2}})\s*{_R_CREDENTIAL_TARGET}")
+_R_LEFTWARD_CREDENTIAL_TARGET_RE = re.compile(rf"(?i){_R_CREDENTIAL_TARGET}\s*(?P<operator>=|<{{1,2}}-)\s*")
+_R_RIGHTWARD_CREDENTIAL_TARGET_RE = re.compile(rf"(?i)->{{1,2}}\s*{_R_CREDENTIAL_TARGET}")
+
+
+def _position_is_in_r_suppressing_non_code_span(
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+    malformed_raw_span_starts: set[int],
+) -> bool:
+    for span_start, span_end in non_code_spans:
+        if span_start > position:
+            return False
+        if position < span_end:
+            return span_start not in malformed_raw_span_starts
+    return False
+
+
+def _r_innermost_code_delimiter(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> str | None:
+    stack: list[str] = []
+    cursor = 0
+    span_index = 0
+    while cursor < position:
+        if span_index < len(non_code_spans) and cursor == non_code_spans[span_index][0]:
+            cursor = non_code_spans[span_index][1]
+            span_index += 1
+            continue
+
+        character = text[cursor]
+        if character in "([{":
+            stack.append(character)
+        elif character in ")]}" and stack:
+            stack.pop()
+        cursor += 1
+    return stack[-1] if stack else None
+
+
+def _contains_r_raw_credential_assignment(text: str) -> bool:
+    raw_string_spans = list(_iter_r_raw_string_spans(text))
+    non_code_spans = _r_non_code_spans(text)
+    malformed_raw_span_starts = {
+        literal_start
+        for literal_start, _literal_end, _content_start, _content_end, is_terminated in raw_string_spans
+        if not is_terminated
+    }
+    for literal_start, literal_end, content_start, content_end, is_terminated in raw_string_spans:
+        if not is_terminated or content_end - content_start < 6:
+            continue
+
+        left_context_start = max(0, literal_start - R_RAW_LEFT_ASSIGNMENT_CONTEXT_CHARS)
+        left_context = text[left_context_start:literal_start]
+        left_match = _R_LEFTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE.search(left_context)
+        if left_match is not None and not _position_is_in_r_suppressing_non_code_span(
+            left_context_start + left_match.start("operator"),
+            non_code_spans,
+            malformed_raw_span_starts,
+        ):
+            return True
+
+        right_match = _R_RIGHTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE.match(text, literal_end)
+        if right_match is not None and not _position_is_in_r_suppressing_non_code_span(
+            right_match.start("operator"),
+            non_code_spans,
+            malformed_raw_span_starts,
+        ):
+            return True
+    return False
+
+
+def _contains_r_quoted_credential_assignment(text: str) -> bool:
+    non_code_spans = _r_non_code_spans(text)
+    for assignment_match in _R_LEFTWARD_QUOTED_CREDENTIAL_ASSIGNMENT_RE.finditer(text):
+        operator_start = assignment_match.start("operator")
+        if _position_is_in_spans(operator_start, non_code_spans):
+            continue
+        if text[operator_start] == "=" and _r_innermost_code_delimiter(text, operator_start, non_code_spans) in {
+            "(",
+            "[",
+        }:
+            continue
+        return True
+
+    for assignment_match in _R_RIGHTWARD_QUOTED_CREDENTIAL_ASSIGNMENT_RE.finditer(text):
+        if not _position_is_in_spans(assignment_match.start("operator"), non_code_spans):
+            return True
+    return False
+
+
+def _r_expression_contains_credential_literal(expression: str) -> bool:
+    if _R_QUOTED_CREDENTIAL_VALUE_RE.search(expression):
+        return True
+    return any(
+        is_terminated and content_end - content_start >= 6
+        for _start, _end, content_start, content_end, is_terminated in _iter_r_raw_string_spans(expression)
+    )
+
+
+def _contains_r_expression_credential_assignment(text: str) -> bool:
+    non_code_spans = _r_non_code_spans(text)
+    statement_starts = _r_statement_starts(text, non_code_spans)
+    for target_match in _R_LEFTWARD_CREDENTIAL_TARGET_RE.finditer(text):
+        operator_start = target_match.start("operator")
+        if _position_is_in_spans(operator_start, non_code_spans):
+            continue
+        if text[operator_start] == "=" and _r_innermost_code_delimiter(text, operator_start, non_code_spans) in {
+            "(",
+            "[",
+        }:
+            continue
+
+        statement_index = bisect_right(statement_starts, target_match.start()) - 1
+        expression_end = (
+            statement_starts[statement_index + 1] - 1 if statement_index + 1 < len(statement_starts) else len(text)
+        )
+        if _r_expression_contains_credential_literal(text[target_match.end() : expression_end]):
+            return True
+
+    previous_target_end = 0
+    for target_match in _R_RIGHTWARD_CREDENTIAL_TARGET_RE.finditer(text):
+        if _position_is_in_spans(target_match.start(), non_code_spans):
+            continue
+
+        statement_start = max(
+            _r_statement_start_before(statement_starts, target_match.start()),
+            previous_target_end,
+        )
+        expression = text[statement_start : target_match.start()]
+        if _r_expression_contains_credential_literal(expression):
+            return True
+        previous_target_end = target_match.end()
+    return False
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -38,6 +232,10 @@ def _redact_url_for_display(url: str) -> str:
 
     netloc = f"{hostname}:{port}" if port is not None else hostname
     return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def _redact_sample_for_display(text: str) -> str:
+    return redact_evidence_string(text, max_chars=200)
 
 
 @dataclass(frozen=True)
@@ -98,9 +296,6 @@ class RSerializedScanner(BaseScanner):
         "aws_access_key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
         "github_token": re.compile(r"\bghp_[A-Za-z0-9]{36}\b"),
         "openai_key_like": re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),
-        "generic_secret_assignment": re.compile(
-            r"(?i)\b(api[_-]?key|token|secret|password)\s*[:=]\s*[\"'][^\"']{6,}[\"']"
-        ),
     }
 
     def __init__(self, config: dict[str, object] | None = None):
@@ -401,6 +596,18 @@ class RSerializedScanner(BaseScanner):
             if previous_match_end != match.start():
                 if previous_match_end is not None:
                     append_printable_tail(previous_match_end, match.start())
+                    gap = payload[previous_match_end : match.start()]
+                    current_text = "".join(current_parts)
+                    if (
+                        gap
+                        and any(byte in (0x0A, 0x0D) for byte in gap)
+                        and all(byte in (0x09, 0x0A, 0x0D, 0x20) for byte in gap)
+                        and _unfinished_r_assignment_literal_closing_sequence(current_text) is not None
+                    ):
+                        current_parts.append(gap.decode("ascii"))
+                        current_parts.append(match.group().decode("utf-8", errors="ignore"))
+                        previous_match_end = match.end()
+                        continue
                 if not append_current_run():
                     truncated = True
                     break
@@ -463,7 +670,7 @@ class RSerializedScanner(BaseScanner):
             if has_exec_symbol:
                 match = self._EXECUTABLE_SYMBOL_RE.search(lowered)
                 assert match is not None
-                hit = {"symbol": match.group(0), "offset": extracted.offset, "sample": text[:200]}
+                hit = {"symbol": match.group(0), "offset": extracted.offset, "sample": _redact_sample_for_display(text)}
                 if has_exec_call or has_code_context:
                     if not documentation_only or has_exec_call:
                         critical_symbol_hits.append(hit)
@@ -472,7 +679,11 @@ class RSerializedScanner(BaseScanner):
 
             command_match = self._COMMAND_RE.search(text)
             if command_match:
-                hit = {"pattern": command_match.group(0), "offset": extracted.offset, "sample": text[:200]}
+                hit = {
+                    "pattern": command_match.group(0),
+                    "offset": extracted.offset,
+                    "sample": _redact_sample_for_display(text),
+                }
                 if has_exec_call or has_code_context or has_exec_symbol:
                     critical_payload_hits.append(hit)
                 elif not documentation_only:
@@ -488,6 +699,12 @@ class RSerializedScanner(BaseScanner):
             for name, pattern in self._CREDENTIAL_PATTERNS.items():
                 if pattern.search(text):
                     credential_hits.add(name)
+            if (
+                _contains_r_quoted_credential_assignment(text)
+                or _contains_r_raw_credential_assignment(text)
+                or _contains_r_expression_credential_assignment(text)
+            ):
+                credential_hits.add("generic_secret_assignment")
 
         if critical_symbol_hits:
             result.add_check(

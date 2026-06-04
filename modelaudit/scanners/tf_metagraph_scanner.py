@@ -14,7 +14,7 @@ from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_D
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 
-from ._evidence_redaction import redact_evidence_string
+from ._evidence_redaction import REDACTED_EVIDENCE_VALUE, redact_evidence_string
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 # Discovery assumptions for `.meta` support:
@@ -82,8 +82,19 @@ _COMMAND_RE = re.compile(
 )
 _NETWORK_RE = re.compile(r"(?i)(?:https?://|wss?://|ftp://|tcp://|udp://|\bsocket\b|\b(?:\d{1,3}\.){3}\d{1,3}\b)")
 _ENCODED_PAYLOAD_RE = re.compile(r"\b[A-Za-z0-9+/]{120,}={0,2}\b")
+_HIGH_CONFIDENCE_SECRET_RE = re.compile(
+    r"(?:AIza[0-9A-Za-z_-]{35}|AKIA[0-9A-Z]{16}|sk-(?:proj-)?[A-Za-z0-9]{48}|"
+    r"gh[ps]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}|glpat-[A-Za-z0-9_-]{20})"
+)
 _DECODE_HINT_RE = re.compile(r"(?i)(?:base64|b64decode|frombase64string|decode\(|eval\(|exec\()")
 _BENIGN_CHECKPOINT_IO_OPS = frozenset({"SaveV2", "RestoreV2"})
+
+
+def _redact_metagraph_evidence(text: str, max_chars: int) -> str:
+    """Redact stored MetaGraph evidence without changing detection input."""
+    sanitized = _ENCODED_PAYLOAD_RE.sub(REDACTED_EVIDENCE_VALUE, text)
+    sanitized = _HIGH_CONFIDENCE_SECRET_RE.sub(REDACTED_EVIDENCE_VALUE, sanitized)
+    return redact_evidence_string(sanitized, max_chars=max_chars)
 
 
 def _read_bounded(path: str, max_bytes: int) -> tuple[bytes, bool]:
@@ -400,12 +411,22 @@ class TensorFlowMetaGraphScanner(BaseScanner):
         }
 
         for ctx in _iter_nodes(metagraph):
-            evidence_location = f"{path} ({redact_evidence_string(ctx.location_suffix, max_chars=240)})"
-            evidence_node_name = redact_evidence_string(ctx.node_name, max_chars=200)
             if ctx.op in _BENIGN_CHECKPOINT_IO_OPS:
                 continue
 
+            evidence_context: tuple[str, str] | None = None
+
+            def get_evidence_context(node_context: _NodeContext = ctx) -> tuple[str, str]:
+                nonlocal evidence_context
+                if evidence_context is None:
+                    evidence_context = (
+                        f"{path} ({_redact_metagraph_evidence(node_context.location_suffix, max_chars=240)})",
+                        _redact_metagraph_evidence(node_context.node_name, max_chars=200),
+                    )
+                return evidence_context
+
             if ctx.op in _DANGEROUS_TF_OPS:
+                evidence_location, evidence_node_name = get_evidence_context()
                 result.add_check(
                     name="TensorFlow MetaGraph Operation Security Check",
                     passed=False,
@@ -416,6 +437,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                     why=get_tf_op_explanation(ctx.op),
                 )
             elif ctx.op in SUSPICIOUS_OPS:
+                evidence_location, evidence_node_name = get_evidence_context()
                 result.add_check(
                     name="TensorFlow MetaGraph Operation Security Check",
                     passed=False,
@@ -438,13 +460,47 @@ class TensorFlowMetaGraphScanner(BaseScanner):
             for attr_string, attr_lower in attr_strings_with_lowered_values:
                 attr_name = attr_string.attr_name
                 attr_val = attr_string.attr_value
-                evidence_attr_name = redact_evidence_string(attr_name, max_chars=200)
+                library_match = _LIBRARY_OR_PATH_RE.search(attr_val)
+                command_match = _COMMAND_RE.search(attr_val)
+                network_match = _NETWORK_RE.search(attr_val)
+                encoded_payload_match = _ENCODED_PAYLOAD_RE.search(attr_val) and (
+                    has_decode_hint or _DECODE_HINT_RE.search(attr_lower)
+                )
+                oversized_attribute = attr_string.byte_length > _MAX_ATTR_VALUE_BYTES
 
-                if _LIBRARY_OR_PATH_RE.search(attr_val):
+                if not any((library_match, command_match, network_match, encoded_payload_match, oversized_attribute)):
+                    continue
+
+                evidence_location, evidence_node_name = get_evidence_context()
+                evidence_attr_name = _redact_metagraph_evidence(attr_name, max_chars=200)
+                needs_value_preview = bool(library_match or command_match or network_match or encoded_payload_match)
+                evidence_value_preview = (
+                    _redact_metagraph_evidence(attr_val, max_chars=200) if needs_value_preview else None
+                )
+                needs_example_preview = (
+                    (
+                        bool(library_match)
+                        and len(suspicious_signal_examples["dynamic_library_or_path"]) < _MAX_SIGNAL_EXAMPLES
+                    )
+                    or (
+                        bool(command_match or network_match)
+                        and len(suspicious_signal_examples["command_or_network"]) < _MAX_SIGNAL_EXAMPLES
+                    )
+                    or (
+                        bool(encoded_payload_match)
+                        and len(suspicious_signal_examples["encoded_payload"]) < _MAX_SIGNAL_EXAMPLES
+                    )
+                )
+                evidence_example_preview = (
+                    _redact_metagraph_evidence(attr_val, max_chars=120) if needs_example_preview else None
+                )
+
+                if library_match:
                     suspicious_signal_categories.add("dynamic_library_or_path")
                     if len(suspicious_signal_examples["dynamic_library_or_path"]) < _MAX_SIGNAL_EXAMPLES:
+                        assert evidence_example_preview is not None
                         suspicious_signal_examples["dynamic_library_or_path"].append(
-                            f"{ctx.op}:{evidence_attr_name}:{redact_evidence_string(attr_val, max_chars=120)}"
+                            f"{ctx.op}:{evidence_attr_name}:{evidence_example_preview}"
                         )
                     result.add_check(
                         name="MetaGraph External Reference Check",
@@ -456,17 +512,16 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                             "op_type": ctx.op,
                             "node_name": evidence_node_name,
                             "attribute": evidence_attr_name,
-                            "value_preview": redact_evidence_string(attr_val, max_chars=200),
+                            "value_preview": evidence_value_preview,
                         },
                     )
 
-                command_match = _COMMAND_RE.search(attr_val)
-                network_match = _NETWORK_RE.search(attr_val)
                 if command_match or network_match:
                     suspicious_signal_categories.add("command_or_network")
                     if len(suspicious_signal_examples["command_or_network"]) < _MAX_SIGNAL_EXAMPLES:
+                        assert evidence_example_preview is not None
                         suspicious_signal_examples["command_or_network"].append(
-                            f"{ctx.op}:{evidence_attr_name}:{redact_evidence_string(attr_val, max_chars=120)}"
+                            f"{ctx.op}:{evidence_attr_name}:{evidence_example_preview}"
                         )
 
                     is_function_reference = attr_name.endswith(".func.name")
@@ -487,15 +542,16 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                             "attribute": evidence_attr_name,
                             "command_pattern": bool(command_match),
                             "network_pattern": bool(network_match),
-                            "value_preview": redact_evidence_string(attr_val, max_chars=200),
+                            "value_preview": evidence_value_preview,
                         },
                     )
 
-                if _ENCODED_PAYLOAD_RE.search(attr_val) and (has_decode_hint or _DECODE_HINT_RE.search(attr_lower)):
+                if encoded_payload_match:
                     suspicious_signal_categories.add("encoded_payload")
                     if len(suspicious_signal_examples["encoded_payload"]) < _MAX_SIGNAL_EXAMPLES:
+                        assert evidence_example_preview is not None
                         suspicious_signal_examples["encoded_payload"].append(
-                            f"{ctx.op}:{evidence_attr_name}:{redact_evidence_string(attr_val, max_chars=120)}"
+                            f"{ctx.op}:{evidence_attr_name}:{evidence_example_preview}"
                         )
                     result.add_check(
                         name="MetaGraph Encoded Payload Check",
@@ -507,11 +563,11 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                             "op_type": ctx.op,
                             "node_name": evidence_node_name,
                             "attribute": evidence_attr_name,
-                            "value_preview": redact_evidence_string(attr_val, max_chars=200),
+                            "value_preview": evidence_value_preview,
                         },
                     )
 
-                if attr_string.byte_length > _MAX_ATTR_VALUE_BYTES:
+                if oversized_attribute:
                     result.add_check(
                         name="MetaGraph Attribute Size Anomaly",
                         passed=False,
@@ -529,11 +585,13 @@ class TensorFlowMetaGraphScanner(BaseScanner):
 
         for key, collection in metagraph.collection_def.items():
             key_lower = key.lower()
-            evidence_key = redact_evidence_string(key, max_chars=200)
+            evidence_key: str | None = None
 
             if hasattr(collection, "bytes_list"):
                 for idx, value in enumerate(collection.bytes_list.value):
                     if len(value) > _MAX_COLLECTION_VALUE_BYTES:
+                        if evidence_key is None:
+                            evidence_key = _redact_metagraph_evidence(key, max_chars=200)
                         result.add_check(
                             name="MetaGraph Collection Size Anomaly",
                             passed=False,
@@ -551,6 +609,8 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                     if any(hint in key_lower for hint in _COLLECTION_EXEC_HINTS):
                         decoded = value[:_MAX_COLLECTION_VALUE_BYTES].decode("utf-8", errors="ignore")
                         if _COMMAND_RE.search(decoded) and _NETWORK_RE.search(decoded):
+                            if evidence_key is None:
+                                evidence_key = _redact_metagraph_evidence(key, max_chars=200)
                             result.add_check(
                                 name="MetaGraph Collection Executable Pattern",
                                 passed=False,
@@ -562,7 +622,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                                 details={
                                     "collection_key": evidence_key,
                                     "index": idx,
-                                    "value_preview": redact_evidence_string(decoded, max_chars=200),
+                                    "value_preview": _redact_metagraph_evidence(decoded, max_chars=200),
                                 },
                             )
 
