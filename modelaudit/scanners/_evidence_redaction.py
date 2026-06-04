@@ -61,7 +61,7 @@ SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[_.-][a-z0-9]+)*"
 )
 CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
-    r"(?:[a-z][A-Za-z0-9]*)?"
+    r"(?:(?:[a-z][A-Za-z0-9]*)|(?:[A-Z]{2,}[A-Za-z0-9]*))?"
     r"(?:AccessKey|accessKey|AccessToken|accessToken|APIKey|ApiKey|apiKey|AuthToken|authToken|"
     r"ClientSecret|clientSecret|Credential|Password|Passwd|PrivateKey|privateKey|Pwd|"
     r"RefreshToken|refreshToken|SAS|Secret|SecretKey|secretKey|Signature|Sig|Token)"
@@ -72,7 +72,7 @@ SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
 )
 SENSITIVE_CONTAINER_KEY: Final[str] = rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|authorization)"
 PYTHON_ANNOTATION_PATTERN: Final[str] = r"(?:[A-Za-z_][\w.\[\](), |]*|[\"'][^\"'\r\n]+[\"'])"
-SCALAR_ASSIGNMENT_OPERATOR_PATTERN: Final[str] = rf"(?:=|:(?!=)(?!\s*{PYTHON_ANNOTATION_PATTERN}\s*=))"
+SCALAR_ASSIGNMENT_OPERATOR_PATTERN: Final[str] = rf"(?:=(?!=)|:(?!=)(?!\s*{PYTHON_ANNOTATION_PATTERN}\s*=))"
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(\bauthorization\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
     r"(?!(?:\(\s*)*(?:[rRuUbBfF]{0,3})?[\"'])"
@@ -205,8 +205,10 @@ PYTHON_COMPOUND_ASSIGNMENT_OPERATORS: Final[tuple[str, ...]] = (
 )
 PYTHON_VALUE_ASSIGNMENT_OPERATORS: Final[frozenset[str]] = frozenset({"=", ":=", *PYTHON_COMPOUND_ASSIGNMENT_OPERATORS})
 PYTHON_ASSIGNMENT_OPERATORS: Final[frozenset[str]] = PYTHON_VALUE_ASSIGNMENT_OPERATORS | {":"}
+PYTHON_SENSITIVE_COMPARISON_OPERATORS: Final[frozenset[str]] = frozenset({"==", "!="})
 PYTHON_ASSIGNMENT_OPERATOR_PATTERN: Final[str] = "|".join(
-    re.escape(operator) for operator in (*PYTHON_COMPOUND_ASSIGNMENT_OPERATORS, ":=", "=")
+    re.escape(operator) if operator != "=" else r"=(?!=)"
+    for operator in (*PYTHON_COMPOUND_ASSIGNMENT_OPERATORS, ":=", "=")
 )
 SENSITIVE_EXPRESSION_ASSIGNMENT_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?P<target>{SENSITIVE_ASSIGNMENT_TARGET})\s*(?P<operator>{PYTHON_ASSIGNMENT_OPERATOR_PATTERN})",
@@ -342,6 +344,18 @@ def _redact_unterminated_quoted_assignment(match: re.Match[str]) -> str:
 
 def _redact_unquoted_assignment(match: re.Match[str]) -> str:
     return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
+
+
+def _redact_scalar_unquoted_assignment(match: re.Match[str]) -> str:
+    prefix = match.group("prefix")
+    if ":" in prefix and "=" not in prefix:
+        statement_start = max(match.string.rfind("\n", 0, match.start()), match.string.rfind(";", 0, match.start())) + 1
+        statement_prefix = match.string[statement_start : match.start()]
+        if re.search(r"\b(?:if|elif|while|lambda|case)\b", statement_prefix) or any(
+            operator in statement_prefix for operator in PYTHON_SENSITIVE_COMPARISON_OPERATORS
+        ):
+            return match.group(0)
+    return f"{prefix}{REDACTED_EVIDENCE_VALUE}"
 
 
 def _line_offsets(text: str) -> list[int]:
@@ -686,6 +700,20 @@ def _significant_tokens(tokens: list[tokenize.TokenInfo]) -> list[tokenize.Token
     ]
 
 
+def _argument_keyword_and_value(
+    tokens: list[tokenize.TokenInfo],
+) -> tuple[str | None, list[tokenize.TokenInfo]]:
+    significant = _significant_tokens(tokens)
+    if (
+        len(significant) >= 3
+        and significant[0].type == tokenize.NAME
+        and significant[1].type == tokenize.OP
+        and significant[1].string == "="
+    ):
+        return significant[0].string, significant[2:]
+    return None, significant
+
+
 def _literal_sensitive_key(tokens: list[tokenize.TokenInfo]) -> bool:
     significant = _significant_tokens(tokens)
     if len(significant) != 1 or significant[0].type != tokenize.STRING:
@@ -702,8 +730,45 @@ def _literal_sensitive_key(tokens: list[tokenize.TokenInfo]) -> bool:
     return isinstance(key, str) and SENSITIVE_CONTAINER_KEY_RE.fullmatch(key) is not None
 
 
-def _redact_sensitive_setter_calls(text: str) -> str:
-    """Redact values passed to bounded credential setter call patterns."""
+def _comparison_target_start(
+    tokens: list[tokenize.TokenInfo],
+    depths: list[int],
+    operator_index: int,
+    operator_depth: int,
+) -> int:
+    for index in range(operator_index - 1, -1, -1):
+        token = tokens[index]
+        if depths[index] < operator_depth:
+            return index + 1
+        if depths[index] != operator_depth:
+            continue
+        if token.type in {tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT}:
+            return index + 1
+        if token.type == tokenize.NAME and token.string in {"and", "or", "if", "while", "assert"}:
+            return index + 1
+        if token.type == tokenize.OP and (
+            token.string in {",", ";", ":"} or token.string in PYTHON_SENSITIVE_COMPARISON_OPERATORS
+        ):
+            return index + 1
+    return 0
+
+
+def _keyed_call_argument(
+    arguments: list[tuple[str | None, list[tokenize.TokenInfo]]],
+    positional_index: int,
+    keywords: frozenset[str],
+) -> list[tokenize.TokenInfo] | None:
+    for keyword, value_tokens in arguments:
+        if keyword in keywords:
+            return value_tokens
+    positional_arguments = [value_tokens for keyword, value_tokens in arguments if keyword is None]
+    if positional_index >= len(positional_arguments):
+        return None
+    return positional_arguments[positional_index]
+
+
+def _redact_sensitive_keyed_calls(text: str) -> str:
+    """Redact credential values/defaults in bounded key/value call patterns."""
     token_input = text.replace("\x00", " ")
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(token_input).readline))
@@ -712,16 +777,20 @@ def _redact_sensitive_setter_calls(text: str) -> str:
 
     depths = _token_depths(tokens)
     offsets = _line_offsets(text)
-    setter_arguments = {
-        "putenv": (0, 1),
-        "setattr": (1, 2),
-        "setdefault": (0, 1),
-        "__setitem__": (0, 1),
+    keyed_call_arguments = {
+        "putenv": (0, 1, frozenset({"key"}), frozenset({"value"})),
+        "setattr": (1, 2, frozenset({"name"}), frozenset({"value"})),
+        "setdefault": (0, 1, frozenset({"key"}), frozenset({"default"})),
+        "__setitem__": (0, 1, frozenset({"key"}), frozenset({"value"})),
+        "getenv": (0, 1, frozenset({"key"}), frozenset({"default"})),
+        "get": (0, 1, frozenset({"key"}), frozenset({"default"})),
+        "getattr": (1, 2, frozenset({"name"}), frozenset({"default"})),
+        "pop": (0, 1, frozenset({"key"}), frozenset({"default"})),
     }
     replacements: list[tuple[int, int]] = []
     for index, token in enumerate(tokens):
-        argument_indexes = setter_arguments.get(token.string) if token.type == tokenize.NAME else None
-        if argument_indexes is None:
+        argument_spec = keyed_call_arguments.get(token.string) if token.type == tokenize.NAME else None
+        if argument_spec is None:
             continue
         open_paren_index = index + 1
         while open_paren_index < len(tokens) and tokens[open_paren_index].type in {tokenize.NL, tokenize.COMMENT}:
@@ -733,20 +802,117 @@ def _redact_sensitive_setter_calls(text: str) -> str:
         ):
             continue
 
-        arguments = _call_argument_ranges(tokens, depths, open_paren_index)
-        key_index, value_index = argument_indexes
-        if value_index >= len(arguments):
+        argument_ranges = _call_argument_ranges(tokens, depths, open_paren_index)
+        arguments = [
+            _argument_keyword_and_value(tokens[argument_start:argument_end])
+            for argument_start, argument_end in argument_ranges
+        ]
+        key_index, value_index, key_keywords, value_keywords = argument_spec
+        key_tokens = _keyed_call_argument(arguments, key_index, key_keywords)
+        value_tokens = _keyed_call_argument(arguments, value_index, value_keywords)
+        if key_tokens is None or value_tokens is None:
             continue
-        key_start, key_end = arguments[key_index]
-        if not _literal_sensitive_key(tokens[key_start:key_end]):
+        if not _literal_sensitive_key(key_tokens):
             continue
-        value_start_index, value_end_index = arguments[value_index]
-        value_tokens = _significant_tokens(tokens[value_start_index:value_end_index])
         if not value_tokens:
             continue
         value_start = _position_offset(offsets, value_tokens[0].start, len(text))
         value_end = _position_offset(offsets, value_tokens[-1].end, len(text))
         replacements.append((value_start, value_end))
+
+    for start, end in reversed(_merge_replacement_ranges(replacements)):
+        text = f"{text[:start]}{REDACTED_EVIDENCE_VALUE}{text[end:]}"
+    return text
+
+
+def _comparison_value_end(
+    tokens: list[tokenize.TokenInfo],
+    depths: list[int],
+    value_index: int,
+    operator_depth: int,
+    text_length: int,
+    offsets: list[int],
+) -> tuple[int, list[tokenize.TokenInfo]]:
+    significant: list[tokenize.TokenInfo] = []
+    for index in range(value_index, len(tokens)):
+        token = tokens[index]
+        depth = depths[index]
+        if token.type == tokenize.ENDMARKER:
+            return text_length, significant
+        if token.type == tokenize.NEWLINE and depth == operator_depth:
+            return _position_offset(offsets, token.start, text_length), significant
+        if depth == operator_depth:
+            if token.type == tokenize.OP and (
+                token.string in ":;,)]}" or token.string in PYTHON_SENSITIVE_COMPARISON_OPERATORS
+            ):
+                return _position_offset(offsets, token.start, text_length), significant
+            if token.type == tokenize.NAME and token.string in {"and", "or"}:
+                return _position_offset(offsets, token.start, text_length), significant
+        if token.type not in {
+            tokenize.NL,
+            tokenize.NEWLINE,
+            tokenize.INDENT,
+            tokenize.DEDENT,
+            tokenize.COMMENT,
+        }:
+            significant.append(token)
+    return text_length, significant
+
+
+def _redact_sensitive_comparisons(text: str) -> str:
+    """Redact literal comparison operands for sensitive code targets."""
+    token_input = text.replace("\x00", " ")
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(token_input).readline))
+    except (IndentationError, tokenize.TokenError):
+        return text
+
+    depths = _token_depths(tokens)
+    offsets = _line_offsets(text)
+    text_length = len(text)
+    replacements: list[tuple[int, int]] = []
+    ignored_value_tokens = {tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT, tokenize.COMMENT}
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.OP or token.string not in PYTHON_SENSITIVE_COMPARISON_OPERATORS:
+            continue
+        operator_depth = depths[index]
+        target_start_index = _comparison_target_start(tokens, depths, index, operator_depth)
+        target_start = _position_offset(offsets, tokens[target_start_index].start, text_length)
+        target_end = _position_offset(offsets, token.start, text_length)
+        target = text[target_start:target_end]
+        left_target_is_sensitive = SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is not None
+
+        value_index = index + 1
+        while value_index < len(tokens) and tokens[value_index].type in ignored_value_tokens:
+            value_index += 1
+        if value_index >= len(tokens) or tokens[value_index].type == tokenize.ENDMARKER:
+            continue
+        value_end, significant = _comparison_value_end(
+            tokens,
+            depths,
+            value_index,
+            operator_depth,
+            text_length,
+            offsets,
+        )
+        value_start = _position_offset(offsets, tokens[value_index].start, text_length)
+        while value_end > value_start and text[value_end - 1].isspace():
+            value_end -= 1
+        if left_target_is_sensitive and any(value_token.type == tokenize.STRING for value_token in significant):
+            replacements.append((value_start, value_end))
+            continue
+
+        right_target = text[value_start:value_end]
+        if SENSITIVE_ASSIGNMENT_TARGET_RE.search(right_target) is None:
+            continue
+        for left_token in _significant_tokens(tokens[target_start_index:index]):
+            if left_token.type == tokenize.STRING:
+                replacements.append(
+                    (
+                        _position_offset(offsets, left_token.start, text_length),
+                        _position_offset(offsets, left_token.end, text_length),
+                    )
+                )
 
     for start, end in reversed(_merge_replacement_ranges(replacements)):
         text = f"{text[:start]}{REDACTED_EVIDENCE_VALUE}{text[end:]}"
@@ -863,7 +1029,6 @@ def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
     redaction_input = text if max_chars is None else text[: max(0, max_chars) + REDACTION_LOOKAHEAD_CHARS]
     redacted = URL_RE.sub(_redact_url, redaction_input)
-    redacted = _redact_sensitive_setter_calls(redacted)
     redacted = _redact_python_expression_assignments(redacted)
     redacted = ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_escaped_quoted_mapping_assignment, redacted)
     redacted = BRACKETED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
@@ -880,5 +1045,7 @@ def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
     redacted = AUTH_SCHEME_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = QUOTED_MAPPING_SENSITIVE_UNQUOTED_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
     redacted = SUBSCRIPTED_SENSITIVE_UNQUOTED_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
-    redacted = SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
+    redacted = SENSITIVE_ASSIGNMENT_RE.sub(_redact_scalar_unquoted_assignment, redacted)
+    redacted = _redact_sensitive_comparisons(redacted)
+    redacted = _redact_sensitive_keyed_calls(redacted)
     return redacted if max_chars is None else _truncate(redacted, max_chars)

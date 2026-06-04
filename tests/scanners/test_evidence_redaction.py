@@ -514,6 +514,103 @@ def test_unparseable_sensitive_assignment_and_setter_variants_fail_closed() -> N
     assert 'eval("1 + 1")' in redacted
 
 
+def test_redacts_acronym_prefixed_sensitive_assignments() -> None:
+    """All-caps provider prefixes should not bypass target classification."""
+    text = (
+        'AWSAccessKeyId = os.getenv("KEY", "AWSACRONYMSECRET1234567890"); '
+        'DBPassword = build("DBACRONYMSECRET1234567890"); '
+        'DBPasswordlessMode = "enabled"'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "AWSACRONYMSECRET1234567890" not in redacted
+    assert "DBACRONYMSECRET1234567890" not in redacted
+    assert "AWSAccessKeyId = <redacted>" in redacted
+    assert "DBPassword = <redacted>" in redacted
+    assert 'DBPasswordlessMode = "enabled"' in redacted
+
+
+def test_redacts_sensitive_getter_defaults_and_keyword_setters() -> None:
+    """Credential keyed calls should support defaults and keyword arguments."""
+    text = (
+        'value = os.getenv("CLIENT_SECRET", "GETTERSECRET1234567890"); '
+        'other = os.environ.get(key="AWS_SECRET_ACCESS_KEY", default="ENVGETSECRET1234567890"); '
+        'os.putenv(key="AWS_SECRET_ACCESS_KEY", value="KWSETSECRET1234567890"); '
+        'setattr(obj=config, name="api_key", value=build("KWATTRSECRET1234567890")); '
+        'value = getattr(config, name="client_secret", default="GETATTRSECRET1234567890"); '
+        'other = settings.get("api_key", "MAPPINGGETSECRET1234567890"); '
+        'removed = settings.pop("refresh_token", "POPSECRET1234567890"); '
+        'value = os.getenv("REGION", "us-east-1"); '
+        'region = settings.get("region", "VISIBLE")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "GETTERSECRET1234567890" not in redacted
+    assert "ENVGETSECRET1234567890" not in redacted
+    assert "KWSETSECRET1234567890" not in redacted
+    assert "KWATTRSECRET1234567890" not in redacted
+    assert "GETATTRSECRET1234567890" not in redacted
+    assert "MAPPINGGETSECRET1234567890" not in redacted
+    assert "POPSECRET1234567890" not in redacted
+    assert 'os.getenv("CLIENT_SECRET", <redacted>)' in redacted
+    assert 'os.environ.get(key="AWS_SECRET_ACCESS_KEY", default=<redacted>)' in redacted
+    assert 'os.putenv(key="AWS_SECRET_ACCESS_KEY", value=<redacted>)' in redacted
+    assert 'setattr(obj=config, name="api_key", value=<redacted>)' in redacted
+    assert 'getattr(config, name="client_secret", default=<redacted>)' in redacted
+    assert 'settings.get("api_key", <redacted>)' in redacted
+    assert 'settings.pop("refresh_token", <redacted>)' in redacted
+    assert 'os.getenv("REGION", "us-east-1")' in redacted
+    assert 'settings.get("region", "VISIBLE")' in redacted
+
+
+def test_redacts_sensitive_comparison_literals_without_losing_context() -> None:
+    """Sensitive comparisons should remove literals and preserve dangerous calls."""
+    text = (
+        'if api_key == "COMPARESECRET1234567890": eval("1 + 1")\n'
+        'if client_secret != build("COMPARESECRET0987654321"): exec("pass")\n'
+        'if safe == "visible" and "REVERSECOMPARESECRET1234567890" == api_key: eval("4 + 4")\n'
+        'if tokenizer == "visible": eval("2 + 2")\n'
+        'if api_key: eval("5 + 5")\n'
+        "if api_key_count == 1: eval('3 + 3')"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "COMPARESECRET1234567890" not in redacted
+    assert "COMPARESECRET0987654321" not in redacted
+    assert "REVERSECOMPARESECRET1234567890" not in redacted
+    assert "api_key == <redacted>" in redacted
+    assert "client_secret != <redacted>" in redacted
+    assert 'eval("1 + 1")' in redacted
+    assert 'exec("pass")' in redacted
+    assert 'safe == "visible" and <redacted> == api_key' in redacted
+    assert 'eval("4 + 4")' in redacted
+    assert 'tokenizer == "visible"' in redacted
+    assert 'if api_key: eval("5 + 5")' in redacted
+    assert "api_key_count == 1" in redacted
+
+
+def test_unparseable_sensitive_comparison_and_keyed_calls_fail_closed() -> None:
+    """NUL framing must not reopen comparison, getter, or keyword-call gaps."""
+    text = (
+        '\x00 value = os.getenv(key="CLIENT_SECRET", default="FRAMEDGETSECRET1234567890"); '
+        'os.putenv(key="AWS_SECRET_ACCESS_KEY", value="FRAMEDSETSECRET1234567890"); '
+        'if api_key == "FRAMEDCOMPARESECRET1234567890": eval("1 + 1")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "FRAMEDGETSECRET1234567890" not in redacted
+    assert "FRAMEDSETSECRET1234567890" not in redacted
+    assert "FRAMEDCOMPARESECRET1234567890" not in redacted
+    assert 'os.getenv(key="CLIENT_SECRET", default=<redacted>)' in redacted
+    assert 'os.putenv(key="AWS_SECRET_ACCESS_KEY", value=<redacted>)' in redacted
+    assert "api_key == <redacted>" in redacted
+    assert 'eval("1 + 1")' in redacted
+
+
 def test_redaction_bounds_expression_analysis_to_output_lookahead() -> None:
     """Very large evidence strings should still redact secrets near the visible prefix."""
     secret = "BOUNDEDSECRET1234567890"
