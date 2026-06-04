@@ -1752,21 +1752,21 @@ class TensorFlowSavedModelScanner(BaseScanner):
             # Check string values in node attributes
             if hasattr(node, "attr"):
                 for attr_name, attr_value in node.attr.items():
-                    string_vals_to_check = []
+                    string_vals_to_check: list[str] = []
 
-                    # Extract string values from different attribute types
-                    if hasattr(attr_value, "s"):  # String attribute
+                    value_kind = attr_value.WhichOneof("value")
+                    if value_kind == "s":
+                        encoded_values = (attr_value.s,)
+                    elif value_kind == "list":
+                        encoded_values = attr_value.list.s
+                    else:
+                        continue
+
+                    for encoded_value in encoded_values:
                         try:
-                            string_vals_to_check.append(attr_value.s.decode("utf-8", errors="ignore"))
+                            string_vals_to_check.append(encoded_value.decode("utf-8", errors="ignore"))
                         except (UnicodeDecodeError, AttributeError):
                             continue
-
-                    elif hasattr(attr_value, "list") and hasattr(attr_value.list, "s"):  # String list
-                        for s_val in attr_value.list.s:
-                            try:
-                                string_vals_to_check.append(s_val.decode("utf-8", errors="ignore"))
-                            except (UnicodeDecodeError, AttributeError):
-                                continue
 
                     # Check each string value against injection patterns
                     for string_val in string_vals_to_check:
