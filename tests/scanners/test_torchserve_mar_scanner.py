@@ -1667,6 +1667,31 @@ def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
             b"    holder = None\n"
             b"    return list(holder.gen)\n"
         ),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in [__import__('math'), __import__('os')]:\n"
+            b"        return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os')\n"
+            b"    match [__import__('math')]:\n"
+            b"        case [module]:\n"
+            b"            pass\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    while True:\n"
+            b"        module = __import__('os')\n"
+            b"        continue\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    runner = lambda module=__import__('os'): module.system('id')\n"
+            b"    return runner(__import__('math'))\n"
+        ),
     ],
 )
 def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
@@ -1894,6 +1919,32 @@ def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
             b"def handle(data, context):\n"
             b"    holder.gen = (module.system('id') for module in [__import__('os')])\n"
             b"    return list(holder.gen)\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in [__import__('os'), __import__('math')]:\n"
+            b"        return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os')\n"
+            b"    match context:\n"
+            b"        case [module]:\n"
+            b"            pass\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    while True:\n"
+            b"        if context:\n"
+            b"            break\n"
+            b"        continue\n"
+            b"    return __import__('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    runner = lambda module=__import__('os'): module.system('id')\n"
+            b"    return runner()\n"
         ),
     ],
 )
