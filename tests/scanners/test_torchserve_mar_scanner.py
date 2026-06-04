@@ -1356,6 +1356,167 @@ def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
 
 
 @pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"def handle(data, context):\n"
+            b"    if False:\n"
+            b"        module = __import__('os')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    if True:\n"
+            b"        module = __import__('math')\n"
+            b"    else:\n"
+            b"        module = __import__('os')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in []:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return [module.system('id') for module in [__import__('os')] if False]\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    while False:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    while True:\n"
+            b"        break\n"
+            b"    else:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (
+            b"def outer():\n"
+            b"    def handle(data, context):\n"
+            b"        return load('os').system('id')\n"
+            b"    return handle\n"
+            b"    load = __import__\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    if not True:\n"
+            b"        module = __import__('os')\n"
+            b"    return module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    if False and __import__('os').system('id'):\n        pass\n"),
+        (b"def handle(data, context):\n    if True or __import__('os').system('id'):\n        pass\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in '':\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in b'':\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return [module.system('id') for module in []]\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    while not True:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    if True:\n"
+            b"        return None\n"
+            b"    module = __import__('os')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os') if False else __import__('math')\n"
+            b"    return module.system('id')\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"def handle(data, context):\n"
+            b"    if True:\n"
+            b"        module = __import__('os')\n"
+            b"    return module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    for module in [__import__('os')]:\n        module.system('id')\n"),
+        (b"def handle(data, context):\n    return [module.system('id') for module in [__import__('os')] if True]\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    while True:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+            b"        break\n"
+        ),
+        (
+            b"def outer():\n"
+            b"    load = __import__\n"
+            b"    def handle(data, context):\n"
+            b"        return load('os').system('id')\n"
+            b"    return handle\n"
+        ),
+        (b"def handle(data, context):\n    if True and __import__('os').system('id'):\n        pass\n"),
+        (b"def handle(data, context):\n    if False or __import__('os').system('id'):\n        pass\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in []:\n"
+            b"        pass\n"
+            b"    else:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    while False:\n"
+            b"        pass\n"
+            b"    else:\n"
+            b"        module = __import__('os')\n"
+            b"        module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    if False:\n"
+            b"        return None\n"
+            b"    module = __import__('os')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os') if True else __import__('math')\n"
+            b"    return module.system('id')\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_preserves_reachable_aliases(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
     ("handler_source", "dangerous_name"),
     [
         (b"import os\ndef handle(data, context):\n    return os.execvpe('/bin/sh', ['sh'], {})\n", "os.execvpe"),
