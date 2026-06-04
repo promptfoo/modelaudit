@@ -72,7 +72,7 @@ SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
 )
 SENSITIVE_CONTAINER_KEY: Final[str] = rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|authorization)"
 PYTHON_ANNOTATION_PATTERN: Final[str] = r"(?:[A-Za-z_][\w.\[\](), |]*|[\"'][^\"'\r\n]+[\"'])"
-SCALAR_ASSIGNMENT_OPERATOR_PATTERN: Final[str] = rf"(?:=|:(?!\s*{PYTHON_ANNOTATION_PATTERN}\s*=))"
+SCALAR_ASSIGNMENT_OPERATOR_PATTERN: Final[str] = rf"(?:=|:(?!=)(?!\s*{PYTHON_ANNOTATION_PATTERN}\s*=))"
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(\bauthorization\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
     r"(?!(?:\(\s*)*(?:[rRuUbBfF]{0,3})?[\"'])"
@@ -180,6 +180,14 @@ QUOTED_SENSITIVE_MAPPING_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?:[rubf]{{0,3}})?(?P<mapping_quote>[\"']){SENSITIVE_CONTAINER_KEY}(?P=mapping_quote)\s*$",
     re.IGNORECASE,
 )
+PREFIXED_QUOTED_SENSITIVE_MAPPING_KEY_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?:[rubf]{{1,3}})[\"']{SENSITIVE_CONTAINER_KEY}[\"']",
+    re.IGNORECASE,
+)
+SENSITIVE_CONTAINER_KEY_RE: Final[re.Pattern[str]] = re.compile(
+    rf"\A(?:{SENSITIVE_CONTAINER_KEY})\Z",
+    re.IGNORECASE,
+)
 PYTHON_COMPOUND_ASSIGNMENT_OPERATORS: Final[tuple[str, ...]] = (
     "**=",
     "//=",
@@ -203,6 +211,9 @@ PYTHON_ASSIGNMENT_OPERATOR_PATTERN: Final[str] = "|".join(
 SENSITIVE_EXPRESSION_ASSIGNMENT_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?P<target>{SENSITIVE_ASSIGNMENT_TARGET})\s*(?P<operator>{PYTHON_ASSIGNMENT_OPERATOR_PATTERN})",
     re.IGNORECASE,
+)
+UNPACKING_EXPRESSION_ASSIGNMENT_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?m)(?P<target>[^;=\r\n]{1,512},[^;=\r\n]{1,512})\s*(?P<operator>=)(?!=)"
 )
 STRING_LITERAL_START_RE: Final[re.Pattern[str]] = re.compile(r"(?:[rubf]{0,3})?[\"']", re.IGNORECASE)
 GENERIC_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
@@ -354,6 +365,8 @@ def _assignment_target_start(
     depths: list[int],
     operator_index: int,
     operator_depth: int,
+    *,
+    stop_at_comma: bool,
 ) -> int:
     for index in range(operator_index - 1, -1, -1):
         token = tokens[index]
@@ -363,9 +376,32 @@ def _assignment_target_start(
             continue
         if token.type in {tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT}:
             return index + 1
-        if token.type == tokenize.OP and token.string in {",", ";"}:
+        if token.type == tokenize.OP and (
+            token.string == ";" or (token.string == "," and (operator_depth > 0 or stop_at_comma))
+        ):
             return index + 1
     return 0
+
+
+def _is_lambda_default_operator(
+    tokens: list[tokenize.TokenInfo],
+    depths: list[int],
+    operator_index: int,
+    operator_depth: int,
+) -> bool:
+    for index in range(operator_index - 1, -1, -1):
+        token = tokens[index]
+        if depths[index] < operator_depth:
+            return False
+        if depths[index] != operator_depth:
+            continue
+        if token.type in {tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT}:
+            return False
+        if token.type == tokenize.OP and token.string == ";":
+            return False
+        if token.type == tokenize.NAME and token.string == "lambda":
+            return True
+    return False
 
 
 def _assignment_value_end(
@@ -376,6 +412,8 @@ def _assignment_value_end(
     operator_depth: int,
     text_length: int,
     offsets: list[int],
+    *,
+    is_lambda_default: bool,
 ) -> tuple[int, list[tokenize.TokenInfo]]:
     significant: list[tokenize.TokenInfo] = []
     for index in range(value_index, len(tokens)):
@@ -388,7 +426,9 @@ def _assignment_value_end(
         if token.type == tokenize.OP and depth == operator_depth:
             if token.string == ";" or token.string in ")]}":
                 return _position_offset(offsets, token.start, text_length), significant
-            if token.string == "," and (operator == ":" or operator_depth > 0):
+            if token.string == "," and (operator == ":" or operator_depth > 0 or is_lambda_default):
+                return _position_offset(offsets, token.start, text_length), significant
+            if token.string == ":" and is_lambda_default:
                 return _position_offset(offsets, token.start, text_length), significant
         if token.type not in {
             tokenize.NL,
@@ -453,6 +493,10 @@ def _is_simple_sensitive_assignment_value(value: str) -> bool:
     return _is_simple_sensitive_assignment_tokens(significant)
 
 
+def _contains_sensitive_unpacking_target(target: str) -> bool:
+    return any(SENSITIVE_ASSIGNMENT_TARGET_RE.search(item) is not None for item in target.split(","))
+
+
 def _assignment_boundary_start(text: str, assignment_start: int, value_start: int) -> int:
     boundary = assignment_start
     while boundary > value_start and text[boundary - 1] in " \t":
@@ -502,7 +546,9 @@ def _unparseable_assignment_value_end(text: str, value_start: int) -> tuple[int,
             index += 1
             continue
         if text[index] in ")]}":
-            depth = max(0, depth - 1)
+            if depth == 0:
+                return index, had_explicit_continuation
+            depth -= 1
             index += 1
             continue
         if text[index] == ";" and depth == 0:
@@ -531,6 +577,11 @@ def _unparseable_assignment_value_end(text: str, value_start: int) -> tuple[int,
 
 def _redact_unparseable_sensitive_expression_assignments(text: str) -> str:
     matches = list(SENSITIVE_EXPRESSION_ASSIGNMENT_PREFIX_RE.finditer(text))
+    matches.extend(
+        match
+        for match in UNPACKING_EXPRESSION_ASSIGNMENT_PREFIX_RE.finditer(text)
+        if _contains_sensitive_unpacking_target(match.group("target"))
+    )
     assignment_starts = sorted(
         {
             _assignment_boundary_start(text, match.start(), 0)
@@ -559,7 +610,14 @@ def _redact_unparseable_sensitive_expression_assignments(text: str) -> str:
         is_simple_value = _is_simple_sensitive_assignment_value(candidate)
         is_annotated_target = ANNOTATED_SENSITIVE_ASSIGNMENT_TARGET_RE.search(match.group("target")) is not None
         is_compound_assignment = match.group("operator") in PYTHON_COMPOUND_ASSIGNMENT_OPERATORS
-        if is_simple_value and not (had_continuation or is_annotated_target or is_compound_assignment):
+        requires_fallback_redaction = (
+            match.group("operator") == ":="
+            or "," in match.group("target")
+            or PREFIXED_QUOTED_SENSITIVE_MAPPING_KEY_RE.search(match.group("target")) is not None
+        )
+        if is_simple_value and not (
+            had_continuation or is_annotated_target or is_compound_assignment or requires_fallback_redaction
+        ):
             continue
 
         try:
@@ -571,6 +629,123 @@ def _redact_unparseable_sensitive_expression_assignments(text: str) -> str:
                 value_end = len(text)
         while value_end > value_start and text[value_end - 1].isspace():
             value_end -= 1
+        replacements.append((value_start, value_end))
+
+    for start, end in reversed(_merge_replacement_ranges(replacements)):
+        text = f"{text[:start]}{REDACTED_EVIDENCE_VALUE}{text[end:]}"
+    return text
+
+
+def _token_depths(tokens: list[tokenize.TokenInfo]) -> list[int]:
+    depths: list[int] = []
+    depth = 0
+    for token in tokens:
+        depths.append(depth)
+        if token.type != tokenize.OP:
+            continue
+        if token.string in "([{":
+            depth += 1
+        elif token.string in ")]}":
+            depth = max(0, depth - 1)
+    return depths
+
+
+def _call_argument_ranges(
+    tokens: list[tokenize.TokenInfo],
+    depths: list[int],
+    open_paren_index: int,
+) -> list[tuple[int, int]]:
+    argument_depth = depths[open_paren_index] + 1
+    argument_start = open_paren_index + 1
+    ranges: list[tuple[int, int]] = []
+    for index in range(argument_start, len(tokens)):
+        token = tokens[index]
+        if token.type == tokenize.OP and token.string == ")" and depths[index] == argument_depth:
+            if argument_start < index:
+                ranges.append((argument_start, index))
+            return ranges
+        if token.type == tokenize.OP and token.string == "," and depths[index] == argument_depth:
+            ranges.append((argument_start, index))
+            argument_start = index + 1
+    return []
+
+
+def _significant_tokens(tokens: list[tokenize.TokenInfo]) -> list[tokenize.TokenInfo]:
+    return [
+        token
+        for token in tokens
+        if token.type
+        not in {
+            tokenize.ENDMARKER,
+            tokenize.NL,
+            tokenize.NEWLINE,
+            tokenize.INDENT,
+            tokenize.DEDENT,
+            tokenize.COMMENT,
+        }
+    ]
+
+
+def _literal_sensitive_key(tokens: list[tokenize.TokenInfo]) -> bool:
+    significant = _significant_tokens(tokens)
+    if len(significant) != 1 or significant[0].type != tokenize.STRING:
+        return False
+    try:
+        key = ast.literal_eval(significant[0].string)
+    except (SyntaxError, ValueError):
+        return False
+    if isinstance(key, bytes):
+        try:
+            key = key.decode()
+        except UnicodeDecodeError:
+            return False
+    return isinstance(key, str) and SENSITIVE_CONTAINER_KEY_RE.fullmatch(key) is not None
+
+
+def _redact_sensitive_setter_calls(text: str) -> str:
+    """Redact values passed to bounded credential setter call patterns."""
+    token_input = text.replace("\x00", " ")
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(token_input).readline))
+    except (IndentationError, tokenize.TokenError):
+        return text
+
+    depths = _token_depths(tokens)
+    offsets = _line_offsets(text)
+    setter_arguments = {
+        "putenv": (0, 1),
+        "setattr": (1, 2),
+        "setdefault": (0, 1),
+        "__setitem__": (0, 1),
+    }
+    replacements: list[tuple[int, int]] = []
+    for index, token in enumerate(tokens):
+        argument_indexes = setter_arguments.get(token.string) if token.type == tokenize.NAME else None
+        if argument_indexes is None:
+            continue
+        open_paren_index = index + 1
+        while open_paren_index < len(tokens) and tokens[open_paren_index].type in {tokenize.NL, tokenize.COMMENT}:
+            open_paren_index += 1
+        if (
+            open_paren_index >= len(tokens)
+            or tokens[open_paren_index].type != tokenize.OP
+            or tokens[open_paren_index].string != "("
+        ):
+            continue
+
+        arguments = _call_argument_ranges(tokens, depths, open_paren_index)
+        key_index, value_index = argument_indexes
+        if value_index >= len(arguments):
+            continue
+        key_start, key_end = arguments[key_index]
+        if not _literal_sensitive_key(tokens[key_start:key_end]):
+            continue
+        value_start_index, value_end_index = arguments[value_index]
+        value_tokens = _significant_tokens(tokens[value_start_index:value_end_index])
+        if not value_tokens:
+            continue
+        value_start = _position_offset(offsets, value_tokens[0].start, len(text))
+        value_end = _position_offset(offsets, value_tokens[-1].end, len(text))
         replacements.append((value_start, value_end))
 
     for start, end in reversed(_merge_replacement_ranges(replacements)):
@@ -590,16 +765,7 @@ def _redact_python_expression_assignments(text: str) -> str:
     except (IndentationError, tokenize.TokenError):
         return _redact_unparseable_sensitive_expression_assignments(text)
 
-    depths: list[int] = []
-    depth = 0
-    for token in tokens:
-        depths.append(depth)
-        if token.type != tokenize.OP:
-            continue
-        if token.string in "([{":
-            depth += 1
-        elif token.string in ")]}":
-            depth = max(0, depth - 1)
+    depths = _token_depths(tokens)
 
     offsets = _line_offsets(text)
     text_length = len(text)
@@ -611,14 +777,23 @@ def _redact_python_expression_assignments(text: str) -> str:
             continue
 
         operator_depth = depths[index]
-        target_start_index = _assignment_target_start(tokens, depths, index, operator_depth)
+        is_lambda_default = _is_lambda_default_operator(tokens, depths, index, operator_depth)
+        target_start_index = _assignment_target_start(
+            tokens,
+            depths,
+            index,
+            operator_depth,
+            stop_at_comma=is_lambda_default,
+        )
         target_start = _position_offset(offsets, tokens[target_start_index].start, text_length)
         target_end = _position_offset(offsets, token.start, text_length)
         target = text[target_start:target_end]
         if token.string == ":":
             if QUOTED_SENSITIVE_MAPPING_KEY_RE.search(target) is None:
                 continue
-        elif SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is None:
+        elif SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is None and not (
+            "," in target and _contains_sensitive_unpacking_target(target)
+        ):
             continue
 
         value_index = index + 1
@@ -635,13 +810,22 @@ def _redact_python_expression_assignments(text: str) -> str:
             operator_depth,
             text_length,
             offsets,
+            is_lambda_default=is_lambda_default,
         )
         value_start = _position_offset(offsets, tokens[value_index].start, text_length)
         is_simple_value = _is_simple_sensitive_assignment_tokens(significant) or (
             SIMPLE_QUOTED_VALUE_RE.fullmatch(text[value_start:value_end].strip()) is not None
         )
         is_annotated_target = ANNOTATED_SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is not None
-        if is_simple_value and token.string not in PYTHON_COMPOUND_ASSIGNMENT_OPERATORS and not is_annotated_target:
+        requires_token_redaction = (
+            token.string == ":=" or "," in target or PREFIXED_QUOTED_SENSITIVE_MAPPING_KEY_RE.search(target) is not None
+        )
+        if (
+            is_simple_value
+            and token.string not in PYTHON_COMPOUND_ASSIGNMENT_OPERATORS
+            and not is_annotated_target
+            and not requires_token_redaction
+        ):
             continue
 
         while value_end > value_start and text[value_end - 1].isspace():
@@ -679,6 +863,7 @@ def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
     redaction_input = text if max_chars is None else text[: max(0, max_chars) + REDACTION_LOOKAHEAD_CHARS]
     redacted = URL_RE.sub(_redact_url, redaction_input)
+    redacted = _redact_sensitive_setter_calls(redacted)
     redacted = _redact_python_expression_assignments(redacted)
     redacted = ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_escaped_quoted_mapping_assignment, redacted)
     redacted = BRACKETED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)

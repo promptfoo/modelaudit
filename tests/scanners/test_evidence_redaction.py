@@ -415,6 +415,105 @@ def test_unparseable_compound_sensitive_assignment_redacts_literal() -> None:
     assert 'eval("1 + 1")' in redacted
 
 
+def test_redacts_bytes_keyed_and_walrus_sensitive_assignments() -> None:
+    """Bytes mapping keys and walrus values must not bypass token redaction."""
+    text = (
+        'os.environb[b"AWS_SECRET_ACCESS_KEY"] = b"BYTESECRET1234567890"\n'
+        'headers[b"Authorization"] = "AUTHSECRET1234567890"\n'
+        'if (token := "WALRUSSECRET1234567890"):\n'
+        '    eval("1 + 1")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "BYTESECRET1234567890" not in redacted
+    assert "AUTHSECRET1234567890" not in redacted
+    assert "WALRUSSECRET1234567890" not in redacted
+    assert 'os.environb[b"AWS_SECRET_ACCESS_KEY"] = <redacted>' in redacted
+    assert 'headers[b"Authorization"] = <redacted>' in redacted
+    assert "token := <redacted>" in redacted
+    assert 'eval("1 + 1")' in redacted
+
+
+def test_redacts_prefixed_camel_case_secret_assignments() -> None:
+    """Provider-prefixed camelCase credential names should remain covered."""
+    text = (
+        'awsSecretAccessKey = "AWSSECRET1234567890"; '
+        'azureClientSecret = "AZURESECRET1234567890"; '
+        'awsSecretsManagerRegion = "us-east-1"'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "AWSSECRET1234567890" not in redacted
+    assert "AZURESECRET1234567890" not in redacted
+    assert 'awsSecretAccessKey = "<redacted>"' in redacted
+    assert 'azureClientSecret = "<redacted>"' in redacted
+    assert 'awsSecretsManagerRegion = "us-east-1"' in redacted
+
+
+def test_redacts_unpacking_assignments_and_preserves_lambda_context() -> None:
+    """Sensitive unpacking and lambda defaults should redact without hiding findings."""
+    text = (
+        'api_key, other = "UNPACKSECRET1234567890", "ok"\n'
+        'safe, visible = "left", "right"\n'
+        'payload = lambda api_key="LAMBDASECRET1234567890": eval("1 + 1")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "UNPACKSECRET1234567890" not in redacted
+    assert "LAMBDASECRET1234567890" not in redacted
+    assert "api_key, other = <redacted>" in redacted
+    assert 'safe, visible = "left", "right"' in redacted
+    assert 'lambda api_key="<redacted>": eval("1 + 1")' in redacted
+
+
+def test_redacts_sensitive_setter_call_values() -> None:
+    """Credential setter APIs should sanitize their value arguments."""
+    text = (
+        'os.putenv("AWS_SECRET_ACCESS_KEY", "PUTENVSECRET1234567890"); '
+        'setattr(config, "api_key", build_secret("SETATTRSECRET1234567890")); '
+        'headers.setdefault("Authorization", "DEFAULTSECRET1234567890"); '
+        'logger.info("api_key", "VISIBLE"); '
+        'setattr(config, "timeout", "30"); eval("1 + 1")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "PUTENVSECRET1234567890" not in redacted
+    assert "SETATTRSECRET1234567890" not in redacted
+    assert "DEFAULTSECRET1234567890" not in redacted
+    assert 'os.putenv("AWS_SECRET_ACCESS_KEY", <redacted>)' in redacted
+    assert 'setattr(config, "api_key", <redacted>)' in redacted
+    assert 'headers.setdefault("Authorization", <redacted>)' in redacted
+    assert 'logger.info("api_key", "VISIBLE")' in redacted
+    assert 'setattr(config, "timeout", "30")' in redacted
+    assert 'eval("1 + 1")' in redacted
+
+
+def test_unparseable_sensitive_assignment_and_setter_variants_fail_closed() -> None:
+    """Binary framing must not reopen token-only assignment and setter gaps."""
+    text = (
+        '\x00 os.putenv("AWS_SECRET_ACCESS_KEY", "FRAMEDSETTERSECRET1234567890"); '
+        'os.environb[b"AWS_SECRET_ACCESS_KEY"] = b"FRAMEDBYTESECRET1234567890"; '
+        'api_key, other = "FRAMEDUNPACKSECRET1234567890", "ok"; '
+        'if (token := "FRAMEDWALRUSSECRET1234567890"): eval("1 + 1")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "FRAMEDSETTERSECRET1234567890" not in redacted
+    assert "FRAMEDBYTESECRET1234567890" not in redacted
+    assert "FRAMEDUNPACKSECRET1234567890" not in redacted
+    assert "FRAMEDWALRUSSECRET1234567890" not in redacted
+    assert 'os.putenv("AWS_SECRET_ACCESS_KEY", <redacted>)' in redacted
+    assert 'os.environb[b"AWS_SECRET_ACCESS_KEY"] = <redacted>' in redacted
+    assert "api_key, other = <redacted>" in redacted
+    assert "token := <redacted>" in redacted
+    assert 'eval("1 + 1")' in redacted
+
+
 def test_redaction_bounds_expression_analysis_to_output_lookahead() -> None:
     """Very large evidence strings should still redact secrets near the visible prefix."""
     secret = "BOUNDEDSECRET1234567890"
