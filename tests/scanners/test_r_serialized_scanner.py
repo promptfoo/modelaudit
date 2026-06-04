@@ -923,6 +923,10 @@ def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None
         '\\(token = "standard") NULL',
         'x[token = "standard"]',
         'x[[token = r"(standard)"]]',
+        '(function(x) x)(token = "standard")',
+        'get("list")(token = r"(standard)")',
+        'r"(list)"(token = "standard")',
+        'get("x")[token = r"(standard)"]',
     ],
 )
 def test_scan_allows_assignment_examples_inside_benign_metadata(tmp_path: Path, metadata: str) -> None:
@@ -972,6 +976,12 @@ def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path,
         'function() (token = r"(FUNCTION_BODY_SECRET)")',
         '[token = "STANDALONE_BRACKET_SECRET"]',
         '[[token = r"(STANDALONE_DOUBLE_BRACKET_SECRET)"]]',
+        '...(token = r"(ELLIPSIS_SECRET)")',
+        '....(token = "ALL_DOTS_SECRET")',
+        'if[token = r"(RESERVED_SUBSCRIPT_SECRET)"]',
+        'function[token = "RESERVED_FUNCTION_SUBSCRIPT_SECRET"]',
+        '...(x)(token = r"(COMPUTED_ELLIPSIS_SECRET)")',
+        '1(x)(token = "COMPUTED_NUMERIC_SECRET")',
     ],
 )
 def test_scan_grouped_equal_assignments_are_detected(tmp_path: Path, assignment: str) -> None:

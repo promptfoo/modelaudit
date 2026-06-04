@@ -81,12 +81,13 @@ _R_LEFTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE = re.compile(
 _R_RIGHTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE = re.compile(rf"(?i)\s*(?P<operator>->{{1,2}})\s*{_R_CREDENTIAL_TARGET}")
 _R_LEFTWARD_CREDENTIAL_TARGET_RE = re.compile(rf"(?i){_R_CREDENTIAL_TARGET}\s*(?P<operator>=|<{{1,2}}-)\s*")
 _R_RIGHTWARD_CREDENTIAL_TARGET_RE = re.compile(rf"(?i)->{{1,2}}\s*{_R_CREDENTIAL_TARGET}")
-_R_NON_CALL_PAREN_PREFIXES = frozenset(
+_R_RESERVED_WORDS = frozenset(
     {
         "break",
         "else",
         "false",
         "for",
+        "function",
         "if",
         "in",
         "inf",
@@ -186,11 +187,19 @@ def _r_open_paren_starts_argument_list(
     span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
     if span_index >= 0 and cursor < non_code_spans[span_index][1]:
         span_start, span_end = non_code_spans[span_index]
-        return not crossed_newline and span_end == cursor + 1 and text[span_start] in "\"'`"
+        return not crossed_newline and span_end == cursor + 1 and text[span_start] != "#"
 
     character = text[cursor]
     if character == "]":
-        return not crossed_newline and _r_closing_delimiter_is_matched(text, cursor, non_code_spans)
+        return not crossed_newline and _r_matching_open_delimiter_position(text, cursor, non_code_spans) is not None
+    if character == ")":
+        if crossed_newline:
+            return False
+        opener_position = _r_matching_open_delimiter_position(text, cursor, non_code_spans)
+        if opener_position is None:
+            return False
+        opener_prefix = _r_identifier_before_position(text, opener_position, non_code_spans)
+        return opener_prefix is None or _r_token_can_start_call(opener_prefix)
     if character == "\\":
         return True
     if not (character.isalnum() or character in "._"):
@@ -200,10 +209,14 @@ def _r_open_paren_starts_argument_list(
     while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
         cursor -= 1
     token = text[cursor + 1 : token_end].lower()
+    return not crossed_newline and _r_token_can_start_call(token, allow_function_keyword=True)
+
+
+def _r_token_can_start_call(token: str, *, allow_function_keyword: bool = False) -> bool:
     if token == "function":
-        return True
+        return allow_function_keyword
     token_starts_like_number = token[0].isdigit() or (token.startswith(".") and len(token) > 1 and token[1].isdigit())
-    return not crossed_newline and not token_starts_like_number and token not in _R_NON_CALL_PAREN_PREFIXES
+    return not token_starts_like_number and bool(token.strip(".")) and token not in _R_RESERVED_WORDS
 
 
 def _r_open_bracket_starts_subscript(
@@ -222,22 +235,63 @@ def _r_open_bracket_starts_subscript(
     if text[cursor] == "[":
         return _r_open_bracket_starts_subscript(text, cursor, non_code_spans)
     if text[cursor] == "]":
-        return _r_closing_delimiter_is_matched(text, cursor, non_code_spans)
+        return _r_matching_open_delimiter_position(text, cursor, non_code_spans) is not None
+    if text[cursor] == ")":
+        opener_position = _r_matching_open_delimiter_position(text, cursor, non_code_spans)
+        if opener_position is None:
+            return False
+        opener_prefix = _r_identifier_before_position(text, opener_position, non_code_spans)
+        return opener_prefix is None or _r_token_can_start_call(opener_prefix)
 
     span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
     if span_index >= 0 and cursor < non_code_spans[span_index][1]:
         span_start, span_end = non_code_spans[span_index]
-        return span_end == cursor + 1 and text[span_start] in "\"'`"
-    return text[cursor].isalnum() or text[cursor] in "._"
+        return span_end == cursor + 1 and text[span_start] != "#"
+    if not (text[cursor].isalnum() or text[cursor] in "._"):
+        return False
+
+    token_end = cursor + 1
+    while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
+        cursor -= 1
+    token = text[cursor + 1 : token_end].lower()
+    return bool(token.strip(".")) and token not in _R_RESERVED_WORDS
 
 
-def _r_closing_delimiter_is_matched(
+def _r_identifier_before_position(
     text: str,
     position: int,
     non_code_spans: list[tuple[int, int]],
-) -> bool:
+) -> str | None:
+    cursor = position - 1
+    while cursor >= 0:
+        while cursor >= 0 and text[cursor].isspace():
+            cursor -= 1
+        if cursor < 0:
+            return None
+
+        span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+        if span_index < 0 or cursor >= non_code_spans[span_index][1]:
+            break
+        span_start, _span_end = non_code_spans[span_index]
+        if text[span_start] != "#":
+            return None
+        cursor = span_start - 1
+
+    if not (text[cursor].isalnum() or text[cursor] in "._"):
+        return None
+    token_end = cursor + 1
+    while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
+        cursor -= 1
+    return text[cursor + 1 : token_end].lower()
+
+
+def _r_matching_open_delimiter_position(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> int | None:
     closing_delimiters = {")": "(", "]": "[", "}": "{"}
-    stack: list[str] = []
+    stack: list[tuple[str, int]] = []
     cursor = 0
     span_index = 0
     while cursor <= position:
@@ -248,17 +302,17 @@ def _r_closing_delimiter_is_matched(
 
         character = text[cursor]
         if character in "([{":
-            stack.append(character)
+            stack.append((character, cursor))
         elif character in ")]}":
-            if stack and stack[-1] != closing_delimiters[character]:
-                return False
+            if stack and stack[-1][0] != closing_delimiters[character]:
+                return None
             is_matched = bool(stack)
             if cursor == position:
-                return is_matched
+                return stack[-1][1] if is_matched else None
             if is_matched:
                 stack.pop()
         cursor += 1
-    return False
+    return None
 
 
 def _contains_r_raw_credential_assignment(text: str) -> bool:
