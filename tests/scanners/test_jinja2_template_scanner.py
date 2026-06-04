@@ -1519,6 +1519,32 @@ class TestJinja2TemplateScannerEdgeCases:
         assert detail == "output"
 
     @pytest.mark.parametrize(
+        ("format_string", "arguments", "expected"),
+        [
+            ("%100000000s", "", True),
+            ("%*s", (100000000, ""), True),
+            ("%10s", "", False),
+        ],
+    )
+    def test_percent_format_budget_projection(
+        self,
+        format_string: str,
+        arguments: object,
+        expected: bool,
+    ) -> None:
+        exceeds_budget = jinja2_template_scanner._percent_format_exceeds_budget(format_string, arguments, 64)
+
+        assert exceeds_budget is expected
+
+    def test_budgeted_sandbox_intercepts_percent_format_before_render(self) -> None:
+        pytest.importorskip("jinja2.sandbox")
+
+        status, detail = jinja2_template_scanner._run_budgeted_sandbox_render("{{ '%1000000s' % '' }}", 64)
+
+        assert status == "budget_exceeded"
+        assert detail == "output"
+
+    @pytest.mark.parametrize(
         "template_content",
         [
             "{{ range(10 ** 13 + 1, 2 * 10 ** 13)|list }}",
@@ -1564,6 +1590,8 @@ class TestJinja2TemplateScannerEdgeCases:
             "{{ range(10 ** 1000 - 10 ** 1000)|list }}",
             "{{ range((10 ** 1000) // (10 ** 1000))|list }}",
             "{{ range((10 ** 1000) % (10 ** 1000))|list }}",
+            "{{ range(-(10 ** 1000))|list }}",
+            "{{ range(10 ** 1000, 0)|list }}",
         ],
     )
     def test_unavailable_sandbox_worker_keeps_non_amplifying_and_invalid_range_calls_clean(
@@ -1587,6 +1615,30 @@ class TestJinja2TemplateScannerEdgeCases:
         assert result.success is True
         assert "scan_outcome" not in result.metadata
         assert not [c for c in result.checks if c.name == "Template Sandbox Safety Probe"]
+
+    def test_unavailable_sandbox_worker_counts_large_range_tail(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("jinja2.sandbox")
+        template_file = tmp_path / "large-range-tail.jinja"
+        template_file.write_text("{{ range(200000)|list }}", encoding="utf-8")
+
+        scanner = Jinja2TemplateScanner({"sandbox_render_max_output_chars": 1_000_000})
+        monkeypatch.setattr(
+            scanner,
+            "_test_template_safety_with_budget",
+            lambda _template_content: ("worker_unavailable", "AssertionError"),
+        )
+        result = scanner.scan(str(template_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert any(
+            check.name == "Template Sandbox Safety Probe" and check.details["budget_type"] == "worker_unavailable"
+            for check in result.checks
+        )
 
     def test_unavailable_sandbox_worker_keeps_small_range_at_large_offset_clean(
         self,

@@ -179,9 +179,39 @@ def _project_combined_value_size(left: Any, right: Any) -> int | None:
     return None
 
 
+_PERCENT_FORMAT_FIELD_PATTERN = re.compile(
+    r"%(?:\([^)]+\))?[#0\- +]*(?P<width>\d+|\*)?(?:\.(?P<precision>\d+|\*))?[hlL]?(?P<conversion>[diouxXeEfFgGcrsa%])"
+)
+
+
+def _percent_format_exceeds_budget(left: Any, right: Any, max_output_chars: int) -> bool:
+    if not isinstance(left, str | bytes):
+        return False
+    format_text = left.decode("latin-1") if isinstance(left, bytes) else left
+    arguments = list(right) if isinstance(right, tuple) else [right]
+    argument_index = 0
+    for match in _PERCENT_FORMAT_FIELD_PATTERN.finditer(format_text):
+        if match.group("conversion") == "%":
+            continue
+        for group_name in ("width", "precision"):
+            value = match.group(group_name)
+            if value == "*":
+                if (
+                    argument_index < len(arguments)
+                    and isinstance(arguments[argument_index], int)
+                    and abs(arguments[argument_index]) > max_output_chars
+                ):
+                    return True
+                argument_index += 1
+            elif value is not None and int(value) > max_output_chars:
+                return True
+        argument_index += 1
+    return False
+
+
 def _create_budgeted_sandbox_environment(max_output_chars: int) -> Any:
     class _BudgetedSandboxEnvironment(jinja2.sandbox.SandboxedEnvironment):
-        intercepted_binops = frozenset({"*", "+"})
+        intercepted_binops = frozenset({"*", "+", "%"})
 
         def call_binop(self, context: Any, operator: str, left: Any, right: Any) -> Any:
             projected_size = None
@@ -189,6 +219,8 @@ def _create_budgeted_sandbox_environment(max_output_chars: int) -> Any:
                 projected_size = _project_repeated_value_size(left, right)
             elif operator == "+":
                 projected_size = _project_combined_value_size(left, right)
+            elif operator == "%" and _percent_format_exceeds_budget(left, right, max_output_chars):
+                raise _SandboxRenderBudgetExceeded
 
             if projected_size is not None and projected_size > max_output_chars:
                 raise _SandboxRenderBudgetExceeded
@@ -1756,6 +1788,7 @@ class Jinja2TemplateScanner(BaseScanner):
             return cap + 1
 
         total = 1
+        checked = 0
         for checked, value in enumerate(range(start, stop, step), start=1):
             if checked > 1:
                 total += 2
@@ -1764,6 +1797,9 @@ class Jinja2TemplateScanner(BaseScanner):
                 return cap + 1
             if checked >= min(count, 100_000):
                 break
+        total += self._remaining_range_rendered_size_lower_bound(start, step, checked, count, 2)
+        if total + 1 > cap:
+            return cap + 1
         return total + 1
 
     def _constant_range_joined_size(
@@ -1786,6 +1822,7 @@ class Jinja2TemplateScanner(BaseScanner):
         start, stop, step = range_values
         count = self._range_iteration_count(start, stop, step, cap)
         total = 0
+        checked = 0
         for checked, value in enumerate(range(start, stop, step), start=1):
             if checked > 1:
                 total += separator_size
@@ -1794,7 +1831,35 @@ class Jinja2TemplateScanner(BaseScanner):
                 return cap + 1
             if checked >= min(count, 100_000):
                 break
+        total += self._remaining_range_rendered_size_lower_bound(
+            start,
+            step,
+            checked,
+            count,
+            separator_size,
+        )
+        if total > cap:
+            return cap + 1
         return total
+
+    @staticmethod
+    def _remaining_range_rendered_size_lower_bound(
+        start: int,
+        step: int,
+        checked: int,
+        count: int,
+        separator_size: int,
+    ) -> int:
+        remaining = count - checked
+        if remaining <= 0:
+            return 0
+        next_value = start + checked * step
+        last_value = start + (count - 1) * step
+        if min(next_value, last_value) <= 0 <= max(next_value, last_value):
+            minimum_value_size = 1
+        else:
+            minimum_value_size = min(len(str(next_value)), len(str(last_value)))
+        return remaining * (minimum_value_size + separator_size)
 
     def _constant_int_expression_value(self, node: Any, cap: int) -> int | None:
         result = self._constant_int_expression_result(node, cap)
@@ -1976,31 +2041,52 @@ class Jinja2TemplateScanner(BaseScanner):
         return self._range_iteration_count(*range_values, cap)
 
     def _constant_range_values(self, args: list[Any], cap: int) -> tuple[int, int, int] | None:
-        values: list[int] = []
-        saturated = False
+        results: list[tuple[int, bool]] = []
         for arg in args[:3]:
             result = self._constant_int_expression_result(arg, cap)
             if result is None:
                 return None
-            value, value_saturated = result
-            saturated = saturated or value_saturated
-            values.append(value)
+            results.append(result)
 
-        if saturated:
-            return 0, max(1, abs(cap)) + 1, 1
-
-        if len(values) == 1:
-            start = 0
-            stop = values[0]
-            step = 1
+        if len(results) == 1:
+            start_result = (0, False)
+            stop_result = results[0]
+            step_result = (1, False)
         else:
-            start = values[0]
-            stop = values[1]
-            step = values[2] if len(values) >= 3 else 1
+            start_result = results[0]
+            stop_result = results[1]
+            step_result = results[2] if len(results) >= 3 else (1, False)
+
+        start, start_saturated = start_result
+        stop, stop_saturated = stop_result
+        step, _step_saturated = step_result
 
         if step == 0:
             return 0, 0, 1
+        if len(args) >= 2 and args[0] == args[1]:
+            return 0, 0, 1
+
+        comparison = self._compare_constant_int_results(start_result, stop_result)
+        if comparison is not None and ((step > 0 and comparison >= 0) or (step < 0 and comparison <= 0)):
+            return 0, 0, 1
+        if start_saturated or stop_saturated:
+            synthetic_stop = max(1, abs(cap)) + 1
+            return (0, synthetic_stop, 1) if step > 0 else (synthetic_stop, 0, -1)
         return start, stop, step
+
+    @staticmethod
+    def _compare_constant_int_results(left: tuple[int, bool], right: tuple[int, bool]) -> int | None:
+        left_value, left_saturated = left
+        right_value, right_saturated = right
+        if not left_saturated and not right_saturated:
+            return (left_value > right_value) - (left_value < right_value)
+        if left_saturated and right_saturated:
+            if (left_value < 0) != (right_value < 0):
+                return -1 if left_value < 0 else 1
+            return None
+        if left_saturated:
+            return -1 if left_value < 0 else 1
+        return 1 if right_value < 0 else -1
 
     def _range_iteration_count(self, start: int, stop: int, step: int, cap: int) -> int:
         if step > 0:
