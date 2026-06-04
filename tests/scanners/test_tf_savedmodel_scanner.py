@@ -10,6 +10,7 @@ from typing import Any, Protocol, TypedDict
 import pytest
 
 import modelaudit.scanners.tf_savedmodel_scanner as tf_savedmodel_module
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
@@ -28,6 +29,7 @@ class _RequiredNodeSpec(TypedDict):
 class _NodeSpec(_RequiredNodeSpec, total=False):
     name: str
     string_attrs: dict[str, str]
+    string_list_attrs: dict[str, list[str]]
     function_ref: str
 
 
@@ -40,6 +42,27 @@ def has_tensorflow():
         return bool(getattr(tf, "__version__", None)) and hasattr(tf, "constant")
     except Exception:
         return False
+
+
+def _protobuf_varint(value: int) -> bytes:
+    chunks: list[int] = []
+    while value > 0x7F:
+        chunks.append((value & 0x7F) | 0x80)
+        value >>= 7
+    chunks.append(value)
+    return bytes(chunks)
+
+
+def _protobuf_bytes_field(field_number: int, payload: bytes) -> bytes:
+    return _protobuf_varint((field_number << 3) | 2) + _protobuf_varint(len(payload)) + payload
+
+
+def _keras_metadata_with_malformed_saved_object(payload: bytes) -> bytes:
+    return _protobuf_bytes_field(1, payload)
+
+
+def _keras_metadata_with_json_metadata(payload: bytes) -> bytes:
+    return _protobuf_bytes_field(1, _protobuf_bytes_field(5, payload))
 
 
 def test_tf_savedmodel_scanner_can_handle(tmp_path: Path) -> None:
@@ -182,6 +205,33 @@ def test_tf_savedmodel_directory_keeps_keras_metadata_read_failure_operational(
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_directory_malformed_keras_metadata_is_inconclusive(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    metadata_path = model_dir / "keras_metadata.pb"
+    metadata_path.write_bytes(b"\x0a\x05abc")
+
+    direct = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
+    aggregate = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    parse_checks = [
+        check
+        for check in direct.checks
+        if check.name == "Keras Metadata Parsing" and check.location == str(metadata_path)
+    ]
+    assert direct.success is False
+    assert aggregate.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "keras_metadata_parse_failed"
+    assert direct.metadata["scan_outcome_reasons"] == ["keras_metadata_parse_failed"]
+    assert len(parse_checks) == 1
+    assert parse_checks[0].status == CheckStatus.FAILED
+    assert parse_checks[0].severity == IssueSeverity.INFO
+    assert parse_checks[0].details["analysis_incomplete"] is True
+    assert parse_checks[0].details["scan_outcome_reason"] == "keras_metadata_parse_failed"
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_tf_savedmodel_directory_oversized_keras_metadata_is_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -208,6 +258,49 @@ def test_tf_savedmodel_directory_oversized_keras_metadata_is_inconclusive(
     assert budget_checks[0].severity == IssueSeverity.INFO
     assert budget_checks[0].details["analysis_incomplete"] is True
     assert budget_checks[0].details["max_parse_bytes"] == 32
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_malformed_keras_metadata_is_inconclusive(tmp_path: Path) -> None:
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(b"\x0a\x05abc")
+
+    direct = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+    aggregate = scan_model_directory_or_file(str(metadata_path), cache_scan_results=False)
+
+    parse_checks = [
+        check
+        for check in direct.checks
+        if check.name == "Keras Metadata Parsing" and check.location == str(metadata_path)
+    ]
+    assert direct.success is False
+    assert aggregate.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "keras_metadata_parse_failed"
+    assert direct.metadata["scan_outcome_reasons"] == ["keras_metadata_parse_failed"]
+    assert len(parse_checks) == 1
+    assert parse_checks[0].status == CheckStatus.FAILED
+    assert parse_checks[0].severity == IssueSeverity.INFO
+    assert parse_checks[0].details["analysis_incomplete"] is True
+    assert parse_checks[0].details["scan_outcome_reason"] == "keras_metadata_parse_failed"
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_nested_malformed_keras_metadata_is_inconclusive(tmp_path: Path) -> None:
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(_keras_metadata_with_malformed_saved_object(b"abc"))
+
+    direct = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+    aggregate = scan_model_directory_or_file(str(metadata_path), cache_scan_results=False)
+
+    assert direct.success is False
+    assert aggregate.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "keras_metadata_parse_failed"
+    assert direct.metadata["scan_outcome_reasons"] == ["keras_metadata_parse_failed"]
+    assert any(check.name == "Keras Metadata Parsing" for check in direct.checks)
     assert determine_exit_code(aggregate) == 2
 
 
@@ -244,6 +337,72 @@ def test_tf_savedmodel_standalone_oversized_keras_metadata_is_inconclusive(
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_malformed_keras_metadata_preserves_lambda_detection(tmp_path: Path) -> None:
+    encoded_code = base64.b64encode(b'exec("print(1)")').decode()
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode())
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(check.name == "Keras Metadata Parsing" for check in result.checks)
+    assert any(
+        issue.message
+        and "Lambda layer contains dangerous code" in issue.message
+        and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_malformed_tail_preserves_lambda_detection(tmp_path: Path) -> None:
+    encoded_code = base64.b64encode(b'exec("print(1)")').decode()
+    lambda_metadata = _keras_metadata_with_json_metadata(
+        f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode()
+    )
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(lambda_metadata + b"\x0a\x05abc")
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(check.name == "Keras Metadata Parsing" for check in result.checks)
+    assert any(
+        issue.message
+        and "Lambda layer contains dangerous code" in issue.message
+        and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_directory_valid_keras_metadata_preserves_success(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    metadata_path = model_dir / "keras_metadata.pb"
+    metadata_path.write_bytes(_keras_metadata_with_json_metadata(b'{"class_name": "Dense"}'))
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert not any(check.name == "Keras Metadata Parsing" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_unknown_keras_metadata_fields_preserve_success(tmp_path: Path) -> None:
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(_protobuf_bytes_field(2, b"forward-compatible"))
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert not any(check.name == "Keras Metadata Parsing" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_tf_savedmodel_standalone_keras_metadata_swap_to_oversized_is_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -273,7 +432,7 @@ def test_tf_savedmodel_standalone_in_budget_keras_metadata_hashes_bounded_conten
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     metadata_path = tmp_path / "keras_metadata.pb"
-    content = b'{"class_name": "Dense"}'
+    content = _keras_metadata_with_json_metadata(b'{"class_name": "Dense"}')
     metadata_path.write_bytes(content)
     monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", len(content))
     monkeypatch.setattr(
@@ -299,7 +458,7 @@ def test_tf_savedmodel_standalone_keras_metadata_tolerates_disabled_md5(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     metadata_path = tmp_path / "keras_metadata.pb"
-    content = b'{"class_name": "Dense"}'
+    content = _keras_metadata_with_json_metadata(b'{"class_name": "Dense"}')
     metadata_path.write_bytes(content)
 
     def reject_md5(*_args: object, **_kwargs: object) -> None:
@@ -336,6 +495,8 @@ def test_tf_savedmodel_standalone_keras_metadata_scans_when_md5_is_disabled(
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
 
     assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(check.name == "Keras Metadata Parsing" for check in result.checks)
     assert any(
         check.name == "Lambda Layer Security Check"
         and check.status == CheckStatus.FAILED
@@ -354,7 +515,7 @@ def test_tf_savedmodel_in_budget_keras_metadata_preserves_success(
 ) -> None:
     model_dir = Path(create_tf_savedmodel(tmp_path))
     metadata_path = model_dir / "keras_metadata.pb"
-    metadata_path.write_bytes(b'{"class_name": "Dense"}')
+    metadata_path.write_bytes(_keras_metadata_with_json_metadata(b'{"class_name": "Dense"}'))
     monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", 64)
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
@@ -747,6 +908,237 @@ def test_protobuf_string_injection_detected_in_function_definition(tmp_path: Pat
     assert any(issue.details.get("node_scope") == "function_def" for issue in injection_issues)
     assert any(issue.details.get("function_name") == function_name for issue in injection_issues)
     assert any(issue.details.get("attribute_name") == "payload" for issue in injection_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_padded_protobuf_string_injection_past_length_threshold_is_detected(tmp_path: Path) -> None:
+    payload = "A" * 12_000 + "os.system('/bin/echo padded exploit')"
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "padded_payload_node",
+                "string_attrs": {"payload": payload},
+            }
+        ],
+        model_name="padded_string_injection",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    injection_issues = [
+        issue
+        for issue in result.issues
+        if "protobuf string" in issue.message.lower() and issue.details.get("attack_type") == "system_command"
+    ]
+    assert result.success is False
+    assert determine_exit_code(aggregate) == 1
+    assert injection_issues, "Expected padded protobuf string injection detection past the old 10 KB cutoff"
+    assert any(issue.details.get("attribute_name") == "payload" for issue in injection_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_padded_protobuf_string_list_injection_is_detected(tmp_path: Path) -> None:
+    payload = "A" * 12_000 + "os.system('/bin/echo padded list exploit')"
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "padded_list_payload_node",
+                "string_list_attrs": {"payloads": ["safe-value", payload]},
+            }
+        ],
+        model_name="padded_string_list_injection",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    injection_issues = [
+        issue
+        for issue in result.issues
+        if "protobuf string" in issue.message.lower() and issue.details.get("attack_type") == "system_command"
+    ]
+    assert result.success is False
+    assert determine_exit_code(aggregate) == 1
+    assert injection_issues, "Expected padded protobuf string-list injection detection"
+    assert any(issue.details.get("attribute_name") == "payloads" for issue in injection_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_benign_long_protobuf_string_is_scanned_without_security_finding(tmp_path: Path) -> None:
+    benign_value = "safe-metadata-" + ("A" * 12_000)
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "benign_long_node",
+                "string_attrs": {"description": benign_value},
+            }
+        ],
+        model_name="benign_long_string",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    assert result.success is True
+    assert determine_exit_code(aggregate) == 0
+    assert not [
+        issue
+        for issue in result.issues
+        if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        and "protobuf string" in issue.message.lower()
+    ]
+    assert any(check.name == "Protobuf String Length Check" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_fully_covered_windowed_protobuf_string_preserves_success(tmp_path: Path) -> None:
+    benign_value = "safe-metadata-" + ("A" * 33_000)
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "fully_covered_windowed_node",
+                "string_attrs": {"description": benign_value},
+            }
+        ],
+        model_name="fully_covered_windowed_string",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    assert result.success is True
+    assert determine_exit_code(aggregate) == 0
+    length_checks = [check for check in result.checks if check.name == "Protobuf String Length Check"]
+    assert length_checks
+    assert length_checks[0].details["string_scan_strategy"] == "full"
+    assert "scan_outcome" not in result.metadata
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_fully_covered_windowed_protobuf_string_detects_boundary_split_injection(tmp_path: Path) -> None:
+    split_offset = 32_768
+    split_prefix = "os.syst"
+    payload = ("A" * (split_offset - len(split_prefix)) + "os.system('/bin/echo split exploit')").ljust(49_152, "A")
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "boundary_split_payload_node",
+                "string_attrs": {"payload": payload},
+            }
+        ],
+        model_name="boundary_split_windowed_string",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    injection_checks = [
+        check
+        for check in result.checks
+        if check.name == "Protobuf String Injection Check" and check.details.get("attack_type") == "system_command"
+    ]
+    assert result.success is False
+    assert determine_exit_code(aggregate) == 1
+    assert injection_checks
+    assert injection_checks[0].details["string_scan_strategy"] == "full"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_partial_window_match_does_not_hide_incomplete_protobuf_string_scan(tmp_path: Path) -> None:
+    oversized_value = "../" + ("A" * 99_997) + "os.system('/bin/echo hidden exploit')" + ("A" * 200_000)
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "partial_window_match_node",
+                "string_attrs": {"payload": oversized_value},
+            }
+        ],
+        model_name="partial_window_match_string",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    assert result.success is False
+    assert determine_exit_code(aggregate) == 2
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "savedmodel_protobuf_string_scan_incomplete"
+    incomplete_checks = [
+        check
+        for check in result.checks
+        if check.name == "Protobuf String Length Check"
+        and check.details.get("scan_outcome_reason") == "savedmodel_protobuf_string_scan_incomplete"
+    ]
+    injection_checks = [check for check in result.checks if check.name == "Protobuf String Injection Check"]
+    assert incomplete_checks
+    assert any(check.details["attack_type"] == "path_traversal" for check in injection_checks)
+    assert not any(check.details["attack_type"] == "system_command" for check in injection_checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_oversized_protobuf_string_without_full_coverage_fails_closed(tmp_path: Path) -> None:
+    oversized_value = "safe-metadata-" + ("A" * 300_000)
+    cache_dir = tmp_path / "cache"
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "oversized_benign_node",
+                "string_attrs": {"description": oversized_value},
+            }
+        ],
+        model_name="oversized_long_string",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    reset_cache_manager()
+    try:
+        aggregates = [
+            scan_model_directory_or_file(
+                model_path,
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            for _ in range(2)
+        ]
+
+        assert all(determine_exit_code(aggregate) == 2 for aggregate in aggregates)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "savedmodel_protobuf_string_scan_incomplete"
+    incomplete_checks = [
+        check
+        for check in result.checks
+        if check.name == "Protobuf String Length Check"
+        and check.details.get("scan_outcome_reason") == "savedmodel_protobuf_string_scan_incomplete"
+    ]
+    assert incomplete_checks
+    assert incomplete_checks[0].details["analysis_incomplete"] is True
+    assert not [
+        issue
+        for issue in result.issues
+        if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        and "protobuf string" in issue.message.lower()
+    ]
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -1294,7 +1686,11 @@ def test_scan_keras_metadata_pb_lambda_exec_sets_success_false(tmp_path: Path) -
     """Standalone `keras_metadata.pb` scans should propagate CRITICAL Lambda findings to success=False."""
     encoded_code = base64.b64encode(b'exec("print(1)")').decode()
     metadata_path = tmp_path / "keras_metadata.pb"
-    metadata_path.write_bytes(f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode())
+    metadata_path.write_bytes(
+        _keras_metadata_with_json_metadata(
+            f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode()
+        )
+    )
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
 
@@ -1900,6 +2296,9 @@ def _create_test_savedmodel_with_scoped_nodes(
 
         for attr_name, attr_value in spec.get("string_attrs", {}).items():
             node.attr[attr_name].s = attr_value.encode("utf-8")
+
+        for attr_name, attr_values in spec.get("string_list_attrs", {}).items():
+            node.attr[attr_name].list.s.extend(value.encode("utf-8") for value in attr_values)
 
         function_ref = spec.get("function_ref")
         if function_ref is not None:
