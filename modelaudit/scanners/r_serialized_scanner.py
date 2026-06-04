@@ -29,21 +29,30 @@ from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 _DECODE_INCONCLUSIVE_REASON = "r_serialized_decode_incomplete"
 _READ_INCONCLUSIVE_REASON = "r_serialized_read_failed"
 _STRING_EXTRACTION_INCONCLUSIVE_REASON = "r_serialized_string_extraction_incomplete"
-_R_CREDENTIAL_KEY_PATTERN = (
+_R_SEPARATED_CREDENTIAL_KEY_PATTERN = (
     r"(?:[a-z0-9]+[._-])*"
     r"(?:access[._-]?key|access[._-]?token|api[._-]?key|apikey|auth[._-]?token|client[._-]?secret|"
-    r"password|passwd|private[._-]?key|refresh[._-]?token|secret|secret[._-]?key|token)"
+    r"password|passwd|private[._-]?key|pwd|refresh[._-]?token|secret|secret[._-]?key|token)"
 )
-_R_BACKTICK_CREDENTIAL_KEY_PATTERN = (
+_R_CAMEL_CASE_CREDENTIAL_KEY_PATTERN = (
+    r"(?:[a-z][A-Za-z0-9]*)?"
+    r"(?:AccessKey|accessKey|AccessToken|accessToken|APIKey|ApiKey|apiKey|AuthToken|authToken|"
+    r"ClientSecret|clientSecret|Password|Passwd|PrivateKey|privateKey|Pwd|RefreshToken|refreshToken|"
+    r"Secret|SecretKey|secretKey|Token)"
+    r"(?:[A-Z][A-Za-z0-9]*)?"
+)
+_R_CREDENTIAL_KEY_PATTERN = rf"(?:{_R_SEPARATED_CREDENTIAL_KEY_PATTERN}|(?-i:{_R_CAMEL_CASE_CREDENTIAL_KEY_PATTERN}))"
+_R_SEPARATED_QUOTED_CREDENTIAL_KEY_PATTERN = (
     r"(?:[a-z0-9]+[\s._-]+)*"
     r"(?:access[\s._-]*key|access[\s._-]*token|api[\s._-]*key|apikey|auth[\s._-]*token|"
-    r"client[\s._-]*secret|password|passwd|private[\s._-]*key|refresh[\s._-]*token|secret|"
+    r"client[\s._-]*secret|password|passwd|private[\s._-]*key|pwd|refresh[\s._-]*token|secret|"
     r"secret[\s._-]*key|token)"
 )
-_R_UNQUOTED_CREDENTIAL_IDENTIFIER = rf"(?:`{_R_BACKTICK_CREDENTIAL_KEY_PATTERN}`|\b{_R_CREDENTIAL_KEY_PATTERN}\b)"
-_R_QUOTED_CREDENTIAL_IDENTIFIER = (
-    rf"""(?:"{_R_BACKTICK_CREDENTIAL_KEY_PATTERN}"|'{_R_BACKTICK_CREDENTIAL_KEY_PATTERN}')"""
+_R_QUOTED_CREDENTIAL_KEY_PATTERN = (
+    rf"(?:{_R_SEPARATED_QUOTED_CREDENTIAL_KEY_PATTERN}|(?-i:{_R_CAMEL_CASE_CREDENTIAL_KEY_PATTERN}))"
 )
+_R_UNQUOTED_CREDENTIAL_IDENTIFIER = rf"(?:`{_R_QUOTED_CREDENTIAL_KEY_PATTERN}`|\b{_R_CREDENTIAL_KEY_PATTERN}\b)"
+_R_QUOTED_CREDENTIAL_IDENTIFIER = rf"""(?:"{_R_QUOTED_CREDENTIAL_KEY_PATTERN}"|'{_R_QUOTED_CREDENTIAL_KEY_PATTERN}')"""
 _R_CREDENTIAL_IDENTIFIER = rf"(?:{_R_UNQUOTED_CREDENTIAL_IDENTIFIER}|{_R_QUOTED_CREDENTIAL_IDENTIFIER})"
 _R_QUOTED_CREDENTIAL_VALUE = r"""(?:"(?:\\.|[^"\\]){6,}"|'(?:\\.|[^'\\]){6,}')"""
 _R_QUOTED_CREDENTIAL_VALUE_RE = re.compile(_R_QUOTED_CREDENTIAL_VALUE)
