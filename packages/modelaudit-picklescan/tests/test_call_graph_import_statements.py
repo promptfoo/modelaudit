@@ -401,7 +401,8 @@ def test_shared_source_sensitive_caches_refreshes_between_outer_scopes(
     finally:
         _clear_call_graph_caches()
 
-    assert safe_report.verdict == SafetyVerdict.CLEAN
+    assert safe_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert not _has_critical_call_graph_finding(safe_report, module_name, "invoke", "os.system")
     assert dangerous_report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_call_graph_finding(dangerous_report, module_name, "invoke", "os.system")
 
@@ -432,7 +433,8 @@ def test_shared_source_sensitive_caches_refreshes_changed_source_within_scope(
     finally:
         _clear_call_graph_caches()
 
-    assert safe_report.verdict == SafetyVerdict.CLEAN
+    assert safe_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert not _has_critical_call_graph_finding(safe_report, module_name, "invoke", "os.system")
     assert dangerous_report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_call_graph_finding(dangerous_report, module_name, "invoke", "os.system")
 
@@ -473,7 +475,8 @@ def test_shared_source_sensitive_caches_fails_closed_when_final_validation_obser
     finally:
         _clear_call_graph_caches()
 
-    assert safe_report.verdict == SafetyVerdict.CLEAN
+    assert safe_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert not _has_critical_call_graph_finding(safe_report, module_name, "invoke", "os.system")
     assert source_rewritten is True
     assert changed_report.status == ScanStatus.INCONCLUSIVE
     assert changed_report.verdict == SafetyVerdict.SUSPICIOUS
@@ -525,7 +528,8 @@ def test_shared_source_sensitive_caches_fails_closed_after_mid_report_refresh(
     finally:
         _clear_call_graph_caches()
 
-    assert safe_report.verdict == SafetyVerdict.CLEAN
+    assert safe_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert not _has_critical_call_graph_finding(safe_report, module_name, "invoke", "os.system")
     assert source_rewritten is True
     assert changed_report.status == ScanStatus.INCONCLUSIVE
     assert changed_report.verdict == SafetyVerdict.SUSPICIOUS
@@ -1907,7 +1911,7 @@ def test_scan_bytes_ignores_uninvoked_nested_function_body_calls(
 
     report = scan_bytes(payload, source=f"{function_name}-nested-body-clean.pkl")
 
-    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert not _has_critical_call_graph_finding(report, module_name, function_name, "subprocess.run")
     child_code = _pickle_exec_child_code(
         """
@@ -1950,7 +1954,7 @@ def test_scan_bytes_does_not_treat_newobj_as_init_invocation(
 
     report = scan_bytes(payload, source="newobj-init-import-clean.pkl")
 
-    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert not _has_critical_call_graph_finding(report, module_name, "InitImports", "os.system")
     child_code = _pickle_exec_child_code(
         """
@@ -2243,7 +2247,8 @@ def test_scan_bytes_refreshes_call_graph_after_source_rewrite(
     finally:
         _clear_call_graph_caches()
 
-    assert safe_report.verdict == SafetyVerdict.CLEAN
+    assert safe_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert not _has_critical_call_graph_finding(safe_report, module_name, "invoke", "os.system")
     assert dangerous_report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_call_graph_finding(dangerous_report, module_name, "invoke", "os.system")
 
@@ -2274,7 +2279,8 @@ def test_scan_bytes_refreshes_invoked_import_fallback_after_source_rewrite(
     finally:
         _clear_call_graph_caches()
 
-    assert safe_report.verdict == SafetyVerdict.CLEAN
+    assert safe_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert not _has_critical_call_graph_finding(safe_report, module_name, "invoke", "builtins.__import__")
     assert dangerous_report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_call_graph_finding(dangerous_report, module_name, "invoke", "builtins.__import__")
 
@@ -3138,7 +3144,7 @@ def test_scan_bytes_ignores_nested_import_aliases_outside_outer_scope(
 
     report = scan_bytes(payload, source=f"{module_name}.pkl")
 
-    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert not _has_critical_call_graph_finding(report, module_name, "harmless", "os.system")
 
 

@@ -21,8 +21,10 @@ import tarfile
 import uuid
 import warnings
 import zipfile
+from importlib.abc import Loader
 from importlib.machinery import EXTENSION_SUFFIXES, ModuleSpec
 from pathlib import Path, PurePosixPath
+from types import ModuleType
 from typing import cast
 
 import pytest
@@ -3886,14 +3888,14 @@ def test_scan_bytes_warns_when_meta_path_finder_shadows_framework_reference(
 ) -> None:
     marker = tmp_path / "meta_path_framework_shadow_marker"
 
-    class ShadowLoader:
-        def create_module(self, _spec: ModuleSpec) -> None:
+    class ShadowLoader(Loader):
+        def create_module(self, _spec: ModuleSpec) -> ModuleType | None:
             return None
 
-        def exec_module(self, module: object) -> None:
-            if getattr(module, "__name__", "") == "torch._utils":
+        def exec_module(self, module: ModuleType) -> None:
+            if module.__name__ == "torch._utils":
                 marker.write_text("owned", encoding="utf-8")
-                setattr(module, "_rebuild_tensor_v2", object())
+                module.__dict__["_rebuild_tensor_v2"] = object()
 
     class ShadowFinder:
         def find_spec(
@@ -4535,7 +4537,7 @@ def test_scan_bytes_blocks_build_slot_state_setattr_import_rce(
         sys.modules.pop(imported_module, None)
 
 
-def test_scan_bytes_allows_build_dict_state_without_calling_setattr(
+def test_scan_bytes_keeps_build_dict_state_under_review_without_calling_setattr(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4556,13 +4558,18 @@ def test_scan_bytes_allows_build_dict_state_without_calling_setattr(
     report = scan_bytes(payload, source=f"{module_name}.pkl")
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert marker.exists() is False
     assert any(
         invocation.get("opcode") == "BUILD" and invocation.get("build_uses_slot_state") is False
         for invocation in report.metadata["callable_invocations"]
     )
     assert all(finding.rule_code != "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
     try:
         gadget = pickle.loads(payload)
         assert gadget.value == "owned"

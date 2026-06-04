@@ -932,13 +932,13 @@ def _trusted_module_origin_kind(module_name: str) -> str | None:
         return None
     _track_shared_source_candidates(parts)
     try:
-        if BuiltinImporter.find_spec(module_name) is not None or FrozenImporter.find_spec(module_name) is not None:
-            return "stdlib"
         spec = _find_module_spec_without_imports(module_name)
     except Exception:
         return None
     if spec is None:
         return "unresolved"
+    if _module_spec_uses_builtin_or_frozen_loader(spec):
+        return "stdlib"
     if spec.origin is None:
         return None
     try:
@@ -4198,14 +4198,40 @@ def _resolve_module_source(module_name: str) -> Path | None:
         spec = _find_module_spec_without_imports(module_name)
     except Exception:
         return None
-    if spec is None or spec.origin is None or not spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
+    if spec is None:
         return None
-    source_path = Path(spec.origin)
+    if _module_spec_uses_builtin_or_frozen_loader(spec):
+        source_path = _trusted_stdlib_source_path(parts)
+    elif spec.origin is not None and spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
+        source_path = Path(spec.origin)
+    else:
+        source_path = None
+    if source_path is None:
+        return None
     _track_shared_source_paths((source_path,))
     try:
         return source_path if source_path.is_file() else None
     except OSError:
         return None
+
+
+def _trusted_stdlib_source_path(parts: tuple[str, ...]) -> Path | None:
+    for root in _TRUSTED_STDLIB_PATHS:
+        for candidate in (
+            root.joinpath(*parts).with_suffix(".py"),
+            root.joinpath(*parts, "__init__.py"),
+        ):
+            try:
+                if candidate.is_file():
+                    return candidate
+            except OSError:
+                continue
+    return None
+
+
+def _module_spec_uses_builtin_or_frozen_loader(spec: ModuleSpec) -> bool:
+    loader = cast(Any, spec.loader)
+    return (loader is BuiltinImporter or loader is FrozenImporter) and spec.origin in {"built-in", "frozen"}
 
 
 def _rce_sink(call_name: str) -> str | None:
