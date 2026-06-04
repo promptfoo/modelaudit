@@ -15,6 +15,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib.machinery import EXTENSION_SUFFIXES, BuiltinImporter, FrozenImporter, ModuleSpec, PathFinder
+from importlib.util import MAGIC_NUMBER, cache_from_source
 from pathlib import Path
 from typing import Any, Protocol, TypeVar, cast
 
@@ -49,6 +50,7 @@ _TRUSTED_STDLIB_PATHS = tuple(
 _TRUSTED_SITE_PACKAGE_PATHS = tuple(
     Path(path).resolve() for name in ("purelib", "platlib") if (path := sysconfig.get_path(name))
 )
+_IMPORT_AFFECTING_MODULE_NAMES = frozenset({"__loader__", "__package__", "__path__", "__spec__"})
 _TRUSTED_IMPORT_ONLY_REFERENCES = frozenset(
     {
         ("_sitebuiltins", "_Helper"),
@@ -76,6 +78,7 @@ _TRUSTED_IMPORT_ONLY_REFERENCES = frozenset(
         ("zipfile", "ZipInfo"),
     }
 )
+_TRUSTED_REFERENCES_REQUIRING_INVOCATION_ANALYSIS = frozenset({("_xxsubinterpreters", "create")})
 _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS = ("__new__", "__init__")
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS = ("__setstate__",)
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHOD_SET = frozenset(_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS)
@@ -127,7 +130,7 @@ class _CallGraphAnalysisLimitError(RuntimeError):
 @dataclass
 class _SharedSourceSnapshot:
     search_context: tuple[str, ...]
-    fingerprints: dict[str, bytes | None] = field(default_factory=dict)
+    fingerprints: dict[str, tuple[int, bool, bytes | None]] = field(default_factory=dict)
     generation: int = 0
     reusable: bool = True
     lock: Any = field(default_factory=threading.RLock)
@@ -613,7 +616,7 @@ def find_analyzed_callable_call_graph_global_positions(
             continue
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
-        if module and name and _call_graph_entrypoints_for_reference(module, name, reference):
+        if module and name and _call_graph_reference_is_analyzed(module, name, reference):
             positions.add(global_position)
     return frozenset(positions)
 
@@ -633,8 +636,11 @@ def module_initialization_is_proven_inert(module_name: str) -> bool:
 
 
 def _module_source_context_initialization_is_proven_inert(context: _ModuleSourceContext) -> bool:
+    guarded_names = {"__getattr__", *_IMPORT_AFFECTING_MODULE_NAMES}
     return not any(
-        _module_statement_binds_name(statement, "__getattr__") for statement in context.module_statements
+        _module_statement_binds_name(statement, name)
+        for statement in context.module_statements
+        for name in guarded_names
     ) and all(_module_initialization_statement_is_inert(statement) for statement in context.module_statements)
 
 
@@ -642,6 +648,18 @@ def import_only_reference_is_proven_trusted(module_name: str, name: str) -> bool
     """Return whether a known-safe reference resolves from a trusted installation path."""
     origin_kind = _trusted_module_origin_kind(module_name)
     return (module_name, name) in _TRUSTED_IMPORT_ONLY_REFERENCES and origin_kind in {"stdlib", "site_packages"}
+
+
+def trusted_import_reference_requires_invocation_analysis(module_name: str, name: str) -> bool:
+    """Return whether invoking a trusted import still needs source-backed analysis."""
+    return (module_name, name) in _TRUSTED_REFERENCES_REQUIRING_INVOCATION_ANALYSIS
+
+
+def import_only_module_requires_origin_review(module_name: str) -> bool:
+    """Return whether a module resolves outside trusted install paths."""
+    if module_name in {"__builtin__", "__builtins__"}:
+        return False
+    return _trusted_module_origin_kind(module_name) is None
 
 
 @_register_source_sensitive_cache
@@ -897,6 +915,14 @@ def _call_graph_entrypoints_for_reference(
     return entrypoints
 
 
+def _call_graph_reference_is_analyzed(
+    module: str,
+    name: str,
+    _reference: Mapping[str, object],
+) -> bool:
+    return bool(_safe_call_graph_entrypoints(f"{module}.{name}"))
+
+
 def _filter_class_entrypoints(entrypoints: tuple[str, ...], methods: tuple[str, ...]) -> tuple[str, ...]:
     class_entrypoints = tuple(
         entrypoint
@@ -1033,15 +1059,20 @@ def _source_search_context() -> tuple[str, ...]:
     return tuple(str(Path(entry or os.getcwd()).absolute()) for entry in sys.path)
 
 
-def _source_candidate_fingerprint(path: Path) -> tuple[bool, bytes | None]:
+def _source_candidate_fingerprint(
+    path: Path,
+    *,
+    read_limit: int = _MAX_SOURCE_BYTES,
+    require_complete: bool = True,
+) -> tuple[bool, bytes | None]:
     if not path.is_file():
         return True, None
     try:
         with path.open("rb") as source_file:
-            source = source_file.read(_MAX_SOURCE_BYTES + 1)
+            source = source_file.read(read_limit + int(require_complete))
     except OSError:
         return False, None
-    if len(source) > _MAX_SOURCE_BYTES:
+    if require_complete and len(source) > read_limit:
         return False, None
     return True, hashlib.sha256(source).digest()
 
@@ -1056,8 +1087,12 @@ def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
 def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:
     if not snapshot.reusable or snapshot.search_context != _source_search_context():
         return False
-    for path, expected_fingerprint in snapshot.fingerprints.items():
-        reusable, fingerprint = _source_candidate_fingerprint(Path(path))
+    for path, (read_limit, require_complete, expected_fingerprint) in snapshot.fingerprints.items():
+        reusable, fingerprint = _source_candidate_fingerprint(
+            Path(path),
+            read_limit=read_limit,
+            require_complete=require_complete,
+        )
         if not reusable or fingerprint != expected_fingerprint:
             return False
     return True
@@ -1089,24 +1124,37 @@ def _ensure_shared_source_snapshot_stable(report_generation: int | None) -> None
 
 
 def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
-    snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
-    if snapshot is None:
-        return
     candidates: set[Path] = set()
     for entry in sys.path:
         root = Path(entry or os.getcwd())
         candidates.add(root.joinpath(*parts).with_suffix(".py").absolute())
         candidates.add(root.joinpath(*parts, "__init__.py").absolute())
+    _track_shared_source_paths(candidates)
+
+
+def _track_shared_source_paths(
+    candidates: Iterable[Path],
+    *,
+    read_limit: int = _MAX_SOURCE_BYTES,
+    require_complete: bool = True,
+) -> None:
+    snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+    if snapshot is None:
+        return
     with snapshot.lock:
         if snapshot.search_context != _source_search_context():
             snapshot.reusable = False
             return
         for candidate in candidates:
-            reusable, fingerprint = _source_candidate_fingerprint(candidate)
+            reusable, fingerprint = _source_candidate_fingerprint(
+                candidate,
+                read_limit=read_limit,
+                require_complete=require_complete,
+            )
             if not reusable:
                 snapshot.reusable = False
                 return
-            snapshot.fingerprints[str(candidate)] = fingerprint
+            snapshot.fingerprints[str(candidate)] = (read_limit, require_complete, fingerprint)
 
 
 def _call_graph_source_unavailable_reason(module_name: str) -> str | None:
@@ -1617,6 +1665,8 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
     if source_path is None:
         return None
     try:
+        if _source_has_importable_unchecked_hash_cache(source_path):
+            return None
         if source_path.stat().st_size > _MAX_SOURCE_BYTES:
             return None
         source = source_path.read_text(encoding="utf-8")
@@ -1627,6 +1677,29 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
     is_package = source_path.name == "__init__.py"
     module_statements = _module_level_statements(tree)
     return _ModuleSourceContext(source_path=source_path, module_statements=module_statements, is_package=is_package)
+
+
+def _source_has_importable_unchecked_hash_cache(source_path: Path) -> bool:
+    try:
+        cache_path = Path(cache_from_source(str(source_path)))
+    except (NotImplementedError, ValueError):
+        return True
+    _track_shared_source_paths((cache_path,), read_limit=16, require_complete=False)
+    if not cache_path.is_file():
+        return False
+    try:
+        with cache_path.open("rb") as cache_file:
+            header = cache_file.read(8)
+    except OSError:
+        return True
+    if len(header) < 8:
+        return False
+    if header[:4] != MAGIC_NUMBER:
+        return False
+    flags = int.from_bytes(header[4:8], "little")
+    if flags & ~0x03:
+        return False
+    return bool(flags & 0x01) and not bool(flags & 0x02)
 
 
 def _module_level_statements(tree: ast.Module) -> tuple[ast.stmt, ...]:

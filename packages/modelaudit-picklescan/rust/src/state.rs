@@ -24,7 +24,9 @@ use crate::nested_surface::{
 };
 use crate::opcode::{parse_opcode, ArgValue, ParseError, ParsedOpcode};
 use crate::options::{deadline_from_timeout, ScanOptions};
-use crate::policy::{callable_severity, global_import_requires_review, global_severity};
+use crate::policy::{
+    callable_severity, global_import_is_allowlisted, global_import_requires_review, global_severity,
+};
 use crate::post_budget::{post_budget_absolute_position, post_budget_global_matches};
 use crate::report::{
     detail_string, detail_usize, notice_to_detail_value, scan_error_to_detail_value, DetailValue,
@@ -5970,6 +5972,12 @@ impl<'a> ScanState<'a> {
             let mut import_reference_details = details.clone();
             import_reference_details
                 .push(("is_dangerous".to_string(), DetailValue::Bool(is_dangerous)));
+            if !is_dangerous && global_import_is_allowlisted(&reference.module) {
+                import_reference_details.push((
+                    "requires_origin_verification".to_string(),
+                    DetailValue::Bool(true),
+                ));
+            }
             self.push_import_reference(import_reference_details);
         }
 

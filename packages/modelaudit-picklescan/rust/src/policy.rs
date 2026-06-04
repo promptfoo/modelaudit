@@ -18,8 +18,11 @@ pub(crate) fn callable_severity(module: &str, name: &str) -> Option<&'static str
 }
 
 pub(crate) fn global_import_requires_review(module: &str, name: &str) -> bool {
-    !IMPORT_ONLY_GLOBAL_ALLOWLIST_MODULES.contains(&module)
-        && global_severity(module, name).is_none()
+    !global_import_is_allowlisted(module) && global_severity(module, name).is_none()
+}
+
+pub(crate) fn global_import_is_allowlisted(module: &str) -> bool {
+    IMPORT_ONLY_GLOBAL_ALLOWLIST_MODULES.contains(&module)
 }
 
 fn pathlib_callable_severity(module: &str, name: &str) -> Option<&'static str> {

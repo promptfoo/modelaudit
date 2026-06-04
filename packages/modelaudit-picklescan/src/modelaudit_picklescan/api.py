@@ -22,9 +22,11 @@ from .call_graph import (
     find_startup_hook_write_call_graphs,
     find_unanalyzed_callable_call_graph_references,
     has_unanalyzed_call_graph_import_references,
+    import_only_module_requires_origin_review,
     import_only_reference_is_proven_trusted,
     module_initialization_is_proven_inert,
     shared_source_sensitive_caches,
+    trusted_import_reference_requires_invocation_analysis,
 )
 from .options import ScanOptions
 from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
@@ -76,6 +78,7 @@ _MAX_PYTORCH_ZIP_ENTRIES = 10_000
 _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES = 512 * 1024 * 1024
 _RUST_EXTENSION_MODULE = "modelaudit_picklescan._rust"
 _MAX_INERT_INITIALIZATION_MODULES = 32
+_TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES = frozenset({"BUILD", "NEWOBJ", "NEWOBJ_EX"})
 _ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
 _ZIP_EOCD_MIN_SIZE = 22
 _ZIP_MAX_COMMENT_SIZE = 0xFFFF
@@ -1022,13 +1025,19 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     callable_invocations_complete = not bool(report.metadata.get("callable_invocations_truncated"))
     try:
         invoked_global_positions = _invoked_global_positions(callable_invocations)
+        trusted_reconstruction_global_positions = _trusted_reconstruction_global_positions(callable_invocations)
     except Exception as error:
         invoked_global_positions = frozenset()
+        trusted_reconstruction_global_positions = frozenset()
         callable_invocations_complete = False
         enrichment_errors.append(("python_import_invocation_classification", error))
     with shared_source_sensitive_caches():
         report_generation = _begin_shared_source_report()
         call_graph_limit_exceeded = has_unanalyzed_call_graph_import_references(import_references)
+        try:
+            report = _with_untrusted_allowlisted_import_findings(report, import_references)
+        except Exception as error:
+            enrichment_errors.append(("python_import_allowlist_origin", error))
         try:
             call_graph_findings = find_dangerous_call_graphs(import_references, callable_invocations)
         except _CallGraphAnalysisLimitError as error:
@@ -1084,6 +1093,7 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
             trusted_import_references,
             invoked_global_positions,
             analyzed_invocation_global_positions,
+            trusted_reconstruction_global_positions,
         )
     updated_report = (
         _with_unanalyzed_call_graph_notices(report, unanalyzed_references) if unanalyzed_references else report
@@ -1156,6 +1166,71 @@ def _proven_inert_initialization_modules(report: PickleReport) -> frozenset[str]
     return frozenset(module for module in modules if module_initialization_is_proven_inert(module))
 
 
+def _with_untrusted_allowlisted_import_findings(
+    report: PickleReport,
+    import_references: object,
+) -> PickleReport:
+    existing_references = {
+        (
+            str(finding.details.get("import_reference", "")),
+            finding.details.get("position"),
+        )
+        for finding in report.findings
+    }
+    additional_findings: list[Finding] = []
+    for raw_reference in _sequence(import_references):
+        reference = _mapping(raw_reference)
+        module = str(reference.get("module", ""))
+        name = str(reference.get("name", ""))
+        import_reference = str(reference.get("import_reference", ""))
+        raw_position = reference.get("position")
+        position = raw_position if type(raw_position) is int else None
+        key = (import_reference, position)
+        if (
+            not module
+            or not name
+            or not import_reference
+            or bool(reference.get("is_dangerous"))
+            or not bool(reference.get("requires_origin_verification"))
+            or key in existing_references
+            or not import_only_module_requires_origin_review(module)
+        ):
+            continue
+        additional_findings.append(
+            Finding(
+                message=f"Found allowlisted global reference from an untrusted module origin: {import_reference}",
+                severity=Severity.WARNING,
+                location=f"{report.source} (pos {position})" if position is not None else report.source,
+                rule_code="NON_ALLOWLISTED_GLOBAL",
+                details={
+                    "opcode": str(reference.get("opcode", "")),
+                    "module": module,
+                    "name": name,
+                    "import_reference": import_reference,
+                    "position": position,
+                },
+                why=(
+                    "Allowlisted modules are safe only when they resolve from the standard library or installed "
+                    "site-packages; a project-local shadow module can execute arbitrary import-time code."
+                ),
+            )
+        )
+        existing_references.add(key)
+    if not additional_findings:
+        return report
+    return PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=SafetyVerdict.MALICIOUS if report.verdict == SafetyVerdict.MALICIOUS else SafetyVerdict.SUSPICIOUS,
+        findings=(*report.findings, *additional_findings),
+        notices=report.notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=report.to_dict()["metadata"],
+        duration_s=report.duration_s,
+    )
+
+
 def _proven_trusted_import_references(report: PickleReport) -> frozenset[tuple[str, str]]:
     references: list[tuple[str, str]] = []
     for finding in report.findings:
@@ -1177,6 +1252,7 @@ def _without_proven_safe_import_findings(
     trusted_import_references: frozenset[tuple[str, str]],
     invoked_global_positions: frozenset[int],
     analyzed_invocation_global_positions: frozenset[int],
+    trusted_reconstruction_global_positions: frozenset[int],
 ) -> PickleReport:
     findings = tuple(
         finding
@@ -1188,6 +1264,7 @@ def _without_proven_safe_import_findings(
             trusted_import_references,
             invoked_global_positions,
             analyzed_invocation_global_positions,
+            trusted_reconstruction_global_positions,
         )
     )
     if len(findings) == len(report.findings):
@@ -1219,6 +1296,7 @@ def _non_allowlisted_import_finding_is_proven_safe(
     trusted_import_references: frozenset[tuple[str, str]],
     invoked_global_positions: frozenset[int],
     analyzed_invocation_global_positions: frozenset[int],
+    trusted_reconstruction_global_positions: frozenset[int],
 ) -> bool:
     module = str(finding.details.get("module", ""))
     name = str(finding.details.get("name", ""))
@@ -1227,7 +1305,13 @@ def _non_allowlisted_import_finding_is_proven_safe(
     inert_reference_is_proven_safe = position is not None and (
         position not in invoked_global_positions or position in analyzed_invocation_global_positions
     )
-    return (module, name) in trusted_import_references or (
+    trusted_reference_is_proven_safe = position is not None and (
+        position not in invoked_global_positions
+        or not trusted_import_reference_requires_invocation_analysis(module, name)
+        or position in analyzed_invocation_global_positions
+        or position in trusted_reconstruction_global_positions
+    )
+    return (trusted_reference_is_proven_safe and (module, name) in trusted_import_references) or (
         inert_reference_is_proven_safe and module in inert_initialization_modules
     )
 
@@ -1240,6 +1324,21 @@ def _invoked_global_positions(callable_invocations: object) -> frozenset[int]:
         if position is not None:
             positions.add(position)
     return frozenset(positions)
+
+
+def _trusted_reconstruction_global_positions(callable_invocations: object) -> frozenset[int]:
+    opcodes_by_position: dict[int, set[str]] = {}
+    for raw_invocation in _sequence(callable_invocations):
+        invocation = _mapping(raw_invocation)
+        position = _optional_int(invocation.get("global_position"))
+        if position is None:
+            continue
+        opcodes_by_position.setdefault(position, set()).add(str(invocation.get("opcode", "")))
+    return frozenset(
+        position
+        for position, opcodes in opcodes_by_position.items()
+        if opcodes and opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
+    )
 
 
 def _with_call_graph_enrichment_errors(

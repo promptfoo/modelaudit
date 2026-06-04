@@ -5571,7 +5571,12 @@ def test_scan_bytes_blocks_tkinter_tcl_process_execution(
 def test_scan_bytes_blocks_subinterpreters_run_string_rce(tmp_path: Path) -> None:
     control_payload = _subinterpreters_control_payload()
     control_report = scan_bytes(control_payload, source="subinterpreters-control.pkl")
-    assert control_report.verdict == SafetyVerdict.CLEAN
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "_xxsubinterpreters.create"
+        for finding in control_report.findings
+    )
 
     marker = tmp_path / "subinterpreters_run_string_marker"
     assert not marker.exists()
