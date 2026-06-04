@@ -78,7 +78,12 @@ from .utils.sources.huggingface import (
     redact_huggingface_url_for_display,
     redact_huggingface_urls_in_text,
 )
-from .utils.sources.jfrog import is_jfrog_url, redact_jfrog_error_for_display, redact_jfrog_url_for_display
+from .utils.sources.jfrog import (
+    is_jfrog_url,
+    is_jfrog_url_like,
+    redact_jfrog_error_for_display,
+    redact_jfrog_url_for_display,
+)
 from .utils.sources.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
 logger = logging.getLogger("modelaudit")
@@ -88,7 +93,7 @@ def _display_path(path: str) -> str:
     """Return a path safe for user-facing CLI output."""
     if is_cloud_url(path):
         return redact_url_for_display(path)
-    if is_jfrog_url(path):
+    if is_jfrog_url_like(path):
         return redact_jfrog_url_for_display(path)
     return redact_huggingface_url_for_display(path)
 
@@ -1695,7 +1700,7 @@ def _resolve_scan_source_for_path(
             return None
 
     if not os.path.exists(path):
-        click.echo(f"Error: Path does not exist: {path}", err=True)
+        click.echo(f"Error: Path does not exist: {_display_path(path)}", err=True)
         audit_result.has_errors = True
         return None
 

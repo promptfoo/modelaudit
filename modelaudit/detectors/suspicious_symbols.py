@@ -549,6 +549,7 @@ EXECUTABLE_SIGNATURES: dict[bytes, str] = {
     b"MZ": "Windows executable (PE)",
     b"\x7fELF": "Linux executable (ELF)",
     b"\xfe\xed\xfa\xce": "macOS executable (Mach-O 32-bit)",
+    b"\xce\xfa\xed\xfe": "macOS executable (Mach-O 32-bit)",
     b"\xfe\xed\xfa\xcf": "macOS executable (Mach-O 64-bit)",
     b"\xcf\xfa\xed\xfe": "macOS executable (Mach-O)",
     b"#!/": "Shell script shebang",
