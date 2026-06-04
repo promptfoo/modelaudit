@@ -234,7 +234,7 @@ def test_tflite_read_failure_is_inconclusive_without_security_finding(
 
     with (
         patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", True),
-        patch.object(TFLiteScanner, "_read_file_safely", side_effect=read_exception),
+        patch("modelaudit.scanners.tflite_scanner._memory_map", side_effect=read_exception),
     ):
         result = TFLiteScanner().scan(str(path))
         aggregate = core.scan_model_directory_or_file(str(path), recursive=False, cache_scan_results=False)
@@ -517,3 +517,23 @@ def test_tflite_metadata_extraction_excessive_subgraph_count_stops_early(tmp_pat
         assert "extraction_error" in metadata
         assert "safe limit" in metadata["extraction_error"]
         mock_model.Subgraphs.assert_not_called()
+
+
+def test_tflite_mmap_caps_at_validated_size(tmp_path: Path) -> None:
+    """TOCTOU guard: if the file grew after the size check, only the validated
+    prefix is mapped — not the file's larger current size."""
+    path = tmp_path / "model.tflite"
+    path.write_bytes(b"\x00\x00\x00\x00TFL3" + b"\x00" * (1024 * 1024))  # ~1 MB on disk
+
+    validated_size = 512  # size the limit check "saw" before the file grew
+
+    with (
+        patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", True),
+        patch.object(TFLiteScanner, "get_file_size", return_value=validated_size),
+    ):
+        scanner = TFLiteScanner()
+        scanner.max_file_read_size = 4096  # validated_size passes the limit
+        result = scanner.scan(str(path))
+
+    # Mapped only the validated size, not the 1 MB now on disk.
+    assert result.bytes_scanned == validated_size

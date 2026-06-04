@@ -1,5 +1,7 @@
 """Tests for shared Keras scanner helpers."""
 
+import marshal
+
 from modelaudit.scanners.keras_utils import find_case_insensitive_substrings, find_lambda_dangerous_patterns
 
 
@@ -33,3 +35,22 @@ def test_find_lambda_dangerous_patterns_preserves_real_open_calls() -> None:
     text = "lambda body: open('/private/tmp/modelaudit-open-prs/payload.py')"
 
     assert find_lambda_dangerous_patterns(text, ("open", "exec")) == ["open"]
+
+
+def test_find_lambda_dangerous_patterns_ignores_substrings_inside_identifiers() -> None:
+    text = "opened executor evaluation ecosystem.systemic os + system osésystem"
+
+    assert find_lambda_dangerous_patterns(text, ("open", "exec", "eval", "os.system")) == []
+
+
+def test_find_lambda_dangerous_patterns_preserves_real_dotted_calls() -> None:
+    text = "lambda body: os.system('id')"
+
+    assert find_lambda_dangerous_patterns(text, ("os.system", "os.popen")) == ["os.system"]
+
+
+def test_find_lambda_dangerous_patterns_detects_marshaled_dotted_symbols() -> None:
+    code = compile("import os\nos.system('id')", "<lambda>", "exec")
+    text = marshal.dumps(code).decode("utf-8", errors="replace")
+
+    assert find_lambda_dangerous_patterns(text, ("open", "os.system", "os.popen")) == ["os.system"]
