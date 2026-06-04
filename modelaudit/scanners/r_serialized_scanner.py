@@ -56,13 +56,9 @@ _R_QUOTED_CREDENTIAL_IDENTIFIER = rf"""(?:"{_R_QUOTED_CREDENTIAL_KEY_PATTERN}"|'
 _R_CREDENTIAL_IDENTIFIER = rf"(?:{_R_UNQUOTED_CREDENTIAL_IDENTIFIER}|{_R_QUOTED_CREDENTIAL_IDENTIFIER})"
 _R_QUOTED_CREDENTIAL_VALUE = r"""(?:"(?:\\.|[^"\\]){6,}"|'(?:\\.|[^'\\]){6,}')"""
 _R_QUOTED_CREDENTIAL_VALUE_RE = re.compile(_R_QUOTED_CREDENTIAL_VALUE)
-_R_LEFTWARD_CREDENTIAL_TARGET = (
-    rf"(?:{_R_UNQUOTED_CREDENTIAL_IDENTIFIER}\s*(?::|=|<{{1,2}}-)"
-    rf"|{_R_QUOTED_CREDENTIAL_IDENTIFIER}\s*(?:=|<{{1,2}}-))"
-)
 _R_LEFTWARD_QUOTED_CREDENTIAL_ASSIGNMENT_RE = re.compile(
     rf"""(?ix)(?:
-        {_R_UNQUOTED_CREDENTIAL_IDENTIFIER}\s*(?P<unquoted_operator>:|=|<{{1,2}}-)
+        {_R_UNQUOTED_CREDENTIAL_IDENTIFIER}\s*(?P<unquoted_operator>=|<{{1,2}}-)
         |
         {_R_QUOTED_CREDENTIAL_IDENTIFIER}\s*(?P<quoted_operator>=|<{{1,2}}-)
     )\s*{_R_QUOTED_CREDENTIAL_VALUE}"""
@@ -70,19 +66,58 @@ _R_LEFTWARD_QUOTED_CREDENTIAL_ASSIGNMENT_RE = re.compile(
 _R_RIGHTWARD_QUOTED_CREDENTIAL_ASSIGNMENT_RE = re.compile(
     rf"""(?ix){_R_QUOTED_CREDENTIAL_VALUE}\s*(?P<operator>->{{1,2}})\s*{_R_CREDENTIAL_IDENTIFIER}"""
 )
-_R_LEFTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE = re.compile(rf"(?i){_R_LEFTWARD_CREDENTIAL_TARGET}\s*$")
-_R_RIGHTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE = re.compile(rf"(?i)\s*->{{1,2}}\s*{_R_CREDENTIAL_IDENTIFIER}")
+_R_LEFTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    rf"""(?ix)(?:
+        {_R_UNQUOTED_CREDENTIAL_IDENTIFIER}
+        |
+        {_R_QUOTED_CREDENTIAL_IDENTIFIER}
+    )\s*(?P<operator>=|<{{1,2}}-)\s*$"""
+)
+_R_RIGHTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE = re.compile(rf"(?i)\s*(?P<operator>->{{1,2}})\s*{_R_CREDENTIAL_IDENTIFIER}")
 _R_RIGHTWARD_CREDENTIAL_TARGET_RE = re.compile(rf"(?i)->{{1,2}}\s*{_R_CREDENTIAL_IDENTIFIER}")
 
 
+def _position_is_in_r_suppressing_non_code_span(
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+    malformed_raw_span_starts: set[int],
+) -> bool:
+    for span_start, span_end in non_code_spans:
+        if span_start > position:
+            return False
+        if position < span_end:
+            return span_start not in malformed_raw_span_starts
+    return False
+
+
 def _contains_r_raw_credential_assignment(text: str) -> bool:
-    for literal_start, literal_end, content_start, content_end, is_terminated in _iter_r_raw_string_spans(text):
+    raw_string_spans = list(_iter_r_raw_string_spans(text))
+    non_code_spans = _r_non_code_spans(text)
+    malformed_raw_span_starts = {
+        literal_start
+        for literal_start, _literal_end, _content_start, _content_end, is_terminated in raw_string_spans
+        if not is_terminated
+    }
+    for literal_start, literal_end, content_start, content_end, is_terminated in raw_string_spans:
         if not is_terminated or content_end - content_start < 6:
             continue
-        left_context = text[max(0, literal_start - R_RAW_LEFT_ASSIGNMENT_CONTEXT_CHARS) : literal_start]
-        if _R_LEFTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE.search(
-            left_context
-        ) or _R_RIGHTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE.match(text, literal_end):
+
+        left_context_start = max(0, literal_start - R_RAW_LEFT_ASSIGNMENT_CONTEXT_CHARS)
+        left_context = text[left_context_start:literal_start]
+        left_match = _R_LEFTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE.search(left_context)
+        if left_match is not None and not _position_is_in_r_suppressing_non_code_span(
+            left_context_start + left_match.start("operator"),
+            non_code_spans,
+            malformed_raw_span_starts,
+        ):
+            return True
+
+        right_match = _R_RIGHTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE.match(text, literal_end)
+        if right_match is not None and not _position_is_in_r_suppressing_non_code_span(
+            right_match.start("operator"),
+            non_code_spans,
+            malformed_raw_span_starts,
+        ):
             return True
     return False
 

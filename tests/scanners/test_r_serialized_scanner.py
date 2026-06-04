@@ -848,6 +848,13 @@ def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None
         'r"(example: "NOT_A_SECRET" -> token)"',
         "'\"NOT_A_SECRET\" -> token'",
         '# "NOT_A_SECRET" -> token',
+        'token: "NOT_A_SECRET"',
+        'token: r"(NOT_A_SECRET)"',
+        '# token <- r"(NOT_A_SECRET)"',
+        '# r"(NOT_A_SECRET)" -> token',
+        "'token <- r\"(NOT_A_SECRET)\"'",
+        '# r"{BROKEN; token <- r"(NOT_A_SECRET)"',
+        '\'r"{BROKEN; token <- r"(NOT_A_SECRET)"\'',
     ],
 )
 def test_scan_allows_assignment_examples_inside_benign_metadata(tmp_path: Path, metadata: str) -> None:
