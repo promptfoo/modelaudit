@@ -1,5 +1,16 @@
+const MAX_DOTTED_GLOBAL_BYTES: usize = 4096;
+const MAX_DOTTED_GLOBAL_SEGMENTS: usize = 64;
+
 pub(crate) fn global_severity(module: &str, name: &str) -> Option<&'static str> {
-    direct_global_severity(module, name).or_else(|| dotted_global_tail_severity(name))
+    let direct = direct_global_severity(module, name);
+    if direct == Some("critical") {
+        return direct;
+    }
+    let tail = dotted_global_tail_severity(name);
+    if tail == Some("critical") {
+        return tail;
+    }
+    direct.or(tail)
 }
 
 pub(crate) fn callable_severity(module: &str, name: &str) -> Option<&'static str> {
@@ -26,6 +37,7 @@ fn direct_global_severity(module: &str, name: &str) -> Option<&'static str> {
     direct_global_severity_without_wrapper_alias(module, name)
         .or_else(|| wrapper_global_alias_severity(module, name))
         .or_else(|| dangerous_global_prefix_severity(module, name))
+        .or_else(|| dotted_global_policy_budget_exceeded(name).then_some("warning"))
 }
 
 fn wrapper_global_alias_severity(module: &str, name: &str) -> Option<&'static str> {
@@ -49,14 +61,17 @@ fn strip_wrapper_global_suffix(name: &str) -> Option<&str> {
 }
 
 fn dangerous_global_prefix_severity(module: &str, name: &str) -> Option<&'static str> {
-    let parts = name.split('.').collect::<Vec<_>>();
-    for split in 1..parts.len() {
-        if is_inert_global_metadata_tail(&parts[split..]) {
+    for (segments_seen, (split, _)) in name.match_indices('.').enumerate() {
+        if segments_seen >= MAX_DOTTED_GLOBAL_SEGMENTS || split > MAX_DOTTED_GLOBAL_BYTES {
+            break;
+        }
+        let tail = &name[split + 1..];
+        if is_inert_global_metadata_tail(tail) {
             continue;
         }
-        let candidate = parts[..split].join(".");
-        if let Some(severity) = direct_global_severity_without_wrapper_alias(module, &candidate)
-            .or_else(|| wrapper_global_alias_severity(module, &candidate))
+        let candidate = &name[..split];
+        if let Some(severity) = direct_global_severity_without_wrapper_alias(module, candidate)
+            .or_else(|| wrapper_global_alias_severity(module, candidate))
         {
             return Some(severity);
         }
@@ -64,11 +79,8 @@ fn dangerous_global_prefix_severity(module: &str, name: &str) -> Option<&'static
     None
 }
 
-fn is_inert_global_metadata_tail(parts: &[&str]) -> bool {
-    matches!(
-        parts,
-        ["__doc__"] | ["__name__"] | ["__module__"] | ["__qualname__"]
-    )
+fn is_inert_global_metadata_tail(tail: &str) -> bool {
+    matches!(tail, "__doc__" | "__name__" | "__module__" | "__qualname__")
 }
 
 fn direct_global_severity_without_wrapper_alias(module: &str, name: &str) -> Option<&'static str> {
@@ -123,17 +135,46 @@ fn dotted_global_tail_severity(name: &str) -> Option<&'static str> {
         return None;
     }
 
-    let parts = name.split('.').collect::<Vec<_>>();
+    let parts = bounded_leading_dotted_parts(name);
+    let mut warning = None;
     for start in 0..parts.len().saturating_sub(1) {
         for split in start + 1..parts.len() {
             let candidate_module = parts[start..split].join(".");
             let candidate_name = parts[split..].join(".");
             if let Some(severity) = direct_global_severity(&candidate_module, &candidate_name) {
-                return Some(severity);
+                if severity == "critical" {
+                    return Some(severity);
+                }
+                warning = Some(severity);
             }
         }
     }
-    None
+    warning.or_else(|| dotted_global_policy_budget_exceeded(name).then_some("warning"))
+}
+
+fn dotted_global_policy_budget_exceeded(name: &str) -> bool {
+    name.len() > MAX_DOTTED_GLOBAL_BYTES
+        || name.split('.').take(MAX_DOTTED_GLOBAL_SEGMENTS + 1).count() > MAX_DOTTED_GLOBAL_SEGMENTS
+}
+
+fn bounded_leading_dotted_parts(name: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut bytes: usize = 0;
+    for part in name.split('.') {
+        let separator_bytes = usize::from(!parts.is_empty());
+        let Some(next_bytes) = bytes
+            .checked_add(separator_bytes)
+            .and_then(|total| total.checked_add(part.len()))
+        else {
+            break;
+        };
+        if parts.len() >= MAX_DOTTED_GLOBAL_SEGMENTS || next_bytes > MAX_DOTTED_GLOBAL_BYTES {
+            break;
+        }
+        parts.push(part);
+        bytes = next_bytes;
+    }
+    parts
 }
 
 #[derive(Clone, Copy)]
@@ -1212,6 +1253,36 @@ mod tests {
         assert_eq!(global_severity("functools", "partial"), Some("warning"));
         assert_eq!(global_severity("functools", "reduce"), Some("critical"));
         assert_eq!(global_severity("linecache", "clearcache"), None);
+    }
+
+    #[test]
+    fn dotted_global_lookup_is_segment_bounded() {
+        let long_dotted_name = (0..(MAX_DOTTED_GLOBAL_SEGMENTS + 4))
+            .map(|index| format!("part{index}"))
+            .collect::<Vec<_>>()
+            .join(".");
+
+        assert_eq!(global_severity("safe", &long_dotted_name), Some("warning"));
+        assert_eq!(
+            global_severity("os", &format!("system.{long_dotted_name}")),
+            Some("critical")
+        );
+        let long_dotted_tail = format!("pkg.os.system.{long_dotted_name}");
+        let bounded_tail = bounded_leading_dotted_parts(&long_dotted_tail);
+        assert_eq!(&bounded_tail[..3], &["pkg", "os", "system"]);
+        assert_eq!(
+            direct_global_severity("os", &bounded_tail[2..].join(".")),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("safe", &format!("pkg.os.system.{long_dotted_name}")),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("safe", "wrapper.os.system"),
+            Some("critical")
+        );
+        assert_eq!(global_severity("safe", "wrapper.custom.loader"), None);
     }
 
     #[test]
