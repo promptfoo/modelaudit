@@ -349,6 +349,18 @@ class TestPickleScannerWithSecrets:
         secret_checks = [c for c in result.checks if "Embedded Secrets" in c.name]
         assert len(secret_checks) == 0, "Secrets check should be disabled"
 
+    def test_secret_detector_failure_does_not_report_clean_check(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        scanner = PickleScanner()
+        result = scanner._create_result()
+
+        def raise_detector_error(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+            raise RuntimeError("simulated secret detector failure")
+
+        monkeypatch.setattr(scanner, "collect_embedded_secret_findings", raise_detector_error)
+
+        assert scanner.check_for_embedded_secrets(b"safe", result, "model.pkl") == 0
+        assert not any(check.name == "Embedded Secrets Detection" for check in result.checks)
+
 
 class TestDetectSecretsInFile:
     """Test the convenience function for file scanning."""
@@ -383,3 +395,15 @@ class TestDetectSecretsInFile:
         assert len(findings) == 1
         assert findings[0]["type"] == "info"
         assert "too large" in findings[0]["message"]
+
+
+def test_secret_finding_limit_is_explicit() -> None:
+    detector = SecretsDetector({"max_findings": 2})
+
+    findings = detector.scan_model_weights(b"AKIAABCDEFGHIJKLMNOP\n" * 10, "vocab.txt")
+
+    reported = [finding for finding in findings if finding["type"] != "detector_finding_limit"]
+    assert len(reported) == 2
+    assert findings[-1]["type"] == "detector_finding_limit"
+    assert findings[-1]["max_findings"] == 2
+    assert findings[-1]["analysis_incomplete"] is True

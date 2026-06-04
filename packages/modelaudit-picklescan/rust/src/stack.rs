@@ -45,6 +45,7 @@ pub(crate) enum StackValue {
         start: usize,
         end: usize,
     },
+    ExternalBuffer,
     Global(GlobalRef),
     Constructed(GlobalRef),
     CallIterator {
@@ -194,6 +195,7 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
         Some(StackValue::Bytes { start, end }) => {
             format!("bytes(len={})", end.saturating_sub(*start))
         }
+        Some(StackValue::ExternalBuffer) => "external_buffer".to_string(),
         Some(StackValue::Mark) => "MARK".to_string(),
         Some(StackValue::Text(value)) => format!("str:{:?}", value),
         Some(StackValue::Tuple(values)) => format!("tuple(len={})", values.len()),
@@ -240,6 +242,7 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
             format!("str_span(len={})", end.saturating_sub(*start))
         }
         StackValue::Bytes { start, end } => format!("bytes(len={})", end.saturating_sub(*start)),
+        StackValue::ExternalBuffer => "external_buffer".to_string(),
         StackValue::Global(reference) => format!("global:{}", reference.symbol()),
         StackValue::Constructed(reference) => format!("constructed:{}", reference.symbol()),
         StackValue::CallIterator { callable } => {
