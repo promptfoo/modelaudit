@@ -87,29 +87,47 @@ def _get_default_hf_streaming_extensions() -> set[str]:
         remote_excluded_extensions = {
             str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
         }
-        content_routed_filenames = {
-            str(filename).lower() for filename in scanner_info.get("content_routed_filenames", [])
-        }
-        supports_extensionless = "" in scanner_extensions or any(
-            not Path(filename).suffixes for filename in content_routed_filenames
-        )
-        if supports_extensionless and "" not in remote_excluded_extensions:
+        if "" in scanner_extensions and "" not in remote_excluded_extensions:
             extensions.add("")
             break
     return extensions
+
+
+def _get_default_hf_streaming_filenames() -> set[str]:
+    """Return exact remotely scannable basenames without widening them to suffix routes."""
+    from ...scanner_registry_metadata import get_scanner_registry_metadata
+
+    filenames: set[str] = set()
+    for scanner_info in get_scanner_registry_metadata().values():
+        remote_excluded_extensions = {
+            str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
+        }
+        for filename in scanner_info.get("content_routed_filenames", []):
+            filename_text = str(filename).lower()
+            if Path(filename_text).suffix.lower() not in remote_excluded_extensions:
+                filenames.add(filename_text)
+    return filenames
 
 
 def _select_streamable_hf_files(
     repo_id: str,
     repo_files: list[str],
     scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
 ) -> list[str]:
     """Select bounded remotely scannable files without treating ``""`` as a wildcard."""
-    extensions = (
-        _get_default_hf_streaming_extensions()
-        if scannable_extensions is None
-        else {str(extension).lower() for extension in scannable_extensions}
-    )
+    if scannable_extensions is None:
+        extensions = _get_default_hf_streaming_extensions()
+        filenames = (
+            _get_default_hf_streaming_filenames()
+            if scannable_filenames is None
+            else {str(filename).lower() for filename in scannable_filenames}
+        )
+    else:
+        extensions = {str(extension).lower() for extension in scannable_extensions}
+        filenames = (
+            set() if scannable_filenames is None else {str(filename).lower() for filename in scannable_filenames}
+        )
     model_files: list[str] = []
     extensionless_count = 0
 
@@ -118,8 +136,10 @@ def _select_streamable_hf_files(
             model_files.append(file_name)
             continue
 
-        if "" in extensions and not Path(file_name).suffixes:
-            extensionless_count += 1
+        is_extensionless = not Path(file_name).suffixes
+        if Path(file_name).name.lower() in filenames or ("" in extensions and is_extensionless):
+            if is_extensionless:
+                extensionless_count += 1
             if extensionless_count > _MAX_HF_STREAMING_EXTENSIONLESS_FILES:
                 raise Exception(
                     f"Refusing to stream-download extensionless files from {repo_id}: "
@@ -444,6 +464,7 @@ def download_model_streaming(
     cache_dir: Path | None = None,
     show_progress: bool = True,
     scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
 ) -> Iterator[tuple[Path, bool]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
 
@@ -455,6 +476,7 @@ def download_model_streaming(
         cache_dir: Optional cache directory for downloads
         show_progress: Whether to show download progress
         scannable_extensions: Optional remote prefilter extensions from scanner selection policy
+        scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
 
     Yields:
         Tuple of (Path, bool) - (downloaded file path, is_last_file flag)
@@ -495,7 +517,12 @@ def download_model_streaming(
                 raise Exception(f"Timeout listing files in repository {repo_id}")
             raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
 
-        model_files = _select_streamable_hf_files(repo_id, repo_files, scannable_extensions)
+        model_files = _select_streamable_hf_files(
+            repo_id,
+            repo_files,
+            scannable_extensions,
+            scannable_filenames,
+        )
 
         # Setup cache directory
         download_path = None

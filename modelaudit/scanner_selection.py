@@ -340,20 +340,34 @@ def selected_scanner_extensions(
             if conservative
             else set()
         )
-        if (
-            conservative
-            and "" not in remote_excluded_extensions
-            and any(
-                not os.path.splitext(str(filename))[1] for filename in scanner_info.get("content_routed_filenames", [])
-            )
-        ):
-            extensions.add("")
         for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
             for extension in scanner_info.get(key, []):
                 extension_text = str(extension).lower()
                 if extension_text not in remote_excluded_extensions:
                     extensions.add(extension_text)
     return frozenset(extensions)
+
+
+def selected_scanner_filenames(
+    policy: ScannerSelectionPolicy,
+    *,
+    conservative: bool = False,
+) -> frozenset[str]:
+    """Return exact basenames routed by the policy's enabled scanners."""
+    metadata = _scanner_metadata()
+    filenames: set[str] = set()
+    for scanner_id in policy.enabled_scanner_ids:
+        scanner_info = metadata.get(scanner_id, {})
+        remote_excluded_extensions = (
+            {str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])}
+            if conservative
+            else set()
+        )
+        for filename in scanner_info.get("content_routed_filenames", []):
+            filename_text = str(filename).lower()
+            if os.path.splitext(filename_text)[1] not in remote_excluded_extensions:
+                filenames.add(filename_text)
+    return frozenset(filenames)
 
 
 SCANNER_SELECTION_CHECK_NAME = "Scanner Selection"

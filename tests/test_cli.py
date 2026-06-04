@@ -1458,7 +1458,8 @@ def test_scan_huggingface_streaming_preserves_selected_extensionless_filenames(
     result = runner.invoke(cli, ["scan", "--stream", "--scanners", "metadata", "--quiet", "hf://test/model"])
 
     assert result.exit_code == 0
-    assert "" in mock_download_streaming.call_args.kwargs["scannable_extensions"]
+    assert "" not in mock_download_streaming.call_args.kwargs["scannable_extensions"]
+    assert mock_download_streaming.call_args.kwargs["scannable_filenames"] == frozenset({"readme", "model_card"})
 
 
 @patch("modelaudit.cli.is_huggingface_url")

@@ -639,12 +639,42 @@ class TestModelDownloadStreaming:
         results = list(
             download_model_streaming(
                 "https://huggingface.co/test/model",
-                scannable_extensions={"", ".md", ".txt"},
+                scannable_extensions={".md", ".txt"},
+                scannable_filenames={"readme", "model_card"},
             )
         )
 
         assert results == [(readme_path, True)]
-        mock_hf_hub_download.assert_called_once_with(repo_id="test/model", filename="README")
+        assert mock_hf_hub_download.call_count == 1
+        assert mock_hf_hub_download.call_args.kwargs["filename"] == "README"
+
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_selected_filename_ignores_unrelated_extensionless_files(
+        self,
+        mock_hf_hub_download: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Exact filename routes must not widen selected scans to every extensionless file."""
+        repo_files = ["README", *(f"payloads/chunk-{idx:04d}" for idx in range(129))]
+        readme_path = tmp_path / "README"
+        mock_hf_hub_download.return_value = str(readme_path)
+
+        with patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(repo_files, None),
+        ):
+            results = list(
+                download_model_streaming(
+                    "https://huggingface.co/test/model",
+                    cache_dir=tmp_path,
+                    scannable_extensions={".md", ".txt"},
+                    scannable_filenames={"readme", "model_card"},
+                )
+            )
+
+        assert results == [(readme_path, True)]
+        assert mock_hf_hub_download.call_count == 1
+        assert mock_hf_hub_download.call_args.kwargs["filename"] == "README"
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch("huggingface_hub.hf_hub_download")
