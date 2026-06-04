@@ -271,6 +271,12 @@ class ModelMetadataExtractor:
             "domain",
             # SafeTensors security fields
             "tensor_count",
+            "has_custom_metadata",
+            "custom_metadata_entry_count",
+            "custom_metadata_valid",
+            "custom_metadata_type",
+            "custom_metadata_invalid_value_count",
+            "custom_metadata_security_flags",
             # Common security indicators
             "has_custom_operators",
             "has_external_data",
@@ -288,9 +294,14 @@ class ModelMetadataExtractor:
 
         if "custom_metadata" in metadata:
             custom_metadata = metadata["custom_metadata"]
-            filtered["has_custom_metadata"] = True
-            if isinstance(custom_metadata, dict):
-                filtered["custom_metadata_entry_count"] = len(custom_metadata)
+            if metadata.get("format") == "safetensors":
+                from .scanners.safetensors_scanner import SafeTensorsScanner
+
+                filtered.update(SafeTensorsScanner._summarize_custom_metadata(custom_metadata))
+            else:
+                filtered.setdefault("has_custom_metadata", True)
+                if isinstance(custom_metadata, dict):
+                    filtered.setdefault("custom_metadata_entry_count", len(custom_metadata))
 
         # Add any keys containing 'security', 'suspicious', 'dangerous', etc.
         for key, value in metadata.items():

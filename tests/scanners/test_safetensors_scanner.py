@@ -76,6 +76,96 @@ def test_valid_safetensors_file(tmp_path: Path) -> None:
     assert header_limit_check.status.value == "passed"
 
 
+def test_valid_empty_safetensors_custom_metadata(tmp_path: Path) -> None:
+    """An empty string-to-string map is valid custom metadata."""
+    file_path = tmp_path / "empty_metadata.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is True
+    assert result.metadata["custom_metadata_valid"] is True
+    assert result.metadata["custom_metadata_entry_count"] == 0
+    assert result.metadata["custom_metadata_security_flags"] == []
+    assert any(
+        check.name == "SafeTensors Metadata Structure Validation" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "custom_metadata",
+    [None, "not-a-map", ["not-a-map"], {"owner": 7}],
+    ids=["null", "string", "list", "non-string-value"],
+)
+def test_malformed_safetensors_custom_metadata_is_inconclusive(tmp_path: Path, custom_metadata: Any) -> None:
+    """SafeTensors custom metadata must be a string-to-string map."""
+    file_path = tmp_path / "malformed_metadata.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": custom_metadata,
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert result.metadata["custom_metadata_valid"] is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "safetensors_structure_validation_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "SafeTensors Metadata Structure Validation" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("custom_metadata", "expected_flags", "expected_check"),
+    [
+        ("<script>alert(1)</script>", ["xss_html_injection"], "SafeTensors XSS/HTML Injection Detection"),
+        (
+            {"api_key": "SECRET_METADATA_TOKEN", "owner": 7},
+            ["credential_exposure"],
+            "SafeTensors Embedded Credentials Detection",
+        ),
+        (["eval(1)"], ["code_injection"], "SafeTensors Code Injection Detection"),
+    ],
+)
+def test_malformed_safetensors_custom_metadata_still_reports_security_flags(
+    tmp_path: Path,
+    custom_metadata: Any,
+    expected_flags: list[str],
+    expected_check: str,
+) -> None:
+    """Malformed metadata should not bypass content detections."""
+    file_path = tmp_path / "malformed_malicious_metadata.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": custom_metadata,
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert result.metadata["custom_metadata_valid"] is False
+    assert result.metadata["custom_metadata_security_flags"] == expected_flags
+    assert any(check.name == expected_check and check.status == CheckStatus.FAILED for check in result.checks)
+
+
 def test_large_safetensors_scans_header_without_default_full_file_cap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -554,6 +644,7 @@ def test_suspicious_metadata(tmp_path: Path) -> None:
     result = scanner.scan(str(file_path))
 
     assert any("suspicious metadata" in issue.message.lower() for issue in result.issues)
+    assert "suspicious_pattern" in result.metadata["custom_metadata_security_flags"]
 
 
 def test_unicode_metadata_is_not_code_injection(tmp_path: Path) -> None:
@@ -567,6 +658,7 @@ def test_unicode_metadata_is_not_code_injection(tmp_path: Path) -> None:
 
     code_injection_checks = [check for check in result.checks if check.name == "SafeTensors Code Injection Detection"]
     assert code_injection_checks == []
+    assert result.metadata["custom_metadata_security_flags"] == []
     assert [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}] == []
 
 
@@ -582,6 +674,7 @@ def test_literal_unicode_escape_metadata_still_flags_code_injection(tmp_path: Pa
     code_injection_checks = [check for check in result.checks if check.name == "SafeTensors Code Injection Detection"]
     assert code_injection_checks
     assert all(check.severity == IssueSeverity.CRITICAL for check in code_injection_checks)
+    assert "code_injection" in result.metadata["custom_metadata_security_flags"]
 
 
 def test_single_comment_token_does_not_bypass_unicode_escape_detection(tmp_path: Path) -> None:

@@ -565,10 +565,13 @@ class TestModelMetadataExtractor:
         assert "custom_metadata" not in metadata
         assert metadata["has_custom_metadata"] is True
         assert metadata["custom_metadata_entry_count"] == 3
+        assert metadata["custom_metadata_valid"] is True
+        assert metadata["custom_metadata_security_flags"] == ["credential_exposure"]
         assert "SECRET_METADATA_TOKEN" not in json.dumps(metadata, sort_keys=True)
 
         # Full metadata extraction remains unchanged.
         assert full_metadata["custom_metadata"]["api_key"] == "SECRET_METADATA_TOKEN"
+        assert "custom_metadata_security_flags" not in full_metadata
 
     def test_security_only_directory_omits_custom_metadata_values(self, tmp_path: Path) -> None:
         """Directory security output should summarize custom metadata without exposing values."""
@@ -597,6 +600,77 @@ class TestModelMetadataExtractor:
         serialized = json.dumps(metadata, sort_keys=True)
         assert metadata_owner not in serialized
         assert metadata_source not in serialized
+
+    @pytest.mark.parametrize(
+        ("custom_metadata", "expected_type", "expected_invalid_value_count", "expected_flags"),
+        [
+            (None, "NoneType", None, []),
+            ("<script>alert(1)</script>", "str", None, ["xss_html_injection"]),
+            (["not-a-map"], "list", None, []),
+            ({"api_key": "SECRET_METADATA_TOKEN", "owner": 7}, None, 1, ["credential_exposure"]),
+        ],
+    )
+    def test_security_only_reports_invalid_custom_metadata_without_values(
+        self,
+        tmp_path: Path,
+        custom_metadata: Any,
+        expected_type: str | None,
+        expected_invalid_value_count: int | None,
+        expected_flags: list[str],
+    ) -> None:
+        """Malformed custom metadata should fail closed without exposing its contents."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        header = {
+            "tensor1": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+            "__metadata__": custom_metadata,
+        }
+        header_json = json.dumps(header).encode("utf-8")
+        st_file = tmp_path / "malformed-metadata.safetensors"
+        st_file.write_bytes(struct.pack("<Q", len(header_json)) + header_json + b"\x00\x00\x00\x00")
+
+        metadata = extractor.extract(str(st_file), security_only=True)
+
+        assert "custom_metadata" not in metadata
+        assert metadata["has_custom_metadata"] is True
+        assert metadata["custom_metadata_valid"] is False
+        assert metadata["custom_metadata_security_flags"] == expected_flags
+        assert "SECRET_METADATA_TOKEN" not in json.dumps(metadata, sort_keys=True)
+        if expected_type is not None:
+            assert metadata["custom_metadata_type"] == expected_type
+        else:
+            assert "custom_metadata_type" not in metadata
+        if expected_invalid_value_count is not None:
+            assert metadata["custom_metadata_invalid_value_count"] == expected_invalid_value_count
+        else:
+            assert "custom_metadata_invalid_value_count" not in metadata
+
+    def test_security_only_distinguishes_absent_and_empty_custom_metadata(self, tmp_path: Path) -> None:
+        """An empty valid map is distinct from a file without custom metadata."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+
+        def write_model(path: Path, custom_metadata: dict[str, str] | None, *, include_metadata: bool) -> None:
+            header: dict[str, Any] = {
+                "tensor1": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+            }
+            if include_metadata:
+                header["__metadata__"] = custom_metadata
+            header_json = json.dumps(header).encode("utf-8")
+            path.write_bytes(struct.pack("<Q", len(header_json)) + header_json + b"\x00\x00\x00\x00")
+
+        empty_file = tmp_path / "empty.safetensors"
+        absent_file = tmp_path / "absent.safetensors"
+        write_model(empty_file, {}, include_metadata=True)
+        write_model(absent_file, None, include_metadata=False)
+
+        empty_metadata = extractor.extract(str(empty_file), security_only=True)
+        absent_metadata = extractor.extract(str(absent_file), security_only=True)
+
+        assert empty_metadata["has_custom_metadata"] is True
+        assert empty_metadata["custom_metadata_entry_count"] == 0
+        assert empty_metadata["custom_metadata_valid"] is True
+        assert empty_metadata["custom_metadata_security_flags"] == []
+        assert "has_custom_metadata" not in absent_metadata
+        assert "custom_metadata_valid" not in absent_metadata
 
     def test_format_table_single_file(self) -> None:
         """Test table formatting for single file."""
