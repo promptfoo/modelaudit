@@ -6,6 +6,7 @@ import json
 import os
 import re
 import struct
+from collections.abc import Iterator
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
@@ -38,16 +39,135 @@ SAFETENSORS_HEADER_LIMIT_INCONCLUSIVE_REASON = "safetensors_header_size_limit_ex
 SAFETENSORS_READ_INCONCLUSIVE_REASON = "safetensors_read_failed"
 
 _HTML_METADATA_PATTERNS = (
-    r"<script[^>]*>.*?</script>",
     r"javascript:",
-    r"on\w+\s*=",
-    r"<iframe[^>]*>",
-    r"<object[^>]*>",
-    r"<embed[^>]*>",
-    r"<form[^>]*>",
-    r"<img[^>]*onerror",
     r"vbscript:",
     r"data:text/html",
+)
+_RISKY_HTML_TAGS = frozenset({"script", "iframe", "object", "embed", "form"})
+_HTML_TAG_NAME_PATTERN = re.compile(r"[a-z][\w:-]*", re.IGNORECASE)
+_HTML_EVENT_HANDLER_PATTERN = re.compile(r"\b(on[a-z][\w:-]*)\s*=", re.IGNORECASE)
+_HTML_EVENT_NAMES = frozenset(
+    {
+        "abort",
+        "afterprint",
+        "animationcancel",
+        "animationend",
+        "animationiteration",
+        "animationstart",
+        "auxclick",
+        "beforeinput",
+        "beforematch",
+        "beforeprint",
+        "beforetoggle",
+        "beforeunload",
+        "begin",
+        "blur",
+        "cancel",
+        "canplay",
+        "canplaythrough",
+        "change",
+        "click",
+        "close",
+        "contextlost",
+        "contextmenu",
+        "contextrestored",
+        "copy",
+        "cuechange",
+        "cut",
+        "dblclick",
+        "drag",
+        "dragend",
+        "dragenter",
+        "dragleave",
+        "dragover",
+        "dragstart",
+        "drop",
+        "durationchange",
+        "emptied",
+        "end",
+        "ended",
+        "error",
+        "focus",
+        "focusin",
+        "focusout",
+        "formdata",
+        "fullscreenchange",
+        "fullscreenerror",
+        "gotpointercapture",
+        "hashchange",
+        "input",
+        "invalid",
+        "keydown",
+        "keypress",
+        "keyup",
+        "languagechange",
+        "load",
+        "loadeddata",
+        "loadedmetadata",
+        "loadstart",
+        "lostpointercapture",
+        "message",
+        "messageerror",
+        "mousedown",
+        "mouseenter",
+        "mouseleave",
+        "mousemove",
+        "mouseout",
+        "mouseover",
+        "mouseup",
+        "offline",
+        "online",
+        "pagehide",
+        "pageshow",
+        "paste",
+        "pause",
+        "play",
+        "playing",
+        "pointercancel",
+        "pointerdown",
+        "pointerenter",
+        "pointerleave",
+        "pointermove",
+        "pointerout",
+        "pointerover",
+        "pointerrawupdate",
+        "pointerup",
+        "popstate",
+        "progress",
+        "ratechange",
+        "rejectionhandled",
+        "repeat",
+        "reset",
+        "resize",
+        "scroll",
+        "scrollend",
+        "securitypolicyviolation",
+        "seeked",
+        "seeking",
+        "select",
+        "selectionchange",
+        "selectstart",
+        "slotchange",
+        "stalled",
+        "storage",
+        "submit",
+        "suspend",
+        "timeupdate",
+        "toggle",
+        "touchcancel",
+        "touchend",
+        "touchmove",
+        "touchstart",
+        "transitioncancel",
+        "transitionend",
+        "transitionrun",
+        "transitionstart",
+        "unhandledrejection",
+        "unload",
+        "volumechange",
+        "waiting",
+        "wheel",
+    }
 )
 _CODE_METADATA_PATTERNS = (
     r"eval\s*\(",
@@ -59,9 +179,9 @@ _CODE_METADATA_PATTERNS = (
     r"os\.popen",
     r"\\x[0-9a-fA-F]{2}",
     r"\\u[0-9a-fA-F]{4}",
-    r"base64\.",
-    r"pickle\.",
-    r"marshal\.",
+    r"base64\.(?:[a-z0-9_]*decode|decodebytes)\s*\(",
+    r"pickle\.(?:load|loads|unpickler)\s*\(",
+    r"marshal\.(?:load|loads)\s*\(",
 )
 _PATH_TRAVERSAL_METADATA_PATTERNS = (
     r"\.\./+",
@@ -152,13 +272,83 @@ class SafeTensorsScanner(BaseScanner):
         summary["custom_metadata_valid"] = True
         return summary
 
+    @staticmethod
+    def _iter_custom_metadata_strings(custom_metadata: Any) -> Iterator[tuple[str, str]]:
+        """Yield string values from nested JSON metadata without recursion."""
+        if isinstance(custom_metadata, dict):
+            stack = [(str(key), value) for key, value in reversed(list(custom_metadata.items()))]
+        else:
+            stack = [("<metadata>", custom_metadata)]
+
+        while stack:
+            key, value = stack.pop()
+            if isinstance(value, str):
+                yield key, value
+            elif isinstance(value, dict):
+                stack.extend((key, nested) for nested in reversed(list(value.values())))
+            elif isinstance(value, list):
+                stack.extend((key, nested) for nested in reversed(value))
+
+    @staticmethod
+    def _find_html_tag_matches(metadata_str: str) -> tuple[list[str], int]:
+        """Find risky opening tags in non-overlapping tags in linear time."""
+        first_matches: list[str] = []
+        total_matches = 0
+        cursor = 0
+        while True:
+            tag_start = metadata_str.find("<", cursor)
+            if tag_start < 0:
+                break
+            tag_end = metadata_str.find(">", tag_start + 1)
+            if tag_end < 0:
+                break
+            tag_body = metadata_str[tag_start + 1 : tag_end].lstrip()
+            if tag_body and tag_body[0] not in "/!?":
+                tag_name_match = _HTML_TAG_NAME_PATTERN.match(tag_body)
+                if tag_name_match and tag_name_match.group(0).lower() in _RISKY_HTML_TAGS:
+                    total_matches += 1
+                    if len(first_matches) < 5:
+                        first_matches.append(f"<{tag_name_match.group(0)}")
+            cursor = tag_end + 1
+        return first_matches, total_matches
+
+    @staticmethod
+    def _find_html_event_handler_matches(metadata_str: str) -> tuple[list[str], int]:
+        """Find recognized inline event-handler assignments without broad on-prefix matches."""
+        first_matches: list[str] = []
+        total_matches = 0
+        for match in _HTML_EVENT_HANDLER_PATTERN.finditer(metadata_str):
+            if match.group(1)[2:].lower() not in _HTML_EVENT_NAMES:
+                continue
+            total_matches += 1
+            if len(first_matches) < 5:
+                first_matches.append(match.group(0))
+        return first_matches, total_matches
+
+    @staticmethod
+    def _find_bounded_matches(pattern: str, content: str, flags: int = 0) -> tuple[list[str], int]:
+        """Return at most five regex matches plus the total match count."""
+        first_matches: list[str] = []
+        total_matches = 0
+        for match in re.finditer(pattern, content, flags):
+            total_matches += 1
+            if len(first_matches) < 5:
+                first_matches.append(match.group(0))
+        return first_matches, total_matches
+
     @classmethod
     def _summarize_custom_metadata(cls, custom_metadata: Any) -> dict[str, Any]:
         """Return a privacy-safe structural and security summary for custom metadata."""
         summary = cls._summarize_custom_metadata_structure(custom_metadata)
         flags: set[str] = set()
         serialized = json.dumps(custom_metadata, ensure_ascii=False)
-        if any(re.search(pattern, serialized, re.IGNORECASE | re.DOTALL) for pattern in _HTML_METADATA_PATTERNS):
+        _, html_tag_match_count = cls._find_html_tag_matches(serialized)
+        _, event_handler_match_count = cls._find_html_event_handler_matches(serialized)
+        if (
+            html_tag_match_count
+            or event_handler_match_count
+            or any(re.search(pattern, serialized, re.IGNORECASE) for pattern in _HTML_METADATA_PATTERNS)
+        ):
             flags.add("xss_html_injection")
         if any(re.search(pattern, serialized, re.IGNORECASE) for pattern in _CODE_METADATA_PATTERNS):
             flags.add("code_injection")
@@ -167,16 +357,13 @@ class SafeTensorsScanner(BaseScanner):
         if any(re.search(pattern, serialized, re.IGNORECASE) for pattern in _CREDENTIAL_METADATA_PATTERNS):
             flags.add("credential_exposure")
 
-        if isinstance(custom_metadata, dict):
-            for value in custom_metadata.values():
-                if not isinstance(value, str):
-                    continue
-                if len(value) > 1000:
-                    flags.add("unusually_long_value")
-                if any(marker in value.lower() for marker in ("import ", "#!/")):
-                    flags.add("code_like_value")
-                if any(re.search(pattern, value) for pattern in SUSPICIOUS_METADATA_PATTERNS):
-                    flags.add("suspicious_pattern")
+        for _, value in cls._iter_custom_metadata_strings(custom_metadata):
+            if len(value) > 1000:
+                flags.add("unusually_long_value")
+            if any(marker in value.lower() for marker in ("import ", "#!/")):
+                flags.add("code_like_value")
+            if any(re.search(pattern, value) for pattern in SUSPICIOUS_METADATA_PATTERNS):
+                flags.add("suspicious_pattern")
 
         summary["custom_metadata_security_flags"] = sorted(flags)
         return summary
@@ -589,58 +776,56 @@ class SafeTensorsScanner(BaseScanner):
 
                 # Check metadata
                 metadata = header.get("__metadata__", {})
-                if isinstance(metadata, dict):
-                    for key, value in metadata.items():
-                        if isinstance(value, str) and len(value) > 1000:
-                            custom_metadata_security_flags.add("unusually_long_value")
+                for key, value in self._iter_custom_metadata_strings(metadata):
+                    if len(value) > 1000:
+                        custom_metadata_security_flags.add("unusually_long_value")
+                        result.add_check(
+                            name="Metadata Length Check",
+                            passed=False,
+                            message=f"Metadata value for {key} is very long",
+                            severity=IssueSeverity.INFO,
+                            location=path,
+                            details={"key": key, "length": len(value), "threshold": 1000},
+                            why=(
+                                "Metadata fields over 1000 characters are unusual in model files. Long strings "
+                                "in metadata could contain encoded payloads, scripts, or data exfiltration "
+                                "attempts."
+                            ),
+                        )
+
+                    lower_val = value.lower()
+
+                    # Check for simple code-like patterns
+                    if any(s in lower_val for s in ["import ", "#!/"]):
+                        custom_metadata_security_flags.add("code_like_value")
+                        result.add_check(
+                            name="Metadata Code Pattern Check",
+                            passed=False,
+                            message=f"Suspicious metadata value for {key}",
+                            severity=IssueSeverity.INFO,
+                            location=path,
+                            details={"key": key, "pattern": "code-like"},
+                            why=(
+                                "Metadata containing code-like patterns (import statements, shebangs, escape "
+                                "sequences) is atypical for model files and may indicate embedded scripts or "
+                                "injection attempts."
+                            ),
+                        )
+
+                    # Check for regex-based suspicious patterns (independent of above check)
+                    for pattern in SUSPICIOUS_METADATA_PATTERNS:
+                        if re.search(pattern, value):
+                            custom_metadata_security_flags.add("suspicious_pattern")
                             result.add_check(
-                                name="Metadata Length Check",
+                                name="Metadata Pattern Check",
                                 passed=False,
-                                message=f"Metadata value for {key} is very long",
+                                message=f"Suspicious metadata value for {key}",
                                 severity=IssueSeverity.INFO,
                                 location=path,
-                                details={"key": key, "length": len(value), "threshold": 1000},
-                                why=(
-                                    "Metadata fields over 1000 characters are unusual in model files. Long strings "
-                                    "in metadata could contain encoded payloads, scripts, or data exfiltration "
-                                    "attempts."
-                                ),
+                                details={"key": key, "pattern": pattern},
+                                why="Metadata matched known suspicious pattern",
                             )
-
-                        if isinstance(value, str):
-                            lower_val = value.lower()
-
-                            # Check for simple code-like patterns
-                            if any(s in lower_val for s in ["import ", "#!/"]):
-                                custom_metadata_security_flags.add("code_like_value")
-                                result.add_check(
-                                    name="Metadata Code Pattern Check",
-                                    passed=False,
-                                    message=f"Suspicious metadata value for {key}",
-                                    severity=IssueSeverity.INFO,
-                                    location=path,
-                                    details={"key": key, "pattern": "code-like"},
-                                    why=(
-                                        "Metadata containing code-like patterns (import statements, shebangs, escape "
-                                        "sequences) is atypical for model files and may indicate embedded scripts or "
-                                        "injection attempts."
-                                    ),
-                                )
-
-                            # Check for regex-based suspicious patterns (independent of above check)
-                            for pattern in SUSPICIOUS_METADATA_PATTERNS:
-                                if re.search(pattern, value):
-                                    custom_metadata_security_flags.add("suspicious_pattern")
-                                    result.add_check(
-                                        name="Metadata Pattern Check",
-                                        passed=False,
-                                        message=f"Suspicious metadata value for {key}",
-                                        severity=IssueSeverity.INFO,
-                                        location=path,
-                                        details={"key": key, "pattern": pattern},
-                                        why="Metadata matched known suspicious pattern",
-                                    )
-                                    break
+                            break
 
                 if "__metadata__" in header:
                     result.metadata["custom_metadata_security_flags"] = sorted(custom_metadata_security_flags)
@@ -749,8 +934,8 @@ class SafeTensorsScanner(BaseScanner):
 
         # XSS/HTML injection patterns
         for pattern in _HTML_METADATA_PATTERNS:
-            matches = re.findall(pattern, metadata_str, re.IGNORECASE | re.DOTALL)
-            if matches:
+            matches, total_matches = self._find_bounded_matches(pattern, metadata_str, re.IGNORECASE)
+            if total_matches:
                 security_flags.add("xss_html_injection")
                 result.add_check(
                     name="SafeTensors XSS/HTML Injection Detection",
@@ -760,16 +945,34 @@ class SafeTensorsScanner(BaseScanner):
                     location=path,
                     details={
                         "pattern_matched": pattern,
-                        "matches": matches[:5],  # Limit to first 5 matches
+                        "matches": matches,
                         "attack_type": "xss_html_injection",
-                        "total_matches": len(matches),
+                        "total_matches": total_matches,
                     },
                 )
 
+        html_tag_matches, html_tag_match_count = self._find_html_tag_matches(metadata_str)
+        event_handler_matches, event_handler_match_count = self._find_html_event_handler_matches(metadata_str)
+        if html_tag_match_count or event_handler_match_count:
+            security_flags.add("xss_html_injection")
+            result.add_check(
+                name="SafeTensors XSS/HTML Injection Detection",
+                passed=False,
+                message="Potential XSS/HTML injection detected in metadata",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                details={
+                    "pattern_matched": "HTML tag or event handler attribute",
+                    "matches": (html_tag_matches + event_handler_matches)[:5],
+                    "attack_type": "xss_html_injection",
+                    "total_matches": html_tag_match_count + event_handler_match_count,
+                },
+            )
+
         # Code injection patterns
         for pattern in _CODE_METADATA_PATTERNS:
-            matches = re.findall(pattern, metadata_str, re.IGNORECASE)
-            if matches:
+            matches, total_matches = self._find_bounded_matches(pattern, metadata_str, re.IGNORECASE)
+            if total_matches:
                 security_flags.add("code_injection")
                 result.add_check(
                     name="SafeTensors Code Injection Detection",
@@ -779,16 +982,16 @@ class SafeTensorsScanner(BaseScanner):
                     location=path,
                     details={
                         "pattern_matched": pattern,
-                        "matches": matches[:5],
+                        "matches": matches,
                         "attack_type": "code_injection",
-                        "total_matches": len(matches),
+                        "total_matches": total_matches,
                     },
                 )
 
         # Path traversal patterns
         for pattern in _PATH_TRAVERSAL_METADATA_PATTERNS:
-            matches = re.findall(pattern, metadata_str, re.IGNORECASE)
-            if matches:
+            matches, total_matches = self._find_bounded_matches(pattern, metadata_str, re.IGNORECASE)
+            if total_matches:
                 security_flags.add("path_traversal")
                 result.add_check(
                     name="SafeTensors Path Traversal Detection",
@@ -798,16 +1001,16 @@ class SafeTensorsScanner(BaseScanner):
                     location=path,
                     details={
                         "pattern_matched": pattern,
-                        "matches": matches[:5],
+                        "matches": matches,
                         "attack_type": "path_traversal",
-                        "total_matches": len(matches),
+                        "total_matches": total_matches,
                     },
                 )
 
         # Check for embedded credentials or secrets
         for pattern in _CREDENTIAL_METADATA_PATTERNS:
-            matches = re.findall(pattern, metadata_str, re.IGNORECASE)
-            if matches:
+            _, total_matches = self._find_bounded_matches(pattern, metadata_str, re.IGNORECASE)
+            if total_matches:
                 security_flags.add("credential_exposure")
                 result.add_check(
                     name="SafeTensors Embedded Credentials Detection",
@@ -818,7 +1021,7 @@ class SafeTensorsScanner(BaseScanner):
                     details={
                         "pattern_matched": pattern,
                         "attack_type": "credential_exposure",
-                        "total_matches": len(matches),
+                        "total_matches": total_matches,
                     },
                 )
 

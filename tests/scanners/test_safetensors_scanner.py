@@ -132,13 +132,18 @@ def test_malformed_safetensors_custom_metadata_is_inconclusive(tmp_path: Path, c
 @pytest.mark.parametrize(
     ("custom_metadata", "expected_flags", "expected_check"),
     [
-        ("<script>alert(1)</script>", ["xss_html_injection"], "SafeTensors XSS/HTML Injection Detection"),
+        (
+            "<script>alert(1)</script>",
+            ["suspicious_pattern", "xss_html_injection"],
+            "SafeTensors XSS/HTML Injection Detection",
+        ),
         (
             {"api_key": "SECRET_METADATA_TOKEN", "owner": 7},
             ["credential_exposure"],
             "SafeTensors Embedded Credentials Detection",
         ),
         (["eval(1)"], ["code_injection"], "SafeTensors Code Injection Detection"),
+        (["https://evil.example/payload"], ["suspicious_pattern"], "Metadata Pattern Check"),
     ],
 )
 def test_malformed_safetensors_custom_metadata_still_reports_security_flags(
@@ -660,6 +665,101 @@ def test_unicode_metadata_is_not_code_injection(tmp_path: Path) -> None:
     assert code_injection_checks == []
     assert result.metadata["custom_metadata_security_flags"] == []
     assert [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}] == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "configuration=enabled",
+        "versioning=enabled",
+        "<div online=true>",
+        "<span only=one>",
+        "encoded with base64.urlsafe_b64encode",
+        "serialized with pickle.dumps for documentation",
+        "serialized with marshal.dumps for documentation",
+    ],
+)
+def test_benign_metadata_references_are_not_injection_patterns(tmp_path: Path, value: str) -> None:
+    file_path = tmp_path / "benign_reference_metadata.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {
+            "t": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"description": value},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is True
+    assert result.metadata["custom_metadata_security_flags"] == []
+    assert not [
+        check
+        for check in result.checks
+        if check.name in {"SafeTensors XSS/HTML Injection Detection", "SafeTensors Code Injection Detection"}
+        and check.status == CheckStatus.FAILED
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "<script src=https://evil.example/payload.js>",
+        "<div onclick=alert(1)>",
+        "<body onload=run()>",
+        "onclick=alert(1)",
+        "onload = run()",
+    ],
+)
+def test_open_html_injection_flags_xss(tmp_path: Path, value: str) -> None:
+    file_path = tmp_path / "open_script_metadata.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {
+            "t": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"description": value},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert "xss_html_injection" in result.metadata["custom_metadata_security_flags"]
+    assert any(
+        check.name == "SafeTensors XSS/HTML Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "base64.b64decode(payload)",
+        "pickle.loads(payload)",
+        "marshal.loads(payload)",
+    ],
+)
+def test_executable_decoder_and_loader_calls_flag_code_injection(tmp_path: Path, value: str) -> None:
+    file_path = tmp_path / "executable_loader_metadata.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {
+            "t": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"payload": value},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert "code_injection" in result.metadata["custom_metadata_security_flags"]
+    assert any(
+        check.name == "SafeTensors Code Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
 
 
 def test_literal_unicode_escape_metadata_still_flags_code_injection(tmp_path: Path) -> None:

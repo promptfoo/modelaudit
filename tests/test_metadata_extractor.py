@@ -605,8 +605,9 @@ class TestModelMetadataExtractor:
         ("custom_metadata", "expected_type", "expected_invalid_value_count", "expected_flags"),
         [
             (None, "NoneType", None, []),
-            ("<script>alert(1)</script>", "str", None, ["xss_html_injection"]),
+            ("<script>alert(1)</script>", "str", None, ["suspicious_pattern", "xss_html_injection"]),
             (["not-a-map"], "list", None, []),
+            (["https://evil.example/payload"], "list", None, ["suspicious_pattern"]),
             ({"api_key": "SECRET_METADATA_TOKEN", "owner": 7}, None, 1, ["credential_exposure"]),
         ],
     )
@@ -672,6 +673,56 @@ class TestModelMetadataExtractor:
         assert "has_custom_metadata" not in absent_metadata
         assert "custom_metadata_valid" not in absent_metadata
 
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "configuration=enabled",
+            "versioning=enabled",
+            "<div online=true>",
+            "<span only=one>",
+            "encoded with base64.urlsafe_b64encode",
+            "serialized with pickle.dumps for documentation",
+            "serialized with marshal.dumps for documentation",
+        ],
+    )
+    def test_safetensors_security_summary_avoids_benign_injection_flags(self, value: str) -> None:
+        from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
+
+        summary = SafeTensorsScanner._summarize_custom_metadata({"description": value})
+
+        assert summary["custom_metadata_security_flags"] == []
+
+    @pytest.mark.parametrize(
+        ("value", "expected_flag"),
+        [
+            ("<script src=https://evil.example/payload.js>", "xss_html_injection"),
+            ("<div onclick=alert(1)>", "xss_html_injection"),
+            ("<body onload=run()>", "xss_html_injection"),
+            ("onclick=alert(1)", "xss_html_injection"),
+            ("onload = run()", "xss_html_injection"),
+            ("base64.b64decode(payload)", "code_injection"),
+            ("pickle.loads(payload)", "code_injection"),
+            ("marshal.loads(payload)", "code_injection"),
+        ],
+    )
+    def test_safetensors_security_summary_preserves_executable_injection_flags(
+        self,
+        value: str,
+        expected_flag: str,
+    ) -> None:
+        from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
+
+        summary = SafeTensorsScanner._summarize_custom_metadata({"description": value})
+
+        assert expected_flag in summary["custom_metadata_security_flags"]
+
+    def test_safetensors_security_summary_handles_many_unclosed_script_markers(self) -> None:
+        from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
+
+        summary = SafeTensorsScanner._summarize_custom_metadata({"description": "<script" * 10_000})
+
+        assert summary["custom_metadata_security_flags"] == ["suspicious_pattern", "unusually_long_value"]
+
     def test_format_table_single_file(self) -> None:
         """Test table formatting for single file."""
         from modelaudit.cli import _format_metadata_table
@@ -713,6 +764,32 @@ class TestModelMetadataExtractor:
         assert "pickle: 1" in output
         assert "model1.safetensors (safetensors)" in output
         assert "model2.pkl (pickle)" in output
+
+    def test_format_table_directory_surfaces_safetensors_security_summary(self) -> None:
+        from modelaudit.cli import _format_metadata_table
+
+        metadata = {
+            "directory": "/test/path",
+            "summary": {"total_files": 1, "formats": {"safetensors": 1}},
+            "files": [
+                {
+                    "file": "model.safetensors",
+                    "format": "safetensors",
+                    "has_custom_metadata": True,
+                    "custom_metadata_entry_count": 2,
+                    "custom_metadata_valid": True,
+                    "custom_metadata_security_flags": ["credential_exposure"],
+                }
+            ],
+        }
+
+        output = _format_metadata_table(metadata)
+
+        assert "model.safetensors (safetensors)" in output
+        assert "Has Custom Metadata: True" in output
+        assert "Custom Metadata Entry Count: 2" in output
+        assert "Custom Metadata Valid: True" in output
+        assert "Custom Metadata Security Flags: credential_exposure" in output
 
     def test_format_table_directory_surfaces_incomplete_budget_warning(self) -> None:
         """Default table output should disclose partial metadata extraction."""
@@ -1211,6 +1288,29 @@ class TestCLIMetadataCommand:
         serialized = json.dumps(output, sort_keys=True)
         assert metadata_owner not in serialized
         assert metadata_source not in serialized
+
+    def test_cli_metadata_security_only_directory_table_surfaces_redacted_flags(self, tmp_path: Path) -> None:
+        """Directory table output should show redacted security signals without raw metadata."""
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        secret = "SECRET_METADATA_TOKEN"
+        header = {
+            "t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+            "__metadata__": {"api_key": secret},
+        }
+        header_json = json.dumps(header).encode("utf-8")
+        st_file = tmp_path / "model.safetensors"
+        st_file.write_bytes(struct.pack("<Q", len(header_json)) + header_json + b"\x00\x00\x00\x00")
+
+        result = CliRunner().invoke(cli, ["metadata", str(tmp_path), "--security-only"])
+
+        assert result.exit_code == 0
+        assert "model.safetensors (safetensors)" in result.output
+        assert "Custom Metadata Valid: True" in result.output
+        assert "Custom Metadata Security Flags: credential_exposure" in result.output
+        assert secret not in result.output
 
     def test_cli_metadata_table_output(self, tmp_path: Path) -> None:
         """Test CLI metadata command with default table output."""
