@@ -236,18 +236,33 @@ class ScanResultsCache:
         include_private_metadata: bool,
     ) -> dict[str, Any]:
         scan_result = cache_entry["scan_result"]
-        if not include_private_metadata or not isinstance(scan_result, dict):
+        if not isinstance(scan_result, dict):
             return scan_result  # type: ignore[no-any-return]
+        result = dict(scan_result)
+        metadata = result.get("metadata")
+        public_fingerprint_metadata = None
+        if isinstance(metadata, dict):
+            metadata = dict(metadata)
+            public_fingerprint_metadata = metadata.pop(_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY, None)
+            result["metadata"] = metadata
+        if not include_private_metadata:
+            result.pop("_private_metadata", None)
+            return result
+
         cache_metadata = cache_entry.get("cache_metadata")
         fingerprint_metadata = (
             cache_metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY) if isinstance(cache_metadata, dict) else None
         )
         if fingerprint_metadata is None:
-            return scan_result
-        return {
-            **scan_result,
-            "_private_metadata": {_CALL_GRAPH_SOURCE_FINGERPRINTS_KEY: fingerprint_metadata},
+            fingerprint_metadata = public_fingerprint_metadata
+        if fingerprint_metadata is None:
+            return result
+        private_metadata = result.get("_private_metadata")
+        result["_private_metadata"] = {
+            **(private_metadata if isinstance(private_metadata, dict) else {}),
+            _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY: fingerprint_metadata,
         }
+        return result
 
     def store_result(
         self,

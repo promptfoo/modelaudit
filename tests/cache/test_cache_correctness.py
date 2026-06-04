@@ -171,23 +171,31 @@ def test_scan_cache_invalidates_call_graph_source_fingerprint_change(
     cache = ScanResultsCache(str(tmp_path / "cache"))
     version_context = build_cache_version_context({})
     source_fingerprint = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    fingerprint_metadata = {
+        "reusable": True,
+        "search_context": [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path],
+        "fingerprints": {
+            str(source_path.absolute()): source_fingerprint,
+            str((source_root / "missing.py").absolute()): None,
+        },
+    }
     scan_result = {
         "checks": [],
         "issues": [],
-        "metadata": {
-            "call_graph_source_fingerprints": {
-                "reusable": True,
-                "search_context": [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path],
-                "fingerprints": {
-                    str(source_path.absolute()): source_fingerprint,
-                    str((source_root / "missing.py").absolute()): None,
-                },
-            }
-        },
+        "metadata": {"call_graph_source_fingerprints": fingerprint_metadata},
     }
+    expected_cached_result: dict[str, Any] = {"checks": [], "issues": [], "metadata": {}}
 
     assert cache.store_result(str(file_path), scan_result, version_context=version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) == scan_result
+    assert cache.get_cached_result(str(file_path), version_context=version_context) == expected_cached_result
+    internal_cached_result = cache.get_cached_result(
+        str(file_path),
+        version_context=version_context,
+        include_private_metadata=True,
+    )
+    assert internal_cached_result is not None
+    assert "call_graph_source_fingerprints" not in internal_cached_result["metadata"]
+    assert internal_cached_result["_private_metadata"]["call_graph_source_fingerprints"] == fingerprint_metadata
 
     source_path.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
 
@@ -217,9 +225,10 @@ def test_scan_cache_invalidates_call_graph_missing_source_appears(
             }
         },
     }
+    expected_cached_result: dict[str, Any] = {"checks": [], "issues": [], "metadata": {}}
 
     assert cache.store_result(str(file_path), scan_result, version_context=version_context)
-    assert cache.get_cached_result(str(file_path), version_context=version_context) == scan_result
+    assert cache.get_cached_result(str(file_path), version_context=version_context) == expected_cached_result
 
     missing_path.write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
 
@@ -269,10 +278,20 @@ def test_scan_cache_accepts_empty_call_graph_source_fingerprint_metadata(
             },
         },
     }
+    expected_cached_result = {
+        "checks": [],
+        "issues": [],
+        "metadata": {
+            "pickle_report_status": "complete",
+            "pickle_verdict": "clean",
+            "import_references": [],
+            "callable_invocations": [],
+        },
+    }
 
     assert cache.store_result(str(file_path), scan_result, version_context=version_context)
 
-    assert cache.get_cached_result(str(file_path), version_context=version_context) == scan_result
+    assert cache.get_cached_result(str(file_path), version_context=version_context) == expected_cached_result
 
 
 def test_scan_cache_uses_private_call_graph_source_fingerprints_without_returning_them(
