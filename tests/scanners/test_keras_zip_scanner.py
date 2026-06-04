@@ -3263,6 +3263,8 @@ class TestCVE202549655TorchModuleWrapper:
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
         assert cve_issues[0].details["keras_version"] == keras_version
         assert "prereleases before final 3.11.3" in cve_issues[0].details["affected_versions"]
+        assert cve_issues[0].why is not None
+        assert "prereleases before final 3.11.3" in cve_issues[0].why
 
     @pytest.mark.parametrize(
         ("keras_version", "expected"),
