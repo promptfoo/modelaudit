@@ -3063,7 +3063,64 @@ def test_scan_file_routes_misnamed_config_only_keras_zip_by_content(tmp_path: Pa
     assert any("lambda" in issue.message.lower() for issue in result.issues)
 
 
+@pytest.mark.parametrize("filename", ["model.jpg", "model.keras"])
 def test_scan_file_fails_closed_when_content_routed_keras_zip_scanner_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+) -> None:
+    disguised_keras = tmp_path / filename
+    _create_misnamed_zip(
+        disguised_keras,
+        {
+            "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
+            "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
+        },
+    )
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    original_load_scanner = core_module._registry._load_scanner
+
+    def load_scanner(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "keras_zip":
+            return None
+        return original_load_scanner(scanner_id)
+
+    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+
+    reset_cache_manager()
+    try:
+        result = scan_file(str(disguised_keras), config=config)
+        repeated = scan_file(str(disguised_keras), config=config)
+
+        assert repeated.success is False
+        assert repeated.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    assert "recognized_format_scanner_unavailable" in result.metadata["scan_outcome_reasons"]
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.details["format"] == "keras_zip"
+    assert check.details["preferred_scanner_id"] == "keras_zip"
+
+    aggregate = scan_model_directory_or_file(str(disguised_keras), cache_scan_results=False)
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_preserves_generic_findings_when_content_routed_keras_zip_scanner_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3073,6 +3130,7 @@ def test_scan_file_fails_closed_when_content_routed_keras_zip_scanner_unavailabl
         {
             "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
             "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
+            "payload.pkl": _build_malicious_pickle(),
         },
     )
     original_load_scanner = core_module._registry._load_scanner
@@ -3086,21 +3144,10 @@ def test_scan_file_fails_closed_when_content_routed_keras_zip_scanner_unavailabl
 
     result = scan_file(str(disguised_keras), config={"cache_enabled": False})
 
-    assert result.scanner_name == "unknown"
+    assert result.scanner_name == "zip"
     assert result.success is False
-    assert result.metadata["scan_outcome"] == "inconclusive"
-    assert result.metadata["analysis_incomplete"] is True
-    assert result.metadata["operational_error"] is True
     assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
-    assert "recognized_format_scanner_unavailable" in result.metadata["scan_outcome_reasons"]
-    assert not any(check.name == "Generic ZIP Security Check" for check in result.checks)
-    check = next(check for check in result.checks if check.name == "Format Detection")
-    assert check.details["format"] == "keras_zip"
-    assert check.details["preferred_scanner_id"] == "keras_zip"
-
-    aggregate = scan_model_directory_or_file(str(disguised_keras), cache_scan_results=False)
-    assert aggregate.success is False
-    assert core_module.determine_exit_code(aggregate) == 2
+    _assert_system_pickle_detected(result, "payload.pkl")
 
 
 def test_scan_file_routes_misnamed_oversized_config_only_keras_zip_by_content(tmp_path: Path) -> None:
