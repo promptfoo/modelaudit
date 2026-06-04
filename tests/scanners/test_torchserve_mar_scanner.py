@@ -1567,6 +1567,15 @@ def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
             b"        return None\n"
             b"    __import__('os').system('id')\n"
         ),
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os')\n"
+            b"    if context:\n"
+            b"        module = __import__('math')\n"
+            b"    else:\n"
+            b"        return []\n"
+            b"    return module.system('id')\n"
+        ),
     ],
 )
 def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
@@ -1720,6 +1729,20 @@ def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
             b"    def __init__(self):\n"
             b"        self.module = __import__('os')\n"
         ),
+        (
+            b"import importlib\n"
+            b"def handle(data, context):\n"
+            b"    return importlib.import_module(**{'name': 'os'}).system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return __import__(**{'name': 'os'}).system('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    consume = list if context else tuple\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return consume(generator)\n"
+        ),
+        (b"def handle(data, context):\n    return getattr(*[__import__('os'), 'system'])('id')\n"),
+        (b"def handle(data, context):\n    return __import__('os').__dict__['system']('id')\n"),
     ],
 )
 def test_dynamic_import_handler_analysis_preserves_reachable_aliases(

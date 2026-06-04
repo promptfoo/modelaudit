@@ -1711,6 +1711,40 @@ class TorchServeMarScanner(BaseScanner):
             expanded_arguments.extend(nested_arguments)
         return expanded_arguments
 
+    @classmethod
+    def _literal_keyword_mapping(cls, node: ast.AST) -> dict[str, ast.expr] | None:
+        if not isinstance(node, ast.Dict):
+            return None
+        mapping: dict[str, ast.expr] = {}
+        for key, value in zip(node.keys, node.values, strict=True):
+            if key is None:
+                nested_mapping = cls._literal_keyword_mapping(value)
+                if nested_mapping is None:
+                    return None
+                mapping.update(nested_mapping)
+                continue
+            key_name = cls._static_string_value(key)
+            if key_name is None:
+                return None
+            mapping[key_name] = value
+        return mapping
+
+    @classmethod
+    def _expanded_literal_call_keywords(
+        cls,
+        keywords: list[ast.keyword],
+    ) -> list[tuple[str, ast.expr]] | None:
+        expanded_keywords: list[tuple[str, ast.expr]] = []
+        for keyword in keywords:
+            if keyword.arg is not None:
+                expanded_keywords.append((keyword.arg, keyword.value))
+                continue
+            unpacked_keywords = cls._literal_keyword_mapping(keyword.value)
+            if unpacked_keywords is None:
+                return None
+            expanded_keywords.extend(unpacked_keywords.items())
+        return expanded_keywords
+
     @staticmethod
     def _static_integer_value(node: ast.AST) -> int | None:
         if isinstance(node, ast.Constant) and isinstance(node.value, int):
@@ -1743,13 +1777,16 @@ class TorchServeMarScanner(BaseScanner):
             expanded_args = self._expanded_literal_call_arguments(node.args)
             if expanded_args is None or len(expanded_args) > len(helper_parameters):
                 continue
+            expanded_keywords = self._expanded_literal_call_keywords(node.keywords)
+            if expanded_keywords is None:
+                continue
             arguments_by_name = dict(zip(helper_parameters, expanded_args, strict=False))
             valid_call = True
-            for keyword in node.keywords:
-                if keyword.arg is None or keyword.arg not in helper_parameters or keyword.arg in arguments_by_name:
+            for keyword_name, keyword_value in expanded_keywords:
+                if keyword_name not in helper_parameters or keyword_name in arguments_by_name:
                     valid_call = False
                     break
-                arguments_by_name[keyword.arg] = keyword.value
+                arguments_by_name[keyword_name] = keyword_value
             if not valid_call:
                 continue
 
@@ -1901,11 +1938,12 @@ class TorchServeMarScanner(BaseScanner):
             )
         if not resolved_helper_names & _DYNAMIC_GETATTR_HELPERS:
             return frozenset()
-        if len(node.args) not in {2, 3} or node.keywords:
+        expanded_args = self._expanded_literal_call_arguments(node.args)
+        if expanded_args is None or len(expanded_args) not in {2, 3} or node.keywords:
             return frozenset()
 
-        target_node = node.args[0]
-        attr_node = node.args[1]
+        target_node = expanded_args[0]
+        attr_node = expanded_args[1]
 
         module_names = self._resolve_dynamic_import_roots(
             target_node,
@@ -1967,6 +2005,22 @@ class TorchServeMarScanner(BaseScanner):
             )
 
         if isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Attribute) and node.value.attr == "__dict__":
+                module_names = self._resolve_dynamic_import_roots(
+                    node.value.value,
+                    aliases,
+                    module_aliases,
+                    import_loader_aliases,
+                    shadowed_names,
+                )
+                attr_name = self._static_string_value(node.slice)
+                if attr_name is not None:
+                    return frozenset(
+                        call_name
+                        for module_name in module_names
+                        if (call_name := _normalized_high_risk_python_call_name(f"{module_name}.{attr_name}"))
+                        is not None
+                    )
             module_names = self._resolve_dynamic_import_roots(
                 node.value,
                 aliases,
@@ -2298,7 +2352,7 @@ class TorchServeMarScanner(BaseScanner):
                 self.callable_aliases.pop(name, None)
                 self.lazy_generator_aliases.pop(name, None)
                 self.static_truthiness_aliases.pop(name, None)
-                if resolved_name in _DYNAMIC_IMPORT_HELPERS:
+                if resolved_name in _DYNAMIC_IMPORT_HELPERS | _EAGER_GENERATOR_CONSUMERS:
                     self.import_loader_aliases[name] = frozenset({resolved_name})
                 else:
                     self.import_loader_aliases.pop(name, None)
@@ -2453,8 +2507,9 @@ class TorchServeMarScanner(BaseScanner):
                     self.module_aliases[name] = module_names
                 if callable_names:
                     self.callable_aliases[name] = callable_names
-                if import_helper_names:
-                    self.import_loader_aliases[name] = import_helper_names
+                loader_alias_names = import_helper_names | eager_consumer_names
+                if loader_alias_names:
+                    self.import_loader_aliases[name] = loader_alias_names
                 if len(assignable_alias_names) == 1:
                     self.import_aliases[name] = next(iter(assignable_alias_names))
                     self.shadowed_names.discard(name)
@@ -3181,10 +3236,23 @@ class TorchServeMarScanner(BaseScanner):
                 initial_state = self._snapshot_state()
                 self._visit_statement_block(node.body)
                 body_state = self._snapshot_state()
+                body_terminates = self._statements_definitely_terminate(node.body)
                 self._restore_state(initial_state)
                 self._visit_statement_block(node.orelse)
                 orelse_state = self._snapshot_state()
-                self._restore_state(self._merge_states(body_state, orelse_state))
+                orelse_terminates = self._statements_definitely_terminate(node.orelse)
+                continuing_states = []
+                if not body_terminates:
+                    continuing_states.append(body_state)
+                if not orelse_terminates:
+                    continuing_states.append(orelse_state)
+                if not continuing_states:
+                    self._restore_state(initial_state)
+                    return
+                merged_state = continuing_states[0]
+                for continuing_state in continuing_states[1:]:
+                    merged_state = self._merge_states(merged_state, continuing_state)
+                self._restore_state(merged_state)
 
             def visit_While(self, node: ast.While) -> None:
                 self.visit(node.test)
@@ -3348,19 +3416,31 @@ class TorchServeMarScanner(BaseScanner):
                 )
                 self.risky_calls.update(call_names)
                 call_name = scanner._resolve_call_name(node.func)
-                resolved_call_name = (
-                    scanner._apply_unshadowed_alias(
-                        call_name,
-                        self.import_aliases,
-                        self.shadowed_names,
+                resolved_call_names = (
+                    self.import_loader_aliases.get(call_name, frozenset()) if call_name is not None else frozenset()
+                )
+                if (
+                    call_name is not None
+                    and not resolved_call_names
+                    and call_name.split(".", maxsplit=1)[0] not in self.shadowed_names
+                ):
+                    resolved_call_names = frozenset(
+                        {
+                            scanner._apply_unshadowed_alias(
+                                call_name,
+                                self.import_aliases,
+                                self.shadowed_names,
+                            )
+                        }
                     )
-                    if call_name is not None and call_name.split(".", maxsplit=1)[0] not in self.shadowed_names
-                    else None
-                )
-                consumed_generator_indexes = self._eager_generator_argument_indexes(
-                    node,
-                    resolved_call_name,
-                )
+                consumed_generator_indexes: set[int] = set()
+                for resolved_call_name in resolved_call_names:
+                    consumed_generator_indexes.update(
+                        self._eager_generator_argument_indexes(
+                            node,
+                            resolved_call_name,
+                        )
+                    )
                 if isinstance(node.func, ast.Attribute) and node.func.attr in {"__next__", "send"}:
                     self._visit_consumed_generator_value(node.func.value)
                 self.visit(node.func)
