@@ -2570,6 +2570,64 @@ def test_scan_zip_tracks_module_replacement_through_sys_modules_from_import(tmp_
     )
 
 
+@pytest.mark.parametrize(
+    "replacement_source",
+    [
+        "sys.modules.__setitem__('runpy', ctypes)",
+        "dict.__setitem__(sys.modules, 'runpy', ctypes)",
+        "sys.modules.update({'runpy': ctypes})",
+        "dict.update(sys.modules, {'runpy': ctypes})",
+        "sys.modules.update(runpy=ctypes)",
+        "dict.update(sys.modules, runpy=ctypes)",
+        "sys.modules.setdefault('runpy', ctypes)",
+        "dict.setdefault(sys.modules, 'runpy', ctypes)",
+    ],
+)
+def test_scan_zip_tracks_module_replacement_through_sys_modules_method_from_import(
+    tmp_path: Path, replacement_source: str
+) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = f"import ctypes\nimport sys\n{replacement_source}\nfrom runpy import CDLL\nCDLL('payload')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert any(
+        check.name == "Python Archive Member Security"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S110"
+        and check.details["reason"] == "high-risk calls: ctypes.CDLL"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "replacement_source",
+    [
+        "sys.modules['runpy'] = ctypes",
+        "sys.modules.__setitem__('runpy', ctypes)",
+    ],
+)
+def test_scan_zip_tracks_module_replacement_through_sys_modules_wildcard_import(
+    tmp_path: Path, replacement_source: str
+) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = f"import ctypes\nimport sys\n{replacement_source}\nfrom runpy import *\nCDLL('payload')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert any(
+        check.name == "Python Archive Member Security"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S110"
+        and check.details["reason"] == "high-risk calls: ctypes.CDLL"
+        for check in result.checks
+    )
+
+
 def test_scan_zip_ignores_missing_member_after_sys_modules_import_replacement(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = "import ctypes\nimport sys\nsys.modules['runpy'] = ctypes\nimport runpy\nrunpy.run_path('payload.py')\n"

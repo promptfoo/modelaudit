@@ -1934,6 +1934,26 @@ class TestJITScriptDetector:
                 b"vars(c)['CDLL'].__call__('payload.so')\n",
                 "Native library loading detected",
             ),
+            (
+                b"import ctypes as c\n",
+                b"object.__getattribute__(c, 'CDLL')('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"type(c).__getattribute__(c, 'CDLL')('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"vars(c).get('CDLL')('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"dict.get(vars(c), 'CDLL')('payload.so')\n",
+                "Native library loading detected",
+            ),
         ],
     )
     def test_scan_model_detects_long_explicit_dunder_call_with_bounded_replay(

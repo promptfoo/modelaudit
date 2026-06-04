@@ -320,6 +320,7 @@ _STATIC_INERT_VALUE_PREFIX = "<inert-value>:"
 _STATIC_INERT_MEMBER_STATUS_PREFIX = "<inert-member-status>:"
 _STATIC_INERT_CTYPES_LIBRARY_LOADER = f"{_STATIC_INERT_VALUE_PREFIX}ctypes.LibraryLoader"
 _SYS_MODULES_BINDING_PREFIX = "<sys-modules>:"
+_SYS_MODULES_NAMESPACE_ALIAS = "sys.modules"
 _TRACKED_STATIC_MEMBER_REFERENCES = (
     _STATIC_OVERWRITABLE_HIGH_RISK_REFERENCES
     | _STATIC_TRUTHY_BUILTIN_REFERENCES
@@ -1352,6 +1353,8 @@ def _resolve_namespace_mapping_roots(
             resolved_mapping_names = _normalize_implicit_builtins_names(resolved_mapping_names, alias_scopes)
             if resolved_mapping_names is None:
                 return None
+            if _SYS_MODULES_NAMESPACE_ALIAS in resolved_mapping_names:
+                return frozenset({_SYS_MODULES_NAMESPACE_ALIAS})
             namespace_roots = frozenset(
                 name.removesuffix(".__dict__") for name in resolved_mapping_names if name.endswith(".__dict__")
             )
@@ -2862,6 +2865,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if guaranteed:
                 return default_names if existing_names == frozenset() else existing_names
             return self._merge_alias_values(default_names)
+        if root == _SYS_MODULES_NAMESPACE_ALIAS:
+            existing_names, guaranteed = _lookup_bound_alias(f"{_SYS_MODULES_BINDING_PREFIX}{key}", self.alias_scopes)
+            if guaranteed:
+                return default_names if existing_names == frozenset() else existing_names
+            return self._merge_alias_values(existing_names, default_names)
 
         member_name = f"{root}.{key}"
         existing_names, guaranteed = _lookup_bound_alias(member_name, self.alias_scopes)
@@ -2885,6 +2893,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
             self.alias_scopes[-1].pop(key, None)
             return
+        if root == _SYS_MODULES_NAMESPACE_ALIAS:
+            self._bind_name(f"{_SYS_MODULES_BINDING_PREFIX}{key}", None)
+            return
         self._record_deleted_statically_inert_loader_member(frozenset({root}), key)
         dotted_name = f"{root}.{key}"
         if dotted_name in _TRACKED_STATIC_MEMBER_REFERENCES:
@@ -2907,6 +2918,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 if root in _TRACKED_MODULE_NAMESPACE_ALIASES:
                     self._bind_module_namespace_key(update_key, localized_value)
                     self._restore_reassigned_instance_member_defaults(update_key, localized_value)
+                elif root == _SYS_MODULES_NAMESPACE_ALIAS:
+                    if update_key in _TRACKED_STATIC_MODULE_ROOTS:
+                        self._bind_name(f"{_SYS_MODULES_BINDING_PREFIX}{update_key}", resolved_value)
                 elif root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
                     self._bind_name(update_key, localized_value)
                     self._restore_reassigned_instance_member_defaults(update_key, localized_value)
@@ -3073,6 +3087,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 localized_value = self._localize_instance_binding_value(key, value_node, resolved_value)
                 self._bind_module_namespace_key(key, localized_value)
                 self._restore_reassigned_instance_member_defaults(key, localized_value)
+                continue
+            if root == _SYS_MODULES_NAMESPACE_ALIAS:
+                if key in _TRACKED_STATIC_MODULE_ROOTS:
+                    self._bind_name(f"{_SYS_MODULES_BINDING_PREFIX}{key}", resolved_value)
                 continue
             if root == _LOCAL_NAMESPACE_MAPPING_ALIAS:
                 localized_value = self._localize_instance_binding_value(key, value_node, resolved_value)
@@ -3496,8 +3514,26 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             return
         for alias in node.names:
             if alias.name == "*":
+                registry_binding, registry_found = _lookup_bound_alias(
+                    f"{_SYS_MODULES_BINDING_PREFIX}{node.module}", self.alias_scopes
+                )
+                known_registry_replacement = isinstance(registry_binding, frozenset) and registry_binding != frozenset(
+                    {node.module}
+                )
+                if known_registry_replacement:
+                    assert isinstance(registry_binding, frozenset)
+                    replacement_bindings: dict[str, set[str]] = {}
+                    for module in registry_binding:
+                        for local_name, import_name in _wildcard_import_aliases(module):
+                            replacement_bindings.setdefault(local_name, set()).add(import_name)
+                    for local_name, import_names in replacement_bindings.items():
+                        self._bind_name(local_name, frozenset(import_names))
+                    continue
                 for local_name, import_name in _wildcard_import_aliases(node.module):
-                    self._bind_name(local_name, frozenset({import_name}))
+                    if registry_found and registry_binding is None:
+                        self._bind_name(local_name, None)
+                    else:
+                        self._bind_name(local_name, frozenset({import_name}))
                 continue
             self._record_import(alias, f"{node.module}.{alias.name}")
 

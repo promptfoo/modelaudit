@@ -3607,7 +3607,12 @@ def _priority_alias_usage_lines(
                 canonical_builtin_helper_aliases,
             )
             if has_priority_reference_syntax
-            and (b"getattr" in line or b"vars" in line or has_canonical_namespace_helper_use)
+            and (
+                b"getattr" in line
+                or b"__getattribute__" in line
+                or b"vars" in line
+                or has_canonical_namespace_helper_use
+            )
             else None
         )
         is_getattr_priority_call = getattr_member is not None
@@ -7514,6 +7519,28 @@ def _line_uses_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> bo
             rb"(?<![A-Za-z0-9_.])(?:builtins\.)?vars\s*\(\s*" + re.escape(alias) + rb"\s*\)\s*\[",
             code_line,
         )
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?vars\s*\(\s*" + re.escape(alias) + rb"\s*\)\s*\.\s*get\s*\(",
+            code_line,
+        )
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?dict\s*\.\s*get\s*\(\s*(?:builtins\.)?vars\s*\(\s*"
+            + re.escape(alias)
+            + rb"\s*\)\s*,",
+            code_line,
+        )
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?object\s*\.\s*__getattribute__\s*\(\s*" + re.escape(alias) + rb"\s*,",
+            code_line,
+        )
+        or re.search(
+            rb"(?<![A-Za-z0-9_.])(?:builtins\.)?type\s*\(\s*"
+            + re.escape(alias)
+            + rb"\s*\)\s*\.\s*__getattribute__\s*\(\s*"
+            + re.escape(alias)
+            + rb"\s*,",
+            code_line,
+        )
         for alias in aliases
     )
 
@@ -7536,6 +7563,61 @@ def _priority_getattr_alias_member(
         "vars": "vars",
         "builtins.vars": "vars",
     }
+    shadowed_helpers = shadowed_builtin_helper_names or set()
+
+    def is_active_helper(reference: str | None, helper_name: str) -> bool:
+        return (
+            reference is not None
+            and canonical_helpers.get(reference) == helper_name
+            and reference not in shadowed_helpers
+            and ("." not in reference or f"builtins.{helper_name}" not in shadowed_helpers)
+        )
+
+    def vars_target(node: ast.AST) -> ast.AST | None:
+        if not isinstance(node, ast.Call):
+            return None
+        helper_name = _simple_reference_name(node.func)
+        if not is_active_helper(helper_name, "vars") or node.keywords or len(node.args) != 1:
+            return None
+        return node.args[0]
+
+    def unbound_getattribute_target(getter: ast.Call) -> tuple[ast.AST, ast.AST] | None:
+        if (
+            not isinstance(getter.func, ast.Attribute)
+            or getter.func.attr != "__getattribute__"
+            or getter.keywords
+            or len(getter.args) != 2
+        ):
+            return None
+        owner_name = _simple_reference_name(getter.func.value)
+        if owner_name in {"object", "builtins.object"}:
+            return getter.args[0], getter.args[1]
+        owner = getter.func.value
+        if (
+            isinstance(owner, ast.Call)
+            and _simple_reference_name(owner.func) in {"type", "builtins.type"}
+            and not owner.keywords
+            and len(owner.args) == 1
+            and isinstance(owner.args[0], ast.Name)
+            and isinstance(getter.args[0], ast.Name)
+            and owner.args[0].id == getter.args[0].id
+        ):
+            return getter.args[0], getter.args[1]
+        return None
+
+    def mapping_get_target(getter: ast.Call) -> tuple[ast.AST, ast.AST] | None:
+        if getter.keywords:
+            return None
+        if isinstance(getter.func, ast.Attribute) and getter.func.attr == "get" and getter.args:
+            target = vars_target(getter.func.value)
+            if target is not None:
+                return target, getter.args[0]
+        if _simple_reference_name(getter.func) in {"dict.get", "builtins.dict.get"} and len(getter.args) >= 2:
+            target = vars_target(getter.args[0])
+            if target is not None:
+                return target, getter.args[1]
+        return None
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -7545,28 +7627,22 @@ def _priority_getattr_alias_member(
         if isinstance(call_target, ast.Call):
             getter = call_target
             getter_name = _simple_reference_name(getter.func)
-            if (
-                canonical_helpers.get(getter_name or "") != "getattr"
-                or getter_name in (shadowed_builtin_helper_names or set())
-                or ("." in (getter_name or "") and "builtins.getattr" in (shadowed_builtin_helper_names or set()))
-            ):
+            if is_active_helper(getter_name, "getattr"):
+                if getter.keywords or len(getter.args) < 2:
+                    continue
+                target_node = getter.args[0]
+                member_node = getter.args[1]
+            elif unbound_getattribute := unbound_getattribute_target(getter):
+                target_node, member_node = unbound_getattribute
+            elif mapping_get := mapping_get_target(getter):
+                target_node, member_node = mapping_get
+            else:
                 continue
-            if getter.keywords or len(getter.args) < 2:
-                continue
-            target_node = getter.args[0]
-            member_node = getter.args[1]
         elif isinstance(call_target, ast.Subscript) and isinstance(call_target.value, ast.Call):
             getter = call_target.value
-            getter_name = _simple_reference_name(getter.func)
-            if (
-                canonical_helpers.get(getter_name or "") != "vars"
-                or getter_name in (shadowed_builtin_helper_names or set())
-                or ("." in (getter_name or "") and "builtins.vars" in (shadowed_builtin_helper_names or set()))
-            ):
+            target_node = vars_target(getter)
+            if target_node is None:
                 continue
-            if getter.keywords or len(getter.args) != 1:
-                continue
-            target_node = getter.args[0]
             member_node = call_target.slice
         else:
             continue
