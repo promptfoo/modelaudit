@@ -2,6 +2,7 @@
 
 import math
 import os
+import re
 import struct
 from typing import Any, ClassVar
 
@@ -22,6 +23,99 @@ class PyTorchBinaryScanner(BaseScanner):
     description = "Scans PyTorch binary tensor files for suspicious patterns"
     supported_extensions: ClassVar[list[str]] = [".bin"]
     SHEBANG_CONTEXT_BYTES: ClassVar[int] = 50
+    SECURITY_CODE_REGEX_MAX_MATCH_BYTES: ClassVar[int] = len(b"ctypes.windll.LoadLibrary(") + 5 * 8
+    SECURITY_CODE_PATTERNS: ClassVar[frozenset[bytes]] = frozenset(
+        {
+            b"eval(",
+            b"exec(",
+            b"__import__",
+            b"execfile(",
+            b"os.system",
+            b"subprocess.call",
+            b"subprocess.Popen",
+            b"socket.socket",
+            b"ctypes.CDLL",
+            b"ctypes.cdll",
+            b"ctypes.windll",
+            b"ctypes.WinDLL",
+            b"ffi.dlopen",
+            b"dlopen(",
+            b"LoadLibrary",
+            b"posix\nsystem",
+            b"posix\npopen",
+            b"nt\nsystem",
+            b"nt\npopen",
+        }
+    )
+    SECURITY_CODE_REGEX_PATTERNS: ClassVar[tuple[tuple[bytes, re.Pattern[bytes]], ...]] = (
+        (b"eval(", re.compile(rb"(?<![\w.])eval[ \t\r\n]{0,8}\(")),
+        (b"exec(", re.compile(rb"(?<![\w.])exec[ \t\r\n]{0,8}\(")),
+        (b"__import__", re.compile(rb"(?<![\w.])__import__[ \t\r\n]{0,8}\(")),
+        (b"execfile(", re.compile(rb"(?<![\w.])execfile[ \t\r\n]{0,8}\(")),
+        (
+            b"os.system",
+            re.compile(rb"(?<![\w.])os[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}system[ \t\r\n]{0,8}\("),
+        ),
+        (
+            b"subprocess.call",
+            re.compile(rb"(?<![\w.])subprocess[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}call[ \t\r\n]{0,8}\("),
+        ),
+        (
+            b"subprocess.Popen",
+            re.compile(rb"(?<![\w.])subprocess[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}Popen[ \t\r\n]{0,8}\("),
+        ),
+        (
+            b"socket.socket",
+            re.compile(rb"(?<![\w.])socket[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}socket[ \t\r\n]{0,8}\("),
+        ),
+        (
+            b"ctypes.CDLL",
+            re.compile(rb"(?<![\w.])ctypes[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}CDLL[ \t\r\n]{0,8}\("),
+        ),
+        (
+            b"ctypes.cdll",
+            re.compile(
+                rb"(?<![\w.])ctypes[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}cdll"
+                rb"[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}LoadLibrary[ \t\r\n]{0,8}\("
+            ),
+        ),
+        (
+            b"ctypes.windll",
+            re.compile(
+                rb"(?<![\w.])ctypes[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}windll"
+                rb"[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}LoadLibrary[ \t\r\n]{0,8}\("
+            ),
+        ),
+        (
+            b"ctypes.WinDLL",
+            re.compile(rb"(?<![\w.])ctypes[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}WinDLL[ \t\r\n]{0,8}\("),
+        ),
+        (
+            b"ffi.dlopen",
+            re.compile(rb"(?<![\w.])ffi[ \t\r\n]{0,8}\.[ \t\r\n]{0,8}dlopen[ \t\r\n]{0,8}\("),
+        ),
+        (b"dlopen(", re.compile(rb"(?<![\w.])dlopen[ \t\r\n]{0,8}\(")),
+        (b"LoadLibrary", re.compile(rb"(?<![\w.])LoadLibrary[ \t\r\n]{0,8}\(")),
+    )
+    SECURITY_CODE_REGEX_PATTERN_LABELS: ClassVar[frozenset[bytes]] = frozenset(
+        {
+            b"eval(",
+            b"exec(",
+            b"__import__",
+            b"execfile(",
+            b"os.system",
+            b"subprocess.call",
+            b"subprocess.Popen",
+            b"socket.socket",
+            b"ctypes.CDLL",
+            b"ctypes.cdll",
+            b"ctypes.windll",
+            b"ctypes.WinDLL",
+            b"ffi.dlopen",
+            b"dlopen(",
+            b"LoadLibrary",
+        }
+    )
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -211,6 +305,7 @@ class PyTorchBinaryScanner(BaseScanner):
         longest_pattern = max(
             [
                 self.SHEBANG_CONTEXT_BYTES,
+                self.SECURITY_CODE_REGEX_MAX_MATCH_BYTES + 1,
                 *(len(pattern) for pattern in BINARY_CODE_PATTERNS),
                 *(len(pattern.encode("utf-8")) for pattern in (self.blacklist_patterns or []) if pattern),
                 *(len(signature) for signature in EXECUTABLE_SIGNATURES),
@@ -227,8 +322,49 @@ class PyTorchBinaryScanner(BaseScanner):
         overlap_prefix_len: int = 0,
     ) -> None:
         """Check for patterns that might indicate embedded code"""
-        # Common patterns that might indicate embedded Python code
         found_suspicious = False
+        reported_matches: set[tuple[bytes, int]] = set()
+
+        def add_pattern_finding(
+            pattern: bytes,
+            pos: int,
+            *,
+            end_pos: int | None = None,
+            severity: IssueSeverity | None = None,
+        ) -> None:
+            nonlocal found_suspicious
+            if (end_pos if end_pos is not None else pos + len(pattern)) <= overlap_prefix_len:
+                return
+            absolute_offset = offset + pos
+            match_key = (pattern, absolute_offset)
+            if match_key in reported_matches:
+                return
+            reported_matches.add(match_key)
+            finding_severity = severity or (
+                IssueSeverity.WARNING if pattern in self.SECURITY_CODE_PATTERNS else IssueSeverity.INFO
+            )
+            result.add_check(
+                name="Embedded Code Pattern Detection",
+                passed=False,
+                message=f"Suspicious code pattern found: {pattern.decode('ascii', errors='ignore')}",
+                rule_code="S902",
+                severity=finding_severity,
+                location=f"{self.current_file_path} (offset: {absolute_offset})",
+                details={
+                    "pattern": pattern.decode("ascii", errors="ignore"),
+                    "offset": absolute_offset,
+                    "pattern_confidence": (
+                        "high" if finding_severity == IssueSeverity.WARNING else "context_dependent"
+                    ),
+                },
+            )
+            found_suspicious = True
+
+        for pattern, regex in self.SECURITY_CODE_REGEX_PATTERNS:
+            for match in regex.finditer(chunk):
+                add_pattern_finding(pattern, match.start(), end_pos=match.end(), severity=IssueSeverity.WARNING)
+                break
+
         for pattern in BINARY_CODE_PATTERNS:
             search_start = 0
             while True:
@@ -236,21 +372,17 @@ class PyTorchBinaryScanner(BaseScanner):
                 if pos == -1:
                     break
                 search_start = pos + 1
-                if pos + len(pattern) <= overlap_prefix_len:
+                if (
+                    pattern in self.SECURITY_CODE_REGEX_PATTERN_LABELS
+                    and pos > 0
+                    and (chunk[pos - 1 : pos].isalnum() or chunk[pos - 1 : pos] == b"_")
+                ):
                     continue
-                result.add_check(
-                    name="Embedded Code Pattern Detection",
-                    passed=False,
-                    message=f"Suspicious code pattern found: {pattern.decode('ascii', errors='ignore')}",
-                    rule_code="S902",
-                    severity=IssueSeverity.INFO,
-                    location=f"{self.current_file_path} (offset: {offset + pos})",
-                    details={
-                        "pattern": pattern.decode("ascii", errors="ignore"),
-                        "offset": offset + pos,
-                    },
+                add_pattern_finding(
+                    pattern,
+                    pos,
+                    severity=(IssueSeverity.INFO if pattern in self.SECURITY_CODE_REGEX_PATTERN_LABELS else None),
                 )
-                found_suspicious = True
                 break
 
         if not found_suspicious and offset == 0:  # Only record success on first chunk

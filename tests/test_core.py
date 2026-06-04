@@ -5,10 +5,12 @@ from __future__ import annotations
 import base64
 import gzip
 import importlib
+import io
 import json
 import os
 import pickle
 import struct
+import subprocess
 import sys
 import zipfile
 from collections.abc import Callable, Iterator
@@ -19,6 +21,7 @@ from typing import Any, cast
 import pytest
 
 from modelaudit import core as core_module
+from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.core import scan_file, scan_model_directory_or_file
@@ -26,6 +29,7 @@ from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner, m
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
+from modelaudit.scanners.zip_scanner import ZipScanner
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
@@ -40,6 +44,7 @@ from modelaudit.utils.file.detection import (
 from modelaudit.utils.helpers import cache_decorator
 from modelaudit.utils.helpers.secure_hasher import SecureFileHasher, compute_aggregate_hash
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
+from modelaudit.whitelists import POPULAR_MODELS
 from tests.helpers import (
     create_mock_coreml,
     create_mock_gguf,
@@ -166,6 +171,114 @@ def _build_malicious_pickle(*, protocol: int | None = None) -> bytes:
 def _require_tf_protos() -> None:
     if not _has_tf_protos():
         pytest.skip("TensorFlow protobuf stubs unavailable")
+
+
+def test_tensorflow_protobuf_bootstrap_avoids_shadow_package(tmp_path: Path) -> None:
+    shadow_root = tmp_path / "shadow"
+    shadow_tensorflow = shadow_root / "tensorflow"
+    shadow_google = shadow_root / "google"
+    shadow_tensorflow.mkdir(parents=True)
+    shadow_google.mkdir()
+    tensorflow_sentinel = tmp_path / "shadow_tensorflow_imported.txt"
+    google_sentinel = tmp_path / "shadow_google_imported.txt"
+    (shadow_tensorflow / "__init__.py").write_text(
+        "\n".join(
+            [
+                "import os",
+                "from pathlib import Path",
+                "Path(os.environ['SHADOW_TENSORFLOW_SENTINEL']).write_text('imported', encoding='utf-8')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (shadow_google / "__init__.py").write_text(
+        "\n".join(
+            [
+                "import os",
+                "from pathlib import Path",
+                "Path(os.environ['SHADOW_GOOGLE_SENTINEL']).write_text('imported', encoding='utf-8')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    project_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    pythonpath_entries = [str(shadow_root), str(project_root)]
+    existing_pythonpath = env.get("PYTHONPATH")
+    if existing_pythonpath:
+        pythonpath_entries.append(existing_pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+    env["SHADOW_TENSORFLOW_SENTINEL"] = str(tensorflow_sentinel)
+    env["SHADOW_GOOGLE_SENTINEL"] = str(google_sentinel)
+
+    script = """
+import importlib
+import json
+import modelaudit.protos
+
+tensorflow_module = importlib.import_module("tensorflow")
+saved_model_cls = modelaudit.protos.get_saved_model_class()
+print(json.dumps({
+    "available": modelaudit.protos._check_vendored_protos(),
+    "using_vendored": modelaudit.protos.is_using_vendored_protos(),
+    "tensorflow_file": getattr(tensorflow_module, "__file__", ""),
+    "saved_model_class": saved_model_cls.__name__,
+}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not tensorflow_sentinel.exists()
+    assert not google_sentinel.exists()
+    payload = json.loads(result.stdout)
+    assert payload["available"] is True
+    assert payload["saved_model_class"] == "SavedModel"
+    tensorflow_file = Path(payload["tensorflow_file"]).resolve()
+    assert not tensorflow_file.is_relative_to(shadow_root)
+    if payload["using_vendored"]:
+        assert tensorflow_file.is_relative_to(project_root / "modelaudit" / "protos")
+
+
+@pytest.mark.parametrize(
+    ("enable_user_site", "expected_trusted"),
+    [
+        pytest.param(False, False, id="disabled"),
+        pytest.param(None, False, id="security-disabled"),
+        pytest.param(True, True, id="enabled"),
+    ],
+)
+def test_tensorflow_trusted_root_honors_user_site_enablement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    enable_user_site: bool | None,
+    expected_trusted: bool,
+) -> None:
+    import modelaudit.protos
+
+    user_site = tmp_path / "user-site"
+    shadow_tensorflow = user_site / "tensorflow"
+    shadow_tensorflow.mkdir(parents=True)
+    (shadow_tensorflow / "__init__.py").write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(modelaudit.protos.sysconfig, "get_paths", lambda: {})
+    monkeypatch.setattr(modelaudit.protos.site, "getsitepackages", lambda: [])
+    monkeypatch.setattr(modelaudit.protos.site, "getusersitepackages", lambda: str(user_site))
+    monkeypatch.setattr(modelaudit.protos.site, "ENABLE_USER_SITE", enable_user_site)
+
+    trusted_root = modelaudit.protos._trusted_tensorflow_root()
+
+    if expected_trusted:
+        assert trusted_root == user_site.resolve()
+    else:
+        assert trusted_root is None
 
 
 def _build_malicious_tf_metagraph() -> bytes:
@@ -1126,6 +1239,38 @@ def test_scan_file_does_not_let_invalid_flax_prefix_mask_malicious_lightgbm(
     )
 
 
+@pytest.mark.parametrize("suffix", [".flax", ".orbax", ".jax", ".msgpack"])
+def test_scan_file_routes_native_flax_suffix_lightgbm_content(tmp_path: Path, suffix: str) -> None:
+    disguised_lightgbm = tmp_path / f"payload{suffix}"
+    _write_malicious_lightgbm(disguised_lightgbm)
+
+    assert file_detection.detect_file_format(str(disguised_lightgbm)) == "lightgbm"
+    assert file_detection.detect_file_format_from_magic(str(disguised_lightgbm)) == "lightgbm"
+    assert file_detection.detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
+
+    result = scan_file(str(disguised_lightgbm), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "lightgbm"
+    assert any(
+        check.name == "Command/Network Correlation Check" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_does_not_route_native_flax_suffix_lightgbm_near_match(tmp_path: Path) -> None:
+    near_match = tmp_path / "payload.flax"
+    _write_malicious_lightgbm(near_match, valid=False)
+
+    assert file_detection.detect_file_format(str(near_match)) == "flax_msgpack"
+    assert file_detection.detect_file_format_from_magic(str(near_match)) == "unknown"
+    assert file_detection.detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+
+    result = scan_file(str(near_match), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert not any(check.name == "Command/Network Correlation Check" for check in result.checks)
+
+
 @pytest.mark.parametrize("foreign_format", ["rknn", "torch7", "cntk", "lightgbm"])
 def test_scan_file_preserves_foreign_findings_in_flax_content_overlap(tmp_path: Path, foreign_format: str) -> None:
     if not flax_msgpack_scanner.HAS_MSGPACK:
@@ -1463,6 +1608,49 @@ def test_scan_file_routes_renamed_flax_stream_after_pickle_shaped_prefix(tmp_pat
     checkpoint = tmp_path / "stream-pickle-prefix.jpg"
     checkpoint.write_bytes(
         prefix
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_scan_file_complete_pickle_does_not_merge_inconclusive_flax(tmp_path: Path, nested: bool) -> None:
+    payload = pickle.dumps((complex(1, 2), {f"field{i}": i for i in range(2500)}), protocol=4)
+    complete_pickle = tmp_path / "complete.pkl"
+    complete_pickle.write_bytes(payload)
+
+    assert file_detection.has_inconclusive_renamed_flax_msgpack_routing(complete_pickle)
+
+    target = complete_pickle
+    expected_scanner = "pickle"
+    if nested:
+        target = tmp_path / "complete.zip"
+        _create_misnamed_zip(target, {"complete.pkl": payload})
+        expected_scanner = "zip"
+
+    result = scan_file(str(target), config={"cache_scan_results": False})
+
+    assert result.scanner_name == expected_scanner
+    assert result.success is True
+    assert "flax_msgpack_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+
+
+def test_scan_file_still_detects_flax_after_complete_pickle_prefix(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "complete-pickle-prefix.jpg"
+    checkpoint.write_bytes(
+        pickle.dumps(None, protocol=4)
         + flax_msgpack_scanner.msgpack.packb(
             {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
             use_bin_type=True,
@@ -2877,6 +3065,321 @@ def test_scan_file_routes_misnamed_config_only_keras_zip_by_content(tmp_path: Pa
 
     assert result.scanner_name == "keras_zip"
     assert any("lambda" in issue.message.lower() for issue in result.issues)
+
+
+@pytest.mark.parametrize("filename", ["model.jpg", "model.keras"])
+def test_scan_file_fails_closed_when_content_routed_keras_zip_scanner_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+) -> None:
+    disguised_keras = tmp_path / filename
+    _create_misnamed_zip(
+        disguised_keras,
+        {
+            "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
+            "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
+        },
+    )
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    original_load_scanner = core_module._registry._load_scanner
+
+    def load_scanner(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "keras_zip":
+            return None
+        return original_load_scanner(scanner_id)
+
+    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+
+    reset_cache_manager()
+    try:
+        result = scan_file(str(disguised_keras), config=config)
+        repeated = scan_file(str(disguised_keras), config=config)
+
+        assert repeated.success is False
+        assert repeated.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    assert "recognized_format_scanner_unavailable" in result.metadata["scan_outcome_reasons"]
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.details["format"] == "keras_zip"
+    assert check.details["preferred_scanner_id"] == "keras_zip"
+
+    aggregate = scan_model_directory_or_file(str(disguised_keras), cache_scan_results=False)
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_bypasses_stale_cache_when_keras_zip_scanner_becomes_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disguised_keras = tmp_path / "model.jpg"
+    _create_misnamed_zip(
+        disguised_keras,
+        {
+            "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
+            "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
+        },
+    )
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    original_load_scanner = core_module._registry._load_scanner
+    keras_scanner_available = True
+
+    def load_scanner(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "keras_zip" and not keras_scanner_available:
+            return None
+        return original_load_scanner(scanner_id)
+
+    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+
+    reset_cache_manager()
+    try:
+        cached = scan_file(str(disguised_keras), config=config)
+        assert cached.success is True
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+
+        keras_scanner_available = False
+        unavailable = scan_file(str(disguised_keras), config=config)
+    finally:
+        reset_cache_manager()
+
+    assert unavailable.scanner_name == "zip"
+    assert unavailable.success is False
+    assert unavailable.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+
+
+def test_scan_file_bypasses_stale_cache_when_pytorch_zip_scanner_becomes_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    original_load_scanner = core_module._registry._load_scanner
+    pytorch_scanner_available = True
+
+    def load_scanner(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "pytorch_zip" and not pytorch_scanner_available:
+            return None
+        return original_load_scanner(scanner_id)
+
+    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+
+    reset_cache_manager()
+    try:
+        cached = scan_file(str(model_path), config=config)
+        assert cached.success is True
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+
+        pytorch_scanner_available = False
+        unavailable = scan_file(str(model_path), config=config)
+    finally:
+        reset_cache_manager()
+
+    assert unavailable.scanner_name == "zip"
+    assert unavailable.success is False
+    assert unavailable.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+
+
+def test_scan_file_bypasses_outer_archive_cache_when_nested_scanner_becomes_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested_keras = io.BytesIO()
+    with zipfile.ZipFile(nested_keras, "w") as archive:
+        archive.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+        archive.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+
+    outer_archive = tmp_path / "outer.zip"
+    with zipfile.ZipFile(outer_archive, "w") as archive:
+        archive.writestr("nested.keras", nested_keras.getvalue())
+
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    original_load_scanner = core_module._registry._load_scanner
+    keras_scanner_available = True
+
+    def load_scanner(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "keras_zip" and not keras_scanner_available:
+            return None
+        return original_load_scanner(scanner_id)
+
+    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+
+    reset_cache_manager()
+    try:
+        cached = scan_file(str(outer_archive), config=config)
+        assert cached.success is True
+        assert "keras_zip" in cached.metadata["scanner_dependency_ids"]
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+
+        keras_scanner_available = False
+        unavailable = scan_file(str(outer_archive), config=config)
+    finally:
+        reset_cache_manager()
+
+    assert unavailable.scanner_name == "zip"
+    assert unavailable.success is False
+    assert "zip_analysis_incomplete" in unavailable.metadata["scan_outcome_reasons"]
+    nested_check = next(check for check in unavailable.checks if check.name == "Format Detection")
+    assert nested_check.location == f"{outer_archive}:nested.keras"
+    assert nested_check.details["preferred_scanner_id"] == "keras_zip"
+
+
+def test_scan_file_disables_advanced_cache_for_unavailable_keras_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disguised_keras = tmp_path / "model.keras"
+    _create_misnamed_zip(
+        disguised_keras,
+        {
+            "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
+            "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
+        },
+    )
+    original_load_scanner = core_module._registry._load_scanner
+
+    def load_scanner(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "keras_zip":
+            return None
+        return original_load_scanner(scanner_id)
+
+    def scan_advanced_without_cache(
+        path: str,
+        scanner: ZipScanner,
+        progress_callback: Any,
+        timeout: int,
+        *,
+        allowed_shard_paths: list[str] | None = None,
+    ) -> ScanResult:
+        assert path == str(disguised_keras)
+        assert progress_callback is None
+        assert timeout == 7200
+        assert allowed_shard_paths is None
+        assert scanner.config["cache_enabled"] is False
+        return scanner.scan(path)
+
+    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+    monkeypatch.setattr(core_module, "should_use_advanced_handler", lambda _path: True)
+    monkeypatch.setattr(core_module, "scan_advanced_large_file", scan_advanced_without_cache)
+
+    result = scan_file(
+        str(disguised_keras),
+        config={"cache_enabled": True, "cache_dir": str(tmp_path / "cache"), "min_cache_file_size": 0},
+    )
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+
+
+def test_scan_file_preserves_generic_findings_when_content_routed_keras_zip_scanner_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disguised_keras = tmp_path / "model.jpg"
+    _create_misnamed_zip(
+        disguised_keras,
+        {
+            "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
+            "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
+            "payload.pkl": _build_malicious_pickle(),
+        },
+    )
+    original_load_scanner = core_module._registry._load_scanner
+
+    def load_scanner(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "keras_zip":
+            return None
+        return original_load_scanner(scanner_id)
+
+    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+
+    result = scan_file(str(disguised_keras), config={"cache_enabled": False})
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    _assert_system_pickle_detected(result, "payload.pkl")
+
+
+def test_scan_file_unavailable_keras_scanner_restores_whitelist_downgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disguised_keras = tmp_path / "model.keras"
+    _create_misnamed_zip(
+        disguised_keras,
+        {
+            "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
+            "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
+        },
+    )
+    original_load_scanner = core_module._registry._load_scanner
+
+    def load_scanner(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "keras_zip":
+            return None
+        return original_load_scanner(scanner_id)
+
+    def scan_with_whitelisted_finding(self: ZipScanner, path: str) -> ScanResult:
+        self.context = UnifiedMLContext(
+            file_path=Path(path),
+            file_size=Path(path).stat().st_size,
+            file_type=".keras",
+            model_id=next(iter(POPULAR_MODELS)),
+            model_source="huggingface",
+        )
+        result = self._create_result()
+        result.add_check(
+            name="Fallback Security Finding",
+            passed=False,
+            message="High confidence fallback anomaly",
+            severity=IssueSeverity.CRITICAL,
+            rule_code="CUSTOM001",
+        )
+        result.finish(success=True)
+        assert result.issues[0].severity == IssueSeverity.INFO
+        return result
+
+    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+    monkeypatch.setattr(ZipScanner, "scan", scan_with_whitelisted_finding)
+
+    result = scan_file(str(disguised_keras), config={"cache_enabled": False})
+
+    assert result.success is False
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].details["whitelist_downgrade_restored"] is True
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
 
 
 def test_scan_file_routes_misnamed_oversized_config_only_keras_zip_by_content(tmp_path: Path) -> None:
