@@ -340,6 +340,14 @@ def selected_scanner_extensions(
             if conservative
             else set()
         )
+        if (
+            conservative
+            and "" not in remote_excluded_extensions
+            and any(
+                not os.path.splitext(str(filename))[1] for filename in scanner_info.get("content_routed_filenames", [])
+            )
+        ):
+            extensions.add("")
         for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
             for extension in scanner_info.get(key, []):
                 extension_text = str(extension).lower()
