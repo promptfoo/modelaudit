@@ -125,6 +125,7 @@ R_SENSITIVE_ASSIGNMENT_TARGET: Final[str] = (
     rf"{SENSITIVE_R_ASSIGNMENT_IDENTIFIER}{R_ASSIGNMENT_INDEX_SUFFIX})"
 )
 R_LEFTWARD_ASSIGNMENT_OPERATOR: Final[str] = r"<{1,2}-"
+R_SENSITIVE_LEFTWARD_ASSIGNMENT_OPERATOR: Final[str] = rf"(?:=|{R_LEFTWARD_ASSIGNMENT_OPERATOR})"
 R_RAW_STRING_PREFIX_RE: Final[re.Pattern[str]] = re.compile(r"""[rR]"(?P<dashes>-*)(?P<delimiter>[\(\[\{])""")
 R_RAW_STRING_CLOSING_DELIMITERS: Final[dict[str, str]] = {"(": ")", "[": "]", "{": "}"}
 R_RAW_LEFT_ASSIGNMENT_CONTEXT_CHARS: Final[int] = 4_096
@@ -262,7 +263,7 @@ BLOCK_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
 )
 BRACKETED_QUERY_KEY_SUFFIX_RE: Final[re.Pattern[str]] = re.compile(r"(?:\[[^\]]*\])+\Z")
 R_SENSITIVE_ASSIGNMENT_PREFIX: Final[str] = (
-    rf"(?P<prefix>{R_SENSITIVE_ASSIGNMENT_TARGET}\s*{R_LEFTWARD_ASSIGNMENT_OPERATOR}\s*"
+    rf"(?P<prefix>{R_SENSITIVE_ASSIGNMENT_TARGET}\s*{R_SENSITIVE_LEFTWARD_ASSIGNMENT_OPERATOR}\s*"
     rf"{VALUE_OPENERS_PATTERN})"
 )
 R_LEFTWARD_SENSITIVE_ASSIGNMENT_TARGET_RE: Final[re.Pattern[str]] = re.compile(
@@ -285,7 +286,7 @@ R_QUOTED_RIGHTWARD_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?P<suffix>\s*->{{1,2}}\s*{R_SENSITIVE_ASSIGNMENT_TARGET})"
 )
 LEFTWARD_R_RAW_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i){R_SENSITIVE_ASSIGNMENT_TARGET}\s*{R_LEFTWARD_ASSIGNMENT_OPERATOR}\s*$"
+    rf"(?i){R_SENSITIVE_ASSIGNMENT_TARGET}\s*{R_SENSITIVE_LEFTWARD_ASSIGNMENT_OPERATOR}\s*$"
 )
 RIGHTWARD_R_RAW_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\s*->{{1,2}}\s*{R_SENSITIVE_ASSIGNMENT_TARGET}"
@@ -678,6 +679,9 @@ def _redact_r_quoted_rightward_assignment(match: re.Match[str]) -> str:
 
 
 def _redact_r_unterminated_quoted_assignment(match: re.Match[str]) -> str:
+    if "=" in match.group("prefix"):
+        string_prefix = match.group("string_prefix") or ""
+        return f"{match.group('prefix')}{string_prefix}{match.group('quote')}{REDACTED_EVIDENCE_VALUE}"
     return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
 
 

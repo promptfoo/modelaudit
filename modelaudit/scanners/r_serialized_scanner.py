@@ -600,7 +600,8 @@ class RSerializedScanner(BaseScanner):
                     current_text = "".join(current_parts)
                     if (
                         gap
-                        and all(byte in (0x0A, 0x0D) for byte in gap)
+                        and any(byte in (0x0A, 0x0D) for byte in gap)
+                        and all(byte in (0x09, 0x0A, 0x0D, 0x20) for byte in gap)
                         and _unfinished_r_assignment_literal_closing_sequence(current_text) is not None
                     ):
                         current_parts.append(gap.decode("ascii"))

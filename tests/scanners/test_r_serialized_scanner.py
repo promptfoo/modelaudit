@@ -660,6 +660,7 @@ def test_scan_redacts_and_detects_leftward_assignment_expressions(tmp_path: Path
         ('`access-token` <- "BACKTICK_LEFT_SECRET"', "BACKTICK_LEFT_SECRET"),
         ('"BACKTICK_RIGHT_SECRET" -> `client-secret`', "BACKTICK_RIGHT_SECRET"),
         ('`access token` <- "SPACED_BACKTICK_SECRET"', "SPACED_BACKTICK_SECRET"),
+        ('`access token` = "BACKTICK_EQUALS_SECRET"', "BACKTICK_EQUALS_SECRET"),
         ('api.key <- "DOT_LEFT_SECRET"', "DOT_LEFT_SECRET"),
         ('"DOT_RIGHT_SECRET" -> access.token', "DOT_RIGHT_SECRET"),
         ('dbPassword <- "CAMEL_PASSWORD_SECRET"', "CAMEL_PASSWORD_SECRET"),
@@ -672,6 +673,7 @@ def test_scan_redacts_and_detects_leftward_assignment_expressions(tmp_path: Path
         ('"RIGHT_MEMBER_SECRET" -> config$token', "RIGHT_MEMBER_SECRET"),
         ('pwd <- "PWD_SECRET_VALUE"', "PWD_SECRET_VALUE"),
         ('token <- r"(RAW_LEFT_SECRET)"', "RAW_LEFT_SECRET"),
+        ('token = r"(RAW_EQUALS_SECRET)"', "RAW_EQUALS_SECRET"),
         ('R"---{RAW_RIGHT_SECRET}---" -> client.secret', "RAW_RIGHT_SECRET"),
         ('refresh.token <- r"[raw values may contain \\"quotes\\" and ; delimiters]"', "raw values may contain"),
         ('token <- r"(UNTERMINATED_RAW_SECRET', "UNTERMINATED_RAW_SECRET"),
@@ -711,6 +713,7 @@ def test_scan_redacts_complex_r_assignment_payload_samples(tmp_path: Path, assig
         "`access-token` <- 'BACKTICK_LEFT_SECRET'",
         "'BACKTICK_RIGHT_SECRET' -> `refresh-token`",
         "`api key` <- 'SPACED_BACKTICK_SECRET'",
+        '`access token` = "BACKTICK_EQUALS_SECRET"',
         r'token <- "ABC\"ESCAPED_SECRET"',
         "api.key <- 'DOT_LEFT_SECRET'",
         "'DOT_RIGHT_SECRET' -> access.token",
@@ -724,6 +727,7 @@ def test_scan_redacts_complex_r_assignment_payload_samples(tmp_path: Path, assig
         "'RIGHT_MEMBER_SECRET' -> config$token",
         "pwd <- 'PWD_SECRET_VALUE'",
         'token <- r"(RAW_LEFT_SECRET)"',
+        'token = r"(RAW_EQUALS_SECRET)"',
         'R"---{RAW_RIGHT_SECRET}---" -> client.secret',
         'refresh.token <- r"[raw values may contain \\"quotes\\" and ; delimiters]"',
         '"access token" <- "QUOTED_NAME_SECRET"',
@@ -802,6 +806,25 @@ def test_scan_detects_and_redacts_multiline_credential_assignments(tmp_path: Pat
     assert "<redacted>" in sample
     assert "MULTILINE" not in sample
     assert "payload" not in sample
+
+
+def test_scan_redacts_indented_multiline_credential_assignment(tmp_path: Path) -> None:
+    path = tmp_path / "indented-multiline-credential-assignment.rds"
+    _write_raw_r_serialized(
+        path,
+        'expression\nlanguage\nbase::system("curl"); token <- "FIRST_SECRET\n\tSECOND_SECRET base::system(curl)"',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    sample = symbol_checks[0].details["examples"][0]["sample"]
+    assert "FIRST_SECRET" not in sample
+    assert "SECOND_SECRET" not in sample
+    assert REDACTED_EVIDENCE_VALUE in sample
 
 
 def test_scan_redacts_unterminated_quoted_assignment_without_credential_false_positive(tmp_path: Path) -> None:

@@ -440,6 +440,19 @@ def test_redacts_escaped_and_backticked_r_assignments() -> None:
     assert f'`api key` <- "{REDACTED_EVIDENCE_VALUE}"' in redacted
 
 
+def test_redacts_r_equals_assignments_for_quoted_identifiers_and_raw_values() -> None:
+    """R equals assignments should use the same fail-closed evidence handling."""
+    redacted = redact_evidence_string(
+        '`access token` = "BACKTICK_EQUALS_SECRET"; token = r"(RAW_EQUALS_SECRET)"',
+        max_chars=500,
+    )
+
+    assert "BACKTICK_EQUALS_SECRET" not in redacted
+    assert "RAW_EQUALS_SECRET" not in redacted
+    assert f'`access token` = "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f"token = {REDACTED_EVIDENCE_VALUE}" in redacted
+
+
 def test_redacts_prefixed_camel_case_r_assignments() -> None:
     """Camel-case R credential names should not preserve raw values."""
     redacted = redact_evidence_string(
