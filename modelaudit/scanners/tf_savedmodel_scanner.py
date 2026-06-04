@@ -2,6 +2,7 @@
 
 import base64
 import contextlib
+import hashlib
 import logging
 import os
 import re
@@ -52,6 +53,7 @@ _ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
 _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
 _MAX_PROTOBUF_PARSE_BYTES = 20 * 1024 * 1024
+_MAX_KERAS_METADATA_PARSE_BYTES = _MAX_PROTOBUF_PARSE_BYTES
 _MAX_COLLECTION_VALUE_BYTES = 256 * 1024
 _CORE_ROOT_MODEL_FILES = frozenset({"saved_model.pb", "keras_metadata.pb", "fingerprint.pb"})
 _CORE_ROOT_MODEL_DIRS = frozenset({"assets", "assets.extra", "variables"})
@@ -301,6 +303,51 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result.finish(success=False)
         return result
 
+    @staticmethod
+    def _mark_keras_metadata_parse_budget_exceeded(result: ScanResult, path: str) -> None:
+        reason = "keras_metadata_parse_budget_exceeded"
+        mark_inconclusive_scan_result(result, reason)
+        mark_operational_scan_error(result, reason)
+        result.add_check(
+            name="Keras Metadata Parse Budget",
+            passed=False,
+            message="keras_metadata.pb exceeds bounded parse budget",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "max_parse_bytes": _MAX_KERAS_METADATA_PARSE_BYTES,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+        )
+
+    @staticmethod
+    def _add_bounded_file_integrity_check(path: str, result: ScanResult, content: bytes) -> None:
+        """Record hashes for the same bounded metadata bytes used by security analysis."""
+        hashes: dict[str, str | None] = {"md5": None, "sha256": None, "sha512": None}
+        try:
+            hashes["md5"] = hashlib.md5(content, usedforsecurity=False).hexdigest()
+        except Exception as exc:
+            logger.warning("Failed to calculate MD5 hash for %s: %s", path, exc)
+        try:
+            hashes["sha256"] = hashlib.sha256(content).hexdigest()
+        except Exception as exc:
+            logger.warning("Failed to calculate SHA256 hash for %s: %s", path, exc)
+        try:
+            hashes["sha512"] = hashlib.sha512(content).hexdigest()
+        except Exception as exc:
+            logger.warning("Failed to calculate SHA512 hash for %s: %s", path, exc)
+
+        result.add_check(
+            name="File Integrity Hash",
+            passed=True,
+            message="File integrity hashes calculated",
+            location=path,
+            details={**hashes, "file_size": len(content)},
+        )
+        result.metadata["file_hashes"] = hashes
+        result.metadata["file_size"] = len(content)
+
     def scan(self, path: str) -> ScanResult:
         """Scan a TensorFlow SavedModel file or directory"""
         # Check if path is valid
@@ -365,19 +412,27 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result.metadata["file_size"] = file_size
         result.metadata["scan_byte_limit"] = _MAX_PROTOBUF_PARSE_BYTES
 
-        # Add file integrity check for compliance
-        self.add_file_integrity_check(path, result)
+        if path.endswith("keras_metadata.pb") and file_size > _MAX_KERAS_METADATA_PARSE_BYTES:
+            self._mark_keras_metadata_parse_budget_exceeded(result, path)
+            result.finish(success=False)
+            return result
+
         self.current_file_path = path
 
         # Check if this is a keras_metadata.pb file
         if path.endswith("keras_metadata.pb"):
             # Scan it for Lambda layers
             try:
-                self._scan_keras_metadata(path, result)
+                self._scan_keras_metadata(path, result, add_integrity_check=True)
             except OSError as e:
                 return self._finish_read_failure(result, path, e)
-            result.finish(success=not result.has_errors)
+            result.finish(
+                success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
+            )
             return result
+
+        # Add file integrity check for compliance
+        self.add_file_integrity_check(path, result)
 
         try:
             # Import vendored protos module (sets up sys.path for tensorflow.* imports)
@@ -1330,12 +1385,17 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 why=get_tf_op_explanation(node.op),
             )
 
-    def _scan_keras_metadata(self, path: str, result: ScanResult) -> None:
+    def _scan_keras_metadata(self, path: str, result: ScanResult, *, add_integrity_check: bool = False) -> None:
         """Scan keras_metadata.pb for Lambda layers and unsafe patterns"""
         try:
             with open(path, "rb") as f:
-                content = f.read()
-                result.bytes_scanned += len(content)
+                content = f.read(_MAX_KERAS_METADATA_PARSE_BYTES + 1)
+                result.bytes_scanned += min(len(content), _MAX_KERAS_METADATA_PARSE_BYTES)
+                if len(content) > _MAX_KERAS_METADATA_PARSE_BYTES:
+                    self._mark_keras_metadata_parse_budget_exceeded(result, path)
+                    return
+                if add_integrity_check:
+                    self._add_bounded_file_integrity_check(path, result, content)
 
                 # Convert to string for pattern matching
                 content_str = content.decode("utf-8", errors="ignore")
