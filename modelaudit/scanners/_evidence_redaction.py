@@ -74,8 +74,8 @@ SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
 QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)({SENSITIVE_ASSIGNMENT_IDENTIFIER}\s*{SENSITIVE_ASSIGNMENT_OPERATOR}\s*)({QUOTED_EVIDENCE_VALUE})"
 )
-RIGHTWARD_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)[^\s\"';&|]+(\s*->{{1,2}}\s*{SENSITIVE_ASSIGNMENT_IDENTIFIER})"
+RIGHTWARD_SENSITIVE_ASSIGNMENT_TARGET_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)->{{1,2}}\s*{SENSITIVE_ASSIGNMENT_IDENTIFIER}"
 )
 QUOTED_RIGHTWARD_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)({QUOTED_EVIDENCE_VALUE})(\s*->{{1,2}}\s*{SENSITIVE_ASSIGNMENT_IDENTIFIER})"
@@ -107,6 +107,21 @@ def _iter_r_raw_string_spans(text: str) -> Iterator[tuple[int, int, int, int, bo
         cursor = literal_end
 
 
+def _replace_spans(text: str, replacements: list[tuple[int, int]]) -> str:
+    if not replacements:
+        return text
+
+    parts: list[str] = []
+    cursor = 0
+    for start, end in replacements:
+        if start < cursor:
+            continue
+        parts.extend((text[cursor:start], REDACTED_EVIDENCE_VALUE))
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
 def _redact_r_raw_assignments(text: str) -> str:
     replacements: list[tuple[int, int]] = []
     for literal_start, literal_end, _content_start, _content_end, _is_terminated in _iter_r_raw_string_spans(text):
@@ -117,9 +132,27 @@ def _redact_r_raw_assignments(text: str) -> str:
         ):
             replacements.append((literal_start, literal_end))
 
-    for literal_start, literal_end in reversed(replacements):
-        text = f"{text[:literal_start]}{REDACTED_EVIDENCE_VALUE}{text[literal_end:]}"
-    return text
+    return _replace_spans(text, replacements)
+
+
+def _redact_bare_rightward_assignments(text: str) -> str:
+    replacements: list[tuple[int, int]] = []
+    for target_match in RIGHTWARD_SENSITIVE_ASSIGNMENT_TARGET_RE.finditer(text):
+        value_end = target_match.start()
+        while value_end > 0 and text[value_end - 1].isspace():
+            value_end -= 1
+
+        value_start = value_end
+        while value_start > 0:
+            character = text[value_start - 1]
+            if character.isspace() or character in "\"';&|":
+                break
+            value_start -= 1
+
+        if value_start < value_end:
+            replacements.append((value_start, value_end))
+
+    return _replace_spans(text, replacements)
 
 
 def _redact_malformed_url(raw_url: str) -> str:
@@ -192,5 +225,5 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
-    redacted = RIGHTWARD_SENSITIVE_ASSIGNMENT_RE.sub(rf"{REDACTED_EVIDENCE_VALUE}\1", redacted)
+    redacted = _redact_bare_rightward_assignments(redacted)
     return _truncate(redacted, max_chars)

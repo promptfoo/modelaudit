@@ -152,3 +152,14 @@ def test_rightward_raw_assignment_does_not_bypass_redaction_with_long_identifier
 
     assert "LONG_RIGHTWARD_RAW_SECRET" not in redacted
     assert redacted.startswith(f"{REDACTED_EVIDENCE_VALUE} -> service_")
+
+
+def test_large_rightward_assignment_evidence_avoids_pathological_backtracking() -> None:
+    """Large printable executable strings should remain practical to redact."""
+    redacted = redact_evidence_string(
+        f"LONG_RIGHTWARD_SECRET -> service_token {'A' * 500_000}",
+        max_chars=200,
+    )
+
+    assert "LONG_RIGHTWARD_SECRET" not in redacted
+    assert redacted.startswith(f"{REDACTED_EVIDENCE_VALUE} -> service_token ")
