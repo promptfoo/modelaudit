@@ -12,7 +12,7 @@ from modelaudit.detectors.suspicious_symbols import (
     KNOWN_SAFE_MODEL_CLASSES,
 )
 
-from ._evidence_redaction import redact_evidence_string
+from ._evidence_redaction import redact_evidence_preview
 from .base import IssueSeverity, ScanResult
 
 # Dangerous patterns to look for inside decoded Lambda bytecode / source
@@ -503,7 +503,7 @@ def _check_lambda_encoded_code(
                 "layer_class": "Lambda",
                 "dangerous_patterns": found_patterns,
                 "function_format": bytecode_format,
-                "code_preview": redact_evidence_string(decoded_str, max_chars=200),
+                "code_preview": redact_evidence_preview(decoded_str, max_chars=200),
             },
             why=(
                 "Lambda layers can execute arbitrary Python code during model inference. "

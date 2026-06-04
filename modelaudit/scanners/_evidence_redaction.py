@@ -10,6 +10,7 @@ from modelaudit.detectors.network_comm import _redact_url_path_tokens
 
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
+EVIDENCE_PREVIEW_LOOKAHEAD: Final[int] = 4096
 
 RFC_URL_PATTERN: Final[str] = r"[a-z][a-z0-9+.-]*://[^\s\"'<>]+"
 URL_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)\b{RFC_URL_PATTERN}")
@@ -179,21 +180,18 @@ def _redact_url_value(raw_url: str) -> str:
         netloc = f"{REDACTED_URL_CREDENTIALS}@{netloc.rsplit('@', 1)[1]}"
     hostname = parsed.hostname or ""
     path = _redact_url_path_tokens(parsed.scheme.lower(), hostname.lower(), parsed.path)
-
-    query_items = []
-    normalized_query = SEMICOLON_QUERY_SEPARATOR_RE.sub("&", HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query))
-    for key, value in parse_qsl(normalized_query, keep_blank_values=True):
-        if _normalize_query_key(key) in SENSITIVE_QUERY_KEYS or _contains_nested_sensitive_query_assignment(value):
-            query_items.append((key, REDACTED_EVIDENCE_VALUE))
-        else:
-            query_items.append((key, value))
+    path_components = PATH_SEPARATOR_RE.split(path)
+    for index in range(0, len(path_components), 2):
+        if path_components[index] and _contains_nested_sensitive_query_assignment(path_components[index]):
+            path_components[index] = REDACTED_EVIDENCE_VALUE
+    path = "".join(path_components)
 
     return urlunsplit(
         (
             parsed.scheme,
             netloc,
             path,
-            urlencode(query_items, doseq=True, safe="<>"),
+            _redact_query(parsed.query),
             "",
         )
     )
@@ -249,6 +247,27 @@ def _contains_nested_url_secret(value: str) -> bool:
         ):
             return True
     return False
+
+
+def _redact_query(query: str) -> str:
+    normalized_query = SEMICOLON_QUERY_SEPARATOR_RE.sub("&", HTML_QUERY_SEPARATOR_RE.sub("&", query))
+    query_items: list[tuple[str, str]] = []
+    for key, value in parse_qsl(normalized_query, keep_blank_values=True):
+        normalized_key = _normalize_query_key(key)
+        if normalized_key in SENSITIVE_QUERY_KEYS:
+            query_items.append((key, REDACTED_EVIDENCE_VALUE))
+        elif _contains_nested_sensitive_query_assignment(key):
+            query_items.append(
+                (
+                    REDACTED_EVIDENCE_VALUE,
+                    REDACTED_EVIDENCE_VALUE if value else "",
+                )
+            )
+        elif _contains_nested_sensitive_query_assignment(value):
+            query_items.append((key, REDACTED_EVIDENCE_VALUE))
+        else:
+            query_items.append((key, value))
+    return urlencode(query_items, doseq=True, safe="<>")
 
 
 def _normalize_query_key(key: str) -> str:
@@ -310,16 +329,40 @@ def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
     return redacted if max_chars is None else _truncate(redacted, max_chars)
 
 
+def redact_evidence_preview(text: str, max_chars: int = 180) -> str:
+    """Redact a bounded evidence prefix before emitting a short preview."""
+    bounded_chars = max_chars + EVIDENCE_PREVIEW_LOOKAHEAD
+    bounded_text = text[:bounded_chars]
+    if len(text) > bounded_chars:
+        for match in URL_RE.finditer(bounded_text):
+            if match.start() >= max_chars or match.end() != len(bounded_text):
+                continue
+            scheme_end = bounded_text.find("://", match.start()) + 3
+            bounded_text = f"{bounded_text[:scheme_end]}{REDACTED_EVIDENCE_VALUE}"
+            break
+    return redact_evidence_string(bounded_text, max_chars=max_chars)
+
+
 def redact_evidence_path(path: str, max_chars: int | None = 180) -> str:
     """Redact secrets and capability tokens from a path-like evidence value."""
     stripped_path = path.strip()
     if RFC_URL_RE.fullmatch(stripped_path) is not None:
-        redacted = redact_evidence_string(_redact_url_value(stripped_path), max_chars=None)
+        redacted = _redact_url_value(stripped_path)
     else:
-        redacted = redact_evidence_string(stripped_path, max_chars=None)
-        components = PATH_SEPARATOR_RE.split(redacted)
+        plain_path, query_separator, query_and_fragment = stripped_path.partition("?")
+        query, fragment_separator, fragment = query_and_fragment.partition("#")
+        redacted_path = redact_evidence_string(plain_path, max_chars=None)
+        components = PATH_SEPARATOR_RE.split(redacted_path)
         for index in range(0, len(components), 2):
             if components[index]:
-                components[index] = _redact_url_path_tokens("", "", components[index])
+                components[index] = (
+                    REDACTED_EVIDENCE_VALUE
+                    if _contains_nested_sensitive_query_assignment(components[index])
+                    else _redact_url_path_tokens("", "", components[index])
+                )
         redacted = "".join(components)
+        if query_separator:
+            redacted = f"{redacted}?{_redact_query(query)}"
+        if fragment_separator:
+            redacted = f"{redacted}#{redact_evidence_string(fragment, max_chars=None)}"
     return redacted if max_chars is None else _truncate(redacted, max_chars)

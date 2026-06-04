@@ -1783,6 +1783,34 @@ __import__('pickle').loads(data)
         assert "headers=<redacted>" in cve_checks[0].details["vocabulary"]
         assert "ok=1" in cve_checks[0].details["vocabulary"]
 
+    def test_stringlookup_vocabulary_evidence_redacts_key_only_authorization_query(self, tmp_path: Path) -> None:
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "StringLookup",
+                        "name": "string_lookup",
+                        "config": {
+                            "vocabulary": (
+                                "https://loader.example/vocab.txt?Authorization%3A%20Bearer%20VOCABSECRET123&ok=1"
+                            )
+                        },
+                    },
+                ],
+            },
+        }
+
+        model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
+        result = scanner.scan(str(model_path))
+
+        serialized = result.to_json()
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-12058"]
+        assert len(cve_checks) == 1
+        assert "VOCABSECRET123" not in serialized
+        assert "?<redacted>=&ok=1" in cve_checks[0].details["vocabulary"]
+
     def test_stringlookup_vocabulary_evidence_redacts_plain_path_capabilities(self, tmp_path: Path) -> None:
         scanner = KerasZipScanner()
         capability = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"

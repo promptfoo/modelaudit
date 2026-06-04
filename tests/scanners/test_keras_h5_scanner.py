@@ -280,6 +280,32 @@ def test_keras_h5_external_reference_evidence_redacts_plain_path_capabilities(tm
     assert external_ref["path"] == "/payload"
 
 
+def test_keras_h5_external_reference_evidence_redacts_encoded_headers_in_plain_paths(tmp_path: Path) -> None:
+    """External-reference paths with query-like headers should not serialize credentials."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        keras_version="3.13.1",
+    )
+    with h5py.File(model_path, "a") as h5_file:
+        weights_group = h5_file.require_group("model_weights")
+        weights_group["linked_kernel"] = h5py.ExternalLink(
+            "/payload?headers=Authorization%3A%20Bearer%20HDF5SECRET123&ok=1",
+            "/payload",
+        )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    serialized = result.to_json()
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert "HDF5SECRET123" not in serialized
+    assert cve_issues[0].details["external_references"][0]["filename"] == ("/payload?headers=<redacted>&ok=1")
+
+
 def test_keras_h5_scanner_detects_cve_2026_1669_external_storage(tmp_path: Path) -> None:
     """External storage segments should also be attributed to CVE-2026-1669."""
     model_path = create_h5_with_external_storage(tmp_path, keras_version="3.12.0")

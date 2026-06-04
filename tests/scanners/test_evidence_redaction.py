@@ -1,8 +1,13 @@
 """Tests for scanner evidence redaction helpers."""
 
+import pytest
+
+from modelaudit.scanners import _evidence_redaction as evidence_redaction
 from modelaudit.scanners._evidence_redaction import (
+    EVIDENCE_PREVIEW_LOOKAHEAD,
     REDACTED_EVIDENCE_VALUE,
     redact_evidence_path,
+    redact_evidence_preview,
     redact_evidence_string,
 )
 
@@ -275,6 +280,66 @@ def test_redacts_nested_authorization_query_values() -> None:
     assert "VOCABSECRET123" not in redacted
     assert "headers=<redacted>" in redacted
     assert "ok=1" in redacted
+
+
+def test_redacts_key_only_authorization_query_components() -> None:
+    """Encoded Authorization headers used as query keys should fail closed."""
+    redacted = redact_evidence_string(
+        "https://loader.example/vocab.txt?Authorization%3A%20Bearer%20VOCABSECRET123&ok=1",
+        max_chars=None,
+    )
+
+    assert "VOCABSECRET123" not in redacted
+    assert "?<redacted>=&ok=1" in redacted
+
+
+def test_plain_path_redacts_encoded_authorization_query_values() -> None:
+    """Query-like tails on plain paths should use URL query redaction."""
+    redacted = redact_evidence_path(
+        "/payload?headers=Authorization%3A%20Bearer%20HDF5SECRET123&ok=1",
+        max_chars=None,
+    )
+
+    assert "HDF5SECRET123" not in redacted
+    assert redacted == "/payload?headers=<redacted>&ok=1"
+
+
+def test_url_path_redacts_encoded_authorization_segments() -> None:
+    """Encoded headers embedded in URL path segments should fail closed."""
+    redacted = redact_evidence_path(
+        "https://loader.example/Authorization%3A%20Bearer%20PATHSECRET123/vocab.txt",
+        max_chars=None,
+    )
+
+    assert "PATHSECRET123" not in redacted
+    assert redacted == "https://loader.example/<redacted>/vocab.txt"
+
+
+def test_evidence_preview_bounds_redaction_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Preview redaction work should stay bounded independently of source size."""
+    seen_lengths: list[int] = []
+
+    def record_redaction(text: str, max_chars: int | None = 180) -> str:
+        seen_lengths.append(len(text))
+        assert max_chars is not None
+        return text[:max_chars]
+
+    monkeypatch.setattr(evidence_redaction, "redact_evidence_string", record_redaction)
+
+    preview = redact_evidence_preview("x" * 100_000, max_chars=200)
+
+    assert len(preview) == 200
+    assert seen_lengths == [200 + EVIDENCE_PREVIEW_LOOKAHEAD]
+
+
+def test_evidence_preview_fails_closed_for_url_crossing_bound() -> None:
+    """A truncated credential-bearing URL must not expose its leading userinfo."""
+    text = "x" * 180 + " gopher://user:" + "p" * (EVIDENCE_PREVIEW_LOOKAHEAD + 100) + "@loader.example/payload"
+
+    preview = redact_evidence_preview(text, max_chars=200)
+
+    assert "gopher://user:" not in preview
+    assert "gopher://<redacted>" in preview
 
 
 def test_plain_path_redaction_preserves_benign_model_paths() -> None:
