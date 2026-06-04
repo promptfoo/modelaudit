@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- scan padded TensorFlow SavedModel protobuf scalar and repeated string attributes past the legacy 10 KB injection-check window
 - mark malformed SavedModel `keras_metadata.pb` analysis as inconclusive instead of a clean scan
 - fail closed on pickle protocol 5 `NEXT_BUFFER` opcodes instead of reporting clean coverage
 - bound `keras_metadata.pb` parsing in SavedModel scans, fail closed when the budget is exceeded, and continue analysis when a system hash policy disables MD5

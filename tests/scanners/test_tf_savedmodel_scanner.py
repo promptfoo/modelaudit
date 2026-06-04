@@ -10,6 +10,7 @@ from typing import Any, Protocol, TypedDict
 import pytest
 
 import modelaudit.scanners.tf_savedmodel_scanner as tf_savedmodel_module
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
@@ -28,6 +29,7 @@ class _RequiredNodeSpec(TypedDict):
 class _NodeSpec(_RequiredNodeSpec, total=False):
     name: str
     string_attrs: dict[str, str]
+    string_list_attrs: dict[str, list[str]]
     function_ref: str
 
 
@@ -906,6 +908,237 @@ def test_protobuf_string_injection_detected_in_function_definition(tmp_path: Pat
     assert any(issue.details.get("node_scope") == "function_def" for issue in injection_issues)
     assert any(issue.details.get("function_name") == function_name for issue in injection_issues)
     assert any(issue.details.get("attribute_name") == "payload" for issue in injection_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_padded_protobuf_string_injection_past_length_threshold_is_detected(tmp_path: Path) -> None:
+    payload = "A" * 12_000 + "os.system('/bin/echo padded exploit')"
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "padded_payload_node",
+                "string_attrs": {"payload": payload},
+            }
+        ],
+        model_name="padded_string_injection",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    injection_issues = [
+        issue
+        for issue in result.issues
+        if "protobuf string" in issue.message.lower() and issue.details.get("attack_type") == "system_command"
+    ]
+    assert result.success is False
+    assert determine_exit_code(aggregate) == 1
+    assert injection_issues, "Expected padded protobuf string injection detection past the old 10 KB cutoff"
+    assert any(issue.details.get("attribute_name") == "payload" for issue in injection_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_padded_protobuf_string_list_injection_is_detected(tmp_path: Path) -> None:
+    payload = "A" * 12_000 + "os.system('/bin/echo padded list exploit')"
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "padded_list_payload_node",
+                "string_list_attrs": {"payloads": ["safe-value", payload]},
+            }
+        ],
+        model_name="padded_string_list_injection",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    injection_issues = [
+        issue
+        for issue in result.issues
+        if "protobuf string" in issue.message.lower() and issue.details.get("attack_type") == "system_command"
+    ]
+    assert result.success is False
+    assert determine_exit_code(aggregate) == 1
+    assert injection_issues, "Expected padded protobuf string-list injection detection"
+    assert any(issue.details.get("attribute_name") == "payloads" for issue in injection_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_benign_long_protobuf_string_is_scanned_without_security_finding(tmp_path: Path) -> None:
+    benign_value = "safe-metadata-" + ("A" * 12_000)
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "benign_long_node",
+                "string_attrs": {"description": benign_value},
+            }
+        ],
+        model_name="benign_long_string",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    assert result.success is True
+    assert determine_exit_code(aggregate) == 0
+    assert not [
+        issue
+        for issue in result.issues
+        if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        and "protobuf string" in issue.message.lower()
+    ]
+    assert any(check.name == "Protobuf String Length Check" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_fully_covered_windowed_protobuf_string_preserves_success(tmp_path: Path) -> None:
+    benign_value = "safe-metadata-" + ("A" * 33_000)
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "fully_covered_windowed_node",
+                "string_attrs": {"description": benign_value},
+            }
+        ],
+        model_name="fully_covered_windowed_string",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    assert result.success is True
+    assert determine_exit_code(aggregate) == 0
+    length_checks = [check for check in result.checks if check.name == "Protobuf String Length Check"]
+    assert length_checks
+    assert length_checks[0].details["string_scan_strategy"] == "full"
+    assert "scan_outcome" not in result.metadata
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_fully_covered_windowed_protobuf_string_detects_boundary_split_injection(tmp_path: Path) -> None:
+    split_offset = 32_768
+    split_prefix = "os.syst"
+    payload = ("A" * (split_offset - len(split_prefix)) + "os.system('/bin/echo split exploit')").ljust(49_152, "A")
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "boundary_split_payload_node",
+                "string_attrs": {"payload": payload},
+            }
+        ],
+        model_name="boundary_split_windowed_string",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    injection_checks = [
+        check
+        for check in result.checks
+        if check.name == "Protobuf String Injection Check" and check.details.get("attack_type") == "system_command"
+    ]
+    assert result.success is False
+    assert determine_exit_code(aggregate) == 1
+    assert injection_checks
+    assert injection_checks[0].details["string_scan_strategy"] == "full"
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_partial_window_match_does_not_hide_incomplete_protobuf_string_scan(tmp_path: Path) -> None:
+    oversized_value = "../" + ("A" * 99_997) + "os.system('/bin/echo hidden exploit')" + ("A" * 200_000)
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "partial_window_match_node",
+                "string_attrs": {"payload": oversized_value},
+            }
+        ],
+        model_name="partial_window_match_string",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    aggregate = scan_model_directory_or_file(model_path, cache_scan_results=False)
+
+    assert result.success is False
+    assert determine_exit_code(aggregate) == 2
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "savedmodel_protobuf_string_scan_incomplete"
+    incomplete_checks = [
+        check
+        for check in result.checks
+        if check.name == "Protobuf String Length Check"
+        and check.details.get("scan_outcome_reason") == "savedmodel_protobuf_string_scan_incomplete"
+    ]
+    injection_checks = [check for check in result.checks if check.name == "Protobuf String Injection Check"]
+    assert incomplete_checks
+    assert any(check.details["attack_type"] == "path_traversal" for check in injection_checks)
+    assert not any(check.details["attack_type"] == "system_command" for check in injection_checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_oversized_protobuf_string_without_full_coverage_fails_closed(tmp_path: Path) -> None:
+    oversized_value = "safe-metadata-" + ("A" * 300_000)
+    cache_dir = tmp_path / "cache"
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "oversized_benign_node",
+                "string_attrs": {"description": oversized_value},
+            }
+        ],
+        model_name="oversized_long_string",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    reset_cache_manager()
+    try:
+        aggregates = [
+            scan_model_directory_or_file(
+                model_path,
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            for _ in range(2)
+        ]
+
+        assert all(determine_exit_code(aggregate) == 2 for aggregate in aggregates)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "savedmodel_protobuf_string_scan_incomplete"
+    incomplete_checks = [
+        check
+        for check in result.checks
+        if check.name == "Protobuf String Length Check"
+        and check.details.get("scan_outcome_reason") == "savedmodel_protobuf_string_scan_incomplete"
+    ]
+    assert incomplete_checks
+    assert incomplete_checks[0].details["analysis_incomplete"] is True
+    assert not [
+        issue
+        for issue in result.issues
+        if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        and "protobuf string" in issue.message.lower()
+    ]
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -2063,6 +2296,9 @@ def _create_test_savedmodel_with_scoped_nodes(
 
         for attr_name, attr_value in spec.get("string_attrs", {}).items():
             node.attr[attr_name].s = attr_value.encode("utf-8")
+
+        for attr_name, attr_values in spec.get("string_list_attrs", {}).items():
+            node.attr[attr_name].list.s.extend(value.encode("utf-8") for value in attr_values)
 
         function_ref = spec.get("function_ref")
         if function_ref is not None:
