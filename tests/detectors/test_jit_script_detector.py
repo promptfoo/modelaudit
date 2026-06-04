@@ -1934,6 +1934,169 @@ class TestJITScriptDetector:
 
         assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
 
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "callbacks = [eval]\n    return callbacks[0](value)",
+            "callbacks = {'run': eval}\n    return callbacks['run'](value)",
+            "callbacks = {'run': eval}\n    return callbacks.get('run')(value)",
+            "callbacks = [len, eval]\n    alias = callbacks\n    return alias[1](value)",
+            "callbacks = [[eval]]\n    return callbacks[0][0](value)",
+            "callbacks = [len, eval]\n    return callbacks[-1](value)",
+            "callbacks = [len]\n    callbacks[-1] = eval\n    return callbacks[0](value)",
+            "callbacks = [len]\n    callbacks[0] = eval\n    return callbacks[-1](value)",
+            "callbacks = [len]\n    alias = callbacks\n    alias[0] = eval\n    return callbacks[0](value)",
+            "callbacks = alias = [len]\n    alias[0] = eval\n    return callbacks[0](value)",
+            "callbacks = [eval]\n    independent = [eval]\n    callbacks[0] = len\n    return independent[0](value)",
+            "callbacks = [eval] if value else {0: len}\n    return callbacks[0](value)",
+            "callbacks = [len] if value else {0: eval}\n    return callbacks[0](value)",
+            "return object.__getattribute__(__builtins__, 'eval')(value)",
+            "holder.sink = eval\n    return holder.sink(value)",
+        ],
+    )
+    def test_scan_model_detects_dangerous_builtins_through_indirect_storage(self, body: str) -> None:
+        detector = JITScriptDetector()
+        data = f"\x00\xffdef payload(value, holder):\n    {body}\n".encode()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            (
+                b"\x00\xffdef benign(value):\n"
+                b"    callbacks = [eval]\n"
+                b"    callbacks[0] = len\n"
+                b"    return callbacks[0](value)\n"
+            ),
+            (
+                b"\x00\xffdef benign(value):\n"
+                b"    callbacks = {'safe': len, 'unused': eval}\n"
+                b"    return callbacks['safe'](value)\n"
+            ),
+            (
+                b"\x00\xffdef benign(value):\n"
+                b"    callbacks = {'run': eval}\n"
+                b"    callbacks['run'] = len\n"
+                b"    return callbacks.get('run')(value)\n"
+            ),
+            (
+                b"\x00\xffdef benign(value):\n"
+                b"    callbacks = [[eval]]\n"
+                b"    callbacks[0][0] = len\n"
+                b"    return callbacks[0][0](value)\n"
+            ),
+            (
+                b"\x00\xffdef benign(value):\n"
+                b"    callbacks = [eval]\n"
+                b"    callbacks[0] = len\n"
+                b"    return callbacks[-1](value)\n"
+            ),
+            (
+                b"\x00\xffdef benign(value):\n"
+                b"    callbacks = [eval]\n"
+                b"    callbacks[-1] = len\n"
+                b"    return callbacks[0](value)\n"
+            ),
+            (
+                b"\x00\xffdef benign(value):\n"
+                b"    callbacks = [eval]\n"
+                b"    alias = callbacks\n"
+                b"    alias[0] = len\n"
+                b"    return callbacks[0](value)\n"
+            ),
+            (
+                b"\x00\xffdef benign(value, flag):\n"
+                b"    callbacks = [eval] if flag else {0: eval}\n"
+                b"    callbacks[0] = len\n"
+                b"    return callbacks[0](value)\n"
+            ),
+            (
+                b"\x00\xffdef benign(value):\n"
+                b"    object = helper\n"
+                b"    return object.__getattribute__(__builtins__, 'eval')(value)\n"
+            ),
+            (
+                b"\x00\xffdef benign(value, holder):\n"
+                b"    holder.sink = eval\n"
+                b"    holder.sink = len\n"
+                b"    return holder.sink(value)\n"
+            ),
+            (
+                b"\x00\xffdef benign(value, holder):\n"
+                b"    holder.sink = eval\n"
+                b"    holder = replacement\n"
+                b"    return holder.sink(value)\n"
+            ),
+            (b"\x00\xffcallbacks = [eval]\ndef benign(value, callbacks):\n    return callbacks[0](value)\n"),
+        ],
+    )
+    def test_scan_model_avoids_stale_indirect_builtin_aliases(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            (
+                b"\x00\xffclass Payload:\n"
+                b"    def prepare(self):\n"
+                b"        self.sink = eval\n"
+                b"    def run(self, value):\n"
+                b"        return self.sink(value)\n"
+            ),
+            (b"\x00\xffclass Payload:\n    sink = eval\n    def run(self, value):\n        return self.sink(value)\n"),
+        ],
+    )
+    def test_scan_model_detects_dangerous_instance_aliases_across_methods(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            (
+                b"\x00\xffclass Benign:\n"
+                b"    def prepare(self):\n"
+                b"        self.sink = eval\n"
+                b"        self.sink = len\n"
+                b"    def run(self, value):\n"
+                b"        return self.sink(value)\n"
+            ),
+            (
+                b"\x00\xffclass Benign:\n"
+                b"    def prepare(self):\n"
+                b"        self.sink = eval\n"
+                b"    def run(self, value):\n"
+                b"        self.sink = len\n"
+                b"        return self.sink(value)\n"
+            ),
+            (
+                b"\x00\xffclass Benign:\n"
+                b"    @staticmethod\n"
+                b"    def prepare(holder):\n"
+                b"        holder.sink = eval\n"
+                b"    @staticmethod\n"
+                b"    def run(holder, value):\n"
+                b"        return holder.sink(value)\n"
+            ),
+        ],
+    )
+    def test_scan_model_avoids_stale_instance_aliases_across_methods(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+
     def test_scan_model_preserves_builtin_alias_across_dead_rebind_branch(self) -> None:
         detector = JITScriptDetector()
         data = b"\x00\xffdef payload():\n    sink = eval\n    if False:\n        sink = len\n    return sink('1+1')\n"

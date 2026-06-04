@@ -1063,13 +1063,30 @@ def _complete_brace_truncated_line_candidate(
     bounded: bytes,
     span: tuple[int, int],
 ) -> tuple[bytes, tuple[int, int]] | None:
-    """Extend a failed block candidate through a same-line closing brace."""
+    """Extend a failed block candidate through its remaining indented lines."""
     if span[1] >= len(bounded) or bounded[span[1] : span[1] + 1] != b"}":
         return None
     line_end = bounded.find(b"\n", span[1])
     end = len(bounded) if line_end < 0 else line_end + 1
     if end <= span[1]:
         return None
+
+    header_end = bounded.find(b"\n", span[0], span[1])
+    if header_end < 0:
+        return bounded[span[0] : end], (span[0], end)
+    header_indent = _line_indent_width(bounded[span[0] : header_end + 1])
+    byte_limit = min(len(bounded), span[0] + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES)
+    while end < byte_limit:
+        next_line_end = bounded.find(b"\n", end, byte_limit)
+        next_end = byte_limit if next_line_end < 0 else next_line_end + 1
+        line = bounded[end:next_end]
+        null_offset = line.find(b"\x00")
+        if null_offset >= 0:
+            break
+        structural_line = _python_structural_line_bytes(line)
+        if structural_line.strip() and _line_indent_width(line) <= header_indent:
+            break
+        end = next_end
     return bounded[span[0] : end], (span[0], end)
 
 
@@ -1766,12 +1783,18 @@ class JITScriptDetector:
         dangerous_builtins = set(DANGEROUS_BUILTINS)
 
         class DangerousBuiltinCallVisitor(ast.NodeVisitor):
+            _SEQUENCE_INDEX_MARKER = "__modelaudit_sequence_index__"
+
             def __init__(self) -> None:
                 self.findings: set[str] = set()
                 self.alias_scopes: list[dict[str, str | None]] = [{}]
                 self.builtins_module_aliases: list[set[str]] = [set()]
                 self.defined_names: list[set[str]] = [set()]
+                self.container_alias_scopes: list[dict[str, dict[tuple[object, ...], str | None]]] = [{}]
+                self.container_identity_scopes: list[dict[str, int | None]] = [{}]
+                self.attribute_alias_scopes: list[dict[tuple[str, ...], str | None]] = [{}]
                 self.scope_kinds = ["module"]
+                self.next_container_identity = 1
 
             def _push_scope(
                 self,
@@ -1784,6 +1807,9 @@ class JITScriptDetector:
                 self.alias_scopes.append({})
                 self.builtins_module_aliases.append(set())
                 self.defined_names.append(set())
+                self.container_alias_scopes.append({})
+                self.container_identity_scopes.append({})
+                self.attribute_alias_scopes.append({})
                 self.scope_kinds.append(kind)
                 for name in local_names or set():
                     self._bind_name(name, None, defined=False)
@@ -1802,6 +1828,9 @@ class JITScriptDetector:
                 self.alias_scopes.pop()
                 self.builtins_module_aliases.pop()
                 self.defined_names.pop()
+                self.container_alias_scopes.pop()
+                self.container_identity_scopes.pop()
+                self.attribute_alias_scopes.pop()
                 self.scope_kinds.pop()
 
             def _visible_scope_indexes(self) -> Iterator[int]:
@@ -1865,6 +1894,196 @@ class JITScriptDetector:
                 ):
                     return self._constant_string(node.args[0]) == "__builtins__"
                 return False
+
+            def _lookup_container_alias(self, name: str) -> dict[tuple[object, ...], str | None]:
+                for index in self._visible_scope_indexes():
+                    if name in self.alias_scopes[index]:
+                        return self.container_alias_scopes[index].get(name, {})
+                return {}
+
+            def _lookup_container_identity(self, name: str) -> int | None:
+                for index in self._visible_scope_indexes():
+                    if name in self.alias_scopes[index]:
+                        return self.container_identity_scopes[index].get(name)
+                return None
+
+            def _new_container_identity(self) -> int:
+                identity = self.next_container_identity
+                self.next_container_identity += 1
+                return identity
+
+            def _container_expression_identity(self, node: ast.AST) -> int | None:
+                if isinstance(node, ast.Name):
+                    return self._lookup_container_identity(node.id)
+                if isinstance(node, ast.NamedExpr):
+                    return self._container_expression_identity(node.value)
+                if isinstance(node, (ast.List, ast.Tuple, ast.Dict)):
+                    return self._new_container_identity()
+                if isinstance(node, ast.IfExp):
+                    truth = self._constant_truth(node.test)
+                    if truth is True:
+                        return self._container_expression_identity(node.body)
+                    if truth is False:
+                        return self._container_expression_identity(node.orelse)
+                return None
+
+            @classmethod
+            def _sequence_index_element(cls, index: int, length: int) -> tuple[str, int, int]:
+                return cls._SEQUENCE_INDEX_MARKER, index, length
+
+            @classmethod
+            def _container_path_element_matches(cls, element: object, key: object) -> bool:
+                if (
+                    isinstance(element, tuple)
+                    and len(element) == 3
+                    and element[0] == cls._SEQUENCE_INDEX_MARKER
+                    and isinstance(element[1], int)
+                    and isinstance(element[2], int)
+                    and isinstance(key, int)
+                ):
+                    index = key if key >= 0 else element[2] + key
+                    return element[1] == index
+                return element == key
+
+            @classmethod
+            def _container_access_prefixes(
+                cls,
+                container: dict[tuple[object, ...], str | None],
+                keys: tuple[object, ...],
+            ) -> tuple[tuple[object, ...], ...]:
+                prefixes: set[tuple[object, ...]] = {()}
+                for key in keys:
+                    next_prefixes = {
+                        (*prefix, path[len(prefix)])
+                        for prefix in prefixes
+                        for path in container
+                        if len(path) > len(prefix)
+                        and path[: len(prefix)] == prefix
+                        and cls._container_path_element_matches(path[len(prefix)], key)
+                    }
+                    if not next_prefixes:
+                        return ()
+                    prefixes = next_prefixes
+                return tuple(sorted(prefixes, key=repr))
+
+            @staticmethod
+            def _merge_container_aliases(
+                *containers: dict[tuple[object, ...], str | None],
+            ) -> dict[tuple[object, ...], str | None]:
+                merged: dict[tuple[object, ...], str | None] = {}
+                for container in containers:
+                    for path, builtin in container.items():
+                        if builtin is not None or path not in merged:
+                            merged[path] = builtin
+                return merged
+
+            @staticmethod
+            def _constant_container_key(node: ast.AST) -> tuple[bool, object]:
+                if isinstance(node, ast.Constant):
+                    try:
+                        hash(node.value)
+                    except TypeError:
+                        return False, None
+                    return True, node.value
+                if (
+                    isinstance(node, ast.UnaryOp)
+                    and isinstance(node.op, (ast.UAdd, ast.USub))
+                    and isinstance(node.operand, ast.Constant)
+                    and isinstance(node.operand.value, (int, float, complex))
+                ):
+                    value = node.operand.value
+                    return True, value if isinstance(node.op, ast.UAdd) else -value
+                return False, None
+
+            def _resolve_builtin_container(self, node: ast.AST) -> dict[tuple[object, ...], str | None]:
+                if isinstance(node, ast.Name):
+                    return dict(self._lookup_container_alias(node.id))
+                if isinstance(node, ast.NamedExpr):
+                    return self._resolve_builtin_container(node.value)
+                if isinstance(node, (ast.List, ast.Tuple)):
+                    resolved: dict[tuple[object, ...], str | None] = {}
+                    for index, element in enumerate(node.elts):
+                        item = self._sequence_index_element(index, len(node.elts))
+                        resolved[(item,)] = self._resolve_builtin(element)
+                        nested = self._resolve_builtin_container(element)
+                        for path, builtin in nested.items():
+                            resolved[(item, *path)] = builtin
+                    return resolved
+                if isinstance(node, ast.Dict):
+                    resolved = {}
+                    for key_node, value_node in zip(node.keys, node.values, strict=True):
+                        if key_node is None:
+                            continue
+                        key_resolved, key = self._constant_container_key(key_node)
+                        builtin = self._resolve_builtin(value_node)
+                        if key_resolved:
+                            resolved[(key,)] = builtin
+                            for path, nested_builtin in self._resolve_builtin_container(value_node).items():
+                                resolved[(key, *path)] = nested_builtin
+                    return resolved
+                if isinstance(node, ast.Subscript):
+                    key_resolved, key = self._constant_container_key(node.slice)
+                    if not key_resolved:
+                        return {}
+                    container = self._resolve_builtin_container(node.value)
+                    prefixes = self._container_access_prefixes(container, (key,))
+                    if not prefixes:
+                        return {}
+                    nested_containers = [
+                        {
+                            path[len(prefix) :]: builtin
+                            for path, builtin in container.items()
+                            if len(path) > len(prefix) and path[: len(prefix)] == prefix
+                        }
+                        for prefix in prefixes
+                    ]
+                    return self._merge_container_aliases(*nested_containers)
+                if isinstance(node, ast.IfExp):
+                    truth = self._constant_truth(node.test)
+                    if truth is True:
+                        return self._resolve_builtin_container(node.body)
+                    if truth is False:
+                        return self._resolve_builtin_container(node.orelse)
+                    return self._merge_container_aliases(
+                        self._resolve_builtin_container(node.orelse),
+                        self._resolve_builtin_container(node.body),
+                    )
+                return {}
+
+            @staticmethod
+            def _attribute_alias_key(node: ast.AST) -> tuple[str, ...] | None:
+                if isinstance(node, ast.Name):
+                    return (node.id,)
+                if isinstance(node, ast.Attribute):
+                    parent = DangerousBuiltinCallVisitor._attribute_alias_key(node.value)
+                    return (*parent, node.attr) if parent is not None else None
+                return None
+
+            def _container_target_path(self, node: ast.Subscript) -> tuple[str, tuple[object, ...]] | None:
+                path: list[object] = []
+                current: ast.AST = node
+                while isinstance(current, ast.Subscript):
+                    key_resolved, key = self._constant_container_key(current.slice)
+                    if not key_resolved:
+                        return None
+                    path.append(key)
+                    current = current.value
+                if not isinstance(current, ast.Name):
+                    return None
+                return current.id, tuple(reversed(path))
+
+            def _lookup_attribute_alias(self, node: ast.Attribute) -> tuple[bool, str | None]:
+                key = self._attribute_alias_key(node)
+                if key is None:
+                    return False, None
+                root_name = key[0]
+                for index in self._visible_scope_indexes():
+                    aliases = self.attribute_alias_scopes[index]
+                    if key in aliases:
+                        return True, aliases[key]
+                    if root_name in self.alias_scopes[index]:
+                        return False, None
+                return False, None
 
             def _is_runtime_namespace(self, node: ast.AST) -> bool:
                 return (
@@ -1950,17 +2169,26 @@ class JITScriptDetector:
                         if self._known_truth(value) is False:
                             return None
                     return self._resolve_builtin(node.values[-1])
-                if (
-                    isinstance(node, ast.Attribute)
-                    and node.attr in dangerous_builtins
-                    and self._is_builtins_namespace(node.value)
-                ):
-                    return node.attr
-                if isinstance(node, ast.Attribute) and node.attr == "__call__":
-                    return self._resolve_builtin(node.value)
-                if isinstance(node, ast.Subscript) and self._is_builtins_namespace(node.value):
-                    name = self._constant_string(node.slice)
-                    return name if name in dangerous_builtins else None
+                if isinstance(node, ast.Attribute):
+                    alias_found, alias = self._lookup_attribute_alias(node)
+                    if alias_found:
+                        return alias
+                    if node.attr in dangerous_builtins and self._is_builtins_namespace(node.value):
+                        return node.attr
+                    if node.attr == "__call__":
+                        return self._resolve_builtin(node.value)
+                if isinstance(node, ast.Subscript):
+                    if self._is_builtins_namespace(node.value):
+                        name = self._constant_string(node.slice)
+                        return name if name in dangerous_builtins else None
+                    key_resolved, key = self._constant_container_key(node.slice)
+                    if key_resolved:
+                        container = self._resolve_builtin_container(node.value)
+                        prefixes = self._container_access_prefixes(container, (key,))
+                        return next(
+                            (builtin for prefix in prefixes if (builtin := container.get(prefix)) is not None),
+                            None,
+                        )
                 if isinstance(node, ast.Call):
                     if (
                         len(node.args) >= 2
@@ -1981,6 +2209,26 @@ class JITScriptDetector:
                     ):
                         name = self._constant_string(node.args[0])
                         return name if name in dangerous_builtins else None
+                    if node.args and isinstance(node.func, ast.Attribute) and node.func.attr in {"get", "__getitem__"}:
+                        key_resolved, key = self._constant_container_key(node.args[0])
+                        if key_resolved:
+                            container = self._resolve_builtin_container(node.func.value)
+                            prefixes = self._container_access_prefixes(container, (key,))
+                            return next(
+                                (builtin for prefix in prefixes if (builtin := container.get(prefix)) is not None),
+                                None,
+                            )
+                    if (
+                        len(node.args) >= 2
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "__getattribute__"
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "object"
+                        and self._is_unshadowed_name("object")
+                        and self._is_builtins_namespace(node.args[0])
+                    ):
+                        name = self._constant_string(node.args[1])
+                        return name if name in dangerous_builtins else None
                 return None
 
             def _bind_name(
@@ -1989,10 +2237,18 @@ class JITScriptDetector:
                 builtin: str | None,
                 *,
                 builtins_module: bool = False,
+                container_aliases: dict[tuple[object, ...], str | None] | None = None,
+                container_identity: int | None = None,
                 defined: bool = True,
                 scope_index: int = -1,
             ) -> None:
                 self.alias_scopes[scope_index][name] = builtin
+                self.container_alias_scopes[scope_index][name] = dict(container_aliases or {})
+                self.container_identity_scopes[scope_index][name] = container_identity
+                attribute_aliases = self.attribute_alias_scopes[scope_index]
+                for key in tuple(attribute_aliases):
+                    if key[0] == name:
+                        del attribute_aliases[key]
                 if defined:
                     self.defined_names[scope_index].add(name)
                 else:
@@ -2005,6 +2261,10 @@ class JITScriptDetector:
             def _unbind_target(self, target: ast.AST) -> None:
                 if isinstance(target, ast.Name):
                     self._bind_name(target.id, None, defined=False)
+                elif isinstance(target, ast.Attribute):
+                    attribute_key = self._attribute_alias_key(target)
+                    if attribute_key is not None:
+                        self.attribute_alias_scopes[-1][attribute_key] = None
                 elif isinstance(target, (ast.Tuple, ast.List)):
                     for element in target.elts:
                         self._unbind_target(element)
@@ -2015,6 +2275,8 @@ class JITScriptDetector:
                 builtin: str | None,
                 *,
                 builtins_module: bool = False,
+                container_aliases: dict[tuple[object, ...], str | None] | None = None,
+                container_identity: int | None = None,
                 scope_index: int = -1,
             ) -> None:
                 if isinstance(target, ast.Name):
@@ -2022,8 +2284,44 @@ class JITScriptDetector:
                         target.id,
                         builtin,
                         builtins_module=builtins_module,
+                        container_aliases=container_aliases,
+                        container_identity=container_identity,
                         scope_index=scope_index,
                     )
+                elif isinstance(target, ast.Attribute):
+                    attribute_key = self._attribute_alias_key(target)
+                    if attribute_key is not None:
+                        self.attribute_alias_scopes[scope_index][attribute_key] = builtin
+                elif isinstance(target, ast.Subscript):
+                    target_path = self._container_target_path(target)
+                    if target_path is not None:
+                        container_name, raw_prefix = target_path
+                        container = dict(self._lookup_container_alias(container_name))
+                        container_identity = self._lookup_container_identity(container_name)
+                        prefixes = self._container_access_prefixes(container, raw_prefix) or (raw_prefix,)
+                        container = {
+                            path: value
+                            for path, value in container.items()
+                            if not any(path[: len(prefix)] == prefix for prefix in prefixes)
+                        }
+                        for prefix in prefixes:
+                            container[prefix] = builtin
+                            for path, nested_builtin in (container_aliases or {}).items():
+                                container[(*prefix, *path)] = nested_builtin
+                        if container_identity is not None:
+                            for identity_scope, container_scope in zip(
+                                self.container_identity_scopes,
+                                self.container_alias_scopes,
+                                strict=True,
+                            ):
+                                for name, identity in identity_scope.items():
+                                    if identity == container_identity:
+                                        container_scope[name] = dict(container)
+                        else:
+                            for index in self._visible_scope_indexes():
+                                if container_name in self.alias_scopes[index]:
+                                    self.container_alias_scopes[index][container_name] = container
+                                    break
                 elif isinstance(target, (ast.Tuple, ast.List)):
                     for element in target.elts:
                         self._bind_target(element, None, scope_index=scope_index)
@@ -2041,6 +2339,8 @@ class JITScriptDetector:
                     target,
                     self._resolve_builtin(value),
                     builtins_module=self._is_builtins_namespace(value),
+                    container_aliases=self._resolve_builtin_container(value),
+                    container_identity=self._container_expression_identity(value),
                     scope_index=scope_index,
                 )
 
@@ -2061,6 +2361,9 @@ class JITScriptDetector:
                     target,
                     next((builtin for value in values if (builtin := self._resolve_builtin(value))), None),
                     builtins_module=any(self._is_builtins_namespace(value) for value in values),
+                    container_aliases=self._merge_container_aliases(
+                        *(self._resolve_builtin_container(value) for value in values)
+                    ),
                 )
 
             def _bind_loop_target_from_iterable(self, target: ast.AST, iterable: ast.AST) -> None:
@@ -2106,46 +2409,97 @@ class JITScriptDetector:
             def _copy_defined_names(defined_names: list[set[str]]) -> list[set[str]]:
                 return [set(scope) for scope in defined_names]
 
+            @staticmethod
+            def _copy_container_alias_scopes(
+                scopes: list[dict[str, dict[tuple[object, ...], str | None]]],
+            ) -> list[dict[str, dict[tuple[object, ...], str | None]]]:
+                return [{name: dict(values) for name, values in scope.items()} for scope in scopes]
+
+            @staticmethod
+            def _copy_container_identity_scopes(
+                scopes: list[dict[str, int | None]],
+            ) -> list[dict[str, int | None]]:
+                return [dict(scope) for scope in scopes]
+
+            @staticmethod
+            def _copy_attribute_alias_scopes(
+                scopes: list[dict[tuple[str, ...], str | None]],
+            ) -> list[dict[tuple[str, ...], str | None]]:
+                return [dict(scope) for scope in scopes]
+
             def _snapshot_alias_state(
                 self,
-            ) -> tuple[list[dict[str, str | None]], list[set[str]], list[set[str]]]:
+            ) -> tuple[
+                list[dict[str, str | None]],
+                list[set[str]],
+                list[set[str]],
+                list[dict[str, dict[tuple[object, ...], str | None]]],
+                list[dict[tuple[str, ...], str | None]],
+                list[dict[str, int | None]],
+            ]:
                 return (
                     self._copy_alias_scopes(self.alias_scopes),
                     self._copy_builtins_module_aliases(self.builtins_module_aliases),
                     self._copy_defined_names(self.defined_names),
+                    self._copy_container_alias_scopes(self.container_alias_scopes),
+                    self._copy_attribute_alias_scopes(self.attribute_alias_scopes),
+                    self._copy_container_identity_scopes(self.container_identity_scopes),
                 )
 
             def _restore_alias_state(
                 self,
-                state: tuple[list[dict[str, str | None]], list[set[str]], list[set[str]]],
+                state: tuple[
+                    list[dict[str, str | None]],
+                    list[set[str]],
+                    list[set[str]],
+                    list[dict[str, dict[tuple[object, ...], str | None]]],
+                    list[dict[tuple[str, ...], str | None]],
+                    list[dict[str, int | None]],
+                ],
             ) -> None:
                 self.alias_scopes = self._copy_alias_scopes(state[0])
                 self.builtins_module_aliases = self._copy_builtins_module_aliases(state[1])
                 self.defined_names = self._copy_defined_names(state[2])
+                self.container_alias_scopes = self._copy_container_alias_scopes(state[3])
+                self.attribute_alias_scopes = self._copy_attribute_alias_scopes(state[4])
+                self.container_identity_scopes = self._copy_container_identity_scopes(state[5])
 
             def _merge_alias_state_variants(
                 self,
-                original: tuple[list[dict[str, str | None]], list[set[str]], list[set[str]]],
-                variants: list[tuple[list[dict[str, str | None]], list[set[str]], list[set[str]]]],
+                original: tuple[
+                    list[dict[str, str | None]],
+                    list[set[str]],
+                    list[set[str]],
+                    list[dict[str, dict[tuple[object, ...], str | None]]],
+                    list[dict[tuple[str, ...], str | None]],
+                    list[dict[str, int | None]],
+                ],
+                variants: list[
+                    tuple[
+                        list[dict[str, str | None]],
+                        list[set[str]],
+                        list[set[str]],
+                        list[dict[str, dict[tuple[object, ...], str | None]]],
+                        list[dict[tuple[str, ...], str | None]],
+                        list[dict[str, int | None]],
+                    ]
+                ],
             ) -> None:
                 merged_scopes = self._copy_alias_scopes(original[0])
-                for index, scope in enumerate(merged_scopes):
-                    names = set(scope)
-                    for variant_scopes, _variant_modules, _variant_defined_names in variants:
+                for index, alias_scope in enumerate(merged_scopes):
+                    names = set(alias_scope)
+                    for variant_scopes, *_variant_state in variants:
                         names.update(variant_scopes[index])
                     for name in names:
                         candidates = [
                             variant_scopes[index].get(name, original[0][index].get(name))
-                            for variant_scopes, _variant_modules, _variant_defined_names in variants
+                            for variant_scopes, *_variant_state in variants
                         ]
-                        scope[name] = next((candidate for candidate in candidates if candidate is not None), None)
+                        alias_scope[name] = next((candidate for candidate in candidates if candidate is not None), None)
                 self.alias_scopes = merged_scopes
                 self.builtins_module_aliases = [
                     set().union(
-                        *(
-                            variant_modules[index]
-                            for _variant_scopes, variant_modules, _variant_defined_names in variants
-                        )
+                        *(variant_modules[index] for _variant_scopes, variant_modules, *_variant_state in variants)
                     )
                     for index in range(len(original[1]))
                 ]
@@ -2153,11 +2507,57 @@ class JITScriptDetector:
                     set.intersection(
                         *(
                             variant_defined_names[index]
-                            for _variant_scopes, _variant_modules, variant_defined_names in variants
+                            for _variant_scopes, _variant_modules, variant_defined_names, *_variant_state in variants
                         )
                     )
                     for index in range(len(original[2]))
                 ]
+                merged_containers = self._copy_container_alias_scopes(original[3])
+                for index, container_scope in enumerate(merged_containers):
+                    names = set(container_scope)
+                    for *_prefix, variant_containers, _variant_attributes, _variant_identities in variants:
+                        names.update(variant_containers[index])
+                    for name in names:
+                        merged_values: dict[tuple[object, ...], str | None] = {}
+                        for *_prefix, variant_containers, _variant_attributes, _variant_identities in variants:
+                            merged_values = self._merge_container_aliases(
+                                merged_values,
+                                variant_containers[index].get(name, original[3][index].get(name, {})),
+                            )
+                        container_scope[name] = merged_values
+                self.container_alias_scopes = merged_containers
+                merged_attributes = self._copy_attribute_alias_scopes(original[4])
+                for index, attribute_scope in enumerate(merged_attributes):
+                    attribute_keys = set(attribute_scope)
+                    for *_prefix, variant_attributes, _variant_identities in variants:
+                        attribute_keys.update(variant_attributes[index])
+                    for attribute_key in attribute_keys:
+                        candidates = [
+                            variant_attributes[index].get(attribute_key, original[4][index].get(attribute_key))
+                            for *_prefix, variant_attributes, _variant_identities in variants
+                        ]
+                        attribute_scope[attribute_key] = next(
+                            (candidate for candidate in candidates if candidate is not None),
+                            None,
+                        )
+                self.attribute_alias_scopes = merged_attributes
+                merged_identities = self._copy_container_identity_scopes(original[5])
+                for index, identity_scope in enumerate(merged_identities):
+                    names = set(identity_scope)
+                    for *_prefix, variant_identities in variants:
+                        names.update(variant_identities[index])
+                    for name in names:
+                        identity_candidates = [
+                            variant_identities[index].get(name, original[5][index].get(name))
+                            for *_prefix, variant_identities in variants
+                        ]
+                        identity_scope[name] = (
+                            identity_candidates[0]
+                            if identity_candidates
+                            and all(candidate == identity_candidates[0] for candidate in identity_candidates)
+                            else None
+                        )
+                self.container_identity_scopes = merged_identities
 
             def _visit_statements(self, statements: list[ast.stmt]) -> ast.stmt | None:
                 for statement in statements:
@@ -2202,6 +2602,22 @@ class JITScriptDetector:
 
             def visit_Assign(self, node: ast.Assign) -> None:
                 self.visit(node.value)
+                if len(node.targets) > 1 and not any(
+                    isinstance(target, (ast.Tuple, ast.List)) for target in node.targets
+                ):
+                    builtin = self._resolve_builtin(node.value)
+                    builtins_module = self._is_builtins_namespace(node.value)
+                    container_aliases = self._resolve_builtin_container(node.value)
+                    container_identity = self._container_expression_identity(node.value)
+                    for target in node.targets:
+                        self._bind_target(
+                            target,
+                            builtin,
+                            builtins_module=builtins_module,
+                            container_aliases=container_aliases,
+                            container_identity=container_identity,
+                        )
+                    return
                 for target in node.targets:
                     self._bind_target_from_value(target, node.value)
 
@@ -2813,8 +3229,80 @@ class JITScriptDetector:
                     self.findings.add(builtin)
                 self.generic_visit(node)
 
+        def method_receiver_name(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+            positional_arguments = [*node.args.posonlyargs, *node.args.args]
+            return positional_arguments[0].arg if positional_arguments else None
+
+        def is_static_method(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+            return any(
+                (isinstance(decorator, ast.Name) and decorator.id == "staticmethod")
+                or (isinstance(decorator, ast.Attribute) and decorator.attr == "staticmethod")
+                for decorator in node.decorator_list
+            )
+
+        def method_visitor(
+            node: ast.FunctionDef | ast.AsyncFunctionDef,
+            instance_aliases: dict[tuple[str, ...], str] | None = None,
+        ) -> tuple[DangerousBuiltinCallVisitor, str | None]:
+            method_analysis = DangerousBuiltinCallVisitor()
+            receiver_name = None if is_static_method(node) else method_receiver_name(node)
+            default_bindings = method_analysis._argument_default_bindings(node.args)
+            method_analysis._push_scope(
+                node.args,
+                default_bindings,
+                method_analysis._local_binding_names(list(node.body)),
+            )
+            if receiver_name is not None:
+                for path, builtin in (instance_aliases or {}).items():
+                    method_analysis.attribute_alias_scopes[-1][(receiver_name, *path)] = builtin
+            method_analysis._visit_statements(node.body)
+            return method_analysis, receiver_name
+
+        def class_instance_builtin_findings(node: ast.ClassDef) -> set[str]:
+            instance_aliases: dict[tuple[str, ...], str] = {}
+            class_analysis = DangerousBuiltinCallVisitor()
+            class_analysis._push_scope(kind="class")
+            class_analysis._visit_statements(
+                [
+                    statement
+                    for statement in node.body
+                    if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+                ]
+            )
+            for name, builtin in class_analysis.alias_scopes[-1].items():
+                if builtin is not None:
+                    instance_aliases[(name,)] = builtin
+
+            methods = [
+                statement for statement in node.body if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
+            for method in methods:
+                method_analysis, receiver_name = method_visitor(method)
+                if receiver_name is None:
+                    continue
+                for key, builtin in method_analysis.attribute_alias_scopes[-1].items():
+                    if key[0] == receiver_name and builtin is not None:
+                        instance_aliases[key[1:]] = builtin
+
+            findings: set[str] = set()
+            for method in methods:
+                method_analysis, _receiver_name = method_visitor(method, instance_aliases)
+                findings.update(method_analysis.findings)
+            return findings
+
+        class ClassInstanceBuiltinVisitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.findings: set[str] = set()
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                self.findings.update(class_instance_builtin_findings(node))
+                self.generic_visit(node)
+
         visitor = DangerousBuiltinCallVisitor()
         visitor.visit(tree)
+        class_visitor = ClassInstanceBuiltinVisitor()
+        class_visitor.visit(tree)
+        visitor.findings.update(class_visitor.findings)
         return visitor.findings
 
     @staticmethod
