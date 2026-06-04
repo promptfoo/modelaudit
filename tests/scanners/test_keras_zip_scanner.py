@@ -3760,6 +3760,7 @@ class TestCVE20251550ModuleReferences:
             ("posix", "module", "posix"),
             ("nt", "fn_module", "nt"),
             ("_ctypes", "module", "_ctypes"),
+            ("_interpreters", "module", "_interpreters"),
             ("_multiprocessing", "module", "_multiprocessing"),
             ("_pickle", "module", "_pickle"),
             ("_posixsubprocess", "module", "_posixsubprocess"),
@@ -3810,6 +3811,7 @@ class TestCVE20251550ModuleReferences:
             "posix.path",
             "nt.path",
             "_ctypes.child",
+            "_interpreters.child",
             "_multiprocessing.child",
             "_pickle.child",
             "_posixsubprocess.child",
@@ -3915,10 +3917,38 @@ class TestCVE20251550ModuleReferences:
                         "class_name": "Dense",
                         "name": "metadata_only",
                         "module": "keras.layers",
-                        "config": {"units": 1, "metadata": {"module": "posix"}},
+                        "config": {
+                            "units": 1,
+                            "metadata": {"class_name": "Report", "module": "posix"},
+                        },
                     }
                 ]
             },
+        }
+
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
+        assert not cve_issues
+
+    @pytest.mark.parametrize(
+        "layer",
+        [
+            {"class_name": "Report", "name": "missing_config", "module": "posix"},
+            {"name": "missing_class", "module": "posix", "config": {}},
+            {"class_name": None, "name": "invalid_class", "module": "posix", "config": {}},
+        ],
+    )
+    def test_non_serialized_layer_shapes_are_not_flagged(
+        self,
+        tmp_path: Path,
+        layer: dict[str, Any],
+    ) -> None:
+        """Malformed layer metadata that Keras does not deserialize must not be promoted to critical."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [layer]},
         }
 
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
@@ -3932,6 +3962,7 @@ class TestCVE20251550ModuleReferences:
             "posixpath",
             "ntpath",
             "_ctypes_test",
+            "_interpreters_helper",
             "_multiprocessing_helper",
             "_pickletools",
             "_posixsubprocess_helper",

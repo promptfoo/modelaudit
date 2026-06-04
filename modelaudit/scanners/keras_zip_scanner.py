@@ -92,6 +92,7 @@ _DANGEROUS_CONFIG_MODULE_ROOTS = frozenset(
 _EXACT_DANGEROUS_CONFIG_MODULES = frozenset(
     {
         "_ctypes",
+        "_interpreters",
         "_multiprocessing",
         "_pickle",
         "_posixsubprocess",
@@ -1475,7 +1476,7 @@ class KerasZipScanner(BaseScanner):
                 continue
 
             object_class = node.get("class_name")
-            if isinstance(object_class, str):
+            if isinstance(object_class, str) and "config" in node:
                 for key in ("module", "fn_module"):
                     module_value = node.get(key)
                     if isinstance(module_value, str) and module_value.strip():
@@ -1496,7 +1497,10 @@ class KerasZipScanner(BaseScanner):
         with safe_mode=True by specifying arbitrary Python modules/functions in
         config.json's module/fn_module keys. This checks ALL layers, not just Lambda.
         """
-        layer_class = str(layer.get("class_name", ""))
+        layer_class = layer.get("class_name")
+        if not isinstance(layer_class, str) or "config" not in layer:
+            return
+
         for key in ("module", "fn_module"):
             layer_value = layer.get(key)
             if isinstance(layer_value, str) and layer_value.strip():
@@ -1509,7 +1513,7 @@ class KerasZipScanner(BaseScanner):
                     layer_name,
                 )
 
-        layer_config = layer.get("config", {})
+        layer_config = layer.get("config")
         if not isinstance(layer_config, dict):
             return
 
