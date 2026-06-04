@@ -202,6 +202,17 @@ class SecretsDetector:
         self.max_entropy = self.config.get("max_entropy", 7.5)
         self.min_secret_length = self.config.get("min_secret_length", 8)
         self.require_high_confidence = self.config.get("require_high_confidence", True)
+        configured_max_findings = self.config.get("max_findings")
+        self.max_findings = (
+            configured_max_findings
+            if isinstance(configured_max_findings, int)
+            and not isinstance(configured_max_findings, bool)
+            and configured_max_findings > 0
+            else None
+        )
+        self._active_findings_count = 0
+        self._findings_truncated = False
+        self._scan_depth = 0
 
         # Combine default patterns with any custom patterns
         self.patterns = SECRET_PATTERNS.copy()
@@ -222,6 +233,25 @@ class SecretsDetector:
         )
         self._compiled_whitelist = [re.compile(pattern, re.IGNORECASE) for pattern in self.whitelist]
         self._compiled_ml_fps = _COMPILED_ML_FALSE_POSITIVES
+
+    def _record_finding(self, findings: list[dict[str, Any]], finding: dict[str, Any]) -> bool:
+        if self.max_findings is not None and self._active_findings_count >= self.max_findings:
+            self._findings_truncated = True
+            return False
+        self._active_findings_count += 1
+        findings.append(finding)
+        return True
+
+    def _finding_limit_marker(self, context: str) -> dict[str, Any]:
+        return {
+            "type": "detector_finding_limit",
+            "detector": "secrets",
+            "severity": "INFO",
+            "message": "Embedded secret findings exceeded the configured reporting limit",
+            "max_findings": self.max_findings,
+            "analysis_incomplete": True,
+            "context": context,
+        }
 
     @staticmethod
     def calculate_shannon_entropy(data: bytes, window_size: int = 64) -> float:
@@ -365,7 +395,7 @@ class SecretsDetector:
         Returns:
             List of detected secrets with details
         """
-        findings = []
+        findings: list[dict[str, Any]] = []
         safe_context = self._redact_context(context)
 
         # First, try to detect secrets in decoded text
@@ -376,6 +406,8 @@ class SecretsDetector:
             # This helps filter out false positives from model weights
             text_findings = self.scan_text(text, context, is_binary_source=True)
             findings.extend(text_findings)
+            if self._findings_truncated:
+                return findings
         except Exception as e:
             logger.debug("Failed to decode binary data as UTF-8 for secrets scanning: %s", e)
 
@@ -404,7 +436,8 @@ class SecretsDetector:
                                 or re.match(r"^[0-9a-fA-F]+$", decoded_text)
                             )
                         ):
-                            findings.append(
+                            if not self._record_finding(
+                                findings,
                                 {
                                     "type": "high_entropy_region",
                                     "severity": "INFO",  # Lower severity as it's just suspicious
@@ -415,8 +448,9 @@ class SecretsDetector:
                                     "possible encoded secret",
                                     "context": f"{safe_context} offset:{i}" if safe_context else f"offset:{i}",
                                     "recommendation": "Review this region for base64/hex encoded secrets",
-                                }
-                            )
+                                },
+                            ):
+                                return findings
                             break  # Only report first high-entropy region to avoid spam
                     except Exception as e:
                         logger.debug("Error analyzing high-entropy region at offset %d: %s", i, e)
@@ -495,7 +529,7 @@ class SecretsDetector:
         Returns:
             List of detected secrets with details
         """
-        findings = []
+        findings: list[dict[str, Any]] = []
         safe_context = self._redact_context(context)
 
         # Limit text size to prevent DoS
@@ -550,7 +584,8 @@ class SecretsDetector:
                 # Redact the secret for safe reporting
                 redacted = secret_text[:4] + "***" + secret_text[-4:] if len(secret_text) > 10 else "***REDACTED***"
 
-                findings.append(
+                if not self._record_finding(
+                    findings,
                     {
                         "type": "embedded_secret",
                         "severity": severity,
@@ -565,8 +600,9 @@ class SecretsDetector:
                         "recommendation": f"Remove {description} from model data immediately"
                         if confidence >= 0.8
                         else f"Review and remove {description} if not intentional",
-                    }
-                )
+                    },
+                ):
+                    return findings
 
         return findings
 
@@ -583,6 +619,8 @@ class SecretsDetector:
         findings = []
 
         for key, value in data.items():
+            if self._findings_truncated:
+                break
             key_context = f"{context}/{key}" if context else str(key)
 
             # Check the key itself for secrets
@@ -620,25 +658,36 @@ class SecretsDetector:
         Returns:
             List of detected secrets with full details
         """
-        findings = []
+        root_scan = self._scan_depth == 0
+        if root_scan:
+            self._active_findings_count = 0
+            self._findings_truncated = False
+        self._scan_depth += 1
+        findings: list[dict[str, Any]] = []
+        try:
+            if isinstance(weights, dict):
+                findings.extend(self.scan_dict(weights, context))
+            elif isinstance(weights, bytes):
+                findings.extend(self.scan_bytes(weights, context))
+            elif isinstance(weights, str):
+                findings.extend(self.scan_text(weights, context))
+            elif hasattr(weights, "tobytes"):
+                # NumPy arrays and similar
+                try:
+                    byte_data = weights.tobytes()
+                    findings.extend(self.scan_bytes(byte_data, f"{context}[array]"))
+                except Exception as e:
+                    logger.debug("Failed to convert model weights to bytes for scanning: %s", e)
+            elif isinstance(weights, list | tuple):
+                for i, item in enumerate(weights):
+                    if self._findings_truncated:
+                        break
+                    findings.extend(self.scan_model_weights(item, f"{context}[{i}]"))
+        finally:
+            self._scan_depth -= 1
 
-        if isinstance(weights, dict):
-            findings.extend(self.scan_dict(weights, context))
-        elif isinstance(weights, bytes):
-            findings.extend(self.scan_bytes(weights, context))
-        elif isinstance(weights, str):
-            findings.extend(self.scan_text(weights, context))
-        elif hasattr(weights, "tobytes"):
-            # NumPy arrays and similar
-            try:
-                byte_data = weights.tobytes()
-                findings.extend(self.scan_bytes(byte_data, f"{context}[array]"))
-            except Exception as e:
-                logger.debug("Failed to convert model weights to bytes for scanning: %s", e)
-        elif isinstance(weights, list | tuple):
-            for i, item in enumerate(weights):
-                findings.extend(self.scan_model_weights(item, f"{context}[{i}]"))
-
+        if root_scan and self._findings_truncated:
+            findings.append(self._finding_limit_marker(context))
         return findings
 
 
