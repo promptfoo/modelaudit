@@ -73,7 +73,8 @@ SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     rf"(?:{SEPARATED_SENSITIVE_ASSIGNMENT_KEY}|(?-i:{CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY}))(?:s|[0-9]+)?"
 )
 SENSITIVE_CONTAINER_KEY: Final[str] = (
-    rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|authorization|cookie|set[_-]?cookie|session[_-]?id|sessionid)"
+    rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|auth|basic[_-]?auth|authorization|cookie|set[_-]?cookie|"
+    rf"session[_-]?id|sessionid)"
 )
 PYTHON_ANNOTATION_PATTERN: Final[str] = r"(?:[A-Za-z_][\w.\[\](), |]*|[\"'][^\"'\r\n]+[\"'])"
 SCALAR_ASSIGNMENT_OPERATOR_PATTERN: Final[str] = rf"(?:=(?!=)|:(?!=)(?!\s*{PYTHON_ANNOTATION_PATTERN}\s*=))"
@@ -118,6 +119,10 @@ SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"\[\s*(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*\]\s*=\s*"
     rf"{VALUE_OPENERS_PATTERN})"
     rf"{QUOTED_VALUE_PATTERN}"
+)
+REGEX_REDACTABLE_SUBSCRIPT_TARGET_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)\A\s*\b[a-z_][\w.]*(?:\s*\[[^\]\n]{{1,120}}\])*\s*"
+    rf"\[\s*(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*\]\s*\Z"
 )
 ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>\\(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})\\(?P=key_quote)\s*:\s*)"
@@ -178,6 +183,10 @@ SENSITIVE_ASSIGNMENT_TARGET_RE: Final[re.Pattern[str]] = re.compile(
 )
 ANNOTATED_SENSITIVE_ASSIGNMENT_TARGET_RE: Final[re.Pattern[str]] = re.compile(
     rf"\b{SENSITIVE_CONTAINER_KEY}\s*:\s*{PYTHON_ANNOTATION_PATTERN}\s*$",
+    re.IGNORECASE,
+)
+TOKEN_ONLY_SENSITIVE_ASSIGNMENT_TARGET_RE: Final[re.Pattern[str]] = re.compile(
+    rf"\b(?:auth|basic[_-]?auth)(?:\s*:\s*{PYTHON_ANNOTATION_PATTERN})?\s*$",
     re.IGNORECASE,
 )
 QUOTED_SENSITIVE_MAPPING_KEY_RE: Final[re.Pattern[str]] = re.compile(
@@ -646,7 +655,7 @@ def _redact_unparseable_sensitive_expression_assignments(text: str) -> str:
 
         try:
             ast.parse(candidate, mode="eval")
-        except (SyntaxError, ValueError):
+        except (RecursionError, SyntaxError, ValueError):
             if STRING_LITERAL_START_RE.match(candidate):
                 continue
             if any(delimiter in candidate for delimiter in "([{"):
@@ -744,9 +753,19 @@ def _is_sensitive_literal_key(key: object) -> bool:
     return isinstance(key, str) and SENSITIVE_CONTAINER_KEY_RE.fullmatch(key) is not None
 
 
-def _static_string_literal_value(expression: ast.expr) -> str | bytes | None:
+def _static_string_literal_value(expression: ast.expr, depth: int = 0) -> str | bytes | None:
+    if depth >= 64:
+        return None
     if isinstance(expression, ast.Constant) and isinstance(expression.value, (str, bytes)):
         return expression.value
+    if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Add):
+        left = _static_string_literal_value(expression.left, depth + 1)
+        right = _static_string_literal_value(expression.right, depth + 1)
+        if isinstance(left, str) and isinstance(right, str):
+            return left + right
+        if isinstance(left, bytes) and isinstance(right, bytes):
+            return left + right
+        return None
     if isinstance(expression, ast.JoinedStr):
         parts: list[str] = []
         for value in expression.values:
@@ -763,7 +782,7 @@ def _literal_sensitive_key(tokens: list[tokenize.TokenInfo]) -> bool:
         return False
     try:
         expression = ast.parse("".join(token.string for token in significant), mode="eval").body
-    except (SyntaxError, ValueError):
+    except (RecursionError, SyntaxError, ValueError):
         return False
     return _is_sensitive_literal_key(_static_string_literal_value(expression))
 
@@ -771,7 +790,7 @@ def _literal_sensitive_key(tokens: list[tokenize.TokenInfo]) -> bool:
 def _target_contains_sensitive_literal_key(target: str) -> bool:
     try:
         expression = ast.parse(target.strip(), mode="eval").body
-    except (SyntaxError, ValueError):
+    except (RecursionError, SyntaxError, ValueError):
         return False
     if _is_sensitive_literal_key(_static_string_literal_value(expression)):
         return True
@@ -781,13 +800,24 @@ def _target_contains_sensitive_literal_key(target: str) -> bool:
     return False
 
 
+def _target_supports_regex_redaction(target: str) -> bool:
+    try:
+        expression = ast.parse(target.strip(), mode="eval").body
+    except (RecursionError, SyntaxError, ValueError):
+        return False
+
+    if _is_sensitive_literal_key(_static_string_literal_value(expression)):
+        return True
+    return REGEX_REDACTABLE_SUBSCRIPT_TARGET_RE.fullmatch(target) is not None
+
+
 def _literal_sensitive_option(tokens: list[tokenize.TokenInfo]) -> bool:
     significant = _significant_tokens(tokens)
     if not significant:
         return False
     try:
         expression = ast.parse("".join(token.string for token in significant), mode="eval").body
-    except (SyntaxError, ValueError):
+    except (RecursionError, SyntaxError, ValueError):
         return False
     option = _static_string_literal_value(expression)
     return isinstance(option, str) and SENSITIVE_OPTION_KEY_RE.fullmatch(option.lstrip("-")) is not None
@@ -835,7 +865,7 @@ def _redact_sensitive_literal_pairs(text: str) -> str:
     replacements: list[tuple[int, int]] = []
     try:
         tree = ast.parse(text)
-    except (SyntaxError, ValueError):
+    except (RecursionError, SyntaxError, ValueError):
         tree = None
 
     if tree is not None:
@@ -1121,7 +1151,7 @@ def _redact_python_expression_assignments(text: str) -> str:
     """Redact expression-valued sensitive assignments while preserving nearby code."""
     try:
         ast.parse(textwrap.dedent(text))
-    except (SyntaxError, ValueError):
+    except (RecursionError, SyntaxError, ValueError):
         return _redact_unparseable_sensitive_expression_assignments(text)
 
     try:
@@ -1190,7 +1220,11 @@ def _redact_python_expression_assignments(text: str) -> str:
             token.string == ":="
             or "," in target
             or PREFIXED_QUOTED_SENSITIVE_MAPPING_KEY_RE.search(target) is not None
-            or (literal_target_is_sensitive and not source_target_is_sensitive)
+            or TOKEN_ONLY_SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is not None
+            or (
+                literal_target_is_sensitive
+                and (not source_target_is_sensitive or not _target_supports_regex_redaction(target))
+            )
         )
         if (
             is_simple_value
@@ -1223,18 +1257,8 @@ def _merge_replacement_ranges(replacements: list[tuple[int, int]]) -> list[tuple
     return non_overlapping_replacements
 
 
-def _truncate(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 3:
-        return text[:max_chars]
-    return f"{text[: max_chars - 3]}..."
-
-
-def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
-    """Redact credentials from a scanner evidence string before truncating it."""
-    redaction_input = text if max_chars is None else text[: max(0, max_chars) + REDACTION_LOOKAHEAD_CHARS]
-    redacted = _redact_sensitive_literal_pairs(redaction_input)
+def _redact_evidence_content(text: str) -> str:
+    redacted = _redact_sensitive_literal_pairs(text)
     redacted = URL_RE.sub(_redact_url, redacted)
     redacted = _redact_python_expression_assignments(redacted)
     redacted = ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_escaped_quoted_mapping_assignment, redacted)
@@ -1255,4 +1279,29 @@ def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(_redact_scalar_unquoted_assignment, redacted)
     redacted = _redact_sensitive_comparisons(redacted)
     redacted = _redact_sensitive_keyed_calls(redacted)
-    return redacted if max_chars is None else _truncate(redacted, max_chars)
+    return redacted
+
+
+def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
+    """Redact credentials from a scanner evidence string before truncating it."""
+    if max_chars is None:
+        return _redact_evidence_content(text)
+
+    limit = max(0, max_chars)
+    bounded_input = text[:limit]
+    bounded_redacted = _redact_evidence_content(bounded_input)
+    if len(text) <= limit:
+        return bounded_redacted
+
+    lookahead_input = text[: limit + REDACTION_LOOKAHEAD_CHARS]
+    lookahead_redacted = _redact_evidence_content(lookahead_input)
+    common_length = 0
+    for bounded_character, lookahead_character in zip(bounded_redacted, lookahead_redacted, strict=False):
+        if bounded_character != lookahead_character:
+            break
+        common_length += 1
+    safe_redacted_prefix = lookahead_redacted[:common_length]
+
+    if max_chars <= 3:
+        return safe_redacted_prefix[:limit]
+    return f"{safe_redacted_prefix[: max_chars - 3]}..."

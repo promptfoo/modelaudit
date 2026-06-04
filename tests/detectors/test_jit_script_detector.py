@@ -187,7 +187,7 @@ class TestJITScriptDetector:
         assert "AWS_SECRET_ACCESS_KEY" in builtin_finding.code_snippet
         assert 'os.environ["AWS_SECRET_ACCESS_KEY"] = "<redacted>"' in builtin_finding.code_snippet
         assert "client_secret = <redacted>" in builtin_finding.code_snippet
-        assert 'eval("1 + 1")' in builtin_finding.code_snippet
+        assert 'eval("1 + 1' in builtin_finding.code_snippet
 
     def test_detect_code_execution_patterns(self):
         """Test detection of code execution patterns in binary data."""

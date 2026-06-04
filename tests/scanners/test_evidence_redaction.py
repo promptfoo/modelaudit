@@ -778,8 +778,87 @@ def test_redacts_cookie_call_arguments_and_header_mappings() -> None:
     assert 'eval("1 + 1")' in redacted
 
 
-def test_redaction_bounds_expression_analysis_to_output_lookahead() -> None:
-    """Very large evidence strings should still redact secrets near the visible prefix."""
+def test_redacts_computed_and_constant_sensitive_subscript_targets() -> None:
+    """Computed bases and constant key expressions must not expose assigned values."""
+    text = (
+        'globals()["api_key"] = "COMPUTEDSECRET1234567890"; '
+        'factory()["Authorization"] = "FACTORYSECRET1234567890"; '
+        '(config)["client_secret"] = "PARENSECRET1234567890"; '
+        'os.environ["AWS_" + "SECRET_ACCESS_KEY"] = "CONCATSECRET1234567890"; '
+        'payload[b"client_" + b"secret"] = b"BYTESECRET1234567890"; '
+        'factory()["api_key_count"] = "visible"; '
+        'payload["api_" + "key_count"] = "visible"; eval("1 + 1")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "COMPUTEDSECRET1234567890" not in redacted
+    assert "FACTORYSECRET1234567890" not in redacted
+    assert "PARENSECRET1234567890" not in redacted
+    assert "CONCATSECRET1234567890" not in redacted
+    assert "BYTESECRET1234567890" not in redacted
+    assert 'globals()["api_key"] = <redacted>' in redacted
+    assert 'factory()["Authorization"] = <redacted>' in redacted
+    assert '(config)["client_secret"] = <redacted>' in redacted
+    assert 'os.environ["AWS_" + "SECRET_ACCESS_KEY"] = <redacted>' in redacted
+    assert 'payload[b"client_" + b"secret"] = <redacted>' in redacted
+    assert 'factory()["api_key_count"] = "visible"' in redacted
+    assert 'payload["api_" + "key_count"] = "visible"' in redacted
+    assert 'eval("1 + 1")' in redacted
+
+
+def test_redacts_exact_auth_targets_without_auth_control_false_positives() -> None:
+    """Credential-bearing auth variables should redact without matching controls."""
+    text = (
+        'auth = ("user", "AUTHSECRET1234567890"); '
+        'basic_auth = build("BASICAUTHSECRET1234567890"); '
+        'config["auth"] = "MAPPINGAUTHSECRET1234567890"; '
+        'auth_timeout = 30; oauth_enabled = True; author = "visible"; eval("1 + 1")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "AUTHSECRET1234567890" not in redacted
+    assert "BASICAUTHSECRET1234567890" not in redacted
+    assert "MAPPINGAUTHSECRET1234567890" not in redacted
+    assert "auth = <redacted>" in redacted
+    assert "basic_auth = <redacted>" in redacted
+    assert 'config["auth"] = "<redacted>"' in redacted
+    assert "auth_timeout = 30" in redacted
+    assert "oauth_enabled = True" in redacted
+    assert 'author = "visible"' in redacted
+    assert 'eval("1 + 1")' in redacted
+
+
+def test_redaction_preserves_original_preview_boundary() -> None:
+    """Shrinking a redacted value must not pull later source text into evidence."""
+    hidden_secret = "HIDDENSECRET1234567890"
+    long_secret = "A" * 4000
+    text = f'api_key = "{long_secret}"\nneutral = "{hidden_secret}"'
+
+    redacted = redact_evidence_string(text, max_chars=180)
+
+    assert "A" * 100 not in redacted
+    assert hidden_secret not in redacted
+    assert redacted.startswith('api_key = "<redacted>')
+    assert redacted.endswith("...")
+    assert len(redacted) < 180
+
+
+def test_redaction_fails_closed_for_tokens_crossing_preview_boundary() -> None:
+    """Lookahead may identify a split token but must not expose later source bytes."""
+    token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    text = f"prefix https://example.com/{token}/done hidden"
+
+    redacted = redact_evidence_string(text, max_chars=45)
+
+    assert token[:10] not in redacted
+    assert "hidden" not in redacted
+    assert redacted == "prefix https://example.com/..."
+
+
+def test_redaction_bounds_expression_analysis_to_original_preview() -> None:
+    """Very large evidence strings should redact secrets within the visible prefix."""
     secret = "BOUNDEDSECRET1234567890"
     text = f'client_secret = os.getenv("KEY", "{secret}")\n' + ("x" * 100_000)
 
@@ -787,7 +866,8 @@ def test_redaction_bounds_expression_analysis_to_output_lookahead() -> None:
 
     assert secret not in redacted
     assert redacted.startswith("client_secret = <redacted>\n")
-    assert len(redacted) == 100
+    assert redacted.endswith("...")
+    assert len(redacted) < 100
 
 
 def test_redacts_triple_quoted_and_escaped_quote_secret_assignments() -> None:
