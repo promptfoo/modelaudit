@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - detect TorchServe MAR handler execution primitives reached through dynamic imports and `getattr`
+- redact sensitive decoded previews in TensorFlow SavedModel collection, PyFunc, and Keras metadata findings
+- fail closed on novel standalone picklescan import/callable metadata truncation without masking operational read errors or repeated benign imports
+- skip scan-result caching for sampled large-file fingerprints
+- classify high-confidence active code patterns in PyTorch binary artifacts as security findings so scan exits reflect them
+- run bounded secret and network-content checks for ML text sidecars and prefer strict LightGBM content over native Flax suffixes
+- bound Flax MessagePack decoding/traversal and Orbax metadata JSON parsing so oversized JAX/Flax checkpoints fail closed
+- avoid false inconclusive Flax overlap results for complete pickle payloads with no trailing data
+- fail closed on noncanonical Keras ZIP Lambda and external-reference versions
 - scan ONNX external data references in sparse initializers, tensor-valued attributes, and function defaults
 - avoid false-positive process-launch findings for parsed framed Python string literals
 - detect dangerous Python calls retrieved through module namespace dictionaries in ZIP and TAR members
@@ -17,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect embedded Python `asyncio.create_subprocess_*` calls and resolved JIT `subprocess` launch aliases
 - detect embedded Python `runpy.run_module`, `runpy.run_path`, and `runpy._run_module_as_main` dynamic-module execution calls
 - preserve embedded Python runpy, webbrowser, and ctypes findings across continued imports, late aliases, and bounded tail-window extraction gaps
+- mark embedded Python/JIT byte and snippet budget exhaustion as incomplete coverage instead of clean scans
 - detect embedded Python `webbrowser` launches and `ctypes` native-library loads in archives and JIT-scanned content
 - resolve embedded `ctypes` loads through more CDLL-subclass construction forms (`__new__` returning inside `try`/`for`/`while`/`with`, `super()`/`*args` initializer forwarding) and indirect loader/controller bindings (conditional, boolean, walrus, and loop-bound expressions)
 - honor benign loader/controller member overwrites spelled as `setattr(..., **{})` or starred `setattr(*(...))`
@@ -24,14 +33,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - scan dangerous RKNN safe-key metadata values instead of suppressing the whole key-value string
 - scan ONNX external data initializers in nested graphs, functions, and training graphs
 - route protocol-0 JAX checkpoint pickles through pickle opcode security checks
+- bound Orbax directory metadata parsing and checkpoint entry enumeration before scanning JAX checkpoints
 - harden legacy JAX checkpoint pickle routing against bounded-prefix bypasses and benign sidecar false positives
 - detect dangerous Python calls retrieved or installed through module namespace dictionaries in ZIP and TAR members, while avoiding comprehension-local false positives
 - preflight and stream-enforce cumulative SevenZip extraction budgets before writing oversized archives
-- mark oversized structured JSON/YAML Jinja template fields as incomplete coverage instead of clean
+- harden structured JSON/YAML/GGUF Jinja template extraction against oversized values, nested containers, and colliding template paths
 - redact capability tokens embedded in network URL path segments
+- redact secret previews and URL path credentials from metadata scanner findings
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
+- include content-routed renamed JFrog folder artifacts in selective downloads with fail-closed bounded probes
+- strip JFrog credentials from untrusted redirect hops during artifact and Storage API requests
+- enforce direct Hugging Face file `--max-size` budgets before downloading
+- scan duplicate and case-varied ExecuTorch pickle ZIP members without shadowable-name or metadata-routing bypasses
+- refresh cloud cache entries that cannot be proven within the configured download size limit
+- enforce automatic cloud download size limits when remote size metadata is missing or late-bound
+- avoid importing attacker-shadowed TensorFlow protobuf packages during static scanning
 - inspect every parsed GGUF chat template when duplicate or trailing malformed metadata could otherwise hide SSTI payloads
 - bound GGUF declared metadata and tensor collections, and cap reported tensor summaries, so oversized structures fail closed without exhausting scanner resources
 - redact secret-shaped dictionary keys from embedded-secret detector finding contexts
@@ -40,8 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
+- fail closed when cloud directory metadata cannot be read for every listed object
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
+- fail closed on interpolation-bearing NeMo Hydra `_target_` selectors whose resolved callable cannot be verified
+- scan and globally bound Keras ZIP wrapper-owned nested layers while preserving custom namespace warnings
 - detect external references in weights-only Keras HDF5 layouts without Keras metadata
+- bound standalone Keras HDF5 layout and external-reference analysis, and distrust artifact-controlled versions
+- inspect mixed dict/list Keras HDF5 Lambda bytecode with bounded, marshal-aware analysis
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - classify unavailable metadata document reads and timed-out metadata scans as operationally incomplete rather than security findings
 - route renamed structured JAX/Orbax JSON checkpoints, conservatively report observable bounded-prefix threats, and fail closed for oversized identified metadata
@@ -60,6 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve per-shard metadata when aggregating sharded model families
 - prevent picklescan call-graph alias cycles from hanging scans
 - preserve HuggingFace snapshot shard paths while grouping cache-backed families
+- fail closed when Hugging Face repository listings contain no recognized scannable files instead of downloading the full repository
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - classify unavailable manifest and ML text reads as inconclusive rather than security findings, including routing, preflight, and stale cache transitions
 - classify unavailable manifest cloud-reference inspection as inconclusive rather than reporting complete coverage
@@ -85,6 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - classify unavailable ZIP traversal, member, manifest-less TorchServe handler, and Keras artifact scan coverage as inconclusive while preserving archive-depth security findings
 - classify unavailable TAR traversal and member scan coverage as inconclusive while preserving depth-limit security findings
 - classify unavailable Skops member and schema coverage as inconclusive rather than security findings
+- preserve Skops nested Python-member detection for high-risk calls reached through `__getattribute__`
 - classify bounded, unreadable, or unparseable TorchServe MAR analysis gaps as inconclusive rather than security findings
 - detect manifest-declared TorchServe extra files and PyTorch ZIP members disguised with executable content
 - classify incomplete SevenZip coverage as inconclusive and avoid caching temporary extracted members
