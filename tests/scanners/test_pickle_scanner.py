@@ -15,6 +15,7 @@ from modelaudit.core_results import merge_scan_result
 from modelaudit.models import create_initial_audit_result
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
+    _BINARY_TAIL_SCAN_BYTES,
     ALWAYS_DANGEROUS_FUNCTIONS,
     ALWAYS_DANGEROUS_MODULES,
     PickleScanner,
@@ -1467,6 +1468,105 @@ def test_scan_pytorch_extension_detects_executable_tail_after_pickle_stream(tmp_
 
     assert result.success is False
     assert any(issue.rule_code == "S502" for issue in result.issues)
+
+
+def test_scan_pytorch_extension_marks_out_of_window_binary_tail_incomplete(tmp_path: Path) -> None:
+    pickle_payload = pickle.dumps({"safe": True}, protocol=4)
+    path = tmp_path / "model.pt"
+    path.write_bytes(pickle_payload + (b"A" * (_BINARY_TAIL_SCAN_BYTES + 8)) + b"\x7fELF/bin/sh\x00")
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pickle_binary_tail_scan_window_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert not any(issue.rule_code == "S502" for issue in result.issues)
+    checks = [check for check in result.checks if check.name == "Pickle Binary Tail Coverage"]
+    assert len(checks) == 1
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].details["tail_bytes_scanned"] == _BINARY_TAIL_SCAN_BYTES
+    assert checks[0].details["tail_bytes_total"] > _BINARY_TAIL_SCAN_BYTES
+
+
+def test_scan_pytorch_extension_keeps_security_exit_for_detected_binary_tail_gap(tmp_path: Path) -> None:
+    pickle_payload = pickle.dumps({"safe": True}, protocol=4)
+    path = tmp_path / "model.pt"
+    path.write_bytes(pickle_payload + b"\x7fELF/bin/sh\x00" + (b"A" * (_BINARY_TAIL_SCAN_BYTES + 8)))
+
+    result = PickleScanner().scan(str(path))
+    result.metadata["file_path"] = str(path)
+    aggregate_result = create_initial_audit_result()
+    merge_scan_result(aggregate_result, result)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pickle_binary_tail_scan_window_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata.get("operational_error") is not True
+    assert any(issue.rule_code == "S502" for issue in result.issues)
+    assert determine_exit_code(aggregate_result) == 1
+
+
+def test_scan_stream_unknown_size_seekable_marks_out_of_window_binary_tail_incomplete() -> None:
+    pickle_payload = pickle.dumps({"safe": True}, protocol=4)
+    filler = b"".join(pickle.dumps({"pad": b"A" * 65536}, protocol=4) for _ in range(17))
+    stream = io.BytesIO(pickle_payload + filler)
+
+    result = PickleScanner().scan_stream(stream, None, source="unknown-tail.pt")
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pickle_binary_tail_scan_window_exceeded" in result.metadata["scan_outcome_reasons"]
+    checks = [check for check in result.checks if check.name == "Pickle Binary Tail Coverage"]
+    assert len(checks) == 1
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].details["tail_bytes_scanned"] == _BINARY_TAIL_SCAN_BYTES
+    assert checks[0].details["tail_bytes_total"] is None
+    assert stream.tell() == 0
+
+
+def test_scan_stream_unknown_size_seekable_allows_exact_binary_tail_window() -> None:
+    pickle_payload = pickle.dumps({"safe": True}, protocol=4)
+    filler = pickle.dumps(b"A" * (_BINARY_TAIL_SCAN_BYTES - 9), protocol=4)
+    assert len(filler) == _BINARY_TAIL_SCAN_BYTES
+    stream = io.BytesIO(pickle_payload + filler)
+
+    result = PickleScanner().scan_stream(stream, None, source="exact-tail.pt")
+
+    assert result.success is True
+    assert not any(check.name == "Pickle Binary Tail Coverage" for check in result.checks)
+    assert stream.tell() == 0
+
+
+def test_scan_file_allows_exact_binary_tail_window(tmp_path: Path) -> None:
+    pickle_payload = pickle.dumps({"safe": True}, protocol=4)
+    path = tmp_path / "exact-tail.pt"
+    path.write_bytes(pickle_payload + (b"A" * _BINARY_TAIL_SCAN_BYTES))
+
+    result = PickleScanner().scan(str(path))
+
+    assert "pickle_binary_tail_scan_window_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "Pickle Binary Tail Coverage" for check in result.checks)
+
+
+def test_scan_stream_unknown_size_tail_timeout_is_inconclusive(monkeypatch: pytest.MonkeyPatch) -> None:
+    pickle_payload = pickle.dumps({"safe": True}, protocol=4)
+    stream = io.BytesIO(pickle_payload + (b"A" * (_BINARY_TAIL_SCAN_BYTES + 1)))
+    scanner = PickleScanner()
+    result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+    result.metadata["first_pickle_end_pos"] = len(pickle_payload)
+    monkeypatch.setattr(scanner, "_check_timeout", lambda allow_partial=False: True)
+
+    scanner._scan_seekable_stream_binary_tail_if_needed(stream, 0, None, result, "timeout-tail.pt")
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["pickle_binary_tail_scan_timeout"]
+    checks = [check for check in result.checks if check.name == "Pickle Binary Tail Coverage"]
+    assert len(checks) == 1
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].details["tail_bytes_scanned"] == 0
+    assert checks[0].details["tail_bytes_total"] is None
+    assert checks[0].details["timed_out"] is True
+    assert stream.tell() == 0
 
 
 def test_scan_file_detects_executable_tail_past_raw_scan_window(tmp_path: Path) -> None:
