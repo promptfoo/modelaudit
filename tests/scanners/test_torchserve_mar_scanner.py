@@ -1439,6 +1439,61 @@ def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
             b"    module = __import__('os') if False else __import__('math')\n"
             b"    return module.system('id')\n"
         ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        raise RuntimeError()\n"
+            b"    except RuntimeError:\n"
+            b"        pass\n"
+            b"    else:\n"
+            b"        __import__('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return []\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    match [__import__('os')]:\n"
+            b"        case [module] if False:\n"
+            b"            module.system('id')\n"
+        ),
+        (
+            b"import importlib\n"
+            b"def handle(data, context):\n"
+            b"    return importlib.import_module(module='os').system('id')\n"
+        ),
+        (
+            b"import importlib\n"
+            b"def handle(data, context):\n"
+            b"    return importlib.import_module(name='os', bogus=True).system('id')\n"
+        ),
+        (
+            b"import importlib\n"
+            b"def handle(data, context):\n"
+            b"    return importlib.import_module('os', name='math').system('id')\n"
+        ),
+        (
+            b"TYPE_CHECKING = False\n"
+            b"if TYPE_CHECKING:\n"
+            b"    module = __import__('os')\n"
+            b"def handle(data, context):\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    list = lambda value: []\n"
+            b"    return list(generator)\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in [__import__('os'), __import__('math')]:\n"
+            b"        if False:\n"
+            b"            break\n"
+            b"    return module.system('id')\n"
+        ),
     ],
 )
 def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
@@ -1503,6 +1558,51 @@ def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
         (
             b"def handle(data, context):\n"
             b"    module = __import__('os') if True else __import__('math')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        pass\n"
+            b"    except RuntimeError:\n"
+            b"        pass\n"
+            b"    else:\n"
+            b"        __import__('os').system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return list(module.system('id') for module in [__import__('os')])\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return list(generator)\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    if context:\n"
+            b"        generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    else:\n"
+            b"        generator = (value for value in [1])\n"
+            b"    alias = generator\n"
+            b"    return next(alias)\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for module in [__import__('os'), __import__('math')]:\n"
+            b"        break\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    match [__import__('os')]:\n"
+            b"        case [module] if True:\n"
+            b"            module.system('id')\n"
+        ),
+        (b"def handle(data, context):\n    for module in {__import__('os'): 1}:\n        module.system('id')\n"),
+        (b"import importlib\ndef handle(data, context):\n    return importlib.import_module(name='os').system('id')\n"),
+        (
+            b"TYPE_CHECKING = True\n"
+            b"if TYPE_CHECKING:\n"
+            b"    module = __import__('os')\n"
+            b"def handle(data, context):\n"
             b"    return module.system('id')\n"
         ),
     ],
@@ -1878,6 +1978,19 @@ def test_non_handler_python_metadata_assignments_do_not_trigger_import_time_exec
     result = TorchServeMarScanner().scan(str(mar_path))
     non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
     assert non_handler_failures == []
+
+
+def test_import_time_analysis_respects_type_checking_rebinding() -> None:
+    scanner = TorchServeMarScanner()
+    imported_guard = ast.parse(
+        "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    __import__('os').system('id')\n"
+    )
+    rebound_guard = ast.parse("TYPE_CHECKING = True\nif TYPE_CHECKING:\n    __import__('os').system('id')\n")
+    disabled_guard = ast.parse("TYPE_CHECKING = False\nif TYPE_CHECKING:\n    __import__('os').system('id')\n")
+
+    assert scanner._has_import_time_execution(imported_guard) is False
+    assert scanner._has_import_time_execution(rebound_guard) is True
+    assert scanner._has_import_time_execution(disabled_guard) is False
 
 
 def test_non_handler_python_logger_initialization_does_not_trigger_import_time_execution(tmp_path: Path) -> None:

@@ -65,6 +65,44 @@ SAFE_IMPORT_TIME_CALLS = {
 _DYNAMIC_IMPORT_HELPERS = frozenset({"__import__", "builtins.__import__", "importlib.import_module"})
 _DYNAMIC_GETATTR_HELPERS = frozenset({"getattr", "builtins.getattr"})
 _DYNAMIC_ASSIGNABLE_HELPERS = _DYNAMIC_IMPORT_HELPERS | _DYNAMIC_GETATTR_HELPERS
+_EAGER_GENERATOR_CONSUMERS = frozenset(
+    {
+        "all",
+        "any",
+        "builtins.all",
+        "builtins.any",
+        "builtins.dict",
+        "builtins.frozenset",
+        "builtins.list",
+        "builtins.max",
+        "builtins.min",
+        "builtins.next",
+        "builtins.set",
+        "builtins.sorted",
+        "builtins.sum",
+        "builtins.tuple",
+        "dict",
+        "frozenset",
+        "list",
+        "max",
+        "min",
+        "next",
+        "set",
+        "sorted",
+        "sum",
+        "tuple",
+    }
+)
+_DynamicGeneratorAliases = dict[str, tuple[ast.GeneratorExp, ...]]
+_DynamicAliasState = tuple[
+    dict[str, frozenset[str]],
+    dict[str, frozenset[str]],
+    dict[str, frozenset[str]],
+    dict[str, str],
+    set[str],
+    _DynamicGeneratorAliases,
+    dict[str, bool],
+]
 
 
 def _canonical_dynamic_helper_name(name: str) -> str:
@@ -1059,17 +1097,22 @@ class TorchServeMarScanner(BaseScanner):
             return False
         return self._is_safe_import_time_value(value, aliases)
 
-    def _is_non_executing_import_guard(self, node: ast.If) -> bool:
+    def _is_non_executing_import_guard(
+        self,
+        node: ast.If,
+        aliases: dict[str, str] | None = None,
+        shadowed_names: set[str] | None = None,
+    ) -> bool:
         test = node.test
-        if isinstance(test, ast.Name) and test.id == "TYPE_CHECKING":
-            return True
-        if (
-            isinstance(test, ast.Attribute)
-            and isinstance(test.value, ast.Name)
-            and test.value.id == "typing"
-            and test.attr == "TYPE_CHECKING"
-        ):
-            return True
+        guard_name = self._resolve_call_name(test)
+        aliases = aliases or {}
+        shadowed_names = shadowed_names or set()
+        if guard_name is not None and guard_name.split(".", maxsplit=1)[0] not in shadowed_names:
+            resolved_guard_name = self._apply_alias(guard_name, aliases)
+            if resolved_guard_name == "typing.TYPE_CHECKING" or (
+                guard_name in {"TYPE_CHECKING", "typing.TYPE_CHECKING"} and guard_name not in aliases
+            ):
+                return True
         if (
             isinstance(test, ast.Compare)
             and len(test.ops) == 1
@@ -1087,7 +1130,9 @@ class TorchServeMarScanner(BaseScanner):
         return False
 
     def _has_import_time_execution(self, tree: ast.Module) -> bool:
-        aliases = self._collect_import_aliases(tree)
+        aliases: dict[str, str] = {}
+        shadowed_names: set[str] = set()
+        static_truthiness_bindings: dict[str, bool] = {}
         for node in tree.body:
             if (
                 isinstance(node, ast.Expr)
@@ -1101,11 +1146,58 @@ class TorchServeMarScanner(BaseScanner):
                 continue
             if isinstance(node, ast.Pass):
                 continue
-            if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    binding_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                    aliases[binding_name] = alias.name if alias.asname else binding_name
+                    shadowed_names.discard(binding_name)
+                    static_truthiness_bindings.pop(binding_name, None)
                 continue
-            if isinstance(node, (ast.Assign, ast.AnnAssign)) and self._is_safe_import_time_assignment(node, aliases):
+            if isinstance(node, ast.ImportFrom):
+                if node.module is not None:
+                    for alias in node.names:
+                        if alias.name == "*":
+                            continue
+                        binding_name = alias.asname or alias.name
+                        aliases[binding_name] = f"{node.module}.{alias.name}"
+                        shadowed_names.discard(binding_name)
+                        static_truthiness_bindings.pop(binding_name, None)
                 continue
-            if isinstance(node, ast.If) and self._is_non_executing_import_guard(node):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                aliases.pop(node.name, None)
+                shadowed_names.add(node.name)
+                static_truthiness_bindings.pop(node.name, None)
+                continue
+            if isinstance(node, ast.Assign | ast.AnnAssign):
+                is_safe_assignment = self._is_safe_import_time_assignment(node, aliases)
+                assignment_value = node.value
+                assignment_truthiness = (
+                    self._static_truthiness(assignment_value) if assignment_value is not None else None
+                )
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    for binding_name in self._target_binding_names(target):
+                        aliases.pop(binding_name, None)
+                        shadowed_names.add(binding_name)
+                        if assignment_truthiness is None:
+                            static_truthiness_bindings.pop(binding_name, None)
+                        else:
+                            static_truthiness_bindings[binding_name] = assignment_truthiness
+                if is_safe_assignment:
+                    continue
+            if (
+                isinstance(node, ast.If)
+                and isinstance(node.test, ast.Name)
+                and node.test.id in static_truthiness_bindings
+            ):
+                if static_truthiness_bindings[node.test.id] is False:
+                    continue
+                return True
+            if isinstance(node, ast.If) and self._is_non_executing_import_guard(
+                node,
+                aliases,
+                shadowed_names,
+            ):
                 continue
             return True
         return False
@@ -1427,6 +1519,20 @@ class TorchServeMarScanner(BaseScanner):
         return None
 
     @staticmethod
+    def _target_binding_names(target: ast.AST) -> set[str]:
+        if isinstance(target, ast.Name):
+            return {target.id}
+        if isinstance(target, ast.Starred):
+            return TorchServeMarScanner._target_binding_names(target.value)
+        if isinstance(target, ast.Tuple | ast.List):
+            return {
+                name
+                for child_target in target.elts
+                for name in TorchServeMarScanner._target_binding_names(child_target)
+            }
+        return set()
+
+    @staticmethod
     def _callable_local_binding_names(
         node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
     ) -> set[str]:
@@ -1577,25 +1683,34 @@ class TorchServeMarScanner(BaseScanner):
         if not import_helpers:
             return frozenset()
 
-        module_arg = node.args[0] if node.args else None
-        for keyword in node.keywords:
-            if keyword.arg in {"name", "module"} and module_arg is None:
-                module_arg = keyword.value
-        if module_arg is None:
-            return frozenset()
-
-        module_name = self._static_string_value(module_arg)
-        if not module_name:
-            return frozenset()
-
-        fromlist_node: ast.AST | None = node.args[3] if len(node.args) >= 4 else None
-        for keyword in node.keywords:
-            if keyword.arg == "fromlist" and fromlist_node is None:
-                fromlist_node = keyword.value
-        fromlist_truthiness = self._static_truthiness(fromlist_node) if fromlist_node is not None else False
-
         module_names: set[str] = set()
         for resolved_helper_name in import_helpers:
+            helper_parameters = (
+                ("name", "globals", "locals", "fromlist", "level")
+                if resolved_helper_name in {"__import__", "builtins.__import__"}
+                else ("name", "package")
+            )
+            if len(node.args) > len(helper_parameters) or any(isinstance(arg, ast.Starred) for arg in node.args):
+                continue
+            arguments_by_name = dict(zip(helper_parameters, node.args, strict=False))
+            valid_call = True
+            for keyword in node.keywords:
+                if keyword.arg is None or keyword.arg not in helper_parameters or keyword.arg in arguments_by_name:
+                    valid_call = False
+                    break
+                arguments_by_name[keyword.arg] = keyword.value
+            if not valid_call:
+                continue
+
+            module_arg = arguments_by_name.get("name")
+            if module_arg is None:
+                continue
+            module_name = self._static_string_value(module_arg)
+            if not module_name:
+                continue
+
+            fromlist_node = arguments_by_name.get("fromlist")
+            fromlist_truthiness = self._static_truthiness(fromlist_node) if fromlist_node is not None else False
             if resolved_helper_name not in {"__import__", "builtins.__import__"} or fromlist_truthiness is True:
                 module_names.add(module_name)
             elif fromlist_truthiness is False:
@@ -1836,38 +1951,15 @@ class TorchServeMarScanner(BaseScanner):
                 self.import_loader_alias_stack: list[dict[str, frozenset[str]]] = [{}]
                 self.import_alias_stack: list[dict[str, str]] = [{}]
                 self.shadowed_name_stack: list[set[str]] = [set()]
+                self.lazy_generator_alias_stack: list[_DynamicGeneratorAliases] = [{}]
+                self.static_truthiness_alias_stack: list[dict[str, bool]] = [{}]
                 self.scope_kind_stack: list[str] = ["module"]
-                self.class_parent_state_stack: list[
-                    tuple[
-                        dict[str, frozenset[str]],
-                        dict[str, frozenset[str]],
-                        dict[str, frozenset[str]],
-                        dict[str, str],
-                        set[str],
-                    ]
-                ] = []
-                self.function_binding_state_stack: list[
-                    tuple[
-                        dict[str, frozenset[str]],
-                        dict[str, frozenset[str]],
-                        dict[str, frozenset[str]],
-                        dict[str, str],
-                        set[str],
-                    ]
-                ] = []
+                self.class_parent_state_stack: list[_DynamicAliasState] = []
+                self.function_binding_state_stack: list[_DynamicAliasState] = []
                 self.risky_calls: set[str] = set()
                 self.collecting_module_bindings = False
                 self.scope_depth = 0
-                self.module_binding_state: (
-                    tuple[
-                        dict[str, frozenset[str]],
-                        dict[str, frozenset[str]],
-                        dict[str, frozenset[str]],
-                        dict[str, str],
-                        set[str],
-                    ]
-                    | None
-                ) = None
+                self.module_binding_state: _DynamicAliasState | None = None
 
             @property
             def module_aliases(self) -> dict[str, frozenset[str]]:
@@ -1889,38 +1981,33 @@ class TorchServeMarScanner(BaseScanner):
             def shadowed_names(self) -> set[str]:
                 return self.shadowed_name_stack[-1]
 
-            def _snapshot_state(
-                self,
-            ) -> tuple[
-                dict[str, frozenset[str]],
-                dict[str, frozenset[str]],
-                dict[str, frozenset[str]],
-                dict[str, str],
-                set[str],
-            ]:
+            @property
+            def lazy_generator_aliases(self) -> _DynamicGeneratorAliases:
+                return self.lazy_generator_alias_stack[-1]
+
+            @property
+            def static_truthiness_aliases(self) -> dict[str, bool]:
+                return self.static_truthiness_alias_stack[-1]
+
+            def _snapshot_state(self) -> _DynamicAliasState:
                 return (
                     dict(self.module_aliases),
                     dict(self.callable_aliases),
                     dict(self.import_loader_aliases),
                     dict(self.import_aliases),
                     set(self.shadowed_names),
+                    dict(self.lazy_generator_aliases),
+                    dict(self.static_truthiness_aliases),
                 )
 
-            def _restore_state(
-                self,
-                state: tuple[
-                    dict[str, frozenset[str]],
-                    dict[str, frozenset[str]],
-                    dict[str, frozenset[str]],
-                    dict[str, str],
-                    set[str],
-                ],
-            ) -> None:
+            def _restore_state(self, state: _DynamicAliasState) -> None:
                 self.module_alias_stack[-1] = dict(state[0])
                 self.callable_alias_stack[-1] = dict(state[1])
                 self.import_loader_alias_stack[-1] = dict(state[2])
                 self.import_alias_stack[-1] = dict(state[3])
                 self.shadowed_name_stack[-1] = set(state[4])
+                self.lazy_generator_alias_stack[-1] = dict(state[5])
+                self.static_truthiness_alias_stack[-1] = dict(state[6])
 
             @staticmethod
             def _merge_possible_aliases(
@@ -1954,48 +2041,46 @@ class TorchServeMarScanner(BaseScanner):
                         merged[name] = left_value
                 return merged
 
+            @staticmethod
+            def _merge_generator_aliases(
+                left: _DynamicGeneratorAliases,
+                right: _DynamicGeneratorAliases,
+            ) -> _DynamicGeneratorAliases:
+                merged: _DynamicGeneratorAliases = {}
+                for name in left.keys() | right.keys():
+                    generators_by_dump = {
+                        ast.dump(generator): generator for generator in (*left.get(name, ()), *right.get(name, ()))
+                    }
+                    if generators_by_dump:
+                        merged[name] = tuple(generators_by_dump.values())
+                return merged
+
+            @staticmethod
+            def _merge_static_truthiness_aliases(
+                left: dict[str, bool],
+                right: dict[str, bool],
+            ) -> dict[str, bool]:
+                return {name: left[name] for name in left.keys() & right.keys() if left[name] is right[name]}
+
             def _merge_states(
                 self,
-                left: tuple[
-                    dict[str, frozenset[str]],
-                    dict[str, frozenset[str]],
-                    dict[str, frozenset[str]],
-                    dict[str, str],
-                    set[str],
-                ],
-                right: tuple[
-                    dict[str, frozenset[str]],
-                    dict[str, frozenset[str]],
-                    dict[str, frozenset[str]],
-                    dict[str, str],
-                    set[str],
-                ],
-            ) -> tuple[
-                dict[str, frozenset[str]],
-                dict[str, frozenset[str]],
-                dict[str, frozenset[str]],
-                dict[str, str],
-                set[str],
-            ]:
+                left: _DynamicAliasState,
+                right: _DynamicAliasState,
+            ) -> _DynamicAliasState:
                 return (
                     self._merge_possible_aliases(left[0], right[0]),
                     self._merge_possible_aliases(left[1], right[1]),
                     self._merge_possible_aliases(left[2], right[2]),
                     self._merge_import_aliases(left[3], right[3]),
                     left[4] & right[4],
+                    self._merge_generator_aliases(left[5], right[5]),
+                    self._merge_static_truthiness_aliases(left[6], right[6]),
                 )
 
             def _push_scope(
                 self,
                 parameters: set[str],
-                inherited_state: tuple[
-                    dict[str, frozenset[str]],
-                    dict[str, frozenset[str]],
-                    dict[str, frozenset[str]],
-                    dict[str, str],
-                    set[str],
-                ]
-                | None = None,
+                inherited_state: _DynamicAliasState | None = None,
                 scope_kind: str = "function",
             ) -> None:
                 state = inherited_state or self._snapshot_state()
@@ -2004,6 +2089,8 @@ class TorchServeMarScanner(BaseScanner):
                 self.import_loader_alias_stack.append(dict(state[2]))
                 self.import_alias_stack.append(dict(state[3]))
                 self.shadowed_name_stack.append(set(state[4]))
+                self.lazy_generator_alias_stack.append(dict(state[5]))
+                self.static_truthiness_alias_stack.append(dict(state[6]))
                 self.scope_kind_stack.append(scope_kind)
                 self.scope_depth += 1
                 for parameter in parameters:
@@ -2015,6 +2102,8 @@ class TorchServeMarScanner(BaseScanner):
                 self.import_loader_alias_stack.pop()
                 self.import_alias_stack.pop()
                 self.shadowed_name_stack.pop()
+                self.lazy_generator_alias_stack.pop()
+                self.static_truthiness_alias_stack.pop()
                 self.scope_kind_stack.pop()
                 self.scope_depth -= 1
 
@@ -2047,15 +2136,7 @@ class TorchServeMarScanner(BaseScanner):
                     *keyword_defaults,
                 ]
 
-            def _callable_inherited_state(
-                self,
-            ) -> tuple[
-                dict[str, frozenset[str]],
-                dict[str, frozenset[str]],
-                dict[str, frozenset[str]],
-                dict[str, str],
-                set[str],
-            ]:
+            def _callable_inherited_state(self) -> _DynamicAliasState:
                 if self.scope_kind_stack[-1] == "module":
                     return self.module_binding_state or self._snapshot_state()
                 if self.scope_kind_stack[-1] == "class":
@@ -2064,17 +2145,53 @@ class TorchServeMarScanner(BaseScanner):
                     return self.function_binding_state_stack[-1]
                 return self._snapshot_state()
 
+            def _resolved_static_truthiness(self, node: ast.AST) -> bool | None:
+                if isinstance(node, ast.Name):
+                    return self.static_truthiness_aliases.get(node.id)
+                if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+                    operand_truthiness = self._resolved_static_truthiness(node.operand)
+                    return None if operand_truthiness is None else not operand_truthiness
+                if isinstance(node, ast.BoolOp):
+                    value_truthiness = [self._resolved_static_truthiness(value) for value in node.values]
+                    if isinstance(node.op, ast.And):
+                        if False in value_truthiness:
+                            return False
+                        if all(value is True for value in value_truthiness):
+                            return True
+                    elif isinstance(node.op, ast.Or):
+                        if True in value_truthiness:
+                            return True
+                        if all(value is False for value in value_truthiness):
+                            return False
+                    return None
+                if isinstance(node, ast.IfExp):
+                    test_truthiness = self._resolved_static_truthiness(node.test)
+                    if test_truthiness is True:
+                        return self._resolved_static_truthiness(node.body)
+                    if test_truthiness is False:
+                        return self._resolved_static_truthiness(node.orelse)
+                    body_truthiness = self._resolved_static_truthiness(node.body)
+                    orelse_truthiness = self._resolved_static_truthiness(node.orelse)
+                    if body_truthiness == orelse_truthiness:
+                        return body_truthiness
+                    return None
+                return scanner._static_truthiness(node)
+
             def _invalidate_name(self, name: str) -> None:
                 self.module_aliases.pop(name, None)
                 self.callable_aliases.pop(name, None)
                 self.import_loader_aliases.pop(name, None)
                 self.import_aliases.pop(name, None)
+                self.lazy_generator_aliases.pop(name, None)
+                self.static_truthiness_aliases.pop(name, None)
                 self.shadowed_names.add(name)
 
             def _record_import_binding(self, name: str, resolved_name: str) -> None:
                 resolved_name = _canonical_dynamic_helper_name(resolved_name)
                 self.module_aliases.pop(name, None)
                 self.callable_aliases.pop(name, None)
+                self.lazy_generator_aliases.pop(name, None)
+                self.static_truthiness_aliases.pop(name, None)
                 if resolved_name in _DYNAMIC_IMPORT_HELPERS:
                     self.import_loader_aliases[name] = frozenset({resolved_name})
                 else:
@@ -2086,13 +2203,7 @@ class TorchServeMarScanner(BaseScanner):
                 self,
                 name: str,
                 value: ast.AST,
-                definition_state: tuple[
-                    dict[str, frozenset[str]],
-                    dict[str, frozenset[str]],
-                    dict[str, frozenset[str]],
-                    dict[str, str],
-                    set[str],
-                ],
+                definition_state: _DynamicAliasState,
             ) -> None:
                 callable_state = self._snapshot_state()
                 self._restore_state(definition_state)
@@ -2111,10 +2222,14 @@ class TorchServeMarScanner(BaseScanner):
                     self.import_aliases[name] = resolved_default_state[3][name]
                 if name not in resolved_default_state[4]:
                     self.shadowed_names.discard(name)
+                if name in resolved_default_state[5]:
+                    self.lazy_generator_aliases[name] = resolved_default_state[5][name]
+                if name in resolved_default_state[6]:
+                    self.static_truthiness_aliases[name] = resolved_default_state[6][name]
 
             def _record_name_assignment(self, name: str, value: ast.AST) -> None:
                 if isinstance(value, ast.IfExp):
-                    truthiness = scanner._static_truthiness(value.test)
+                    truthiness = self._resolved_static_truthiness(value.test)
                     if truthiness is True:
                         self._record_name_assignment(name, value.body)
                         return
@@ -2184,8 +2299,15 @@ class TorchServeMarScanner(BaseScanner):
                     if helper_name in _DYNAMIC_ASSIGNABLE_HELPERS
                 )
                 import_helper_names = helper_names & _DYNAMIC_IMPORT_HELPERS
+                static_truthiness = self._resolved_static_truthiness(value)
 
                 self._invalidate_name(name)
+                if isinstance(value, ast.GeneratorExp):
+                    self.lazy_generator_aliases[name] = (value,)
+                elif isinstance(value, ast.Name) and value.id in self.lazy_generator_aliases:
+                    self.lazy_generator_aliases[name] = self.lazy_generator_aliases[value.id]
+                if static_truthiness is not None:
+                    self.static_truthiness_aliases[name] = static_truthiness
                 if module_names:
                     self.module_aliases[name] = module_names
                 if callable_names:
@@ -2236,18 +2358,33 @@ class TorchServeMarScanner(BaseScanner):
                 self.import_alias_stack[destination_index].pop(name, None)
                 if name in self.import_aliases:
                     self.import_alias_stack[destination_index][name] = self.import_aliases[name]
+                self.lazy_generator_alias_stack[destination_index].pop(name, None)
+                if name in self.lazy_generator_aliases:
+                    self.lazy_generator_alias_stack[destination_index][name] = self.lazy_generator_aliases[name]
+                self.static_truthiness_alias_stack[destination_index].pop(name, None)
+                if name in self.static_truthiness_aliases:
+                    self.static_truthiness_alias_stack[destination_index][name] = self.static_truthiness_aliases[name]
                 self.shadowed_name_stack[destination_index].discard(name)
                 if name in self.shadowed_names:
                     self.shadowed_name_stack[destination_index].add(name)
 
+            @staticmethod
+            def _literal_iterable_elements(iterable: ast.AST) -> list[ast.expr] | None:
+                if isinstance(iterable, ast.List | ast.Tuple | ast.Set):
+                    return list(iterable.elts)
+                if isinstance(iterable, ast.Dict):
+                    return [key for key in iterable.keys if key is not None]
+                return None
+
             def _record_target_from_iterable(self, target: ast.AST, iterable: ast.AST) -> bool:
-                if not isinstance(iterable, ast.List | ast.Tuple | ast.Set) or not iterable.elts:
+                elements = self._literal_iterable_elements(iterable)
+                if not elements:
                     self._invalidate_target(target)
                     return False
 
                 initial_state = self._snapshot_state()
                 possible_states = []
-                for element in iterable.elts:
+                for element in elements:
                     self._restore_state(initial_state)
                     self._record_target_assignment(target, element)
                     possible_states.append(self._snapshot_state())
@@ -2460,7 +2597,7 @@ class TorchServeMarScanner(BaseScanner):
             def visit_BoolOp(self, node: ast.BoolOp) -> None:
                 for value in node.values:
                     self.visit(value)
-                    truthiness = scanner._static_truthiness(value)
+                    truthiness = self._resolved_static_truthiness(value)
                     if isinstance(node.op, ast.And) and truthiness is False:
                         return
                     if isinstance(node.op, ast.Or) and truthiness is True:
@@ -2468,7 +2605,7 @@ class TorchServeMarScanner(BaseScanner):
 
             def visit_IfExp(self, node: ast.IfExp) -> None:
                 self.visit(node.test)
-                truthiness = scanner._static_truthiness(node.test)
+                truthiness = self._resolved_static_truthiness(node.test)
                 if truthiness is True:
                     self.visit(node.body)
                     return
@@ -2484,7 +2621,7 @@ class TorchServeMarScanner(BaseScanner):
                 if not isinstance(statement, ast.If):
                     return False
 
-                truthiness = scanner._static_truthiness(statement.test)
+                truthiness = self._resolved_static_truthiness(statement.test)
                 if truthiness is True:
                     return self._statements_definitely_terminate(statement.body)
                 if truthiness is False:
@@ -2546,19 +2683,81 @@ class TorchServeMarScanner(BaseScanner):
                     binding_visitor.visit(statement)
                 return binding_visitor.rebound
 
+            def _loop_body_may_break(self, body: list[ast.stmt]) -> bool:
+                visitor = self
+
+                class BreakVisitor(ast.NodeVisitor):
+                    def __init__(self) -> None:
+                        self.found = False
+
+                    def visit_Break(self, node: ast.Break) -> None:
+                        self.found = True
+
+                    def visit_If(self, node: ast.If) -> None:
+                        truthiness = visitor._resolved_static_truthiness(node.test)
+                        if truthiness is True:
+                            for statement in node.body:
+                                self.visit(statement)
+                            return
+                        if truthiness is False:
+                            for statement in node.orelse:
+                                self.visit(statement)
+                            return
+                        self.generic_visit(node)
+
+                    def visit_For(self, node: ast.For) -> None:
+                        return
+
+                    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+                        return
+
+                    def visit_While(self, node: ast.While) -> None:
+                        return
+
+                    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                        return
+
+                    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                        return
+
+                    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                        return
+
+                    def visit_Lambda(self, node: ast.Lambda) -> None:
+                        return
+
+                break_visitor = BreakVisitor()
+                for statement in body:
+                    break_visitor.visit(statement)
+                return break_visitor.found
+
+            def _visit_consumed_generator_value(self, value: ast.AST) -> bool:
+                if isinstance(value, ast.GeneratorExp):
+                    self._visit_eager_generator_expression(value)
+                    return True
+                if isinstance(value, ast.Name):
+                    generators = self.lazy_generator_aliases.get(value.id, ())
+                    for generator in generators:
+                        self._visit_eager_generator_expression(generator)
+                    return bool(generators)
+                return False
+
             def _visit_for(self, node: ast.For | ast.AsyncFor) -> None:
-                self.visit(node.iter)
+                if not self._visit_consumed_generator_value(node.iter):
+                    self.visit(node.iter)
                 if scanner._static_iterable_truthiness(node.iter) is False:
                     self._visit_statement_block(node.orelse)
                     return
                 self._record_target_from_iterable(node.target, node.iter)
                 self._visit_statement_block(node.body)
+                literal_elements = self._literal_iterable_elements(node.iter)
                 if (
-                    isinstance(node.iter, ast.List | ast.Tuple)
-                    and node.iter.elts
+                    isinstance(node.iter, ast.List | ast.Tuple | ast.Dict)
+                    and literal_elements
                     and not self._loop_body_rebinds_target(node.target, node.body)
+                    and not self._loop_body_may_break(node.body)
                 ):
-                    self._record_target_assignment(node.target, node.iter.elts[-1])
+                    self._record_target_assignment(node.target, literal_elements[-1])
                 self._visit_statement_block(node.orelse)
 
             def visit_For(self, node: ast.For) -> None:
@@ -2574,14 +2773,15 @@ class TorchServeMarScanner(BaseScanner):
             ) -> None:
                 self._push_scope(set(), scope_kind="comprehension")
                 for generator in generators:
-                    self.visit(generator.iter)
+                    if not self._visit_consumed_generator_value(generator.iter):
+                        self.visit(generator.iter)
                     if scanner._static_iterable_truthiness(generator.iter) is False:
                         self._pop_scope()
                         return
                     self._record_target_from_iterable(generator.target, generator.iter)
                     for condition in generator.ifs:
                         self.visit(condition)
-                        if scanner._static_truthiness(condition) is False:
+                        if self._resolved_static_truthiness(condition) is False:
                             self._pop_scope()
                             return
                 for result_node in result_nodes:
@@ -2594,22 +2794,38 @@ class TorchServeMarScanner(BaseScanner):
             def visit_SetComp(self, node: ast.SetComp) -> None:
                 self._visit_comprehension(node.generators, [node.elt])
 
-            def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+            def _visit_eager_generator_expression(self, node: ast.GeneratorExp) -> None:
                 self._visit_comprehension(node.generators, [node.elt])
+
+            def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+                if node.generators:
+                    self.visit(node.generators[0].iter)
 
             def visit_DictComp(self, node: ast.DictComp) -> None:
                 self._visit_comprehension(node.generators, [node.key, node.value])
 
+            def visit_YieldFrom(self, node: ast.YieldFrom) -> None:
+                if not self._visit_consumed_generator_value(node.value):
+                    self.visit(node.value)
+
+            def visit_Starred(self, node: ast.Starred) -> None:
+                if not self._visit_consumed_generator_value(node.value):
+                    self.visit(node.value)
+
             def visit_If(self, node: ast.If) -> None:
                 self.visit(node.test)
-                truthiness = scanner._static_truthiness(node.test)
+                truthiness = self._resolved_static_truthiness(node.test)
                 if truthiness is True:
                     self._visit_statement_block(node.body)
                     return
                 if truthiness is False:
                     self._visit_statement_block(node.orelse)
                     return
-                if scanner._is_non_executing_import_guard(node):
+                if scanner._is_non_executing_import_guard(
+                    node,
+                    self.import_aliases,
+                    self.shadowed_names,
+                ):
                     self._visit_statement_block(node.orelse)
                     return
                 initial_state = self._snapshot_state()
@@ -2622,7 +2838,7 @@ class TorchServeMarScanner(BaseScanner):
 
             def visit_While(self, node: ast.While) -> None:
                 self.visit(node.test)
-                truthiness = scanner._static_truthiness(node.test)
+                truthiness = self._resolved_static_truthiness(node.test)
                 if truthiness is False:
                     self._visit_statement_block(node.orelse)
                     return
@@ -2641,8 +2857,11 @@ class TorchServeMarScanner(BaseScanner):
                 initial_state = self._snapshot_state()
                 self._visit_statement_block(node.body)
                 body_state = self._snapshot_state()
-                self._visit_statement_block(node.orelse)
-                possible_states = [self._snapshot_state()]
+                body_terminates = self._statements_definitely_terminate(node.body)
+                possible_states = []
+                if not body_terminates:
+                    self._visit_statement_block(node.orelse)
+                    possible_states.append(self._snapshot_state())
 
                 handler_initial_state = self._merge_states(initial_state, body_state)
                 for handler in node.handlers:
@@ -2656,10 +2875,13 @@ class TorchServeMarScanner(BaseScanner):
                         self._invalidate_name(handler.name)
                     possible_states.append(self._snapshot_state())
 
-                merged_state = possible_states[0]
-                for possible_state in possible_states[1:]:
-                    merged_state = self._merge_states(merged_state, possible_state)
-                self._restore_state(merged_state)
+                if possible_states:
+                    merged_state = possible_states[0]
+                    for possible_state in possible_states[1:]:
+                        merged_state = self._merge_states(merged_state, possible_state)
+                    self._restore_state(merged_state)
+                else:
+                    self._restore_state(body_state)
                 self._visit_statement_block(node.finalbody)
 
             def visit_Match(self, node: ast.Match) -> None:
@@ -2671,6 +2893,13 @@ class TorchServeMarScanner(BaseScanner):
                     self._record_pattern_assignment(case.pattern, node.subject)
                     if case.guard is not None:
                         self.visit(case.guard)
+                        guard_state = self._snapshot_state()
+                        guard_truthiness = self._resolved_static_truthiness(case.guard)
+                        if guard_truthiness is False:
+                            possible_states.append(guard_state)
+                            continue
+                        if guard_truthiness is None:
+                            possible_states.append(guard_state)
                     self._visit_statement_block(case.body)
                     possible_states.append(self._snapshot_state())
 
@@ -2726,7 +2955,25 @@ class TorchServeMarScanner(BaseScanner):
                     self.shadowed_names,
                 )
                 self.risky_calls.update(call_names)
-                self.generic_visit(node)
+                call_name = scanner._resolve_call_name(node.func)
+                resolved_call_name = (
+                    scanner._apply_unshadowed_alias(
+                        call_name,
+                        self.import_aliases,
+                        self.shadowed_names,
+                    )
+                    if call_name is not None and call_name.split(".", maxsplit=1)[0] not in self.shadowed_names
+                    else None
+                )
+                consumes_generator_argument = resolved_call_name in _EAGER_GENERATOR_CONSUMERS
+                if isinstance(node.func, ast.Attribute) and node.func.attr in {"__next__", "send"}:
+                    self._visit_consumed_generator_value(node.func.value)
+                self.visit(node.func)
+                for argument in node.args:
+                    if not (consumes_generator_argument and self._visit_consumed_generator_value(argument)):
+                        self.visit(argument)
+                for keyword in node.keywords:
+                    self.visit(keyword.value)
 
         visitor = DynamicImportExecutionVisitor()
         visitor.visit(tree)
