@@ -2186,6 +2186,18 @@ class TestJITScriptDetector:
                 b"Alias().run(eval)\n"
             ),
             (b"__builtins__.__dict__.pop('eval')('1+1')\n"),
+            (b"callbacks = []\nalias = callbacks\ncallbacks += [eval]\nalias[0]('1+1')\n"),
+            (b"\x00\xffdef run(g=getattr):\n    return g(__builtins__, 'eval')('1+1')\nrun()\n"),
+            (
+                b"\x00\xffdef run(callback):\n"
+                b"    return callback('1+1')\n"
+                b"def outer(*functions):\n"
+                b"    return functions[0](eval)\n"
+                b"outer(run)\n"
+            ),
+            (b"(lambda callback: callback('1+1'))(eval)\n"),
+            (b"\x00\xffglobals().update({'sink': eval})\nsink('1+1')\n"),
+            (b"\x00\xffdef run(callbacks=[]):\n    callbacks.append(eval)\n    return callbacks[0]('1+1')\nrun()\n"),
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
@@ -2413,6 +2425,26 @@ class TestJITScriptDetector:
                 b"unused = eval\n"
             ),
             (b"__builtins__.__dict__.pop('len')([])\nunused = eval\n"),
+            (b"callbacks = []\ncallbacks += [len]\ncallbacks[0]([])\nunused = eval\n"),
+            (b"callbacks = (len,)\nalias = callbacks\ncallbacks += (eval,)\nalias[1]('1+1')\n"),
+            (b"\x00\xffdef run(g=lambda *_args: len):\n    return g(__builtins__, 'eval')([])\nrun()\nunused = eval\n"),
+            (
+                b"\x00\xffdef run(callback):\n"
+                b"    return callback([])\n"
+                b"def outer(*functions):\n"
+                b"    return functions[0](len)\n"
+                b"outer(run)\n"
+                b"unused = eval\n"
+            ),
+            (b"(lambda callback: callback([]))(len)\nunused = eval\n"),
+            (b"\x00\xffglobals().update({'sink': eval})\nglobals().update({'sink': len})\nsink([])\n"),
+            (
+                b"\x00\xffdef run(callbacks=[]):\n"
+                b"    callbacks.append(len)\n"
+                b"    return callbacks[0]([])\n"
+                b"run()\n"
+                b"unused = eval\n"
+            ),
         ],
     )
     def test_scan_model_avoids_false_positives_across_callable_summaries(self, data: bytes) -> None:
