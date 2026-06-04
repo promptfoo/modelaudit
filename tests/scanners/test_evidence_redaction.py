@@ -137,6 +137,18 @@ def test_redacts_multiline_sensitive_expression_assignment() -> None:
     assert 'return eval("1 + 1")' in redacted
 
 
+def test_unparseable_expression_assignment_redacts_complete_rhs() -> None:
+    """Binary framing must not let concatenated secret literals survive fallback redaction."""
+    secret = "SECRETTAIL1234567890"
+    text = f'\x00 client_secret = "prefix" + "{secret}"; eval("1 + 1")'
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert secret not in redacted
+    assert "client_secret = <redacted>" in redacted
+    assert 'eval("1 + 1")' in redacted
+
+
 def test_expression_redaction_preserves_annotations_and_argument_boundaries() -> None:
     """Redaction should preserve enough syntax to explain the surrounding finding."""
     text = (

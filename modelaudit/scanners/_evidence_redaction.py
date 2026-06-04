@@ -84,6 +84,11 @@ SENSITIVE_EXPRESSION_ASSIGNMENT_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 STRING_LITERAL_START_RE: Final[re.Pattern[str]] = re.compile(r"(?:[rubf]{0,2})?[\"']", re.IGNORECASE)
+GENERIC_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![a-z0-9_])(?:[a-z_]\w*(?:\.[a-z_]\w*)*(?:\[\s*[\"'][^\"']+[\"']\s*\])?|[\"'][^\"']+[\"'])"
+    r"\s*(?:=|:(?![^\r\n=]*=))",
+    re.IGNORECASE,
+)
 
 
 def _redact_malformed_url(raw_url: str) -> str:
@@ -208,21 +213,66 @@ def _assignment_value_end(
     return text_length, significant
 
 
-def _redact_malformed_sensitive_expression_assignment(text: str) -> str:
-    for match in SENSITIVE_EXPRESSION_ASSIGNMENT_PREFIX_RE.finditer(text):
+def _is_simple_sensitive_assignment_value(value: str) -> bool:
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(value).readline))
+    except (IndentationError, tokenize.TokenError):
+        return False
+    significant = [
+        token
+        for token in tokens
+        if token.type
+        not in {
+            tokenize.ENDMARKER,
+            tokenize.NL,
+            tokenize.NEWLINE,
+            tokenize.INDENT,
+            tokenize.DEDENT,
+            tokenize.COMMENT,
+        }
+    ]
+    return len(significant) == 1 and significant[0].type in {tokenize.NAME, tokenize.NUMBER, tokenize.STRING}
+
+
+def _redact_unparseable_sensitive_expression_assignments(text: str) -> str:
+    matches = list(SENSITIVE_EXPRESSION_ASSIGNMENT_PREFIX_RE.finditer(text))
+    assignment_starts = [match.start() for match in GENERIC_ASSIGNMENT_START_RE.finditer(text)]
+    replacements: list[tuple[int, int]] = []
+    for match in matches:
         value_start = match.end()
         while value_start < len(text) and text[value_start] in " \t":
             value_start += 1
-        if STRING_LITERAL_START_RE.match(text, value_start):
-            continue
 
         line_end_candidates = [
             position for position in (text.find("\n", value_start), text.find(";", value_start)) if position >= 0
         ]
-        line_end = min(line_end_candidates, default=len(text))
-        if not any(delimiter in text[value_start:line_end] for delimiter in "([{"):
+        value_end = min(line_end_candidates, default=len(text))
+        next_assignment_start = next(
+            (assignment_start for assignment_start in assignment_starts if value_start < assignment_start < value_end),
+            None,
+        )
+        if next_assignment_start is not None and _is_simple_sensitive_assignment_value(
+            text[value_start:next_assignment_start].strip()
+        ):
+            value_end = next_assignment_start
+
+        candidate = text[value_start:value_end].rstrip()
+        if not candidate or _is_simple_sensitive_assignment_value(candidate):
             continue
-        return f"{text[:value_start]}{REDACTED_EVIDENCE_VALUE}"
+
+        try:
+            ast.parse(candidate, mode="eval")
+        except SyntaxError:
+            if STRING_LITERAL_START_RE.match(candidate):
+                continue
+            if any(delimiter in candidate for delimiter in "([{"):
+                value_end = len(text)
+        while value_end > value_start and text[value_end - 1].isspace():
+            value_end -= 1
+        replacements.append((value_start, value_end))
+
+    for start, end in reversed(_merge_replacement_ranges(replacements)):
+        text = f"{text[:start]}{REDACTED_EVIDENCE_VALUE}{text[end:]}"
     return text
 
 
@@ -231,12 +281,12 @@ def _redact_python_expression_assignments(text: str) -> str:
     try:
         ast.parse(textwrap.dedent(text))
     except SyntaxError:
-        return _redact_malformed_sensitive_expression_assignment(text)
+        return _redact_unparseable_sensitive_expression_assignments(text)
 
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
     except (IndentationError, tokenize.TokenError):
-        return _redact_malformed_sensitive_expression_assignment(text)
+        return _redact_unparseable_sensitive_expression_assignments(text)
 
     depths: list[int] = []
     depth = 0
@@ -293,6 +343,12 @@ def _redact_python_expression_assignments(text: str) -> str:
         if value_end > value_start:
             replacements.append((value_start, value_end))
 
+    for start, end in reversed(_merge_replacement_ranges(replacements)):
+        text = f"{text[:start]}{REDACTED_EVIDENCE_VALUE}{text[end:]}"
+    return text
+
+
+def _merge_replacement_ranges(replacements: list[tuple[int, int]]) -> list[tuple[int, int]]:
     non_overlapping_replacements: list[tuple[int, int]] = []
     for start, end in sorted(replacements):
         if non_overlapping_replacements and end <= non_overlapping_replacements[-1][1]:
@@ -302,10 +358,7 @@ def _redact_python_expression_assignments(text: str) -> str:
             non_overlapping_replacements[-1] = (previous_start, end)
             continue
         non_overlapping_replacements.append((start, end))
-
-    for start, end in reversed(non_overlapping_replacements):
-        text = f"{text[:start]}{REDACTED_EVIDENCE_VALUE}{text[end:]}"
-    return text
+    return non_overlapping_replacements
 
 
 def _truncate(text: str, max_chars: int) -> str:
