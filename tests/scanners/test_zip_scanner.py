@@ -3051,6 +3051,34 @@ def test_scan_nested_file_fails_closed_and_preserves_generic_keras_zip_findings(
     assert has_pickle_finding is malicious
 
 
+def test_scan_nested_file_reports_unavailable_keras_scanner_when_zip_fallback_is_excluded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested_keras = tmp_path / "nested.keras"
+    with zipfile.ZipFile(nested_keras, "w") as archive:
+        archive.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+        archive.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+    original_load_scanner = _registry._load_scanner
+
+    def load_scanner(scanner_id: str) -> type[BaseScanner] | None:
+        if scanner_id == "keras_zip":
+            return None
+        return original_load_scanner(scanner_id)
+
+    monkeypatch.setattr(_registry, "_load_scanner", load_scanner)
+
+    result = scan_nested_file(
+        str(nested_keras),
+        {"scanners": ["keras_zip"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    assert not any(check.name == "Scanner Selection" for check in result.checks)
+
+
 def test_scan_nested_file_unavailable_keras_scanner_restores_whitelist_downgrade(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

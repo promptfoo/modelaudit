@@ -1990,7 +1990,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             )
         if scanner_class:
             logger.debug(f"Using {scanner_class.name} scanner for {path}")
-            scanner = scanner_class(config=config)
+            scanner_config = config
+            if unavailable_preferred_scanner_id is not None:
+                scanner_config = dict(config)
+                scanner_config["cache_enabled"] = False
+            scanner = scanner_class(config=scanner_config)
 
             try:
                 # Record scanner usage telemetry

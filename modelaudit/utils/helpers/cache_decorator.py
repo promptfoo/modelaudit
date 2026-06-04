@@ -92,6 +92,20 @@ def should_bypass_cache_for_safetensors_header_limit(file_path: str, config: dic
     return should_defer_safetensors_header_limit_hash(file_path, max_header_bytes)
 
 
+def should_bypass_cache_for_unavailable_keras_zip_scanner(file_path: str) -> bool:
+    """Bypass stale clean results when trusted Keras ZIP coverage is unavailable."""
+    try:
+        from ...scanners import _registry
+        from ..file.detection import is_keras_zip_archive
+
+        extension = os.path.splitext(file_path)[1].lower()
+        if not is_keras_zip_archive(file_path, allow_config_only=extension == ".keras"):
+            return False
+        return _registry.load_scanner_by_id("keras_zip") is None
+    except Exception:
+        return False
+
+
 def _known_uncacheable_scan_result(result: Any) -> bool:
     """Return True for ScanResult objects policy will reject without serialization."""
     try:
@@ -166,6 +180,10 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                 if should_bypass_cache_for_read_failure_aware_file(file_path):
                     logger.debug(f"Bypassing cache for read-failure-aware scanner: {file_path}")
+                    return func(*args, **kwargs)
+
+                if should_bypass_cache_for_unavailable_keras_zip_scanner(file_path):
+                    logger.debug(f"Bypassing cache for unavailable Keras ZIP scanner: {file_path}")
                     return func(*args, **kwargs)
 
                 if not cache_config.should_cache_file(file_stat.st_size, file_ext):

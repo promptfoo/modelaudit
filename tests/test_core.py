@@ -3123,6 +3123,98 @@ def test_scan_file_fails_closed_when_content_routed_keras_zip_scanner_unavailabl
     assert core_module.determine_exit_code(aggregate) == 2
 
 
+def test_scan_file_bypasses_stale_cache_when_keras_zip_scanner_becomes_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disguised_keras = tmp_path / "model.jpg"
+    _create_misnamed_zip(
+        disguised_keras,
+        {
+            "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
+            "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
+        },
+    )
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    original_load_scanner = core_module._registry._load_scanner
+    keras_scanner_available = True
+
+    def load_scanner(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "keras_zip" and not keras_scanner_available:
+            return None
+        return original_load_scanner(scanner_id)
+
+    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+
+    reset_cache_manager()
+    try:
+        cached = scan_file(str(disguised_keras), config=config)
+        assert cached.success is True
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+
+        keras_scanner_available = False
+        unavailable = scan_file(str(disguised_keras), config=config)
+    finally:
+        reset_cache_manager()
+
+    assert unavailable.scanner_name == "zip"
+    assert unavailable.success is False
+    assert unavailable.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+
+
+def test_scan_file_disables_advanced_cache_for_unavailable_keras_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disguised_keras = tmp_path / "model.keras"
+    _create_misnamed_zip(
+        disguised_keras,
+        {
+            "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
+            "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
+        },
+    )
+    original_load_scanner = core_module._registry._load_scanner
+
+    def load_scanner(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "keras_zip":
+            return None
+        return original_load_scanner(scanner_id)
+
+    def scan_advanced_without_cache(
+        path: str,
+        scanner: ZipScanner,
+        progress_callback: Any,
+        timeout: int,
+        *,
+        allowed_shard_paths: list[str] | None = None,
+    ) -> ScanResult:
+        assert path == str(disguised_keras)
+        assert progress_callback is None
+        assert timeout == 7200
+        assert allowed_shard_paths is None
+        assert scanner.config["cache_enabled"] is False
+        return scanner.scan(path)
+
+    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+    monkeypatch.setattr(core_module, "should_use_advanced_handler", lambda _path: True)
+    monkeypatch.setattr(core_module, "scan_advanced_large_file", scan_advanced_without_cache)
+
+    result = scan_file(
+        str(disguised_keras),
+        config={"cache_enabled": True, "cache_dir": str(tmp_path / "cache"), "min_cache_file_size": 0},
+    )
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+
+
 def test_scan_file_preserves_generic_findings_when_content_routed_keras_zip_scanner_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

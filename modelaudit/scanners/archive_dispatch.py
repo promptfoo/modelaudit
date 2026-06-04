@@ -822,7 +822,7 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
             scanner_class = _registry.get_scanner_for_path(path)
 
     if scanner_class is None:
-        if scanner_selection.active:
+        if unavailable_preferred_scanner_id is None and scanner_selection.active:
             candidate_scanner_id = skipped_preferred_scanner_id
             if candidate_scanner_id is None:
                 candidate_scanner_class = _registry.get_scanner_for_path(path)
@@ -855,6 +855,8 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         format_validation["routed_format"] = PROTOBUF_MODEL_CANDIDATE_FORMAT
         scanner_config[FORMAT_VALIDATION_CONFIG_KEY] = format_validation
 
+    if unavailable_preferred_scanner_id is not None:
+        scanner_config["cache_enabled"] = False
     scanner = scanner_class(config=scanner_config)
     result = scanner.scan(path) if unavailable_preferred_scanner_id is not None else scanner.scan_with_cache(path)
     if unavailable_preferred_scanner_id is not None:
