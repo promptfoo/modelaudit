@@ -46,6 +46,7 @@ _MAX_DISTRIBUTIONS_PER_TOP_LEVEL = 16
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
 _IMPORT_EXECUTION_SINK = "builtins.__import__"
 _IMPORT_EXECUTION_SAFE_MODULES = frozenset(sys.builtin_module_names)
+_REVIEWED_INERT_STDLIB_IMPORTS = frozenset({"os", "pathlib", "subprocess"})
 _TRUSTED_STDLIB_PATHS = tuple(
     Path(path).resolve() for name in ("stdlib", "platstdlib") if (path := sysconfig.get_path(name))
 )
@@ -81,6 +82,13 @@ _TRUSTED_IMPORT_ONLY_REFERENCES = frozenset(
     }
 )
 _TRUSTED_REFERENCES_REQUIRING_INVOCATION_ANALYSIS = frozenset({("_xxsubinterpreters", "create")})
+_TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = frozenset(
+    {
+        ("pathlib._local", "PurePath"),
+        ("pathlib._local", "PurePosixPath"),
+        ("pathlib._local", "PureWindowsPath"),
+    }
+)
 _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS = ("__new__", "__init__")
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS = ("__setstate__",)
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHOD_SET = frozenset(_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS)
@@ -690,11 +698,14 @@ def unresolved_trusted_import_reference_is_safe_when_invoked(module_name: str, n
     )
 
 
-def import_only_module_requires_origin_review(module_name: str) -> bool:
+def import_only_module_requires_origin_review(module_name: str, name: str) -> bool:
     """Return whether a module resolves outside trusted install paths."""
     if module_name in {"__builtin__", "__builtins__"}:
         return False
-    return _trusted_module_origin_kind(module_name) is None
+    origin_kind = _trusted_module_origin_kind(module_name)
+    return origin_kind not in {"stdlib", "site_packages"} and not (
+        origin_kind == "unresolved" and (module_name, name) in _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES
+    )
 
 
 @_register_source_sensitive_cache
@@ -1750,13 +1761,13 @@ def _module_initialization_statement_is_inert(statement: ast.stmt) -> bool:
     if isinstance(statement, ast.Expr):
         return isinstance(statement.value, ast.Constant)
     if isinstance(statement, ast.Import):
-        return all(_trusted_module_origin_kind(alias.name) == "stdlib" for alias in statement.names)
+        return all(_stdlib_import_is_reviewed_inert(alias.name) for alias in statement.names)
     if isinstance(statement, ast.ImportFrom):
         return (
             statement.level == 0
             and statement.module is not None
             and all(alias.name != "*" for alias in statement.names)
-            and _trusted_module_origin_kind(statement.module) == "stdlib"
+            and _stdlib_import_is_reviewed_inert(statement.module)
         )
     if isinstance(statement, ast.Assign):
         return all(_inert_assignment_target(target) for target in statement.targets) and _inert_definition_expression(
@@ -1779,6 +1790,10 @@ def _module_initialization_statement_is_inert(statement: ast.stmt) -> bool:
             and all(_module_initialization_statement_is_inert(item) for item in statement.body)
         )
     return False
+
+
+def _stdlib_import_is_reviewed_inert(module_name: str) -> bool:
+    return module_name in _REVIEWED_INERT_STDLIB_IMPORTS and _trusted_module_origin_kind(module_name) == "stdlib"
 
 
 def _module_statement_binds_name(statement: ast.stmt, name: str) -> bool:

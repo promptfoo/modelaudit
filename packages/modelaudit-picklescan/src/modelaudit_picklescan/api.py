@@ -1207,7 +1207,7 @@ def _with_untrusted_allowlisted_import_findings(
             or bool(reference.get("is_dangerous"))
             or not bool(reference.get("requires_origin_verification"))
             or key in existing_references
-            or not import_only_module_requires_origin_review(module)
+            or not import_only_module_requires_origin_review(module, name)
         ):
             continue
         additional_findings.append(

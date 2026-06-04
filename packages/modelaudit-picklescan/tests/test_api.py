@@ -26,6 +26,7 @@ from typing import cast
 import pytest
 
 import modelaudit_picklescan.api as package_api
+import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import (
     CoverageSummary,
     Finding,
@@ -3570,6 +3571,29 @@ def test_scan_bytes_allows_source_available_import_only_global_with_inert_initia
     assert all(finding.rule_code != "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
 
 
+def test_scan_bytes_warns_when_source_module_imports_side_effectful_stdlib_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_stdlib_side_effect_{uuid.uuid4().hex}"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import antigravity\n\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_warns_when_unchecked_hash_cache_overrides_inert_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3897,6 +3921,22 @@ def test_scan_bytes_warns_when_allowlisted_module_resolves_to_shadow_module(
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.Gadget"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_warns_when_allowlisted_module_is_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(call_graph, "_find_module_spec_without_imports", lambda _module_name: None)
+    call_graph._trusted_module_origin_kind.cache_clear()
+    try:
+        report = scan_bytes(b"cnumpy\nGadget\n.", source="unresolved-numpy-gadget.pkl")
+    finally:
+        call_graph._trusted_module_origin_kind.cache_clear()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "numpy.Gadget"
         for finding in report.findings
