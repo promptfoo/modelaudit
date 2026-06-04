@@ -82,6 +82,10 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
             logger.debug("Invalid path type in DVC file %s: %s", file_path, type(out_path))
             unresolved.append(f"<invalid-output-path:{type(out_path).__name__}>")
             continue
+        if not out_path.strip():
+            logger.debug("Empty output path in DVC file %s", file_path)
+            unresolved.append("<empty-output-path>")
+            continue
 
         # Security: Resolve target path and validate it's within safe boundaries
         try:
@@ -101,6 +105,11 @@ def resolve_dvc_file_status(file_path: str) -> DvcResolution:
 
             if not is_safe:
                 logger.warning(f"DVC target path outside safe boundaries: {file_path} -> {target}")
+                unresolved.append(out_path)
+                continue
+
+            if target.is_dir() and path.is_relative_to(target):
+                logger.warning(f"DVC target directory contains its own pointer: {file_path} -> {target}")
                 unresolved.append(out_path)
                 continue
 

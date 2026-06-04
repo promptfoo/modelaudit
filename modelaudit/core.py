@@ -154,6 +154,7 @@ _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
+_DVC_SCAN_BUDGET_EXHAUSTED_REASON = "dvc_scan_budget_exhausted"
 
 
 def _record_incomplete_dvc_resolution(
@@ -185,6 +186,32 @@ def _record_incomplete_dvc_resolution(
         severity=IssueSeverity.INFO.value,
         location=dvc_file,
         details=details,
+    )
+
+
+def _record_incomplete_dvc_scan_budget(
+    results: ModelAuditResultModel,
+    scan_metadata: dict[str, Any],
+    dvc_file: str,
+    *,
+    budget_type: str,
+    limit: int,
+) -> None:
+    """Record exhaustion of a shared DVC scan budget."""
+    scan_metadata["success"] = False
+    scan_metadata["has_operational_errors"] = True
+    _add_issue_to_model(
+        results,
+        f"DVC scan {budget_type} budget exhausted before all resolved outputs were scanned",
+        severity=IssueSeverity.INFO.value,
+        location=dvc_file,
+        details={
+            "analysis_incomplete": True,
+            "operational_error": True,
+            "scan_outcome_reason": _DVC_SCAN_BUDGET_EXHAUSTED_REASON,
+            "budget_type": budget_type,
+            "limit": limit,
+        },
     )
 
 
@@ -1362,7 +1389,8 @@ def scan_model_directory_or_file(
         else:
             # Scan a single file or DVC pointer
             target_files = [path]
-            if path.endswith(".dvc"):
+            is_dvc_pointer = path.endswith(".dvc")
+            if is_dvc_pointer:
                 dvc_resolution = resolve_dvc_file_status(path)
                 _record_incomplete_dvc_resolution(results, scan_metadata, path, dvc_resolution)
                 target_files = list(dvc_resolution.resolved_paths)
@@ -1371,21 +1399,69 @@ def scan_model_directory_or_file(
                 # Check for interrupts
                 check_interrupted()
 
+                target_timeout = timeout
+                target_max_total_size = max_total_size
+                target_config = config
+                if is_dvc_pointer:
+                    target_timeout = timeout - int(time.time() - start_time)
+                    if target_timeout <= 0:
+                        _record_incomplete_dvc_scan_budget(
+                            results,
+                            scan_metadata,
+                            path,
+                            budget_type="timeout",
+                            limit=timeout,
+                        )
+                        break
+
+                    if max_total_size > 0:
+                        target_max_total_size = max_total_size - results.bytes_scanned
+                        if target_max_total_size <= 0:
+                            _record_incomplete_dvc_scan_budget(
+                                results,
+                                scan_metadata,
+                                path,
+                                budget_type="total_size",
+                                limit=max_total_size,
+                            )
+                            break
+
+                    target_config = dict(config)
+                    target_config["timeout"] = target_timeout
+                    target_config["max_total_size"] = target_max_total_size
+
                 if os.path.isdir(target):
                     nested_result = scan_model_directory_or_file(
                         target,
                         blacklist_patterns=blacklist_patterns,
-                        timeout=timeout,
+                        timeout=target_timeout,
                         max_file_size=max_file_size,
-                        max_total_size=max_total_size,
+                        max_total_size=target_max_total_size,
                         strict_license=strict_license,
                         progress_callback=progress_callback,
                         skip_file_types=skip_file_types,
                         **kwargs,
                     )
                     results.aggregate_scan_result(nested_result)
+                    for nested_metadata in nested_result.file_metadata.values():
+                        nested_content_hash = nested_metadata.get("content_hash")
+                        if (
+                            isinstance(nested_content_hash, str)
+                            and nested_content_hash
+                            and nested_content_hash not in file_hashes
+                        ):
+                            file_hashes.append(nested_content_hash)
                     if nested_result.has_errors:
                         scan_metadata["has_operational_errors"] = True
+                    if is_dvc_pointer and max_total_size > 0 and results.bytes_scanned > max_total_size:
+                        _record_incomplete_dvc_scan_budget(
+                            results,
+                            scan_metadata,
+                            path,
+                            budget_type="total_size",
+                            limit=max_total_size,
+                        )
+                        break
                     continue
 
                 if progress_callback:
@@ -1400,7 +1476,8 @@ def scan_model_directory_or_file(
                     try:
                         top_level_hashing_started_at = _start_phase_timing(phase_timings)
                         file_hash = _calculate_file_hash(target)
-                        file_hashes.append(file_hash)
+                        if not is_dvc_pointer or file_hash not in file_hashes:
+                            file_hashes.append(file_hash)
                     except Exception as e:
                         logger.debug(f"Failed to hash file {target}: {e}")
                     finally:
@@ -1408,7 +1485,7 @@ def scan_model_directory_or_file(
 
                 file_scan_started_at = _start_phase_timing(phase_timings)
                 try:
-                    file_result = scan_file(target, config)
+                    file_result = scan_file(target, target_config)
                 finally:
                     _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
 
@@ -1448,6 +1525,15 @@ def scan_model_directory_or_file(
                         location=target,
                         details={"max_total_size": max_total_size},
                     )
+                    if is_dvc_pointer:
+                        _record_incomplete_dvc_scan_budget(
+                            results,
+                            scan_metadata,
+                            path,
+                            budget_type="total_size",
+                            limit=max_total_size,
+                        )
+                        break
 
                 if progress_callback:
                     progress_callback(f"Completed scanning: {target}", 100.0)

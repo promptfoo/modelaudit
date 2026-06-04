@@ -1,8 +1,13 @@
 import json
 import pickle
 from pathlib import Path
+from typing import Any
 
+import pytest
+
+from modelaudit import core as core_module
 from modelaudit.core import scan_model_directory_or_file
+from modelaudit.models import create_initial_audit_result
 from modelaudit.utils.sources.dvc import (
     DVC_ANALYSIS_INCOMPLETE_REASON,
     DVC_OUTPUT_LIMIT_EXCEEDED_REASON,
@@ -243,6 +248,70 @@ class TestDvcIntegration:
             issue.details.get("scan_outcome_reason") == DVC_ANALYSIS_INCOMPLETE_REASON for issue in results.issues
         )
 
+    def test_dvc_directory_outputs_share_timeout_and_total_size_budgets(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Each resolved directory must receive only the remaining parent scan budget."""
+        first_dir = tmp_path / "first"
+        second_dir = tmp_path / "second"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        dvc_file = tmp_path / "directories.dvc"
+        dvc_file.write_text("outs:\n- path: first\n- path: second\n")
+
+        original_scan = core_module.scan_model_directory_or_file
+        calls: list[tuple[int, int]] = []
+        now = [100.0]
+        monkeypatch.setattr(core_module.time, "time", lambda: now[0])
+
+        def fake_recursive_scan(path: str, *args: Any, **kwargs: Any) -> Any:
+            assert Path(path).is_dir()
+            calls.append((kwargs["timeout"], kwargs["max_total_size"]))
+            nested_result = create_initial_audit_result()
+            nested_result.files_scanned = 1
+            nested_result.bytes_scanned = 60
+            nested_result.success = True
+            now[0] += 3
+            return nested_result
+
+        monkeypatch.setattr(core_module, "scan_model_directory_or_file", fake_recursive_scan)
+
+        result = original_scan(str(dvc_file), timeout=10, max_total_size=100)
+
+        assert calls == [(10, 100), (7, 40)]
+        assert result.has_errors is True
+        assert result.success is False
+        assert any(
+            issue.details.get("scan_outcome_reason") == "dvc_scan_budget_exhausted"
+            and issue.details.get("budget_type") == "total_size"
+            for issue in result.issues
+        )
+
+    def test_dvc_directory_and_file_outputs_all_contribute_to_content_hash(self, tmp_path: Path) -> None:
+        """Mutating either a nested directory file or a direct output must change the aggregate hash."""
+        output_dir = tmp_path / "model"
+        output_dir.mkdir()
+        nested_path = output_dir / "nested.pkl"
+        direct_path = tmp_path / "direct.pkl"
+        nested_path.write_bytes(pickle.dumps({"nested": 1}))
+        direct_path.write_bytes(pickle.dumps({"direct": 1}))
+        dvc_file = tmp_path / "mixed.dvc"
+        dvc_file.write_text("outs:\n- path: model\n- path: direct.pkl\n")
+
+        initial = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
+        nested_path.write_bytes(pickle.dumps({"nested": 2}))
+        nested_changed = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
+        direct_path.write_bytes(pickle.dumps({"direct": 2}))
+        direct_changed = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
+
+        assert initial.content_hash is not None
+        assert nested_changed.content_hash is not None
+        assert direct_changed.content_hash is not None
+        assert initial.content_hash != nested_changed.content_hash
+        assert nested_changed.content_hash != direct_changed.content_hash
+
 
 class TestDvcSecurity:
     """Test security aspects of DVC integration."""
@@ -374,6 +443,22 @@ class TestDvcSecurity:
         assert resolution.resolved_paths == ()
         assert resolution.analysis_incomplete is True
         assert resolution.incomplete_reason == "dvc_invalid_structure"
+
+    @pytest.mark.parametrize("output_path", ["", ".", "./"])
+    def test_self_referential_dvc_directory_output_is_unresolved(
+        self,
+        tmp_path: Path,
+        output_path: str,
+    ) -> None:
+        """A pointer must not recursively expand the directory containing itself."""
+        dvc_file = tmp_path / "recursive.dvc"
+        dvc_file.write_text(f"outs:\n- path: {output_path!r}\n")
+
+        resolution = resolve_dvc_file_status(str(dvc_file))
+
+        assert resolution.resolved_paths == ()
+        assert resolution.analysis_incomplete is True
+        assert resolution.incomplete_reason == DVC_ANALYSIS_INCOMPLETE_REASON
 
     def test_malformed_dvc_file_handling(self, tmp_path):
         """Test handling of malformed DVC files."""
