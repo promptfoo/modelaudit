@@ -2235,6 +2235,7 @@ class TorchServeMarScanner(BaseScanner):
                 self.class_name_stack: list[str] = []
                 self.class_attribute_states: dict[str, _DynamicAliasState] = {}
                 self.function_binding_state_stack: list[_DynamicAliasState] = []
+                self.loop_break_state_stack: list[list[_DynamicAliasState]] = []
                 self.risky_calls: set[str] = set()
                 self.collecting_module_bindings = False
                 self.collecting_class_attribute_bindings = False
@@ -2378,6 +2379,12 @@ class TorchServeMarScanner(BaseScanner):
                     self._merge_static_truthiness_aliases(left[6], right[6]),
                     self._merge_lambda_aliases(left[7], right[7]),
                 )
+
+            def _merge_state_list(self, states: list[_DynamicAliasState]) -> _DynamicAliasState:
+                merged_state = states[0]
+                for state in states[1:]:
+                    merged_state = self._merge_states(merged_state, state)
+                return merged_state
 
             def _push_scope(
                 self,
@@ -3600,6 +3607,10 @@ class TorchServeMarScanner(BaseScanner):
                 for target in node.targets:
                     self._invalidate_target(target)
 
+            def visit_Break(self, node: ast.Break) -> None:
+                if self.loop_break_state_stack:
+                    self.loop_break_state_stack[-1].append(self._snapshot_state())
+
             def visit_BoolOp(self, node: ast.BoolOp) -> None:
                 possible_exit_states = []
                 for index, value in enumerate(node.values):
@@ -3842,6 +3853,13 @@ class TorchServeMarScanner(BaseScanner):
                             return
                         self.generic_visit(node)
 
+                    def visit_Try(self, node: ast.Try) -> None:
+                        if node.finalbody and visitor._statements_definitely_terminate(node.finalbody):
+                            for statement in node.finalbody:
+                                self.visit(statement)
+                            return
+                        self.generic_visit(node)
+
                     def visit_For(self, node: ast.For) -> None:
                         return
 
@@ -3949,7 +3967,9 @@ class TorchServeMarScanner(BaseScanner):
                         self._record_target_assignment(node.target, first_element)
                 else:
                     self._record_target_from_iterable(node.target, node.iter)
+                self.loop_break_state_stack.append([])
                 self._visit_statement_block(node.body)
+                break_states = self.loop_break_state_stack.pop()
                 if (
                     not model_first_iteration
                     and isinstance(node.iter, ast.List | ast.Tuple | ast.Dict)
@@ -3966,6 +3986,12 @@ class TorchServeMarScanner(BaseScanner):
                     and self._statements_definitely_prevent_loop_else(node.body)
                 ):
                     self._visit_statement_block(node.orelse)
+                    if break_states:
+                        self._restore_state(
+                            self._merge_states(self._snapshot_state(), self._merge_state_list(break_states))
+                        )
+                elif break_states:
+                    self._restore_state(self._merge_state_list(break_states))
 
             def visit_For(self, node: ast.For) -> None:
                 self._visit_for(node)
@@ -4119,16 +4145,24 @@ class TorchServeMarScanner(BaseScanner):
                     return
 
                 initial_state = self._snapshot_state()
+                self.loop_break_state_stack.append([])
                 self._visit_statement_block(node.body)
+                break_states = self.loop_break_state_stack.pop()
                 body_state = self._snapshot_state()
                 if truthiness is True:
+                    if break_states:
+                        self._restore_state(self._merge_state_list(break_states))
                     return
 
                 self._restore_state(self._merge_states(initial_state, body_state))
                 self._visit_statement_block(node.orelse)
-                self._restore_state(self._merge_states(body_state, self._snapshot_state()))
+                normal_exit_state = self._merge_states(body_state, self._snapshot_state())
+                if break_states:
+                    normal_exit_state = self._merge_states(normal_exit_state, self._merge_state_list(break_states))
+                self._restore_state(normal_exit_state)
 
             def visit_Try(self, node: ast.Try) -> None:
+                break_state_start = len(self.loop_break_state_stack[-1]) if self.loop_break_state_stack else None
                 initial_state = self._snapshot_state()
                 body_exits_without_exception = self._statements_definitely_exit_without_exception(node.body)
                 body_cannot_raise = self._statements_definitely_do_not_raise(node.body)
@@ -4160,7 +4194,28 @@ class TorchServeMarScanner(BaseScanner):
                     self._restore_state(merged_state)
                 else:
                     self._restore_state(body_state)
+
+                pending_break_states: list[_DynamicAliasState] = []
+                if break_state_start is not None:
+                    pending_break_states = self.loop_break_state_stack[-1][break_state_start:]
+                    del self.loop_break_state_stack[-1][break_state_start:]
+                normal_exit_state = self._snapshot_state()
+                transformed_break_states: list[_DynamicAliasState] = []
+                for break_state in pending_break_states:
+                    # A finally block runs before the pending break leaves the loop.
+                    self._restore_state(break_state)
+                    nested_break_start = len(self.loop_break_state_stack[-1])
+                    self._visit_statement_block(node.finalbody)
+                    nested_break_states = self.loop_break_state_stack[-1][nested_break_start:]
+                    del self.loop_break_state_stack[-1][nested_break_start:]
+                    transformed_break_states.extend(nested_break_states)
+                    if not self._statements_definitely_terminate(node.finalbody):
+                        transformed_break_states.append(self._snapshot_state())
+
+                self._restore_state(normal_exit_state)
                 self._visit_statement_block(node.finalbody)
+                if self.loop_break_state_stack:
+                    self.loop_break_state_stack[-1].extend(transformed_break_states)
 
             def visit_Match(self, node: ast.Match) -> None:
                 self.visit(node.subject)

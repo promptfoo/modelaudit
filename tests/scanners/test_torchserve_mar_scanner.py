@@ -921,6 +921,128 @@ def test_dynamic_import_handler_analysis_keeps_definitely_truthy_branch_unreacha
 
 
 @pytest.mark.parametrize(
+    "loop_source",
+    [
+        (
+            b"    while True:\n"
+            b"        if context:\n"
+            b"            module = __import__('os')\n"
+            b"            break\n"
+            b"        module = __import__('math')\n"
+            b"        break\n"
+        ),
+        (
+            b"    for choice in [context]:\n"
+            b"        if choice:\n"
+            b"            module = __import__('os')\n"
+            b"            break\n"
+            b"        module = __import__('math')\n"
+            b"        break\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_preserves_conditional_break_aliases(loop_source: bytes) -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('math')\n" + loop_source + b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+@pytest.mark.parametrize(
+    "loop_source",
+    [
+        (
+            b"    while True:\n"
+            b"        if context:\n"
+            b"            module = __import__('math')\n"
+            b"            break\n"
+            b"        module = __import__('json')\n"
+            b"        break\n"
+        ),
+        (
+            b"    for choice in [context]:\n"
+            b"        if choice:\n"
+            b"            module = __import__('math')\n"
+            b"            break\n"
+            b"        module = __import__('json')\n"
+            b"        break\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_replaces_stale_aliases_on_conditional_breaks(loop_source: bytes) -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('os')\n" + loop_source + b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_applies_finally_before_break_exit() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('math')\n"
+        b"    while True:\n"
+        b"        try:\n"
+        b"            break\n"
+        b"        finally:\n"
+        b"            module = __import__('os')\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
+def test_dynamic_import_handler_analysis_drops_stale_alias_before_finally_break_exit() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    module = __import__('os')\n"
+        b"    while True:\n"
+        b"        try:\n"
+        b"            break\n"
+        b"        finally:\n"
+        b"            module = __import__('math')\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize("terminal_statement", [b"return []", b"continue"])
+def test_dynamic_import_handler_analysis_honors_finally_overriding_break(
+    terminal_statement: bytes,
+) -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    while True:\n"
+        b"        try:\n"
+        b"            break\n"
+        b"        finally:\n"
+        b"            " + terminal_statement + b"\n"
+        b"    return __import__('os').system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
     "handler_source",
     [
         (b"def handle(data, context):\n    return module.system('id')\n\nmodule = __import__('os')\n"),
