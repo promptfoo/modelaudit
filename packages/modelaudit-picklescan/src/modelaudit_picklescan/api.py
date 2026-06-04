@@ -154,6 +154,7 @@ class PickleScanner:
                     partial_report,
                     source=source,
                     error=error,
+                    stream_start_offset=position_offset,
                 )
             return _io_error_report(
                 source=source,
@@ -912,7 +913,13 @@ def _with_short_read_error(
     *,
     source: str,
     error: _StreamShortReadError,
+    stream_start_offset: int,
 ) -> PickleReport:
+    report = _without_unproven_oversized_frame_tamper(
+        report,
+        bytes_total=error.expected_size,
+        stream_start_offset=stream_start_offset,
+    )
     errors = (
         *report.errors,
         ScanError(

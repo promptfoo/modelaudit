@@ -1684,6 +1684,43 @@ def test_scan_stream_fails_closed_on_short_reads_for_expected_size() -> None:
     assert report.coverage.opcode_scan_complete is False
 
 
+def test_scan_stream_short_read_does_not_report_unproven_oversized_frame_tamper() -> None:
+    prefix = b"HEADER"
+    payload = b"\x80\x04\x95\x02\x00\x00\x00\x00\x00\x00\x00}."
+    stream = io.BytesIO(prefix + payload[:11])
+    stream.seek(len(prefix))
+
+    report = PickleScanner().scan_stream(
+        stream,
+        source="short-read-frame.pkl",
+        size=len(payload),
+    )
+
+    assert report.status == ScanStatus.ERROR
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert not any(notice.code == "oversized_frame" for notice in report.notices)
+    assert any(error.category == "short_read" for error in report.errors)
+
+
+def test_scan_stream_short_read_preserves_proven_oversized_frame_tamper() -> None:
+    payload = b"\x80\x04\x95\x03\x00\x00\x00\x00\x00\x00\x00}."
+
+    report = PickleScanner().scan_stream(
+        io.BytesIO(payload[:11]),
+        source="short-read-proven-oversized-frame.pkl",
+        size=len(payload),
+    )
+
+    assert report.status == ScanStatus.ERROR
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    finding = next(finding for finding in report.findings if finding.rule_code == "STRUCTURAL_TAMPER")
+    assert finding.details["tamper_type"] == "oversized_frame"
+    assert finding.details["frame_length"] == 3
+    assert any(notice.code == "oversized_frame" for notice in report.notices)
+    assert any(error.category == "short_read" for error in report.errors)
+
+
 def test_scan_stream_scans_partial_bytes_on_short_read() -> None:
     payload = pickle.dumps(MaliciousPayload(), protocol=4)
     expected_size = len(payload) + 8
