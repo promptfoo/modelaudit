@@ -2298,6 +2298,10 @@ class TorchServeMarScanner(BaseScanner):
                     for helper_name in resolved_value_names | callable_names
                     if helper_name in _DYNAMIC_ASSIGNABLE_HELPERS
                 )
+                eager_consumer_names = frozenset(
+                    helper_name for helper_name in resolved_value_names if helper_name in _EAGER_GENERATOR_CONSUMERS
+                )
+                assignable_alias_names = helper_names | eager_consumer_names
                 import_helper_names = helper_names & _DYNAMIC_IMPORT_HELPERS
                 static_truthiness = self._resolved_static_truthiness(value)
 
@@ -2314,8 +2318,8 @@ class TorchServeMarScanner(BaseScanner):
                     self.callable_aliases[name] = callable_names
                 if import_helper_names:
                     self.import_loader_aliases[name] = import_helper_names
-                if len(helper_names) == 1:
-                    self.import_aliases[name] = next(iter(helper_names))
+                if len(assignable_alias_names) == 1:
+                    self.import_aliases[name] = next(iter(assignable_alias_names))
                     self.shadowed_names.discard(name)
 
             def _record_target_assignment(self, target: ast.AST, value: ast.AST) -> None:
@@ -2635,6 +2639,52 @@ class TorchServeMarScanner(BaseScanner):
             def _statements_definitely_terminate(self, statements: list[ast.stmt]) -> bool:
                 return any(self._statement_definitely_terminates(statement) for statement in statements)
 
+            @staticmethod
+            def _expression_definitely_does_not_raise(node: ast.AST) -> bool:
+                if isinstance(node, ast.Constant):
+                    return True
+                if isinstance(node, ast.List | ast.Tuple | ast.Set):
+                    return all(
+                        DynamicImportExecutionVisitor._expression_definitely_does_not_raise(element)
+                        for element in node.elts
+                    )
+                if isinstance(node, ast.Dict):
+                    return all(
+                        key is None or DynamicImportExecutionVisitor._expression_definitely_does_not_raise(key)
+                        for key in node.keys
+                    ) and all(
+                        DynamicImportExecutionVisitor._expression_definitely_does_not_raise(value)
+                        for value in node.values
+                    )
+                return False
+
+            def _statement_definitely_exits_without_exception(self, statement: ast.stmt) -> bool:
+                if isinstance(statement, ast.Return):
+                    return statement.value is None or self._expression_definitely_does_not_raise(statement.value)
+                if isinstance(statement, ast.Break | ast.Continue):
+                    return True
+                if not isinstance(statement, ast.If) or not self._expression_definitely_does_not_raise(statement.test):
+                    return False
+
+                truthiness = self._resolved_static_truthiness(statement.test)
+                if truthiness is True:
+                    return self._statements_definitely_exit_without_exception(statement.body)
+                if truthiness is False:
+                    return self._statements_definitely_exit_without_exception(statement.orelse)
+                return (
+                    bool(statement.orelse)
+                    and self._statements_definitely_exit_without_exception(statement.body)
+                    and self._statements_definitely_exit_without_exception(statement.orelse)
+                )
+
+            def _statements_definitely_exit_without_exception(self, statements: list[ast.stmt]) -> bool:
+                for statement in statements:
+                    if self._statement_definitely_exits_without_exception(statement):
+                        return True
+                    if not isinstance(statement, ast.Pass):
+                        return False
+                return False
+
             def _visit_statement_block(self, statements: list[ast.stmt]) -> None:
                 for statement in statements:
                     self.visit(statement)
@@ -2855,6 +2905,7 @@ class TorchServeMarScanner(BaseScanner):
 
             def visit_Try(self, node: ast.Try) -> None:
                 initial_state = self._snapshot_state()
+                body_exits_without_exception = self._statements_definitely_exit_without_exception(node.body)
                 self._visit_statement_block(node.body)
                 body_state = self._snapshot_state()
                 body_terminates = self._statements_definitely_terminate(node.body)
@@ -2864,16 +2915,17 @@ class TorchServeMarScanner(BaseScanner):
                     possible_states.append(self._snapshot_state())
 
                 handler_initial_state = self._merge_states(initial_state, body_state)
-                for handler in node.handlers:
-                    self._restore_state(handler_initial_state)
-                    if handler.type is not None:
-                        self.visit(handler.type)
-                    if handler.name is not None:
-                        self._invalidate_name(handler.name)
-                    self._visit_statement_block(handler.body)
-                    if handler.name is not None:
-                        self._invalidate_name(handler.name)
-                    possible_states.append(self._snapshot_state())
+                if not body_exits_without_exception:
+                    for handler in node.handlers:
+                        self._restore_state(handler_initial_state)
+                        if handler.type is not None:
+                            self.visit(handler.type)
+                        if handler.name is not None:
+                            self._invalidate_name(handler.name)
+                        self._visit_statement_block(handler.body)
+                        if handler.name is not None:
+                            self._invalidate_name(handler.name)
+                        possible_states.append(self._snapshot_state())
 
                 if possible_states:
                     merged_state = possible_states[0]
@@ -2945,6 +2997,40 @@ class TorchServeMarScanner(BaseScanner):
             def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
                 self._visit_with(node)
 
+            @staticmethod
+            def _eager_generator_argument_indexes(
+                node: ast.Call,
+                resolved_call_name: str | None,
+            ) -> set[int]:
+                if resolved_call_name is None or any(isinstance(argument, ast.Starred) for argument in node.args):
+                    return set()
+
+                consumer_name = resolved_call_name.removeprefix("builtins.")
+                keyword_names = [keyword.arg for keyword in node.keywords]
+                if any(keyword_name is None for keyword_name in keyword_names):
+                    return set()
+                named_keywords = {keyword_name for keyword_name in keyword_names if keyword_name is not None}
+                if len(named_keywords) != len(keyword_names):
+                    return set()
+
+                if consumer_name in {"all", "any", "frozenset", "list", "set", "tuple"}:
+                    return {0} if len(node.args) == 1 and not keyword_names else set()
+                if consumer_name == "dict":
+                    return {0} if len(node.args) == 1 else set()
+                if consumer_name == "sorted":
+                    return {0} if len(node.args) == 1 and named_keywords <= {"key", "reverse"} else set()
+                if consumer_name == "sum":
+                    if len(node.args) not in {1, 2} or named_keywords - {"start"}:
+                        return set()
+                    if len(node.args) == 2 and "start" in named_keywords:
+                        return set()
+                    return {0}
+                if consumer_name in {"max", "min"}:
+                    return {0} if len(node.args) == 1 and named_keywords <= {"default", "key"} else set()
+                if consumer_name == "next":
+                    return {0} if len(node.args) in {1, 2} and not keyword_names else set()
+                return set()
+
             def visit_Call(self, node: ast.Call) -> None:
                 call_names = scanner._resolve_dynamic_import_execution_calls(
                     node.func,
@@ -2965,12 +3051,17 @@ class TorchServeMarScanner(BaseScanner):
                     if call_name is not None and call_name.split(".", maxsplit=1)[0] not in self.shadowed_names
                     else None
                 )
-                consumes_generator_argument = resolved_call_name in _EAGER_GENERATOR_CONSUMERS
+                consumed_generator_indexes = self._eager_generator_argument_indexes(
+                    node,
+                    resolved_call_name,
+                )
                 if isinstance(node.func, ast.Attribute) and node.func.attr in {"__next__", "send"}:
                     self._visit_consumed_generator_value(node.func.value)
                 self.visit(node.func)
-                for argument in node.args:
-                    if not (consumes_generator_argument and self._visit_consumed_generator_value(argument)):
+                for argument_index, argument in enumerate(node.args):
+                    if not (
+                        argument_index in consumed_generator_indexes and self._visit_consumed_generator_value(argument)
+                    ):
                         self.visit(argument)
                 for keyword in node.keywords:
                     self.visit(keyword.value)

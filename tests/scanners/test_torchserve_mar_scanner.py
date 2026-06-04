@@ -1494,6 +1494,23 @@ def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
             b"            break\n"
             b"    return module.system('id')\n"
         ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        return None\n"
+            b"    except Exception:\n"
+            b"        return __import__('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return list(generator, 1)\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return next(generator, None, None)\n"
+        ),
     ],
 )
 def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
@@ -1604,6 +1621,19 @@ def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
             b"    module = __import__('os')\n"
             b"def handle(data, context):\n"
             b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    consume = list\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return consume(generator)\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        raise RuntimeError()\n"
+            b"    except RuntimeError:\n"
+            b"        return __import__('os').system('id')\n"
         ),
     ],
 )
