@@ -114,6 +114,52 @@ _R_SIMPLE_NUMERIC_TOKEN_RE = re.compile(
 _R_DOT_ARGUMENT_TOKEN_RE = re.compile(r"\.\.[0-9]+")
 
 
+def _r_function_keyword_before_position(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> bool:
+    cursor = position - 1
+    while cursor >= 0:
+        while cursor >= 0 and text[cursor].isspace():
+            cursor -= 1
+        if cursor < 0:
+            return False
+
+        span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+        if span_index < 0 or cursor >= non_code_spans[span_index][1]:
+            break
+        span_start, _span_end = non_code_spans[span_index]
+        if text[span_start] != "#":
+            return False
+        cursor = span_start - 1
+
+    token_end = cursor + 1
+    while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
+        cursor -= 1
+    if text[cursor + 1 : token_end] != "function":
+        return False
+
+    while cursor >= 0:
+        while cursor >= 0 and text[cursor].isspace():
+            cursor -= 1
+        if cursor < 0:
+            return True
+
+        span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+        if span_index < 0 or cursor >= non_code_spans[span_index][1]:
+            return text[cursor] not in "$@:"
+        span_start, _span_end = non_code_spans[span_index]
+        if text[span_start] != "#":
+            return True
+        cursor = span_start - 1
+    return True
+
+
+def _r_function_keyword_awaits_formals(text: str) -> bool:
+    return _r_function_keyword_before_position(text, len(text), _r_non_code_spans(text))
+
+
 def _position_is_in_r_suppressing_non_code_span(
     position: int,
     non_code_spans: list[tuple[int, int]],
@@ -154,6 +200,11 @@ def _r_equals_is_named_argument(
     if not stack or stack[-1][0] not in {"(", "["}:
         return False
     target = stack[-1]
+    target_is_function_formals = target[0] == "(" and _r_function_keyword_before_position(
+        text,
+        target[1],
+        non_code_spans,
+    )
     if target[0] == "(" and not _r_open_paren_starts_argument_list(text, target[1], non_code_spans):
         return False
     if target[0] == "[" and not _r_open_bracket_starts_subscript(text, target[1], non_code_spans):
@@ -173,7 +224,11 @@ def _r_equals_is_named_argument(
                 return False
             closed = stack.pop()
             if closed == target:
-                return True
+                return not target_is_function_formals or _r_function_body_follows(
+                    text,
+                    cursor + 1,
+                    non_code_spans,
+                )
         cursor += 1
     return False
 
@@ -183,6 +238,9 @@ def _r_open_paren_starts_argument_list(
     position: int,
     non_code_spans: list[tuple[int, int]],
 ) -> bool:
+    if _r_function_keyword_before_position(text, position, non_code_spans):
+        return True
+
     cursor = position - 1
     crossed_newline = False
     while cursor >= 0 and text[cursor].isspace():
@@ -212,7 +270,11 @@ def _r_open_paren_starts_argument_list(
         if opener_position is None:
             return False
         opener_prefix = _r_identifier_before_position(text, opener_position, non_code_spans)
-        return opener_prefix is None or opener_prefix in {"else", "repeat"} or _r_token_can_start_call(opener_prefix)
+        return (
+            _r_grouped_expression_can_start_call(text, opener_position, cursor, non_code_spans)
+            if opener_prefix is None
+            else opener_prefix in {"else", "repeat"} or _r_token_can_start_call(opener_prefix)
+        )
     if character == "}":
         return not crossed_newline and _r_matching_open_delimiter_position(text, cursor, non_code_spans) is not None
     if character == "\\":
@@ -224,12 +286,12 @@ def _r_open_paren_starts_argument_list(
     while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
         cursor -= 1
     token = text[cursor + 1 : token_end]
-    return not crossed_newline and _r_token_can_start_call(token, allow_function_keyword=True)
+    return not crossed_newline and _r_token_can_start_call(token)
 
 
-def _r_token_can_start_call(token: str, *, allow_function_keyword: bool = False) -> bool:
+def _r_token_can_start_call(token: str) -> bool:
     if token == "function":
-        return allow_function_keyword
+        return False
     token_starts_like_number = token[0].isdigit() or (token.startswith(".") and len(token) > 1 and token[1].isdigit())
     return (
         not token_starts_like_number
@@ -238,6 +300,64 @@ def _r_token_can_start_call(token: str, *, allow_function_keyword: bool = False)
         and _R_DOT_ARGUMENT_TOKEN_RE.fullmatch(token) is None
         and token not in _R_RESERVED_WORDS
     )
+
+
+def _r_grouped_expression_can_start_call(
+    text: str,
+    opener_position: int,
+    closer_position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> bool:
+    chunks: list[str] = []
+    cursor = opener_position + 1
+    span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+    span_index = max(0, span_index)
+    while cursor < closer_position:
+        while span_index < len(non_code_spans) and non_code_spans[span_index][1] <= cursor:
+            span_index += 1
+        if span_index < len(non_code_spans) and non_code_spans[span_index][0] <= cursor:
+            span_start, span_end = non_code_spans[span_index]
+            if text[span_start] == "#":
+                cursor = min(span_end, closer_position)
+                continue
+            chunks.append(text[cursor : min(span_end, closer_position)])
+            cursor = min(span_end, closer_position)
+            continue
+        next_span_start = (
+            min(non_code_spans[span_index][0], closer_position) if span_index < len(non_code_spans) else closer_position
+        )
+        chunks.append(text[cursor:next_span_start])
+        cursor = next_span_start
+
+    expression = "".join(chunks).strip()
+    if not expression:
+        return False
+    if all(character.isalnum() or character in "._" for character in expression):
+        return _r_token_can_start_call(expression)
+    return True
+
+
+def _r_function_body_follows(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> bool:
+    cursor = position
+    while cursor < len(text):
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text):
+            return False
+
+        span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+        if span_index >= 0 and cursor < non_code_spans[span_index][1]:
+            span_start, span_end = non_code_spans[span_index]
+            if text[span_start] != "#":
+                return True
+            cursor = span_end
+            continue
+        return text[cursor] not in ";,)]}"
+    return False
 
 
 def _r_token_can_start_subscript(token: str) -> bool:
@@ -840,7 +960,10 @@ class RSerializedScanner(BaseScanner):
                         gap
                         and any(byte in (0x0A, 0x0D) for byte in gap)
                         and all(byte in (0x09, 0x0A, 0x0D, 0x20) for byte in gap)
-                        and _unfinished_r_assignment_literal_closing_sequence(current_text) is not None
+                        and (
+                            _unfinished_r_assignment_literal_closing_sequence(current_text) is not None
+                            or _r_function_keyword_awaits_formals(current_text)
+                        )
                     ):
                         current_parts.append(gap.decode("ascii"))
                         current_parts.append(match.group().decode("utf-8", errors="ignore"))
