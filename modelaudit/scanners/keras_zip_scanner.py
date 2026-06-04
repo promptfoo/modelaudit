@@ -173,8 +173,8 @@ def _zip_member_hdf5_signature_offset(archive: zipfile.ZipFile, member_info: zip
     return None
 
 
-def _content_routable_hdf5_userblock_prefix(prefix: bytes) -> bytes:
-    """Trim HDF5 user-block padding without corrupting an embedded ZIP end record."""
+def _content_routable_hdf5_userblock_segments(prefix: bytes) -> tuple[bytes, ...]:
+    """Split a user block into a valid ZIP prefix and later non-padding content."""
     search_end = len(prefix)
     while True:
         eocd_offset = prefix.rfind(_ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE, 0, search_end)
@@ -185,13 +185,17 @@ def _content_routable_hdf5_userblock_prefix(prefix: bytes) -> bytes:
         if fixed_end <= len(prefix):
             comment_length = int.from_bytes(prefix[eocd_offset + 20 : fixed_end], "little")
             zip_end = fixed_end + comment_length
-            if zip_end <= len(prefix) and not prefix[zip_end:].strip(b"\x00"):
+            if zip_end <= len(prefix):
                 candidate = prefix[:zip_end]
                 if zipfile.is_zipfile(io.BytesIO(candidate)):
-                    return candidate
+                    trailing_content = prefix[zip_end:].rstrip(b"\x00")
+                    if trailing_content:
+                        return candidate, trailing_content
+                    return (candidate,)
         search_end = eocd_offset
 
-    return prefix.rstrip(b"\x00")
+    candidate = prefix.rstrip(b"\x00")
+    return (candidate,) if candidate else ()
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -2115,62 +2119,71 @@ class KerasZipScanner(BaseScanner):
         if prefix_bytes <= 0:
             return
 
-        prefix = _content_routable_hdf5_userblock_prefix(_read_zip_member_prefix(archive, weights_info, prefix_bytes))
-        if not prefix:
+        prefix_segments = _content_routable_hdf5_userblock_segments(
+            _read_zip_member_prefix(archive, weights_info, prefix_bytes)
+        )
+        if not prefix_segments:
             return
 
         weights_entry = weights_info.filename
-        temp_path: str | None = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-                temp_file.write(prefix)
-                temp_path = temp_file.name
-
-            nested_config = dict(self.config)
-            nested_config.pop("skip_archive_entries", None)
-            nested_config.pop(ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY, None)
-            nested_config.pop(ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY, None)
-            nested_config.pop(KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, None)
-            nested_config["cache_enabled"] = False
-            nested_config["_archive_depth"] = get_archive_depth(self.config) + 1
-
-            zip_scanner = ZipScanner(config=self.config)
-            prefix_result = zip_scanner._scan_nested_archive_entry(temp_path, nested_config)
-            if self._scan_result_has_actionable_security_findings(prefix_result):
-                zip_scanner._rewrite_nested_result_context(
-                    prefix_result,
-                    temp_path,
-                    self.current_file_path,
-                    weights_entry,
-                )
-                self._annotate_embedded_weights_security_prefix_result(
-                    prefix_result,
-                    weights_entry=weights_entry,
-                    hdf5_signature_offset=hdf5_signature_offset,
-                )
-                result.merge(prefix_result)
-                return
-        finally:
-            if temp_path is not None:
-                Path(temp_path).unlink(missing_ok=True)
-
         from .pickle_scanner import PickleScanner
         from .picklescan_adapter import apply_pickle_member_context
 
-        pickle_source = f"{self.current_file_path}:{weights_entry}:embedded-weights-prefix.pkl"
-        pickle_result = PickleScanner(config=self.config).scan_stream(
-            io.BytesIO(prefix),
-            len(prefix),
-            source=pickle_source,
-        )
-        if self._scan_result_has_actionable_security_findings(pickle_result):
-            apply_pickle_member_context(pickle_result, archive_path=self.current_file_path, member_name=weights_entry)
-            self._annotate_embedded_weights_security_prefix_result(
-                pickle_result,
-                weights_entry=weights_entry,
-                hdf5_signature_offset=hdf5_signature_offset,
+        nested_config = dict(self.config)
+        nested_config.pop("skip_archive_entries", None)
+        nested_config.pop(ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY, None)
+        nested_config.pop(ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY, None)
+        nested_config.pop(KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, None)
+        nested_config["cache_enabled"] = False
+        nested_config["_archive_depth"] = get_archive_depth(self.config) + 1
+
+        zip_scanner = ZipScanner(config=self.config)
+        for segment_index, prefix in enumerate(prefix_segments):
+            temp_path: str | None = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                    temp_file.write(prefix)
+                    temp_path = temp_file.name
+
+                prefix_result = zip_scanner._scan_nested_archive_entry(temp_path, nested_config)
+                if self._scan_result_has_actionable_security_findings(prefix_result):
+                    zip_scanner._rewrite_nested_result_context(
+                        prefix_result,
+                        temp_path,
+                        self.current_file_path,
+                        weights_entry,
+                    )
+                    self._annotate_embedded_weights_security_prefix_result(
+                        prefix_result,
+                        weights_entry=weights_entry,
+                        hdf5_signature_offset=hdf5_signature_offset,
+                    )
+                    result.merge(prefix_result)
+                    continue
+                if prefix_result.scanner_name != "unknown":
+                    continue
+            finally:
+                if temp_path is not None:
+                    Path(temp_path).unlink(missing_ok=True)
+
+            pickle_source = f"{self.current_file_path}:{weights_entry}:embedded-weights-prefix-{segment_index}.pkl"
+            pickle_result = PickleScanner(config=self.config).scan_stream(
+                io.BytesIO(prefix),
+                len(prefix),
+                source=pickle_source,
             )
-            result.merge(pickle_result)
+            if self._scan_result_has_actionable_security_findings(pickle_result):
+                apply_pickle_member_context(
+                    pickle_result,
+                    archive_path=self.current_file_path,
+                    member_name=weights_entry,
+                )
+                self._annotate_embedded_weights_security_prefix_result(
+                    pickle_result,
+                    weights_entry=weights_entry,
+                    hdf5_signature_offset=hdf5_signature_offset,
+                )
+                result.merge(pickle_result)
 
     @staticmethod
     def _annotate_embedded_weights_security_prefix_result(
