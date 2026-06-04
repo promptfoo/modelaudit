@@ -142,8 +142,8 @@ def test_flax_scan_reuses_ml_structure_analysis(
     assert analyze_calls == 1
 
 
-def test_flax_ml_structure_reuses_lowered_object_text() -> None:
-    """Layer-keyword analysis should stringify the checkpoint object once."""
+def test_flax_ml_structure_uses_bounded_text_without_whole_object_stringification() -> None:
+    """Layer-keyword analysis should not stringify the whole checkpoint object."""
 
     class StringCountingDict(dict[str, Any]):
         stringify_calls = 0
@@ -157,7 +157,7 @@ def test_flax_ml_structure_reuses_lowered_object_text() -> None:
 
     scanner._analyze_ml_structure(obj, scanner._create_result())
 
-    assert obj.stringify_calls == 1
+    assert obj.stringify_calls == 0
 
 
 def test_flax_msgpack_suspicious_content(tmp_path):
@@ -335,6 +335,43 @@ def test_flax_msgpack_scans_trailing_msgpack_objects(tmp_path: Path) -> None:
     )
 
 
+def test_flax_msgpack_preserves_trailing_scan_after_first_object_exhausts_node_budget(tmp_path: Path) -> None:
+    """A large first object must not starve a small malicious trailing object."""
+    path = tmp_path / "trailing_after_budget.msgpack"
+    payload = msgpack.packb({"params": list(range(8))}, use_bin_type=True)
+    payload += msgpack.packb("eval('x')", use_bin_type=True)
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_structure_nodes": 4}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == r"Suspicious code pattern detected: eval\s*\("
+        and issue.location == "root[msgpack_object_1]"
+        for issue in result.issues
+    )
+
+
+def test_flax_msgpack_trailing_objects_do_not_dilute_primary_scan_budget(tmp_path: Path) -> None:
+    """Many trailing objects must not shrink the primary checkpoint's security traversal."""
+    path = tmp_path / "primary_before_many_trailing.msgpack"
+    payload = msgpack.packb({"params": ["safe", "eval('x')"]}, use_bin_type=True)
+    payload += b"".join(msgpack.packb("safe", use_bin_type=True) for _ in range(3))
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_structure_nodes": 4}).scan(str(path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == r"Suspicious code pattern detected: eval\s*\("
+        and issue.location == "root/params[1]"
+        for issue in result.issues
+    )
+
+
 def test_flax_msgpack_benign_trailing_dict_object_is_info_only(tmp_path: Path) -> None:
     """Valid trailing dict objects should be scanned without warning-level stream noise."""
     path = tmp_path / "benign_two_objects.msgpack"
@@ -375,6 +412,23 @@ def test_flax_msgpack_scalar_trailing_junk_stays_warning(tmp_path: Path) -> None
     assert stream_checks[0].details["trailing_objects_are_container_like"] is False
 
 
+def test_flax_msgpack_incomplete_trailing_object_fails_closed(tmp_path: Path) -> None:
+    """A partial trailing object must not disappear into the streaming unpacker buffer."""
+    path = tmp_path / "incomplete_trailing_object.msgpack"
+    payload = msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True) + b"\x81\xa1"
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Msgpack Parse Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["parse_error"] == "incomplete trailing msgpack object"
+        for check in result.checks
+    )
+
+
 def test_flax_msgpack_caps_trailing_stream_object_count(tmp_path: Path) -> None:
     """Too many trailing msgpack objects should fail closed without materializing the full stream."""
     path = tmp_path / "many_objects.msgpack"
@@ -396,6 +450,163 @@ def test_flax_msgpack_caps_trailing_stream_object_count(tmp_path: Path) -> None:
     assert object_limit_checks[0].details["max_msgpack_stream_objects"] == 4
 
 
+def test_flax_msgpack_streaming_decode_does_not_call_unpackb(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native scans should stream through Unpacker instead of full-buffer unpackb."""
+    path = tmp_path / "streamed.msgpack"
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}})
+
+    def fail_unpackb(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("scan should not full-buffer decode through msgpack.unpackb")
+
+    monkeypatch.setattr(msgpack, "unpackb", fail_unpackb)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata.get("top_level_type") == "dict"
+
+
+def test_flax_msgpack_small_decode_buffer_accepts_stream_of_small_objects(tmp_path: Path) -> None:
+    """A bounded decoder should stream complete small objects without buffering the whole file."""
+    path = tmp_path / "small_stream_objects.msgpack"
+    payload = b"".join(msgpack.packb({"params": {"n": [index]}}, use_bin_type=True) for index in range(8))
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 32}).scan(str(path))
+
+    assert result.success is True
+    assert result.metadata.get("msgpack_object_count") == 8
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+
+
+def test_flax_msgpack_decode_limit_is_inconclusive(tmp_path: Path) -> None:
+    """Oversized MessagePack members should fail closed before materializing content."""
+    path = tmp_path / "oversized_blob.msgpack"
+    create_msgpack_file(path, {"params": {"blob": b"x" * 512}})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.DECODE_LIMIT_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Msgpack Decode Budget"
+        and check.status == CheckStatus.FAILED
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "oversized_value",
+    [
+        ["eval('x')", "safe", "extra"],
+        {"payload": "eval('x')", "safe": "ok", "extra": "ok"},
+    ],
+)
+def test_flax_msgpack_decode_limit_scans_visible_oversized_container_prefix(
+    tmp_path: Path,
+    oversized_value: object,
+) -> None:
+    """Early malicious values remain visible when a container exceeds the decode cap."""
+    path = tmp_path / "oversized_container.msgpack"
+    create_msgpack_file(path, {"params": oversized_value})
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_items_per_container": 2,
+            "max_msgpack_decode_bytes": 1024,
+        }
+    ).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.DECODE_LIMIT_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.message == r"Suspicious code pattern detected: eval\s*\("
+        for issue in result.issues
+    )
+
+
+def test_flax_msgpack_decode_limit_scans_visible_jax_transform_prefix(tmp_path: Path) -> None:
+    """Dedicated JAX checks must run on the visible prefix of oversized containers."""
+    path = tmp_path / "oversized_jax_transform.msgpack"
+    create_msgpack_file(path, {"params": [{"jit_compile": "safe"}, "safe", "extra"]})
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_items_per_container": 2,
+            "max_msgpack_decode_bytes": 1024,
+        }
+    ).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    jax_checks = [
+        check
+        for check in result.checks
+        if check.name == "JAX Transform Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["transform"] == "jit_compile"
+    ]
+    assert len(jax_checks) == 1
+
+
+def test_flax_msgpack_scans_byte_encoded_jax_transform_metadata(tmp_path: Path) -> None:
+    """Byte-valued JAX metadata must retain the dedicated transform check."""
+    path = tmp_path / "byte_jax_transform.msgpack"
+    create_msgpack_file(path, {"params": {"x": b"jit_compile"}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        check.name == "JAX Transform Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["transform"] == "jit_compile"
+        for check in result.checks
+    )
+
+
+def test_flax_msgpack_decode_limit_does_not_join_adjacent_jax_transform_parts(tmp_path: Path) -> None:
+    """Separate visible keys and values must not synthesize a JAX transform."""
+    path = tmp_path / "oversized_jax_transform_parts.msgpack"
+    create_msgpack_file(path, {"params": [{"jit": "compile"}, "safe", "extra"]})
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_items_per_container": 2,
+            "max_msgpack_decode_bytes": 1024,
+        }
+    ).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert all(check.name != "JAX Transform Security Check" for check in result.checks)
+
+
+def test_flax_msgpack_decode_limit_does_not_join_adjacent_visible_strings(tmp_path: Path) -> None:
+    """Structurally separate values must not become a synthetic suspicious pattern."""
+    path = tmp_path / "oversized_benign_strings.msgpack"
+    create_msgpack_file(path, {"params": ["ev", "al(", "extra"]})
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_items_per_container": 2,
+            "max_msgpack_decode_bytes": 1024,
+        }
+    ).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_flax_msgpack_large_containers(tmp_path):
     """Test detection of containers with excessive items."""
     path = tmp_path / "large.msgpack"
@@ -414,11 +625,10 @@ def test_flax_msgpack_large_containers(tmp_path):
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
-    assert len(info_issues) >= 2  # Should report both large containers at INFO level
-
-    issue_messages = [issue.message for issue in info_issues]
-    assert any("excessive items" in msg for msg in issue_messages)
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.DECODE_LIMIT_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "Msgpack Decode Budget" for check in result.checks)
 
 
 def test_flax_msgpack_deep_nesting_is_inconclusive(tmp_path: Path) -> None:
@@ -473,6 +683,32 @@ def test_flax_msgpack_renamed_hidden_pattern_beyond_recursion_limit_is_inconclus
         tmp_path / "hidden-payload-cache",
         max_recursion_depth=2,
     )
+
+
+def test_flax_msgpack_preanalysis_depth_limit_skips_unbounded_ml_helpers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deep structures should fail closed before ML metadata helpers recurse over them."""
+    path = tmp_path / "preanalysis_deep.msgpack"
+    nested: object = "benign"
+    for _ in range(6):
+        nested = {"nested": nested}
+    create_msgpack_file(path, {"params": nested})
+
+    scanner = FlaxMsgpackScanner(config={"max_recursion_depth": 2})
+
+    def fail_analyze(_obj: Any, _result: ScanResult) -> dict[str, Any]:
+        raise AssertionError("ML structure helper should be skipped once preanalysis depth is exhausted")
+
+    monkeypatch.setattr(scanner, "_analyze_ml_structure", fail_analyze)
+
+    result = scanner.scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.RECURSION_LIMIT_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "Flax MessagePack Preanalysis Depth Limit" for check in result.checks)
 
 
 def test_flax_msgpack_pattern_within_recursion_limit_remains_security_finding(tmp_path: Path) -> None:

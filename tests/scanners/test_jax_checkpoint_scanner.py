@@ -2385,6 +2385,122 @@ def test_malformed_orbax_metadata_is_inconclusive(tmp_path: Path) -> None:
     )
 
 
+def test_oversized_orbax_metadata_fails_closed_without_json_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir = tmp_path / "oversized_orbax"
+    checkpoint_dir.mkdir()
+    padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
+    (checkpoint_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "type": "orbax_checkpoint",
+                "padding": padding,
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_json_load(_stream: Any) -> Any:
+        raise AssertionError("oversized Orbax metadata must not be fully loaded")
+
+    monkeypatch.setattr("modelaudit.scanners.jax_checkpoint_scanner.json.load", fail_json_load)
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_orbax_metadata_analysis_size_limit" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Orbax Metadata Analysis Limit"
+        and check.status == CheckStatus.FAILED
+        and check.details["analysis_incomplete"] is True
+        for check in result.checks
+    )
+    assert all(check.name != "Orbax Pattern Security Check" for check in result.checks)
+
+
+def test_oversized_orbax_metadata_reports_visible_bounded_pattern(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "oversized_orbax_visible"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "type": "orbax_checkpoint",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_orbax_metadata_analysis_size_limit" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Orbax Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["context"] == "orbax_metadata_bounded_prefix.payload"
+        for check in result.checks
+    )
+
+
+def test_oversized_orbax_metadata_reports_visible_dangerous_restore_fn(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "oversized_orbax_restore_fn"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "type": "orbax_checkpoint",
+                "restore_fn": "os.system",
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_orbax_metadata_analysis_size_limit" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Orbax Restore Function Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["restore_fn"] == "os.system"
+        for check in result.checks
+    )
+
+
+def test_oversized_orbax_metadata_keeps_visible_benign_restore_fn_warning_only(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "oversized_orbax_benign_restore_fn"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "type": "orbax_checkpoint",
+                "restore_fn": "custom_deserialize",
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    restore_checks = [check for check in result.checks if check.name == "Orbax Restore Function Check"]
+    assert len(restore_checks) == 1
+    assert restore_checks[0].status == CheckStatus.FAILED
+    assert restore_checks[0].severity == IssueSeverity.WARNING
+    assert restore_checks[0].details["restore_fn"] == "custom_deserialize"
+
+
 def test_orbax_metadata_read_failure_is_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
