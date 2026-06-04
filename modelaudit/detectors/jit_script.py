@@ -3000,15 +3000,19 @@ class JITScriptDetector:
                     ):
                         return self._resolve_builtin(node.func.value)
                     if isinstance(node.func, ast.Attribute) and node.func.attr in {"get", "__getitem__", "pop"}:
-                        key_resolved, key = (
-                            (True, -1)
-                            if node.func.attr == "pop" and not node.args and not node.keywords
-                            else self._constant_container_key(node.args[0])
-                            if node.args
-                            else (False, None)
-                        )
+                        container = self._resolve_builtin_container(node.func.value)
+                        if node.args:
+                            key_resolved, key = self._constant_container_key(node.args[0])
+                        else:
+                            key_resolved = node.func.attr == "pop" and any(
+                                path
+                                and isinstance(path[0], tuple)
+                                and len(path[0]) == 3
+                                and path[0][0] == self._SEQUENCE_INDEX_MARKER
+                                for path in container
+                            )
+                            key = -1
                         if key_resolved:
-                            container = self._resolve_builtin_container(node.func.value)
                             prefixes = self._container_access_prefixes(container, (key,))
                             return next(
                                 (builtin for prefix in prefixes if (builtin := container.get(prefix)) is not None),
@@ -4079,14 +4083,18 @@ class JITScriptDetector:
                 self.function_nodes[function_id] = node
                 self._register_function_summary(node.name, (effects, return_binding, ((function_id, 0),)))
                 for decorator in reversed(node.decorator_list):
-                    decorated_call = ast.Call(
+                    decorator_call = ast.Call(
                         func=decorator,
                         args=[ast.Name(id=node.name, ctx=ast.Load())],
                         keywords=[],
                     )
-                    decorated_binding = self._binding_from_expression(decorated_call)
-                    if self._binding_has_tracked_value(decorated_binding):
-                        self._apply_binding(node.name, decorated_binding, scope_index=-1)
+                    if builtin := self._resolve_builtin(decorator_call.func):
+                        self.findings.add(builtin)
+                    self._analyze_function_call(decorator_call)
+                    self._apply_function_effects(decorator_call.func)
+                    decorator_binding = self._binding_from_expression(decorator_call)
+                    if self._binding_has_tracked_value(decorator_binding):
+                        self._apply_binding(node.name, decorator_binding, scope_index=-1)
 
             def _sequence_binding(self, bindings: list[_BuiltinAliasBinding]) -> _BuiltinAliasBinding:
                 container: dict[tuple[object, ...], str | None] = {}
@@ -4779,17 +4787,25 @@ class JITScriptDetector:
                 enter_method = "__aenter__" if isinstance(node, ast.AsyncWith) else "__enter__"
                 for item in node.items:
                     self.visit(item.context_expr)
+                    enter_call = ast.Call(
+                        func=ast.Attribute(
+                            value=item.context_expr,
+                            attr=enter_method,
+                            ctx=ast.Load(),
+                        ),
+                        args=[],
+                        keywords=[],
+                    )
+                    if builtin := self._resolve_builtin(enter_call.func):
+                        self.findings.add(builtin)
+                    self._analyze_function_call(enter_call)
+                    self._apply_function_effects(enter_call.func)
                     if item.optional_vars is not None:
-                        enter_call = ast.Call(
-                            func=ast.Attribute(
-                                value=item.context_expr,
-                                attr=enter_method,
-                                ctx=ast.Load(),
-                            ),
-                            args=[],
-                            keywords=[],
-                        )
-                        self._bind_target_from_value(item.optional_vars, enter_call)
+                        binding = self._binding_from_expression(enter_call)
+                        if self._binding_has_tracked_value(binding):
+                            self._apply_binding_to_target(item.optional_vars, binding)
+                        else:
+                            self._bind_target(item.optional_vars, None)
                 return self._visit_statements(node.body)
 
             def visit_With(self, node: ast.With) -> ast.stmt | None:
@@ -4922,7 +4938,11 @@ class JITScriptDetector:
                         )
 
             def _bind_container_mutation_call(self, node: ast.Call) -> None:
-                if not isinstance(node.func, ast.Attribute) or not isinstance(node.func.value, ast.Name):
+                if (
+                    not isinstance(node.func, ast.Attribute)
+                    or not isinstance(node.func.value, ast.Name)
+                    or node.keywords
+                ):
                     return
                 container_name = node.func.value.id
                 container_identity = self._lookup_container_identity(container_name)
@@ -4930,35 +4950,76 @@ class JITScriptDetector:
                     return
                 container = dict(self._lookup_container_alias(container_name))
                 function_container = dict(self._lookup_container_functions(container_name))
-                if node.func.attr == "append" and len(node.args) == 1 and not node.keywords:
-                    bindings = [
-                        *(
-                            (builtin, False, nested, set(), {}, None, None, ())
-                            for builtin, nested in self._sequence_container_element_bindings(container)
-                        ),
-                        self._binding_from_expression(node.args[0]),
-                    ]
-                    container = self._sequence_binding(bindings)[2]
-                elif node.func.attr == "pop" and len(node.args) <= 1 and not node.keywords:
-                    key_resolved, key = self._constant_container_key(node.args[0]) if node.args else (True, -1)
-                    if not key_resolved:
-                        return
-                    prefixes = self._container_access_prefixes(container, (key,))
-                    if not prefixes:
-                        return
-                    container = {
-                        path: builtin
-                        for path, builtin in container.items()
-                        if not any(path[: len(prefix)] == prefix for prefix in prefixes)
-                    }
-                    function_prefixes = self._container_access_prefixes(function_container, (key,)) or prefixes
+                bindings: list[_BuiltinAliasBinding] = [
+                    (builtin, False, nested, set(), {}, None, None, ())
+                    for builtin, nested in self._sequence_container_element_bindings(container)
+                ]
+                if node.func.attr == "append" and len(node.args) == 1:
+                    previous_length = len(bindings)
+                    bindings.append(self._binding_from_expression(node.args[0]))
+                    new_length = len(bindings)
                     function_container = {
-                        path: functions
+                        (
+                            (
+                                path[0][0],
+                                path[0][1],
+                                new_length,
+                            ),
+                            *path[1:],
+                        ): functions
                         for path, functions in function_container.items()
-                        if not any(path[: len(prefix)] == prefix for prefix in function_prefixes)
+                        if path
+                        and isinstance(path[0], tuple)
+                        and len(path[0]) == 3
+                        and path[0][0] == self._SEQUENCE_INDEX_MARKER
                     }
+                    appended_marker = self._sequence_index_element(previous_length, new_length)
+                    if summary := self._function_summary_for_node(node.args[0]):
+                        function_container[(appended_marker,)] = summary[2]
+                    for path, functions in self._resolve_function_container(node.args[0]).items():
+                        function_container[(appended_marker, *path)] = functions
+                elif node.func.attr == "pop" and len(node.args) <= 1 and bindings:
+                    if node.args:
+                        key_resolved, key = self._constant_container_key(node.args[0])
+                        if not key_resolved or not isinstance(key, int):
+                            return
+                    else:
+                        key = -1
+                    index = key if key >= 0 else len(bindings) + key
+                    if not 0 <= index < len(bindings):
+                        return
+                    bindings.pop(index)
+                    new_length = len(bindings)
+                    reindexed_functions: dict[
+                        tuple[object, ...],
+                        tuple[tuple[str, int], ...],
+                    ] = {}
+                    for path, functions in function_container.items():
+                        if (
+                            not path
+                            or not isinstance(path[0], tuple)
+                            or len(path[0]) != 3
+                            or path[0][0] != self._SEQUENCE_INDEX_MARKER
+                        ):
+                            continue
+                        old_index = path[0][1]
+                        if old_index == index:
+                            continue
+                        new_index = old_index - 1 if old_index > index else old_index
+                        reindexed_functions[
+                            (
+                                (
+                                    self._SEQUENCE_INDEX_MARKER,
+                                    new_index,
+                                    new_length,
+                                ),
+                                *path[1:],
+                            )
+                        ] = functions
+                    function_container = reindexed_functions
                 else:
                     return
+                container = self._sequence_binding(bindings)[2]
                 for scope_index, (identity_scope, container_scope) in enumerate(
                     zip(
                         self.container_identity_scopes,

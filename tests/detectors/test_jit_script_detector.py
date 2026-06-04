@@ -2151,6 +2151,20 @@ class TestJITScriptDetector:
             ),
             (b"\x00\xffdef deco(function):\n    return eval\n@deco\ndef sink():\n    pass\nsink('1+1')\n"),
             (b"\x00\xffdef framing():\n    return None\ncallbacks = [eval]\ncallbacks.pop()('1+1')\n"),
+            (
+                b"\x00\xffdef framing():\n"
+                b"    return None\n"
+                b"callbacks = [len, eval]\n"
+                b"callbacks.pop(0)\n"
+                b"callbacks[0]('1+1')\n"
+            ),
+            (
+                b"\x00\xffdef run(callback):\n"
+                b"    return callback('1+1')\n"
+                b"callbacks = [len, run]\n"
+                b"callbacks.pop(0)\n"
+                b"callbacks[0](eval)\n"
+            ),
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
@@ -2331,6 +2345,15 @@ class TestJITScriptDetector:
                 b"callbacks.pop()\n"
                 b"callbacks.append(len)\n"
                 b"callbacks[0]([])\n"
+            ),
+            (b"\x00\xffdef framing():\n    return None\ncallbacks = [eval, len]\ncallbacks.pop(0)\ncallbacks[0]([])\n"),
+            (
+                b"\x00\xffdef run(callback):\n"
+                b"    return callback('1+1')\n"
+                b"callbacks = [run, len]\n"
+                b"callbacks.pop(0)\n"
+                b"callbacks[0]([])\n"
+                b"unused = eval\n"
             ),
         ],
     )
