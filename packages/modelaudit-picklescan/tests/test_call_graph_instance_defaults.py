@@ -144,7 +144,9 @@ def _aiobotocore_anyio_backend_rce_payload(marker: Path) -> tuple[bytes, str]:
     return payload, marker_content
 
 
-def _assert_pickle_payload_executes_in_subprocess(payload: bytes, marker: Path, tmp_path: Path) -> None:
+def _assert_pickle_payload_executes_in_subprocess(
+    payload: bytes, marker: Path, marker_content: str, tmp_path: Path
+) -> None:
     payload_path = tmp_path / "payload.pkl"
     payload_path.write_bytes(payload)
     process = subprocess.Popen(
@@ -159,7 +161,9 @@ def _assert_pickle_payload_executes_in_subprocess(payload: bytes, marker: Path, 
         text=True,
     )
     deadline = time.monotonic() + 5
-    while process.poll() is None and not marker.exists() and time.monotonic() < deadline:
+    while process.poll() is None and time.monotonic() < deadline:
+        if marker.exists() and marker.read_text() == marker_content:
+            break
         time.sleep(0.01)
 
     if process.poll() is None:
@@ -171,6 +175,7 @@ def _assert_pickle_payload_executes_in_subprocess(payload: bytes, marker: Path, 
         _, stderr = process.communicate()
 
     assert marker.exists(), f"pickle payload did not execute: {stderr.strip()}"
+    assert marker.read_text() == marker_content
 
 
 def _has_critical_call_graph_finding(report: PickleReport, module: str, name: str, sink: str) -> bool:
@@ -264,5 +269,4 @@ def test_scan_bytes_blocks_aiobotocore_anyio_backend_rce(tmp_path: Path) -> None
     )
 
     assert not marker.exists()
-    _assert_pickle_payload_executes_in_subprocess(payload, marker, tmp_path)
-    assert marker.read_text() == marker_content
+    _assert_pickle_payload_executes_in_subprocess(payload, marker, marker_content, tmp_path)
