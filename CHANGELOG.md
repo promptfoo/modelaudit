@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - detect TorchServe MAR handler execution primitives reached through dynamic imports and `getattr`
+- fail closed when structurally recognized Keras ZIP scanners are unavailable while retaining generic ZIP security findings
 - redact sensitive decoded previews in TensorFlow SavedModel collection, PyFunc, and Keras metadata findings
 - fail closed on novel standalone picklescan import/callable metadata truncation without masking operational read errors or repeated benign imports
 - skip scan-result caching for sampled large-file fingerprints
