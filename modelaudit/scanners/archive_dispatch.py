@@ -381,14 +381,16 @@ def merge_executable_zip_container_findings(
     for subtype_id in subtype_ids:
         if scanner_selection.allows(subtype_id):
             subtype_scanner = _registry.load_scanner_by_id(subtype_id)
-            if subtype_scanner:
+            if subtype_scanner is None:
+                subtype_result = _make_unavailable_recognized_format_result(path, subtype_id, subtype_id)
+            else:
                 subtype_result = subtype_scanner(config=subtype_config).scan(path)
                 raw_offsets = subtype_result.metadata.pop(KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, ())
                 if isinstance(raw_offsets, (list, tuple, set, frozenset)):
                     known_unreadable_offsets.update(
                         offset for offset in raw_offsets if isinstance(offset, int) and not isinstance(offset, bool)
                     )
-                _merge_composed_scan_result(result, subtype_result)
+            _merge_composed_scan_result(result, subtype_result)
         else:
             add_scanner_selection_skip_check(
                 result,

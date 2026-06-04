@@ -13,9 +13,10 @@ use crate::nested::{
     decode_possible_encoded_pickle, detect_oversized_encoded_pickle_prefixes,
     encoded_literal_may_contain_pickle, encoded_nested_literal_probe_coverage_incomplete,
     encoded_nested_literal_probe_windows_with_limit, encoded_nested_window_char_limit,
-    has_execution_opcode, has_pickle_prefix, looks_like_pickle_payload,
+    has_binary_pickle_prefix, has_execution_opcode, has_pickle_prefix, looks_like_pickle_payload,
     nested_pickle_probe_offsets, pickle_payload_extent,
-    truncated_pickle_prefix_requires_fail_closed, MAX_NESTED_PAYLOAD_PROBES,
+    protocol0_global_or_inst_prefix_has_import_reference_lines,
+    truncated_pickle_prefix_requires_fail_closed, NestedProbeOffsets, MAX_NESTED_PAYLOAD_PROBES,
 };
 use crate::nested_surface::{
     encoded_nested_payload_finding, is_allowlisted_nested_constructor_ref,
@@ -507,6 +508,7 @@ pub(crate) struct ScanState<'a> {
     next_buffer_count: usize,
     readonly_buffer_count: usize,
     readonly_buffer_empty_stack_count: usize,
+    readonly_buffer_invalid_stack_count: usize,
     first_buffer_opcode_position: Option<usize>,
     persistent_id_count: usize,
     first_persistent_id_position: Option<usize>,
@@ -570,6 +572,7 @@ impl<'a> ScanState<'a> {
             next_buffer_count: 0,
             readonly_buffer_count: 0,
             readonly_buffer_empty_stack_count: 0,
+            readonly_buffer_invalid_stack_count: 0,
             first_buffer_opcode_position: None,
             persistent_id_count: 0,
             first_persistent_id_position: None,
@@ -1004,6 +1007,7 @@ impl<'a> ScanState<'a> {
                 type_name: None, ..
             }
             | StackValue::Mark
+            | StackValue::ExternalBuffer
             | StackValue::Other => 0,
         }
     }
@@ -1031,6 +1035,7 @@ impl<'a> ScanState<'a> {
             | StackValue::Bytes { .. }
             | StackValue::Primitive { .. }
             | StackValue::Mark
+            | StackValue::ExternalBuffer
             | StackValue::Other => false,
         }
     }
@@ -1188,9 +1193,25 @@ impl<'a> ScanState<'a> {
                             self.scan_raw_nested_pickle_bytes(bytes, self.position_offset + start);
                         }
                     }
+                    "BINUNICODE" | "BINUNICODE8" | "SHORT_BINUNICODE" => {
+                        if let ArgValue::TextSpan { start, end } = opcode.arg {
+                            if start <= end && end <= self.payload.len() {
+                                let bytes = &self.payload[start..end];
+                                self.scan_raw_nested_unicode_bytes(
+                                    bytes,
+                                    self.position_offset + start,
+                                );
+                            }
+                        }
+                    }
                     "STRING" => {
                         if let Some(bytes) = opcode.arg.raw_bytes(self.payload) {
                             self.scan_raw_nested_pickle_bytes(bytes.as_ref(), position);
+                        }
+                    }
+                    "UNICODE" => {
+                        if let ArgValue::Text(value) = &opcode.arg {
+                            self.scan_raw_nested_unicode_text(value, position);
                         }
                     }
                     _ => {}
@@ -1223,11 +1244,16 @@ impl<'a> ScanState<'a> {
                 }
             }
             "NEXT_BUFFER" => {
-                self.record_buffer_opcode(opcode.name, position, false);
-                self.push_stack_value(StackValue::Other);
+                self.record_buffer_opcode(opcode.name, position, false, false);
+                self.push_stack_value(StackValue::ExternalBuffer);
             }
             "READONLY_BUFFER" => {
-                self.record_buffer_opcode(opcode.name, position, self.stack.is_empty());
+                self.record_buffer_opcode(
+                    opcode.name,
+                    position,
+                    self.stack.is_empty(),
+                    Self::readonly_buffer_operand_is_definitely_invalid(self.stack.last()),
+                );
             }
             "MARK" => self.push_stack_value(StackValue::Mark),
             "POP" => {
@@ -1549,7 +1575,20 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn record_buffer_opcode(&mut self, op_name: &'static str, position: usize, empty_stack: bool) {
+    fn readonly_buffer_operand_is_definitely_invalid(value: Option<&StackValue>) -> bool {
+        !matches!(
+            value,
+            Some(StackValue::Bytes { .. } | StackValue::ExternalBuffer)
+        )
+    }
+
+    fn record_buffer_opcode(
+        &mut self,
+        op_name: &'static str,
+        position: usize,
+        empty_stack: bool,
+        invalid_stack: bool,
+    ) {
         if self.first_buffer_opcode_position.is_none() {
             self.first_buffer_opcode_position = Some(position);
         }
@@ -1559,6 +1598,9 @@ impl<'a> ScanState<'a> {
                 self.readonly_buffer_count += 1;
                 if empty_stack {
                     self.readonly_buffer_empty_stack_count += 1;
+                }
+                if invalid_stack {
+                    self.readonly_buffer_invalid_stack_count += 1;
                 }
             }
             _ => {}
@@ -1570,11 +1612,25 @@ impl<'a> ScanState<'a> {
         if buffer_opcode_count == 0 {
             return;
         }
+        let requires_external_buffer_context = self.next_buffer_count > 0;
+        let analysis_incomplete =
+            requires_external_buffer_context || self.readonly_buffer_invalid_stack_count > 0;
+        if analysis_incomplete && self.status.is_complete() {
+            self.status = ScanStatus::Inconclusive;
+        }
         let position = self.first_buffer_opcode_position.unwrap_or(0);
         self.add_notice(Notice {
-            message: format!(
-                "Encountered {buffer_opcode_count} protocol 5 buffer opcode(s); external buffer context is opaque"
-            ),
+            message: if requires_external_buffer_context {
+                format!(
+                    "Encountered {buffer_opcode_count} protocol 5 buffer opcode(s); external buffer context is opaque"
+                )
+            } else if analysis_incomplete {
+                format!(
+                    "Encountered {buffer_opcode_count} malformed protocol 5 buffer opcode(s); stack context is opaque"
+                )
+            } else {
+                format!("Encountered {buffer_opcode_count} in-band protocol 5 buffer opcode(s)")
+            },
             severity: "info",
             location: Some(format!("{} (pos {})", self.source, position)),
             code: Some("buffer_opcode"),
@@ -1596,8 +1652,16 @@ impl<'a> ScanState<'a> {
                     DetailValue::UInt(self.readonly_buffer_empty_stack_count as u64),
                 ),
                 (
+                    "readonly_buffer_invalid_stack_count".to_string(),
+                    DetailValue::UInt(self.readonly_buffer_invalid_stack_count as u64),
+                ),
+                (
                     "requires_external_buffer_context".to_string(),
-                    DetailValue::Bool(true),
+                    DetailValue::Bool(requires_external_buffer_context),
+                ),
+                (
+                    "analysis_incomplete".to_string(),
+                    DetailValue::Bool(analysis_incomplete),
                 ),
             ],
         });
@@ -5557,8 +5621,25 @@ impl<'a> ScanState<'a> {
     }
 
     fn scan_raw_nested_pickle_bytes(&mut self, value: &[u8], position: usize) {
+        self.scan_raw_nested_pickle_bytes_with_policy(value, position, true);
+    }
+
+    fn scan_raw_nested_unicode_pickle_bytes(&mut self, value: &[u8], position: usize) {
+        self.scan_raw_nested_pickle_bytes_with_policy(value, position, false);
+    }
+
+    fn scan_raw_nested_pickle_bytes_with_policy(
+        &mut self,
+        value: &[u8],
+        position: usize,
+        allow_ambiguous_malformed_prefix: bool,
+    ) {
         let mut skip_offsets_before = 0usize;
-        let probe_offsets = nested_pickle_probe_offsets(value);
+        let probe_offsets = if allow_ambiguous_malformed_prefix {
+            nested_pickle_probe_offsets(value)
+        } else {
+            self.raw_nested_unicode_probe_offsets(value)
+        };
         let limit_exceeded = probe_offsets.limit_exceeded;
         for offset in probe_offsets.offsets {
             if offset < skip_offsets_before {
@@ -5591,7 +5672,12 @@ impl<'a> ScanState<'a> {
                 skip_offsets_before = offset.saturating_add(payload_len);
                 continue;
             }
-            if has_pickle_prefix(probe) && has_execution_opcode(probe) {
+            if has_pickle_prefix(probe)
+                && has_execution_opcode(probe)
+                && (allow_ambiguous_malformed_prefix
+                    || has_binary_pickle_prefix(probe)
+                    || protocol0_global_or_inst_prefix_has_import_reference_lines(probe))
+            {
                 let surface_outcome =
                     self.surface_nested_pickle_findings(probe, "raw", position + offset);
                 self.add_nested_payload_finding(
@@ -5615,6 +5701,104 @@ impl<'a> ScanState<'a> {
         }
         if limit_exceeded {
             self.record_nested_probe_limit_exceeded("raw", value.len(), position);
+        }
+    }
+
+    fn raw_nested_unicode_probe_offsets(&self, value: &[u8]) -> NestedProbeOffsets {
+        let mut offsets = Vec::new();
+        let last_stop_offset = value.iter().rposition(|byte| *byte == b'.');
+        let mut search_start = 0usize;
+        while search_start < value.len().saturating_sub(1) {
+            let probe_offsets = nested_pickle_probe_offsets(&value[search_start..]);
+            for relative_offset in probe_offsets.offsets.iter().copied() {
+                let offset = search_start.saturating_add(relative_offset);
+                let remaining_len = value.len().saturating_sub(offset);
+                let end = value
+                    .len()
+                    .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
+                let probe = &value[offset..end];
+                let complete_payload = last_stop_offset.is_some_and(|stop| offset < stop)
+                    && pickle_payload_extent(probe, self.options.max_nested_pickle_bytes).is_some();
+                let malformed_payload = has_execution_opcode(probe)
+                    && (has_binary_pickle_prefix(probe)
+                        || protocol0_global_or_inst_prefix_has_import_reference_lines(probe));
+                let truncated_payload = remaining_len > self.options.max_nested_pickle_bytes
+                    && truncated_pickle_prefix_requires_fail_closed(probe);
+                if !complete_payload && !malformed_payload && !truncated_payload {
+                    continue;
+                }
+                if offsets.len() >= MAX_NESTED_PAYLOAD_PROBES {
+                    return NestedProbeOffsets {
+                        offsets,
+                        limit_exceeded: true,
+                    };
+                }
+                offsets.push(offset);
+            }
+            let Some(last_relative_offset) = probe_offsets.offsets.last() else {
+                break;
+            };
+            if !probe_offsets.limit_exceeded {
+                break;
+            }
+            search_start = search_start
+                .saturating_add(*last_relative_offset)
+                .saturating_add(1);
+        }
+        NestedProbeOffsets {
+            offsets,
+            limit_exceeded: false,
+        }
+    }
+
+    fn scan_raw_nested_unicode_bytes(&mut self, value: &[u8], position: usize) {
+        let Ok(text) = std::str::from_utf8(value) else {
+            self.scan_raw_nested_pickle_bytes(value, position);
+            return;
+        };
+        self.scan_raw_nested_unicode_text(text, position);
+    }
+
+    fn scan_raw_nested_unicode_text(&mut self, value: &str, position: usize) {
+        if value.is_ascii() {
+            self.scan_raw_nested_unicode_pickle_bytes(value.as_bytes(), position);
+            return;
+        }
+
+        let overlap_bytes = self.options.max_nested_pickle_bytes;
+        if overlap_bytes == 0 {
+            return;
+        }
+        // Advance by at least the overlap size so a small literal-scan limit
+        // cannot turn a large Unicode value into repeated multi-megabyte scans.
+        let chunk_advance_bytes = self
+            .options
+            .max_string_literal_scan_chars
+            .max(overlap_bytes);
+        let chunk_limit = overlap_bytes.saturating_add(chunk_advance_bytes);
+        let mut segment = Vec::with_capacity(value.len().min(chunk_limit));
+        let mut segment_position = position;
+        for (offset, character) in value.char_indices() {
+            let Ok(byte) = u8::try_from(u32::from(character)) else {
+                if !segment.is_empty() {
+                    self.scan_raw_nested_unicode_pickle_bytes(&segment, segment_position);
+                    segment.clear();
+                }
+                continue;
+            };
+            if segment.is_empty() {
+                segment_position = position.saturating_add(offset);
+            }
+            segment.push(byte);
+            if segment.len() >= chunk_limit {
+                self.scan_raw_nested_unicode_pickle_bytes(&segment, segment_position);
+                let discard_bytes = segment.len().saturating_sub(overlap_bytes);
+                segment = segment.split_off(discard_bytes);
+                segment_position = segment_position.saturating_add(discard_bytes);
+            }
+        }
+        if !segment.is_empty() {
+            self.scan_raw_nested_unicode_pickle_bytes(&segment, segment_position);
         }
     }
 
@@ -8415,7 +8599,7 @@ mod tests {
         );
         assert_eq!(
             detail_string(&finding.details, "name_operand").as_deref(),
-            Some("object")
+            Some("external_buffer")
         );
         assert!(scan
             .notices
@@ -8462,6 +8646,100 @@ mod tests {
             detail_usize(&notice.details, "readonly_buffer_count"),
             Some(2)
         );
+        assert!(notice
+            .details
+            .iter()
+            .any(|(key, value)| key == "analysis_incomplete"
+                && matches!(value, DetailValue::Bool(true))));
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.verdict, "unknown");
+    }
+
+    #[test]
+    fn in_band_readonly_buffer_preserves_complete_coverage() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x05\x96\x01\x00\x00\x00\x00\x00\x00\x00A\x98.";
+        let mut scan = ScanState::new(
+            "in-band-readonly-buffer.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let notice = scan
+            .notices
+            .iter()
+            .find(|notice| notice.code == Some("buffer_opcode"))
+            .expect("buffer opcode notice");
+        assert_eq!(scan.status, ScanStatus::Complete);
+        assert_eq!(scan.verdict, "clean");
+        assert_eq!(detail_usize(&notice.details, "next_buffer_count"), Some(0));
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_count"),
+            Some(1)
+        );
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_invalid_stack_count"),
+            Some(0)
+        );
+        assert!(notice.details.iter().any(|(key, value)| {
+            key == "requires_external_buffer_context" && matches!(value, DetailValue::Bool(false))
+        }));
+        assert!(notice.details.iter().any(|(key, value)| {
+            key == "analysis_incomplete" && matches!(value, DetailValue::Bool(false))
+        }));
+    }
+
+    #[test]
+    fn non_buffer_readonly_operand_fails_closed() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x05G\x00\x00\x00\x00\x00\x00\x00\x00\x98.";
+        let mut scan = ScanState::new(
+            "non-buffer-readonly.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let notice = scan
+            .notices
+            .iter()
+            .find(|notice| notice.code == Some("buffer_opcode"))
+            .expect("buffer opcode notice");
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.verdict, "unknown");
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_empty_stack_count"),
+            Some(0)
+        );
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_invalid_stack_count"),
+            Some(1)
+        );
     }
 
     #[test]
@@ -8505,10 +8783,21 @@ mod tests {
             .iter()
             .find(|notice| notice.code == Some("buffer_opcode"))
             .expect("buffer opcode notice");
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(scan.verdict, "malicious");
         assert_eq!(
             detail_usize(&notice.details, "readonly_buffer_empty_stack_count"),
             Some(1)
         );
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_invalid_stack_count"),
+            Some(1)
+        );
+        assert!(notice
+            .details
+            .iter()
+            .any(|(key, value)| key == "analysis_incomplete"
+                && matches!(value, DetailValue::Bool(true))));
     }
 
     #[test]
@@ -9276,6 +9565,182 @@ mod tests {
                         == Some("os.system")
             }));
         }
+    }
+
+    #[test]
+    fn unicode_string_opcodes_scan_raw_nested_payloads() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let nested_bytes = b"AAAAAAcos\nsystem\n)R.BBBB";
+        let payloads = [
+            ("short-binunicode", {
+                let mut payload = b"\x80\x04".to_vec();
+                payload.extend_from_slice(&short_binunicode(nested_bytes));
+                payload.push(b'.');
+                payload
+            }),
+            ("binunicode", {
+                let mut payload = b"\x80\x02X".to_vec();
+                payload.extend_from_slice(&(nested_bytes.len() as u32).to_le_bytes());
+                payload.extend_from_slice(nested_bytes);
+                payload.push(b'.');
+                payload
+            }),
+            ("binunicode8", {
+                let mut payload = b"\x80\x04\x8d".to_vec();
+                payload.extend_from_slice(&(nested_bytes.len() as u64).to_le_bytes());
+                payload.extend_from_slice(nested_bytes);
+                payload.push(b'.');
+                payload
+            }),
+            (
+                "protocol0-unicode",
+                b"VAAAAAAcos\\u000asystem\\u000a)R.BBBB\n.".to_vec(),
+            ),
+        ];
+
+        for (label, payload) in payloads {
+            let mut scan = ScanState::new(
+                format!("unicode-raw-nested-{label}.pkl"),
+                &payload,
+                &options,
+                Some(payload.len()),
+                0,
+                0,
+                None,
+            );
+
+            scan.run();
+
+            assert_eq!(scan.verdict, "malicious", "missed {label}");
+            assert!(scan.findings.iter().any(|finding| {
+                finding.rule_code == Some("S213")
+                    && detail_string(&finding.details, "encoding").as_deref() == Some("raw")
+                    && detail_usize(&finding.details, "payload_size") == Some(14)
+            }));
+            assert!(scan.findings.iter().any(|finding| {
+                finding.rule_code == Some("DANGEROUS_CALL")
+                    && detail_string(&finding.details, "import_reference").as_deref()
+                        == Some("os.system")
+            }));
+        }
+    }
+
+    #[test]
+    fn unicode_string_opcodes_fail_closed_for_malformed_protocol0_container_payloads() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let nested_bytes = b"(cos\nsystem\n)R";
+        let mut payload = b"\x80\x04".to_vec();
+        payload.extend_from_slice(&short_binunicode(nested_bytes));
+        payload.push(b'.');
+        let mut scan = ScanState::new(
+            "unicode-malformed-protocol0-container.pkl".to_string(),
+            &payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert_eq!(scan.status, "inconclusive");
+        assert_eq!(scan.verdict, "malicious");
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("S213")
+                && detail_string(&finding.details, "encoding").as_deref() == Some("raw")
+                && finding.details.iter().any(|(key, value)| {
+                    key == "analysis_incomplete" && matches!(value, DetailValue::Bool(true))
+                })
+        }));
+    }
+
+    #[test]
+    fn unicode_string_opcodes_scan_large_ascii_literals_without_copying() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: 1024,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut nested_bytes = vec![b'A'; 128 * 1024];
+        nested_bytes.extend_from_slice(b"cos\nsystem\n)R.");
+        let mut payload = b"\x80\x04X".to_vec();
+        payload.extend_from_slice(&(nested_bytes.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&nested_bytes);
+        payload.push(b'.');
+        let mut scan = ScanState::new(
+            "unicode-large-ascii-raw-nested.pkl".to_string(),
+            &payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert_eq!(scan.status, "inconclusive");
+        assert_eq!(scan.verdict, "malicious");
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("DANGEROUS_CALL")
+                && detail_string(&finding.details, "import_reference").as_deref()
+                    == Some("os.system")
+        }));
+    }
+
+    #[test]
+    fn unicode_raw_nested_scan_detects_payload_across_bounded_conversion_chunks() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: 0,
+            max_nested_pickle_bytes: 32,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "unicode-chunk-boundary.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+        let value = format!("{}{}", "\u{ff}".repeat(60), "cos\nsystem\n)R.");
+
+        scan.scan_raw_nested_unicode_text(&value, 0);
+        scan.finalize_verdict();
+
+        assert_eq!(scan.verdict, "malicious");
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("S213")
+                && detail_string(&finding.details, "encoding").as_deref() == Some("raw")
+                && detail_usize(&finding.details, "payload_size") == Some(14)
+        }));
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("DANGEROUS_CALL")
+                && detail_string(&finding.details, "import_reference").as_deref()
+                    == Some("os.system")
+        }));
     }
 
     #[test]

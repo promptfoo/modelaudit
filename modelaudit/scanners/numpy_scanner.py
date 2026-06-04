@@ -56,6 +56,9 @@ def _finish_with_inconclusive_contract(result: ScanResult, *, default_success: b
     result.finish(success=default_success and not result.has_errors)
 
 
+NUMPY_OBJECT_EMBEDDED_PICKLE_SELECTION_SKIP_REASON = "numpy_object_embedded_pickle_scanner_selection_skip"
+
+
 class NumPyScanner(BaseScanner):
     """Scanner for NumPy binary files (.npy) with cross-version compatibility."""
 
@@ -148,7 +151,16 @@ class NumPyScanner(BaseScanner):
                 self.scanner_selection,
                 context="embedded NumPy object pickle analysis",
             )
-            result.finish(success=True)
+            if result.checks:
+                result.checks[-1].details.update(
+                    {
+                        "analysis_incomplete": True,
+                        "scan_outcome": INCONCLUSIVE_SCAN_OUTCOME,
+                        "scan_outcome_reason": NUMPY_OBJECT_EMBEDDED_PICKLE_SELECTION_SKIP_REASON,
+                    }
+                )
+            _mark_inconclusive_scan_result(result, NUMPY_OBJECT_EMBEDDED_PICKLE_SELECTION_SKIP_REASON)
+            _finish_with_inconclusive_contract(result, default_success=False)
             return result
 
         pickle_scanner = PickleScanner(config=self.config)
@@ -453,6 +465,22 @@ class NumPyScanner(BaseScanner):
                             # fixed-width element data, so the numeric dtype/size validation path
                             # is not applicable after we recurse into the embedded pickle payload.
                             pickle_scan_skipped = embedded_result.scanner_name == "scanner_selection"
+                            data_type_details: dict[str, Any] = {
+                                "dtype": str(dtype),
+                                "dtype_kind": dtype.kind,
+                                "handled_via": (
+                                    "scanner_selection_skip" if pickle_scan_skipped else "embedded_pickle_scan"
+                                ),
+                                "cve_id": self.CVE_2019_6446_ID,
+                            }
+                            if pickle_scan_skipped:
+                                data_type_details.update(
+                                    {
+                                        "analysis_incomplete": True,
+                                        "scan_outcome": INCONCLUSIVE_SCAN_OUTCOME,
+                                        "scan_outcome_reason": NUMPY_OBJECT_EMBEDDED_PICKLE_SELECTION_SKIP_REASON,
+                                    }
+                                )
                             result.add_check(
                                 name="Data Type Safety Check",
                                 passed=True,
@@ -463,14 +491,7 @@ class NumPyScanner(BaseScanner):
                                 ),
                                 location=path,
                                 rule_code=None,
-                                details={
-                                    "dtype": str(dtype),
-                                    "dtype_kind": dtype.kind,
-                                    "handled_via": (
-                                        "scanner_selection_skip" if pickle_scan_skipped else "embedded_pickle_scan"
-                                    ),
-                                    "cve_id": self.CVE_2019_6446_ID,
-                                },
+                                details=data_type_details,
                             )
                             result.bytes_scanned = file_size
                             result.metadata.update(
