@@ -359,6 +359,8 @@ def download_artifact(
     api_token: str | None = None,
     access_token: str | None = None,
     timeout: int = 30,
+    *,
+    require_same_origin_redirects: bool = False,
 ) -> Path:
     """
     Download an artifact from JFrog Artifactory with proper authentication.
@@ -375,6 +377,7 @@ def download_artifact(
         api_token: JFrog API token (recommended)
         access_token: JFrog access token
         timeout: Request timeout in seconds
+        require_same_origin_redirects: Refuse redirects outside the original URL origin
 
     Returns:
         Path to the downloaded file
@@ -414,12 +417,19 @@ def download_artifact(
     response: requests.Response | None = None
     try:
         # Use requests for proper authentication and error handling
-        response = _get_with_jfrog_redirect_policy(
-            url,
-            headers=headers,
-            timeout=timeout,
-            stream=True,
-        )
+        if require_same_origin_redirects:
+            response, _ = _get_jfrog_response_with_redirect_policy(
+                url,
+                headers=headers,
+                timeout=timeout,
+            )
+        else:
+            response = _get_with_jfrog_redirect_policy(
+                url,
+                headers=headers,
+                timeout=timeout,
+                stream=True,
+            )
 
         # Raise an exception for HTTP error responses
         response.raise_for_status()
@@ -786,12 +796,25 @@ def _detect_jfrog_flax_msgpack_route(prefix: bytes, size_hint: int) -> str | Non
     return "flax_msgpack" if route_state is not False else None
 
 
-def _detect_jfrog_llamafile_route(prefix: bytes) -> str | None:
+def _detect_jfrog_llamafile_route(prefix: bytes, size_hint: int) -> str | None:
     """Recognize llamafile executable evidence within the bounded remote prefix."""
-    from modelaudit.utils.file.detection import LLAMAFILE_MARKER, _is_supported_llamafile_executable_header
+    import zipfile
 
-    if _is_supported_llamafile_executable_header(prefix[:4]) and LLAMAFILE_MARKER in prefix.lower():
+    from modelaudit.utils.file.detection import (
+        EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+        LLAMAFILE_MARKER,
+        LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
+        _is_supported_llamafile_executable_header,
+    )
+
+    if not _is_supported_llamafile_executable_header(prefix[:4]):
+        return None
+    if LLAMAFILE_MARKER in prefix.lower():
         return "llamafile"
+    if zipfile.is_zipfile(BytesIO(prefix)):
+        return EXECUTABLE_ZIP_POLYGLOT_FORMAT
+    if size_hint <= 0 or size_hint > len(prefix) or len(prefix) >= _JFROG_CONTENT_SNIFF_BYTES:
+        return LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT
     return None
 
 
@@ -856,7 +879,7 @@ def _detect_jfrog_content_route_format(
     jax_route = _detect_jfrog_jax_json_checkpoint_route(prefix, size_hint)
     if jax_route is not None:
         return jax_route, probe_download_url
-    llamafile_route = _detect_jfrog_llamafile_route(prefix)
+    llamafile_route = _detect_jfrog_llamafile_route(prefix, size_hint)
     if llamafile_route is not None:
         return llamafile_route, probe_download_url
     if _is_executorch_binary_signature(prefix):
@@ -914,6 +937,8 @@ def _detect_jfrog_content_route_format(
 def _scanner_ids_for_detected_jfrog_format(detected_format: str) -> set[str]:
     from modelaudit.scanner_registry_metadata import get_scanner_registry_metadata
     from modelaudit.utils.file.detection import (
+        EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+        LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
         MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
         PROTOBUF_MODEL_CANDIDATE_FORMAT,
         TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
@@ -925,10 +950,15 @@ def _scanner_ids_for_detected_jfrog_format(detected_format: str) -> set[str]:
     for scanner_id, scanner_info in get_scanner_registry_metadata().items():
         if detected_format == scanner_id or detected_format in scanner_info.get("header_formats", ()):
             scanner_ids.add(scanner_id)
-    if detected_format == "zip":
+    if detected_format in {"zip", EXECUTABLE_ZIP_POLYGLOT_FORMAT}:
         scanner_ids.update(_JFROG_ZIP_STRUCTURE_ROUTED_SCANNER_IDS)
     if detected_format in {"tar", "gzip", "bzip2", "xz"}:
         scanner_ids.add("nemo")
+    if detected_format in {"gzip", "bzip2", "xz"}:
+        scanner_ids.add("tar")
+    if detected_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
+        scanner_ids.add("llamafile")
+        scanner_ids.update(_JFROG_ZIP_STRUCTURE_ROUTED_SCANNER_IDS)
     if detected_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
         scanner_ids.update({"coreml", "onnx", "tf_metagraph", "tf_savedmodel"})
     if detected_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
@@ -1286,13 +1316,15 @@ def download_jfrog_folder(
             local_file.parent.mkdir(parents=True, exist_ok=True)
 
             # Download the individual file
-            download_url = str(file_info.get("content_probe_download_url", file_info["path"]))
+            download_url = str(file_info["path"])
+            content_was_probed = "content_probe_download_url" in file_info
             download_artifact(
                 download_url,
                 cache_dir=local_file.parent,
                 api_token=api_token,
                 access_token=access_token,
                 timeout=timeout,
+                require_same_origin_redirects=content_was_probed,
             )
 
             # Move to correct location if needed
