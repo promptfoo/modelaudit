@@ -330,6 +330,9 @@ class SevenZipScanner(BaseScanner):
             self.config.get("max_7z_cumulative_entries"),
             self._MAX_CUMULATIVE_ENTRIES,
         )
+        self._archive_member_info_cache: dict[int, tuple[Any, dict[str, list[Any]]]] = {}
+        self._reported_member_metadata_gaps: set[tuple[str, str]] = set()
+        self._reported_preextraction_links: set[tuple[str, str]] = set()
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -388,6 +391,10 @@ class SevenZipScanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan a 7-Zip archive file"""
+        self._archive_member_info_cache.clear()
+        self._reported_member_metadata_gaps.clear()
+        self._reported_preextraction_links.clear()
+
         # Check if py7zr is available
         if not HAS_PY7ZR:
             result = self._create_result()
@@ -891,41 +898,77 @@ class SevenZipScanner(BaseScanner):
         probe.seek(0)
         return probe.read(limit)
 
-    def _get_archive_member_info(self, archive: Any, file_name: str) -> Any | None:
-        """Return metadata for a member without extracting it, across py7zr API variants."""
-        files = getattr(archive, "files", None)
-        if files is not None:
-            with suppress(Exception):
-                for member_info in files:
-                    if getattr(member_info, "filename", None) == file_name:
-                        return member_info
+    def _get_archive_member_infos(self, archive: Any, file_name: str) -> list[Any]:
+        """Return every metadata record for a member across py7zr API variants."""
+        archive_key = id(archive)
+        cached_archive = self._archive_member_info_cache.get(archive_key)
+        member_index = cached_archive[1] if cached_archive is not None and cached_archive[0] is archive else None
+        if member_index is None:
+            member_index = {}
+            metadata_records: list[Any] = []
 
+            files = getattr(archive, "files", None)
+            if files is not None:
+                try:
+                    metadata_records = list(files)
+                except Exception:
+                    metadata_records = []
+
+            if not metadata_records:
+                list_members = getattr(archive, "list", None)
+                if callable(list_members):
+                    try:
+                        metadata_records = list(list_members())
+                    except Exception:
+                        metadata_records = []
+
+            for member_info in metadata_records:
+                member_name = getattr(member_info, "filename", None)
+                if isinstance(member_name, str):
+                    member_index.setdefault(member_name, []).append(member_info)
+            self._archive_member_info_cache[archive_key] = (archive, member_index)
+
+        member_infos = member_index.get(file_name)
+        if member_infos is not None:
+            return member_infos
+
+        # Older or mocked py7zr variants may expose only per-name lookup.
+        member_info = None
         getinfo = getattr(archive, "getinfo", None)
         if callable(getinfo):
             with suppress(Exception):
-                return getinfo(file_name)
+                member_info = getinfo(file_name)
+        member_infos = [] if member_info is None else [member_info]
+        member_index[file_name] = member_infos
+        return member_infos
 
-        list_members = getattr(archive, "list", None)
-        if callable(list_members):
-            with suppress(Exception):
-                for member_info in list_members():
-                    if getattr(member_info, "filename", None) == file_name:
-                        return member_info
-
+    def _get_archive_member_info(self, archive: Any, file_name: str) -> Any | None:
+        """Return unambiguous metadata for a member without extracting it."""
+        member_infos = self._get_archive_member_infos(archive, file_name)
+        if len(member_infos) == 1:
+            return member_infos[0]
         return None
 
     @staticmethod
     def _preflight_member_symlink_state(member_info: Any | None) -> str:
         if member_info is None:
             return "unknown"
-        is_symlink = getattr(member_info, "is_symlink", None)
+        try:
+            is_symlink = getattr(member_info, "is_symlink", None)
+            is_junction = getattr(member_info, "is_junction", False)
+        except Exception:
+            return "unknown"
         if isinstance(is_symlink, bool):
-            return "symlink" if is_symlink else "regular"
-        if type(is_symlink).__module__.startswith("unittest.mock") and "is_symlink" not in vars(member_info):
+            if is_symlink or is_junction is True:
+                return "symlink"
             return "regular"
         return "unknown"
 
     def _add_member_metadata_incomplete_check(self, result: ScanResult, archive_path: str, file_name: str) -> None:
+        finding_key = (archive_path, file_name)
+        if finding_key in self._reported_member_metadata_gaps:
+            return
+        self._reported_member_metadata_gaps.add(finding_key)
         result.add_check(
             name="7z Member Metadata",
             passed=False,
@@ -947,6 +990,10 @@ class SevenZipScanner(BaseScanner):
         file_name: str,
         member_info: Any | None,
     ) -> None:
+        finding_key = (archive_path, file_name)
+        if finding_key in self._reported_preextraction_links:
+            return
+        self._reported_preextraction_links.add(finding_key)
         details: dict[str, Any] = {
             "threat_type": "symlink_traversal",
             "checked_before_extraction": True,
@@ -1008,6 +1055,7 @@ class SevenZipScanner(BaseScanner):
         """Check for path traversal vulnerabilities and return only safe entries."""
         safe_entries: list[str] = []
         canonical_entries: dict[str, str] = {}
+        ambiguous_entries: set[str] = set()
         temp_base = os.path.join(tempfile.gettempdir(), "modelaudit_7z")
 
         for file_name in file_names:
@@ -1029,18 +1077,22 @@ class SevenZipScanner(BaseScanner):
 
             canonical_entry = os.path.normcase(os.path.normpath(sanitized_path))
             if canonical_entry in canonical_entries:
+                first_entry = canonical_entries[canonical_entry]
+                if canonical_entry not in ambiguous_entries:
+                    ambiguous_entries.add(canonical_entry)
+                    safe_entries.remove(first_entry)
                 result.add_check(
                     name="7z Duplicate Entry Protection",
                     passed=False,
                     message=(
                         "Archive contains duplicate entries that resolve to the same extraction path: "
-                        f"{canonical_entries[canonical_entry]} and {file_name}"
+                        f"{first_entry} and {file_name}"
                     ),
                     severity=IssueSeverity.WARNING,
                     location=f"{archive_path}:{file_name}",
                     details={
                         "entry": file_name,
-                        "first_entry": canonical_entries[canonical_entry],
+                        "first_entry": first_entry,
                         "canonical_path": sanitized_path,
                         "threat_type": "duplicate_entry_shadowing",
                     },

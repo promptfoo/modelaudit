@@ -884,6 +884,11 @@ class TestSevenZipScanner:
         ):
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["../../../escape.pkl", "safe.pkl", "readme.txt"]
+            mock_archive.getinfo.return_value = MagicMock(
+                is_directory=False,
+                is_symlink=False,
+                uncompressed=16,
+            )
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
             result = scanner.scan(temp_7z_file)
@@ -951,7 +956,8 @@ class TestSevenZipScanner:
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["large_file.pkl", "safe.pkl"]
             mock_archive.getinfo.side_effect = lambda name: MagicMock(
-                uncompressed=1000 if name == "large_file.pkl" else 10
+                uncompressed=1000 if name == "large_file.pkl" else 10,
+                is_symlink=False,
             )
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
@@ -996,7 +1002,11 @@ class TestSevenZipScanner:
 
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["safe.pkl", "nested_archive", *extensionless_members]
-            mock_archive.getinfo.side_effect = lambda _name: MagicMock(uncompressed=16, is_directory=False)
+            mock_archive.getinfo.side_effect = lambda _name: MagicMock(
+                uncompressed=16,
+                is_directory=False,
+                is_symlink=False,
+            )
             mock_archive.extract.side_effect = fake_extract
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
@@ -1112,6 +1122,11 @@ class TestSevenZipScanner:
         ):
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["test.pkl"]
+            mock_archive.getinfo.return_value = MagicMock(
+                is_directory=False,
+                is_symlink=False,
+                uncompressed=16,
+            )
             mock_archive.extract.side_effect = Exception("Extraction failed")
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
@@ -1325,7 +1340,7 @@ class TestSevenZipScannerConfiguration:
         ):
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["safe.pkl"]
-            mock_archive.getinfo.return_value = MagicMock(uncompressed=16)
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=16, is_symlink=False)
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
             result = scanner.scan(temp_7z_file)
@@ -1348,6 +1363,11 @@ class TestSevenZipScannerConfiguration:
         ):
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["large_file.pkl"]
+            mock_archive.getinfo.return_value = MagicMock(
+                is_directory=False,
+                is_symlink=False,
+                uncompressed=1000,
+            )
             mock_archive.extract = MagicMock()
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
@@ -1415,7 +1435,7 @@ class TestSevenZipScannerHardening:
         ):
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["safe.pkl"]
-            mock_archive.getinfo.return_value = MagicMock(uncompressed=16)
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=16, is_symlink=False)
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
             mock_islink.return_value = True
 
@@ -1484,6 +1504,117 @@ class TestSevenZipScannerHardening:
         assert len(symlink_checks) == 1
         assert symlink_checks[0].details["checked_before_extraction"] is True
         mock_archive.extract.assert_not_called()
+
+    def test_named_security_symlink_reports_once(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
+        """Probe and extraction preflights should share one link finding per member."""
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["payload.py"]
+            mock_archive.getinfo.return_value = MagicMock(
+                is_directory=False,
+                is_symlink=True,
+                is_junction=False,
+                uncompressed=16,
+            )
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+        symlink_checks = [c for c in result.checks if c.name == "7z Symlink Protection"]
+        assert result.success is False
+        assert len(symlink_checks) == 1
+        mock_archive.extract.assert_not_called()
+
+    def test_duplicate_name_with_symlink_is_blocked_before_extraction(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
+        """Name-based py7zr extraction must not select a hidden duplicate symlink entry."""
+        regular_member = MagicMock(
+            filename="dup.pkl",
+            is_directory=False,
+            is_symlink=False,
+            is_junction=False,
+            uncompressed=16,
+        )
+        symlink_member = MagicMock(
+            filename="dup.pkl",
+            is_directory=False,
+            is_symlink=True,
+            is_junction=False,
+            uncompressed=8,
+        )
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.files = [regular_member, symlink_member]
+            mock_archive.getnames.return_value = ["dup.pkl", "dup.pkl"]
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+        duplicate_checks = [c for c in result.checks if c.name == "7z Duplicate Entry Protection"]
+        assert result.success is False
+        assert len(duplicate_checks) == 1
+        mock_archive.extract.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "member_names",
+        [
+            ["dup.pkl", "dup.pkl"],
+            ["dup.pkl", "subdir/../dup.pkl"],
+        ],
+    )
+    def test_ambiguous_duplicate_paths_have_no_safe_extraction_target(
+        self,
+        scanner: SevenZipScanner,
+        member_names: list[str],
+    ) -> None:
+        """Every entry in a canonical-name collision must be excluded from extraction."""
+        result = ScanResult(scanner_name="sevenzip")
+
+        safe_entries = scanner._check_path_traversal(member_names, "archive.7z", result)
+
+        assert safe_entries == []
+        duplicate_checks = [c for c in result.checks if c.name == "7z Duplicate Entry Protection"]
+        assert len(duplicate_checks) == 1
+
+    def test_member_metadata_is_indexed_once(self, scanner: SevenZipScanner) -> None:
+        """Repeated preflight lookups should not rescan the full archive metadata iterable."""
+
+        class CountingMemberList:
+            iterations = 0
+
+            def __iter__(self) -> Generator[MagicMock, None, None]:
+                self.iterations += 1
+                yield MagicMock(filename="first.pkl", is_symlink=False, uncompressed=1)
+                yield MagicMock(filename="second.pkl", is_symlink=False, uncompressed=2)
+
+        archive = MagicMock()
+        archive.files = CountingMemberList()
+
+        assert scanner._get_archive_member_info(archive, "first.pkl") is not None
+        assert scanner._get_archive_member_info(archive, "second.pkl") is not None
+        assert archive.files.iterations == 1
+
+    def test_junction_metadata_is_treated_as_symlink(self, scanner: SevenZipScanner) -> None:
+        """Windows junctions are reparse-point links and must be blocked before extraction."""
+        member_info = MagicMock(is_symlink=False, is_junction=True)
+
+        assert scanner._preflight_member_symlink_state(member_info) == "symlink"
 
     @pytest.mark.parametrize(("is_symlink", "expected_state"), [(False, "regular"), (True, "symlink")])
     def test_legacy_internal_member_metadata_preserves_symlink_preflight(
@@ -1650,7 +1781,7 @@ class TestSevenZipScannerHardening:
         ):
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = extensionless_members
-            mock_archive.getinfo.return_value = MagicMock(is_directory=False, uncompressed=16)
+            mock_archive.getinfo.return_value = MagicMock(is_directory=False, is_symlink=False, uncompressed=16)
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
             result = scanner.scan(temp_7z_file)
@@ -1827,7 +1958,7 @@ class TestSevenZipScannerHardening:
         ):
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["payload.jpg"]
-            mock_archive.getinfo.return_value = MagicMock(is_directory=False, uncompressed=16)
+            mock_archive.getinfo.return_value = MagicMock(is_directory=False, is_symlink=False, uncompressed=16)
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
             result = scanner.scan(str(archive_path))
@@ -1884,7 +2015,7 @@ class TestSevenZipScannerHardening:
         ):
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["payload.jpg"]
-            mock_archive.getinfo.return_value = MagicMock(is_directory=False, uncompressed=32)
+            mock_archive.getinfo.return_value = MagicMock(is_directory=False, is_symlink=False, uncompressed=32)
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
             result = scanner.scan(str(archive_path))
@@ -2240,7 +2371,7 @@ class TestSevenZipScannerHardening:
         ):
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["payload.py"]
-            mock_archive.getinfo.return_value = MagicMock(is_directory=False, uncompressed=32)
+            mock_archive.getinfo.return_value = MagicMock(is_directory=False, is_symlink=False, uncompressed=32)
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
             result = scanner.scan(str(archive_path))
@@ -2383,7 +2514,11 @@ class TestSevenZipScannerHardening:
         ):
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["a.pkl", "b.pkl"]
-            mock_archive.getinfo.side_effect = lambda _name: MagicMock(uncompressed=60, is_directory=False)
+            mock_archive.getinfo.side_effect = lambda _name: MagicMock(
+                uncompressed=60,
+                is_directory=False,
+                is_symlink=False,
+            )
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
             result = scanner.scan(temp_7z_file)
@@ -2421,7 +2556,11 @@ class TestSevenZipScannerHardening:
         ):
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["a.pkl", "b.pkl"]
-            mock_archive.getinfo.side_effect = lambda _name: MagicMock(uncompressed=None, is_directory=False)
+            mock_archive.getinfo.side_effect = lambda _name: MagicMock(
+                uncompressed=None,
+                is_directory=False,
+                is_symlink=False,
+            )
             mock_archive.extract.side_effect = fake_extract
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
@@ -2493,7 +2632,7 @@ class TestSevenZipScannerHardening:
         ):
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["nested.7z"]
-            mock_archive.getinfo.return_value = MagicMock(uncompressed=16, is_directory=False)
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=16, is_directory=False, is_symlink=False)
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
             result = scanner.scan(temp_7z_file)
@@ -2612,7 +2751,7 @@ class TestSevenZipScannerHardening:
 
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["nested_payload"]
-            mock_archive.getinfo.return_value = MagicMock(uncompressed=16, is_directory=False)
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=16, is_directory=False, is_symlink=False)
             mock_archive.extract.side_effect = fake_extract
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
@@ -2648,7 +2787,7 @@ class TestSevenZipScannerHardening:
 
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["nested_payload"]
-            mock_archive.getinfo.return_value = MagicMock(uncompressed=16, is_directory=False)
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=16, is_directory=False, is_symlink=False)
             mock_archive.extract.side_effect = fake_extract
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
@@ -2682,7 +2821,11 @@ class TestSevenZipScannerHardening:
 
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["nested_payload"]
-            mock_archive.getinfo.return_value = MagicMock(uncompressed=len(payload), is_directory=False)
+            mock_archive.getinfo.return_value = MagicMock(
+                uncompressed=len(payload),
+                is_directory=False,
+                is_symlink=False,
+            )
             mock_archive.extract.side_effect = fake_extract
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
@@ -2716,7 +2859,11 @@ class TestSevenZipScannerHardening:
 
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["nested_payload"]
-            mock_archive.getinfo.return_value = MagicMock(uncompressed=len(payload), is_directory=False)
+            mock_archive.getinfo.return_value = MagicMock(
+                uncompressed=len(payload),
+                is_directory=False,
+                is_symlink=False,
+            )
             mock_archive.extract.side_effect = fake_extract
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
@@ -2750,7 +2897,11 @@ class TestSevenZipScannerHardening:
 
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["nested_payload"]
-            mock_archive.getinfo.return_value = MagicMock(uncompressed=len(payload), is_directory=False)
+            mock_archive.getinfo.return_value = MagicMock(
+                uncompressed=len(payload),
+                is_directory=False,
+                is_symlink=False,
+            )
             mock_archive.extract.side_effect = fake_extract
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
@@ -2784,7 +2935,11 @@ class TestSevenZipScannerHardening:
 
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["nested_payload"]
-            mock_archive.getinfo.return_value = MagicMock(uncompressed=len(payload), is_directory=False)
+            mock_archive.getinfo.return_value = MagicMock(
+                uncompressed=len(payload),
+                is_directory=False,
+                is_symlink=False,
+            )
             mock_archive.extract.side_effect = fake_extract
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
