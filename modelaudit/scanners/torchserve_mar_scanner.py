@@ -1815,6 +1815,9 @@ class TorchServeMarScanner(BaseScanner):
                 shadowed_names,
             )
         if isinstance(node, ast.Attribute):
+            attribute_name = self._resolve_call_name(node)
+            if attribute_name is not None and attribute_name in module_aliases:
+                return module_aliases[attribute_name]
             parents = self._resolve_dynamic_import_roots(
                 node.value,
                 aliases,
@@ -1930,6 +1933,9 @@ class TorchServeMarScanner(BaseScanner):
             return callable_aliases.get(node.id, frozenset())
 
         if isinstance(node, ast.Attribute):
+            attribute_name = self._resolve_call_name(node)
+            if attribute_name is not None and attribute_name in callable_aliases:
+                return callable_aliases[attribute_name]
             if node.attr == "__call__":
                 return self._resolve_dynamic_import_execution_calls(
                     node.value,
@@ -2006,9 +2012,12 @@ class TorchServeMarScanner(BaseScanner):
                 self.static_truthiness_alias_stack: list[dict[str, bool]] = [{}]
                 self.scope_kind_stack: list[str] = ["module"]
                 self.class_parent_state_stack: list[_DynamicAliasState] = []
+                self.class_name_stack: list[str] = []
+                self.class_attribute_states: dict[str, _DynamicAliasState] = {}
                 self.function_binding_state_stack: list[_DynamicAliasState] = []
                 self.risky_calls: set[str] = set()
                 self.collecting_module_bindings = False
+                self.collecting_class_attribute_bindings = False
                 self.scope_depth = 0
                 self.module_binding_state: _DynamicAliasState | None = None
 
@@ -2191,10 +2200,47 @@ class TorchServeMarScanner(BaseScanner):
                 if self.scope_kind_stack[-1] == "module":
                     return self.module_binding_state or self._snapshot_state()
                 if self.scope_kind_stack[-1] == "class":
-                    return self.class_parent_state_stack[-1]
+                    inherited_state = self.class_parent_state_stack[-1]
+                    if self.class_name_stack:
+                        attribute_state = self.class_attribute_states.get(self.class_name_stack[-1])
+                        if attribute_state is not None:
+                            inherited_state = self._merge_states(inherited_state, attribute_state)
+                    return inherited_state
                 if self.scope_kind_stack[-1] == "function":
                     return self.function_binding_state_stack[-1]
                 return self._snapshot_state()
+
+            def _record_class_attribute_binding(self, name: str) -> None:
+                if not self.class_name_stack:
+                    return
+                state = self.class_attribute_states.setdefault(
+                    self.class_name_stack[-1],
+                    ({}, {}, {}, {}, set(), {}, {}),
+                )
+                if name in self.module_aliases:
+                    state[0][name] = state[0].get(name, frozenset()) | self.module_aliases[name]
+                if name in self.callable_aliases:
+                    state[1][name] = state[1].get(name, frozenset()) | self.callable_aliases[name]
+                if name in self.import_loader_aliases:
+                    state[2][name] = state[2].get(name, frozenset()) | self.import_loader_aliases[name]
+                if name in self.import_aliases:
+                    existing_alias = state[3].get(name)
+                    if existing_alias is None or existing_alias == self.import_aliases[name]:
+                        state[3][name] = self.import_aliases[name]
+                    else:
+                        state[3].pop(name, None)
+                if name in self.lazy_generator_aliases:
+                    generators_by_dump = {
+                        ast.dump(generator): generator
+                        for generator in (*state[5].get(name, ()), *self.lazy_generator_aliases[name])
+                    }
+                    state[5][name] = tuple(generators_by_dump.values())
+                if name in self.static_truthiness_aliases:
+                    existing_truthiness = state[6].get(name)
+                    if existing_truthiness is None or existing_truthiness is self.static_truthiness_aliases[name]:
+                        state[6][name] = self.static_truthiness_aliases[name]
+                    else:
+                        state[6].pop(name, None)
 
             def _resolved_static_truthiness(self, node: ast.AST) -> bool | None:
                 if isinstance(node, ast.Name):
@@ -2417,6 +2463,13 @@ class TorchServeMarScanner(BaseScanner):
                 if isinstance(target, ast.Name):
                     self._record_name_assignment(target.id, value)
                     return
+                if isinstance(target, ast.Attribute):
+                    target_name = scanner._resolve_call_name(target)
+                    if target_name is not None:
+                        self._record_name_assignment(target_name, value)
+                        if self.collecting_class_attribute_bindings:
+                            self._record_class_attribute_binding(target_name)
+                    return
                 if isinstance(target, ast.Starred):
                     self._invalidate_target(target.value)
                     return
@@ -2461,6 +2514,10 @@ class TorchServeMarScanner(BaseScanner):
             def _invalidate_target(self, target: ast.AST) -> None:
                 if isinstance(target, ast.Name):
                     self._invalidate_name(target.id)
+                elif isinstance(target, ast.Attribute):
+                    target_name = scanner._resolve_call_name(target)
+                    if target_name is not None:
+                        self._invalidate_name(target_name)
                 elif isinstance(target, ast.Starred):
                     self._invalidate_target(target.value)
                 elif isinstance(target, ast.Tuple | ast.List):
@@ -2619,6 +2676,15 @@ class TorchServeMarScanner(BaseScanner):
                         self._invalidate_pattern(child_pattern)
 
             def _visit_function_definition(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+                if self.collecting_class_attribute_bindings:
+                    self._push_scope(
+                        self._parameter_names(node.args) | scanner._callable_local_binding_names(node),
+                        self._callable_inherited_state(),
+                        scope_kind="function",
+                    )
+                    self._visit_statement_block(node.body)
+                    self._pop_scope()
+                    return
                 for decorator in node.decorator_list:
                     self.visit(decorator)
                 for default in [*node.args.defaults, *node.args.kw_defaults]:
@@ -2706,10 +2772,20 @@ class TorchServeMarScanner(BaseScanner):
                     class_body_state = self._snapshot_state()
                     class_parent_state = self.function_binding_state_stack[-1]
                 self.class_parent_state_stack.append(class_parent_state)
+                class_name = ".".join([*self.class_name_stack, node.name])
+                self.class_name_stack.append(class_name)
                 self._push_scope(set(), class_body_state, scope_kind="class")
+                class_initial_state = self._snapshot_state()
+                self.collecting_class_attribute_bindings = True
+                for statement in node.body:
+                    if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
+                        self.visit(statement)
+                self.collecting_class_attribute_bindings = False
+                self._restore_state(class_initial_state)
                 for statement in node.body:
                     self.visit(statement)
                 self._pop_scope()
+                self.class_name_stack.pop()
                 self.class_parent_state_stack.pop()
 
             def visit_Module(self, node: ast.Module) -> None:
@@ -2790,6 +2866,10 @@ class TorchServeMarScanner(BaseScanner):
             def _statement_definitely_terminates(self, statement: ast.stmt) -> bool:
                 if isinstance(statement, ast.Return | ast.Raise | ast.Break | ast.Continue):
                     return True
+                if isinstance(statement, ast.For | ast.AsyncFor):
+                    return scanner._static_iterable_truthiness(
+                        statement.iter
+                    ) is True and self._statements_definitely_exit_scope(statement.body)
                 if not isinstance(statement, ast.If):
                     return False
 
@@ -2806,6 +2886,44 @@ class TorchServeMarScanner(BaseScanner):
 
             def _statements_definitely_terminate(self, statements: list[ast.stmt]) -> bool:
                 return any(self._statement_definitely_terminates(statement) for statement in statements)
+
+            def _statement_definitely_exits_scope(self, statement: ast.stmt) -> bool:
+                if isinstance(statement, ast.Return | ast.Raise):
+                    return True
+                if not isinstance(statement, ast.If):
+                    return False
+                truthiness = self._resolved_static_truthiness(statement.test)
+                if truthiness is True:
+                    return self._statements_definitely_exit_scope(statement.body)
+                if truthiness is False:
+                    return self._statements_definitely_exit_scope(statement.orelse)
+                return (
+                    bool(statement.orelse)
+                    and self._statements_definitely_exit_scope(statement.body)
+                    and self._statements_definitely_exit_scope(statement.orelse)
+                )
+
+            def _statements_definitely_exit_scope(self, statements: list[ast.stmt]) -> bool:
+                return any(self._statement_definitely_exits_scope(statement) for statement in statements)
+
+            def _statement_definitely_prevents_loop_else(self, statement: ast.stmt) -> bool:
+                if isinstance(statement, ast.Break | ast.Return | ast.Raise):
+                    return True
+                if not isinstance(statement, ast.If):
+                    return False
+                truthiness = self._resolved_static_truthiness(statement.test)
+                if truthiness is True:
+                    return self._statements_definitely_prevent_loop_else(statement.body)
+                if truthiness is False:
+                    return self._statements_definitely_prevent_loop_else(statement.orelse)
+                return (
+                    bool(statement.orelse)
+                    and self._statements_definitely_prevent_loop_else(statement.body)
+                    and self._statements_definitely_prevent_loop_else(statement.orelse)
+                )
+
+            def _statements_definitely_prevent_loop_else(self, statements: list[ast.stmt]) -> bool:
+                return any(self._statement_definitely_prevents_loop_else(statement) for statement in statements)
 
             @staticmethod
             def _expression_definitely_does_not_raise(node: ast.AST) -> bool:
@@ -2852,6 +2970,13 @@ class TorchServeMarScanner(BaseScanner):
                     if not isinstance(statement, ast.Pass):
                         return False
                 return False
+
+            def _statements_definitely_do_not_raise(self, statements: list[ast.stmt]) -> bool:
+                return all(
+                    isinstance(statement, ast.Pass)
+                    or (isinstance(statement, ast.Expr) and self._expression_definitely_does_not_raise(statement.value))
+                    for statement in statements
+                )
 
             def _visit_statement_block(self, statements: list[ast.stmt]) -> None:
                 for statement in statements:
@@ -2979,7 +3104,11 @@ class TorchServeMarScanner(BaseScanner):
                     last_element = literal_elements[-1]
                     if last_element is not None:
                         self._record_target_assignment(node.target, last_element)
-                self._visit_statement_block(node.orelse)
+                if not (
+                    scanner._static_iterable_truthiness(node.iter) is True
+                    and self._statements_definitely_prevent_loop_else(node.body)
+                ):
+                    self._visit_statement_block(node.orelse)
 
             def visit_For(self, node: ast.For) -> None:
                 self._visit_for(node)
@@ -3077,6 +3206,7 @@ class TorchServeMarScanner(BaseScanner):
             def visit_Try(self, node: ast.Try) -> None:
                 initial_state = self._snapshot_state()
                 body_exits_without_exception = self._statements_definitely_exit_without_exception(node.body)
+                body_cannot_raise = self._statements_definitely_do_not_raise(node.body)
                 self._visit_statement_block(node.body)
                 body_state = self._snapshot_state()
                 body_terminates = self._statements_definitely_terminate(node.body)
@@ -3086,7 +3216,7 @@ class TorchServeMarScanner(BaseScanner):
                     possible_states.append(self._snapshot_state())
 
                 handler_initial_state = self._merge_states(initial_state, body_state)
-                if not body_exits_without_exception:
+                if not body_exits_without_exception and not body_cannot_raise:
                     for handler in node.handlers:
                         self._restore_state(handler_initial_state)
                         if handler.type is not None:
@@ -3125,6 +3255,8 @@ class TorchServeMarScanner(BaseScanner):
                             possible_states.append(guard_state)
                     self._visit_statement_block(case.body)
                     possible_states.append(self._snapshot_state())
+                    if isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.guard is None:
+                        break
 
                 merged_state = possible_states[0]
                 for possible_state in possible_states[1:]:

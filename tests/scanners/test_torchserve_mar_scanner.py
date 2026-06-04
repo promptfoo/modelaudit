@@ -1539,6 +1539,34 @@ def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
             b"    module = __import__('os') and __import__('math')\n"
             b"    return module.system('id')\n"
         ),
+        (
+            b"def handle(data, context):\n"
+            b"    for value in [0]:\n"
+            b"        break\n"
+            b"    else:\n"
+            b"        __import__('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    match [__import__('os')]:\n"
+            b"        case _:\n"
+            b"            pass\n"
+            b"        case [module]:\n"
+            b"            module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        pass\n"
+            b"    except Exception:\n"
+            b"        __import__('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    for value in [0]:\n"
+            b"        return None\n"
+            b"    __import__('os').system('id')\n"
+        ),
     ],
 )
 def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
@@ -1683,6 +1711,14 @@ def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
             b"def handle(data, context):\n"
             b"    (context and (module := __import__('os'))) or (module := __import__('math'))\n"
             b"    return module.system('id')\n"
+        ),
+        (
+            b"class Handler:\n"
+            b"    def handle(self, data, context):\n"
+            b"        return self.module.system('id')\n"
+            b"\n"
+            b"    def __init__(self):\n"
+            b"        self.module = __import__('os')\n"
         ),
     ],
 )
