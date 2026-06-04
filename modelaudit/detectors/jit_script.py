@@ -1784,6 +1784,9 @@ class JITScriptDetector:
 
         class DangerousBuiltinCallVisitor(ast.NodeVisitor):
             _SEQUENCE_INDEX_MARKER = "__modelaudit_sequence_index__"
+            # Store import identities with scoped aliases so branch snapshots preserve them.
+            _FUNCTOOLS_MODULE_MARKER = "__modelaudit_functools_module__:"
+            _FUNCTOOLS_PARTIAL_MARKER = "__modelaudit_functools_partial__:"
 
             def __init__(self) -> None:
                 self.findings: set[str] = set()
@@ -1799,7 +1802,16 @@ class JITScriptDetector:
             def _push_scope(
                 self,
                 arguments: ast.arguments | None = None,
-                default_bindings: dict[str, tuple[str | None, bool]] | None = None,
+                default_bindings: dict[
+                    str,
+                    tuple[
+                        str | None,
+                        bool,
+                        dict[tuple[object, ...], str | None],
+                        int | None,
+                    ],
+                ]
+                | None = None,
                 local_names: set[str] | None = None,
                 *,
                 kind: str = "function",
@@ -1821,8 +1833,16 @@ class JITScriptDetector:
                     self._bind_name(arguments.vararg.arg, None)
                 if arguments.kwarg is not None:
                     self._bind_name(arguments.kwarg.arg, None)
-                for name, (builtin, builtins_module) in (default_bindings or {}).items():
-                    self._bind_name(name, builtin, builtins_module=builtins_module)
+                for name, (builtin, builtins_module, container_aliases, container_identity) in (
+                    default_bindings or {}
+                ).items():
+                    self._bind_name(
+                        name,
+                        builtin,
+                        builtins_module=builtins_module,
+                        container_aliases=container_aliases,
+                        container_identity=container_identity,
+                    )
 
             def _pop_scope(self) -> None:
                 self.alias_scopes.pop()
@@ -1879,6 +1899,22 @@ class JITScriptDetector:
                     if name in scope:
                         return name in self.builtins_module_aliases[index]
                 return name in _BUILTINS_MODULE_NAMES
+
+            def _has_binding_marker(self, name: str, marker: str) -> bool:
+                for index in self._visible_scope_indexes():
+                    if name in self.alias_scopes[index]:
+                        return f"{marker}{name}" in self.builtins_module_aliases[index]
+                return False
+
+            def _is_functools_partial(self, node: ast.AST) -> bool:
+                if isinstance(node, ast.Name):
+                    return self._has_binding_marker(node.id, self._FUNCTOOLS_PARTIAL_MARKER)
+                return (
+                    isinstance(node, ast.Attribute)
+                    and node.attr == "partial"
+                    and isinstance(node.value, ast.Name)
+                    and self._has_binding_marker(node.value.id, self._FUNCTOOLS_MODULE_MARKER)
+                )
 
             def _is_builtins_module(self, node: ast.AST) -> bool:
                 if isinstance(node, ast.Name):
@@ -2190,6 +2226,8 @@ class JITScriptDetector:
                             None,
                         )
                 if isinstance(node, ast.Call):
+                    if self._is_functools_partial(node.func) and node.args:
+                        return self._resolve_builtin(node.args[0])
                     if (
                         len(node.args) >= 2
                         and isinstance(node.func, ast.Name)
@@ -2245,6 +2283,8 @@ class JITScriptDetector:
                 self.alias_scopes[scope_index][name] = builtin
                 self.container_alias_scopes[scope_index][name] = dict(container_aliases or {})
                 self.container_identity_scopes[scope_index][name] = container_identity
+                self.builtins_module_aliases[scope_index].discard(f"{self._FUNCTOOLS_MODULE_MARKER}{name}")
+                self.builtins_module_aliases[scope_index].discard(f"{self._FUNCTOOLS_PARTIAL_MARKER}{name}")
                 attribute_aliases = self.attribute_alias_scopes[scope_index]
                 for key in tuple(attribute_aliases):
                     if key[0] == name:
@@ -2590,6 +2630,8 @@ class JITScriptDetector:
                 for alias in node.names:
                     local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
                     self._bind_name(local_name, None, builtins_module=alias.name in _BUILTINS_MODULE_NAMES)
+                    if alias.name == "functools":
+                        self.builtins_module_aliases[-1].add(f"{self._FUNCTOOLS_MODULE_MARKER}{local_name}")
 
             def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
                 if node.module in _BUILTINS_MODULE_NAMES:
@@ -2598,7 +2640,10 @@ class JITScriptDetector:
                         self._bind_name(local_name, alias.name if alias.name in dangerous_builtins else None)
                 else:
                     for alias in node.names:
-                        self._bind_name(alias.asname or alias.name, None)
+                        local_name = alias.asname or alias.name
+                        self._bind_name(local_name, None)
+                        if node.module == "functools" and alias.name == "partial":
+                            self.builtins_module_aliases[-1].add(f"{self._FUNCTOOLS_PARTIAL_MARKER}{local_name}")
 
             def visit_Assign(self, node: ast.Assign) -> None:
                 self.visit(node.value)
@@ -2759,8 +2804,27 @@ class JITScriptDetector:
                     visitor.visit(node)
                 return visitor.local_names - visitor.outer_names
 
-            def _argument_default_bindings(self, arguments: ast.arguments) -> dict[str, tuple[str | None, bool]]:
-                bindings: dict[str, tuple[str | None, bool]] = {}
+            def _argument_default_bindings(
+                self,
+                arguments: ast.arguments,
+            ) -> dict[
+                str,
+                tuple[
+                    str | None,
+                    bool,
+                    dict[tuple[object, ...], str | None],
+                    int | None,
+                ],
+            ]:
+                bindings: dict[
+                    str,
+                    tuple[
+                        str | None,
+                        bool,
+                        dict[tuple[object, ...], str | None],
+                        int | None,
+                    ],
+                ] = {}
                 positional_arguments = [*arguments.posonlyargs, *arguments.args]
                 if arguments.defaults:
                     for argument, default in zip(
@@ -2771,12 +2835,16 @@ class JITScriptDetector:
                         bindings[argument.arg] = (
                             self._resolve_builtin(default),
                             self._is_builtins_namespace(default),
+                            self._resolve_builtin_container(default),
+                            self._container_expression_identity(default),
                         )
                 for argument, kw_default in zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True):
                     if kw_default is not None:
                         bindings[argument.arg] = (
                             self._resolve_builtin(kw_default),
                             self._is_builtins_namespace(kw_default),
+                            self._resolve_builtin_container(kw_default),
+                            self._container_expression_identity(kw_default),
                         )
                 return bindings
 
@@ -3224,10 +3292,54 @@ class JITScriptDetector:
             def visit_DictComp(self, node: ast.DictComp) -> None:
                 self._visit_comprehension(node.generators, (node.key, node.value))
 
+            def _dangerous_callback_builtins(self, node: ast.Call) -> set[str]:
+                callbacks: list[ast.AST] = []
+                if (
+                    isinstance(node.func, ast.Name)
+                    and self._is_unshadowed_name(node.func.id)
+                    and node.func.id in {"filter", "map"}
+                    and node.args
+                ):
+                    callbacks.append(node.args[0])
+                if (
+                    isinstance(node.func, ast.Name)
+                    and self._is_unshadowed_name(node.func.id)
+                    and node.func.id in {"max", "min", "sorted"}
+                ):
+                    callbacks.extend(keyword.value for keyword in node.keywords if keyword.arg == "key")
+                return {builtin for callback in callbacks if (builtin := self._resolve_builtin(callback)) is not None}
+
+            def _bind_attribute_setter_call(self, node: ast.Call) -> None:
+                target: ast.AST | None = None
+                name_node: ast.AST | None = None
+                value: ast.AST | None = None
+                is_builtin_setattr = (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "setattr"
+                    and self._is_unshadowed_name("setattr")
+                )
+                is_object_setattr = (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "__setattr__"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "object"
+                    and self._is_unshadowed_name("object")
+                )
+                if len(node.args) >= 3 and (is_builtin_setattr or is_object_setattr):
+                    target, name_node, value = node.args[:3]
+                if target is None or name_node is None or value is None:
+                    return
+                target_key = self._attribute_alias_key(target)
+                attribute_name = self._constant_string(name_node)
+                if target_key is not None and attribute_name is not None:
+                    self.attribute_alias_scopes[-1][(*target_key, attribute_name)] = self._resolve_builtin(value)
+
             def visit_Call(self, node: ast.Call) -> None:
                 if builtin := self._resolve_builtin(node.func):
                     self.findings.add(builtin)
+                self.findings.update(self._dangerous_callback_builtins(node))
                 self.generic_visit(node)
+                self._bind_attribute_setter_call(node)
 
         def method_receiver_name(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
             positional_arguments = [*node.args.posonlyargs, *node.args.args]

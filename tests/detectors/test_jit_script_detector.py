@@ -1952,6 +1952,8 @@ class TestJITScriptDetector:
             "callbacks = [len] if value else {0: eval}\n    return callbacks[0](value)",
             "return object.__getattribute__(__builtins__, 'eval')(value)",
             "holder.sink = eval\n    return holder.sink(value)",
+            "setattr(holder, 'sink', eval)\n    return holder.sink(value)",
+            "object.__setattr__(holder, 'sink', eval)\n    return holder.sink(value)",
         ],
     )
     def test_scan_model_detects_dangerous_builtins_through_indirect_storage(self, body: str) -> None:
@@ -2030,10 +2032,97 @@ class TestJITScriptDetector:
                 b"    holder = replacement\n"
                 b"    return holder.sink(value)\n"
             ),
+            (
+                b"\x00\xffdef benign(value, holder):\n"
+                b"    setattr(holder, 'sink', eval)\n"
+                b"    setattr(holder, 'sink', len)\n"
+                b"    return holder.sink(value)\n"
+            ),
+            (
+                b"\x00\xffdef benign(value, holder):\n"
+                b"    setattr(holder, 'sink', eval)\n"
+                b"    holder = replacement\n"
+                b"    return holder.sink(value)\n"
+            ),
+            (
+                b"\x00\xffdef benign(value, holder):\n"
+                b"    object.__setattr__(holder, 'sink', eval)\n"
+                b"    object.__setattr__(holder, 'sink', len)\n"
+                b"    return holder.sink(value)\n"
+            ),
+            (
+                b"\x00\xffdef benign(value, holder, setattr):\n"
+                b"    setattr(holder, 'sink', eval)\n"
+                b"    return holder.sink(value)\n"
+            ),
+            (
+                b"\x00\xffdef benign(value, holder, object):\n"
+                b"    object.__setattr__(holder, 'sink', eval)\n"
+                b"    return holder.sink(value)\n"
+            ),
             (b"\x00\xffcallbacks = [eval]\ndef benign(value, callbacks):\n    return callbacks[0](value)\n"),
+            (b"\x00\xffdef benign(value, callbacks=[eval]):\n    callbacks[0] = len\n    return callbacks[0](value)\n"),
         ],
     )
     def test_scan_model_avoids_stale_indirect_builtin_aliases(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            (b"\x00\xffdef payload(value, callbacks=[eval]):\n    return callbacks[0](value)\n"),
+            (b"\x00\xffdef payload(value, *, callbacks={'run': eval}):\n    return callbacks['run'](value)\n"),
+        ],
+    )
+    def test_scan_model_detects_dangerous_builtins_in_default_containers(self, data: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "return list(map(eval, values))",
+            "return list(filter(eval, values))",
+            "return sorted(values, key=eval)",
+            "return min(values, key=eval)",
+            "return max(values, key=eval)",
+            "import functools\n    return functools.partial(eval, values[0])()",
+            "import functools as ft\n    return ft.partial(eval, values[0])()",
+            "from functools import partial as bind\n    runner = bind(eval, values[0])\n    return runner()",
+        ],
+    )
+    def test_scan_model_detects_dangerous_builtins_used_as_callbacks(self, body: str) -> None:
+        detector = JITScriptDetector()
+        data = f"\x00\xffdef payload(values):\n    {body}\n".encode()
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            (b"\x00\xffdef benign(values, map):\n    return list(map(eval, values))\n"),
+            (b"\x00\xffdef benign(values, sorted):\n    return sorted(values, key=eval)\n"),
+            (b"\x00\xffdef benign(value, functools):\n    return functools.partial(eval, value)()\n"),
+            (
+                b"\x00\xffdef benign(value):\n"
+                b"    from functools import partial\n"
+                b"    partial = helper\n"
+                b"    return partial(eval, value)()\n"
+            ),
+            (b"\x00\xffdef benign(value):\n    import functools\n    return functools.partial(eval, value)\n"),
+            (b"\x00\xffdef benign(value):\n    return helper(eval, value)\n"),
+        ],
+    )
+    def test_scan_model_avoids_noninvoking_or_shadowed_callback_lookalikes(self, data: bytes) -> None:
         detector = JITScriptDetector()
 
         findings = detector.scan_model(data, "pytorch", "payload.bin")
@@ -2047,6 +2136,13 @@ class TestJITScriptDetector:
                 b"\x00\xffclass Payload:\n"
                 b"    def prepare(self):\n"
                 b"        self.sink = eval\n"
+                b"    def run(self, value):\n"
+                b"        return self.sink(value)\n"
+            ),
+            (
+                b"\x00\xffclass Payload:\n"
+                b"    def prepare(self):\n"
+                b"        setattr(self, 'sink', eval)\n"
                 b"    def run(self, value):\n"
                 b"        return self.sink(value)\n"
             ),
