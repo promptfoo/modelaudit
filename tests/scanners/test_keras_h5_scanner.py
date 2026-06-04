@@ -1426,6 +1426,33 @@ def test_lambda_malformed_source_fails_closed_without_echoing_source(tmp_path: P
     assert malformed_source not in str(malformed_checks[0].details)
 
 
+def test_lambda_empty_source_fails_closed(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "empty_source_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {"name": "empty_source", "function": ""},
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("validation_status") == "invalid_python"
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize("malformed_source", ["lambda x: x / \u0661", "lambda\nx: x / 255"])
 def test_lambda_malformed_safe_pattern_lookalike_fails_closed(tmp_path: Path, malformed_source: str) -> None:
     model_path = create_custom_h5_file(
@@ -2422,6 +2449,45 @@ def test_lambda_legacy_named_framework_function_still_passes(tmp_path: Path) -> 
     )
 
 
+def test_lambda_named_reference_metadata_does_not_suppress_source_analysis(tmp_path: Path) -> None:
+    """A separate function name must not reinterpret attacker-controlled source as a named reference."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "conflicting_named_function_reference",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "function": 'lambda x: __import__("os").system("id")',
+                            "function_type": "function",
+                            "module": "keras.activations",
+                            "function_name": "relu",
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="conflicting_named_function_reference.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Lambda Layer Module Reference Check" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize(
     ("module_name", "function_name", "expected_severity"),
     [
@@ -2709,6 +2775,69 @@ def test_lambda_allowlisted_framework_root_does_not_hide_python_callback_helper(
         and check.details.get("function") == "py_function"
         for check in result.checks
     )
+
+
+@pytest.mark.parametrize("function_name", ["raw_ops.PyFunc", "raw_ops.PyFuncStateless", "raw_ops.EagerPyFunc"])
+def test_lambda_tensorflow_raw_python_callback_alias_is_critical(tmp_path: Path, function_name: str) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "raw_python_callback",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {"module": "tensorflow", "function_name": function_name},
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name=f"raw_python_callback_{function_name.lower()}.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("function") == function_name
+        for check in result.checks
+    )
+
+
+def test_lambda_tensorflow_raw_python_callback_near_match_is_not_critical(tmp_path: Path) -> None:
+    function_name = "raw_ops.PyFunctional"
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "raw_python_callback_near_match",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {"module": "tensorflow", "function_name": function_name},
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="raw_python_callback_near_match.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Module Reference Check" and check.details.get("function") == function_name
+    ]
+    assert len(matching_checks) == 1
+    assert matching_checks[0].status == CheckStatus.FAILED
+    assert matching_checks[0].severity == IssueSeverity.WARNING
 
 
 def test_lambda_safe_source_does_not_suppress_dangerous_module_reference(tmp_path: Path) -> None:

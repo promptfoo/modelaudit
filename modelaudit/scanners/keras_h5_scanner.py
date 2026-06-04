@@ -126,6 +126,7 @@ class KerasH5Scanner(BaseScanner):
             "attrgetter",
             "compile",
             "eval",
+            "eagerpyfunc",
             "exec",
             "load_file_system_library",
             "load_library",
@@ -135,6 +136,8 @@ class KerasH5Scanner(BaseScanner):
             "numpy_function",
             "py_func",
             "py_function",
+            "pyfunc",
+            "pyfuncstateless",
             "spawn",
             "system",
         }
@@ -1072,7 +1075,9 @@ class KerasH5Scanner(BaseScanner):
 
         # Legacy Keras H5 stores named callables in `function` and distinguishes
         # them from serialized Lambda code with `function_type="function"`.
-        is_named_function_reference = function_type == "function"
+        is_named_function_reference = (
+            function_type == "function" and function_name is None and isinstance(function_str, str)
+        )
         reference_function_name = function_name
         if reference_function_name is None and is_named_function_reference:
             reference_function_name = function_str
@@ -1112,7 +1117,7 @@ class KerasH5Scanner(BaseScanner):
             )
 
         # Check if there's actual Python code to validate
-        if function_str and isinstance(function_str, str) and not is_named_function_reference:
+        if isinstance(function_str, str) and not is_named_function_reference:
             is_valid, error = validate_python_syntax(function_str)
             is_safe_pattern = is_valid and self._is_lambda_source_allowlisted(function_str)
 
