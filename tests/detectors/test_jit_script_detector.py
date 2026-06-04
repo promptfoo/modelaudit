@@ -6304,6 +6304,16 @@ class TestJITScriptDetector:
             (b"class C:\n    def __call__(self, callback):\n        callback('1+1')\nC()(eval)\n"),
             (b"class C:\n    def __new__(cls):\n        return eval\nC()('1+1')\n"),
             (b"callbacks = {eval}\nfor callback in callbacks:\n    callback('1+1')\n"),
+            (b"import builtins as b\nb.getattr(__builtins__, 'eval')('1+1')\n"),
+            (b"import builtins as b\nb.vars(__builtins__)['eval']('1+1')\n"),
+            (b"def configure():\n    globals()['sink'] = eval\nconfigure()\nsink('1+1')\n"),
+            (b"import operator\noperator.call(eval, '1+1')\n"),
+            (b"from operator import call as invoke\ninvoke(eval, '1+1')\n"),
+            (b"name = f'eval'\ngetattr(__builtins__, name)('1+1')\n"),
+            (b"callbacks = {'run': eval}\ncallbacks.setdefault('run')('1+1')\n"),
+            (b"callbacks = {'run': eval}\ndict.get(callbacks, 'run')('1+1')\n"),
+            (b"callbacks = [eval]\nlist.__getitem__(callbacks, 0)('1+1')\n"),
+            (b"staticmethod(eval)('1+1')\n"),
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
@@ -6628,6 +6638,24 @@ class TestJITScriptDetector:
                 b"C()(eval)\n"
             ),
             (b"callbacks = {len}\nfor callback in callbacks:\n    callback([])\nunused = eval\n"),
+            (b"import builtins as b\nb.getattr(__builtins__, 'len')([])\nunused = eval\n"),
+            (b"import builtins as b\nb.vars(__builtins__)['len']([])\nunused = eval\n"),
+            (b"def configure():\n    globals()['sink'] = len\nconfigure()\nsink([])\nunused = eval\n"),
+            (b"import operator\noperator.call(len, [])\nunused = eval\n"),
+            (
+                b"import operator\n"
+                b"class Safe:\n"
+                b"    call = staticmethod(lambda callback, value: value)\n"
+                b"operator = Safe\n"
+                b"operator.call(eval, '1+1')\n"
+            ),
+            (b"name = f'len'\ngetattr(__builtins__, name)([])\nunused = eval\n"),
+            (b"callbacks = {'run': len}\ncallbacks.setdefault('run', eval)([])\n"),
+            (b"callbacks = {'run': len}\ndict.get(callbacks, 'run')([])\nunused = eval\n"),
+            (b"callbacks = [len]\nlist.__getitem__(callbacks, 0)([])\nunused = eval\n"),
+            (b"staticmethod(len)([])\nunused = eval\n"),
+            (b"callbacks = {-1: eval}\ncallbacks.pop()('1+1')\n"),
+            (b"callbacks = [eval]\nlist.get(callbacks, 0)('1+1')\n"),
         ],
     )
     def test_scan_model_avoids_false_positives_across_callable_summaries(self, data: bytes) -> None:

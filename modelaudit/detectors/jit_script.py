@@ -9421,6 +9421,7 @@ class JITScriptDetector:
             # Store import identities with scoped aliases so branch snapshots preserve them.
             _FUNCTOOLS_MODULE_MARKER = "__modelaudit_functools_module__:"
             _FUNCTOOLS_PARTIAL_MARKER = "__modelaudit_functools_partial__:"
+            _OPERATOR_MODULE_MARKER = "__modelaudit_operator_module__:"
             _CONSTANT_STRING_MARKER = "__modelaudit_constant_string__:"
             _FUNCTION_EFFECT_MARKER = "__modelaudit_function_effect__:"
             _CALLBACK_INVOKER_MARKER = "__modelaudit_callback_invoker__:"
@@ -9632,8 +9633,13 @@ class JITScriptDetector:
                     return self._resolve_callback_invoker(node.value)
                 if return_binding := self._function_return_binding(node):
                     return return_binding[7]
-                if isinstance(node, ast.Await):
-                    return self._resolve_callback_invoker(node.value)
+                if (
+                    isinstance(node, ast.Attribute)
+                    and node.attr == "call"
+                    and isinstance(node.value, ast.Name)
+                    and self._has_binding_marker(node.value.id, self._OPERATOR_MODULE_MARKER)
+                ):
+                    return "operator.call"
                 if not isinstance(node, ast.Name):
                     return None
                 helper = self._resolve_builtin_helper(node)
@@ -9646,8 +9652,12 @@ class JITScriptDetector:
                     return self._resolve_builtin_helper(node.value)
                 if return_binding := self._function_return_binding(node):
                     return return_binding[6]
-                if isinstance(node, ast.Await):
-                    return self._resolve_builtin_helper(node.value)
+                if (
+                    isinstance(node, ast.Attribute)
+                    and node.attr in _PYTHON_BUILTIN_NAMES
+                    and self._is_builtins_module(node.value)
+                ):
+                    return node.attr
                 if not isinstance(node, ast.Name):
                     return None
                 marker_prefix = self._builtin_helper_marker_prefix(node.id)
@@ -9907,6 +9917,23 @@ class JITScriptDetector:
                 if isinstance(node, ast.Lambda):
                     return self.lambda_summaries.get(id(node))
                 if isinstance(node, ast.Call):
+                    if len(node.args) == 1 and not node.keywords and self._is_builtin_helper(node.func, "staticmethod"):
+                        return self._function_summary_for_node(node.args[0])
+                    if accessor := self._container_accessor_call(node):
+                        container_node, key_node, _method, default_node = accessor
+                        key_resolved, key = self._constant_container_key(key_node)
+                        if key_resolved:
+                            builtin_container = self._resolve_builtin_container(container_node)
+                            container = self._resolve_function_container(container_node)
+                            builtin_prefixes = self._container_access_prefixes(builtin_container, (key,))
+                            function_prefixes = self._container_access_prefixes(container, (key,))
+                            functions = {
+                                function for prefix in function_prefixes for function in container.get(prefix, ())
+                            }
+                            if functions:
+                                return [], None, tuple(sorted(functions))
+                            if not builtin_prefixes and not function_prefixes and default_node is not None:
+                                return self._function_summary_for_node(default_node)
                     if self._is_class_name(node.func):
                         allocator = ast.Attribute(value=node.func, attr="__new__", ctx=ast.Load())
                         allocator_summary = self._function_summary_for_node(allocator)
@@ -10799,9 +10826,11 @@ class JITScriptDetector:
 
             def _runtime_global_target_name(self, node: ast.Subscript) -> str | None:
                 if (
-                    self.scope_kinds[-1] == "module"
-                    and isinstance(node.value, ast.Call)
-                    and any(self._is_builtin_helper(node.value.func, name) for name in ("globals", "locals"))
+                    isinstance(node.value, ast.Call)
+                    and (
+                        self._is_builtin_helper(node.value.func, "globals")
+                        or (self.scope_kinds[-1] == "module" and self._is_builtin_helper(node.value.func, "locals"))
+                    )
                     and not node.value.args
                     and not node.value.keywords
                 ):
@@ -10887,8 +10916,23 @@ class JITScriptDetector:
                     return {node.value}
                 if isinstance(node, ast.Name):
                     return self._lookup_constant_strings(node.id)
-                if isinstance(node, ast.Await):
-                    return self._constant_strings(node.value)
+                if isinstance(node, ast.JoinedStr):
+                    candidates = {""}
+                    for value in node.values:
+                        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                            parts = {value.value}
+                        elif (
+                            isinstance(value, ast.FormattedValue)
+                            and value.conversion == -1
+                            and value.format_spec is None
+                        ):
+                            parts = self._constant_strings(value.value)
+                        else:
+                            return set()
+                        candidates = {prefix + part for prefix in candidates for part in parts}
+                        if not candidates or len(candidates) > self._MAX_CONSTANT_STRING_CANDIDATES:
+                            return set(sorted(candidates)[: self._MAX_CONSTANT_STRING_CANDIDATES])
+                    return candidates
                 if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
                     combined: set[str] = set()
                     for left in self._constant_strings(node.left):
@@ -10916,6 +10960,54 @@ class JITScriptDetector:
             def _dangerous_constant_string(self, node: ast.AST) -> str | None:
                 candidates = self._constant_strings(node)
                 return next((name for name in dangerous_builtins if name in candidates), None)
+
+            def _container_accessor_call(
+                self,
+                node: ast.Call,
+            ) -> tuple[ast.AST, ast.AST, str, ast.AST | None] | None:
+                if not isinstance(node.func, ast.Attribute) or node.keywords:
+                    return None
+                method = node.func.attr
+                if method not in {"get", "__getitem__", "pop", "setdefault"}:
+                    return None
+
+                owner = node.func.value
+                arguments = list(node.args)
+                unbound_owner = next(
+                    (name for name in ("dict", "list", "tuple") if self._is_builtin_helper(owner, name)),
+                    None,
+                )
+                allowed_unbound_methods = {
+                    "dict": {"get", "__getitem__", "pop", "setdefault"},
+                    "list": {"__getitem__", "pop"},
+                    "tuple": {"__getitem__"},
+                }
+                if unbound_owner is not None:
+                    if method not in allowed_unbound_methods[unbound_owner]:
+                        return None
+                    if not arguments:
+                        return None
+                    container_node = arguments.pop(0)
+                else:
+                    container_node = owner
+                if not arguments:
+                    if method != "pop" or (unbound_owner is not None and unbound_owner != "list"):
+                        return None
+                    if unbound_owner is None:
+                        container = self._resolve_builtin_container(container_node)
+                        if not any(
+                            path
+                            and isinstance(path[0], tuple)
+                            and len(path[0]) == 3
+                            and path[0][0] == self._SEQUENCE_INDEX_MARKER
+                            for path in container
+                        ):
+                            return None
+                    key_node: ast.AST = ast.Constant(value=-1)
+                else:
+                    key_node = arguments[0]
+                default_node = arguments[1] if method in {"get", "setdefault"} and len(arguments) >= 2 else None
+                return container_node, key_node, method, default_node
 
             def _resolve_builtin(self, node: ast.AST) -> str | None:
                 if isinstance(node, ast.Name):
@@ -10975,6 +11067,8 @@ class JITScriptDetector:
                 if isinstance(node, ast.Call):
                     if (return_binding := self._function_return_binding(node)) and return_binding[0] is not None:
                         return return_binding[0]
+                    if len(node.args) == 1 and not node.keywords and self._is_builtin_helper(node.func, "staticmethod"):
+                        return self._resolve_builtin(node.args[0])
                     if (
                         node.args
                         and self._is_builtin_helper(node.func, "next")
@@ -11016,6 +11110,19 @@ class JITScriptDetector:
                         and self._is_builtins_namespace(node.func.value)
                     ):
                         return self._dangerous_constant_string(node.args[0])
+                    if accessor := self._container_accessor_call(node):
+                        container_node, key_node, _method, default_node = accessor
+                        key_resolved, key = self._constant_container_key(key_node)
+                        if key_resolved:
+                            container = self._resolve_builtin_container(container_node)
+                            prefixes = self._container_access_prefixes(container, (key,))
+                            if prefixes:
+                                return next(
+                                    (builtin for prefix in prefixes if (builtin := container.get(prefix)) is not None),
+                                    None,
+                                )
+                            if default_node is not None:
+                                return self._resolve_builtin(default_node)
                     if (
                         node.args
                         and isinstance(node.func, ast.Attribute)
@@ -11023,25 +11130,6 @@ class JITScriptDetector:
                         and "__call__" in self._constant_strings(node.args[0])
                     ):
                         return self._resolve_builtin(node.func.value)
-                    if isinstance(node.func, ast.Attribute) and node.func.attr in {"get", "__getitem__", "pop"}:
-                        container = self._resolve_builtin_container(node.func.value)
-                        if node.args:
-                            key_resolved, key = self._constant_container_key(node.args[0])
-                        else:
-                            key_resolved = node.func.attr == "pop" and any(
-                                path
-                                and isinstance(path[0], tuple)
-                                and len(path[0]) == 3
-                                and path[0][0] == self._SEQUENCE_INDEX_MARKER
-                                for path in container
-                            )
-                            key = -1
-                        if key_resolved:
-                            prefixes = self._container_access_prefixes(container, (key,))
-                            return next(
-                                (builtin for prefix in prefixes if (builtin := container.get(prefix)) is not None),
-                                None,
-                            )
                     if (
                         len(node.args) >= 2
                         and isinstance(node.func, ast.Attribute)
@@ -11075,6 +11163,7 @@ class JITScriptDetector:
                 self.container_identity_scopes[scope_index][name] = container_identity
                 self.builtins_module_aliases[scope_index].discard(f"{self._FUNCTOOLS_MODULE_MARKER}{name}")
                 self.builtins_module_aliases[scope_index].discard(f"{self._FUNCTOOLS_PARTIAL_MARKER}{name}")
+                self.builtins_module_aliases[scope_index].discard(f"{self._OPERATOR_MODULE_MARKER}{name}")
                 self.builtins_module_aliases[scope_index].discard(self._class_marker(name))
                 self.builtins_module_aliases[scope_index].discard(self._global_delete_marker(name))
                 constant_string_prefix = self._constant_string_marker_prefix(name)
@@ -11238,12 +11327,20 @@ class JITScriptDetector:
                     if attribute_key is not None:
                         self.attribute_alias_scopes[scope_index][attribute_key] = builtin
                     elif runtime_global_name is not None:
+                        target_scope = 0 if self.scope_kinds[-1] == "module" else scope_index
+                        if target_scope != 0:
+                            self.global_name_scopes[target_scope].add(runtime_global_name)
                         self._bind_name(
                             runtime_global_name,
                             builtin,
+                            builtins_module=builtins_module,
                             container_aliases=container_aliases,
+                            container_identity=container_identity,
                             constant_strings=constant_strings,
-                            scope_index=0,
+                            callback_invoker=callback_invoker,
+                            builtin_helper=builtin_helper,
+                            container_functions=container_functions,
+                            scope_index=target_scope,
                         )
                     elif (target_path := self._container_target_path(target)) is not None:
                         container_name, raw_prefix = target_path
@@ -11981,6 +12078,8 @@ class JITScriptDetector:
                     self._bind_name(local_name, None, builtins_module=alias.name in _BUILTINS_MODULE_NAMES)
                     if alias.name == "functools":
                         self.builtins_module_aliases[-1].add(f"{self._FUNCTOOLS_MODULE_MARKER}{local_name}")
+                    elif alias.name == "operator":
+                        self.builtins_module_aliases[-1].add(f"{self._OPERATOR_MODULE_MARKER}{local_name}")
 
             def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
                 if node.module in _BUILTINS_MODULE_NAMES:
@@ -12003,7 +12102,13 @@ class JITScriptDetector:
                 else:
                     for alias in node.names:
                         local_name = alias.asname or alias.name
-                        self._bind_name(local_name, None)
+                        self._bind_name(
+                            local_name,
+                            None,
+                            callback_invoker=(
+                                "operator.call" if node.module == "operator" and alias.name == "call" else None
+                            ),
+                        )
                         if node.module == "functools" and alias.name == "partial":
                             self.builtins_module_aliases[-1].add(f"{self._FUNCTOOLS_PARTIAL_MARKER}{local_name}")
 
@@ -12314,6 +12419,7 @@ class JITScriptDetector:
                 self.return_binding_stack.append([])
                 self._visit_statements(node.body)
                 return_binding = self._merge_bindings(self.return_binding_stack.pop())
+                effect_global_names = set(self.global_name_scopes[-1])
                 effects = [
                     (
                         (
@@ -12324,7 +12430,7 @@ class JITScriptDetector:
                         name,
                         self._binding_from_name(name, -1),
                     )
-                    for name in global_names
+                    for name in effect_global_names
                     if name in self.alias_scopes[-1]
                 ]
                 effects.extend(
@@ -13265,6 +13371,8 @@ class JITScriptDetector:
                 callbacks: list[ast.AST] = []
                 callback_invoker = self._resolve_callback_invoker(node.func)
                 if callback_invoker in {"filter", "map"} and node.args:
+                    callbacks.append(node.args[0])
+                if callback_invoker == "operator.call" and node.args:
                     callbacks.append(node.args[0])
                 if callback_invoker in {"max", "min", "sorted"}:
                     callbacks.extend(keyword.value for keyword in node.keywords if keyword.arg == "key")
