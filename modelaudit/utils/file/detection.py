@@ -1856,7 +1856,7 @@ def _read_zip_member_text(
     try:
         data = _read_zip_member_bounded(archive, member_info, max_bytes)
         return data.decode("utf-8", errors="strict").strip()
-    except (OSError, RuntimeError, UnicodeDecodeError, ValueError):
+    except (OSError, RuntimeError, UnicodeDecodeError, ValueError, zipfile.BadZipFile):
         return None
 
 
@@ -2016,13 +2016,14 @@ def is_executorch_archive(path: str) -> bool:
 
     try:
         with zipfile.ZipFile(file_path, "r") as archive:
-            member_names = {
-                _normalize_archive_member_name(info.filename)
-                for info in archive.infolist()
-                if info.filename and not info.is_dir()
-            }
+            members_by_name: dict[str, list[zipfile.ZipInfo]] = {}
+            for info in archive.infolist():
+                if not info.filename or info.is_dir():
+                    continue
+                name = _normalize_archive_member_name(info.filename).casefold()
+                members_by_name.setdefault(name, []).append(info)
 
-            for name in member_names:
+            for name in members_by_name:
                 if name == "bytecode.pkl":
                     prefix = ""
                 elif name.endswith("/bytecode.pkl"):
@@ -2031,13 +2032,10 @@ def is_executorch_archive(path: str) -> bool:
                     continue
 
                 version_name = f"{prefix}/version" if prefix else "version"
-                version_info = archive.NameToInfo.get(version_name)
-                if version_info is None:
-                    continue
-
-                version_text = _read_zip_member_text(archive, version_info, _PYTORCH_ZIP_METADATA_MAX_BYTES)
-                if version_text is not None and re.fullmatch(r"\d+(?:\.\d+)?", version_text):
-                    return True
+                for version_info in members_by_name.get(version_name, []):
+                    version_text = _read_zip_member_text(archive, version_info, _PYTORCH_ZIP_METADATA_MAX_BYTES)
+                    if version_text is not None and re.fullmatch(r"\d+(?:\.\d+)?", version_text):
+                        return True
     except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
 
