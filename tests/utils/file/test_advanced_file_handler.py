@@ -256,6 +256,29 @@ class TestShardedModelDetector:
         assert shard_info["missing_shard_count"] == 1
         assert should_use_advanced_handler(str(shard_one))
 
+    def test_detect_shards_treats_symlink_loop_as_unreadable(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Cyclic sibling symlinks must fail closed as incomplete shard coverage."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        shard_one.write_bytes(b"safe")
+        shard_two.symlink_to(shard_two.name)
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_one))
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shard_one)]
+        assert shard_info["unreadable_shard_count"] == 1
+        assert shard_info["unreadable_shards"] == [str(shard_two)]
+
+        result = AdvancedFileHandler(str(shard_one), CompletingShardScanner()).scan()
+
+        assert result.success is False
+        assert "unreadable_model_shards" in result.metadata["scan_outcome_reasons"]
+
     def test_no_shards_detected(self) -> None:
         """Test when file is not sharded."""
         with tempfile.NamedTemporaryFile(suffix=".bin") as f:

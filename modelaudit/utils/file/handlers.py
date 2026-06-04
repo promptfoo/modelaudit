@@ -41,8 +41,11 @@ MAX_RECORDED_MISSING_SHARD_INDICES = 1000
 
 def _is_resolved_path_within_directory(base_dir: Path, resolved_target: str) -> bool:
     """Return True when a resolved target remains inside the shard directory."""
-    base_path = base_dir.resolve()
-    target_path = Path(resolved_target).resolve()
+    try:
+        base_path = base_dir.resolve()
+        target_path = Path(resolved_target).resolve()
+    except (OSError, RuntimeError):
+        return False
     if os.name == "nt":
         base_norm = os.path.normcase(os.path.normpath(str(base_path)))
         target_norm = os.path.normcase(os.path.normpath(str(target_path)))
@@ -167,7 +170,11 @@ class ShardedModelDetector:
                 for file in dir_path.glob("*"):
                     file_match = re.fullmatch(pattern, file.name)
                     if file_match:
-                        resolved_file = str(file.resolve())
+                        try:
+                            resolved_file = str(file.resolve())
+                        except (OSError, RuntimeError):
+                            unreadable_shards.append(str(file))
+                            continue
                         if allowed_path_set is not None and resolved_file not in allowed_path_set:
                             continue
                         if (
