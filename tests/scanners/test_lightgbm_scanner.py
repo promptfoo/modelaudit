@@ -269,6 +269,8 @@ def test_lightgbm_read_failure_takes_operational_precedence_over_security_findin
 
 def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
     path = tmp_path / "network_secret.model"
+    hostname_secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    benign_hostname = "sk-documentation-20260604.evil.example"
     path.write_text(
         _build_lightgbm_text(
             [
@@ -280,6 +282,8 @@ def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
                 ),
                 "callback_url=https://lgb_user:lgb_pass@collector.evil.example/"
                 + "LGB_PATH_SECRET/payload.sh?token=LGB_SECRET#frag",
+                f"callback_url=https://{hostname_secret}.evil.example/payload.sh",
+                f"callback_url=https://{benign_hostname}/model.txt",
             ]
         ),
         encoding="utf-8",
@@ -293,6 +297,8 @@ def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
         "examples": [
             {"line": "18", "type": "url", "value": "https://collector.evil.example"},
             {"line": "19", "type": "url", "value": "https://collector.evil.example"},
+            {"line": "20", "type": "url", "value": "https://<redacted>.evil.example"},
+            {"line": "21", "type": "url", "value": f"https://{benign_hostname}"},
         ]
     }
 
@@ -304,6 +310,7 @@ def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
     assert "LGB_ADJACENT_SECRET" not in failed_details
     assert "LGB_BEARER_SECRET" not in failed_details
     assert "LGB_STANDALONE_SECRET" not in failed_details
+    assert hostname_secret not in failed_details
     assert "model_text_may_contain_sensitive_literals" in failed_details
     assert "payload.sh" not in failed_details
     assert "#frag" not in failed_details

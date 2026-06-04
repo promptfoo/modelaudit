@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- omit sensitive LightGBM model excerpts and credential-shaped URL host labels from finding evidence
 - redact and detect secrets in R serialized executable samples across native assignment syntax
 - scan padded TensorFlow SavedModel protobuf scalar and repeated string attributes past the legacy 10 KB injection-check window
 - mark malformed SavedModel `keras_metadata.pb` analysis as inconclusive instead of a clean scan

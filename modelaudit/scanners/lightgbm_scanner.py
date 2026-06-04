@@ -91,6 +91,23 @@ _BASE64_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{100,}={0,2})")
 _HEX_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2}){8,}")
 _DEDICATED_LIGHTGBM_EXTENSIONS = {".lgb", ".lightgbm"}
 _EXCERPT_OMITTED_REASON = "model_text_may_contain_sensitive_literals"
+_SENSITIVE_HOST_LABEL_PATTERN = re.compile(
+    r"(?i)^(?:"
+    r"akia[0-9a-z]{16}|"
+    r"gh[opusr]_[a-z0-9]{36}|"
+    r"github_pat_[a-z0-9]{22}_[a-z0-9]{59}|"
+    r"sk-(?:proj-)?[a-z0-9_-]{24,}|"
+    r"xox[baprs]-[0-9a-z-]{20,}|"
+    r"[a-f0-9]{32,}"
+    r")$"
+)
+
+
+def _redact_sensitive_hostname_labels(hostname: str) -> str:
+    """Redact credential-shaped hostname labels while preserving endpoint context."""
+    return ".".join(
+        "<redacted>" if _SENSITIVE_HOST_LABEL_PATTERN.fullmatch(label) else label for label in hostname.split(".")
+    )
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -103,7 +120,7 @@ def _redact_url_for_display(url: str) -> str:
     if not parsed.scheme or not parsed.hostname:
         return "[invalid-url]"
 
-    hostname = parsed.hostname
+    hostname = _redact_sensitive_hostname_labels(parsed.hostname)
     if ":" in hostname and not hostname.startswith("["):
         hostname = f"[{hostname}]"
 
