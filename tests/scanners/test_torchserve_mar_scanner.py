@@ -1598,6 +1598,32 @@ def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
             b"    generator = (module.system('id') for module in [__import__('math'), __import__('os')])\n"
             b"    return next(generator)\n"
         ),
+        (
+            b"def handle(data, context):\n"
+            b"    holder.module = __import__('os')\n"
+            b"    holder = None\n"
+            b"    return holder.module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        return []\n"
+            b"    finally:\n"
+            b"        module = __import__('os')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        pass\n"
+            b"    except Exception:\n"
+            b"        return []\n"
+            b"    else:\n"
+            b"        return []\n"
+            b"    return __import__('os').system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return any(call() for call in [lambda: True, __import__('os').system])\n"),
+        (b"def handle(data, context):\n    return all(call() for call in [lambda: False, __import__('os').system])\n"),
     ],
 )
 def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
@@ -1772,6 +1798,30 @@ def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
             b"            module.system('id')\n"
         ),
         (b"def handle(data, context):\n    runner = lambda: __import__('os').system('id')\n    return runner()\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        {**1}\n"
+            b"    except Exception:\n"
+            b"        return __import__('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    try:\n"
+            b"        might_fail()\n"
+            b"    except Exception:\n"
+            b"        pass\n"
+            b"    else:\n"
+            b"        return []\n"
+            b"    return __import__('os').system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return list(zip(generator))\n"
+        ),
+        (b"def handle(data, context):\n    return any(call() for call in [lambda: False, __import__('os').system])\n"),
+        (b"def handle(data, context):\n    return all(call() for call in [lambda: True, __import__('os').system])\n"),
     ],
 )
 def test_dynamic_import_handler_analysis_preserves_reachable_aliases(
@@ -2152,10 +2202,14 @@ def test_import_time_analysis_respects_type_checking_rebinding() -> None:
     imported_guard = ast.parse(
         "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    __import__('os').system('id')\n"
     )
+    relative_guard = ast.parse(
+        "from .typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    __import__('os').system('id')\n"
+    )
     rebound_guard = ast.parse("TYPE_CHECKING = True\nif TYPE_CHECKING:\n    __import__('os').system('id')\n")
     disabled_guard = ast.parse("TYPE_CHECKING = False\nif TYPE_CHECKING:\n    __import__('os').system('id')\n")
 
     assert scanner._has_import_time_execution(imported_guard) is False
+    assert scanner._has_import_time_execution(relative_guard) is True
     assert scanner._has_import_time_execution(rebound_guard) is True
     assert scanner._has_import_time_execution(disabled_guard) is False
 

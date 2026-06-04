@@ -93,6 +93,7 @@ _EAGER_GENERATOR_CONSUMERS = frozenset(
         "tuple",
     }
 )
+_LAZY_GENERATOR_WRAPPERS = frozenset({"builtins.enumerate", "builtins.zip", "enumerate", "zip"})
 _DynamicGeneratorAliases = dict[str, tuple[ast.GeneratorExp, ...]]
 _DynamicAliasState = tuple[
     dict[str, frozenset[str]],
@@ -1161,6 +1162,11 @@ class TorchServeMarScanner(BaseScanner):
                             if alias.name == "*":
                                 continue
                             binding_name = alias.asname or alias.name
+                            if node.level:
+                                aliases.pop(binding_name, None)
+                                shadowed_names.add(binding_name)
+                                static_truthiness_bindings.pop(binding_name, None)
+                                continue
                             aliases[binding_name] = f"{node.module}.{alias.name}"
                             shadowed_names.discard(binding_name)
                             static_truthiness_bindings.pop(binding_name, None)
@@ -2209,6 +2215,15 @@ class TorchServeMarScanner(BaseScanner):
                 self.scope_depth += 1
                 for parameter in parameters:
                     self._invalidate_name(parameter)
+                if scope_kind == "function" and self.class_name_stack:
+                    attribute_state = self.class_attribute_states.get(self.class_name_stack[-1])
+                    if attribute_state is not None:
+                        self.module_aliases.update(attribute_state[0])
+                        self.callable_aliases.update(attribute_state[1])
+                        self.import_loader_aliases.update(attribute_state[2])
+                        self.import_aliases.update(attribute_state[3])
+                        self.lazy_generator_aliases.update(attribute_state[5])
+                        self.static_truthiness_aliases.update(attribute_state[6])
 
             def _pop_scope(self) -> None:
                 self.module_alias_stack.pop()
@@ -2338,12 +2353,25 @@ class TorchServeMarScanner(BaseScanner):
                 return scanner._static_truthiness(node)
 
             def _invalidate_name(self, name: str) -> None:
-                self.module_aliases.pop(name, None)
-                self.callable_aliases.pop(name, None)
-                self.import_loader_aliases.pop(name, None)
-                self.import_aliases.pop(name, None)
-                self.lazy_generator_aliases.pop(name, None)
-                self.static_truthiness_aliases.pop(name, None)
+                names_to_invalidate = {
+                    candidate_name
+                    for candidate_name in (
+                        self.module_aliases.keys()
+                        | self.callable_aliases.keys()
+                        | self.import_loader_aliases.keys()
+                        | self.import_aliases.keys()
+                        | self.lazy_generator_aliases.keys()
+                        | self.static_truthiness_aliases.keys()
+                    )
+                    if candidate_name == name or candidate_name.startswith(f"{name}.")
+                }
+                for candidate_name in names_to_invalidate | {name}:
+                    self.module_aliases.pop(candidate_name, None)
+                    self.callable_aliases.pop(candidate_name, None)
+                    self.import_loader_aliases.pop(candidate_name, None)
+                    self.import_aliases.pop(candidate_name, None)
+                    self.lazy_generator_aliases.pop(candidate_name, None)
+                    self.static_truthiness_aliases.pop(candidate_name, None)
                 self.shadowed_names.add(name)
 
             def _record_import_binding(self, name: str, resolved_name: str) -> None:
@@ -3045,6 +3073,15 @@ class TorchServeMarScanner(BaseScanner):
                     return self._resolved_static_truthiness(
                         statement.test
                     ) is True and self._statements_definitely_exit_scope(statement.body)
+                if isinstance(statement, ast.Try):
+                    if self._statements_definitely_terminate(statement.finalbody):
+                        return True
+                    normal_path_terminates = self._statements_definitely_terminate(
+                        statement.body
+                    ) or self._statements_definitely_terminate(statement.orelse)
+                    return normal_path_terminates and all(
+                        self._statements_definitely_terminate(handler.body) for handler in statement.handlers
+                    )
                 if not isinstance(statement, ast.If):
                     return False
 
@@ -3111,8 +3148,13 @@ class TorchServeMarScanner(BaseScanner):
                     )
                 if isinstance(node, ast.Dict):
                     return all(
-                        key is None or DynamicImportExecutionVisitor._expression_definitely_does_not_raise(key)
-                        for key in node.keys
+                        (
+                            isinstance(value, ast.Dict)
+                            and DynamicImportExecutionVisitor._expression_definitely_does_not_raise(value)
+                        )
+                        if key is None
+                        else DynamicImportExecutionVisitor._expression_definitely_does_not_raise(key)
+                        for key, value in zip(node.keys, node.values, strict=True)
                     ) and all(
                         DynamicImportExecutionVisitor._expression_definitely_does_not_raise(value)
                         for value in node.values
@@ -3254,15 +3296,50 @@ class TorchServeMarScanner(BaseScanner):
                 value: ast.AST,
                 *,
                 first_only: bool = False,
+                short_circuit_on: bool | None = None,
             ) -> bool:
                 if isinstance(value, ast.GeneratorExp):
-                    self._visit_eager_generator_expression(value, first_only=first_only)
+                    self._visit_eager_generator_expression(
+                        value,
+                        first_only=first_only,
+                        short_circuit_on=short_circuit_on,
+                    )
                     return True
                 if isinstance(value, ast.Name):
                     generators = self.lazy_generator_aliases.get(value.id, ())
                     for generator in generators:
-                        self._visit_eager_generator_expression(generator, first_only=first_only)
+                        self._visit_eager_generator_expression(
+                            generator,
+                            first_only=first_only,
+                            short_circuit_on=short_circuit_on,
+                        )
                     return bool(generators)
+                if isinstance(value, ast.Call):
+                    wrapper_name = scanner._resolve_call_name(value.func)
+                    resolved_wrapper_name = (
+                        scanner._apply_unshadowed_alias(
+                            wrapper_name,
+                            self.import_aliases,
+                            self.shadowed_names,
+                        )
+                        if wrapper_name is not None
+                        else None
+                    )
+                    if resolved_wrapper_name in _LAZY_GENERATOR_WRAPPERS:
+                        consumed_generator = False
+                        wrapped_first_only = first_only or short_circuit_on is True
+                        self.visit(value.func)
+                        for argument in value.args:
+                            if self._visit_consumed_generator_value(
+                                argument,
+                                first_only=wrapped_first_only,
+                            ):
+                                consumed_generator = True
+                            else:
+                                self.visit(argument)
+                        for keyword in value.keywords:
+                            self.visit(keyword.value)
+                        return consumed_generator
                 return False
 
             def _visit_for(self, node: ast.For | ast.AsyncFor) -> None:
@@ -3302,6 +3379,7 @@ class TorchServeMarScanner(BaseScanner):
                 result_nodes: list[ast.AST],
                 *,
                 first_only: bool = False,
+                short_circuit_on: bool | None = None,
             ) -> None:
                 self._push_scope(set(), scope_kind="comprehension")
                 literal_elements = self._literal_iterable_elements(generators[0].iter) if generators else None
@@ -3314,6 +3392,32 @@ class TorchServeMarScanner(BaseScanner):
                     and literal_elements[0] is not None
                 ):
                     model_first_item = True
+                if (
+                    not model_first_item
+                    and short_circuit_on is not None
+                    and len(generators) == 1
+                    and not generators[0].ifs
+                    and len(result_nodes) == 1
+                    and literal_elements
+                    and literal_elements[0] is not None
+                ):
+                    initial_state = self._snapshot_state()
+                    first_element = literal_elements[0]
+                    assert first_element is not None
+                    self._record_target_assignment(generators[0].target, first_element)
+                    result_truthiness = self._resolved_static_truthiness(result_nodes[0])
+                    if (
+                        result_truthiness is None
+                        and isinstance(generators[0].target, ast.Name)
+                        and isinstance(first_element, ast.Lambda)
+                        and isinstance(result_nodes[0], ast.Call)
+                        and not result_nodes[0].args
+                        and not result_nodes[0].keywords
+                        and scanner._resolve_call_name(result_nodes[0].func) == generators[0].target.id
+                    ):
+                        result_truthiness = self._resolved_static_truthiness(first_element.body)
+                    self._restore_state(initial_state)
+                    model_first_item = result_truthiness is short_circuit_on
                 for generator_index, generator in enumerate(generators):
                     if not self._visit_consumed_generator_value(generator.iter):
                         self.visit(generator.iter)
@@ -3321,9 +3425,9 @@ class TorchServeMarScanner(BaseScanner):
                         self._pop_scope()
                         return
                     if model_first_item and generator_index == 0 and literal_elements is not None:
-                        first_element = literal_elements[0]
-                        if first_element is not None:
-                            self._record_target_assignment(generator.target, first_element)
+                        current_first_element = literal_elements[0]
+                        if current_first_element is not None:
+                            self._record_target_assignment(generator.target, current_first_element)
                     else:
                         self._record_target_from_iterable(generator.target, generator.iter)
                     for condition in generator.ifs:
@@ -3346,11 +3450,13 @@ class TorchServeMarScanner(BaseScanner):
                 node: ast.GeneratorExp,
                 *,
                 first_only: bool = False,
+                short_circuit_on: bool | None = None,
             ) -> None:
                 self._visit_comprehension(
                     node.generators,
                     [node.elt],
                     first_only=first_only,
+                    short_circuit_on=short_circuit_on,
                 )
 
             def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
@@ -3601,6 +3707,10 @@ class TorchServeMarScanner(BaseScanner):
                 consume_first_only = bool(resolved_call_names) and all(
                     resolved_call_name.removeprefix("builtins.") == "next" for resolved_call_name in resolved_call_names
                 )
+                consumer_names = {
+                    resolved_call_name.removeprefix("builtins.") for resolved_call_name in resolved_call_names
+                }
+                short_circuit_on = True if consumer_names == {"any"} else False if consumer_names == {"all"} else None
                 if isinstance(node.func, ast.Attribute) and node.func.attr in {"__next__", "send"}:
                     self._visit_consumed_generator_value(node.func.value, first_only=True)
                 self.visit(node.func)
@@ -3610,6 +3720,7 @@ class TorchServeMarScanner(BaseScanner):
                         and self._visit_consumed_generator_value(
                             argument,
                             first_only=consume_first_only,
+                            short_circuit_on=short_circuit_on,
                         )
                     ):
                         self.visit(argument)
