@@ -275,7 +275,7 @@ def test_tf_savedmodel_standalone_in_budget_keras_metadata_hashes_bounded_conten
     metadata_path = tmp_path / "keras_metadata.pb"
     content = b'{"class_name": "Dense"}'
     metadata_path.write_bytes(content)
-    monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", 64)
+    monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", len(content))
     monkeypatch.setattr(
         tf_savedmodel_module.TensorFlowSavedModelScanner,
         "calculate_file_hashes",
@@ -286,10 +286,65 @@ def test_tf_savedmodel_standalone_in_budget_keras_metadata_hashes_bounded_conten
 
     integrity_checks = [check for check in result.checks if check.name == "File Integrity Hash"]
     assert result.success is True
+    assert result.bytes_scanned == len(content)
     assert len(integrity_checks) == 1
     assert integrity_checks[0].details["sha256"] == hashlib.sha256(content).hexdigest()
     assert integrity_checks[0].details["file_size"] == len(content)
     assert result.metadata["file_hashes"]["sha256"] == hashlib.sha256(content).hexdigest()
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_keras_metadata_tolerates_disabled_md5(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_path = tmp_path / "keras_metadata.pb"
+    content = b'{"class_name": "Dense"}'
+    metadata_path.write_bytes(content)
+
+    def reject_md5(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("MD5 disabled by system policy")
+
+    monkeypatch.setattr(tf_savedmodel_module.hashlib, "md5", reject_md5)
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+
+    integrity_checks = [check for check in result.checks if check.name == "File Integrity Hash"]
+    assert result.success is True
+    assert len(integrity_checks) == 1
+    assert integrity_checks[0].details["md5"] is None
+    assert integrity_checks[0].details["sha256"] == hashlib.sha256(content).hexdigest()
+    assert result.metadata["file_hashes"]["md5"] is None
+    assert not any(check.name == "Keras Metadata Scan" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_standalone_keras_metadata_scans_when_md5_is_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decoded_code = b'import os\nos.system("id")'
+    encoded_code = base64.b64encode(decoded_code).decode()
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode())
+
+    def reject_md5(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("MD5 disabled by system policy")
+
+    monkeypatch.setattr(tf_savedmodel_module.hashlib, "md5", reject_md5)
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Lambda Layer Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert result.metadata["file_hashes"]["md5"] is None
+    assert result.metadata["file_hashes"]["sha256"]
+    assert not any(check.name == "Keras Metadata Scan" for check in result.checks)
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -919,9 +974,7 @@ def test_savedmodel_preview_redaction_removes_python_container_secrets() -> None
 
 
 def test_savedmodel_preview_redaction_removes_escaped_quote_secret() -> None:
-    preview = tf_savedmodel_module._safe_decoded_preview(
-        'api_key = "prefix\\"ESCAPEDSECRET123"\nos.system("id")', 200
-    )
+    preview = tf_savedmodel_module._safe_decoded_preview('api_key = "prefix\\"ESCAPEDSECRET123"\nos.system("id")', 200)
 
     assert "ESCAPEDSECRET123" not in preview
     assert 'api_key = "<redacted>"' in preview
@@ -1017,9 +1070,7 @@ def test_savedmodel_preview_redaction_does_not_expand_original_window() -> None:
 def test_savedmodel_preview_redaction_redacts_boundary_crossing_tokens() -> None:
     github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
     private_tail = "PRIVATE_AFTER_TOKEN_SHOULD_NOT_APPEAR"
-    preview = tf_savedmodel_module._safe_decoded_preview(
-        f"padding{'x' * 62}/{github_token}/{private_tail}", 80
-    )
+    preview = tf_savedmodel_module._safe_decoded_preview(f"padding{'x' * 62}/{github_token}/{private_tail}", 80)
 
     assert "ghp_" not in preview
     assert github_token not in preview

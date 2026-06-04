@@ -324,11 +324,20 @@ class TensorFlowSavedModelScanner(BaseScanner):
     @staticmethod
     def _add_bounded_file_integrity_check(path: str, result: ScanResult, content: bytes) -> None:
         """Record hashes for the same bounded metadata bytes used by security analysis."""
-        hashes = {
-            "md5": hashlib.md5(content).hexdigest(),
-            "sha256": hashlib.sha256(content).hexdigest(),
-            "sha512": hashlib.sha512(content).hexdigest(),
-        }
+        hashes: dict[str, str | None] = {"md5": None, "sha256": None, "sha512": None}
+        try:
+            hashes["md5"] = hashlib.md5(content, usedforsecurity=False).hexdigest()
+        except Exception as exc:
+            logger.warning("Failed to calculate MD5 hash for %s: %s", path, exc)
+        try:
+            hashes["sha256"] = hashlib.sha256(content).hexdigest()
+        except Exception as exc:
+            logger.warning("Failed to calculate SHA256 hash for %s: %s", path, exc)
+        try:
+            hashes["sha512"] = hashlib.sha512(content).hexdigest()
+        except Exception as exc:
+            logger.warning("Failed to calculate SHA512 hash for %s: %s", path, exc)
+
         result.add_check(
             name="File Integrity Hash",
             passed=True,
