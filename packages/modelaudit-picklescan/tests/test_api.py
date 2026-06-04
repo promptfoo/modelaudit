@@ -40,6 +40,7 @@ from modelaudit_picklescan import (
 from modelaudit_picklescan.call_graph import (
     CallGraphFinding,
     StartupHookWriteFinding,
+    UnanalyzedCallGraphReference,
     _CallGraphAnalysisLimitError,
     find_startup_hook_write_call_graphs,
 )
@@ -3721,6 +3722,23 @@ def test_scan_bytes_warns_on_unresolved_import_only_custom_global() -> None:
     )
 
 
+def test_scan_bytes_warns_on_unresolved_reviewed_optional_global(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(package_api, "import_only_reference_is_proven_trusted", lambda *_args: False)
+
+    report = scan_bytes(
+        b"cbotocore.credentials\nProcessProvider\n.",
+        source="unresolved-reviewed-optional-global.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "botocore.credentials.ProcessProvider"
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_warns_on_invoked_non_allowlisted_custom_global() -> None:
     report = scan_bytes(b"cprivate_payload\nGadget\n)R.", source="invoked-custom-global.pkl")
 
@@ -3933,6 +3951,67 @@ def test_with_call_graph_findings_marks_startup_hook_enrichment_failures_incompl
         and error.details["analysis_incomplete"] is True
         for error in updated.errors
     )
+
+
+def test_with_call_graph_findings_preserves_suspicious_verdict_on_enrichment_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_call_graph_error(*_args: object, **_kwargs: object) -> tuple[()]:
+        raise RuntimeError("call graph exploded")
+
+    monkeypatch.setattr(package_api, "find_dangerous_call_graphs", raise_call_graph_error)
+    finding = Finding(
+        message="existing suspicious evidence",
+        severity=Severity.WARNING,
+        location="suspicious-enrichment-error.pkl",
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+    report = PickleReport(
+        source="suspicious-enrichment-error.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(finding,),
+        metadata={"import_references": ()},
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.SUSPICIOUS
+    assert updated.findings == (finding,)
+    assert updated.metadata["analysis_incomplete"] is True
+
+
+def test_unanalyzed_call_graph_notice_preserves_suspicious_verdict() -> None:
+    finding = Finding(
+        message="existing suspicious evidence",
+        severity=Severity.WARNING,
+        location="suspicious-source-unavailable.pkl",
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+    report = PickleReport(
+        source="suspicious-source-unavailable.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(finding,),
+    )
+
+    updated = package_api._with_unanalyzed_call_graph_notices(
+        report,
+        (
+            UnanalyzedCallGraphReference(
+                module="private_payload",
+                name="Gadget",
+                import_reference="private_payload.Gadget",
+                reason="module_source_unavailable",
+            ),
+        ),
+    )
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.SUSPICIOUS
+    assert updated.findings == (finding,)
+    assert updated.metadata["analysis_incomplete"] is True
 
 
 def test_with_call_graph_findings_preserves_startup_hook_findings_before_limit_error(

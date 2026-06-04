@@ -133,13 +133,13 @@ def test_module_initialization_inert_proof_rejects_unbounded_module_depth(
     assert call_graph.module_initialization_is_proven_inert(".".join(["package"] * 33)) is False
 
 
-def test_import_only_reference_trust_preserves_reviewed_unavailable_optional_module(
+def test_import_only_reference_trust_rejects_reviewed_unavailable_optional_module(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(call_graph, "_find_module_spec_without_imports", lambda _module_name: None)
     call_graph._trusted_module_origin_kind.cache_clear()
     try:
-        assert call_graph.import_only_reference_is_proven_trusted("dill", "dump") is True
+        assert call_graph.import_only_reference_is_proven_trusted("dill", "dump") is False
         assert call_graph.import_only_reference_is_proven_trusted("dill", "loads") is False
         assert call_graph.import_only_reference_is_proven_trusted("private_payload", "Gadget") is False
     finally:
@@ -345,7 +345,7 @@ def test_shared_source_sensitive_caches_fails_closed_when_final_validation_obser
     assert safe_report.verdict == SafetyVerdict.CLEAN
     assert source_rewritten is True
     assert changed_report.status == ScanStatus.INCONCLUSIVE
-    assert changed_report.verdict == SafetyVerdict.UNKNOWN
+    assert changed_report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(error.details.get("analysis") == "python_call_graph_source_stability" for error in changed_report.errors)
 
 
@@ -397,7 +397,7 @@ def test_shared_source_sensitive_caches_fails_closed_after_mid_report_refresh(
     assert safe_report.verdict == SafetyVerdict.CLEAN
     assert source_rewritten is True
     assert changed_report.status == ScanStatus.INCONCLUSIVE
-    assert changed_report.verdict == SafetyVerdict.UNKNOWN
+    assert changed_report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(error.details.get("analysis") == "python_call_graph_source_stability" for error in changed_report.errors)
 
 
@@ -1966,7 +1966,7 @@ def test_scan_bytes_marks_zipimported_invoked_call_graph_source_unavailable(
         _clear_call_graph_caches()
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
 
 
@@ -2000,7 +2000,7 @@ def test_scan_bytes_marks_zipimported_dotted_source_unavailable_without_parent_i
         _clear_call_graph_caches()
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
     assert not marker.exists()
 
@@ -2025,7 +2025,7 @@ def test_scan_bytes_marks_lookup_failures_as_unanalyzable(
         _clear_call_graph_caches()
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
 
 
@@ -2054,7 +2054,7 @@ def test_scan_bytes_marks_custom_meta_path_specs_as_unanalyzable(
         _clear_call_graph_caches()
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
 
 
@@ -2082,7 +2082,7 @@ def test_scan_bytes_marks_bytecode_only_invoked_call_graph_source_unavailable(
         _clear_call_graph_caches()
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
 
 

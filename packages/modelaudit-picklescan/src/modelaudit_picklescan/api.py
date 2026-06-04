@@ -1263,7 +1263,11 @@ def _with_call_graph_enrichment_errors(
     return PickleReport(
         source=report.source,
         status=ScanStatus.INCONCLUSIVE if report.status == ScanStatus.COMPLETE else report.status,
-        verdict=SafetyVerdict.MALICIOUS if report.verdict == SafetyVerdict.MALICIOUS else SafetyVerdict.UNKNOWN,
+        verdict=(
+            report.verdict
+            if report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+            else SafetyVerdict.UNKNOWN
+        ),
         findings=report.findings,
         notices=report.notices,
         errors=errors,
@@ -1300,7 +1304,11 @@ def _with_unanalyzed_call_graph_notices(
     return PickleReport(
         source=report.source,
         status=ScanStatus.INCONCLUSIVE if report.status == ScanStatus.COMPLETE else report.status,
-        verdict=SafetyVerdict.MALICIOUS if report.verdict == SafetyVerdict.MALICIOUS else SafetyVerdict.UNKNOWN,
+        verdict=(
+            report.verdict
+            if report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+            else SafetyVerdict.UNKNOWN
+        ),
         findings=report.findings,
         notices=notices,
         errors=report.errors,
