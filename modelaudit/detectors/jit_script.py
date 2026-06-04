@@ -31,7 +31,7 @@ _BuiltinAliasBinding = tuple[
 _FunctionAliasSummary = tuple[
     list[tuple[str, str, _BuiltinAliasBinding]],
     _BuiltinAliasBinding | None,
-    tuple[str, ...],
+    tuple[tuple[str, int], ...],
 ]
 
 
@@ -1842,6 +1842,7 @@ class JITScriptDetector:
             _CALLBACK_INVOKER_MARKER = "__modelaudit_callback_invoker__:"
             _BUILTIN_HELPER_MARKER = "__modelaudit_builtin_helper__:"
             _ATTRIBUTE_CONTAINER_MARKER = "__modelaudit_attribute_container__:"
+            _ATTRIBUTE_FUNCTION_MARKER = "__modelaudit_attribute_function__:"
             _MAX_CONSTANT_STRING_CANDIDATES = 16
 
             def __init__(self) -> None:
@@ -1856,7 +1857,15 @@ class JITScriptDetector:
                 self.next_container_identity = 1
                 self.return_binding_stack: list[list[_BuiltinAliasBinding]] = []
                 self.active_function_calls: set[str] = set()
-                self.function_nodes: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+                self.function_nodes: dict[str, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda] = {}
+                self.lambda_summaries: dict[int, _FunctionAliasSummary] = {}
+                self.constructor_call_bindings: dict[
+                    int,
+                    tuple[
+                        dict[tuple[str, ...], str | None],
+                        dict[tuple[str, ...], dict[tuple[object, ...], str | None]],
+                    ],
+                ] = {}
 
             def _push_scope(
                 self,
@@ -1997,6 +2006,16 @@ class JITScriptDetector:
                     return None
                 return tuple(name.removeprefix(cls._ATTRIBUTE_CONTAINER_MARKER).split(chr(0)))
 
+            @classmethod
+            def _attribute_function_name(cls, key: tuple[str, ...]) -> str:
+                return f"{cls._ATTRIBUTE_FUNCTION_MARKER}{chr(0).join(key)}"
+
+            @classmethod
+            def _attribute_function_key(cls, name: str) -> tuple[str, ...] | None:
+                if not name.startswith(cls._ATTRIBUTE_FUNCTION_MARKER):
+                    return None
+                return tuple(name.removeprefix(cls._ATTRIBUTE_FUNCTION_MARKER).split(chr(0)))
+
             def _lookup_constant_strings(self, name: str) -> set[str]:
                 marker_prefix = self._constant_string_marker_prefix(name)
                 for index in self._visible_scope_indexes():
@@ -2122,7 +2141,7 @@ class JITScriptDetector:
                 self.builtins_module_aliases[scope_index] = {
                     marker for marker in self.builtins_module_aliases[scope_index] if not marker.startswith(prefix)
                 }
-                effects, return_binding, function_ids = summary
+                effects, return_binding, functions = summary
                 payload = {
                     "effects": [
                         {
@@ -2133,7 +2152,7 @@ class JITScriptDetector:
                         for kind, name, binding in effects
                     ],
                     "return_binding": (self._binding_payload(return_binding) if return_binding is not None else None),
-                    "function_ids": list(function_ids),
+                    "functions": [list(function) for function in functions],
                 }
                 self.builtins_module_aliases[scope_index].add(
                     f"{prefix}{json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
@@ -2146,7 +2165,7 @@ class JITScriptDetector:
                         continue
                     effect_bindings: dict[tuple[str, str], list[_BuiltinAliasBinding]] = {}
                     return_bindings: list[_BuiltinAliasBinding] = []
-                    function_ids: set[str] = set()
+                    functions: set[tuple[str, int]] = set()
                     for marker in self.builtins_module_aliases[index]:
                         if marker.startswith(prefix):
                             payload = json.loads(marker.removeprefix(prefix))
@@ -2157,8 +2176,11 @@ class JITScriptDetector:
                             return_payload = payload.get("return_binding")
                             if return_payload is not None:
                                 return_bindings.append(self._binding_from_payload(return_payload))
-                            function_ids.update(payload.get("function_ids", []))
-                    if effect_bindings or return_bindings or function_ids:
+                            functions.update(
+                                (str(function_id), int(positional_offset))
+                                for function_id, positional_offset in payload.get("functions", [])
+                            )
+                    if effect_bindings or return_bindings or functions:
                         effects = [
                             (kind, target_name, binding)
                             for (kind, target_name), bindings in effect_bindings.items()
@@ -2167,7 +2189,7 @@ class JITScriptDetector:
                         return index, (
                             effects,
                             self._merge_bindings(return_bindings),
-                            tuple(sorted(function_ids)),
+                            tuple(sorted(functions)),
                         )
                     return index, None
                 return -1, None
@@ -2175,6 +2197,12 @@ class JITScriptDetector:
             def _function_summary_for_node(self, node: ast.AST) -> _FunctionAliasSummary | None:
                 if isinstance(node, ast.Name):
                     return self._lookup_function_summary(node.id)[1]
+                if isinstance(node, ast.Attribute):
+                    key = self._attribute_alias_key(node)
+                    if key is not None:
+                        return self._lookup_function_summary(self._attribute_function_name(key))[1]
+                if isinstance(node, ast.Lambda):
+                    return self.lambda_summaries.get(id(node))
                 return None
 
             def _function_return_binding(self, node: ast.AST) -> _BuiltinAliasBinding | None:
@@ -2247,7 +2275,7 @@ class JITScriptDetector:
                 owner_index, summary = self._lookup_function_summary(node.id)
                 if summary is None:
                     return
-                effects, _return_binding, _function_ids = summary
+                effects, _return_binding, _functions = summary
                 for kind, target_name, binding in effects:
                     target_scope = 0 if kind == "global" else owner_index
                     self._apply_binding(target_name, binding, scope_index=target_scope)
@@ -2299,6 +2327,51 @@ class JITScriptDetector:
                     container = self.container_alias_scopes[index].get(synthetic_name)
                     if container is not None:
                         return dict(container)
+                    if root_name in self.alias_scopes[index]:
+                        return {}
+                return {}
+
+            def _resolve_attribute_containers(
+                self,
+                node: ast.AST,
+            ) -> dict[tuple[str, ...], dict[tuple[object, ...], str | None]]:
+                key = self._attribute_alias_key(node)
+                if key is None:
+                    return {}
+                root_name = key[0]
+                for index in self._visible_scope_indexes():
+                    containers = {
+                        attribute_key[len(key) :]: dict(container)
+                        for name, container in self.container_alias_scopes[index].items()
+                        if (attribute_key := self._attribute_container_key(name)) is not None
+                        and len(attribute_key) > len(key)
+                        and attribute_key[: len(key)] == key
+                    }
+                    if containers:
+                        return containers
+                    if root_name in self.alias_scopes[index]:
+                        return {}
+                return {}
+
+            def _resolve_attribute_function_summaries(
+                self,
+                node: ast.AST,
+            ) -> dict[tuple[str, ...], _FunctionAliasSummary]:
+                key = self._attribute_alias_key(node)
+                if key is None:
+                    return {}
+                root_name = key[0]
+                for index in self._visible_scope_indexes():
+                    summaries = {
+                        attribute_key[len(key) :]: summary
+                        for name in self.alias_scopes[index]
+                        if (attribute_key := self._attribute_function_key(name)) is not None
+                        and len(attribute_key) > len(key)
+                        and attribute_key[: len(key)] == key
+                        and (summary := self._lookup_function_summary(name)[1]) is not None
+                    }
+                    if summaries:
+                        return summaries
                     if root_name in self.alias_scopes[index]:
                         return {}
                 return {}
@@ -2401,6 +2474,10 @@ class JITScriptDetector:
                 if isinstance(node, ast.Name):
                     return dict(self._lookup_container_alias(node.id))
                 if isinstance(node, ast.Attribute):
+                    if isinstance(node.value, ast.Call):
+                        _attributes, containers = self._constructor_call_instance_bindings(node.value)
+                        if (container := containers.get((node.attr,))) is not None:
+                            return dict(container)
                     attribute_key = self._attribute_alias_key(node)
                     return self._lookup_attribute_container(attribute_key) if attribute_key is not None else {}
                 if isinstance(node, ast.NamedExpr):
@@ -2495,6 +2572,10 @@ class JITScriptDetector:
             def _resolve_attribute_aliases(self, node: ast.AST) -> dict[tuple[str, ...], str | None]:
                 if (return_binding := self._function_return_binding(node)) and return_binding[4]:
                     return dict(return_binding[4])
+                if isinstance(node, ast.Call):
+                    attributes, _containers = self._constructor_call_instance_bindings(node)
+                    if attributes:
+                        return attributes
                 key = self._attribute_alias_key(node)
                 if key is None:
                     return {}
@@ -2647,6 +2728,10 @@ class JITScriptDetector:
                             return None
                     return self._resolve_builtin(node.values[-1])
                 if isinstance(node, ast.Attribute):
+                    if isinstance(node.value, ast.Call):
+                        attributes, _containers = self._constructor_call_instance_bindings(node.value)
+                        if (node.attr,) in attributes:
+                            return attributes[(node.attr,)]
                     alias_found, alias = self._lookup_attribute_alias(node)
                     if alias_found:
                         return alias
@@ -2758,6 +2843,13 @@ class JITScriptDetector:
                     attribute_key = self._attribute_container_key(container_name)
                     if attribute_key is not None and attribute_key[0] == name:
                         del self.container_alias_scopes[scope_index][container_name]
+                for alias_name in tuple(self.alias_scopes[scope_index]):
+                    attribute_key = self._attribute_function_key(alias_name)
+                    if attribute_key is not None and attribute_key[0] == name:
+                        self._bind_name(alias_name, None, defined=False, scope_index=scope_index)
+                        self.alias_scopes[scope_index].pop(alias_name, None)
+                        self.container_alias_scopes[scope_index].pop(alias_name, None)
+                        self.container_identity_scopes[scope_index].pop(alias_name, None)
                 if defined:
                     self.defined_names[scope_index].add(name)
                 else:
@@ -2774,6 +2866,7 @@ class JITScriptDetector:
                 *,
                 container_aliases: dict[tuple[object, ...], str | None] | None = None,
                 attribute_aliases: dict[tuple[str, ...], str | None] | None = None,
+                function_summary: _FunctionAliasSummary | None = None,
                 scope_index: int = -1,
             ) -> None:
                 self.attribute_alias_scopes[scope_index][key] = builtin
@@ -2782,10 +2875,27 @@ class JITScriptDetector:
                 self.attribute_alias_scopes[scope_index].update(
                     {(*key, *path): nested_builtin for path, nested_builtin in (attribute_aliases or {}).items()}
                 )
+                function_name = self._attribute_function_name(key)
+                self._bind_name(function_name, None, scope_index=scope_index)
+                if function_summary is not None:
+                    self._register_function_summary(
+                        function_name,
+                        function_summary,
+                        scope_index=scope_index,
+                    )
+
+            def _remove_name_binding(self, name: str, *, scope_index: int = -1) -> None:
+                self._bind_name(name, None, defined=False, scope_index=scope_index)
+                self.alias_scopes[scope_index].pop(name, None)
+                self.container_alias_scopes[scope_index].pop(name, None)
+                self.container_identity_scopes[scope_index].pop(name, None)
 
             def _unbind_target(self, target: ast.AST) -> None:
                 if isinstance(target, ast.Name):
-                    self._bind_name(target.id, None, defined=False)
+                    if self.scope_kinds[-1] in {"class", "module"}:
+                        self._remove_name_binding(target.id)
+                    else:
+                        self._bind_name(target.id, None, defined=False)
                 elif isinstance(target, ast.Attribute):
                     attribute_key = self._attribute_alias_key(target)
                     if attribute_key is not None:
@@ -2841,6 +2951,7 @@ class JITScriptDetector:
                             builtin,
                             container_aliases=container_aliases,
                             attribute_aliases=attribute_aliases,
+                            function_summary=function_summary,
                             scope_index=scope_index,
                         )
                 elif isinstance(target, ast.Subscript):
@@ -3611,78 +3722,137 @@ class JITScriptDetector:
                 self._pop_scope()
                 function_id = str(id(node))
                 self.function_nodes[function_id] = node
-                self._register_function_summary(node.name, (effects, return_binding, (function_id,)))
+                self._register_function_summary(node.name, (effects, return_binding, ((function_id, 0),)))
+
+            def _sequence_binding(self, bindings: list[_BuiltinAliasBinding]) -> _BuiltinAliasBinding:
+                container: dict[tuple[object, ...], str | None] = {}
+                for index, binding in enumerate(bindings):
+                    item = self._sequence_index_element(index, len(bindings))
+                    container[(item,)] = binding[0]
+                    for path, builtin in binding[2].items():
+                        container[(item, *path)] = builtin
+                return None, False, container, set(), {}
+
+            def _mapping_binding(self, bindings: dict[str, _BuiltinAliasBinding]) -> _BuiltinAliasBinding:
+                container: dict[tuple[object, ...], str | None] = {}
+                for key, binding in bindings.items():
+                    container[(key,)] = binding[0]
+                    for path, builtin in binding[2].items():
+                        container[(key, *path)] = builtin
+                return None, False, container, set(), {}
+
+            def _expanded_positional_bindings(self, node: ast.Call) -> list[_BuiltinAliasBinding]:
+                bindings: list[_BuiltinAliasBinding] = []
+                for argument in node.args:
+                    if not isinstance(argument, ast.Starred):
+                        bindings.append(self._binding_from_expression(argument))
+                        continue
+                    elements = self._literal_iterable_elements(argument.value)
+                    if elements is not None:
+                        bindings.extend(self._binding_from_expression(element) for element in elements)
+                        continue
+                    bindings.extend(
+                        (builtin, False, nested, set(), {})
+                        for builtin, nested in self._sequence_container_element_bindings(
+                            self._resolve_builtin_container(argument.value)
+                        )
+                    )
+                return bindings
+
+            def _expanded_keyword_bindings(self, node: ast.Call) -> dict[str, _BuiltinAliasBinding]:
+                bindings: dict[str, _BuiltinAliasBinding] = {}
+                for keyword in node.keywords:
+                    if keyword.arg is not None:
+                        bindings[keyword.arg] = self._binding_from_expression(keyword.value)
+                        continue
+                    if isinstance(keyword.value, ast.Dict):
+                        for key_node, value_node in zip(keyword.value.keys, keyword.value.values, strict=True):
+                            if key_node is not None and (key := self._constant_string(key_node)) is not None:
+                                bindings[key] = self._binding_from_expression(value_node)
+                        continue
+                    container = self._resolve_builtin_container(keyword.value)
+                    for path in container:
+                        if not path or not isinstance(path[0], str) or len(path) != 1:
+                            continue
+                        found, builtin, nested = self._container_child_binding(container, path[0])
+                        if found:
+                            bindings[path[0]] = (builtin, False, nested, set(), {})
+                return bindings
+
+            def _bind_call_arguments(
+                self,
+                arguments: ast.arguments,
+                node: ast.Call,
+                *,
+                positional_offset: int = 0,
+            ) -> None:
+                positional_parameters = [*arguments.posonlyargs, *arguments.args]
+                call_bindings = self._expanded_positional_bindings(node)
+                available_parameters = positional_parameters[positional_offset:]
+                for argument, binding in zip(available_parameters, call_bindings, strict=False):
+                    self._apply_binding(argument.arg, binding, scope_index=-1)
+
+                extra_bindings = call_bindings[len(available_parameters) :]
+                if arguments.vararg is not None and extra_bindings:
+                    self._apply_binding(
+                        arguments.vararg.arg,
+                        self._sequence_binding(extra_bindings),
+                        scope_index=-1,
+                    )
+
+                keyword_bindings = self._expanded_keyword_bindings(node)
+                known_parameters = {
+                    argument.arg
+                    for argument in [
+                        *arguments.args,
+                        *arguments.kwonlyargs,
+                    ]
+                }
+                extra_keywords: dict[str, _BuiltinAliasBinding] = {}
+                for name, binding in keyword_bindings.items():
+                    if name in known_parameters:
+                        self._apply_binding(name, binding, scope_index=-1)
+                    elif arguments.kwarg is not None:
+                        extra_keywords[name] = binding
+                if arguments.kwarg is not None and extra_keywords:
+                    self._apply_binding(
+                        arguments.kwarg.arg,
+                        self._mapping_binding(extra_keywords),
+                        scope_index=-1,
+                    )
 
             def _analyze_function_call(self, node: ast.Call) -> None:
                 summary = self._function_summary_for_node(node.func)
                 if summary is None:
                     return
-                _effects, _return_binding, function_ids = summary
-                for function_id in function_ids:
+                _effects, _return_binding, functions = summary
+                for function_id, positional_offset in functions:
                     if function_id in self.active_function_calls:
                         continue
                     function_node = self.function_nodes.get(function_id)
                     if function_node is None:
                         continue
 
-                    positional_parameters = [
-                        *function_node.args.posonlyargs,
-                        *function_node.args.args,
-                    ]
+                    body_nodes: list[ast.AST] = (
+                        [function_node.body] if isinstance(function_node, ast.Lambda) else list(function_node.body)
+                    )
                     default_bindings = self._argument_default_bindings(function_node.args)
                     self.active_function_calls.add(function_id)
                     self._push_scope(
                         function_node.args,
                         default_bindings,
-                        self._local_binding_names(list(function_node.body)),
+                        self._local_binding_names(body_nodes),
                     )
                     try:
-                        for argument, value in zip(positional_parameters, node.args, strict=False):
-                            self._apply_binding(argument.arg, self._binding_from_expression(value), scope_index=-1)
-
-                        if function_node.args.vararg is not None and len(node.args) > len(positional_parameters):
-                            extra_arguments = ast.Tuple(
-                                elts=node.args[len(positional_parameters) :],
-                                ctx=ast.Load(),
-                            )
-                            self._apply_binding(
-                                function_node.args.vararg.arg,
-                                self._binding_from_expression(extra_arguments),
-                                scope_index=-1,
-                            )
-
-                        known_parameters = {
-                            argument.arg
-                            for argument in [
-                                *positional_parameters,
-                                *function_node.args.kwonlyargs,
-                            ]
-                        }
-                        extra_keywords: list[tuple[ast.expr, ast.expr]] = []
-                        for keyword in node.keywords:
-                            if keyword.arg is None:
-                                continue
-                            if keyword.arg in known_parameters:
-                                self._apply_binding(
-                                    keyword.arg,
-                                    self._binding_from_expression(keyword.value),
-                                    scope_index=-1,
-                                )
-                            elif function_node.args.kwarg is not None:
-                                extra_keywords.append((ast.Constant(keyword.arg), keyword.value))
-
-                        if function_node.args.kwarg is not None and extra_keywords:
-                            keyword_container = ast.Dict(
-                                keys=[key for key, _value in extra_keywords],
-                                values=[value for _key, value in extra_keywords],
-                            )
-                            self._apply_binding(
-                                function_node.args.kwarg.arg,
-                                self._binding_from_expression(keyword_container),
-                                scope_index=-1,
-                            )
-
-                        self._visit_statements(function_node.body)
+                        self._bind_call_arguments(
+                            function_node.args,
+                            node,
+                            positional_offset=positional_offset,
+                        )
+                        if isinstance(function_node, ast.Lambda):
+                            self.visit(function_node.body)
+                        else:
+                            self._visit_statements(function_node.body)
                     finally:
                         self._pop_scope()
                         self.active_function_calls.discard(function_id)
@@ -3700,26 +3870,20 @@ class JITScriptDetector:
                         self.visit(default)
                 self._push_scope(node.args, default_bindings, self._local_binding_names([node.body]))
                 self.visit(node.body)
+                return_binding = self._binding_from_expression(node.body)
                 self._pop_scope()
+                function_id = str(id(node))
+                self.function_nodes[function_id] = node
+                self.lambda_summaries[id(node)] = ([], return_binding, ((function_id, 0),))
 
-            def _constructor_instance_bindings(
+            def _instance_bindings_from_constructor(
                 self,
-                node: ast.ClassDef,
+                constructor: ast.FunctionDef | ast.AsyncFunctionDef,
+                call: ast.Call | None = None,
             ) -> tuple[
                 dict[tuple[str, ...], str | None],
                 dict[tuple[str, ...], dict[tuple[object, ...], str | None]],
             ]:
-                constructor = next(
-                    (
-                        statement
-                        for statement in node.body
-                        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
-                        and statement.name == "__init__"
-                    ),
-                    None,
-                )
-                if constructor is None:
-                    return {}, {}
                 positional_arguments = [
                     *constructor.args.posonlyargs,
                     *constructor.args.args,
@@ -3735,6 +3899,8 @@ class JITScriptDetector:
                     self._local_binding_names(list(constructor.body)),
                 )
                 try:
+                    if call is not None:
+                        self._bind_call_arguments(constructor.args, call, positional_offset=1)
                     self._visit_statements(constructor.body)
                     attribute_aliases = {
                         key[1:]: builtin
@@ -3752,6 +3918,64 @@ class JITScriptDetector:
                 finally:
                     self._pop_scope()
 
+            def _constructor_instance_bindings(
+                self,
+                node: ast.ClassDef,
+            ) -> tuple[
+                dict[tuple[str, ...], str | None],
+                dict[tuple[str, ...], dict[tuple[object, ...], str | None]],
+            ]:
+                constructor = next(
+                    (
+                        statement
+                        for statement in node.body
+                        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and statement.name == "__init__"
+                    ),
+                    None,
+                )
+                return self._instance_bindings_from_constructor(constructor) if constructor is not None else ({}, {})
+
+            def _constructor_call_instance_bindings(
+                self,
+                node: ast.Call,
+            ) -> tuple[
+                dict[tuple[str, ...], str | None],
+                dict[tuple[str, ...], dict[tuple[object, ...], str | None]],
+            ]:
+                if cached := self.constructor_call_bindings.get(id(node)):
+                    return cached
+                constructor = ast.Attribute(value=node.func, attr="__init__", ctx=ast.Load())
+                summary = self._function_summary_for_node(constructor)
+                if summary is None:
+                    return {}, {}
+                attribute_variants: list[dict[tuple[str, ...], str | None]] = []
+                container_variants: list[dict[tuple[str, ...], dict[tuple[object, ...], str | None]]] = []
+                for function_id, _positional_offset in summary[2]:
+                    function_node = self.function_nodes.get(function_id)
+                    if isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        variant_attributes, variant_containers = self._instance_bindings_from_constructor(
+                            function_node,
+                            node,
+                        )
+                        attribute_variants.append(variant_attributes)
+                        container_variants.append(variant_containers)
+                attributes: dict[tuple[str, ...], str | None] = {}
+                for variant in attribute_variants:
+                    for key, builtin in variant.items():
+                        if builtin is not None or key not in attributes:
+                            attributes[key] = builtin
+                containers: dict[tuple[str, ...], dict[tuple[object, ...], str | None]] = {}
+                for container_variant in container_variants:
+                    for key, nested_container in container_variant.items():
+                        containers[key] = self._merge_container_aliases(
+                            containers.get(key, {}),
+                            nested_container,
+                        )
+                result = attributes, containers
+                self.constructor_call_bindings[id(node)] = result
+                return result
+
             def visit_ClassDef(self, node: ast.ClassDef) -> None:
                 for base in node.bases:
                     self.visit(base)
@@ -3759,22 +3983,73 @@ class JITScriptDetector:
                     self.visit(keyword.value)
                 for decorator in node.decorator_list:
                     self.visit(decorator)
+                inherited_aliases: dict[tuple[str, ...], str | None] = {}
+                inherited_containers: dict[
+                    tuple[str, ...],
+                    dict[tuple[object, ...], str | None],
+                ] = {}
+                inherited_functions: dict[tuple[str, ...], _FunctionAliasSummary] = {}
+                for base in node.bases:
+                    inherited_aliases.update(self._resolve_attribute_aliases(base))
+                    inherited_containers.update(self._resolve_attribute_containers(base))
+                    inherited_functions.update(self._resolve_attribute_function_summaries(base))
                 self._push_scope(kind="class")
                 self._visit_statements(node.body)
-                class_aliases = dict(self.alias_scopes[-1])
+                class_aliases = {
+                    name: builtin
+                    for name, builtin in self.alias_scopes[-1].items()
+                    if self._attribute_function_key(name) is None
+                }
                 class_containers = {
                     name: dict(container)
                     for name, container in self.container_alias_scopes[-1].items()
                     if name in class_aliases
                 }
                 class_attributes = dict(self.attribute_alias_scopes[-1])
+                method_nodes = {
+                    statement.name: statement
+                    for statement in node.body
+                    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+                }
+                class_functions = {
+                    (name,): (
+                        summary[0],
+                        summary[1],
+                        tuple(
+                            (
+                                function_id,
+                                (
+                                    0
+                                    if (method := method_nodes.get(name)) is not None
+                                    and any(
+                                        (isinstance(decorator, ast.Name) and decorator.id == "staticmethod")
+                                        or (isinstance(decorator, ast.Attribute) and decorator.attr == "staticmethod")
+                                        for decorator in method.decorator_list
+                                    )
+                                    else 1
+                                ),
+                            )
+                            for function_id, _positional_offset in summary[2]
+                        ),
+                    )
+                    for name in class_aliases
+                    if (summary := self._lookup_function_summary(name)[1]) is not None
+                }
                 self._pop_scope()
                 self._bind_name(node.name, None)
+                for key in inherited_aliases.keys() | inherited_containers.keys() | inherited_functions.keys():
+                    self._bind_attribute_key(
+                        (node.name, *key),
+                        inherited_aliases.get(key),
+                        container_aliases=inherited_containers.get(key),
+                        function_summary=inherited_functions.get(key),
+                    )
                 for name, builtin in class_aliases.items():
                     self._bind_attribute_key(
                         (node.name, name),
                         builtin,
                         container_aliases=class_containers.get(name),
+                        function_summary=class_functions.get((name,)),
                     )
                 for key, builtin in class_attributes.items():
                     self._bind_attribute_key((node.name, *key), builtin)
@@ -4173,6 +4448,8 @@ class JITScriptDetector:
                             self._bind_name(handler.name, None)
                         handler_terminal = self._visit_statements(handler.body)
                         if handler_terminal is None:
+                            if handler.name is not None:
+                                self._unbind_target(ast.Name(id=handler.name, ctx=ast.Del()))
                             variants.append(self._snapshot_alias_state())
                 self._merge_alias_state_variants(original, variants or [body_state])
                 finally_terminal = self._visit_statements(node.finalbody)
@@ -4259,6 +4536,7 @@ class JITScriptDetector:
                             self._resolve_builtin(value),
                             container_aliases=self._resolve_builtin_container(value),
                             attribute_aliases=self._resolve_attribute_aliases(value),
+                            function_summary=self._function_summary_for_node(value),
                         )
 
             def visit_Call(self, node: ast.Call) -> None:
