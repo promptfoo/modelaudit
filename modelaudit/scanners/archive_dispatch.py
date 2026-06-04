@@ -865,6 +865,9 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
                 unavailable_preferred_scanner_id,
             )
         )
+        # Refresh late metadata so incomplete coverage restores whitelist-downgraded findings.
+        mark_inconclusive_scan_result(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
+        mark_operational_scan_error(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
     if result.scanner_name == "flax_msgpack":
         merge_flax_msgpack_overlap_findings(
             path,

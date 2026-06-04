@@ -2037,6 +2037,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                         unavailable_preferred_scanner_id,
                     )
                 )
+                # Refresh late metadata so incomplete coverage restores whitelist-downgraded findings.
+                _mark_inconclusive_scan_outcome(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
+                _mark_operational_scan_error(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
             if skipped_preferred_scanner_id and result is not None:
                 add_scanner_selection_skip_check(
                     result,

@@ -17,6 +17,7 @@ from typing import Any, ClassVar, cast
 import pytest
 
 from modelaudit import core
+from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import build_cache_version_context
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
@@ -35,6 +36,7 @@ from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 from modelaudit.scanners.zip_scanner import KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY, ZipScanner
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
+from modelaudit.whitelists import POPULAR_MODELS
 from tests.helpers import (
     create_mock_mxnet_symbol,
     create_mock_onnx,
@@ -3047,6 +3049,52 @@ def test_scan_nested_file_fails_closed_and_preserves_generic_keras_zip_findings(
         issue.rule_code == "S201" and issue.details.get("zip_entry") == "payload.pkl" for issue in result.issues
     )
     assert has_pickle_finding is malicious
+
+
+def test_scan_nested_file_unavailable_keras_scanner_restores_whitelist_downgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested_keras = tmp_path / "nested.keras"
+    with zipfile.ZipFile(nested_keras, "w") as archive:
+        archive.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+        archive.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+    original_load_scanner = _registry._load_scanner
+
+    def load_scanner(scanner_id: str) -> type[BaseScanner] | None:
+        if scanner_id == "keras_zip":
+            return None
+        return original_load_scanner(scanner_id)
+
+    def scan_with_whitelisted_finding(self: ZipScanner, path: str) -> ScanResult:
+        self.context = UnifiedMLContext(
+            file_path=Path(path),
+            file_size=Path(path).stat().st_size,
+            file_type=".keras",
+            model_id=next(iter(POPULAR_MODELS)),
+            model_source="huggingface",
+        )
+        result = self._create_result()
+        result.add_check(
+            name="Fallback Security Finding",
+            passed=False,
+            message="High confidence fallback anomaly",
+            severity=IssueSeverity.CRITICAL,
+            rule_code="CUSTOM001",
+        )
+        result.finish(success=True)
+        assert result.issues[0].severity == IssueSeverity.INFO
+        return result
+
+    monkeypatch.setattr(_registry, "_load_scanner", load_scanner)
+    monkeypatch.setattr(ZipScanner, "scan", scan_with_whitelisted_finding)
+
+    result = scan_nested_file(str(nested_keras), {"cache_enabled": False})
+
+    assert result.success is False
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].details["whitelist_downgrade_restored"] is True
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
 
 
 def test_scan_nested_file_fails_closed_when_xml_root_is_beyond_bounded_probe(tmp_path: Path) -> None:

@@ -20,6 +20,7 @@ from typing import Any, cast
 import pytest
 
 from modelaudit import core as core_module
+from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.core import scan_file, scan_model_directory_or_file
@@ -27,6 +28,7 @@ from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner, m
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
+from modelaudit.scanners.zip_scanner import ZipScanner
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
@@ -41,6 +43,7 @@ from modelaudit.utils.file.detection import (
 from modelaudit.utils.helpers import cache_decorator
 from modelaudit.utils.helpers.secure_hasher import SecureFileHasher, compute_aggregate_hash
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
+from modelaudit.whitelists import POPULAR_MODELS
 from tests.helpers import (
     create_mock_coreml,
     create_mock_gguf,
@@ -3148,6 +3151,56 @@ def test_scan_file_preserves_generic_findings_when_content_routed_keras_zip_scan
     assert result.success is False
     assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
     _assert_system_pickle_detected(result, "payload.pkl")
+
+
+def test_scan_file_unavailable_keras_scanner_restores_whitelist_downgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disguised_keras = tmp_path / "model.keras"
+    _create_misnamed_zip(
+        disguised_keras,
+        {
+            "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
+            "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
+        },
+    )
+    original_load_scanner = core_module._registry._load_scanner
+
+    def load_scanner(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "keras_zip":
+            return None
+        return original_load_scanner(scanner_id)
+
+    def scan_with_whitelisted_finding(self: ZipScanner, path: str) -> ScanResult:
+        self.context = UnifiedMLContext(
+            file_path=Path(path),
+            file_size=Path(path).stat().st_size,
+            file_type=".keras",
+            model_id=next(iter(POPULAR_MODELS)),
+            model_source="huggingface",
+        )
+        result = self._create_result()
+        result.add_check(
+            name="Fallback Security Finding",
+            passed=False,
+            message="High confidence fallback anomaly",
+            severity=IssueSeverity.CRITICAL,
+            rule_code="CUSTOM001",
+        )
+        result.finish(success=True)
+        assert result.issues[0].severity == IssueSeverity.INFO
+        return result
+
+    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+    monkeypatch.setattr(ZipScanner, "scan", scan_with_whitelisted_finding)
+
+    result = scan_file(str(disguised_keras), config={"cache_enabled": False})
+
+    assert result.success is False
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].details["whitelist_downgrade_restored"] is True
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
 
 
 def test_scan_file_routes_misnamed_oversized_config_only_keras_zip_by_content(tmp_path: Path) -> None:
