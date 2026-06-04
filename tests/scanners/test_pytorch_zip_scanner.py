@@ -1179,6 +1179,32 @@ def test_pytorch_zip_jit_scan_size_limit_marks_inconclusive(tmp_path: Path) -> N
     assert size_checks[0].details["max_scan_bytes"] == 4
 
 
+def test_pytorch_zip_jit_detector_byte_budget_marks_inconclusive(tmp_path: Path) -> None:
+    model_path = tmp_path / "late_jit_payload.pt"
+    padding = b"# pad\n" * ((jit_script_module._EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT // len(b"# pad\n")) + 1)
+    late_payload = padding + b"def payload():\n    return 1\n"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zip_file.writestr("archive/code/debug/source.py", late_payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+    aggregate = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert jit_script_module._EMBEDDED_PYTHON_BYTE_LIMIT_REASON in result.metadata["scan_outcome_reasons"]
+    jit_checks = [check for check in result.checks if check.name == "JIT/Script Code Execution Detection"]
+    assert any(
+        check.details.get("details", {}).get("reason") == jit_script_module._EMBEDDED_PYTHON_BYTE_LIMIT_REASON
+        for check in jit_checks
+    )
+    assert getattr(aggregate.file_metadata[str(model_path)], "scan_outcome", None) == INCONCLUSIVE_SCAN_OUTCOME
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_pytorch_zip_jit_scan_read_failure_marks_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

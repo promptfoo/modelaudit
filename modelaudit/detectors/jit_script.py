@@ -143,6 +143,8 @@ _MAX_PRIORITY_ASSIGNMENT_PROBES = 48
 # Bound nested ``:``-header recursion when extracting an embedded statement so a
 # crafted deeply-indented blob cannot exhaust the interpreter stack.
 _MAX_BODY_STATEMENT_NESTING = 100
+_MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES = 64
+_EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT = 1_000_000
 _EMBEDDED_PYTHON_SCAN_WINDOW_BYTES = 1_000_000
 _MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES = 16_384
 _PROVEN_HIGH_RISK_CALL_PROBES = {
@@ -192,6 +194,8 @@ _TYPED_PROOF_MEMBER_NAMES = frozenset(
         "windll",
     }
 )
+_EMBEDDED_PYTHON_BYTE_LIMIT_REASON = "jit_embedded_python_byte_limit"
+_EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON = "jit_embedded_python_snippet_limit"
 _EMBEDDED_PYTHON_START_MARKERS = (b"def ", b"async def ", b"class ", b"import ", b"from ")
 _PRIORITY_EMBEDDED_PYTHON_MODULES = tuple(
     sorted(
@@ -237,6 +241,12 @@ _EMBEDDED_PYTHON_START_PATTERN = re.compile(
     rb"(?:(?:async\s+)?def\s+\w+|class\s+\w+|import\s+[A-Za-z_][\w.]*|"
     rb"from\s+[A-Za-z_][\w.]*(?:\s|\\\r?\n)+import)"
 )
+_UNAMBIGUOUS_EMBEDDED_PYTHON_START_PATTERN = re.compile(
+    rb"(?:(?:async\s+)?def\s+\w+\s*[\[(]|"
+    rb"class\s+\w+\s*[\[(:]|"
+    rb"import\s+[A-Za-z_][\w.]*(?:\s*(?:,|as\b|\\\r?\n|\r?\n|$))|"
+    rb"from\s+[A-Za-z_][\w.]*(?:\s|\\\r?\n)+import(?:\s|\\\r?\n)+(?:\(|[A-Za-z_*]))"
+)
 _EMBEDDED_PYTHON_CONTEXT_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])(?:if\s+[^:\n]+\s*:|import\s+[A-Za-z_][\w.]*|from\s+[A-Za-z_][\w.]*|"
     + _EMBEDDED_PYTHON_CONTEXT_ASSIGNMENT_LHS_PATTERN
@@ -257,6 +267,27 @@ _EMBEDDED_PYTHON_STATIC_MAPPING_CALL_CONTEXT_START_PATTERN = re.compile(
     rb"(?<![A-Za-z0-9_'\".])[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*\s*\([^#\n]*__dict__[^#\n]*\)"
 )
 _EmbeddedPythonCandidate = tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]
+
+
+def _has_source_like_embedded_python_start(data: bytes, *, start_offset: int = 0) -> bool:
+    """Return whether a Python start marker follows source indentation or binary framing."""
+    source_start_probes = 0
+    for match in _EMBEDDED_PYTHON_START_PATTERN.finditer(data, start_offset):
+        cursor = match.start()
+        while cursor > 0 and data[cursor - 1] in b" \t\r":
+            cursor -= 1
+        if cursor > 0 and data[cursor - 1] != 0x0A and 0x20 <= data[cursor - 1] < 0x7F:
+            continue
+        source_start_probes += 1
+        if source_start_probes > _MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES:
+            return True
+        candidate = data[match.start() : match.start() + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES]
+        code_str, _byte_offsets = _decode_utf8_with_byte_offsets(candidate)
+        if _parse_embedded_python_snippet(code_str) is not None:
+            return True
+        if _UNAMBIGUOUS_EMBEDDED_PYTHON_START_PATTERN.match(candidate):
+            return True
+    return False
 
 
 def _resolve_alias_aware_high_risk_calls(tree: ast.AST) -> set[tuple[str, str]]:
@@ -4913,6 +4944,8 @@ _INERT_FORWARDING_TOKEN_PATTERN = re.compile(
 def _is_inert_forwarding_suffix(suffix: bytes) -> bool:
     if suffix == b"pass":
         return True
+    if suffix in {b"r", b"R", b"b", b"B", b"u", b"U", b"rb", b"rB", b"Rb", b"RB", b"br", b"bR", b"Br", b"BR"}:
+        return True
     position = 0
     matched_token = False
     while position < len(suffix):
@@ -8030,15 +8063,19 @@ def _compact_candidate_segments(candidate: bytes, segment_ranges: list[tuple[int
     return b"\n".join(candidate[start:end].rstrip(b"\n") for start, end in segment_ranges)
 
 
-def _prioritized_embedded_python_snippets(
+def _select_prioritized_embedded_python_snippets(
     candidates: list[_EmbeddedPythonCandidate],
     bounded: bytes | None = None,
-) -> list[_EmbeddedPythonCandidate]:
+) -> tuple[list[_EmbeddedPythonCandidate], list[tuple[int, int]]]:
     selected: list[_EmbeddedPythonCandidate] = []
     selected_spans: set[tuple[int, int]] = set()
     priority_offsets = _priority_import_offsets(bounded) if bounded is not None else []
+    selected_default_candidates = 0
     selected_priority_candidates = 0
-    for index, (candidate, span, real_ranges) in enumerate(candidates):
+    omitted_budgeted_spans: list[tuple[int, int]] = []
+    for candidate, span, real_ranges in candidates:
+        if span in selected_spans:
+            continue
         has_priority_marker = (
             _span_contains_priority_offset(span, priority_offsets)
             if bounded is not None
@@ -8049,32 +8086,44 @@ def _prioritized_embedded_python_snippets(
         )
         if oversized_priority_candidate:
             if selected_priority_candidates >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
+                omitted_budgeted_spans.append(span)
                 continue
             candidate, span, real_ranges = _bounded_priority_embedded_python_candidate(
                 candidate, span, priority_offsets
             )
+            if span in selected_spans:
+                continue
             selected_priority_candidates += 1
-        if index >= _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:
+        elif selected_default_candidates >= _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS:
             if not has_priority_marker:
+                omitted_budgeted_spans.append(span)
                 continue
-            if oversized_priority_candidate:
-                pass
-            elif selected_priority_candidates >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
+            if selected_priority_candidates >= _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS:
+                omitted_budgeted_spans.append(span)
                 continue
-            elif bounded is not None:
+            if bounded is not None:
                 candidate, span, real_ranges = _bounded_priority_embedded_python_candidate(
                     candidate, span, priority_offsets
                 )
-                selected_priority_candidates += 1
-            elif not oversized_priority_candidate:
+            else:
                 candidate = candidate[:_MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES]
                 span = (span[0], span[0] + len(candidate))
                 real_ranges = (span,)
-                selected_priority_candidates += 1
-        if span in selected_spans:
-            continue
+            if span in selected_spans:
+                continue
+            selected_priority_candidates += 1
+        else:
+            selected_default_candidates += 1
         selected_spans.add(span)
         selected.append((candidate, span, real_ranges))
+    return selected, omitted_budgeted_spans
+
+
+def _prioritized_embedded_python_snippets(
+    candidates: list[_EmbeddedPythonCandidate],
+    bounded: bytes | None = None,
+) -> list[_EmbeddedPythonCandidate]:
+    selected, _omitted_budgeted_spans = _select_prioritized_embedded_python_snippets(candidates, bounded)
     return selected
 
 
@@ -8694,6 +8743,44 @@ def _bounded_priority_tail_starts(tail_starts: list[int]) -> list[int]:
     return [*tail_starts[:head_count], *tail_starts[-tail_count:]]
 
 
+def _embedded_python_analysis_incomplete_finding(
+    *,
+    framework: str,
+    context: str,
+    reason: str,
+    message: str,
+    max_scan_bytes: int | None = None,
+    omitted_snippets: int | None = None,
+    candidates_count: int | None = None,
+) -> "JITScriptFinding":
+    details: dict[str, Any] = {
+        "analysis_incomplete": True,
+        "reason": reason,
+    }
+    if max_scan_bytes is not None:
+        details["max_scan_bytes"] = max_scan_bytes
+    if omitted_snippets is not None:
+        details["omitted_snippets"] = omitted_snippets
+    if candidates_count is not None:
+        details["candidate_snippets"] = candidates_count
+
+    return create_jit_finding(
+        message=message,
+        severity="INFO",
+        context=context,
+        pattern=None,
+        recommendation="Treat JIT/embedded Python coverage as inconclusive and review the model source.",
+        confidence=1.0,
+        details=details,
+        framework=framework,
+        code_snippet=None,
+        type="analysis_incomplete",
+        operation=None,
+        builtin=None,
+        import_=None,
+    )
+
+
 def _tail_starts_for_priority_alias_uses(
     tail: bytes,
     tail_starts: list[int],
@@ -9024,7 +9111,7 @@ class JITScriptDetector:
         # Look for embedded Python code even when framework markers are absent.
         # Scanner callers can hand us raw code-bearing blobs, and an attacker can
         # remove marker strings without removing the executable payload.
-        if b"def " in data or b"class " in data:
+        if _has_source_like_embedded_python_start(data):
             code_findings = self._extract_and_check_python_code(data, "TorchScript", context)
             findings.extend(code_findings)
 
@@ -9236,8 +9323,41 @@ class JITScriptDetector:
         if not self.check_ast:
             return findings
 
-        bounded = data if include_full_source else data[:1000000]
+        bounded = data if include_full_source else data[:_EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT]
         matches = _candidate_embedded_python_snippets(bounded, include_full_source=include_full_source)
+        if prioritized_snippets is None:
+            prioritized_matches, omitted_budgeted_spans = _select_prioritized_embedded_python_snippets(
+                matches, bounded=bounded
+            )
+        else:
+            prioritized_matches = prioritized_snippets
+            omitted_budgeted_spans = []
+        has_bounded_source = _has_source_like_embedded_python_start(bounded)
+        has_source_beyond_bound = (
+            not include_full_source
+            and len(data) > _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+            and _has_source_like_embedded_python_start(
+                data,
+                start_offset=max(
+                    0,
+                    _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT - _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES,
+                ),
+            )
+        )
+        if (
+            not include_full_source
+            and len(data) > _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+            and (has_bounded_source or has_source_beyond_bound)
+        ):
+            findings.append(
+                _embedded_python_analysis_incomplete_finding(
+                    framework=framework,
+                    context=context,
+                    reason=_EMBEDDED_PYTHON_BYTE_LIMIT_REASON,
+                    message=("Embedded Python/JIT analysis incomplete: payload exceeds the bounded byte scan window"),
+                    max_scan_bytes=_EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT,
+                )
+            )
         bounded_high_risk_calls: set[tuple[str, str]] | None = None
         snippet_high_risk_calls: set[tuple[str, str]] = set()
         parsed_snippet_spans: list[tuple[int, int]] = []
@@ -9254,12 +9374,7 @@ class JITScriptDetector:
                 # raw pattern detection active and fall back to extracted snippets.
                 bounded_high_risk_calls = None
 
-        selected_snippets = (
-            prioritized_snippets
-            if prioritized_snippets is not None
-            else _prioritized_embedded_python_snippets(matches, bounded=bounded)
-        )
-        for match, span, real_ranges in selected_snippets:
+        for match, span, real_ranges in prioritized_matches:
             for rule_code, (call_name, probe) in _PROVEN_HIGH_RISK_CALL_PROBES.items():
                 if probe in match:
                     snippet_high_risk_calls.add((call_name, rule_code))
@@ -9338,6 +9453,21 @@ class JITScriptDetector:
             except Exception:
                 # Failed to process this code snippet
                 continue
+
+        uncovered_omitted_spans = [
+            span for span in omitted_budgeted_spans if not _is_span_inside_parsed_spans(span, parsed_snippet_spans)
+        ]
+        if uncovered_omitted_spans:
+            findings.append(
+                _embedded_python_analysis_incomplete_finding(
+                    framework=framework,
+                    context=context,
+                    reason=_EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON,
+                    message=("Embedded Python/JIT analysis incomplete: candidate snippet budget was exceeded"),
+                    omitted_snippets=len(uncovered_omitted_spans),
+                    candidates_count=len(matches),
+                )
+            )
 
         # Check for common code execution patterns in binary
         resolved_high_risk_calls = (bounded_high_risk_calls or set()) | snippet_high_risk_calls
@@ -9736,19 +9866,39 @@ class JITScriptDetector:
             elif b"onnx" in data or b"ai.onnx" in data:
                 model_type = "onnx"
 
+        source_like_embedded_python = (
+            _has_source_like_embedded_python_start(data)
+            if model_type == "pickle"
+            or (
+                model_type in ["pytorch", "torchscript", "unknown"] and len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+            )
+            else False
+        )
+        model_specific_embedded_python_fully_scanned = False
+
         # Scan based on model type
         if model_type in ["pytorch", "torchscript"]:
             findings.extend(self.scan_torchscript(data, context))
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
+            model_specific_embedded_python_fully_scanned = (
+                source_like_embedded_python and len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+            )
 
         if model_type in ["tensorflow", "tf", "keras"]:
             findings.extend(self.scan_tensorflow(data, context))
+            model_specific_embedded_python_fully_scanned = (
+                len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
+                and (b"SavedFunction" in data or b"saved_model.pb" in data)
+                and (b"python_function" in data or b"function_spec" in data)
+                and _has_source_like_embedded_python_start(data)
+            )
 
         if model_type == "onnx":
             findings.extend(self.scan_onnx(data, context))
 
-        if model_type == "pickle" and (b"def " in data or b"class " in data):
+        if model_type == "pickle" and source_like_embedded_python:
             findings.extend(self._extract_and_check_python_code(data, "Generic Python", context))
+            model_specific_embedded_python_fully_scanned = len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT
 
         # Always check for generic dangerous patterns
         # Only run fallback scanners if model type is truly unknown
@@ -9760,8 +9910,17 @@ class JITScriptDetector:
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
             findings.extend(self.scan_tensorflow(data, context))
             findings.extend(self.scan_onnx(data, context))
+            model_specific_embedded_python_fully_scanned = len(data) <= _EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT and (
+                source_like_embedded_python
+                or (
+                    (b"SavedFunction" in data or b"saved_model.pb" in data)
+                    and (b"python_function" in data or b"function_spec" in data)
+                    and _has_source_like_embedded_python_start(data)
+                )
+            )
 
-        if self._looks_like_dangerous_python_source(data):
+        dangerous_python_source = self._looks_like_dangerous_python_source(data)
+        if not model_specific_embedded_python_fully_scanned and dangerous_python_source:
             findings.extend(
                 self._extract_and_check_python_code(
                     data,
@@ -9770,7 +9929,7 @@ class JITScriptDetector:
                     include_full_source=True,
                 )
             )
-        else:
+        elif not dangerous_python_source:
             prioritized_snippets_by_window: dict[int, list[_EmbeddedPythonCandidate]] = {}
             if self._looks_like_framed_dangerous_python_source(data, prioritized_snippets_by_window):
                 for window_index, (window, include_full_source) in enumerate(_embedded_python_extraction_windows(data)):
