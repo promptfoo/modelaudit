@@ -1019,6 +1019,39 @@ class TestKerasZipScanner:
         assert "X-Goog-Signature=<redacted>" in preview
         assert "Authorization: <redacted>" in preview
 
+    def test_lambda_dict_code_preview_redacts_plain_path_capabilities(self, tmp_path: Path) -> None:
+        scanner = KerasZipScanner()
+        capability = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+        malicious_code = f"__import__('os').system('cat /cache/{capability}/key')"
+        encoded_code = base64.b64encode(malicious_code.encode()).decode()
+        config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "lambda_dict",
+                        "config": {
+                            "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                        },
+                    },
+                ],
+            },
+        }
+        keras_path = create_configured_keras_zip(tmp_path, config, keras_version="3.0.0")
+
+        result = scanner.scan(str(keras_path))
+
+        serialized = result.to_json()
+        dangerous_lambda = [
+            check
+            for check in result.checks
+            if check.name == "Lambda Layer Code Analysis" and check.details.get("layer_name") == "lambda_dict"
+        ]
+        assert len(dangerous_lambda) == 1
+        assert capability not in serialized
+        assert "/cache/<redacted>/key" in dangerous_lambda[0].details["code_preview"]
+
     def test_scan_normalized_weights_member_checks_embedded_hdf5_external_references(self, tmp_path: Path) -> None:
         """Normalized ./model.weights.h5 members should still receive Keras-specific HDF5 checks."""
         scanner = KerasZipScanner()

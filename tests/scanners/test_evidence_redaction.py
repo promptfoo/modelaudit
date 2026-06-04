@@ -321,8 +321,8 @@ def test_evidence_preview_bounds_redaction_input(monkeypatch: pytest.MonkeyPatch
 
     def record_redaction(text: str, max_chars: int | None = 180) -> str:
         seen_lengths.append(len(text))
-        assert max_chars is not None
-        return text[:max_chars]
+        assert max_chars is None
+        return text
 
     monkeypatch.setattr(evidence_redaction, "redact_evidence_string", record_redaction)
 
@@ -340,6 +340,26 @@ def test_evidence_preview_fails_closed_for_url_crossing_bound() -> None:
 
     assert "gopher://user:" not in preview
     assert "gopher://<redacted>" in preview
+
+
+def test_evidence_preview_redacts_plain_path_capability_tokens() -> None:
+    """Absolute paths in preview text should not preserve bearer capabilities."""
+    capability = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+    preview = redact_evidence_preview(
+        f"__import__('os').system('cat /cache/{capability}/key')",
+        max_chars=200,
+    )
+
+    assert capability not in preview
+    assert "/cache/<redacted>/key" in preview
+
+
+def test_evidence_preview_preserves_high_entropy_non_path_text() -> None:
+    """Path-specific preview redaction should not rewrite unrelated identifiers."""
+    identifier = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
+    text = f"model_digest = {identifier}"
+
+    assert redact_evidence_preview(text, max_chars=200) == text
 
 
 def test_plain_path_redaction_preserves_benign_model_paths() -> None:

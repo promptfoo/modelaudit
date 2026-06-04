@@ -153,6 +153,11 @@ BLOCK_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
 )
 BRACKETED_QUERY_KEY_SUFFIX_RE: Final[re.Pattern[str]] = re.compile(r"(?:\[[^\]]*\])+\Z")
 PATH_SEPARATOR_RE: Final[re.Pattern[str]] = re.compile(r"([/\\])")
+PLAIN_PATH_IN_TEXT_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![A-Za-z0-9_:/\\])"
+    r"(?:[A-Za-z]:[\\/]|~[\\/]|\.{1,2}[\\/]|[\\/])"
+    r"[^\s\"'<>`|()[\]{},;]+"
+)
 
 
 def _redact_malformed_url(raw_url: str) -> str:
@@ -340,7 +345,12 @@ def redact_evidence_preview(text: str, max_chars: int = 180) -> str:
             scheme_end = bounded_text.find("://", match.start()) + 3
             bounded_text = f"{bounded_text[:scheme_end]}{REDACTED_EVIDENCE_VALUE}"
             break
-    return redact_evidence_string(bounded_text, max_chars=max_chars)
+    redacted = redact_evidence_string(bounded_text, max_chars=None)
+    redacted = PLAIN_PATH_IN_TEXT_RE.sub(
+        lambda match: redact_evidence_path(match.group(0), max_chars=None),
+        redacted,
+    )
+    return _truncate(redacted, max_chars)
 
 
 def redact_evidence_path(path: str, max_chars: int | None = 180) -> str:
