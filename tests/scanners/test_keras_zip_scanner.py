@@ -543,9 +543,46 @@ class TestKerasZipScanner:
 
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert reason in result.metadata["scan_outcome_reasons"]
+        pickle_issues = [
+            issue
+            for issue in result.issues
+            if issue.rule_code == "S201"
+            and issue.details.get("zip_entry") == "model.weights.h5"
+            and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system", "nt.system"))
+        ]
+        assert pickle_issues
+        assert not any(issue.details.get("embedded_weights_hdf5_userblock") for issue in pickle_issues)
+        assert not any(check.name == "H5PY Library Check" for check in result.checks)
+
+    def test_oversized_non_hdf5_weights_preserve_nested_archive_dispatch(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Probe-incomplete weights must retain content-routed nested scanning."""
+        nested_zip_path = tmp_path / "disguised_weights.zip"
+        with zipfile.ZipFile(nested_zip_path, "w") as nested_zip:
+            nested_zip.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+            nested_zip.writestr("padding.bin", bytes(_HDF5_SIGNATURE_SCAN_MAX_BYTES))
+
+        assert nested_zip_path.stat().st_size > _HDF5_SIGNATURE_SCAN_MAX_BYTES
+        keras_path = tmp_path / "oversized_disguised_zip.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.12.0"}))
+            zf.write(nested_zip_path, "model.weights.h5")
+
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+        reason = "keras_zip_embedded_weights_hdf5_signature_probe_incomplete"
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert reason in result.metadata["scan_outcome_reasons"]
         assert any(
             issue.rule_code == "S201"
-            and issue.details.get("zip_entry") == "model.weights.h5"
+            and issue.details.get("zip_entry") == "model.weights.h5:payload.pkl"
             and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system", "nt.system"))
             for issue in result.issues
         )

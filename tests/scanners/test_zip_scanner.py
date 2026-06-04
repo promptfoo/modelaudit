@@ -34,6 +34,7 @@ from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Che
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 from modelaudit.scanners.zip_scanner import (
     KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY,
+    ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY,
     ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY,
     ZipScanner,
 )
@@ -5339,6 +5340,36 @@ class TestZipScanner:
                 "path": f"{archive_path}:model.weights.h5",
                 "type": "security_only",
                 "size": 72,
+            }
+        ]
+
+    def test_content_only_entry_dispatches_without_untrusted_suffix(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "content-only.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.weights.h5", b"content-routed payload")
+
+        nested_scan_paths: list[str] = []
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_scan_paths.append(path)
+            result = ScanResult(scanner_name="test")
+            result.finish(success=True)
+            return result
+
+        result = ZipScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY: ["model.weights.h5"],
+            }
+        ).scan(str(archive_path))
+
+        assert len(nested_scan_paths) == 1
+        assert Path(nested_scan_paths[0]).suffix == ""
+        assert result.metadata["contents"] == [
+            {
+                "path": f"{archive_path}:model.weights.h5",
+                "type": "test",
+                "size": 22,
             }
         ]
 
