@@ -11,10 +11,9 @@ from modelaudit.detectors.network_comm import _redact_url_path_tokens
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 
-URL_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)\b(?:https?|ftp|ftps|ssh|telnet|wss?|tcp|udp|s3|gs|az|wasbs?|abfss?|file)://[^\s\"'<>]+"
-)
-RFC_URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)^[a-z][a-z0-9+.-]*://[^\s\"'<>]+$")
+RFC_URL_PATTERN: Final[str] = r"[a-z][a-z0-9+.-]*://[^\s\"'<>]+"
+URL_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)\b{RFC_URL_PATTERN}")
+RFC_URL_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)^{RFC_URL_PATTERN}$")
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "access_key",
@@ -214,6 +213,8 @@ def _contains_nested_sensitive_query_assignment(value: str) -> bool:
         decoded = next_decoded
     return bool(
         NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE.search(decoded)
+        or AUTHORIZATION_VALUE_RE.search(decoded)
+        or AUTH_SCHEME_VALUE_RE.search(decoded)
         or QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
         or ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
         or BRACKETED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
@@ -311,10 +312,11 @@ def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
 
 def redact_evidence_path(path: str, max_chars: int | None = 180) -> str:
     """Redact secrets and capability tokens from a path-like evidence value."""
-    if RFC_URL_RE.fullmatch(path) is not None:
-        redacted = redact_evidence_string(_redact_url_value(path), max_chars=None)
+    stripped_path = path.strip()
+    if RFC_URL_RE.fullmatch(stripped_path) is not None:
+        redacted = redact_evidence_string(_redact_url_value(stripped_path), max_chars=None)
     else:
-        redacted = redact_evidence_string(path, max_chars=None)
+        redacted = redact_evidence_string(stripped_path, max_chars=None)
         components = PATH_SEPARATOR_RE.split(redacted)
         for index in range(0, len(components), 2):
             if components[index]:

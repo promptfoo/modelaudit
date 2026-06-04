@@ -243,6 +243,40 @@ def test_path_redaction_handles_arbitrary_rfc_url_schemes() -> None:
     assert redacted == "gopher://<credentials-redacted>@loader.example/vocab.txt?token=<redacted>&ok=1"
 
 
+def test_path_redaction_strips_incidental_whitespace_before_url_parsing() -> None:
+    """Whitespace accepted by Keras path routing must not bypass URL redaction."""
+    redacted = redact_evidence_path(
+        "  gopher://user:pass@loader.example/vocab.txt  ",
+        max_chars=None,
+    )
+
+    assert "user:pass" not in redacted
+    assert redacted == "gopher://<credentials-redacted>@loader.example/vocab.txt"
+
+
+def test_redacts_custom_scheme_urls_embedded_in_text() -> None:
+    """Arbitrary RFC-style URLs in code previews should redact userinfo."""
+    redacted = redact_evidence_string(
+        "curl gopher://user:pass@loader.example/payload",
+        max_chars=None,
+    )
+
+    assert "user:pass" not in redacted
+    assert redacted == "curl gopher://<credentials-redacted>@loader.example/payload"
+
+
+def test_redacts_nested_authorization_query_values() -> None:
+    """Encoded Authorization values under benign query keys should fail closed."""
+    redacted = redact_evidence_string(
+        "https://loader.example/vocab.txt?headers=Authorization%3A%20Bearer%20VOCABSECRET123&ok=1",
+        max_chars=None,
+    )
+
+    assert "VOCABSECRET123" not in redacted
+    assert "headers=<redacted>" in redacted
+    assert "ok=1" in redacted
+
+
 def test_plain_path_redaction_preserves_benign_model_paths() -> None:
     """Ordinary artifact paths should remain useful in evidence."""
     path = r"C:\models\transformer_encoder\weights.h5"
