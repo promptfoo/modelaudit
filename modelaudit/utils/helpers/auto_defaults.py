@@ -24,13 +24,16 @@ def detect_input_type(path: str) -> str:
     """
     # Cloud storage detection
     hostname = _get_hostname(path)
-    if path.startswith(("s3://", "gs://", "az://")) or hostname.endswith(".blob.core.windows.net"):
-        if path.startswith("s3://"):
-            return "cloud_s3"
-        elif path.startswith("gs://"):
-            return "cloud_gcs"
-        else:
-            return "cloud_azure"
+    if (
+        path.startswith(("s3://", "r2://"))
+        or hostname.endswith(".s3.amazonaws.com")
+        or hostname.endswith(".r2.cloudflarestorage.com")
+    ):
+        return "cloud_s3"
+    if path.startswith(("gs://", "gcs://")) or hostname == "storage.googleapis.com":
+        return "cloud_gcs"
+    if path.startswith("az://") or hostname.endswith(".blob.core.windows.net"):
+        return "cloud_azure"
 
     # HuggingFace detection
     if path.startswith(("hf://", "https://huggingface.co/", "https://hf.co/")):

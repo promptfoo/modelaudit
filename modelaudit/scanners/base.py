@@ -21,6 +21,7 @@ from ..scanner_results import (
     Issue,
     IssueSeverity,
     ScanResult,
+    mark_inconclusive_scan_result,
 )
 from ..utils.helpers.interrupt_handler import check_interrupted
 from .rule_mapper import get_embedded_code_rule_code, get_network_rule_code, get_secret_rule_code
@@ -822,6 +823,14 @@ class BaseScanner(ABC):
                 location = getattr(finding, "context", context)
                 recommendation = getattr(finding, "recommendation", "Review JIT/Script code for security")
                 details = finding.__dict__ if hasattr(finding, "__dict__") else {"object": str(finding)}
+
+            finding_details = details.get("details") if isinstance(details, dict) else None
+            if isinstance(finding_details, dict) and finding_details.get("analysis_incomplete"):
+                reason = finding_details.get("reason")
+                mark_inconclusive_scan_result(
+                    result,
+                    reason if isinstance(reason, str) and reason else "jit_script_analysis_incomplete",
+                )
 
             jit_indicator = f"{details.get('type', '')} {message} {model_type}".strip()
             jit_rule_code = get_embedded_code_rule_code(jit_indicator)
