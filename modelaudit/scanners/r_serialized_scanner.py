@@ -96,12 +96,13 @@ def _position_is_in_r_suppressing_non_code_span(
     return False
 
 
-def _r_innermost_code_delimiter(
+def _r_equals_is_named_argument(
     text: str,
     position: int,
     non_code_spans: list[tuple[int, int]],
-) -> str | None:
-    stack: list[str] = []
+) -> bool:
+    closing_delimiters = {"(": ")", "[": "]", "{": "}"}
+    stack: list[tuple[str, int]] = []
     cursor = 0
     span_index = 0
     while cursor < position:
@@ -112,11 +113,34 @@ def _r_innermost_code_delimiter(
 
         character = text[cursor]
         if character in "([{":
-            stack.append(character)
-        elif character in ")]}" and stack:
+            stack.append((character, cursor))
+        elif character in ")]}":
+            if not stack or closing_delimiters[stack[-1][0]] != character:
+                return False
             stack.pop()
         cursor += 1
-    return stack[-1] if stack else None
+
+    if not stack or stack[-1][0] not in {"(", "["}:
+        return False
+    target = stack[-1]
+
+    while cursor < len(text):
+        if span_index < len(non_code_spans) and cursor == non_code_spans[span_index][0]:
+            cursor = non_code_spans[span_index][1]
+            span_index += 1
+            continue
+
+        character = text[cursor]
+        if character in "([{":
+            stack.append((character, cursor))
+        elif character in ")]}":
+            if not stack or closing_delimiters[stack[-1][0]] != character:
+                return False
+            closed = stack.pop()
+            if closed == target:
+                return True
+        cursor += 1
+    return False
 
 
 def _contains_r_raw_credential_assignment(text: str) -> bool:
@@ -134,12 +158,17 @@ def _contains_r_raw_credential_assignment(text: str) -> bool:
         left_context_start = max(0, literal_start - R_RAW_LEFT_ASSIGNMENT_CONTEXT_CHARS)
         left_context = text[left_context_start:literal_start]
         left_match = _R_LEFTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE.search(left_context)
-        if left_match is not None and not _position_is_in_r_suppressing_non_code_span(
-            left_context_start + left_match.start("operator"),
-            non_code_spans,
-            malformed_raw_span_starts,
-        ):
-            return True
+        if left_match is not None:
+            operator_start = left_context_start + left_match.start("operator")
+            operator_is_suppressed = _position_is_in_r_suppressing_non_code_span(
+                operator_start,
+                non_code_spans,
+                malformed_raw_span_starts,
+            )
+            if not operator_is_suppressed and (
+                text[operator_start] != "=" or not _r_equals_is_named_argument(text, operator_start, non_code_spans)
+            ):
+                return True
 
         right_match = _R_RIGHTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE.match(text, literal_end)
         if right_match is not None and not _position_is_in_r_suppressing_non_code_span(
@@ -157,10 +186,7 @@ def _contains_r_quoted_credential_assignment(text: str) -> bool:
         operator_start = assignment_match.start("operator")
         if _position_is_in_spans(operator_start, non_code_spans):
             continue
-        if text[operator_start] == "=" and _r_innermost_code_delimiter(text, operator_start, non_code_spans) in {
-            "(",
-            "[",
-        }:
+        if text[operator_start] == "=" and _r_equals_is_named_argument(text, operator_start, non_code_spans):
             continue
         return True
 
@@ -186,10 +212,7 @@ def _contains_r_expression_credential_assignment(text: str) -> bool:
         operator_start = target_match.start("operator")
         if _position_is_in_spans(operator_start, non_code_spans):
             continue
-        if text[operator_start] == "=" and _r_innermost_code_delimiter(text, operator_start, non_code_spans) in {
-            "(",
-            "[",
-        }:
+        if text[operator_start] == "=" and _r_equals_is_named_argument(text, operator_start, non_code_spans):
             continue
 
         statement_index = bisect_right(statement_starts, target_match.start()) - 1

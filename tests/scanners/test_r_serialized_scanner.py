@@ -912,7 +912,9 @@ def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None
         '# r"{BROKEN; token <- r"(NOT_A_SECRET)"',
         '\'r"{BROKEN; token <- r"(NOT_A_SECRET)"\'',
         'list(token = "standard")',
+        'list(token = r"(standard)")',
         'function(token = "standard") NULL',
+        'function(token = r"(standard)") NULL',
     ],
 )
 def test_scan_allows_assignment_examples_inside_benign_metadata(tmp_path: Path, metadata: str) -> None:
@@ -924,6 +926,26 @@ def test_scan_allows_assignment_examples_inside_benign_metadata(tmp_path: Path, 
     credential_checks = _check_by_name(result, "Credential-like String Detection")
     assert len(credential_checks) == 1
     assert credential_checks[0].status == CheckStatus.PASSED
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        '( token = "UNMATCHED_PAREN_SECRET"',
+        '[ token = "UNMATCHED_BRACKET_SECRET"',
+        '( token = r"(UNMATCHED_RAW_PAREN_SECRET)"',
+        '[ token = r"(UNMATCHED_RAW_BRACKET_SECRET)"',
+    ],
+)
+def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path, assignment: str) -> None:
+    path = tmp_path / "unmatched-delimiter-credential.rds"
+    _write_raw_r_serialized(path, assignment)
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
 
 
 def test_scan_doc_heavy_content_with_risky_words_is_not_critical(tmp_path: Path) -> None:
