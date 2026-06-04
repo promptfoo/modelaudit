@@ -3984,6 +3984,183 @@ class TestCVE202523304HydraTarget:
         assert cve_checks[0].details["cve_id"] == "CVE-2025-23304"
 
     @pytest.mark.parametrize(
+        "target",
+        [
+            "http.client.HTTPConnection.endheaders",
+            "http.client.HTTPSConnection.endheaders",
+            "http.client.HTTPConnection._send_output",
+            "http.client.HTTPSConnection._send_output",
+            "http.client.HTTPResponse.read",
+            "http.client.HTTPResponse.read1",
+            "http.client.HTTPResponse.readinto",
+            "http.client.HTTPResponse.readinto1",
+            "http.client.HTTPResponse.readline",
+            "http.client.HTTPResponse.readlines",
+            "http.client.HTTPResponse.peek",
+            "socket.socket.accept",
+            "socket.socket.sendfile",
+            "socket.socket.recv_into",
+            "socket.socket.recvfrom_into",
+            "socket.socket.recvmsg_into",
+            "socket.SocketType.accept",
+            "socket.SocketType.sendfile",
+            "socket.SocketType.recv_into",
+            "socket.SocketType.recvfrom_into",
+            "socket.SocketType.recvmsg_into",
+            "socket.send_fds",
+            "socket.recv_fds",
+            "_socket.socket.accept",
+            "_socket.socket.recv_into",
+            "_socket.socket.recvfrom_into",
+            "_socket.socket.recvmsg_into",
+            "_socket.SocketType.accept",
+            "_socket.SocketType.recv_into",
+            "_socket.SocketType.recvfrom_into",
+            "_socket.SocketType.recvmsg_into",
+            "os.access",
+            "posix.access",
+            "nt.access",
+            "os.fstat",
+            "posix.fstat",
+            "nt.fstat",
+            "os.statvfs",
+            "posix.statvfs",
+            "os.fstatvfs",
+            "posix.fstatvfs",
+            "os.readv",
+            "posix.readv",
+            "os.pread",
+            "posix.pread",
+            "os.preadv",
+            "posix.preadv",
+            "os.writev",
+            "posix.writev",
+            "os.pwrite",
+            "posix.pwrite",
+            "os.pwritev",
+            "posix.pwritev",
+            "os.sendfile",
+            "posix.sendfile",
+            "os.copy_file_range",
+            "posix.copy_file_range",
+            "os.splice",
+            "posix.splice",
+            "os.path.lexists",
+            "posixpath.lexists",
+            "ntpath.lexists",
+            "os.path.realpath",
+            "posixpath.realpath",
+            "ntpath.realpath",
+            "os.path.samefile",
+            "posixpath.samefile",
+            "ntpath.samefile",
+            "os.path.sameopenfile",
+            "posixpath.sameopenfile",
+            "ntpath.sameopenfile",
+            "genericpath.exists",
+            "genericpath.isfile",
+            "genericpath.isdir",
+            "genericpath.getatime",
+            "genericpath.getctime",
+            "genericpath.getmtime",
+            "genericpath.getsize",
+            "genericpath.samefile",
+            "genericpath.sameopenfile",
+            "os.path.ismount",
+            "posixpath.ismount",
+            "ntpath.ismount",
+            "pathlib.Path.resolve",
+            "pathlib.PosixPath.resolve",
+            "pathlib.WindowsPath.resolve",
+            "pathlib.Path.samefile",
+            "pathlib.PosixPath.samefile",
+            "pathlib.WindowsPath.samefile",
+            "pathlib.Path.owner",
+            "pathlib.PosixPath.owner",
+            "pathlib.WindowsPath.owner",
+            "pathlib.Path.group",
+            "pathlib.PosixPath.group",
+            "pathlib.WindowsPath.group",
+            "pathlib.Path.is_socket",
+            "pathlib.PosixPath.is_socket",
+            "pathlib.WindowsPath.is_socket",
+            "pathlib.Path.is_fifo",
+            "pathlib.PosixPath.is_fifo",
+            "pathlib.WindowsPath.is_fifo",
+            "pathlib.Path.is_block_device",
+            "pathlib.PosixPath.is_block_device",
+            "pathlib.WindowsPath.is_block_device",
+            "pathlib.Path.is_char_device",
+            "pathlib.PosixPath.is_char_device",
+            "pathlib.WindowsPath.is_char_device",
+            "os.chmod",
+            "posix.chmod",
+            "nt.chmod",
+            "os.fchmod",
+            "posix.fchmod",
+            "nt.fchmod",
+            "os.chown",
+            "posix.chown",
+            "os.fchown",
+            "posix.fchown",
+            "os.lchown",
+            "posix.lchown",
+            "os.utime",
+            "posix.utime",
+            "nt.utime",
+            "os.ftruncate",
+            "posix.ftruncate",
+            "nt.ftruncate",
+            "os.fsync",
+            "posix.fsync",
+            "nt.fsync",
+            "os.fdatasync",
+            "posix.fdatasync",
+            "os.mknod",
+            "posix.mknod",
+            "os.mkfifo",
+            "posix.mkfifo",
+            "os.getxattr",
+            "posix.getxattr",
+            "os.listxattr",
+            "posix.listxattr",
+            "os.setxattr",
+            "posix.setxattr",
+            "os.removexattr",
+            "posix.removexattr",
+            "shutil.copyfileobj",
+            "shutil.copymode",
+            "shutil.copystat",
+            "shutil.chown",
+            "shutil.disk_usage",
+            "shutil.make_archive",
+            "shutil.unpack_archive",
+            "pathlib.Path.chmod",
+            "pathlib.PosixPath.chmod",
+            "pathlib.WindowsPath.chmod",
+            "pathlib.Path.lchmod",
+            "pathlib.PosixPath.lchmod",
+            "pathlib.WindowsPath.lchmod",
+            "pathlib.Path.link_to",
+            "pathlib.PosixPath.link_to",
+            "pathlib.WindowsPath.link_to",
+        ],
+    )
+    def test_additional_immediate_io_targets_are_dangerous(self, tmp_path: Path, target: str) -> None:
+        """Immediate I/O aliases in covered sink families must not remain INFO-only."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = NemoScanner().scan(str(path))
+
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == target
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
         ("target", "target_config"),
         [
             (
@@ -4240,6 +4417,29 @@ class TestCVE202523304HydraTarget:
         )
         assert determine_exit_code(result) == 1
 
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "http.client.HTTPConnection.endheaders",
+            "socket.socket.sendfile",
+            "os.path.realpath",
+            "os.chmod",
+            "pathlib.Path.resolve",
+            "shutil.unpack_archive",
+        ],
+    )
+    def test_additional_immediate_io_targets_fail_aggregate_scan(self, tmp_path: Path, target: str) -> None:
+        """Representative added I/O aliases should retain security exit-code precedence."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+        result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and issue.details.get("target") == target
+            for issue in result.issues
+        )
+        assert determine_exit_code(result) == 1
+
     def test_unknown_request_named_custom_target_remains_review_only(self, tmp_path: Path) -> None:
         """Exact sink coverage should not promote benign request-like custom factories."""
         config = {"model": {"_target_": "custom_package.requests_get_factory.SafeBuilder"}}
@@ -4408,6 +4608,28 @@ class TestCVE202523304HydraTarget:
         assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "nemo_config_traversal_node_limit" in direct_result.metadata["scan_outcome_reasons"]
         assert determine_exit_code(aggregate_result) == 2
+
+    def test_wide_yaml_config_preserves_detected_security_exit1(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Direct findings visited within the node budget must survive a wide-config limit."""
+        monkeypatch.setattr(nemo_scanner_module, "NEMO_MAX_CONFIG_TRAVERSAL_NODES", 8)
+        path = _create_nemo_file(
+            tmp_path,
+            {
+                "_target_": "os.system",
+                **{f"child_{index}": {"value": index} for index in range(32)},
+            },
+        )
+
+        aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        metadata = aggregate_result.file_metadata[str(path)]
+        assert "nemo_config_traversal_node_limit" in metadata["scan_outcome_reasons"]
+        assert any(issue.details.get("target") == "os.system" for issue in aggregate_result.issues)
+        assert determine_exit_code(aggregate_result) == 1
 
     def test_recursive_yaml_alias_preserves_detected_security_exit1(self, tmp_path: Path) -> None:
         """Findings visited before an alias cycle should retain security precedence."""
