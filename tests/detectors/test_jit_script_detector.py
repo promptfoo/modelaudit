@@ -2154,6 +2154,38 @@ class TestJITScriptDetector:
             ),
             (b"\x00\xffdef deco(function):\n    return eval\n@deco\ndef sink():\n    pass\nsink('1+1')\n"),
             (b"\x00\xffdef framing():\n    return None\ncallbacks = [eval]\ncallbacks.pop()('1+1')\n"),
+            (
+                b"\x00\xffdef framing():\n"
+                b"    return None\n"
+                b"callbacks = [len, eval]\n"
+                b"callbacks.pop(0)\n"
+                b"callbacks[0]('1+1')\n"
+            ),
+            (
+                b"\x00\xffdef run(callback):\n"
+                b"    return callback('1+1')\n"
+                b"callbacks = [len, run]\n"
+                b"callbacks.pop(0)\n"
+                b"callbacks[0](eval)\n"
+            ),
+            (b"\x00\xffeval = len\ndef payload():\n    global eval\n    del eval\n    return eval('1+1')\npayload()\n"),
+            (
+                b"\x00\xffclass H:\n"
+                b"    @classmethod\n"
+                b"    def run(cls, callback):\n"
+                b"        return callback('1+1')\n"
+                b"H.run(eval)\n"
+            ),
+            (b"\x00\xffdef deco(_class):\n    return eval\n@deco\nclass C:\n    pass\nC('1+1')\n"),
+            (b"\x00\xffclass H:\n    @property\n    def sink(self):\n        return eval\nH().sink('1+1')\n"),
+            (
+                b"\x00\xffclass H:\n"
+                b"    def run(self, callback):\n"
+                b"        return callback('1+1')\n"
+                b"Alias = H\n"
+                b"Alias().run(eval)\n"
+            ),
+            (b"__builtins__.__dict__.pop('eval')('1+1')\n"),
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
@@ -2337,6 +2369,50 @@ class TestJITScriptDetector:
                 b"callbacks.append(len)\n"
                 b"callbacks[0]([])\n"
             ),
+            (b"\x00\xffdef framing():\n    return None\ncallbacks = [eval, len]\ncallbacks.pop(0)\ncallbacks[0]([])\n"),
+            (
+                b"\x00\xffdef run(callback):\n"
+                b"    return callback('1+1')\n"
+                b"callbacks = [run, len]\n"
+                b"callbacks.pop(0)\n"
+                b"callbacks[0]([])\n"
+                b"unused = eval\n"
+            ),
+            (
+                b"\x00\xffeval = len\n"
+                b"def benign():\n"
+                b"    global eval\n"
+                b"    del eval\n"
+                b"    eval = len\n"
+                b"    return eval([])\n"
+                b"benign()\n"
+            ),
+            (
+                b"\x00\xffclass H:\n"
+                b"    @classmethod\n"
+                b"    def run(cls, callback):\n"
+                b"        return callback([])\n"
+                b"H.run(len)\n"
+                b"unused = eval\n"
+            ),
+            (b"\x00\xffdef deco(_class):\n    return len\n@deco\nclass C:\n    pass\nC([])\nunused = eval\n"),
+            (
+                b"\x00\xffclass H:\n"
+                b"    @property\n"
+                b"    def sink(self):\n"
+                b"        return len\n"
+                b"H().sink([])\n"
+                b"unused = eval\n"
+            ),
+            (
+                b"\x00\xffclass H:\n"
+                b"    def run(self, callback):\n"
+                b"        return callback([])\n"
+                b"Alias = H\n"
+                b"Alias().run(len)\n"
+                b"unused = eval\n"
+            ),
+            (b"__builtins__.__dict__.pop('len')([])\nunused = eval\n"),
         ],
     )
     def test_scan_model_avoids_false_positives_across_callable_summaries(self, data: bytes) -> None:
