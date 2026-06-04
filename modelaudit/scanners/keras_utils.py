@@ -36,7 +36,8 @@ _LAMBDA_DANGEROUS_PATTERNS: list[str] = [
     "ctypes",
 ]
 _MARSHALLED_CODE_FILENAME_RE = re.compile(r"(?i)(?:[A-Za-z]:)?[\\/][^\x00-\x1f\x7f\"'`<>|]+?\.py[co]?")
-_MAX_LAMBDA_DICT_CODE_B64_CHARS = 1024 * 1024
+_MARSHALLED_NAME_SEPARATOR_RE = r"(?:\.|[\x00-\x1f\x7f\ufffd]{1,16})"
+_MAX_LAMBDA_CODE_B64_CHARS = 1024 * 1024
 
 _EXTRA_SAFE_KERAS_LOSS_IDENTIFIERS: frozenset[str] = frozenset(
     {
@@ -141,10 +142,14 @@ def find_lambda_dangerous_patterns(text: str, patterns: Iterable[str]) -> list[s
     """Match dangerous Lambda bytecode text while ignoring marshalled source filenames."""
     sanitized = _MARSHALLED_CODE_FILENAME_RE.sub(" ", text)
     return [
-        pattern
-        for pattern in patterns
-        if re.search(rf"(?<![0-9A-Za-z_]){re.escape(pattern)}(?![0-9A-Za-z_])", sanitized, re.IGNORECASE)
+        pattern for pattern in patterns if re.search(_lambda_dangerous_pattern_regex(pattern), sanitized, re.IGNORECASE)
     ]
+
+
+def _lambda_dangerous_pattern_regex(pattern: str) -> str:
+    """Match dotted names across bounded marshal metadata without identifier substrings."""
+    pattern_body = _MARSHALLED_NAME_SEPARATOR_RE.join(re.escape(part) for part in pattern.split("."))
+    return rf"(?<![0-9A-Za-z_]){pattern_body}(?![0-9A-Za-z_])"
 
 
 def iter_keras_serialized_identifiers(value: Any) -> Iterator[tuple[str, Any]]:
@@ -300,7 +305,7 @@ def check_lambda_dict_function(
         )
         return True
 
-    if len(code_b64) > _MAX_LAMBDA_DICT_CODE_B64_CHARS:
+    if len(code_b64) > _MAX_LAMBDA_CODE_B64_CHARS:
         _add_lambda_code_size_limit_check(code_b64, result, location, layer_name, function_format="dict")
         return True
 
@@ -357,7 +362,7 @@ def check_lambda_list_function(
         )
         return True
 
-    if len(code_b64) > _MAX_LAMBDA_DICT_CODE_B64_CHARS:
+    if len(code_b64) > _MAX_LAMBDA_CODE_B64_CHARS:
         _add_lambda_code_size_limit_check(code_b64, result, location, layer_name, function_format="list")
         return True
 
@@ -396,7 +401,7 @@ def _add_lambda_code_size_limit_check(
             "function_format": function_format,
             "analysis_status": "code_size_limit_exceeded",
             "encoded_code_chars": len(code_b64),
-            "max_encoded_code_chars": _MAX_LAMBDA_DICT_CODE_B64_CHARS,
+            "max_encoded_code_chars": _MAX_LAMBDA_CODE_B64_CHARS,
         },
         why="Oversized Lambda bytecode was not decoded because it exceeds the bounded static-analysis limit.",
     )

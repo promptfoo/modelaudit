@@ -1107,7 +1107,12 @@ class KerasH5Scanner(BaseScanner):
                             why=get_pattern_explanation("lambda_layer"),
                             rule_code="S1103",
                         )
-        if module_name or function_name:
+        module_reference_values = (module_name, function_name)
+        has_invalid_module_reference = any(
+            value is not None and not isinstance(value, str) for value in module_reference_values
+        )
+        has_module_reference = any(isinstance(value, str) and bool(value.strip()) for value in module_reference_values)
+        if has_module_reference or has_invalid_module_reference:
             # Module/function reference - check for dangerous imports
             if self._is_lambda_module_reference_dangerous(module_name, function_name):
                 result.add_check(
@@ -1122,6 +1127,21 @@ class KerasH5Scanner(BaseScanner):
                         "function": function_name,
                     },
                     why=get_pattern_explanation("lambda_layer"),
+                    rule_code="S1103",
+                )
+            elif has_invalid_module_reference:
+                result.add_check(
+                    name="Lambda Layer Module Reference Check",
+                    passed=False,
+                    message="Lambda layer uses malformed module/function reference metadata",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={
+                        "layer_class": "Lambda",
+                        "module_type": type(module_name).__name__,
+                        "function_type": type(function_name).__name__,
+                    },
+                    why="Malformed Lambda module references cannot be safely classified.",
                     rule_code="S1103",
                 )
             elif not encoded_function_handled:
