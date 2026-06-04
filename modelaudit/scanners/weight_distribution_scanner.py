@@ -12,9 +12,13 @@ from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 _ANALYSIS_INCONCLUSIVE_REASON = "weight_distribution_analysis_incomplete"
 _PATCHED_TORCH_WEIGHTS_ONLY_VERSION = (2, 6, 0)
-_TORCH_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?")
+_TORCH_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)\.(\d+)([A-Za-z0-9.+_-]*)\s*$")
 _TORCH_PRERELEASE_MARKER_PATTERN = re.compile(r"(?i)^(?:a|b|c|rc|alpha|beta|pre|preview|dev)")
-_TORCH_STABLE_SUFFIX_PATTERN = re.compile(r"(?i)^post\d*(?:\+.*)?$")
+_TORCH_LOCAL_SUFFIX = r"\+[a-z0-9]+(?:[._-][a-z0-9]+)*"
+_TORCH_POSTRELEASE_SUFFIX = r"(?:(?:[._-]?(?:post|rev|r)(?:[._-]?\d+)?)|-\d+)"
+_TORCH_STABLE_SUFFIX_PATTERN = re.compile(
+    rf"(?i)^(?:{_TORCH_LOCAL_SUFFIX}|{_TORCH_POSTRELEASE_SUFFIX}(?:{_TORCH_LOCAL_SUFFIX})?)$"
+)
 
 
 class WeightDistributionScanner(BaseScanner):
@@ -240,12 +244,12 @@ class WeightDistributionScanner(BaseScanner):
         if not match:
             return False
 
-        release = tuple(int(part or 0) for part in match.groups())
-        suffix = version_text[match.end() :].strip()
+        release = tuple(int(part) for part in match.groups()[:3])
+        suffix = match.group(4)
         normalized_suffix = suffix.lstrip("._-")
         if _TORCH_PRERELEASE_MARKER_PATTERN.match(normalized_suffix):
             return False
-        if suffix and not suffix.startswith("+") and _TORCH_STABLE_SUFFIX_PATTERN.fullmatch(normalized_suffix) is None:
+        if suffix and _TORCH_STABLE_SUFFIX_PATTERN.fullmatch(suffix) is None:
             return False
         return release >= _PATCHED_TORCH_WEIGHTS_ONLY_VERSION
 
