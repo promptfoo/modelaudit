@@ -1,10 +1,16 @@
+import html as html_lib
+import os
 import posixpath
 import re
 import shutil
 import tempfile
+import unicodedata
 from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
-from urllib.parse import unquote, urlsplit
+from typing import BinaryIO
+from urllib.parse import unquote, urldefrag, urlsplit
 
 import click
 import requests
@@ -12,7 +18,39 @@ import requests
 from ..helpers.disk_space import check_disk_space
 
 _PYTORCH_HUB_PATTERN = r"^https?://pytorch\.org/hub/[\w\-_.]+/?$"
-_PYTORCH_MODEL_URL_PATTERN = r"https://download\.pytorch\.org/models/[^\s\"'<>\\)\]]+"
+_PYTORCH_MODEL_URL_PATTERN = re.compile(
+    r"https://download\.pytorch\.org/models/[^\s\"'<>]+",
+    re.IGNORECASE,
+)
+_MAX_MODEL_URL_DECODE_ROUNDS = 4
+_WINDOWS_INVALID_PATH_CHARS = frozenset('<>:"\\|?*')
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"} | {f"COM{index}" for index in range(1, 10)} | {f"LPT{index}" for index in range(1, 10)}
+)
+
+
+class _ModelURLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.candidates: list[tuple[str, bool, bool]] = []
+
+    def _collect(self, value: str, *, prose: bool) -> None:
+        self.candidates.extend((match.group(0), prose, True) for match in _PYTORCH_MODEL_URL_PATTERN.finditer(value))
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del tag
+        for _, value in attrs:
+            if value is not None:
+                self._collect(value, prose=False)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_data(self, data: str) -> None:
+        self._collect(data, prose=True)
+
+    def handle_comment(self, data: str) -> None:
+        self._collect(data, prose=True)
 
 
 def _get_model_extensions() -> set[str]:
@@ -23,18 +61,52 @@ def _get_model_extensions() -> set[str]:
 
 def _normalized_model_path(url: str) -> str | None:
     """Return a decoded path that remains within download.pytorch.org/models."""
-    path = urlsplit(url).path
-    decoded_path = unquote(path)
-    while decoded_path != path:
-        path = decoded_path
-        decoded_path = unquote(path)
+    try:
+        parsed_url = urlsplit(url)
+    except ValueError:
+        return None
+    if parsed_url.scheme.casefold() != "https" or parsed_url.netloc.casefold() != "download.pytorch.org":
+        return None
 
-    if "\\" in path or "\x00" in path:
-        return None
-    normalized_path = posixpath.normpath(path)
-    if not normalized_path.startswith("/models/"):
-        return None
-    return normalized_path
+    path = unquote(parsed_url.path)
+    normalized_path: str | None = None
+    for _ in range(_MAX_MODEL_URL_DECODE_ROUNDS):
+        if "\\" in path or "\x00" in path:
+            return None
+        current_normalized_path = posixpath.normpath(path)
+        if not current_normalized_path.startswith("/models/"):
+            return None
+        if normalized_path is None:
+            normalized_path = current_normalized_path
+
+        decoded_path = unquote(path)
+        if decoded_path == path:
+            return normalized_path
+        path = decoded_path
+
+    return None
+
+
+def _safe_local_component(component: str) -> str:
+    """Encode path characters that are unsafe or misleading on local filesystems."""
+    trailing_start = len(component.rstrip(" ."))
+    safe_chars: list[str] = []
+    for index, char in enumerate(component):
+        unsafe = (
+            char in _WINDOWS_INVALID_PATH_CHARS
+            or unicodedata.category(char) in {"Cc", "Cf"}
+            or (index >= trailing_start and char in " .")
+        )
+        if unsafe:
+            safe_chars.extend(f"%{byte:02X}" for byte in char.encode())
+        else:
+            safe_chars.append(char)
+
+    safe_component = "".join(safe_chars)
+    reserved_stem = component.split(".", 1)[0].rstrip(" .").upper()
+    if reserved_stem in _WINDOWS_RESERVED_NAMES:
+        safe_component = f"__modelaudit_{safe_component}"
+    return safe_component
 
 
 def _weight_relative_path(url: str) -> Path:
@@ -42,40 +114,133 @@ def _weight_relative_path(url: str) -> Path:
     normalized_path = _normalized_model_path(url)
     if normalized_path is None:
         raise ValueError(f"Unsafe PyTorch Hub model URL: {url}")
-    return Path(*PurePosixPath(normalized_path).relative_to("/models").parts)
+    relative_parts = PurePosixPath(normalized_path).relative_to("/models").parts
+    return Path(*(_safe_local_component(part) for part in relative_parts))
+
+
+def _path_collision_key(path: Path) -> tuple[str, ...]:
+    return tuple(unicodedata.normalize("NFC", part).casefold() for part in path.parts)
+
+
+def _paths_conflict(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
+    shared_length = min(len(left), len(right))
+    return left[:shared_length] == right[:shared_length]
+
+
+def _trim_unmatched_closing_delimiters(url: str) -> str:
+    unmatched = {
+        ")": max(url.count(")") - url.count("("), 0),
+        "]": max(url.count("]") - url.count("["), 0),
+    }
+    end = len(url)
+    while end:
+        closing = url[end - 1]
+        if closing not in unmatched or unmatched[closing] == 0:
+            break
+        unmatched[closing] -= 1
+        end -= 1
+    return url[:end]
+
+
+def _trim_prose_url(url: str) -> str:
+    url = _trim_unmatched_closing_delimiters(url)
+    if url.endswith((".", ",", ";", ":", "}")):
+        url = _trim_unmatched_closing_delimiters(url[:-1])
+    return url
+
+
+def _model_url_candidates(html: str) -> list[tuple[str, bool, bool]]:
+    parser = _ModelURLParser()
+    parser.feed(html)
+    parser.close()
+    parsed_urls = {url for url, _, _ in parser.candidates}
+    # HTMLParser omits URLs inside malformed, unclosed attributes.
+    parser.candidates.extend(
+        (match.group(0), False, False)
+        for match in _PYTORCH_MODEL_URL_PATTERN.finditer(html)
+        if html_lib.unescape(match.group(0)) not in parsed_urls
+    )
+    return parser.candidates
 
 
 def _artifact_download_paths(urls: list[str]) -> list[tuple[str, Path]]:
     """Preserve artifact subpaths and uniquify any remaining local collisions."""
     artifacts: list[tuple[str, Path]] = []
-    used_paths: set[Path] = set()
+    used_paths: set[tuple[str, ...]] = set()
 
     for url in urls:
         relative_path = _weight_relative_path(url)
         download_path = relative_path
         duplicate_index = 2
-        while download_path in used_paths:
+        collision_key = _path_collision_key(download_path)
+        while any(_paths_conflict(collision_key, used_path) for used_path in used_paths):
             download_path = Path(f"__modelaudit_duplicate_{duplicate_index}") / relative_path
             duplicate_index += 1
+            collision_key = _path_collision_key(download_path)
 
-        used_paths.add(download_path)
+        used_paths.add(collision_key)
         artifacts.append((url, download_path))
 
     return artifacts
 
 
 def _safe_destination_path(dest_dir: Path, relative_path: Path) -> Path:
-    """Return a contained local destination without following cache symlinks outside the root."""
+    """Return a contained local destination without resolving outside the root."""
     dest_file = dest_dir / relative_path
     if not dest_file.resolve().is_relative_to(dest_dir.resolve()):
         raise ValueError(f"Unsafe PyTorch Hub cache path: {relative_path.as_posix()}")
-    dest_file.parent.mkdir(parents=True, exist_ok=True)
     return dest_file
+
+
+def _supports_secure_dir_fd_open() -> bool:
+    return (
+        hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_DIRECTORY")
+        and os.open in os.supports_dir_fd
+        and os.mkdir in os.supports_dir_fd
+    )
+
+
+@contextmanager
+def _open_destination_file(dest_dir: Path, relative_path: Path) -> Iterator[BinaryIO]:
+    """Open an artifact without following replaceable symlink path components."""
+    dest_file = _safe_destination_path(dest_dir, relative_path)
+    if not _supports_secure_dir_fd_open():
+        dest_file.parent.mkdir(parents=True, exist_ok=True)
+        dest_file = _safe_destination_path(dest_dir, relative_path)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(dest_file, flags, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            yield handle
+        return
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    directory_fds = [os.open(dest_dir.resolve(), directory_flags)]
+    try:
+        for part in relative_path.parent.parts:
+            parent_fd = directory_fds[-1]
+            try:
+                child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                with suppress(FileExistsError):
+                    os.mkdir(part, mode=0o700, dir_fd=parent_fd)
+                child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            directory_fds.append(child_fd)
+
+        fd = os.open(relative_path.name, file_flags, 0o600, dir_fd=directory_fds[-1])
+        with os.fdopen(fd, "wb") as handle:
+            yield handle
+    finally:
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
 
 
 def is_pytorch_hub_url(url: str) -> bool:
     """Return True if the URL points to a PyTorch Hub model page."""
-    return bool(re.match(_PYTORCH_HUB_PATTERN, url))
+    return bool(re.match(_PYTORCH_HUB_PATTERN, url, re.IGNORECASE))
 
 
 def _extract_weight_urls(html: str) -> list[str]:
@@ -84,16 +249,26 @@ def _extract_weight_urls(html: str) -> list[str]:
     weight_urls: list[str] = []
     seen: set[str] = set()
 
-    for raw_url in re.findall(_PYTORCH_MODEL_URL_PATTERN, html):
-        url = raw_url.rstrip(".,;:")
-        normalized_path = _normalized_model_path(url)
-        if (
-            normalized_path is not None
-            and url not in seen
-            and any(normalized_path.lower().endswith(extension) for extension in model_extensions)
-        ):
-            weight_urls.append(url)
-            seen.add(url)
+    for raw_url, prose, entity_decoded in _model_url_candidates(html):
+        candidates = [raw_url]
+        if prose:
+            trimmed_url = _trim_prose_url(raw_url)
+            if trimmed_url != raw_url:
+                candidates.insert(0, trimmed_url)
+
+        for candidate in candidates:
+            decoded_candidate = candidate if entity_decoded else html_lib.unescape(candidate)
+            url = urldefrag(decoded_candidate).url
+            parsed_url = urlsplit(url)
+            url = parsed_url._replace(scheme="https", netloc="download.pytorch.org").geturl()
+            normalized_path = _normalized_model_path(url)
+            if normalized_path is not None and any(
+                normalized_path.lower().endswith(extension) for extension in model_extensions
+            ):
+                if url not in seen:
+                    weight_urls.append(url)
+                    seen.add(url)
+                break
 
     return weight_urls
 
@@ -137,14 +312,18 @@ def download_pytorch_hub_model(url: str, cache_dir: Path | None = None) -> Path:
             raise Exception(f"Cannot download model from {url}: {message}")
 
     for weight_url, relative_path in _artifact_download_paths(weight_urls):
-        dest_file = _safe_destination_path(dest_dir, relative_path)
         try:
+            _safe_destination_path(dest_dir, relative_path)
             with requests.get(weight_url, stream=True, timeout=30) as resp:
                 resp.raise_for_status()
-                with open(dest_file, "wb") as f:
+                with _open_destination_file(dest_dir, relative_path) as f:
                     for chunk in resp.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
+        except ValueError:
+            if cache_dir is None:
+                shutil.rmtree(dest_dir, ignore_errors=True)
+            raise
         except Exception as e:
             if cache_dir is None:
                 shutil.rmtree(dest_dir, ignore_errors=True)
@@ -197,7 +376,7 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
             try:
                 with requests.get(weight_url, stream=True, timeout=30) as resp:
                     resp.raise_for_status()
-                    with open(dest_file, "wb") as f:
+                    with _open_destination_file(temp_dir, relative_path) as f:
                         for chunk in resp.iter_content(chunk_size=8192):
                             if chunk:
                                 f.write(chunk)
