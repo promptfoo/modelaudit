@@ -818,16 +818,37 @@ def test_savedmodel_preview_redaction_removes_prefixed_and_camel_case_secrets() 
 def test_savedmodel_preview_redaction_removes_authorization_and_escaped_json_secrets() -> None:
     preview = _safe_decoded_preview(
         'Authorization = "ApiKey AUTHSECRET123"\n'
+        "Authorization: ApiKey AUTHSECRET789\n"
         r'payload="{\"api_key\":\"ESCAPEDJSONSECRET456\", \"safe\":\"ok\"}"'
         '\nos.system("id")',
         500,
     )
 
     assert "AUTHSECRET123" not in preview
+    assert "AUTHSECRET789" not in preview
     assert "ESCAPEDJSONSECRET456" not in preview
     assert 'Authorization = "<redacted>"' in preview
+    assert "Authorization: <redacted>" in preview
     assert r"\"api_key\":\"<redacted>\"" in preview
     assert r"\"safe\":\"ok\"" in preview
+    assert "os.system" in preview
+
+
+def test_savedmodel_preview_redaction_removes_non_scalar_sensitive_values() -> None:
+    preview = _safe_decoded_preview(
+        '{"api_key": ["ARRAYSECRET123"], "clientSecret": {"nested": "OBJECTSECRET456"}, "safe": true}\n'
+        "api_key: |\n"
+        "  BLOCKSECRET789\n"
+        "os.system('id')",
+        500,
+    )
+
+    assert "ARRAYSECRET123" not in preview
+    assert "OBJECTSECRET456" not in preview
+    assert "BLOCKSECRET789" not in preview
+    assert '"api_key": <redacted>' in preview
+    assert '"clientSecret": <redacted>' in preview
+    assert "api_key: |\n  <redacted>" in preview
     assert "os.system" in preview
 
 
@@ -894,6 +915,21 @@ def test_savedmodel_preview_redaction_removes_nested_encoded_query_secrets() -> 
     assert "JSONSECRET456" not in preview
     assert "redirect=<redacted>" in preview
     assert "payload=<redacted>" in preview
+
+
+def test_savedmodel_preview_redaction_removes_nested_redirect_url_secrets() -> None:
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    preview = _safe_decoded_preview(
+        "first=https://example.com/hook?redirect=https%3A%2F%2Fuser%3Apass%40evil.example%2Fcb "
+        f"second=https://example.com/hook?callback=https%3A%2F%2Fcb.example%2F{github_token}%2Fdone",
+        500,
+    )
+
+    assert "user%3Apass" not in preview
+    assert "user:pass" not in preview
+    assert github_token not in preview
+    assert "redirect=<redacted>" in preview
+    assert "callback=<redacted>" in preview
 
 
 def test_savedmodel_preview_redaction_removes_additional_url_secret_shapes() -> None:

@@ -35,7 +35,7 @@ def test_redacts_structured_secret_suffixes_pwd_and_token_auth() -> None:
     assert "AUTHTOKEN123" not in redacted
     assert f"token_value={REDACTED_EVIDENCE_VALUE}" in redacted
     assert f"pwd={REDACTED_EVIDENCE_VALUE}" in redacted
-    assert f"Authorization: Token {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f"Authorization: {REDACTED_EVIDENCE_VALUE}" in redacted
 
 
 def test_redacts_multiline_secret_assignments() -> None:
@@ -76,14 +76,20 @@ def test_redacts_prefixed_string_literal_secret_assignments() -> None:
 
 def test_redacts_bare_quoted_authorization_assignments() -> None:
     """Authorization assignments should redact arbitrary quoted auth schemes."""
-    text = 'Authorization = "ApiKey AUTHSECRET123" authorization = r"Custom AUTHSECRET456"'
+    text = (
+        'Authorization = "ApiKey AUTHSECRET123" '
+        'authorization = r"Custom AUTHSECRET456" '
+        "Authorization: ApiKey AUTHSECRET789"
+    )
 
     redacted = redact_evidence_string(text, max_chars=None)
 
     assert "AUTHSECRET123" not in redacted
     assert "AUTHSECRET456" not in redacted
+    assert "AUTHSECRET789" not in redacted
     assert f'Authorization = "{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert f'authorization = r"{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f"Authorization: {REDACTED_EVIDENCE_VALUE}" in redacted
 
 
 def test_redacts_escaped_json_mapping_secret_values() -> None:
@@ -116,6 +122,26 @@ def test_redacts_camel_case_secret_assignments() -> None:
     assert f'sessionToken: "{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert f'"clientSecret": "{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert f'headers["githubToken"] = "{REDACTED_EVIDENCE_VALUE}"' in redacted
+
+
+def test_redacts_non_scalar_sensitive_mapping_values() -> None:
+    """Array/object and block sensitive values should fail closed."""
+    text = (
+        '{"api_key": ["ARRAYSECRET123"], "clientSecret": {"nested": "OBJECTSECRET456"}, "safe": true}\n'
+        "api_key: |\n"
+        "  BLOCKSECRET789\n"
+        "safe: ok"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "ARRAYSECRET123" not in redacted
+    assert "OBJECTSECRET456" not in redacted
+    assert "BLOCKSECRET789" not in redacted
+    assert f'"api_key": {REDACTED_EVIDENCE_VALUE}' in redacted
+    assert f'"clientSecret": {REDACTED_EVIDENCE_VALUE}' in redacted
+    assert f"api_key: |\n  {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "safe: ok" in redacted
 
 
 def test_redacts_parenthesized_quoted_secret_assignments() -> None:
@@ -233,6 +259,23 @@ def test_redacts_nested_bracketed_and_json_sensitive_query_parameters() -> None:
     assert "JSONSECRET456" not in redacted
     assert "redirect=<redacted>" in redacted
     assert "payload=<redacted>" in redacted
+
+
+def test_redacts_credentials_inside_nested_redirect_urls() -> None:
+    """Encoded redirect/callback URLs should not preserve embedded credentials."""
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    text = (
+        "first=https://example.com/hook?redirect=https%3A%2F%2Fuser%3Apass%40evil.example%2Fcb "
+        f"second=https://example.com/hook?callback=https%3A%2F%2Fcb.example%2F{github_token}%2Fdone"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "user%3Apass" not in redacted
+    assert "user:pass" not in redacted
+    assert github_token not in redacted
+    assert "redirect=<redacted>" in redacted
+    assert "callback=<redacted>" in redacted
 
 
 def test_redacts_sensitive_query_values_with_raw_semicolons() -> None:

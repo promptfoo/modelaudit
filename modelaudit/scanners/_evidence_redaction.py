@@ -69,8 +69,8 @@ SENSITIVE_CONTAINER_KEY: Final[str] = rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|authoriza
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(\bauthorization\s*[:=]\s*"
     r"(?!(?:\(\s*)*(?:[rRuUbBfF]{0,3})?[\"'])"
-    r"(?:(?:bearer|basic|token)\s+)?)"
-    r"[^\s\"';&|]+"
+    r")"
+    r"(?:[A-Za-z][A-Za-z0-9._-]*\s+)?[^\s\"';&|,}\]]+"
 )
 AUTH_SCHEME_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\b(?:bearer|basic|token)\s+)[A-Za-z0-9._~+/=-]{8,}")
 STRING_LITERAL_PREFIX_PATTERN: Final[str] = r"(?P<string_prefix>[rRuUbBfF]{0,3})?"
@@ -108,6 +108,11 @@ ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.comp
     rf"(?is)(?P<prefix>\\(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})\\(?P=key_quote)\s*:\s*)"
     r"\\(?P<value_quote>[\"'])(?:(?!\\(?P=value_quote)).)*?\\(?P=value_quote)"
 )
+BRACKETED_MAPPING_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>(?:(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)"
+    rf"|\b(?:{SENSITIVE_ASSIGNMENT_KEY})\b)\s*:\s*)"
+    r"(?:\[[^\]]{0,4096}\]|\{[^}]{0,4096}\})"
+)
 UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*{VALUE_OPENERS_PATTERN})"
     rf"{UNTERMINATED_QUOTED_VALUE_PATTERN}"
@@ -140,6 +145,10 @@ HTML_QUERY_SEPARATOR_RE: Final[re.Pattern[str]] = re.compile(r"(?i)&amp;")
 SEMICOLON_QUERY_SEPARATOR_RE: Final[re.Pattern[str]] = re.compile(r"(?i);(?=(?:amp;)?[a-z0-9%_.\-\[\]]+\s*=)")
 NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(?:^|[?&;])(?:amp;)?{SENSITIVE_ASSIGNMENT_KEY}(?:\[[^\]]*\])*\s*[:=]"
+)
+BLOCK_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?im)(?P<prefix>\b(?:{SENSITIVE_ASSIGNMENT_KEY})\s*:\s*[|>][+-]?)"
+    r"(?P<block>(?:\n(?P<indent>[ \t]+)[^\n]*)+)"
 )
 BRACKETED_QUERY_KEY_SUFFIX_RE: Final[re.Pattern[str]] = re.compile(r"(?:\[[^\]]*\])+\Z")
 
@@ -202,9 +211,38 @@ def _contains_nested_sensitive_query_assignment(value: str) -> bool:
         NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE.search(decoded)
         or QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
         or ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
+        or BRACKETED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
+        or BLOCK_SENSITIVE_ASSIGNMENT_RE.search(decoded)
+        or _contains_nested_url_secret(decoded)
         or QUOTED_MAPPING_SENSITIVE_UNQUOTED_ASSIGNMENT_RE.search(decoded)
         or UNTERMINATED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
     )
+
+
+def _contains_nested_url_secret(value: str) -> bool:
+    """Detect credential-bearing URLs embedded inside decoded query values."""
+    for match in URL_RE.finditer(value):
+        raw_url = match.group(0)
+        try:
+            parsed = urlsplit(raw_url)
+        except ValueError:
+            if "@" in raw_url:
+                return True
+            continue
+
+        hostname = parsed.hostname or ""
+        if "@" in parsed.netloc:
+            return True
+        if _redact_url_path_tokens(parsed.scheme.lower(), hostname.lower(), parsed.path) != parsed.path:
+            return True
+        normalized_query = SEMICOLON_QUERY_SEPARATOR_RE.sub("&", HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query))
+        if any(
+            _normalize_query_key(key) in SENSITIVE_QUERY_KEYS
+            or _contains_nested_sensitive_query_assignment(query_value)
+            for key, query_value in parse_qsl(normalized_query, keep_blank_values=True)
+        ):
+            return True
+    return False
 
 
 def _normalize_query_key(key: str) -> str:
@@ -220,6 +258,11 @@ def _redact_quoted_assignment(match: re.Match[str]) -> str:
 def _redact_escaped_quoted_mapping_assignment(match: re.Match[str]) -> str:
     value_quote = match.group("value_quote")
     return f"{match.group('prefix')}\\{value_quote}{REDACTED_EVIDENCE_VALUE}\\{value_quote}"
+
+
+def _redact_block_assignment(match: re.Match[str]) -> str:
+    indent = match.group("indent") or "  "
+    return f"{match.group('prefix')}\n{indent}{REDACTED_EVIDENCE_VALUE}"
 
 
 def _redact_unterminated_quoted_assignment(match: re.Match[str]) -> str:
@@ -243,6 +286,8 @@ def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
     redacted = URL_RE.sub(_redact_url, text)
     redacted = ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_escaped_quoted_mapping_assignment, redacted)
+    redacted = BRACKETED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
+    redacted = BLOCK_SENSITIVE_ASSIGNMENT_RE.sub(_redact_block_assignment, redacted)
     redacted = QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = QUOTED_AUTHORIZATION_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
