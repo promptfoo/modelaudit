@@ -456,7 +456,7 @@ fn global_ref_details(
 
 type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
 type ImportReferenceDedupeKey = (String, String, String);
-type CallableInvocationDedupeKey = (String, String, String, Option<usize>);
+type CallableInvocationDedupeKey = (String, String, String, Option<usize>, Option<bool>);
 type PendingGlobalImportFinding = (String, usize, Vec<(String, DetailValue)>);
 
 fn detail_value_content_bytes(value: &DetailValue) -> usize {
@@ -495,6 +495,7 @@ struct CallableInvocation {
     op_name: &'static str,
     opcode_position: usize,
     positional_arg_count: Option<usize>,
+    build_uses_slot_state: Option<bool>,
     args: Vec<StackValue>,
 }
 
@@ -2044,55 +2045,66 @@ impl<'a> ScanState<'a> {
         opcode: &ParsedOpcode,
         position: usize,
     ) -> Vec<CallableInvocation> {
-        let (callable_value, positional_arg_count, argument_values) = match opcode.name {
-            "REDUCE" | "NEWOBJ" => {
-                let Some(values) = self.consume_top_operand_values(2) else {
-                    return Vec::new();
-                };
-                (
-                    values.first().cloned(),
-                    Self::tuple_positional_arg_count(values.get(1)),
-                    Self::tuple_argument_values(values.get(1)),
-                )
-            }
-            "NEWOBJ_EX" => {
-                let Some(values) = self.consume_top_operand_values(3) else {
-                    return Vec::new();
-                };
-                (
-                    values.first().cloned(),
-                    Self::tuple_positional_arg_count(values.get(1)),
-                    Self::tuple_argument_values(values.get(1)),
-                )
-            }
-            "OBJ" => {
-                let values = self.pop_to_mark();
-                let positional_arg_count = values.len().checked_sub(1);
-                let callable_value = values.first().cloned();
-                let argument_values = values.get(1..).map(|items| items.to_vec());
-                self.push_constructed_result(callable_value.as_ref());
-                (callable_value, positional_arg_count, argument_values)
-            }
-            "INST" => {
-                let values = self.pop_to_mark();
-                let (module, name) = opcode.arg.global_parts(self.payload);
-                let reference = GlobalRef {
-                    module,
-                    name,
-                    position,
-                    malformed: false,
-                };
-                self.record_global_ref(&reference, opcode.name);
-                self.push_stack_value(StackValue::Constructed(reference.clone()));
-                (
-                    Some(StackValue::Global(reference)),
-                    Some(values.len()),
-                    Some(values),
-                )
-            }
-            "BUILD" => (self.consume_top_operands(2), None, None),
-            _ => (None, None, None),
-        };
+        let (callable_value, positional_arg_count, argument_values, build_uses_slot_state) =
+            match opcode.name {
+                "REDUCE" | "NEWOBJ" => {
+                    let Some(values) = self.consume_top_operand_values(2) else {
+                        return Vec::new();
+                    };
+                    (
+                        values.first().cloned(),
+                        Self::tuple_positional_arg_count(values.get(1)),
+                        Self::tuple_argument_values(values.get(1)),
+                        None,
+                    )
+                }
+                "NEWOBJ_EX" => {
+                    let Some(values) = self.consume_top_operand_values(3) else {
+                        return Vec::new();
+                    };
+                    (
+                        values.first().cloned(),
+                        Self::tuple_positional_arg_count(values.get(1)),
+                        Self::tuple_argument_values(values.get(1)),
+                        None,
+                    )
+                }
+                "OBJ" => {
+                    let values = self.pop_to_mark();
+                    let positional_arg_count = values.len().checked_sub(1);
+                    let callable_value = values.first().cloned();
+                    let argument_values = values.get(1..).map(|items| items.to_vec());
+                    self.push_constructed_result(callable_value.as_ref());
+                    (callable_value, positional_arg_count, argument_values, None)
+                }
+                "INST" => {
+                    let values = self.pop_to_mark();
+                    let (module, name) = opcode.arg.global_parts(self.payload);
+                    let reference = GlobalRef {
+                        module,
+                        name,
+                        position,
+                        malformed: false,
+                    };
+                    self.record_global_ref(&reference, opcode.name);
+                    self.push_stack_value(StackValue::Constructed(reference.clone()));
+                    (
+                        Some(StackValue::Global(reference)),
+                        Some(values.len()),
+                        Some(values),
+                        None,
+                    )
+                }
+                "BUILD" => {
+                    let values = self.consume_top_operand_values(2);
+                    let callable_value = values.as_ref().and_then(|items| items.first()).cloned();
+                    let build_uses_slot_state = values
+                        .as_ref()
+                        .and_then(|items| Self::build_uses_slot_state(items.get(1)));
+                    (callable_value, None, None, build_uses_slot_state)
+                }
+                _ => (None, None, None, None),
+            };
 
         self.record_dynamic_type_callable_attribute_finding(
             callable_value.as_ref(),
@@ -2112,13 +2124,14 @@ impl<'a> ScanState<'a> {
         );
 
         let mut invocations = Vec::new();
-        if let Some(invocation) = Self::callable_invocation_for_value(
+        if let Some(mut invocation) = Self::callable_invocation_for_value(
             callable_value.as_ref(),
             opcode.name,
             position,
             positional_arg_count,
             argument_values.as_deref(),
         ) {
+            invocation.build_uses_slot_state = build_uses_slot_state;
             invocations.push(invocation);
         }
         invocations.extend(self.protocol_dispatch_invocations(
@@ -2171,6 +2184,7 @@ impl<'a> ScanState<'a> {
                     op_name,
                     opcode_position: position,
                     positional_arg_count,
+                    build_uses_slot_state: None,
                     args: args.unwrap_or_default().to_vec(),
                 })
             }
@@ -2184,6 +2198,7 @@ impl<'a> ScanState<'a> {
                     op_name,
                     opcode_position: position,
                     positional_arg_count,
+                    build_uses_slot_state: None,
                     args: args.unwrap_or_default().to_vec(),
                 })
             }
@@ -2195,6 +2210,7 @@ impl<'a> ScanState<'a> {
                     op_name,
                     opcode_position: position,
                     positional_arg_count,
+                    build_uses_slot_state: None,
                     args: args.unwrap_or_default().to_vec(),
                 })
             }
@@ -2206,6 +2222,26 @@ impl<'a> ScanState<'a> {
         matches!(op_name, "REDUCE" | "OBJ")
             && reference.module == "re"
             && reference.name == "Scanner"
+    }
+
+    fn build_uses_slot_state(state: Option<&StackValue>) -> Option<bool> {
+        match state {
+            Some(StackValue::TrackedDict { .. }) => Some(false),
+            Some(StackValue::Tuple(items)) if items.len() == 2 => match items.get(1) {
+                Some(StackValue::TrackedDict {
+                    entries,
+                    unknown_key_values,
+                    unknown_key_values_overflowed,
+                    ..
+                }) => Some(
+                    !entries.is_empty()
+                        || !unknown_key_values.is_empty()
+                        || *unknown_key_values_overflowed,
+                ),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn record_dynamic_type_callable_attribute_finding(
@@ -4196,6 +4232,7 @@ impl<'a> ScanState<'a> {
             op_name,
             opcode_position: position,
             positional_arg_count: Some(1),
+            build_uses_slot_state: None,
             args: Vec::new(),
         })
     }
@@ -4670,6 +4707,7 @@ impl<'a> ScanState<'a> {
             op_name,
             opcode_position: position,
             positional_arg_count,
+            build_uses_slot_state: None,
             args: Vec::new(),
         }
     }
@@ -4792,11 +4830,6 @@ impl<'a> ScanState<'a> {
         if let Some(StackValue::FutureCallbacks(callbacks)) = self.memo.get_mut(&memo_index) {
             callbacks.done = true;
         }
-    }
-
-    fn consume_top_operands(&mut self, operand_count: usize) -> Option<StackValue> {
-        self.consume_top_operand_values(operand_count)
-            .and_then(|values| values.into_iter().next())
     }
 
     fn consume_top_operand_values(&mut self, operand_count: usize) -> Option<Vec<StackValue>> {
@@ -6286,6 +6319,7 @@ impl<'a> ScanState<'a> {
             invocation.reference.name.clone(),
             invocation.op_name.to_string(),
             invocation.positional_arg_count,
+            invocation.build_uses_slot_state,
         );
         if self.callable_invocation_keys.contains(&dedupe_key) {
             return;
@@ -6324,6 +6358,12 @@ impl<'a> ScanState<'a> {
             details.push((
                 "positional_arg_count".to_string(),
                 DetailValue::UInt(positional_arg_count as u64),
+            ));
+        }
+        if let Some(build_uses_slot_state) = invocation.build_uses_slot_state {
+            details.push((
+                "build_uses_slot_state".to_string(),
+                DetailValue::Bool(build_uses_slot_state),
             ));
         }
         self.callable_invocations.push(details);
@@ -7015,7 +7055,22 @@ impl<'a> ScanState<'a> {
         }
         let opcode = detail_string(details, "opcode")?;
         let positional_arg_count = detail_usize(details, "positional_arg_count");
-        Some((module, name, opcode, positional_arg_count))
+        let build_uses_slot_state = details.iter().find_map(|(key, value)| {
+            if key != "build_uses_slot_state" {
+                return None;
+            }
+            match value {
+                DetailValue::Bool(value) => Some(*value),
+                _ => None,
+            }
+        });
+        Some((
+            module,
+            name,
+            opcode,
+            positional_arg_count,
+            build_uses_slot_state,
+        ))
     }
 
     fn coalesce_redundant_global_findings(&mut self) {
@@ -8926,7 +8981,7 @@ mod tests {
         );
         scan.stack.push(StackValue::Text("survivor".to_string()));
 
-        assert!(scan.consume_top_operands(2).is_none());
+        assert!(scan.consume_top_operand_values(2).is_none());
 
         assert_eq!(scan.stack.len(), 2);
         assert_eq!(stack_value_preview(&scan.stack[0], 0), "str:\"survivor\"");

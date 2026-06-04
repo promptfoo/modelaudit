@@ -4845,7 +4845,10 @@ def test_scan_bytes_blocks_fsspec_registry_poisoning_inherited_constructor_rce(t
     payload = _fsspec_registry_poisoning_payload(marker, cache_dir)
     class_ref = "fsspec.implementations.cached.WholeFileCacheFileSystem"
 
-    assert _call_graph_entrypoints(class_ref) == (f"{class_ref}.__init__",)
+    assert _call_graph_entrypoints(class_ref) == (
+        f"{class_ref}.__getattribute__",
+        f"{class_ref}.__init__",
+    )
     assert _find_sink_path(f"{class_ref}.__init__") == (
         f"{class_ref}.__init__",
         "fsspec.filesystem",

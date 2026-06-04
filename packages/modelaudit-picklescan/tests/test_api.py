@@ -3997,6 +3997,171 @@ def test_scan_bytes_keeps_each_repeated_global_invocation_under_review(
     assert marker.read_text(encoding="utf-8") == "owned"
 
 
+def test_scan_bytes_blocks_build_slot_state_setattr_rce(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_build_setattr_{uuid.uuid4().hex}"
+    marker = tmp_path / "build_setattr_marker"
+    setattr_payload = f"open({str(marker)!r}, 'w').write(value)"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Gadget:\n"
+        "    __slots__ = ('value',)\n"
+        "    def __new__(cls):\n"
+        "        return object.__new__(cls)\n"
+        "    def __setattr__(self, name, value):\n"
+        f"        exec({setattr_payload!r})\n"
+        "        object.__setattr__(self, name, value)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"\x80\x04" + f"c{module_name}\nGadget\n".encode() + b")\x81N}\x8c\x05value\x8c\x05owneds\x86b."
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert marker.exists() is False
+    assert any(
+        invocation.get("opcode") == "BUILD" and invocation.get("build_uses_slot_state") is True
+        for invocation in report.metadata["callable_invocations"]
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        and finding.details.get("sink") == "builtins.exec"
+        and finding.details.get("call_path", ())[0].endswith("Gadget.__setattr__")
+        for finding in report.findings
+    )
+    try:
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_scan_bytes_blocks_build_slot_state_setattr_import_rce(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_build_setattr_import_{uuid.uuid4().hex}"
+    imported_module = f"modelaudit_c095_build_setattr_target_{uuid.uuid4().hex}"
+    marker = tmp_path / "build_setattr_import_marker"
+    (tmp_path / f"{imported_module}.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Gadget:\n"
+        "    __slots__ = ('value',)\n"
+        "    def __new__(cls):\n"
+        "        return object.__new__(cls)\n"
+        "    def __setattr__(self, name, value):\n"
+        f"        import {imported_module}\n"
+        "        object.__setattr__(self, name, value)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"\x80\x04" + f"c{module_name}\nGadget\n".encode() + b")\x81N}\x8c\x05value\x8c\x05owneds\x86b."
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        and finding.details.get("sink") == "builtins.__import__"
+        and finding.details.get("call_path", ())[0].endswith("Gadget.__setattr__")
+        for finding in report.findings
+    )
+    try:
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop(module_name, None)
+        sys.modules.pop(imported_module, None)
+
+
+def test_scan_bytes_allows_build_dict_state_without_calling_setattr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_build_dict_setattr_{uuid.uuid4().hex}"
+    marker = tmp_path / "build_dict_setattr_marker"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Gadget:\n"
+        "    def __new__(cls):\n"
+        "        return object.__new__(cls)\n"
+        "    def __setattr__(self, name, value):\n"
+        f"        open({str(marker)!r}, 'w').write(value)\n"
+        "        object.__setattr__(self, name, value)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"\x80\x04" + f"c{module_name}\nGadget\n".encode() + b")\x81}\x8c\x05value\x8c\x05ownedsb."
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert marker.exists() is False
+    assert any(
+        invocation.get("opcode") == "BUILD" and invocation.get("build_uses_slot_state") is False
+        for invocation in report.metadata["callable_invocations"]
+    )
+    assert all(finding.rule_code != "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+    try:
+        gadget = pickle.loads(payload)
+        assert gadget.value == "owned"
+        assert marker.exists() is False
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_scan_bytes_preserves_distinct_build_state_invocations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_build_state_variants_{uuid.uuid4().hex}"
+    marker = tmp_path / "build_state_variants_marker"
+    setattr_payload = f"open({str(marker)!r}, 'w').write(value)"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Gadget:\n"
+        "    __slots__ = ('value', '__dict__')\n"
+        "    def __new__(cls):\n"
+        "        return object.__new__(cls)\n"
+        "    def __setattr__(self, name, value):\n"
+        f"        exec({setattr_payload!r})\n"
+        "        object.__setattr__(self, name, value)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    global_opcode = f"c{module_name}\nGadget\n".encode()
+    direct_dict_state = b")\x81}\x8c\x05value\x8c\x04safesb0"
+    slot_state = b"h\x00)\x81N}\x8c\x05value\x8c\x05owneds\x86b."
+    payload = b"\x80\x04" + global_opcode + b"\x94" + direct_dict_state + slot_state
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert marker.exists() is False
+    build_invocations = [
+        invocation for invocation in report.metadata["callable_invocations"] if invocation.get("opcode") == "BUILD"
+    ]
+    assert {invocation.get("build_uses_slot_state") for invocation in build_invocations} == {
+        False,
+        True,
+    }
+    try:
+        pickle.loads(payload)
+        assert marker.read_text(encoding="utf-8") == "owned"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 def test_scan_bytes_allows_import_only_global_with_inert_package_chain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4491,6 +4656,64 @@ def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -
     assert updated is report
     assert updated.verdict == SafetyVerdict.CLEAN
     assert updated.findings == ()
+
+
+def test_scan_bytes_skips_call_graph_enrichment_without_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_enrichment(_report: PickleReport) -> PickleReport:
+        raise AssertionError("reference-free reports should not enter call-graph enrichment")
+
+    monkeypatch.setattr(package_api, "_with_call_graph_findings", unexpected_enrichment)
+
+    report = scan_bytes(pickle.dumps({"weights": [1, 2, 3]}, protocol=4), source="no-references.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_skips_call_graph_enrichment_for_already_critical_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_enrichment(_report: PickleReport) -> PickleReport:
+        raise AssertionError("critical references should not enter redundant call-graph enrichment")
+
+    monkeypatch.setattr(package_api, "_with_call_graph_findings", unexpected_enrichment)
+
+    report = scan_bytes(pickle.dumps(MaliciousPayload(), protocol=4), source="already-critical.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") in SYSTEM_GLOBALS
+        for finding in report.findings
+    )
+
+
+def test_call_graph_enrichment_remains_required_for_unreviewed_sibling() -> None:
+    report = PickleReport(
+        source="critical-with-unreviewed-sibling.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="native critical finding",
+                severity=Severity.CRITICAL,
+                location="critical-with-unreviewed-sibling.pkl",
+                rule_code="DANGEROUS_CALL",
+                details={"module": "posix", "name": "system"},
+            ),
+        ),
+        metadata={
+            "import_references": (
+                {"module": "posix", "name": "system"},
+                {"module": "private_payload", "name": "Gadget"},
+            )
+        },
+    )
+
+    assert package_api._call_graph_enrichment_is_redundant(report) is False
 
 
 def test_scan_bytes_marks_call_graph_enrichment_failures_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:

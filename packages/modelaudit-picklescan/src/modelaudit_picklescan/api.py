@@ -977,7 +977,9 @@ def _scan_pickle_payload_native(
         if not isinstance(raw_report, Mapping):
             raise TypeError(f"Rust scanner returned {type(raw_report).__name__}, expected mapping")
         report = _report_from_native_dict(raw_report)
-        return _with_call_graph_findings(report) if enrich_call_graph else _with_import_origin_findings(report)
+        if enrich_call_graph:
+            return report if _call_graph_enrichment_is_redundant(report) else _with_call_graph_findings(report)
+        return _with_import_origin_findings(report)
     except Exception as error:
         return _engine_error_report(
             source=source,
@@ -1016,6 +1018,31 @@ def _report_from_native_dict(raw_report: Mapping[str, Any]) -> PickleReport:
         metadata=dict(_mapping(raw_report.get("metadata", {}))),
         duration_s=float(raw_report.get("duration_s", 0.0)),
     )
+
+
+def _call_graph_enrichment_is_redundant(report: PickleReport) -> bool:
+    if report.metadata.get("import_references_truncated") or report.metadata.get("callable_invocations_truncated"):
+        return False
+
+    references = {
+        (str(reference.get("module", "")), str(reference.get("name", "")))
+        for raw_reference in (
+            *_sequence(report.metadata.get("import_references")),
+            *_sequence(report.metadata.get("callable_invocations")),
+        )
+        if (reference := _mapping(raw_reference))
+        and str(reference.get("module", ""))
+        and str(reference.get("name", ""))
+    }
+    if not references:
+        return True
+
+    critical_references = {
+        (str(finding.details.get("module", "")), str(finding.details.get("name", "")))
+        for finding in report.findings
+        if finding.severity == Severity.CRITICAL
+    }
+    return references <= critical_references
 
 
 def _with_call_graph_findings(report: PickleReport) -> PickleReport:

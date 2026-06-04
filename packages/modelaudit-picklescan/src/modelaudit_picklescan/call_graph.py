@@ -190,14 +190,20 @@ _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = frozenset(
 )
 _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS = ("__new__", "__init__")
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS = ("__setstate__",)
+_PICKLE_BUILD_ENTRYPOINT_METHODS = (
+    "__getattribute__",
+    "__getattr__",
+    *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
+    "__setattr__",
+)
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHOD_SET = frozenset(_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS)
 _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS = (
     *_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
-    *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
+    *_PICKLE_BUILD_ENTRYPOINT_METHODS,
 )
 _INHERITED_CLASS_ENTRYPOINT_METHODS = (
     *_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
-    *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
+    *_PICKLE_BUILD_ENTRYPOINT_METHODS,
 )
 _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH: ContextVar[int] = ContextVar(
     "_SHARED_SOURCE_SENSITIVE_CACHE_DEPTH",
@@ -296,6 +302,7 @@ _CLASS_ENTRYPOINT_METHODS = (
     "__exit__",
     "__new__",
     *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
+    "__setattr__",
     "__init__",
 )
 _CLASS_ENTRYPOINT_METHOD_SET = frozenset(_CLASS_ENTRYPOINT_METHODS)
@@ -558,6 +565,23 @@ def find_dangerous_call_graphs(
                 analysis_limit_error = error
             sink_path = error.partial_path
         if sink_path is None:
+            for entrypoint in entrypoints:
+                entrypoint_arg_count = _pickle_entrypoint_positional_arg_count(reference, entrypoint)
+                if entrypoint_arg_count is None:
+                    continue
+                try:
+                    sink_path = _find_invoked_import_execution_path(
+                        entrypoint,
+                        entrypoint_arg_count,
+                        allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
+                    )
+                except _CallGraphAnalysisLimitError as error:
+                    if analysis_limit_error is None:
+                        analysis_limit_error = error
+                    sink_path = error.partial_path
+                if sink_path is not None:
+                    break
+        if sink_path is None:
             for positional_arg_count in positional_arg_counts.get((module, name), ()):
                 try:
                     sink_path = _first_matching_path(
@@ -611,10 +635,13 @@ def find_startup_hook_write_call_graphs(
     openers: list[_ImportCallPath] = []
     writers: list[_ImportCallPath] = []
     seen: set[tuple[str, str]] = set()
-    invoked_references = {
-        (str(reference.get("module", "")), str(reference.get("name", "")))
-        for reference in _iter_callable_invocation_references(callable_invocations)
-    }
+    callable_references = _iter_callable_invocation_references(callable_invocations)
+    invocations_by_reference: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for reference in callable_references:
+        module = str(reference.get("module", ""))
+        name = str(reference.get("name", ""))
+        if module and name:
+            invocations_by_reference.setdefault((module, name), []).append(reference)
     require_invocations = callable_invocations is not None and callable_invocations_complete
     analysis_limit_error: _CallGraphAnalysisLimitError | None = None
     for reference in _iter_import_references(import_references):
@@ -622,12 +649,27 @@ def find_startup_hook_write_call_graphs(
         name = str(reference.get("name", ""))
         if not module or not name or (module, name) in seen:
             continue
-        if require_invocations and (module, name) not in invoked_references:
+        invocation_references = invocations_by_reference.get((module, name), ())
+        if require_invocations and not invocation_references:
             continue
         seen.add((module, name))
 
         try:
-            entrypoints = _safe_call_graph_entrypoints(f"{module}.{name}")
+            entrypoints = (
+                _dedupe_calls(
+                    tuple(
+                        entrypoint
+                        for invocation_reference in invocation_references
+                        for entrypoint in _call_graph_entrypoints_for_reference(
+                            module,
+                            name,
+                            invocation_reference,
+                        )
+                    )
+                )
+                if require_invocations
+                else _safe_call_graph_entrypoints(f"{module}.{name}")
+            )
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
@@ -946,7 +988,7 @@ def _iter_call_graph_references(
 ) -> tuple[dict[str, object], ...]:
     normalized: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
-    seen_invocations: set[tuple[str, str, str, int | None]] = set()
+    seen_invocations: set[tuple[str, str, str, int | None, bool | None]] = set()
     for item in callable_references:
         module = str(item.get("module", ""))
         name = str(item.get("name", ""))
@@ -959,6 +1001,7 @@ def _iter_call_graph_references(
             name,
             opcode,
             positional_arg_count if isinstance(positional_arg_count, int) else None,
+            _optional_bool_reference_detail(item.get("build_uses_slot_state")),
         )
         if invocation_key in seen_invocations:
             continue
@@ -1002,12 +1045,16 @@ def _iter_import_references(import_references: object) -> tuple[dict[str, object
     return tuple(normalized)
 
 
+def _optional_bool_reference_detail(value: object) -> bool | None:
+    return value if type(value) is bool else None
+
+
 def _iter_callable_invocation_references(callable_invocations: object | None) -> tuple[dict[str, object], ...]:
     if not isinstance(callable_invocations, list | tuple):
         return ()
 
     normalized: list[dict[str, object]] = []
-    seen: set[tuple[str, str, str, int | None]] = set()
+    seen: set[tuple[str, str, str, int | None, bool | None]] = set()
     for item in callable_invocations:
         if not isinstance(item, Mapping):
             continue
@@ -1026,6 +1073,7 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
                 reference_name,
                 opcode,
                 positional_arg_count if isinstance(positional_arg_count, int) else None,
+                _optional_bool_reference_detail(item.get("build_uses_slot_state")),
             )
             if reference_key in seen:
                 continue
@@ -1060,10 +1108,27 @@ def _call_graph_entrypoints_for_reference(
             return _filter_class_entrypoints(entrypoints, (*_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS, "__new__"))
         return _filter_class_entrypoints(entrypoints, ("__new__",))
     if opcode in _BUILD_OPCODES:
-        return _filter_class_entrypoints(entrypoints, _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS)
+        methods: tuple[str, ...] = _PICKLE_BUILD_ENTRYPOINT_METHODS
+        if reference.get("build_uses_slot_state") is False:
+            methods = tuple(method for method in methods if method != "__setattr__")
+        return _filter_class_entrypoints(entrypoints, methods)
     if opcode in _CONSTRUCTOR_OPCODES:
         return _filter_class_entrypoints(entrypoints, _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS)
     return entrypoints
+
+
+def _pickle_entrypoint_positional_arg_count(
+    reference: Mapping[str, object],
+    entrypoint: str,
+) -> int | None:
+    if str(reference.get("opcode", "")) not in _BUILD_OPCODES:
+        return None
+    method_name = entrypoint.rpartition(".")[2]
+    if method_name in {"__getattribute__", "__getattr__", "__setstate__"}:
+        return 1
+    if method_name == "__setattr__":
+        return 2
+    return None
 
 
 def _call_graph_reference_is_analyzed(

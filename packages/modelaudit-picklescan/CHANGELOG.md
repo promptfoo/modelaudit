@@ -58,6 +58,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed when encoded nested-pickle probe candidates exhaust the analysis cap
 - warn on import-only pickle globals that reference non-allowlisted custom modules,
   shadow trusted modules, rewrite package import paths, or rely on unchecked bytecode caches
+- detect `BUILD` slot-state execution through custom attribute hooks without
+  flagging ordinary dictionary state
 - preserve reviewed safe callable references in dependency-minimal environments and
   recognize active-environment package overlays without trusting project-local shadows
 - prevent call-graph alias cycles from hanging scans
@@ -73,6 +75,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance Improvements
 
 - expose a bounded, source-validated analysis cache scope for multi-artifact scan operations
+- skip Python call-graph enrichment when native analysis has no references or
+  has already classified every reference as critical
 
 ## [0.1.3](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.2...modelaudit-picklescan-v0.1.3) (2026-04-27)
 
