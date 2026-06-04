@@ -1647,6 +1647,26 @@ def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
             b"    vars = lambda value: {'system': lambda command: None}\n"
             b"    return vars(__import__('os'))['system']('id')\n"
         ),
+        (
+            b"import contextlib\n"
+            b"\n"
+            b"def handle(data, context):\n"
+            b"    with contextlib.nullcontext():\n"
+            b"        return []\n"
+            b"        __import__('os').system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return __import__('os').__getattribute__('system', None)('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return list(*(generator, generator))\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    holder.gen = (module.system('id') for module in [__import__('os')])\n"
+            b"    holder = None\n"
+            b"    return list(holder.gen)\n"
+        ),
     ],
 )
 def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
@@ -1858,6 +1878,23 @@ def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
         ),
         (b"class Handler(object, marker=__import__('os').system('id')):\n    pass\n"),
         (b"def handle(data, context):\n    return vars(__import__('os'))['system']('id')\n"),
+        (
+            b"import importlib\n"
+            b"\n"
+            b"def handle(data, context):\n"
+            b"    return getattr(importlib, 'import_module')('os').system('id')\n"
+        ),
+        (b"def handle(data, context):\n    return __import__('os').__getattribute__('system')('id')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    generator = (module.system('id') for module in [__import__('os')])\n"
+            b"    return list(*(generator,))\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    holder.gen = (module.system('id') for module in [__import__('os')])\n"
+            b"    return list(holder.gen)\n"
+        ),
     ],
 )
 def test_dynamic_import_handler_analysis_preserves_reachable_aliases(

@@ -1925,6 +1925,14 @@ class TorchServeMarScanner(BaseScanner):
                 import_loader_aliases,
                 shadowed_names,
             )
+            if isinstance(node.func, ast.Call):
+                factory_roots |= self._resolve_dynamic_import_getattr_roots(
+                    node.func,
+                    aliases,
+                    module_aliases,
+                    import_loader_aliases,
+                    shadowed_names,
+                )
             retained_roots = set(self._module_names_for_import_helpers(node, factory_roots & _DYNAMIC_IMPORT_HELPERS))
             retained_roots.update(root for root in factory_roots if root == "webbrowser.get")
             if "ctypes.LibraryLoader" in factory_roots:
@@ -2001,6 +2009,13 @@ class TorchServeMarScanner(BaseScanner):
             import_loader_aliases,
             shadowed_names,
         )
+        target_name = self._resolve_call_name(target_node)
+        if (
+            target_name is not None
+            and target_name.split(".", maxsplit=1)[0] not in shadowed_names
+            and target_name.split(".", maxsplit=1)[0] in aliases
+        ):
+            module_names |= frozenset({self._apply_alias(target_name, aliases)})
         attr_name = self._static_string_value(attr_node)
         if not module_names or attr_name is None:
             return frozenset()
@@ -2144,13 +2159,37 @@ class TorchServeMarScanner(BaseScanner):
             )
 
         if isinstance(node, ast.Call):
-            return self._resolve_dynamic_import_getattr_calls(
-                node,
-                aliases,
-                module_aliases,
-                import_loader_aliases,
-                shadowed_names,
+            call_names = set(
+                self._resolve_dynamic_import_getattr_calls(
+                    node,
+                    aliases,
+                    module_aliases,
+                    import_loader_aliases,
+                    shadowed_names,
+                )
             )
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "__getattribute__"
+                and len(node.args) == 1
+                and not node.keywords
+            ):
+                module_names = self._resolve_dynamic_import_roots(
+                    node.func.value,
+                    aliases,
+                    module_aliases,
+                    import_loader_aliases,
+                    shadowed_names,
+                )
+                attr_name = self._static_string_value(node.args[0])
+                if attr_name is not None:
+                    call_names.update(
+                        call_name
+                        for module_name in module_names
+                        if (call_name := _normalized_high_risk_python_call_name(f"{module_name}.{attr_name}"))
+                        is not None
+                    )
+            return frozenset(call_names)
 
         return frozenset()
 
@@ -3551,6 +3590,18 @@ class TorchServeMarScanner(BaseScanner):
                             short_circuit_on=short_circuit_on,
                         )
                     return bool(generators)
+                if isinstance(value, ast.Attribute):
+                    attribute_name = scanner._resolve_call_name(value)
+                    generators = (
+                        self.lazy_generator_aliases.get(attribute_name, ()) if attribute_name is not None else ()
+                    )
+                    for generator in generators:
+                        self._visit_eager_generator_expression(
+                            generator,
+                            first_only=first_only,
+                            short_circuit_on=short_circuit_on,
+                        )
+                    return bool(generators)
                 if isinstance(value, ast.Call):
                     wrapper_name = scanner._resolve_call_name(value.func)
                     resolved_wrapper_name = (
@@ -3858,8 +3909,7 @@ class TorchServeMarScanner(BaseScanner):
                             self._invalidate_target(item.optional_vars)
                         else:
                             self._record_target_assignment(item.optional_vars, bound_value)
-                for statement in node.body:
-                    self.visit(statement)
+                self._visit_statement_block(node.body)
 
             def visit_With(self, node: ast.With) -> None:
                 self._visit_with(node)
@@ -3872,7 +3922,10 @@ class TorchServeMarScanner(BaseScanner):
                 node: ast.Call,
                 resolved_call_name: str | None,
             ) -> set[int]:
-                if resolved_call_name is None or any(isinstance(argument, ast.Starred) for argument in node.args):
+                if resolved_call_name is None:
+                    return set()
+                expanded_args = scanner._expanded_literal_call_arguments(node.args)
+                if expanded_args is None:
                     return set()
 
                 consumer_name = resolved_call_name.removeprefix("builtins.")
@@ -3884,21 +3937,21 @@ class TorchServeMarScanner(BaseScanner):
                     return set()
 
                 if consumer_name in {"all", "any", "frozenset", "list", "set", "tuple"}:
-                    return {0} if len(node.args) == 1 and not keyword_names else set()
+                    return {0} if len(expanded_args) == 1 and not keyword_names else set()
                 if consumer_name == "dict":
-                    return {0} if len(node.args) == 1 else set()
+                    return {0} if len(expanded_args) == 1 else set()
                 if consumer_name == "sorted":
-                    return {0} if len(node.args) == 1 and named_keywords <= {"key", "reverse"} else set()
+                    return {0} if len(expanded_args) == 1 and named_keywords <= {"key", "reverse"} else set()
                 if consumer_name == "sum":
-                    if len(node.args) not in {1, 2} or named_keywords - {"start"}:
+                    if len(expanded_args) not in {1, 2} or named_keywords - {"start"}:
                         return set()
-                    if len(node.args) == 2 and "start" in named_keywords:
+                    if len(expanded_args) == 2 and "start" in named_keywords:
                         return set()
                     return {0}
                 if consumer_name in {"max", "min"}:
-                    return {0} if len(node.args) == 1 and named_keywords <= {"default", "key"} else set()
+                    return {0} if len(expanded_args) == 1 and named_keywords <= {"default", "key"} else set()
                 if consumer_name == "next":
-                    return {0} if len(node.args) in {1, 2} and not keyword_names else set()
+                    return {0} if len(expanded_args) in {1, 2} and not keyword_names else set()
                 return set()
 
             def visit_Call(self, node: ast.Call) -> None:
@@ -3951,7 +4004,13 @@ class TorchServeMarScanner(BaseScanner):
                 if isinstance(node.func, ast.Attribute) and node.func.attr in {"__next__", "send"}:
                     self._visit_consumed_generator_value(node.func.value, first_only=True)
                 self.visit(node.func)
-                for argument_index, argument in enumerate(node.args):
+                expanded_args = (
+                    scanner._expanded_literal_call_arguments(node.args)
+                    if any(isinstance(argument, ast.Starred) for argument in node.args)
+                    else node.args
+                )
+                arguments_to_visit = expanded_args if expanded_args is not None else node.args
+                for argument_index, argument in enumerate(arguments_to_visit):
                     if not (
                         argument_index in consumed_generator_indexes
                         and self._visit_consumed_generator_value(
