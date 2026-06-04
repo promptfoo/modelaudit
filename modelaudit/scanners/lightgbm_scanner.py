@@ -93,18 +93,38 @@ _DEDICATED_LIGHTGBM_EXTENSIONS = {".lgb", ".lightgbm"}
 _EXCERPT_OMITTED_REASON = "model_text_may_contain_sensitive_literals"
 _SENSITIVE_HOST_LABEL_PATTERN = re.compile(
     r"(?i)^(?:"
+    r"aiza[0-9a-z_-]{35}|"
     r"akia[0-9a-z]{16}|"
     r"gh[opusr]_[a-z0-9]{36}|"
     r"github_pat_[a-z0-9]{22}_[a-z0-9]{59}|"
+    r"glpat-[a-z0-9_-]{20}|"
+    r"hf_[a-z0-9_-]{20,}|"
+    r"npm_[a-z0-9]{36}|"
+    r"rg_[a-z0-9]{32}|"
     r"sk-(?:proj-)?[a-z0-9_-]{24,}|"
+    r"sq0atp-[a-z0-9_-]{22}|"
+    r"sq0csp-[a-z0-9_-]{43}|"
+    r"(?:stripe_live|[rs]k_live)_[a-z0-9]{24}|"
     r"xox[baprs]-[0-9a-z-]{20,}|"
+    r"az[a-z0-9]{34}|"
     r"[a-f0-9]{32,}"
     r")$"
+)
+_SENSITIVE_MULTILABEL_HOST_PATTERN = re.compile(
+    r"(?i)(?<![a-z0-9_-])(?:"
+    r"sg\.[a-z0-9_-]{22}\.[a-z0-9_-]{43}|"
+    r"eyj[a-z0-9_-]{8,}\.eyj[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}|"
+    r"[0-9]{17,19}\.[a-z0-9_-]{6}\.[a-z0-9_-]{27}"
+    r")(?![a-z0-9_-])"
 )
 
 
 def _redact_sensitive_hostname_labels(hostname: str) -> str:
     """Redact credential-shaped hostname labels while preserving endpoint context."""
+    hostname = _SENSITIVE_MULTILABEL_HOST_PATTERN.sub(
+        "<redacted>",
+        hostname,
+    )
     return ".".join(
         "<redacted>" if _SENSITIVE_HOST_LABEL_PATTERN.fullmatch(label) else label for label in hostname.split(".")
     )

@@ -10,7 +10,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.lightgbm_scanner import LightGBMScanner
+from modelaudit.scanners.lightgbm_scanner import LightGBMScanner, _redact_url_for_display
 from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension, validate_file_type
 
 
@@ -269,7 +269,15 @@ def test_lightgbm_read_failure_takes_operational_precedence_over_security_findin
 
 def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
     path = tmp_path / "network_secret.model"
-    hostname_secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    hostname_secrets = [
+        "sk-" + ("a" * 30),
+        "AIza" + ("a" * 35),
+        "hf_" + ("a" * 36),
+        "glpat-" + ("a" * 20),
+        "npm_" + ("a" * 36),
+        "SG." + ("a" * 22) + "." + ("b" * 43),
+        "eyJ" + ("a" * 18) + ".eyJ" + ("b" * 28) + "." + ("c" * 18),
+    ]
     benign_hostname = "sk-documentation-20260604.evil.example"
     path.write_text(
         _build_lightgbm_text(
@@ -282,7 +290,7 @@ def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
                 ),
                 "callback_url=https://lgb_user:lgb_pass@collector.evil.example/"
                 + "LGB_PATH_SECRET/payload.sh?token=LGB_SECRET#frag",
-                f"callback_url=https://{hostname_secret}.evil.example/payload.sh",
+                *(f"callback_url=https://{secret}.evil.example/payload.sh" for secret in hostname_secrets),
                 f"callback_url=https://{benign_hostname}/model.txt",
             ]
         ),
@@ -294,26 +302,51 @@ def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
     network_checks = _check_by_name(result, "Network Indicator Check")
     assert len(network_checks) == 1
     assert network_checks[0].details == {
-        "examples": [
-            {"line": "18", "type": "url", "value": "https://collector.evil.example"},
-            {"line": "19", "type": "url", "value": "https://collector.evil.example"},
-            {"line": "20", "type": "url", "value": "https://<redacted>.evil.example"},
-            {"line": "21", "type": "url", "value": f"https://{benign_hostname}"},
-        ]
+        "examples": (
+            [
+                {"line": "18", "type": "url", "value": "https://collector.evil.example"},
+                {"line": "19", "type": "url", "value": "https://collector.evil.example"},
+            ]
+            + [
+                {"line": str(20 + index), "type": "url", "value": "https://<redacted>.evil.example"}
+                for index in range(len(hostname_secrets))
+            ]
+            + [
+                {
+                    "line": str(20 + len(hostname_secrets)),
+                    "type": "url",
+                    "value": f"https://{benign_hostname}",
+                }
+            ]
+        )
     }
 
-    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    failed_details = " ".join(
+        str(check.details) for check in result.checks if check.status == CheckStatus.FAILED
+    ).lower()
     assert "lgb_user" not in failed_details
     assert "lgb_pass" not in failed_details
-    assert "LGB_SECRET" not in failed_details
-    assert "LGB_PATH_SECRET" not in failed_details
-    assert "LGB_ADJACENT_SECRET" not in failed_details
-    assert "LGB_BEARER_SECRET" not in failed_details
-    assert "LGB_STANDALONE_SECRET" not in failed_details
-    assert hostname_secret not in failed_details
+    assert "lgb_secret" not in failed_details
+    assert "lgb_path_secret" not in failed_details
+    assert "lgb_adjacent_secret" not in failed_details
+    assert "lgb_bearer_secret" not in failed_details
+    assert "lgb_standalone_secret" not in failed_details
+    assert all(secret.lower() not in failed_details for secret in hostname_secrets)
     assert "model_text_may_contain_sensitive_literals" in failed_details
     assert "payload.sh" not in failed_details
     assert "#frag" not in failed_details
+
+
+@pytest.mark.parametrize(
+    "hostname",
+    [
+        "sk-documentation-20260604.evil.example",
+        "hf_model-documentation.evil.example",
+        "aiza-documentation.evil.example",
+    ],
+)
+def test_lightgbm_url_redaction_preserves_benign_hostname_lookalikes(hostname: str) -> None:
+    assert _redact_url_for_display(f"https://{hostname}/model.txt") == f"https://{hostname}"
 
 
 def test_scan_corrupt_file_fails_signature_validation(tmp_path: Path) -> None:
