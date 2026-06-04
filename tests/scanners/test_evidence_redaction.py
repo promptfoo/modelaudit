@@ -611,6 +611,55 @@ def test_unparseable_sensitive_comparison_and_keyed_calls_fail_closed() -> None:
     assert 'eval("1 + 1")' in redacted
 
 
+def test_redacts_http_auth_and_sensitive_option_defaults() -> None:
+    """Auth arguments and credential option defaults must not retain secrets."""
+    text = (
+        'requests.get(url, auth=("user", "BASICAUTHSECRET1234567890")); '
+        'parser.add_argument("-k", "--api-key", default="ARGPARSESECRET1234567890"); '
+        'click.option("--client-secret", default=build("CLICKSECRET1234567890")); '
+        'requests.get(url, auth_timeout="visible"); '
+        'parser.add_argument("--region", default="us-east-1"); '
+        'parser.add_argument("--api-key-count", default=3); '
+        'click.option("--token-cache", default="enabled"); eval("1 + 1")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "BASICAUTHSECRET1234567890" not in redacted
+    assert "ARGPARSESECRET1234567890" not in redacted
+    assert "CLICKSECRET1234567890" not in redacted
+    assert "auth=<redacted>" in redacted
+    assert 'parser.add_argument("-k", "--api-key", default=<redacted>)' in redacted
+    assert 'click.option("--client-secret", default=<redacted>)' in redacted
+    assert 'auth_timeout="visible"' in redacted
+    assert 'parser.add_argument("--region", default="us-east-1")' in redacted
+    assert 'parser.add_argument("--api-key-count", default=3)' in redacted
+    assert 'click.option("--token-cache", default="enabled")' in redacted
+    assert 'eval("1 + 1")' in redacted
+
+
+def test_redacts_parsed_python_literal_sensitive_keys() -> None:
+    """Escaped and triple-quoted keys should be classified by parsed value."""
+    text = (
+        'os.environ["""API_KEY"""] = "TRIPLEKEYSECRET1234567890"\n'
+        'payload[("client_" "secret")] = "CONCATKEYSECRET1234567890"\n'
+        'payload = {"api_\\x6bey": "ESCAPEDKEYSECRET1234567890", '
+        '"regi\\x6fn": "visible"}\n'
+        'safe: "api_key" = "visible"'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "TRIPLEKEYSECRET1234567890" not in redacted
+    assert "CONCATKEYSECRET1234567890" not in redacted
+    assert "ESCAPEDKEYSECRET1234567890" not in redacted
+    assert 'os.environ["""API_KEY"""] = <redacted>' in redacted
+    assert 'payload[("client_" "secret")] = <redacted>' in redacted
+    assert '"api_\\x6bey": <redacted>' in redacted
+    assert '"regi\\x6fn": "visible"' in redacted
+    assert 'safe: "api_key" = "visible"' in redacted
+
+
 def test_redaction_bounds_expression_analysis_to_output_lookahead() -> None:
     """Very large evidence strings should still redact secrets near the visible prefix."""
     secret = "BOUNDEDSECRET1234567890"

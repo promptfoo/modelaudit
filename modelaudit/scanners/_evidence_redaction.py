@@ -188,6 +188,12 @@ SENSITIVE_CONTAINER_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"\A(?:{SENSITIVE_CONTAINER_KEY})\Z",
     re.IGNORECASE,
 )
+SENSITIVE_OPTION_KEY_RE: Final[re.Pattern[str]] = re.compile(
+    r"\A(?:(?:[a-z0-9]+[-_.])*(?:access[-_]?key(?:[-_]?id)?|access[-_]?token|api[-_]?key|apikey|"
+    r"auth[-_]?token|client[-_]?secret|credential|password|passwd|private[-_]?key|pwd|"
+    r"refresh[-_]?token|sas|secret|secret[-_]?key|signature|sig|token)|authorization)\Z",
+    re.IGNORECASE,
+)
 PYTHON_COMPOUND_ASSIGNMENT_OPERATORS: Final[tuple[str, ...]] = (
     "**=",
     "//=",
@@ -714,6 +720,15 @@ def _argument_keyword_and_value(
     return None, significant
 
 
+def _is_sensitive_literal_key(key: object) -> bool:
+    if isinstance(key, bytes):
+        try:
+            key = key.decode()
+        except UnicodeDecodeError:
+            return False
+    return isinstance(key, str) and SENSITIVE_CONTAINER_KEY_RE.fullmatch(key) is not None
+
+
 def _literal_sensitive_key(tokens: list[tokenize.TokenInfo]) -> bool:
     significant = _significant_tokens(tokens)
     if len(significant) != 1 or significant[0].type != tokenize.STRING:
@@ -722,12 +737,35 @@ def _literal_sensitive_key(tokens: list[tokenize.TokenInfo]) -> bool:
         key = ast.literal_eval(significant[0].string)
     except (SyntaxError, ValueError):
         return False
-    if isinstance(key, bytes):
-        try:
-            key = key.decode()
-        except UnicodeDecodeError:
-            return False
-    return isinstance(key, str) and SENSITIVE_CONTAINER_KEY_RE.fullmatch(key) is not None
+    return _is_sensitive_literal_key(key)
+
+
+def _target_contains_sensitive_literal_key(target: str) -> bool:
+    try:
+        expression = ast.parse(target.strip(), mode="eval").body
+    except (SyntaxError, ValueError):
+        return False
+    if isinstance(expression, ast.Constant):
+        return _is_sensitive_literal_key(expression.value)
+    for node in ast.walk(expression):
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.slice, ast.Constant)
+            and _is_sensitive_literal_key(node.slice.value)
+        ):
+            return True
+    return False
+
+
+def _literal_sensitive_option(tokens: list[tokenize.TokenInfo]) -> bool:
+    significant = _significant_tokens(tokens)
+    if len(significant) != 1 or significant[0].type != tokenize.STRING:
+        return False
+    try:
+        option = ast.literal_eval(significant[0].string)
+    except (SyntaxError, ValueError):
+        return False
+    return isinstance(option, str) and SENSITIVE_OPTION_KEY_RE.fullmatch(option.lstrip("-")) is not None
 
 
 def _comparison_target_start(
@@ -789,9 +827,9 @@ def _redact_sensitive_keyed_calls(text: str) -> str:
     }
     replacements: list[tuple[int, int]] = []
     for index, token in enumerate(tokens):
-        argument_spec = keyed_call_arguments.get(token.string) if token.type == tokenize.NAME else None
-        if argument_spec is None:
+        if token.type != tokenize.NAME:
             continue
+        argument_spec = keyed_call_arguments.get(token.string)
         open_paren_index = index + 1
         while open_paren_index < len(tokens) and tokens[open_paren_index].type in {tokenize.NL, tokenize.COMMENT}:
             open_paren_index += 1
@@ -807,6 +845,33 @@ def _redact_sensitive_keyed_calls(text: str) -> str:
             _argument_keyword_and_value(tokens[argument_start:argument_end])
             for argument_start, argument_end in argument_ranges
         ]
+        for keyword, argument_value_tokens in arguments:
+            if keyword == "auth" and argument_value_tokens:
+                replacements.append(
+                    (
+                        _position_offset(offsets, argument_value_tokens[0].start, len(text)),
+                        _position_offset(offsets, argument_value_tokens[-1].end, len(text)),
+                    )
+                )
+
+        if token.string in {"add_argument", "option"}:
+            default_tokens = next(
+                (argument_value_tokens for keyword, argument_value_tokens in arguments if keyword == "default"),
+                None,
+            )
+            positional_arguments = [
+                argument_value_tokens for keyword, argument_value_tokens in arguments if keyword is None
+            ]
+            if default_tokens and any(_literal_sensitive_option(value_tokens) for value_tokens in positional_arguments):
+                replacements.append(
+                    (
+                        _position_offset(offsets, default_tokens[0].start, len(text)),
+                        _position_offset(offsets, default_tokens[-1].end, len(text)),
+                    )
+                )
+
+        if argument_spec is None:
+            continue
         key_index, value_index, key_keywords, value_keywords = argument_spec
         key_tokens = _keyed_call_argument(arguments, key_index, key_keywords)
         value_tokens = _keyed_call_argument(arguments, value_index, value_keywords)
@@ -954,11 +1019,16 @@ def _redact_python_expression_assignments(text: str) -> str:
         target_start = _position_offset(offsets, tokens[target_start_index].start, text_length)
         target_end = _position_offset(offsets, token.start, text_length)
         target = text[target_start:target_end]
+        source_target_is_sensitive = SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is not None
+        literal_target_is_sensitive = _target_contains_sensitive_literal_key(target)
         if token.string == ":":
-            if QUOTED_SENSITIVE_MAPPING_KEY_RE.search(target) is None:
+            source_target_is_sensitive = QUOTED_SENSITIVE_MAPPING_KEY_RE.search(target) is not None
+            if not source_target_is_sensitive and not literal_target_is_sensitive:
                 continue
-        elif SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is None and not (
-            "," in target and _contains_sensitive_unpacking_target(target)
+        elif (
+            not source_target_is_sensitive
+            and not literal_target_is_sensitive
+            and not ("," in target and _contains_sensitive_unpacking_target(target))
         ):
             continue
 
@@ -984,7 +1054,10 @@ def _redact_python_expression_assignments(text: str) -> str:
         )
         is_annotated_target = ANNOTATED_SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is not None
         requires_token_redaction = (
-            token.string == ":=" or "," in target or PREFIXED_QUOTED_SENSITIVE_MAPPING_KEY_RE.search(target) is not None
+            token.string == ":="
+            or "," in target
+            or PREFIXED_QUOTED_SENSITIVE_MAPPING_KEY_RE.search(target) is not None
+            or (literal_target_is_sensitive and not source_target_is_sensitive)
         )
         if (
             is_simple_value
