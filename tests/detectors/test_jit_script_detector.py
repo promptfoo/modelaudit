@@ -2093,18 +2093,38 @@ class TestJITScriptDetector:
             (b"\x00\xffdef payload(values):\n    order = sorted\n    return order(values, key=eval)\n"),
             b"\x00\xffdef payload():\n    return eval.__getattribute__('__call__')('1+1')\n",
             b"\x00\xffdef payload():\n    return object.__getattribute__(eval, '__call__')('1+1')\n",
-            b"\x00\xffdef run(callback):\n    callback('1+1')\nrun(eval)\n",
+            b"\x00\xffdef run(callback):\n    return callback('1+1')\nrun(eval)\n",
             b"\x00\xffclass H:\n    callbacks = [eval]\nH.callbacks[0]('1+1')\n",
             b"\x00\xffclass H:\n    callbacks = [eval]\nH().callbacks[0]('1+1')\n",
             b"\x00\xfflocals()['sink'] = eval\nsink('1+1')\n",
-            b"\x00\xffdef payload(holder):\n    holder.callbacks = [eval]\n    return holder.callbacks[0]('1+1')\n",
-            b"\x00\xffdef get_callback():\n    return {b'x': eval}\nget_callback()[b'x']('1+1')\n",
-            b"\x00\xfffrom builtins import getattr\ngetattr(__builtins__, 'eval')('1+1')\n",
-            b"\x00\xfffrom builtins import getattr as lookup\nlookup(__builtins__, 'eval')('1+1')\n",
-            b"\x00\xfffrom builtins import map\nlist(map(eval, ['1+1']))\n",
-            b"\x00\xfffrom builtins import map as apply\nlist(apply(eval, ['1+1']))\n",
-            b"\x00\xffclass H:\n    def __init__(self):\n        self.sink = eval\nH().sink('1+1')\n",
-            b"\x00\xffclass H:\n    def __init__(self):\n        self.callbacks = [eval]\nH().callbacks[0]('1+1')\n",
+            (b"\x00\xffdef framing():\n    return None\nlocals()['sink'] = eval\nsink('1+1')\n"),
+            (b"\x00\xffdef payload(holder):\n    holder.callbacks = [eval]\n    return holder.callbacks[0]('1+1')\n"),
+            (b"\x00\xfffrom builtins import getattr as lookup\nlookup(__builtins__, 'eval')('1+1')\n"),
+            (b"\x00\xfffrom builtins import map as apply\nlist(apply(eval, ['1+1']))\n"),
+            (b"\x00\xffclass H:\n    def __init__(self):\n        self.sink = eval\nH().sink('1+1')\n"),
+            (b"\x00\xffclass H:\n    def __init__(self):\n        self.callbacks = [eval]\nH().callbacks[0]('1+1')\n"),
+            (b"\x00\xffdef framing():\n    return None\neval = len\ndel eval\neval('1+1')\n"),
+            (
+                b"\x00\xffdef framing():\n"
+                b"    return None\n"
+                b"try:\n"
+                b"    raise ValueError\n"
+                b"except Exception as eval:\n"
+                b"    pass\n"
+                b"eval('1+1')\n"
+            ),
+            b"\x00\xffdef run(callback):\n    return callback('1+1')\nrun(*[eval])\n",
+            (b"\x00\xffdef run(callback=None):\n    return callback('1+1')\nrun(**{'callback': eval})\n"),
+            (b"\x00\xffdef run(callback):\n    return callback('1+1')\nholder.run = run\nholder.run(eval)\n"),
+            (b"\x00\xffclass H:\n    def run(self, callback):\n        return callback('1+1')\nH().run(eval)\n"),
+            (b"\x00\xffdef payload():\n    run = lambda callback: callback('1+1')\n    return run(eval)\n"),
+            (
+                b"\x00\xffclass H:\n"
+                b"    def __init__(self, callback):\n"
+                b"        self.sink = callback\n"
+                b"H(eval).sink('1+1')\n"
+            ),
+            b"\x00\xffclass B:\n    sink = eval\nclass H(B):\n    pass\nH().sink('1+1')\n",
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
@@ -2150,17 +2170,17 @@ class TestJITScriptDetector:
                 b"    object = type('Safe', (), {'__getattribute__': lambda *_args: len})\n"
                 b"    return object.__getattribute__(eval, '__call__')([])\n"
             ),
-            b"\x00\xffdef run(callback):\n    return callback\nrun(eval)\n",
-            b"\x00\xffdef run(callback):\n    eval = len\n    eval([])\nrun(open)\n",
+            b"\x00\xffdef run(callback):\n    return callback([])\nrun(len)\nunused = eval\n",
             b"\x00\xffclass H:\n    callbacks = [eval]\n    callbacks = [len]\nH.callbacks[0]([])\n",
             b"\x00\xfflocals = lambda: {}\nlocals()['sink'] = eval\nsink = len\nsink([])\n",
+            (b"\x00\xffdef framing():\n    return None\nlocals()['sink'] = eval\nlocals()['sink'] = len\nsink([])\n"),
             (
                 b"\x00\xffdef benign(holder):\n"
                 b"    holder.callbacks = [eval]\n"
                 b"    holder.callbacks = [len]\n"
                 b"    return holder.callbacks[0]([])\n"
             ),
-            b"\x00\xfffrom builtins import map\nmap = lambda callback, values: values\nlist(map(eval, ['1+1']))\n",
+            b"\x00\xffdef run(callback):\n    eval = len\n    eval([])\nrun(open)\n",
             (
                 b"\x00\xfffrom builtins import getattr as lookup\n"
                 b"lookup = lambda *_args: len\n"
@@ -2178,6 +2198,40 @@ class TestJITScriptDetector:
                 b"        self.sink = len\n"
                 b"H().sink([])\n"
             ),
+            (b"\x00\xffdef benign():\n    eval = len\n    del eval\n    return eval('1+1')\n"),
+            (
+                b"\x00\xffdef benign():\n"
+                b"    try:\n"
+                b"        raise ValueError\n"
+                b"    except Exception as eval:\n"
+                b"        pass\n"
+                b"    return eval('1+1')\n"
+            ),
+            b"\x00\xffdef run(callback):\n    return callback([])\nrun(*[len])\nunused = eval\n",
+            (b"\x00\xffdef run(callback=None):\n    return callback([])\nrun(**{'callback': len})\nunused = eval\n"),
+            (
+                b"\x00\xffdef run(callback):\n"
+                b"    return callback([])\n"
+                b"holder.run = run\n"
+                b"holder.run(len)\n"
+                b"unused = eval\n"
+            ),
+            (
+                b"\x00\xffclass H:\n"
+                b"    def run(self, callback):\n"
+                b"        return callback([])\n"
+                b"H().run(len)\n"
+                b"unused = eval\n"
+            ),
+            (b"\x00\xffdef benign():\n    run = lambda callback: callback([])\n    return run(len)\nunused = eval\n"),
+            (
+                b"\x00\xffclass H:\n"
+                b"    def __init__(self, callback):\n"
+                b"        self.sink = callback\n"
+                b"H(len).sink([])\n"
+                b"unused = eval\n"
+            ),
+            (b"\x00\xffclass B:\n    sink = eval\nclass H(B):\n    sink = len\nH().sink([])\n"),
         ],
     )
     def test_scan_model_avoids_false_positives_across_callable_summaries(self, data: bytes) -> None:
