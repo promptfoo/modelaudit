@@ -21,6 +21,7 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners import keras_zip_scanner as keras_zip_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner, _has_get_file_reference
@@ -2901,6 +2902,256 @@ __import__('pickle').loads(data)
         assert any(check.details.get("layer_class") == "MaliciousLayer" for check in custom_layer_checks)
         assert any(check.details.get("identifier") == "MaliciousMetric" for check in custom_metric_checks)
         assert any(check.details.get("identifier") == "malicious_loss" for check in custom_loss_checks)
+
+    def test_keras_zip_details_redact_credentials_in_json_and_sarif(self, tmp_path: Path) -> None:
+        direct_secret = "ZIP_DIRECT_SECRET"
+        dict_secret = "ZIP_DICT_SECRET"
+        lambda_layer_name_secret = "ZIP_LAMBDA_LAYER_NAME_SECRET"
+        custom_secret = "ZIP_CUSTOM_SECRET"
+        nested_secret = "ZIP_NESTED_SECRET"
+        access_key_id_secret = "ZIP_ACCESS_KEY_ID_SECRET"
+        camel_case_secret = "ZIP_CAMEL_CASE_SECRET"
+        camel_case_key_secret = "ZIP_CAMEL_CASE_KEY_SECRET"
+        camel_case_query_secret = "ZIP_CAMEL_CASE_QUERY_SECRET"
+        authorization_secret = "ZIP_AUTHORIZATION_SECRET"
+        config_key_secret = "ZIP_CONFIG_KEY_SECRET"
+        metric_secret = "ZIP_METRIC_SECRET"
+        metric_identifier_secret = "ZIP_METRIC_IDENTIFIER_SECRET"
+        loss_secret = "ZIP_LOSS_SECRET"
+        custom_layer_class_secret = "ZIP_CUSTOM_LAYER_CLASS_SECRET"
+        custom_layer_name_secret = "ZIP_CUSTOM_LAYER_NAME_SECRET"
+        json_string_secret = "ZIP_JSON_STRING_SECRET"
+        lambda_function_name_secret = "ZIP_LAMBDA_FUNCTION_NAME_SECRET"
+        stringlookup_vocabulary_secret = "ZIP_STRINGLOOKUP_VOCABULARY_SECRET"
+        keras_version_secret = "ZIP_KERAS_VERSION_SECRET"
+        escaped_assignment_secret = "ZIP_ESCAPED_ASSIGNMENT_SECRET"
+        json_container_secret = "ZIP_JSON_CONTAINER_SECRET"
+        container_assignment_secret = "ZIP_CONTAINER_ASSIGNMENT_SECRET"
+        malformed_lambda_config_secret = "ZIP_MALFORMED_LAMBDA_CONFIG_SECRET"
+        model_class_secret = "ZIP_MODEL_CLASS_SECRET"
+
+        def direct_lambda_code(x: Any) -> Any:
+            token = "ZIP_DIRECT_SECRET"
+            return (__import__("os").system("id"), token, x)[-1]
+
+        def dict_lambda_code(x: Any) -> Any:
+            token = "ZIP_DICT_SECRET"
+            return (__import__("os").system("id"), token, x)[-1]
+
+        config = {
+            "class_name": f"token={model_class_secret}",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": f"token={lambda_layer_name_secret}",
+                        "config": {
+                            "function": [base64.b64encode(marshal.dumps(direct_lambda_code.__code__)).decode()],
+                        },
+                    },
+                    {
+                        "class_name": "Lambda",
+                        "name": "dict_lambda",
+                        "config": {
+                            "function": {
+                                "class_name": "__lambda__",
+                                "config": {"code": base64.b64encode(marshal.dumps(dict_lambda_code.__code__)).decode()},
+                            },
+                        },
+                    },
+                    {
+                        "class_name": "Lambda",
+                        "name": "malformed_dict_lambda",
+                        "config": {
+                            "function": {
+                                "class_name": "__lambda__",
+                                "config": f"token={malformed_lambda_config_secret}",
+                            },
+                        },
+                    },
+                    {
+                        "class_name": "SecretLayer",
+                        "name": "secret_layer",
+                        "config": {
+                            "api_key": custom_secret,
+                            "nested": {"token": nested_secret},
+                            "aws_access_key_id": access_key_id_secret,
+                            "awsSecretAccessKey": camel_case_secret,
+                            f"awsSecretAccessKey={camel_case_key_secret}": "secret key should be redacted",
+                            "source": (f"https://example.test/model.keras?clientSecret={camel_case_query_secret}&ok=1"),
+                            "Authorization": f"Basic {authorization_secret}",
+                            "metadata": f'{{"api_key":"{json_string_secret}","safe":"ok"}}',
+                            "metadata_container": f'{{"api_key":["{json_container_secret}"],"safe":["ok"]}}',
+                            "escaped_assignment": f"awsSecretAccessKey='abc\\'{escaped_assignment_secret}'",
+                            "container_assignment": f'awsSecretAccessKey=["{container_assignment_secret}"]',
+                            f"token={config_key_secret}": "secret key should be redacted",
+                            "units": 4,
+                        },
+                    },
+                    {
+                        "class_name": f"token={custom_layer_class_secret}",
+                        "name": f"token={custom_layer_name_secret}",
+                        "config": {"units": 4},
+                    },
+                    {
+                        "class_name": "Lambda",
+                        "name": "module_lambda",
+                        "config": {
+                            "module": "os",
+                            "function_name": {"token": lambda_function_name_secret},
+                        },
+                    },
+                    {
+                        "class_name": "StringLookup",
+                        "name": "lookup",
+                        "config": {
+                            "vocabulary": (
+                                "https://user:"
+                                f"{stringlookup_vocabulary_secret}@example.test/vocab.txt?token="
+                                f"{stringlookup_vocabulary_secret}"
+                            ),
+                        },
+                    },
+                ]
+            },
+            "compile_config": {
+                "metrics": [
+                    {"class_name": "MaliciousMetric", "config": {"api_key": metric_secret}},
+                    f"token={metric_identifier_secret}",
+                ],
+                "loss": {"class_name": "MaliciousLoss", "config": {"token": loss_secret}},
+            },
+        }
+        raw_secrets = [
+            direct_secret,
+            dict_secret,
+            lambda_layer_name_secret,
+            custom_secret,
+            nested_secret,
+            access_key_id_secret,
+            camel_case_secret,
+            camel_case_key_secret,
+            camel_case_query_secret,
+            authorization_secret,
+            config_key_secret,
+            metric_secret,
+            metric_identifier_secret,
+            loss_secret,
+            custom_layer_class_secret,
+            custom_layer_name_secret,
+            json_string_secret,
+            lambda_function_name_secret,
+            stringlookup_vocabulary_secret,
+            keras_version_secret,
+            escaped_assignment_secret,
+            json_container_secret,
+            container_assignment_secret,
+            malformed_lambda_config_secret,
+            model_class_secret,
+        ]
+
+        model_path = create_configured_keras_zip(
+            tmp_path,
+            config,
+            file_name="redacted_details.keras",
+            keras_version=f"token={keras_version_secret}",
+        )
+        scanner_result = KerasZipScanner().scan(str(model_path))
+        details_json = json.dumps([check.details for check in scanner_result.checks], default=str)
+        assert all(secret not in details_json for secret in raw_secrets)
+        assert "<redacted>" in details_json
+        assert "encoded_lambda_may_contain_sensitive_constants" in details_json
+        assert "opaque_bytecode_may_contain_sensitive_constants" in details_json
+
+        audit_result = scan_model_directory_or_file(str(model_path))
+        json_output = audit_result.model_dump_json(indent=2, exclude_none=True)
+        sarif_output = format_sarif_output(audit_result, [str(model_path)])
+
+        assert all(secret not in json_output for secret in raw_secrets)
+        assert all(secret not in sarif_output for secret in raw_secrets)
+        assert "<redacted>" in json_output
+        assert "<redacted>" in sarif_output
+
+    def test_non_string_layer_class_reports_invalid_type_without_abort(self, tmp_path: Path) -> None:
+        """Malformed non-string class names should fail closed without crashing redaction."""
+        class_secret = "ZIP_LAYER_CLASS_REPR_SECRET"
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": {"api_key": [class_secret]},
+                        "name": "structured_class",
+                        "config": {},
+                    }
+                ]
+            },
+        }
+
+        model_path = create_configured_keras_zip(tmp_path, config, file_name="structured_class.keras")
+        result = KerasZipScanner().scan(str(model_path))
+
+        assert not any(check.name == "Keras ZIP File Scan" for check in result.checks)
+        type_checks = [check for check in result.checks if check.name == "Layer Class Type Validation"]
+        assert any(check.severity == IssueSeverity.WARNING for check in type_checks)
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_layer_class_invalid_type" in result.metadata["scan_outcome_reasons"]
+        assert "<invalid:dict>" in result.metadata["layer_counts"]
+        assert class_secret not in json.dumps(result.metadata, default=str)
+        assert class_secret not in json.dumps([check.details for check in result.checks], default=str)
+
+        audit_result = scan_model_directory_or_file(str(model_path))
+        assert determine_exit_code(audit_result) != 0
+        assert class_secret not in audit_result.model_dump_json(exclude_none=True)
+
+    def test_malformed_layer_identifiers_do_not_abort_redaction(self, tmp_path: Path) -> None:
+        """Malformed names and Lambda module metadata should not crash evidence redaction."""
+        deeply_nested_module: object = "os"
+        for _ in range(150):
+            deeply_nested_module = [deeply_nested_module]
+
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "CustomRegisteredLayer",
+                        "registered_name": "CustomRegisteredLayer",
+                        "name": 123,
+                        "config": {},
+                    },
+                    {
+                        "class_name": "Lambda",
+                        "name": "malformed_module",
+                        "config": {"module": ["os"], "function_name": "system"},
+                    },
+                    {
+                        "class_name": "Lambda",
+                        "name": "malformed_dict_module",
+                        "config": {"module": {"os": True}, "function_name": "system"},
+                    },
+                    {
+                        "class_name": "Lambda",
+                        "name": "benign_cosine_module",
+                        "config": {"module": ["cosine"], "function_name": "call"},
+                    },
+                    {
+                        "class_name": "Lambda",
+                        "name": "deeply_nested_module",
+                        "config": {"module": deeply_nested_module, "function_name": "system"},
+                    },
+                ]
+            },
+        }
+
+        result = KerasZipScanner().scan(
+            str(create_configured_keras_zip(tmp_path, config, file_name="malformed_identifiers.keras"))
+        )
+
+        assert not any(check.name == "Keras ZIP File Scan" for check in result.checks)
+        lambda_module_checks = [check for check in result.checks if check.name == "Lambda Layer Module Reference Check"]
+        assert len(lambda_module_checks) >= 2
+        assert not any(check.details.get("layer_name") == "benign_cosine_module" for check in lambda_module_checks)
 
     def test_compile_config_detects_nested_metric_and_loss_mappings(self, tmp_path: Path) -> None:
         """Nested compile_config structures should not bypass custom-object detection."""
