@@ -53,8 +53,8 @@ from .zip_scanner import ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY
 _SAFE_KERAS_MODULE_ROOTS: frozenset[str] = frozenset({"keras", "tensorflow", "tf_keras", "tf", "numpy", "math"})
 _SAFE_ALLOWLISTED_REGISTERED_OBJECTS: frozenset[str] = frozenset({"notequal"})
 
-# Modules that are explicitly dangerous when referenced in config.json
-_DANGEROUS_CONFIG_MODULES = frozenset(
+# Importable module roots that are explicitly dangerous when referenced in config.json.
+_DANGEROUS_CONFIG_MODULE_ROOTS = frozenset(
     {
         "os",
         "sys",
@@ -68,16 +68,6 @@ _DANGEROUS_CONFIG_MODULES = frozenset(
         "pickle",
         "marshal",
         "ctypes",
-        "_ctypes",
-        "_multiprocessing",
-        "_pickle",
-        "_posixsubprocess",
-        "_signal",
-        "_socket",
-        "_thread",
-        "_winapi",
-        "posix",
-        "nt",
         "code",
         "codeop",
         "compileall",
@@ -95,6 +85,23 @@ _DANGEROUS_CONFIG_MODULES = frozenset(
         "pip",
         "setuptools",
         "distutils",
+    }
+)
+
+# Native extension modules are not packages, so dotted descendants are not importable.
+_EXACT_DANGEROUS_CONFIG_MODULES = frozenset(
+    {
+        "_ctypes",
+        "_multiprocessing",
+        "_pickle",
+        "_posixsubprocess",
+        "_signal",
+        "_socket",
+        "_thread",
+        "_winapi",
+        "_xxsubinterpreters",
+        "nt",
+        "posix",
     }
 )
 
@@ -223,6 +230,7 @@ class KerasZipScanner(BaseScanner):
             configured_embedded_limit = min(configured_embedded_limit, self.max_file_read_size)
         self.max_embedded_weights_bytes = configured_embedded_limit
         self._nested_layer_items_scanned = 0
+        self._checked_config_module_references: set[tuple[int, str, str]] = set()
 
     @staticmethod
     def _is_allowlisted_keras_module(module_value: Any) -> bool:
@@ -443,6 +451,7 @@ class KerasZipScanner(BaseScanner):
         # Initialize context for this file
         self._initialize_context(path)
         self._nested_layer_items_scanned = 0
+        self._checked_config_module_references.clear()
 
         # Check if path is valid
         path_check_result = self._check_path(path)
@@ -1374,6 +1383,112 @@ class KerasZipScanner(BaseScanner):
         except ValueError:
             return None
 
+    def _check_config_module_reference(
+        self,
+        source: dict[str, Any],
+        key: str,
+        module_value: str,
+        object_class: str,
+        result: ScanResult,
+        layer_name: str,
+    ) -> None:
+        reference_key = (id(source), key, module_value)
+        if reference_key in self._checked_config_module_references:
+            return
+        self._checked_config_module_references.add(reference_key)
+
+        redacted_module_value = redact_evidence_string(module_value)
+        redacted_object_class = redact_evidence_string(object_class)
+        top_module = module_value.split(".")[0]
+        is_dangerous = module_value in _EXACT_DANGEROUS_CONFIG_MODULES or top_module in _DANGEROUS_CONFIG_MODULE_ROOTS
+        is_outside_allowlist = top_module not in _SAFE_KERAS_MODULE_ROOTS
+
+        if is_dangerous:
+            result.add_check(
+                name="CVE-2025-1550: Dangerous Module in Config",
+                passed=False,
+                message=(
+                    f"CVE-2025-1550: Layer '{layer_name}' references dangerous module "
+                    f"'{redacted_module_value}' in {key} field — arbitrary code execution via safe_mode bypass"
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=f"{self.current_file_path} (layer: {layer_name})",
+                details={
+                    "layer_name": layer_name,
+                    "layer_class": redacted_object_class,
+                    "key": key,
+                    "module": redacted_module_value,
+                    "cve_id": "CVE-2025-1550",
+                    "cvss": 9.8,
+                    "cwe": "CWE-502",
+                    "description": (
+                        "Arbitrary dangerous module references in .keras config can bypass safe_mode "
+                        "and execute attacker-controlled code during model loading."
+                    ),
+                    "remediation": "Upgrade Keras to >= 3.9.0 or remove untrusted module references",
+                },
+                why=get_cve_2025_1550_explanation("dangerous_module"),
+            )
+        elif is_outside_allowlist and (
+            key == "fn_module" or object_class == "function" or self._is_lambda_layer_class(object_class)
+        ):
+            result.add_check(
+                name="CVE-2025-1550: Untrusted Module in Config",
+                passed=False,
+                message=(
+                    f"CVE-2025-1550: Layer '{layer_name}' references non-allowlisted module "
+                    f"'{redacted_module_value}' in {key} field — potential safe_mode bypass"
+                ),
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path} (layer: {layer_name})",
+                details={
+                    "layer_name": layer_name,
+                    "layer_class": redacted_object_class,
+                    "key": key,
+                    "module": redacted_module_value,
+                    "cve_id": "CVE-2025-1550",
+                    "cvss": 9.8,
+                    "cwe": "CWE-502",
+                    "description": (
+                        "Non-allowlisted callable module references may indicate safe_mode bypass "
+                        "paths in untrusted .keras config content."
+                    ),
+                    "remediation": "Upgrade Keras to >= 3.9.0 or verify this module is safe",
+                },
+                why=get_cve_2025_1550_explanation("untrusted_module"),
+            )
+
+    def _check_nested_serialized_module_references(
+        self,
+        layer_config: dict[str, Any],
+        result: ScanResult,
+        layer_name: str,
+    ) -> None:
+        """Inspect nested Keras object configs without recursing on attacker-controlled depth."""
+        pending: list[Any] = list(layer_config.values())
+        while pending:
+            node = pending.pop()
+            if isinstance(node, list):
+                pending.extend(node)
+                continue
+            if not isinstance(node, dict):
+                continue
+
+            object_class = node.get("class_name")
+            if isinstance(object_class, str):
+                for key in ("module", "fn_module"):
+                    module_value = node.get(key)
+                    if isinstance(module_value, str) and module_value.strip():
+                        self._check_config_module_reference(
+                            node,
+                            key,
+                            module_value.strip(),
+                            object_class,
+                            result,
+                            layer_name,
+                        )
+            pending.extend(node.values())
+
     def _check_layer_module_references(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check layer config for dangerous module references (CVE-2025-1550).
 
@@ -1381,85 +1496,36 @@ class KerasZipScanner(BaseScanner):
         with safe_mode=True by specifying arbitrary Python modules/functions in
         config.json's module/fn_module keys. This checks ALL layers, not just Lambda.
         """
+        layer_class = str(layer.get("class_name", ""))
+        for key in ("module", "fn_module"):
+            layer_value = layer.get(key)
+            if isinstance(layer_value, str) and layer_value.strip():
+                self._check_config_module_reference(
+                    layer,
+                    key,
+                    layer_value.strip(),
+                    layer_class,
+                    result,
+                    layer_name,
+                )
+
         layer_config = layer.get("config", {})
         if not isinstance(layer_config, dict):
             return
 
-        # Check both the layer-level and config-level module references
-        module_keys_to_check: list[tuple[str, str]] = []
         for key in ("module", "fn_module"):
-            layer_value = layer.get(key)
-            if isinstance(layer_value, str) and layer_value.strip():
-                module_keys_to_check.append((key, layer_value.strip()))
             config_value = layer_config.get(key)
             if isinstance(config_value, str) and config_value.strip():
-                module_keys_to_check.append((key, config_value.strip()))
-
-        layer_class = str(layer.get("class_name", ""))
-        redacted_layer_class = redact_evidence_string(layer_class)
-        for key, module_value in module_keys_to_check:
-            redacted_module_value = redact_evidence_string(module_value)
-            # Extract the top-level module name (e.g., "os" from "os.path")
-            top_module = module_value.split(".")[0]
-
-            # Check if it's an explicitly dangerous module
-            is_dangerous = top_module in _DANGEROUS_CONFIG_MODULES
-
-            # Check if it's outside the safe allowlist (exact root matching)
-            is_outside_allowlist = top_module not in _SAFE_KERAS_MODULE_ROOTS
-
-            if is_dangerous:
-                result.add_check(
-                    name="CVE-2025-1550: Dangerous Module in Config",
-                    passed=False,
-                    message=(
-                        f"CVE-2025-1550: Layer '{layer_name}' references dangerous module "
-                        f"'{redacted_module_value}' in {key} field — arbitrary code execution via safe_mode bypass"
-                    ),
-                    severity=IssueSeverity.CRITICAL,
-                    location=f"{self.current_file_path} (layer: {layer_name})",
-                    details={
-                        "layer_name": layer_name,
-                        "layer_class": redacted_layer_class,
-                        "key": key,
-                        "module": redacted_module_value,
-                        "cve_id": "CVE-2025-1550",
-                        "cvss": 9.8,
-                        "cwe": "CWE-502",
-                        "description": (
-                            "Arbitrary dangerous module references in .keras config can bypass safe_mode "
-                            "and execute attacker-controlled code during model loading."
-                        ),
-                        "remediation": "Upgrade Keras to >= 3.9.0 or remove untrusted module references",
-                    },
-                    why=get_cve_2025_1550_explanation("dangerous_module"),
+                self._check_config_module_reference(
+                    layer_config,
+                    key,
+                    config_value.strip(),
+                    layer_class,
+                    result,
+                    layer_name,
                 )
-            elif is_outside_allowlist and (key == "fn_module" or self._is_lambda_layer_class(layer_class)):
-                result.add_check(
-                    name="CVE-2025-1550: Untrusted Module in Config",
-                    passed=False,
-                    message=(
-                        f"CVE-2025-1550: Layer '{layer_name}' references non-allowlisted module "
-                        f"'{redacted_module_value}' in {key} field — potential safe_mode bypass"
-                    ),
-                    severity=IssueSeverity.WARNING,
-                    location=f"{self.current_file_path} (layer: {layer_name})",
-                    details={
-                        "layer_name": layer_name,
-                        "layer_class": redacted_layer_class,
-                        "key": key,
-                        "module": redacted_module_value,
-                        "cve_id": "CVE-2025-1550",
-                        "cvss": 9.8,
-                        "cwe": "CWE-502",
-                        "description": (
-                            "Non-allowlisted callable module references may indicate safe_mode bypass "
-                            "paths in untrusted .keras config content."
-                        ),
-                        "remediation": "Upgrade Keras to >= 3.9.0 or verify this module is safe",
-                    },
-                    why=get_cve_2025_1550_explanation("untrusted_module"),
-                )
+
+        self._check_nested_serialized_module_references(layer_config, result, layer_name)
 
     def _check_get_file_gadget(self, model_config: Any, result: ScanResult) -> None:
         """Check for CVE-2025-8747: keras.utils.get_file gadget bypass.

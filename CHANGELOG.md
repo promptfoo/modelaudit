@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- classify native system module aliases in Keras configs as critical CVE-2025-1550 findings without promoting benign prefix collisions
+- detect native execution modules and nested serialized callables in Keras configs without promoting unimportable dotted native-module paths
 - add aggregate file, byte, and depth budgets to directory metadata extraction and reject non-regular entries and symlink targets
 - redact and detect secrets in R serialized executable samples across native assignment syntax
 - scan padded TensorFlow SavedModel protobuf scalar and repeated string attributes past the legacy 10 KB injection-check window

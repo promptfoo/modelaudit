@@ -3750,7 +3750,7 @@ class TestCVE20251550ModuleReferences:
             ("_socket", "fn_module", "_socket"),
             ("_thread", "module", "_thread"),
             ("_winapi", "module", "_winapi"),
-            ("posix.path", "fn_module", "posix"),
+            ("_xxsubinterpreters", "module", "_xxsubinterpreters"),
         ],
     )
     def test_native_dangerous_module_roots_are_critical(
@@ -3786,6 +3786,128 @@ class TestCVE20251550ModuleReferences:
         assert cve_issues
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
         assert cve_issues[0].details["module"].split(".")[0] == expected_root
+
+    @pytest.mark.parametrize(
+        "module_value",
+        [
+            "posix.path",
+            "nt.path",
+            "_ctypes.child",
+            "_multiprocessing.child",
+            "_pickle.child",
+            "_posixsubprocess.child",
+            "_signal.child",
+            "_socket.child",
+            "_thread.child",
+            "_winapi.child",
+            "_xxsubinterpreters.child",
+        ],
+    )
+    def test_native_extension_dotted_children_are_not_critical(
+        self,
+        tmp_path: Path,
+        module_value: str,
+    ) -> None:
+        """Native extension modules are not packages with importable dotted children."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "native_child",
+                        "config": {"fn_module": module_value},
+                    }
+                ]
+            },
+        }
+
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
+        assert cve_issues
+        assert all(issue.severity != IssueSeverity.CRITICAL for issue in cve_issues)
+
+    def test_native_function_with_string_config_is_critical(self, tmp_path: Path) -> None:
+        """Canonical serialized functions must be checked even though their config is a string."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "function",
+                        "name": "native_function",
+                        "module": "posix",
+                        "config": "system",
+                        "registered_name": "system",
+                        "inbound_nodes": [],
+                    }
+                ]
+            },
+        }
+
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
+        assert cve_issues
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["module"] == "posix"
+
+    def test_nested_serialized_native_function_is_critical(self, tmp_path: Path) -> None:
+        """Nested activations use serialized function dicts that must not bypass module checks."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_with_native_activation",
+                        "module": "keras.layers",
+                        "config": {
+                            "units": 1,
+                            "activation": {
+                                "module": "posix",
+                                "class_name": "function",
+                                "config": "system",
+                                "registered_name": "system",
+                            },
+                        },
+                    }
+                ]
+            },
+        }
+
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
+        assert cve_issues
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["module"] == "posix"
+
+    def test_nested_non_object_module_metadata_is_not_flagged(self, tmp_path: Path) -> None:
+        """Arbitrary metadata dictionaries should not be treated as serialized Keras objects."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "metadata_only",
+                        "module": "keras.layers",
+                        "config": {"units": 1, "metadata": {"module": "posix"}},
+                    }
+                ]
+            },
+        }
+
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
+        assert not cve_issues
 
     @pytest.mark.parametrize(
         "module_value",
