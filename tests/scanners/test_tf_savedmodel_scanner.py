@@ -880,6 +880,28 @@ def test_savedmodel_preview_redaction_removes_nested_encoded_query_secrets() -> 
     assert "payload=<redacted>" in preview
 
 
+def test_savedmodel_preview_redaction_removes_additional_url_secret_shapes() -> None:
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    preview = _safe_decoded_preview(
+        f"file:///tmp/{github_token}/model "
+        "ssh://SSHTOKEN@git.example/repo "
+        "ftps://user:FTPSPASSWORD@files.example/model.bin "
+        "https://example.com/hook?token=SEMICOLONSECRET123;STILLSECRET456&ok=1",
+        500,
+    )
+
+    assert github_token not in preview
+    assert "SSHTOKEN" not in preview
+    assert "user:FTPSPASSWORD" not in preview
+    assert "SEMICOLONSECRET123" not in preview
+    assert "STILLSECRET456" not in preview
+    assert "file:///tmp/<redacted>/model" in preview
+    assert "ssh://<credentials-redacted>@git.example/repo" in preview
+    assert "ftps://<credentials-redacted>@files.example/model.bin" in preview
+    assert "token=<redacted>" in preview
+    assert "ok=1" in preview
+
+
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_collection_preview_redacts_sensitive_values(tmp_path: Path) -> None:
     raw_secret = "c081-collection-secret-value-00000000"

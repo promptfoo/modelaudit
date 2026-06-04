@@ -11,7 +11,9 @@ from modelaudit.detectors.network_comm import _redact_url_path_tokens
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 
-URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|wss?|ftp|tcp|udp|s3|gs|file)://[^\s\"'<>]+")
+URL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)\b(?:https?|ftp|ftps|ssh|telnet|wss?|tcp|udp|s3|gs|az|wasbs?|abfss?|file)://[^\s\"'<>]+"
+)
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "access_key",
@@ -121,6 +123,7 @@ SUBSCRIPTED_SENSITIVE_UNQUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compil
     rf"{VALUE_OPENERS_PATTERN}){UNQUOTED_VALUE_PATTERN}"
 )
 HTML_QUERY_SEPARATOR_RE: Final[re.Pattern[str]] = re.compile(r"(?i)&amp;")
+SEMICOLON_QUERY_SEPARATOR_RE: Final[re.Pattern[str]] = re.compile(r"(?i);(?=(?:amp;)?[a-z0-9%_.\-\[\]]+\s*=)")
 NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(?:^|[?&;])(?:amp;)?{SENSITIVE_ASSIGNMENT_KEY}(?:\[[^\]]*\])*\s*[:=]"
 )
@@ -152,10 +155,10 @@ def _redact_url(match: re.Match[str]) -> str:
     if "@" in netloc:
         netloc = f"{REDACTED_URL_CREDENTIALS}@{netloc.rsplit('@', 1)[1]}"
     hostname = parsed.hostname or ""
-    path = _redact_url_path_tokens(parsed.scheme.lower(), hostname.lower(), parsed.path) if hostname else parsed.path
+    path = _redact_url_path_tokens(parsed.scheme.lower(), hostname.lower(), parsed.path)
 
     query_items = []
-    normalized_query = HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query).replace(";", "&")
+    normalized_query = SEMICOLON_QUERY_SEPARATOR_RE.sub("&", HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query))
     for key, value in parse_qsl(normalized_query, keep_blank_values=True):
         if _normalize_query_key(key) in SENSITIVE_QUERY_KEYS or _contains_nested_sensitive_query_assignment(value):
             query_items.append((key, REDACTED_EVIDENCE_VALUE))

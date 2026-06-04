@@ -156,6 +156,18 @@ def test_redacts_url_path_capability_tokens() -> None:
     assert "https://callback.example/api/<redacted>/done" in redacted
 
 
+def test_redacts_hostname_less_url_path_capability_tokens() -> None:
+    """Path-token redaction should also apply when URL parsing finds no hostname."""
+    github_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    text = f"file:///tmp/{github_token}/model https:///api/{github_token}/done"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert github_token not in redacted
+    assert "file:///tmp/<redacted>/model" in redacted
+    assert "https:///api/<redacted>/done" in redacted
+
+
 def test_redacts_compound_sensitive_query_parameters() -> None:
     """Compound query credential keys should be redacted in URL evidence."""
     text = "url=https://example.com/callback?client_secret=CLIENTSECRET123&refresh_token=REFRESHTOKEN456&ok=1"
@@ -200,6 +212,19 @@ def test_redacts_nested_bracketed_and_json_sensitive_query_parameters() -> None:
     assert "payload=<redacted>" in redacted
 
 
+def test_redacts_sensitive_query_values_with_raw_semicolons() -> None:
+    """Semicolons inside sensitive values should not leak as synthetic query keys."""
+    text = "https://example.com/hook?token=SEMICOLONSECRET123;STILLSECRET456&ok=1"
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "SEMICOLONSECRET123" not in redacted
+    assert "STILLSECRET456" not in redacted
+    assert "STILLSECRET456=" not in redacted
+    assert "token=<redacted>" in redacted
+    assert "ok=1" in redacted
+
+
 def test_redacts_bracketed_sensitive_query_parameters() -> None:
     """Array-style query keys should still be treated as sensitive keys."""
     text = "https://example.com/hook?api_key[]=ARRAYSECRET123&token[0]=INDEXSECRET456&ok=1"
@@ -229,7 +254,10 @@ def test_redacts_token_only_userinfo_across_network_url_schemes() -> None:
     text = (
         "wss://WEBSOCKETTOKEN@socket.example/stream "
         "ftp://user:FTPPASSWORD@files.example/model.bin "
-        "tcp://TCPTOKEN@callback.example:4444"
+        "tcp://TCPTOKEN@callback.example:4444 "
+        "ftps://user:FTPSPASSWORD@files.example/model.bin "
+        "ssh://SSHTOKEN@git.example/repo "
+        "telnet://user:TELNETPASSWORD@legacy.example"
     )
 
     redacted = redact_evidence_string(text, max_chars=None)
@@ -237,7 +265,10 @@ def test_redacts_token_only_userinfo_across_network_url_schemes() -> None:
     assert "WEBSOCKETTOKEN" not in redacted
     assert "user:FTPPASSWORD" not in redacted
     assert "TCPTOKEN" not in redacted
-    assert redacted.count("<credentials-redacted>@") == 3
+    assert "user:FTPSPASSWORD" not in redacted
+    assert "SSHTOKEN" not in redacted
+    assert "user:TELNETPASSWORD" not in redacted
+    assert redacted.count("<credentials-redacted>@") == 6
 
 
 def test_existing_token_assignment_redaction_still_applies() -> None:

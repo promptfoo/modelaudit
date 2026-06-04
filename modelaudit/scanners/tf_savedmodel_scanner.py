@@ -132,7 +132,10 @@ _STANDALONE_KEY_SECRET_RE = re.compile(
 _PREVIEW_TOKEN_LOOKAHEAD_CHARS = 512
 _PREVIEW_TOKEN_SUFFIX_RE = re.compile(r"([A-Za-z0-9._~+-]+)\Z")
 _PREVIEW_TOKEN_CONTINUATION_RE = re.compile(r"[A-Za-z0-9._~+=-]*")
-_PREVIEW_URL_SUFFIX_RE = re.compile(r"(?i)(?P<scheme>(?:https?|wss?|ftp|tcp|udp|s3|gs|file)://)[^\s\"'<>]*\Z")
+_PREVIEW_URL_SUFFIX_RE = re.compile(
+    r"(?i)(?P<scheme>(?:https?|ftp|ftps|ssh|telnet|wss?|tcp|udp|s3|gs|az|wasbs?|abfss?|file)://)"
+    r"[^\s\"'<>]*\Z"
+)
 _PREVIEW_URL_CONTINUATION_RE = re.compile(r"[^\s\"'<>]*")
 _URL_AUTHORITY_TERMINATOR_RE = re.compile(r"[/?#]")
 
