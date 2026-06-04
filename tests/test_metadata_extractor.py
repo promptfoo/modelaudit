@@ -212,6 +212,34 @@ class TestModelMetadataExtractor:
         # Full metadata extraction remains unchanged.
         assert full_metadata["custom_metadata"]["api_key"] == "SECRET_METADATA_TOKEN"
 
+    def test_security_only_directory_omits_custom_metadata_values(self, tmp_path: Path) -> None:
+        """Directory security output should summarize custom metadata without exposing values."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        metadata_owner = "private-training-team"
+        metadata_source = "https://example.com/model.bin?download=private"
+        header = {
+            "tensor1": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+            "__metadata__": {"owner": metadata_owner, "source": metadata_source},
+        }
+        header_json = json.dumps(header).encode("utf-8")
+        st_file = tmp_path / "model.safetensors"
+        with st_file.open("wb") as f:
+            f.write(struct.pack("<Q", len(header_json)))
+            f.write(header_json)
+            f.write(b"\x00\x00\x00\x00")
+
+        metadata = extractor.extract(str(tmp_path), security_only=True)
+
+        assert metadata["summary"]["total_files"] == 1
+        assert len(metadata["files"]) == 1
+        file_metadata = metadata["files"][0]
+        assert "custom_metadata" not in file_metadata
+        assert file_metadata["has_custom_metadata"] is True
+        assert file_metadata["custom_metadata_entry_count"] == 2
+        serialized = json.dumps(metadata, sort_keys=True)
+        assert metadata_owner not in serialized
+        assert metadata_source not in serialized
+
     def test_format_table_single_file(self) -> None:
         """Test table formatting for single file."""
         from modelaudit.cli import _format_metadata_table
