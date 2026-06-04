@@ -59,7 +59,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dotted globals, and recursive mappings
 - fail closed when encoded nested-pickle probe candidates exhaust the analysis cap
 - warn on import-only pickle globals that reference non-allowlisted custom modules,
-  shadow trusted modules, rewrite package import paths, or rely on unchecked bytecode caches
+  shadow trusted modules or transitive standard-library imports, rewrite package
+  import paths, or rely on unchecked bytecode caches
 - detect `BUILD` slot-state execution through custom attribute hooks without
   flagging ordinary dictionary state
 - preserve reviewed safe callable references in dependency-minimal environments and

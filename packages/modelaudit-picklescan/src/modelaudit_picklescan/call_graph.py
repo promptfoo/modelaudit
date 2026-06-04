@@ -15,7 +15,15 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
-from importlib.machinery import EXTENSION_SUFFIXES, BuiltinImporter, FrozenImporter, ModuleSpec, PathFinder
+from importlib.machinery import (
+    BYTECODE_SUFFIXES,
+    EXTENSION_SUFFIXES,
+    SOURCE_SUFFIXES,
+    BuiltinImporter,
+    FrozenImporter,
+    ModuleSpec,
+    PathFinder,
+)
 from importlib.metadata import distribution, packages_distributions
 from importlib.util import MAGIC_NUMBER, cache_from_source
 from pathlib import Path
@@ -54,7 +62,10 @@ _MAX_TRUSTED_PTH_PATHS = 64
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
 _IMPORT_EXECUTION_SINK = "builtins.__import__"
 _IMPORT_EXECUTION_SAFE_MODULES = frozenset(sys.builtin_module_names)
-_REVIEWED_INERT_STDLIB_IMPORTS = frozenset({"os", "pathlib", "subprocess"})
+# Only modules whose import cannot resolve additional shadowable Python modules
+# are safe here. pathlib and subprocess transitively import modules such as
+# fnmatch and selectors, so a sibling shadow can still execute during unpickling.
+_REVIEWED_INERT_STDLIB_IMPORTS = frozenset({"os"})
 _TRUSTED_STDLIB_PATHS = tuple(
     Path(path).resolve() for name in ("stdlib", "platstdlib") if (path := sysconfig.get_path(name))
 )
@@ -1417,10 +1428,14 @@ def _ensure_shared_source_snapshot_stable(report_generation: int | None) -> None
 
 def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
     candidates: set[Path] = set()
+    import_suffixes = (*EXTENSION_SUFFIXES, *SOURCE_SUFFIXES, *BYTECODE_SUFFIXES)
     for entry in sys.path:
         root = Path(entry or os.getcwd())
-        candidates.add(root.joinpath(*parts).with_suffix(".py").absolute())
-        candidates.add(root.joinpath(*parts, "__init__.py").absolute())
+        for index in range(1, len(parts) + 1):
+            module_path = root.joinpath(*parts[:index])
+            for suffix in import_suffixes:
+                candidates.add(Path(f"{module_path}{suffix}").absolute())
+                candidates.add(module_path.joinpath(f"__init__{suffix}").absolute())
     _track_shared_source_paths(candidates)
 
 
@@ -1488,15 +1503,15 @@ def _call_graph_source_unavailable_reason(module_name: str) -> str | None:
 
 
 def _find_module_spec_without_imports(module_name: str) -> ModuleSpec | None:
-    parts = module_name.split(".")
-    if not parts or any(not part or "/" in part or "\\" in part for part in parts):
+    parts = _bounded_module_name_parts(module_name)
+    if parts is None:
         return None
 
     search_path: list[str] | None = None
     spec: ModuleSpec | None = None
     for index in range(len(parts)):
         qualified_name = ".".join(parts[: index + 1])
-        spec = PathFinder.find_spec(qualified_name, search_path)
+        spec = _find_effective_module_spec_without_imports(qualified_name, search_path)
         if spec is None:
             return None
         if index == len(parts) - 1:
@@ -1506,6 +1521,21 @@ def _find_module_spec_without_imports(module_name: str) -> ModuleSpec | None:
             return None
         search_path = list(locations)
     return spec
+
+
+def _find_effective_module_spec_without_imports(
+    module_name: str,
+    search_path: list[str] | None,
+) -> ModuleSpec | None:
+    for finder in sys.meta_path:
+        find_spec = getattr(finder, "find_spec", None)
+        if find_spec is None:
+            raise RuntimeError(f"meta path finder {type(finder).__name__} does not support find_spec")
+        spec = find_spec(module_name, search_path, None)
+        if spec is None:
+            continue
+        return spec if isinstance(spec, ModuleSpec) else None
+    return None
 
 
 def _find_meta_path_module_spec_without_imports(module_name: str) -> ModuleSpec | None:
@@ -2082,6 +2112,8 @@ def _module_initialization_statement_is_inert(statement: ast.stmt) -> bool:
     if isinstance(statement, ast.Import):
         return all(_stdlib_import_is_reviewed_inert(alias.name) for alias in statement.names)
     if isinstance(statement, ast.ImportFrom):
+        if statement.level == 0 and statement.module == "__future__":
+            return all(alias.name != "*" for alias in statement.names)
         return (
             statement.level == 0
             and statement.module is not None
@@ -4158,27 +4190,22 @@ def _resolve_import_from_module(module_name: str, is_package: bool, level: int, 
 @_register_source_sensitive_cache
 @lru_cache(maxsize=1024)
 def _resolve_module_source(module_name: str) -> Path | None:
-    parts = module_name.split(".")
-    if not parts or any(not part or "/" in part or "\\" in part for part in parts):
+    parts = _bounded_module_name_parts(module_name)
+    if parts is None:
         return None
-    _track_shared_source_candidates(tuple(parts))
-    for entry in sys.path:
-        root = Path(entry or os.getcwd())
-        current = root
-        for index, part in enumerate(parts):
-            is_last = index == len(parts) - 1
-            if is_last:
-                module_file = current / f"{part}.py"
-                if module_file.is_file():
-                    return module_file
-                package_file = current / part / "__init__.py"
-                if package_file.is_file():
-                    return package_file
-            else:
-                current = current / part
-                if not current.is_dir():
-                    break
-    return None
+    _track_shared_source_candidates(parts)
+    try:
+        spec = _find_module_spec_without_imports(module_name)
+    except Exception:
+        return None
+    if spec is None or spec.origin is None or not spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
+        return None
+    source_path = Path(spec.origin)
+    _track_shared_source_paths((source_path,))
+    try:
+        return source_path if source_path.is_file() else None
+    except OSError:
+        return None
 
 
 def _rce_sink(call_name: str) -> str | None:

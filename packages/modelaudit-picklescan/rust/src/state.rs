@@ -6871,6 +6871,11 @@ impl<'a> ScanState<'a> {
             outcome.has_unclassified_execution = true;
         }
         let nested_incomplete = !nested_scan.status.is_complete();
+        let nested_import_references = std::mem::take(&mut nested_scan.import_references);
+        self.merge_follow_on_import_references(
+            nested_import_references,
+            nested_scan.import_references_truncated,
+        );
 
         for nested_finding in nested_scan.findings {
             if nested_finding.severity == "critical" {
