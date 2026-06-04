@@ -1300,6 +1300,61 @@ def test_dynamic_import_handler_analysis_avoids_deleted_and_lambda_alias_false_p
     assert "os.system" not in risky_calls
 
 
+def test_dynamic_import_handler_analysis_keeps_literal_loop_exit_binding() -> None:
+    handler_source = (
+        b"def handle(data, context):\n"
+        b"    for module in [__import__('os'), __import__('math')]:\n"
+        b"        pass\n"
+        b"    return module.system('id')\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def test_dynamic_import_handler_analysis_evaluates_defaults_at_definition_time() -> None:
+    handler_source = (
+        b"def handle(data, context, module=load('os')):\n"
+        b"    return module.system('id')\n"
+        b"\n"
+        b"from importlib import import_module as load\n"
+    )
+
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"def handle(data, context):\n"
+            b"    module = __import__('os') if context else __import__('math')\n"
+            b"    return module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    if context:\n"
+            b"        from builtins import getattr as resolve\n"
+            b"    else:\n"
+            b"        resolve = getattr\n"
+            b"    return resolve(__import__('os'), 'system')('id')\n"
+        ),
+    ],
+)
+def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
+    handler_source: bytes,
+) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" in risky_calls
+
+
 @pytest.mark.parametrize(
     ("handler_source", "dangerous_name"),
     [
