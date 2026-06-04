@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import pickle
 import shlex
+import subprocess
 import sys
+import time
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -142,6 +144,40 @@ def _aiobotocore_anyio_backend_rce_payload(marker: Path) -> tuple[bytes, str]:
     return payload, marker_content
 
 
+def _assert_pickle_payload_executes_in_subprocess(
+    payload: bytes, marker: Path, marker_content: str, tmp_path: Path
+) -> None:
+    payload_path = tmp_path / "payload.pkl"
+    payload_path.write_bytes(payload)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import pickle, pathlib, sys; pickle.loads(pathlib.Path(sys.argv[1]).read_bytes())",
+            str(payload_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 5
+    while process.poll() is None and time.monotonic() < deadline:
+        if marker.exists() and marker.read_text() == marker_content:
+            break
+        time.sleep(0.01)
+
+    if process.poll() is None:
+        process.terminate()
+    try:
+        _, stderr = process.communicate(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        _, stderr = process.communicate()
+
+    assert marker.exists(), f"pickle payload did not execute: {stderr.strip()}"
+    assert marker.read_text() == marker_content
+
+
 def _has_critical_call_graph_finding(report: PickleReport, module: str, name: str, sink: str) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -233,12 +269,4 @@ def test_scan_bytes_blocks_aiobotocore_anyio_backend_rce(tmp_path: Path) -> None
     )
 
     assert not marker.exists()
-    result = pickle.loads(payload)
-    assert result == {
-        "access_key": "A",
-        "secret_key": "S",
-        "token": None,
-        "expiry_time": None,
-        "account_id": "1",
-    }
-    assert marker.read_text() == marker_content
+    _assert_pickle_payload_executes_in_subprocess(payload, marker, marker_content, tmp_path)
