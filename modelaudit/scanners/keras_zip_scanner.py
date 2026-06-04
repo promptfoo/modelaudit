@@ -104,7 +104,6 @@ _ARCHIVE_EXTRACT_URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
-_WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[a-zA-Z]:[\\/]|\\\\)")
 _KERAS_CONFIG_ENTRY = "config.json"
 _KERAS_CONFIG_MAX_BYTES = 10 * 1024 * 1024
 
@@ -2160,7 +2159,11 @@ class KerasZipScanner(BaseScanner):
                     )
                     result.merge(prefix_result)
                     continue
-                if prefix_result.scanner_name != "unknown":
+                pickle_scan_was_selection_skipped = (
+                    prefix_result.scanner_name == "scanner_selection"
+                    and prefix_result.metadata.get("skipped_scanner_id") == "pickle"
+                )
+                if prefix_result.scanner_name != "unknown" and not pickle_scan_was_selection_skipped:
                     continue
             finally:
                 if temp_path is not None:

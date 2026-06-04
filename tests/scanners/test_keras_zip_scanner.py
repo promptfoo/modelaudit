@@ -29,6 +29,7 @@ from modelaudit.scanners.keras_zip_scanner import (
     KerasZipScanner,
     _has_get_file_reference,
 )
+from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file import detection as file_detection
 
 try:
@@ -415,14 +416,9 @@ class TestKerasZipScanner:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Missing h5py must not suppress malicious bytes stored before the user-block signature."""
-        if h5py is None:
-            pytest.skip("h5py not available")
         pickle_payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
         weights_path = tmp_path / "userblock_pickle.weights.h5"
-        with h5py.File(weights_path, "w", userblock_size=512) as h5_file:
-            h5_file.create_dataset("kernel", data=[1.0, 2.0])
-        with weights_path.open("r+b") as weights_file:
-            weights_file.write(pickle_payload)
+        weights_path.write_bytes(pickle_payload + bytes(512 - len(pickle_payload)) + b"\x89HDF\r\n\x1a\n")
         assert weights_path.read_bytes()[512 : 512 + 8] == b"\x89HDF\r\n\x1a\n"
 
         monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
@@ -486,6 +482,44 @@ class TestKerasZipScanner:
             for issue in result.issues
         )
         assert not any(check.name == "H5PY Library Check" for check in result.checks)
+
+    def test_userblock_embedded_weights_does_not_pickle_scan_selection_skipped_zip(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A recognized user-block ZIP must not be reinterpreted as pickle when ZIP scanning is disabled."""
+        nested_zip_path = tmp_path / "userblock_payload.zip"
+        with zipfile.ZipFile(nested_zip_path, "w") as nested_zip:
+            nested_zip.writestr("README.txt", b"benign user-block archive")
+
+        nested_zip_payload = nested_zip_path.read_bytes()
+        hdf5_signature_offset = 512
+        assert len(nested_zip_payload) < hdf5_signature_offset
+        weights_path = tmp_path / "userblock_zip.weights.h5"
+        weights_path.write_bytes(
+            nested_zip_payload + bytes(hdf5_signature_offset - len(nested_zip_payload)) + b"\x89HDF\r\n\x1a\n"
+        )
+
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+
+        def fail_pickle_scan(*args: Any, **kwargs: Any) -> Any:
+            pytest.fail("recognized ZIP user-block content must not fall back to pickle scanning")
+
+        monkeypatch.setattr(PickleScanner, "scan_stream", fail_pickle_scan)
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.12.0",
+            weights_h5_path=weights_path,
+        )
+
+        result = KerasZipScanner(config={"scanners": ["keras_zip"]}).scan(str(keras_path))
+
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["embedded_weights_hdf5_signature_offset"] == hdf5_signature_offset
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
     def test_userblock_embedded_weights_does_not_hide_content_after_zip_end_record(
         self,
