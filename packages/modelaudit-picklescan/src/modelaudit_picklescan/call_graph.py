@@ -33,6 +33,9 @@ _MAX_MODULE_COMPONENTS = 32
 # scan precision or throughput needs change.
 _MAX_SOURCE_BYTES = 1024 * 1024
 _MAX_BYTECODE_CACHE_BYTES = 4 * _MAX_SOURCE_BYTES
+_MAX_BYTECODE_CACHE_DIRECTORY_BYTES = 64 * 1024
+_MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES = 256
+_BYTECODE_CACHE_OPTIMIZATIONS = (("", 0), ("1", 1), ("2", 2))
 _MAX_CALL_GRAPH_DEPTH = 4
 _MAX_VISITED_FUNCTIONS = 64
 _MAX_CALLS_PER_FUNCTION = 128
@@ -1134,6 +1137,21 @@ def _source_candidate_fingerprint(
     read_limit: int = _MAX_SOURCE_BYTES,
     require_complete: bool = True,
 ) -> tuple[bool, bytes | None]:
+    if path.is_dir():
+        try:
+            entries: list[bytes] = []
+            total_bytes = 0
+            for index, entry in enumerate(path.iterdir()):
+                if index >= _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES:
+                    return False, None
+                entry_name = os.fsencode(entry.name)
+                total_bytes += len(entry_name) + 1
+                if require_complete and total_bytes > read_limit:
+                    return False, None
+                entries.append(entry_name)
+        except OSError:
+            return False, None
+        return True, hashlib.sha256(b"\0".join(sorted(entries))).digest()
     if not path.is_file():
         return True, None
     try:
@@ -1752,11 +1770,48 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
 
 
 def _source_has_importable_untrusted_cache(source_path: Path, source: str) -> bool:
+    cache_paths: list[tuple[Path, int]] = []
+    for optimization, optimize_level in _BYTECODE_CACHE_OPTIMIZATIONS:
+        try:
+            cache_path = Path(cache_from_source(str(source_path), optimization=optimization))
+        except (NotImplementedError, ValueError):
+            return True
+        cache_paths.append((cache_path, optimize_level))
+    cache_directory = cache_paths[0][0].parent
+    _track_shared_source_paths(
+        (cache_directory,),
+        read_limit=_MAX_BYTECODE_CACHE_DIRECTORY_BYTES,
+    )
     try:
-        cache_path = Path(cache_from_source(str(source_path)))
-    except (NotImplementedError, ValueError):
+        if cache_directory.is_dir():
+            default_cache_name = cache_paths[0][0].name
+            optimized_prefix = f"{default_cache_name[:-4]}.opt-"
+            for index, candidate in enumerate(cache_directory.iterdir()):
+                if index >= _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES:
+                    return True
+                if not candidate.name.startswith(optimized_prefix) or not candidate.name.endswith(".pyc"):
+                    continue
+                optimization = candidate.name[len(optimized_prefix) : -4]
+                if optimization.isdecimal() and int(optimization) > 2 and candidate.is_file():
+                    return True
+    except OSError:
         return True
-    _track_shared_source_paths((cache_path,), read_limit=_MAX_BYTECODE_CACHE_BYTES)
+    _track_shared_source_paths(
+        (cache_path for cache_path, _ in cache_paths),
+        read_limit=_MAX_BYTECODE_CACHE_BYTES,
+    )
+    return any(
+        _bytecode_cache_can_override_source(cache_path, source_path, source, optimize_level)
+        for cache_path, optimize_level in cache_paths
+    )
+
+
+def _bytecode_cache_can_override_source(
+    cache_path: Path,
+    source_path: Path,
+    source: str,
+    optimize_level: int,
+) -> bool:
     if not cache_path.is_file():
         return False
     try:
@@ -1773,16 +1828,15 @@ def _source_has_importable_untrusted_cache(source_path: Path, source: str) -> bo
     flags = int.from_bytes(header[4:8], "little")
     if flags & ~0x03:
         return False
-    if flags & 0x01:
-        return not bool(flags & 0x02)
-    if len(header) < 16:
-        return False
-    source_stat = source_path.stat()
-    cached_mtime = int.from_bytes(header[8:12], "little")
-    cached_size = int.from_bytes(header[12:16], "little")
-    if cached_mtime != int(source_stat.st_mtime) & 0xFFFFFFFF or cached_size != source_stat.st_size & 0xFFFFFFFF:
-        return False
-    source_code = compile(source, str(source_path), "exec", dont_inherit=True, optimize=-1)
+    if not flags & 0x01:
+        if len(header) < 16:
+            return False
+        source_stat = source_path.stat()
+        cached_mtime = int.from_bytes(header[8:12], "little")
+        cached_size = int.from_bytes(header[12:16], "little")
+        if cached_mtime != int(source_stat.st_mtime) & 0xFFFFFFFF or cached_size != source_stat.st_size & 0xFFFFFFFF:
+            return False
+    source_code = compile(source, str(source_path), "exec", dont_inherit=True, optimize=optimize_level)
     return cache_bytes[16:] != marshal.dumps(source_code)
 
 

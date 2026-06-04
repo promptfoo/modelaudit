@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import pickle
 import shlex
+import subprocess
 import sys
+import time
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -233,12 +235,28 @@ def test_scan_bytes_blocks_aiobotocore_anyio_backend_rce(tmp_path: Path) -> None
     )
 
     assert not marker.exists()
-    result = pickle.loads(payload)
-    assert result == {
-        "access_key": "A",
-        "secret_key": "S",
-        "token": None,
-        "expiry_time": None,
-        "account_id": "1",
-    }
-    assert marker.read_text() == marker_content
+    proof = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            f"import pickle; pickle.loads({payload!r})",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while not marker.exists() and time.monotonic() < deadline:
+            assert proof.poll() is None
+            time.sleep(0.1)
+        assert marker.read_text() == marker_content
+    finally:
+        if proof.poll() is None:
+            proof.terminate()
+            try:
+                proof.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proof.kill()
+                proof.wait(timeout=5)

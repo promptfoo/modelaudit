@@ -1027,14 +1027,17 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     trusted_import_references: frozenset[tuple[str, str]] = frozenset()
     unresolved_trusted_invocation_positions: frozenset[int] = frozenset()
     analyzed_invocation_global_positions: frozenset[int] = frozenset()
+    analyzed_invocation_references: frozenset[tuple[str, str]] = frozenset()
     source_snapshot_stable = True
     callable_invocations_complete = not bool(report.metadata.get("callable_invocations_truncated"))
     try:
         invoked_global_positions = _invoked_global_positions(callable_invocations)
         trusted_reconstruction_global_positions = _trusted_reconstruction_global_positions(callable_invocations)
+        trusted_reconstruction_references = _trusted_reconstruction_references(callable_invocations)
     except Exception as error:
         invoked_global_positions = frozenset()
         trusted_reconstruction_global_positions = frozenset()
+        trusted_reconstruction_references = frozenset()
         callable_invocations_complete = False
         enrichment_errors.append(("python_import_invocation_classification", error))
     with shared_source_sensitive_caches():
@@ -1072,6 +1075,10 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
             analyzed_invocation_global_positions = find_analyzed_callable_call_graph_global_positions(
                 callable_invocations
             )
+            analyzed_invocation_references = _invocation_references_for_positions(
+                callable_invocations,
+                analyzed_invocation_global_positions,
+            )
         except Exception as error:
             enrichment_errors.append(("python_import_invocation_analysis", error))
         try:
@@ -1107,7 +1114,9 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
             unresolved_trusted_invocation_positions,
             invoked_global_positions,
             analyzed_invocation_global_positions,
+            analyzed_invocation_references,
             trusted_reconstruction_global_positions,
+            trusted_reconstruction_references,
         )
     updated_report = (
         _with_unanalyzed_call_graph_notices(report, unanalyzed_references) if unanalyzed_references else report
@@ -1273,7 +1282,7 @@ def _proven_unresolved_trusted_invocation_positions(
         position = _optional_int(finding.details.get("position"))
         if (
             position is None
-            or position not in invoked_global_positions
+            or not _finding_is_invoked(finding, position, invoked_global_positions)
             or not unresolved_trusted_import_reference_is_safe_when_invoked(module, name)
         ):
             continue
@@ -1288,7 +1297,9 @@ def _without_proven_safe_import_findings(
     unresolved_trusted_invocation_positions: frozenset[int],
     invoked_global_positions: frozenset[int],
     analyzed_invocation_global_positions: frozenset[int],
+    analyzed_invocation_references: frozenset[tuple[str, str]],
     trusted_reconstruction_global_positions: frozenset[int],
+    trusted_reconstruction_references: frozenset[tuple[str, str]],
 ) -> PickleReport:
     findings = tuple(
         finding
@@ -1301,7 +1312,9 @@ def _without_proven_safe_import_findings(
             unresolved_trusted_invocation_positions,
             invoked_global_positions,
             analyzed_invocation_global_positions,
+            analyzed_invocation_references,
             trusted_reconstruction_global_positions,
+            trusted_reconstruction_references,
         )
     )
     if len(findings) == len(report.findings):
@@ -1334,25 +1347,45 @@ def _non_allowlisted_import_finding_is_proven_safe(
     unresolved_trusted_invocation_positions: frozenset[int],
     invoked_global_positions: frozenset[int],
     analyzed_invocation_global_positions: frozenset[int],
+    analyzed_invocation_references: frozenset[tuple[str, str]],
     trusted_reconstruction_global_positions: frozenset[int],
+    trusted_reconstruction_references: frozenset[tuple[str, str]],
 ) -> bool:
     module = str(finding.details.get("module", ""))
     name = str(finding.details.get("name", ""))
     raw_position = finding.details.get("position")
     position = raw_position if type(raw_position) is int else None
-    inert_reference_is_proven_safe = position is not None and (
-        position not in invoked_global_positions or position in analyzed_invocation_global_positions
+    reference = (module, name)
+    finding_is_invoked = position is not None and _finding_is_invoked(
+        finding,
+        position,
+        invoked_global_positions,
     )
+    invocation_is_analyzed = (
+        position is not None and position in analyzed_invocation_global_positions
+    ) or reference in analyzed_invocation_references
+    invocation_is_trusted_reconstruction = (
+        position is not None and position in trusted_reconstruction_global_positions
+    ) or reference in trusted_reconstruction_references
+    inert_reference_is_proven_safe = position is not None and (not finding_is_invoked or invocation_is_analyzed)
     trusted_reference_is_proven_safe = position is not None and (
-        position not in invoked_global_positions
+        not finding_is_invoked
         or not trusted_import_reference_requires_invocation_analysis(module, name)
-        or position in analyzed_invocation_global_positions
-        or position in trusted_reconstruction_global_positions
+        or invocation_is_analyzed
+        or invocation_is_trusted_reconstruction
     )
     return (
         trusted_reference_is_proven_safe
         and ((module, name) in trusted_import_references or position in unresolved_trusted_invocation_positions)
     ) or (inert_reference_is_proven_safe and module in inert_initialization_modules)
+
+
+def _finding_is_invoked(
+    finding: Finding,
+    position: int,
+    invoked_global_positions: frozenset[int],
+) -> bool:
+    return finding.details.get("invoked") is True or position in invoked_global_positions
 
 
 def _invoked_global_positions(callable_invocations: object) -> frozenset[int]:
@@ -1363,6 +1396,21 @@ def _invoked_global_positions(callable_invocations: object) -> frozenset[int]:
         if position is not None:
             positions.add(position)
     return frozenset(positions)
+
+
+def _invocation_references_for_positions(
+    callable_invocations: object,
+    positions: frozenset[int],
+) -> frozenset[tuple[str, str]]:
+    references: set[tuple[str, str]] = set()
+    for raw_invocation in _sequence(callable_invocations):
+        invocation = _mapping(raw_invocation)
+        position = _optional_int(invocation.get("global_position"))
+        module = str(invocation.get("module", ""))
+        name = str(invocation.get("name", ""))
+        if position in positions and module and name:
+            references.add((module, name))
+    return frozenset(references)
 
 
 def _trusted_reconstruction_global_positions(callable_invocations: object) -> frozenset[int]:
@@ -1376,6 +1424,22 @@ def _trusted_reconstruction_global_positions(callable_invocations: object) -> fr
     return frozenset(
         position
         for position, opcodes in opcodes_by_position.items()
+        if opcodes and opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
+    )
+
+
+def _trusted_reconstruction_references(callable_invocations: object) -> frozenset[tuple[str, str]]:
+    opcodes_by_reference: dict[tuple[str, str], set[str]] = {}
+    for raw_invocation in _sequence(callable_invocations):
+        invocation = _mapping(raw_invocation)
+        module = str(invocation.get("module", ""))
+        name = str(invocation.get("name", ""))
+        if not module or not name:
+            continue
+        opcodes_by_reference.setdefault((module, name), set()).add(str(invocation.get("opcode", "")))
+    return frozenset(
+        reference
+        for reference, opcodes in opcodes_by_reference.items()
         if opcodes and opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
     )
 

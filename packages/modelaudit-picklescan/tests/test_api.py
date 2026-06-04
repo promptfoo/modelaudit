@@ -15,6 +15,7 @@ import os
 import pickle
 import py_compile
 import re
+import subprocess
 import sys
 import tarfile
 import uuid
@@ -3671,6 +3672,119 @@ def test_scan_bytes_warns_when_timestamp_cache_overrides_inert_source(
         sys.modules.pop(module_name, None)
 
 
+def test_scan_bytes_warns_when_optimized_cache_overrides_inert_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_optimized_cache_{uuid.uuid4().hex}"
+    marker = tmp_path / "optimized_cache_marker"
+    source_path = tmp_path / f"{module_name}.py"
+    malicious_source = f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n"
+    benign_source = "class Gadget:\n    pass\n"
+    benign_source += "#" * (len(malicious_source.encode()) - len(benign_source.encode()))
+    fixed_mtime = 1_700_000_000
+    source_path.write_text(malicious_source, encoding="utf-8")
+    os.utime(source_path, (fixed_mtime, fixed_mtime))
+    py_compile.compile(
+        str(source_path),
+        doraise=True,
+        optimize=1,
+        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+    )
+    source_path.write_text(benign_source, encoding="utf-8")
+    os.utime(source_path, (fixed_mtime, fixed_mtime))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+    load_payload = f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})"
+    subprocess.run([sys.executable, "-O", "-c", load_payload], check=True)
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_scan_bytes_warns_when_higher_optimized_cache_overrides_inert_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_higher_optimized_cache_{uuid.uuid4().hex}"
+    marker = tmp_path / "higher_optimized_cache_marker"
+    source_path = tmp_path / f"{module_name}.py"
+    malicious_source = f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n"
+    benign_source = "class Gadget:\n    pass\n"
+    benign_source += "#" * (len(malicious_source.encode()) - len(benign_source.encode()))
+    fixed_mtime = 1_700_000_000
+    source_path.write_text(malicious_source, encoding="utf-8")
+    os.utime(source_path, (fixed_mtime, fixed_mtime))
+    compile_module = f"import sys; sys.path.insert(0, {str(tmp_path)!r}); import {module_name}"
+    subprocess.run([sys.executable, "-OOO", "-c", compile_module], check=True)
+    marker.unlink()
+    source_path.write_text(benign_source, encoding="utf-8")
+    os.utime(source_path, (fixed_mtime, fixed_mtime))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+    load_payload = f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})"
+    subprocess.run([sys.executable, "-OOO", "-c", load_payload], check=True)
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
+def test_scan_bytes_warns_when_checked_hash_cache_overrides_inert_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_checked_cache_override_{uuid.uuid4().hex}"
+    marker = tmp_path / "checked_hash_cache_marker"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\nclass Gadget:\n    pass\n",
+        encoding="utf-8",
+    )
+    py_compile.compile(
+        str(source_path),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH,
+    )
+    source_path.write_text("class Gadget:\n    pass\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = f"c{module_name}\nGadget\n.".encode()
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        for finding in report.findings
+    )
+    load_payload = f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})"
+    subprocess.run(
+        [sys.executable, "--check-hash-based-pycs", "never", "-c", load_payload],
+        check=True,
+    )
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
 def test_scan_bytes_allows_inert_source_with_stale_timestamp_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3758,8 +3872,48 @@ def test_scan_bytes_warns_on_invoked_global_from_inert_source_module(
     assert any(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
         and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        and finding.details.get("invoked") is True
         for finding in report.findings
     )
+
+
+def test_scan_bytes_keeps_each_repeated_global_invocation_under_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_c095_repeated_invocation_{uuid.uuid4().hex}"
+    marker = tmp_path / "repeated_invocation_marker"
+    constructor_payload = f"open({str(marker)!r}, 'w').write('owned')"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Gadget:\n"
+        "    def __new__(cls):\n"
+        "        return object.__new__(cls)\n"
+        "    def __init__(self):\n"
+        f"        exec({constructor_payload!r})\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    global_opcode = f"c{module_name}\nGadget\n".encode()
+    payload = b"\x80\x04" + global_opcode + b")\x810" + global_opcode + b")R."
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert marker.exists() is False
+    assert len(report.metadata["callable_invocations"]) == 2
+    assert {invocation["opcode"] for invocation in report.metadata["callable_invocations"]} == {
+        "NEWOBJ",
+        "REDUCE",
+    }
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.details.get("import_reference") == f"{module_name}.Gadget"
+        and finding.details.get("sink") == "builtins.exec"
+        for finding in report.findings
+    )
+    pickle.loads(payload)
+    assert marker.read_text(encoding="utf-8") == "owned"
 
 
 def test_scan_bytes_allows_import_only_global_with_inert_package_chain(

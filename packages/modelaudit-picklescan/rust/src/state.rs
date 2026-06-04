@@ -456,7 +456,7 @@ fn global_ref_details(
 
 type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
 type ImportReferenceDedupeKey = (String, String, String);
-type CallableInvocationDedupeKey = (String, String, Option<usize>);
+type CallableInvocationDedupeKey = (String, String, String, Option<usize>);
 type PendingGlobalImportFinding = (String, usize, Vec<(String, DetailValue)>);
 
 fn detail_value_content_bytes(value: &DetailValue) -> usize {
@@ -1409,6 +1409,7 @@ impl<'a> ScanState<'a> {
             name if REDUCE_OPCODES.contains(&name) => {
                 let invocations = self.consume_callable_opcode(opcode, position);
                 for invocation in &invocations {
+                    self.mark_non_allowlisted_global_invoked(invocation);
                     self.push_callable_invocation(invocation);
                 }
                 if let Some(primary_invocation) = invocations.first() {
@@ -6236,6 +6237,7 @@ impl<'a> ScanState<'a> {
         let dedupe_key = (
             invocation.reference.module.clone(),
             invocation.reference.name.clone(),
+            invocation.op_name.to_string(),
             invocation.positional_arg_count,
         );
         if self.callable_invocation_keys.contains(&dedupe_key) {
@@ -6278,6 +6280,19 @@ impl<'a> ScanState<'a> {
             ));
         }
         self.callable_invocations.push(details);
+    }
+
+    fn mark_non_allowlisted_global_invoked(&mut self, invocation: &CallableInvocation) {
+        let symbol = invocation.reference.symbol();
+        for (pending_symbol, position, details) in &mut self.non_allowlisted_global_imports {
+            if pending_symbol != &symbol || *position != invocation.reference.position {
+                continue;
+            }
+            if !details.iter().any(|(key, _)| key == "invoked") {
+                details.push(("invoked".to_string(), DetailValue::Bool(true)));
+            }
+            break;
+        }
     }
 
     fn record_callable_invocations_truncated_notice(&mut self) {
@@ -6945,14 +6960,15 @@ impl<'a> ScanState<'a> {
 
     fn callable_invocation_detail_key(
         details: &[(String, DetailValue)],
-    ) -> Option<(String, String, Option<usize>)> {
+    ) -> Option<CallableInvocationDedupeKey> {
         let module = detail_string(details, "module").unwrap_or_default();
         let name = detail_string(details, "name").unwrap_or_default();
         if module.is_empty() || name.is_empty() {
             return None;
         }
+        let opcode = detail_string(details, "opcode")?;
         let positional_arg_count = detail_usize(details, "positional_arg_count");
-        Some((module, name, positional_arg_count))
+        Some((module, name, opcode, positional_arg_count))
     }
 
     fn coalesce_redundant_global_findings(&mut self) {
@@ -9130,6 +9146,67 @@ mod tests {
             .notices
             .iter()
             .any(|notice| notice.code == Some("callable_invocations_truncated")));
+    }
+
+    #[test]
+    fn repeated_callable_invocations_preserve_each_semantic_opcode() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "repeated-invocations.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+        let first = ScanState::callable_invocation(
+            GlobalRef {
+                module: "module".to_string(),
+                name: "Gadget".to_string(),
+                position: 4,
+                malformed: false,
+            },
+            "NEWOBJ",
+            20,
+            Some(0),
+        );
+        let second = ScanState::callable_invocation(
+            GlobalRef {
+                module: "module".to_string(),
+                name: "Gadget".to_string(),
+                position: 24,
+                malformed: false,
+            },
+            "REDUCE",
+            40,
+            Some(0),
+        );
+        let duplicate_reduce = ScanState::callable_invocation(
+            GlobalRef {
+                module: "module".to_string(),
+                name: "Gadget".to_string(),
+                position: 44,
+                malformed: false,
+            },
+            "REDUCE",
+            60,
+            Some(0),
+        );
+
+        scan.push_callable_invocation(&first);
+        scan.push_callable_invocation(&second);
+        scan.push_callable_invocation(&duplicate_reduce);
+
+        assert_eq!(scan.callable_invocations.len(), 2);
+        assert!(!scan.callable_invocations_truncated);
     }
 
     #[test]
