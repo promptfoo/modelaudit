@@ -1924,6 +1924,16 @@ class TestJITScriptDetector:
                 b"getattr(\n    rp.run_path,\n    '__call__'\n)(\n    'payload.py'\n)\n",
                 "Dynamic module execution detected",
             ),
+            (
+                b"import ctypes as c\n",
+                b"getattr(c, 'CDLL').__call__('payload.so')\n",
+                "Native library loading detected",
+            ),
+            (
+                b"import ctypes as c\n",
+                b"vars(c)['CDLL'].__call__('payload.so')\n",
+                "Native library loading detected",
+            ),
         ],
     )
     def test_scan_model_detects_long_explicit_dunder_call_with_bounded_replay(

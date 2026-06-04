@@ -722,6 +722,31 @@ def test_scan_zip_flags_webbrowser_and_ctypes_python_member(tmp_path: Path) -> N
     assert "ctypes.LibraryLoader.classbodyinitlib" in checks_by_rule["S110"].details["reason"]
 
 
+def test_scan_zip_flags_unbound_libraryloader_accessor_dispatch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import ctypes\n"
+        "loader = ctypes.LibraryLoader(ctypes.CDLL)\n"
+        "type(loader).__getattr__(loader, 'typegetattr')\n"
+        "loader.__class__.__getitem__(loader, 'classgetitem')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_rule = {check.rule_code: check for check in python_checks}
+    assert set(checks_by_rule) == {"S110"}
+    s110_reason = checks_by_rule["S110"].details["reason"]
+    assert "ctypes.LibraryLoader.typegetattr" in s110_reason
+    assert "ctypes.LibraryLoader.classgetitem" in s110_reason
+
+
 def test_scan_zip_flags_webbrowser_controller_getattribute_launch(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = "import webbrowser\nwebbrowser.get().__getattribute__('open')('https://example.invalid')\n"

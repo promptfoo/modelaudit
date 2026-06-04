@@ -7533,14 +7533,17 @@ def _priority_getattr_alias_member(
     canonical_helpers = canonical_builtin_helper_aliases or {
         "getattr": "getattr",
         "builtins.getattr": "getattr",
+        "vars": "vars",
+        "builtins.vars": "vars",
     }
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         member_node: ast.AST | None = None
         target_node: ast.AST | None = None
-        if isinstance(node.func, ast.Call):
-            getter = node.func
+        call_target = _explicit_call_target(node.func)
+        if isinstance(call_target, ast.Call):
+            getter = call_target
             getter_name = _simple_reference_name(getter.func)
             if (
                 canonical_helpers.get(getter_name or "") != "getattr"
@@ -7552,8 +7555,8 @@ def _priority_getattr_alias_member(
                 continue
             target_node = getter.args[0]
             member_node = getter.args[1]
-        elif isinstance(node.func, ast.Subscript) and isinstance(node.func.value, ast.Call):
-            getter = node.func.value
+        elif isinstance(call_target, ast.Subscript) and isinstance(call_target.value, ast.Call):
+            getter = call_target.value
             getter_name = _simple_reference_name(getter.func)
             if (
                 canonical_helpers.get(getter_name or "") != "vars"
@@ -7564,7 +7567,7 @@ def _priority_getattr_alias_member(
             if getter.keywords or len(getter.args) != 1:
                 continue
             target_node = getter.args[0]
-            member_node = node.func.slice
+            member_node = call_target.slice
         else:
             continue
         if target_node is None or member_node is None or not isinstance(target_node, ast.Name):

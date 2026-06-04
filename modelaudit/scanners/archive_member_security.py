@@ -1207,14 +1207,14 @@ def _resolve_unbound_getattribute_call_names(
 ) -> frozenset[str] | None:
     if (
         not isinstance(node.func, ast.Attribute)
-        or node.func.attr != "__getattribute__"
+        or node.func.attr not in {"__getattribute__", "__getattr__", "__getitem__"}
         or len(node.args) != 2
         or node.keywords
     ):
         return None
-    attr_name = _resolve_static_string(node.args[1])
-    if attr_name is None:
+    if _is_static_non_string(node.args[1]):
         return None
+    attr_name = _resolve_static_string(node.args[1])
     target_roots = _resolve_static_reference_names(
         node.args[0],
         alias_scopes,
@@ -1257,6 +1257,10 @@ def _resolve_unbound_getattribute_call_names(
         if root in _TRACKED_STATIC_MODULE_ROOTS or _is_ctypes_library_loader_object_root(root)
     )
     if not compatible_roots:
+        return None
+    if node.func.attr in {"__getattr__", "__getitem__"}:
+        return _apply_aliases_to_names(_ctypes_loader_member_load_names(compatible_roots, attr_name), alias_scopes)
+    if attr_name is None:
         return None
     return _apply_aliases_to_names(frozenset(f"{root}.{attr_name}" for root in compatible_roots), alias_scopes)
 
