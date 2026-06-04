@@ -2139,6 +2139,16 @@ class TestJITScriptDetector:
                 b"with C() as sink:\n"
                 b"    sink('1+1')\n"
             ),
+            (
+                b"\x00\xffclass C:\n"
+                b"    async def __aenter__(self):\n"
+                b"        return eval\n"
+                b"    async def __aexit__(self, *_args):\n"
+                b"        pass\n"
+                b"async def payload():\n"
+                b"    async with C() as sink:\n"
+                b"        sink('1+1')\n"
+            ),
             (b"\x00\xffdef deco(function):\n    return eval\n@deco\ndef sink():\n    pass\nsink('1+1')\n"),
             (b"\x00\xffdef framing():\n    return None\ncallbacks = [eval]\ncallbacks.pop()('1+1')\n"),
         ],
@@ -2300,6 +2310,17 @@ class TestJITScriptDetector:
                 b"        pass\n"
                 b"with C() as sink:\n"
                 b"    sink([])\n"
+                b"unused = eval\n"
+            ),
+            (
+                b"\x00\xffclass C:\n"
+                b"    async def __aenter__(self):\n"
+                b"        return len\n"
+                b"    async def __aexit__(self, *_args):\n"
+                b"        pass\n"
+                b"async def payload():\n"
+                b"    async with C() as sink:\n"
+                b"        sink([])\n"
                 b"unused = eval\n"
             ),
             (b"\x00\xffdef deco(function):\n    return len\n@deco\ndef sink():\n    pass\nsink([])\nunused = eval\n"),
