@@ -3001,6 +3001,137 @@ def test_scan_nested_file_fails_closed_when_recognized_header_scanner_is_unavail
     assert check.details["preferred_scanner_id"] == "header_only_scanner"
 
 
+def test_executable_zip_composed_routing_fails_closed_when_subtype_scanner_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "skops-polyglot.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "schema.json",
+            json.dumps(
+                {
+                    "__loader__": "OperatorFuncNode",
+                    "__module__": "builtins",
+                    "__class__": "eval",
+                    "_skops_version": "0.11.0",
+                    "content": {},
+                }
+            ),
+        )
+        archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+    original_loader = _registry.load_scanner_by_id
+
+    def load_scanner_by_id(scanner_id: str) -> type[BaseScanner] | None:
+        if scanner_id == "skops":
+            return None
+        return original_loader(scanner_id)
+
+    monkeypatch.setattr(_registry, "load_scanner_by_id", load_scanner_by_id)
+
+    result = ScanResult(scanner_name="zip")
+    archive_dispatch.merge_executable_zip_container_findings(
+        str(archive_path),
+        result,
+        {"cache_enabled": False},
+        context="test executable ZIP polyglot",
+    )
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    assert "recognized_format_scanner_unavailable" in result.metadata["scan_outcome_reasons"]
+
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.status == CheckStatus.FAILED
+    assert check.severity == IssueSeverity.INFO
+    assert check.details["format"] == "skops"
+    assert check.details["preferred_scanner_id"] == "skops"
+    assert any(
+        issue.rule_code == "S201"
+        and issue.details.get("zip_entry") == "payload.pkl"
+        and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+
+
+def test_executable_zip_unavailable_subtype_fails_closed_and_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "skops-polyglot.jpg"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "schema.json",
+            json.dumps(
+                {
+                    "__loader__": "ObjectNode",
+                    "__module__": "sklearn.pipeline",
+                    "__class__": "Pipeline",
+                    "_skops_version": "0.12.0",
+                    "content": {},
+                }
+            ),
+        )
+    archive_path.write_bytes(b"\x7fELF" + b"\x00" * 60 + archive_path.read_bytes())
+
+    original_loader = _registry.load_scanner_by_id
+
+    def load_scanner_by_id(scanner_id: str) -> type[BaseScanner] | None:
+        if scanner_id == "skops":
+            return None
+        return original_loader(scanner_id)
+
+    monkeypatch.setattr(_registry, "load_scanner_by_id", load_scanner_by_id)
+
+    _assert_inconclusive_zip_aggregate_not_cached(
+        archive_path,
+        "recognized_format_scanner_unavailable",
+        tmp_path / "cache",
+    )
+
+
+def test_executable_zip_unavailable_subtype_ignores_benign_schema_near_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "generic-polyglot.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "schema.json",
+            json.dumps(
+                {
+                    "__loader__": "ObjectNode",
+                    "__module__": "sklearn.pipeline",
+                    "__class__": "Pipeline",
+                    "content": {},
+                }
+            ),
+        )
+
+    original_loader = _registry.load_scanner_by_id
+
+    def load_scanner_by_id(scanner_id: str) -> type[BaseScanner] | None:
+        if scanner_id == "skops":
+            raise AssertionError("benign schema near-match routed to the Skops scanner")
+        return original_loader(scanner_id)
+
+    monkeypatch.setattr(_registry, "load_scanner_by_id", load_scanner_by_id)
+
+    result = ScanResult(scanner_name="zip")
+    archive_dispatch.merge_executable_zip_container_findings(
+        str(archive_path),
+        result,
+        {"cache_enabled": False},
+        context="test executable ZIP polyglot",
+    )
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert all(check.name != "Format Detection" for check in result.checks)
+
+
 def test_scan_nested_file_does_not_fail_closed_for_extension_only_member(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
