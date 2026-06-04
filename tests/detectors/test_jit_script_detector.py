@@ -6314,6 +6314,12 @@ class TestJITScriptDetector:
             (b"callbacks = {'run': eval}\ndict.get(callbacks, 'run')('1+1')\n"),
             (b"callbacks = [eval]\nlist.__getitem__(callbacks, 0)('1+1')\n"),
             (b"staticmethod(eval)('1+1')\n"),
+            (b"def run():\n    list(map(lambda callback: callback('1+1'), [eval]))\nrun()\n"),
+            (b"def callbacks():\n    yield eval\nfor callback in callbacks():\n    callback('1+1')\n"),
+            (b"from functools import reduce\nreduce(lambda _value, callback: callback('1+1'), [eval], None)\n"),
+            (b"try:\n    raise Exception(eval)\nexcept Exception as error:\n    error.args[0]('1+1')\n"),
+            (b"type(eval).__call__(eval, '1+1')\n"),
+            (b"def annotated(value: eval):\n    pass\nannotated.__annotations__['value']('1+1')\n"),
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
@@ -6656,6 +6662,21 @@ class TestJITScriptDetector:
             (b"staticmethod(len)([])\nunused = eval\n"),
             (b"callbacks = {-1: eval}\ncallbacks.pop()('1+1')\n"),
             (b"callbacks = [eval]\nlist.get(callbacks, 0)('1+1')\n"),
+            (b"list(map(lambda callback: callback([]), [len]))\nunused = eval\n"),
+            (b"def callbacks():\n    yield len\nfor callback in callbacks():\n    callback([])\nunused = eval\n"),
+            (
+                b"from functools import reduce\n"
+                b"reduce(lambda _value, callback: callback([]), [len], None)\n"
+                b"unused = eval\n"
+            ),
+            (b"try:\n    raise Exception(len)\nexcept Exception as error:\n    error.args[0]([])\nunused = eval\n"),
+            (b"type(len).__call__(len, [])\nunused = eval\n"),
+            (
+                b"from __future__ import annotations\n"
+                b"def annotated(value: eval):\n"
+                b"    pass\n"
+                b"annotated.__annotations__['value']('1+1')\n"
+            ),
         ],
     )
     def test_scan_model_avoids_false_positives_across_callable_summaries(self, data: bytes) -> None:

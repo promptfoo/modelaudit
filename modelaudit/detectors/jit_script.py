@@ -9446,7 +9446,9 @@ class JITScriptDetector:
                 self.next_container_identity = 1
                 self.mutable_sequence_identities: set[int] = set()
                 self.return_binding_stack: list[list[_BuiltinAliasBinding]] = []
+                self.yield_binding_stack: list[list[_BuiltinAliasBinding]] = []
                 self.active_function_calls: set[str] = set()
+                self.deferred_annotations = False
                 self.function_nodes: dict[str, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda] = {}
                 self.lambda_summaries: dict[int, _FunctionAliasSummary] = {}
                 self.constructor_call_bindings: dict[
@@ -9635,11 +9637,19 @@ class JITScriptDetector:
                     return return_binding[7]
                 if (
                     isinstance(node, ast.Attribute)
-                    and node.attr == "call"
+                    and node.attr in {"call", "reduce"}
                     and isinstance(node.value, ast.Name)
-                    and self._has_binding_marker(node.value.id, self._OPERATOR_MODULE_MARKER)
                 ):
-                    return "operator.call"
+                    if node.attr == "call" and self._has_binding_marker(
+                        node.value.id,
+                        self._OPERATOR_MODULE_MARKER,
+                    ):
+                        return "operator.call"
+                    if node.attr == "reduce" and self._has_binding_marker(
+                        node.value.id,
+                        self._FUNCTOOLS_MODULE_MARKER,
+                    ):
+                        return "functools.reduce"
                 if not isinstance(node, ast.Name):
                     return None
                 helper = self._resolve_builtin_helper(node)
@@ -12082,6 +12092,9 @@ class JITScriptDetector:
                         self.builtins_module_aliases[-1].add(f"{self._OPERATOR_MODULE_MARKER}{local_name}")
 
             def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+                if node.module == "__future__" and any(alias.name == "annotations" for alias in node.names):
+                    self.deferred_annotations = True
+                    return
                 if node.module in _BUILTINS_MODULE_NAMES:
                     for alias in node.names:
                         if alias.name == "*":
@@ -12106,7 +12119,11 @@ class JITScriptDetector:
                             local_name,
                             None,
                             callback_invoker=(
-                                "operator.call" if node.module == "operator" and alias.name == "call" else None
+                                "operator.call"
+                                if node.module == "operator" and alias.name == "call"
+                                else "functools.reduce"
+                                if node.module == "functools" and alias.name == "reduce"
+                                else None
                             ),
                         )
                         if node.module == "functools" and alias.name == "partial":
@@ -12212,6 +12229,17 @@ class JITScriptDetector:
                     if self.return_binding_stack:
                         self.return_binding_stack[-1].append(self._binding_from_expression(node.value))
                     self.visit(node.value)
+
+            def visit_Yield(self, node: ast.Yield) -> None:
+                if node.value is not None:
+                    if self.yield_binding_stack:
+                        self.yield_binding_stack[-1].append(self._binding_from_expression(node.value))
+                    self.visit(node.value)
+
+            def visit_YieldFrom(self, node: ast.YieldFrom) -> None:
+                if self.yield_binding_stack:
+                    self.yield_binding_stack[-1].extend(self._iterator_element_bindings(node.value))
+                self.visit(node.value)
 
             def visit_Delete(self, node: ast.Delete) -> None:
                 for target in node.targets:
@@ -12417,8 +12445,13 @@ class JITScriptDetector:
                     global_names=global_names,
                 )
                 self.return_binding_stack.append([])
+                self.yield_binding_stack.append([])
                 self._visit_statements(node.body)
-                return_binding = self._merge_bindings(self.return_binding_stack.pop())
+                return_bindings = self.return_binding_stack.pop()
+                yield_bindings = self.yield_binding_stack.pop()
+                return_binding = (
+                    self._iterable_binding(yield_bindings) if yield_bindings else self._merge_bindings(return_bindings)
+                )
                 effect_global_names = set(self.global_name_scopes[-1])
                 effects = [
                     (
@@ -12442,6 +12475,27 @@ class JITScriptDetector:
                 function_id = str(id(node))
                 self.function_nodes[function_id] = node
                 self._register_function_summary(node.name, (effects, return_binding, ((function_id, 0),)))
+                if not self.deferred_annotations:
+                    annotation_bindings = {
+                        argument.arg: self._binding_from_expression(argument.annotation)
+                        for argument in [
+                            *node.args.posonlyargs,
+                            *node.args.args,
+                            *node.args.kwonlyargs,
+                            node.args.vararg,
+                            node.args.kwarg,
+                        ]
+                        if argument is not None and argument.annotation is not None
+                    }
+                    if node.returns is not None:
+                        annotation_bindings["return"] = self._binding_from_expression(node.returns)
+                    if annotation_bindings:
+                        annotations = self._mapping_binding(annotation_bindings)
+                        self._bind_attribute_key(
+                            (node.name, "__annotations__"),
+                            None,
+                            container_aliases=annotations[2],
+                        )
                 for decorator in reversed(node.decorator_list):
                     decorator_call = ast.Call(
                         func=decorator,
@@ -12461,6 +12515,20 @@ class JITScriptDetector:
                 function_container: dict[tuple[object, ...], tuple[tuple[str, int], ...]] = {}
                 for index, binding in enumerate(bindings):
                     item = self._sequence_index_element(index, len(bindings))
+                    container[(item,)] = binding[0]
+                    for path, builtin in binding[2].items():
+                        container[(item, *path)] = builtin
+                    if binding[8]:
+                        function_container[(item,)] = binding[8]
+                    for path, functions in binding[3].items():
+                        function_container[(item, *path)] = functions
+                return None, False, container, function_container, set(), {}, None, None, ()
+
+            def _iterable_binding(self, bindings: list[_BuiltinAliasBinding]) -> _BuiltinAliasBinding:
+                container: dict[tuple[object, ...], str | None] = {}
+                function_container: dict[tuple[object, ...], tuple[tuple[str, int], ...]] = {}
+                for index, binding in enumerate(bindings):
+                    item = self._unordered_element(index)
                     container[(item,)] = binding[0]
                     for path, builtin in binding[2].items():
                         container[(item, *path)] = builtin
@@ -13280,13 +13348,32 @@ class JITScriptDetector:
 
             def visit_Try(self, node: ast.Try) -> ast.stmt | None:
                 original = self._snapshot_alias_state()
-                handler_entry_states = []
+                handler_entry_states: list[
+                    tuple[
+                        tuple[
+                            list[dict[str, str | None]],
+                            list[set[str]],
+                            list[set[str]],
+                            list[dict[str, dict[tuple[object, ...], str | None]]],
+                            list[dict[tuple[str, ...], str | None]],
+                            list[dict[str, int | None]],
+                        ],
+                        _BuiltinAliasBinding | None,
+                    ]
+                ] = []
                 body_terminal: ast.stmt | None = None
                 for statement in node.body:
                     entry_state = self._snapshot_alias_state()
+                    exception_args = (
+                        self._sequence_binding(
+                            [self._binding_from_expression(argument) for argument in statement.exc.args]
+                        )
+                        if isinstance(statement, ast.Raise) and isinstance(statement.exc, ast.Call)
+                        else None
+                    )
                     visit_result = self.visit(statement)
                     if self._statement_may_raise_before_completion(statement):
-                        handler_entry_states.append(entry_state)
+                        handler_entry_states.append((entry_state, exception_args))
                     if isinstance(statement, (ast.Break, ast.Continue, ast.Raise, ast.Return)):
                         body_terminal = statement
                         break
@@ -13302,12 +13389,18 @@ class JITScriptDetector:
                     else:
                         body_terminal = orelse_terminal
                 for handler in node.handlers:
-                    for entry_state in handler_entry_states:
+                    for entry_state, exception_args in handler_entry_states:
                         self._restore_alias_state(entry_state)
                         if handler.type is not None:
                             self.visit(handler.type)
                         if handler.name is not None:
                             self._bind_name(handler.name, None)
+                            if exception_args is not None:
+                                self._bind_attribute_key(
+                                    (handler.name, "args"),
+                                    None,
+                                    container_aliases=exception_args[2],
+                                )
                         handler_terminal = self._visit_statements(handler.body)
                         if handler_terminal is None:
                             if handler.name is not None:
@@ -13374,9 +13467,66 @@ class JITScriptDetector:
                     callbacks.append(node.args[0])
                 if callback_invoker == "operator.call" and node.args:
                     callbacks.append(node.args[0])
+                if callback_invoker == "functools.reduce" and node.args:
+                    callbacks.append(node.args[0])
                 if callback_invoker in {"max", "min", "sorted"}:
                     callbacks.extend(keyword.value for keyword in node.keywords if keyword.arg == "key")
                 return {builtin for callback in callbacks if (builtin := self._resolve_builtin(callback)) is not None}
+
+            def _analyze_eager_callback_calls(self, node: ast.Call) -> None:
+                callback_invoker = self._resolve_callback_invoker(node.func)
+                if callback_invoker in {"filter", "map"} and len(node.args) >= 2:
+                    callback = node.args[0]
+                    iterable_elements = [self._literal_iterable_elements(iterable) for iterable in node.args[1:]]
+                    if any(elements is None for elements in iterable_elements):
+                        return
+                    concrete_elements = [elements for elements in iterable_elements if elements is not None]
+                    invocation_count = min((len(elements) for elements in concrete_elements), default=0)
+                    calls = [
+                        ast.Call(
+                            func=callback,
+                            args=[elements[index] for elements in concrete_elements],
+                            keywords=[],
+                        )
+                        for index in range(min(invocation_count, self._MAX_CONSTANT_STRING_CANDIDATES))
+                    ]
+                elif callback_invoker == "functools.reduce" and len(node.args) >= 2:
+                    callback = node.args[0]
+                    elements = self._literal_iterable_elements(node.args[1])
+                    if elements is None:
+                        return
+                    if len(node.args) >= 3:
+                        accumulator: ast.expr = node.args[2]
+                        remaining = elements
+                    elif elements:
+                        accumulator = elements[0]
+                        remaining = elements[1:]
+                    else:
+                        return
+                    calls = []
+                    for element in remaining[: self._MAX_CONSTANT_STRING_CANDIDATES]:
+                        calls.append(ast.Call(func=callback, args=[accumulator, element], keywords=[]))
+                        accumulator = ast.Constant(value=None)
+                else:
+                    return
+
+                if isinstance(callback, ast.Lambda) and id(callback) not in self.lambda_summaries:
+                    self.visit(callback)
+                for callback_call in calls:
+                    self._analyze_function_call(callback_call)
+
+            def _function_type_descriptor_builtin(self, node: ast.Call) -> str | None:
+                if (
+                    not isinstance(node.func, ast.Attribute)
+                    or node.func.attr != "__call__"
+                    or not isinstance(node.func.value, ast.Call)
+                    or not self._is_builtin_helper(node.func.value.func, "type")
+                    or len(node.func.value.args) != 1
+                    or node.func.value.keywords
+                    or not node.args
+                ):
+                    return None
+                return self._resolve_builtin(node.args[0])
 
             def _bind_attribute_setter_call(self, node: ast.Call) -> None:
                 target: ast.AST | None = None
@@ -13525,7 +13675,10 @@ class JITScriptDetector:
                     self.visit(node.func)
                 if builtin := self._resolve_builtin(node.func):
                     self.findings.add(builtin)
+                if descriptor_builtin := self._function_type_descriptor_builtin(node):
+                    self.findings.add(descriptor_builtin)
                 self.findings.update(self._dangerous_callback_builtins(node))
+                self._analyze_eager_callback_calls(node)
                 self._analyze_function_call(node)
                 if inline_lambda:
                     for argument in node.args:
