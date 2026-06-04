@@ -8,6 +8,7 @@ import re
 import textwrap
 import tokenize
 from typing import Final
+from urllib.parse import urlsplit, urlunsplit
 
 from modelaudit.detectors.network_comm import redact_url_for_finding
 
@@ -105,8 +106,31 @@ def _redact_malformed_url(raw_url: str) -> str:
     return f"{scheme}{REDACTED_URL_CREDENTIALS}@{rest.rsplit('@', 1)[1]}"
 
 
+def _redact_file_url(raw_url: str) -> str | None:
+    """Preserve valid absolute file paths while removing URL credentials."""
+    try:
+        parsed = urlsplit(raw_url)
+    except ValueError:
+        return None
+
+    if parsed.scheme.lower() != "file" or not parsed.path.startswith("/"):
+        return None
+
+    hostname = parsed.hostname
+    if parsed.netloc and hostname is None:
+        return None
+    if hostname is not None and ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+
+    return urlunsplit((parsed.scheme, hostname or "", parsed.path, "", ""))
+
+
 def _redact_url(match: re.Match[str]) -> str:
     raw_url = match.group(0)
+    safe_file_url = _redact_file_url(raw_url)
+    if safe_file_url is not None:
+        return safe_file_url
+
     safe_url = redact_url_for_finding(raw_url)
     if safe_url == "[invalid-url]":
         return _redact_malformed_url(raw_url)

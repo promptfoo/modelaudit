@@ -91,6 +91,21 @@ def test_redacts_legacy_s3_signed_url_access_key_id() -> None:
     assert redacted == "https://bucket.s3.amazonaws.com/model.bin"
 
 
+def test_preserves_absolute_file_url_paths_without_credentials() -> None:
+    """Absolute file URL evidence should retain paths but drop untrusted URL data."""
+    text = (
+        "local=file:///tmp/model/payload.py?token=LOCALSECRET#fragment "
+        "remote=file://user:FILEPASSWORD@fileserver/share/model.bin?signature=REMOTESECRET"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "LOCALSECRET" not in redacted
+    assert "FILEPASSWORD" not in redacted
+    assert "REMOTESECRET" not in redacted
+    assert redacted == ("local=file:///tmp/model/payload.py remote=file://fileserver/share/model.bin")
+
+
 def test_redacts_python_container_secret_assignments() -> None:
     """Python dictionary and environment assignments should not bypass evidence redaction."""
     text = 'os.environ["AWS_SECRET_ACCESS_KEY"] = "ENVSECRET123" credentials = {"client_secret": "DICTSECRET456"}'
