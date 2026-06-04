@@ -2983,7 +2983,11 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
             output.append(f"  {fmt}: {count}")
         output.append("\nFiles:")
         for file_meta in metadata["files"][:10]:  # Show first 10 files
-            output.append(f"  {file_meta.get('file', 'unknown')} ({file_meta.get('format', 'unknown')})")
+            file_name = file_meta.get("file", "unknown")
+            if error := file_meta.get("error"):
+                output.append(f"  {file_name} (error: {error})")
+            else:
+                output.append(f"  {file_name} ({file_meta.get('format', 'unknown')})")
         if len(metadata["files"]) > 10:
             output.append(f"  ... and {len(metadata['files']) - 10} more")
     else:

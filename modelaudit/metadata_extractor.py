@@ -17,6 +17,7 @@ MAX_METADATA_DIRECTORY_BYTES = 1024 * 1024 * 1024
 MAX_METADATA_DIRECTORY_DEPTH = 64
 MAX_METADATA_DIRECTORY_ENTRIES = 20_000
 METADATA_DIRECTORY_BUDGET_REASON = "metadata_directory_extraction_budget_exceeded"
+NON_REGULAR_METADATA_ENTRY_ERROR = "Unsupported non-regular filesystem entry"
 
 
 class ModelMetadataExtractor:
@@ -111,7 +112,8 @@ class ModelMetadataExtractor:
                         entries_considered += 1
                         try:
                             is_directory = entry.is_dir(follow_symlinks=False)
-                        except OSError:
+                        except OSError as e:
+                            logger.debug("Failed to classify metadata directory entry %s: %s", entry.path, e)
                             is_directory = False
 
                         if is_directory:
@@ -129,10 +131,16 @@ class ModelMetadataExtractor:
                             continue
 
                         try:
-                            if entry.is_symlink() and entry.is_dir():
+                            is_symlink = entry.is_symlink()
+                        except OSError as e:
+                            logger.debug("Failed to classify metadata symlink entry %s: %s", entry.path, e)
+                            is_symlink = False
+
+                        try:
+                            if is_symlink and entry.is_dir():
                                 continue
-                        except OSError:
-                            pass
+                        except OSError as e:
+                            logger.debug("Failed to inspect metadata directory symlink %s: %s", entry.path, e)
 
                         if files_considered >= MAX_METADATA_DIRECTORY_FILES:
                             self._mark_directory_budget_exceeded(
@@ -146,6 +154,24 @@ class ModelMetadataExtractor:
                             break
 
                         files_considered += 1
+
+                        if not is_symlink:
+                            try:
+                                is_regular_file = entry.is_file(follow_symlinks=False)
+                            except OSError as e:
+                                results["files"].append({"file": entry.name, "path": entry.path, "error": str(e)})
+                                continue
+
+                            if not is_regular_file:
+                                results["files"].append(
+                                    {
+                                        "file": entry.name,
+                                        "path": entry.path,
+                                        "error": NON_REGULAR_METADATA_ENTRY_ERROR,
+                                    }
+                                )
+                                continue
+
                         files.append(entry.name)
             except OSError as e:
                 results["files"].append({"file": root_path.name, "path": root, "error": str(e)})

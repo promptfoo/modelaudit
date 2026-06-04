@@ -180,6 +180,42 @@ class TestModelMetadataExtractor:
             }
         ]
 
+    def test_extract_directory_metadata_allows_in_root_file_symlinks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """A symlink to a regular file inside the scan root should remain scannable."""
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        target = scan_dir / "target.fake"
+        target.write_bytes(b"metadata")
+        linked_model = scan_dir / "linked.fake"
+        linked_model.symlink_to(target)
+        scanned_paths: list[str] = []
+
+        class FakeScanner:
+            name = "fake"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                scanned_paths.append(file_path)
+                return {"format": "fake", "file_size": Path(file_path).stat().st_size}
+
+        monkeypatch.setattr(
+            metadata_extractor_module,
+            "get_scanner_for_file",
+            lambda _path, _config=None: FakeScanner(),
+        )
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert scanned_paths == [str(linked_model), str(target)]
+        assert metadata["summary"]["total_files"] == 2
+        assert metadata["summary"]["formats"] == {"fake": 2}
+        assert all("error" not in file_metadata for file_metadata in metadata["files"])
+
     def test_extract_directory_metadata_stops_at_file_budget(
         self,
         tmp_path: Path,
@@ -278,6 +314,48 @@ class TestModelMetadataExtractor:
         assert metadata["budget_events"][0]["files_considered"] == 2
         assert len(metadata["files"]) == 2
 
+    def test_extract_directory_metadata_does_not_dispatch_named_pipes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Special filesystem entries must not reach scanners that may block while opening them."""
+        mkfifo = getattr(os, "mkfifo", None)
+        if mkfifo is None:
+            pytest.skip("named pipes are not supported on this platform")
+
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        named_pipe = scan_dir / "blocking.pkl"
+        mkfifo(named_pipe)
+        scanned_paths: list[str] = []
+
+        class FakeScanner:
+            name = "fake"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                scanned_paths.append(file_path)
+                return {"format": "fake", "file_size": 0}
+
+        monkeypatch.setattr(
+            metadata_extractor_module,
+            "get_scanner_for_file",
+            lambda _path, _config=None: FakeScanner(),
+        )
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert scanned_paths == []
+        assert metadata["summary"]["total_files"] == 0
+        assert metadata["files"] == [
+            {
+                "file": named_pipe.name,
+                "path": str(named_pipe),
+                "error": metadata_extractor_module.NON_REGULAR_METADATA_ENTRY_ERROR,
+            }
+        ]
+
     def test_extract_directory_metadata_stops_at_depth_budget(
         self,
         tmp_path: Path,
@@ -356,6 +434,9 @@ class TestModelMetadataExtractor:
 
             def is_symlink(self) -> bool:
                 return False
+
+            def is_file(self, *, follow_symlinks: bool = True) -> bool:
+                return True
 
         def iter_entries() -> Iterator[FakeEntry]:
             for index in range(100):
@@ -499,6 +580,26 @@ class TestModelMetadataExtractor:
 
         assert "Warning: Metadata extraction is incomplete" in output
         assert "Budget exceeded: max_files" in output
+
+    def test_format_table_directory_surfaces_file_errors(self) -> None:
+        """Default table output should not disguise rejected filesystem entries as unknown formats."""
+        from modelaudit.cli import _format_metadata_table
+
+        metadata = {
+            "directory": "/test/path",
+            "summary": {"total_files": 0, "formats": {}},
+            "files": [
+                {
+                    "file": "blocking.pkl",
+                    "path": "/test/path/blocking.pkl",
+                    "error": metadata_extractor_module.NON_REGULAR_METADATA_ENTRY_ERROR,
+                }
+            ],
+        }
+
+        output = _format_metadata_table(metadata)
+
+        assert f"blocking.pkl (error: {metadata_extractor_module.NON_REGULAR_METADATA_ENTRY_ERROR})" in output
 
     def test_pickle_metadata_no_deserialization(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Ensure pickle metadata extraction does not deserialize by default."""
