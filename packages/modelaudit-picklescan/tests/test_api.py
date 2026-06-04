@@ -1823,6 +1823,32 @@ def test_scan_stream_known_size_cap_preserves_proven_oversized_frame_tamper() ->
     assert any(notice.code == "known_stream_truncated" for notice in report.notices)
 
 
+def test_scan_stream_known_size_cap_preserves_multistream_oversized_frame_tamper() -> None:
+    first_stream = pickle.dumps({"safe": True}, protocol=4)
+    declared_remaining_after_frame = 11
+    frame_length = declared_remaining_after_frame + 1
+    second_stream = b"\x80\x04\x95" + frame_length.to_bytes(8, "little") + (b"." * declared_remaining_after_frame)
+    payload = first_stream + second_stream
+    max_known_read_bytes = len(payload) - 1
+
+    report = PickleScanner(ScanOptions(max_known_stream_read_bytes=max_known_read_bytes)).scan_stream(
+        io.BytesIO(payload),
+        source="known-size-capped-multistream-frame.pkl",
+        size=len(payload),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    finding = next(finding for finding in report.findings if finding.rule_code == "STRUCTURAL_TAMPER")
+    assert finding.details["tamper_type"] == "oversized_frame"
+    assert finding.details["position"] == len(first_stream) + 2
+    assert finding.details["stream_offset"] == len(first_stream)
+    assert finding.details["frame_length"] == frame_length
+    assert finding.details["remaining_bytes"] == declared_remaining_after_frame - 1
+    assert any(notice.code == "oversized_frame" for notice in report.notices)
+    assert any(notice.code == "known_stream_truncated" for notice in report.notices)
+
+
 def test_scan_stream_unknown_size_cap_does_not_report_unproven_oversized_frame_tamper() -> None:
     payload = b"\x80\x04\x95\x02\x00\x00\x00\x00\x00\x00\x00}."
 
