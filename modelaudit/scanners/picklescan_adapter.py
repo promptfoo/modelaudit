@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from modelaudit_picklescan import Finding, PickleReport, ScanError, ScanOptions, ScanStatus, Severity
+from modelaudit_picklescan import Finding, Notice, PickleReport, ScanError, ScanOptions, ScanStatus, Severity
 
 from modelaudit.config.explanations import get_import_explanation
 
@@ -26,6 +26,9 @@ _INCONCLUSIVE_NOTICE_CODES = frozenset(
         "opcode_budget",
         "parse_incomplete",
         "known_stream_truncated",
+        "buffer_opcode",
+        "import_references_truncated",
+        "callable_invocations_truncated",
         "timeout",
         "unbounded_stream_truncated",
     }
@@ -49,6 +52,9 @@ _LEGACY_SCAN_OUTCOME_REASONS = {
     "opcode_budget": "opcode_budget_exceeded",
     "parse_incomplete": "pickle_analysis_incomplete",
     "known_stream_truncated": "known_stream_truncated",
+    "buffer_opcode": "protocol5_external_buffer_context",
+    "import_references_truncated": "import_references_truncated",
+    "callable_invocations_truncated": "callable_invocations_truncated",
     "timeout": "scan_timeout",
     "unbounded_stream_truncated": "unbounded_stream_truncated",
 }
@@ -63,6 +69,26 @@ _BENIGN_SERIALIZATION_TAIL_MODULE_PREFIXES = frozenset(
         "sklearn",
     }
 )
+
+
+def _notice_marks_incomplete_coverage(notice: Notice) -> bool:
+    if notice.code not in _INCONCLUSIVE_NOTICE_CODES:
+        return False
+    if notice.code != "buffer_opcode":
+        return True
+    readonly_buffer_invalid_stack_count = notice.details.get("readonly_buffer_invalid_stack_count")
+    if readonly_buffer_invalid_stack_count is None and notice.details.get(
+        "readonly_buffer_count"
+    ) != notice.details.get("readonly_buffer_empty_stack_count"):
+        return True
+    counts = [
+        notice.details.get("next_buffer_count"),
+        notice.details.get("readonly_buffer_empty_stack_count"),
+        readonly_buffer_invalid_stack_count,
+    ]
+    if any(not isinstance(count, int) or isinstance(count, bool) or count < 0 for count in counts):
+        return True
+    return any(count != 0 for count in counts)
 
 
 def _parse_positive_float(value: Any, default: float) -> float:
@@ -173,14 +199,16 @@ def pickle_report_to_scan_result(
     if suppress_parse_failure_escalation:
         result.metadata["trusted_incomplete_tail"] = True
     has_only_parse_errors = bool(report.errors) and all(error.category == "parse_error" for error in report.errors)
+    incomplete_notice_reasons = [
+        _legacy_scan_outcome_reason(notice.code)
+        for notice in report.notices
+        if _notice_marks_incomplete_coverage(notice)
+    ]
+    has_incomplete_coverage = report.status == ScanStatus.INCONCLUSIVE or bool(incomplete_notice_reasons)
 
-    if report.status == ScanStatus.INCONCLUSIVE:
+    if has_incomplete_coverage:
         result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-        result.metadata["scan_outcome_reasons"] = [
-            _legacy_scan_outcome_reason(notice.code)
-            for notice in report.notices
-            if notice.code in _INCONCLUSIVE_NOTICE_CODES
-        ] or ["pickle_analysis_incomplete"]
+        result.metadata["scan_outcome_reasons"] = incomplete_notice_reasons or ["pickle_analysis_incomplete"]
         result.metadata["analysis_incomplete"] = True
     elif report.status == ScanStatus.ERROR and any(error.category == "parse_error" for error in report.errors):
         result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
@@ -228,9 +256,10 @@ def pickle_report_to_scan_result(
         }
         details.setdefault("pickle_notice_code", notice.code)
         notice_is_nested_payload = notice.code in _NESTED_PAYLOAD_NOTICE_CODES
+        notice_marks_incomplete_coverage = _notice_marks_incomplete_coverage(notice)
         result.add_check(
             name="Standalone Pickle Notice",
-            passed=notice.code not in _INCONCLUSIVE_NOTICE_CODES and not notice_is_nested_payload,
+            passed=not notice_marks_incomplete_coverage and not notice_is_nested_payload,
             message=notice.message,
             severity=IssueSeverity.CRITICAL if notice_is_nested_payload else _to_issue_severity(notice.severity),
             location=notice.location,
@@ -345,8 +374,14 @@ def pickle_report_to_scan_result(
         )
 
     scan_success = (
-        report.status == ScanStatus.COMPLETE
-        or (report.status == ScanStatus.INCONCLUSIVE and report.has_security_findings)
+        (report.status == ScanStatus.COMPLETE and not has_incomplete_coverage)
+        or (
+            report.has_security_findings
+            and (
+                report.status == ScanStatus.INCONCLUSIVE
+                or (report.status == ScanStatus.COMPLETE and bool(incomplete_notice_reasons))
+            )
+        )
         or (report.status == ScanStatus.ERROR and has_only_parse_errors)
     )
     result.finish(success=scan_success)
@@ -498,6 +533,8 @@ def _legacy_why_for_notice(notice_code: str | None) -> str | None:
         return "Nested pickle payloads can hide code execution paths from shallow scanners."
     if notice_code == "encoded_nested_payload_detected":
         return "Encoded nested pickle payloads can hide deserialization gadgets inside metadata strings."
+    if notice_code == "buffer_opcode":
+        return "Protocol 5 out-of-band buffer opcodes depend on external bytes that were not available to the scanner."
     return None
 
 

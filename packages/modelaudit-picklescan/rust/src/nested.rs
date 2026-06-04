@@ -360,6 +360,20 @@ pub(crate) fn truncated_pickle_prefix_requires_fail_closed(value: &[u8]) -> bool
         || has_execution_opcode(value)
 }
 
+pub(crate) fn protocol0_global_or_inst_prefix_has_import_reference_lines(value: &[u8]) -> bool {
+    if !matches!(value.first().copied(), Some(b'c' | b'i')) {
+        return false;
+    }
+    let mut fields = value[1..].splitn(3, |byte| *byte == b'\n');
+    let Some(module) = fields.next() else {
+        return false;
+    };
+    let Some(name) = fields.next() else {
+        return false;
+    };
+    is_protocol0_import_reference(module) && is_protocol0_import_reference(name)
+}
+
 fn pickle_prefix_has_structured_opcodes(value: &[u8], allow_truncated: bool) -> bool {
     let mut index = 0usize;
     let mut stack_depth = 0usize;
@@ -525,6 +539,19 @@ fn is_protocol0_global_operand(value: &[u8]) -> bool {
         && value
             .iter()
             .all(|byte| matches!(*byte, b'\t' | b' '..=b'~'))
+}
+
+fn is_protocol0_import_reference(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.split(|byte| *byte == b'.').all(|component| {
+            component
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+                && component
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        })
 }
 
 pub(crate) fn nested_pickle_probe_offsets(value: &[u8]) -> NestedProbeOffsets {
