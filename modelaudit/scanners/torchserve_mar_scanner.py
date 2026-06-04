@@ -22,7 +22,11 @@ from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
 from .archive_member_security import (
+    _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT,
+    _CTYPES_LIBRARY_LOADER_TYPE_ALIASES,
+    _CTYPES_LIBRARY_LOADER_TYPES,
     _normalized_high_risk_python_call_name,
+    _wildcard_import_aliases,
     executable_archive_member_name_rule_code,
     executable_archive_member_rule_code,
     high_risk_python_calls_in_tree,
@@ -1278,19 +1282,6 @@ class TorchServeMarScanner(BaseScanner):
                     aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
         return aliases
 
-    def _collect_module_import_aliases(self, tree: ast.AST) -> dict[str, str]:
-        """Collect imports bound directly in the current module scope."""
-        aliases: dict[str, str] = {}
-        nodes = tree.body if isinstance(tree, ast.Module) else []
-        for node in nodes:
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    aliases[alias.asname or alias.name] = alias.name
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                for alias in node.names:
-                    aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
-        return aliases
-
     def _resolve_call_name(self, node: ast.AST) -> str | None:
         if isinstance(node, ast.Name):
             return node.id
@@ -1379,6 +1370,154 @@ class TorchServeMarScanner(BaseScanner):
                 return f"{left}{right}"
         return None
 
+    @staticmethod
+    def _static_truthiness(node: ast.AST) -> bool | None:
+        if isinstance(node, ast.Constant):
+            return bool(node.value)
+        if isinstance(node, ast.List | ast.Tuple | ast.Set):
+            return bool(node.elts)
+        if isinstance(node, ast.Dict):
+            return bool(node.keys)
+        return None
+
+    @staticmethod
+    def _function_local_binding_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+        """Return names Python treats as local bindings in a function body."""
+
+        class LocalBindingVisitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.bound_names: set[str] = set()
+                self.global_names: set[str] = set()
+                self.nonlocal_names: set[str] = set()
+
+            def _bind_target(self, target: ast.AST) -> None:
+                if isinstance(target, ast.Name):
+                    self.bound_names.add(target.id)
+                elif isinstance(target, ast.Starred):
+                    self._bind_target(target.value)
+                elif isinstance(target, ast.Tuple | ast.List):
+                    for child_target in target.elts:
+                        self._bind_target(child_target)
+
+            def visit_Global(self, declaration: ast.Global) -> None:
+                self.global_names.update(declaration.names)
+
+            def visit_Nonlocal(self, declaration: ast.Nonlocal) -> None:
+                self.nonlocal_names.update(declaration.names)
+
+            def visit_Assign(self, assignment: ast.Assign) -> None:
+                self.visit(assignment.value)
+                for target in assignment.targets:
+                    self._bind_target(target)
+
+            def visit_AnnAssign(self, assignment: ast.AnnAssign) -> None:
+                self._bind_target(assignment.target)
+                self.visit(assignment.annotation)
+                if assignment.value is not None:
+                    self.visit(assignment.value)
+
+            def visit_AugAssign(self, assignment: ast.AugAssign) -> None:
+                self._bind_target(assignment.target)
+                self.visit(assignment.value)
+
+            def visit_NamedExpr(self, expression: ast.NamedExpr) -> None:
+                self.visit(expression.value)
+                self._bind_target(expression.target)
+
+            def _visit_for_binding(self, loop: ast.For | ast.AsyncFor) -> None:
+                self.visit(loop.iter)
+                self._bind_target(loop.target)
+                for statement in [*loop.body, *loop.orelse]:
+                    self.visit(statement)
+
+            def visit_For(self, loop: ast.For) -> None:
+                self._visit_for_binding(loop)
+
+            def visit_AsyncFor(self, loop: ast.AsyncFor) -> None:
+                self._visit_for_binding(loop)
+
+            def _visit_with_binding(self, context: ast.With | ast.AsyncWith) -> None:
+                for item in context.items:
+                    self.visit(item.context_expr)
+                    if item.optional_vars is not None:
+                        self._bind_target(item.optional_vars)
+                for statement in context.body:
+                    self.visit(statement)
+
+            def visit_With(self, context: ast.With) -> None:
+                self._visit_with_binding(context)
+
+            def visit_AsyncWith(self, context: ast.AsyncWith) -> None:
+                self._visit_with_binding(context)
+
+            def visit_Import(self, import_node: ast.Import) -> None:
+                for alias in import_node.names:
+                    self.bound_names.add(alias.asname or alias.name.split(".", maxsplit=1)[0])
+
+            def visit_ImportFrom(self, import_node: ast.ImportFrom) -> None:
+                for alias in import_node.names:
+                    if alias.name != "*":
+                        self.bound_names.add(alias.asname or alias.name)
+
+            def visit_ExceptHandler(self, handler: ast.ExceptHandler) -> None:
+                if handler.type is not None:
+                    self.visit(handler.type)
+                if handler.name is not None:
+                    self.bound_names.add(handler.name)
+                for statement in handler.body:
+                    self.visit(statement)
+
+            def visit_Delete(self, delete_node: ast.Delete) -> None:
+                for target in delete_node.targets:
+                    self._bind_target(target)
+
+            def _bind_pattern(self, pattern: ast.pattern) -> None:
+                if isinstance(pattern, ast.MatchAs):
+                    if pattern.pattern is not None:
+                        self._bind_pattern(pattern.pattern)
+                    if pattern.name is not None:
+                        self.bound_names.add(pattern.name)
+                elif isinstance(pattern, ast.MatchStar):
+                    if pattern.name is not None:
+                        self.bound_names.add(pattern.name)
+                elif isinstance(pattern, ast.MatchMapping):
+                    for child_pattern in pattern.patterns:
+                        self._bind_pattern(child_pattern)
+                    if pattern.rest is not None:
+                        self.bound_names.add(pattern.rest)
+                elif isinstance(pattern, ast.MatchSequence | ast.MatchOr):
+                    for child_pattern in pattern.patterns:
+                        self._bind_pattern(child_pattern)
+                elif isinstance(pattern, ast.MatchClass):
+                    for child_pattern in [*pattern.patterns, *pattern.kwd_patterns]:
+                        self._bind_pattern(child_pattern)
+
+            def visit_Match(self, match_node: ast.Match) -> None:
+                self.visit(match_node.subject)
+                for case in match_node.cases:
+                    self._bind_pattern(case.pattern)
+                    if case.guard is not None:
+                        self.visit(case.guard)
+                    for statement in case.body:
+                        self.visit(statement)
+
+            def visit_FunctionDef(self, function: ast.FunctionDef) -> None:
+                self.bound_names.add(function.name)
+
+            def visit_AsyncFunctionDef(self, function: ast.AsyncFunctionDef) -> None:
+                self.bound_names.add(function.name)
+
+            def visit_ClassDef(self, class_node: ast.ClassDef) -> None:
+                self.bound_names.add(class_node.name)
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                return
+
+        collector = LocalBindingVisitor()
+        for statement in node.body:
+            collector.visit(statement)
+        return collector.bound_names - collector.global_names - collector.nonlocal_names
+
     def _dynamic_import_module_names(
         self,
         node: ast.AST,
@@ -1412,12 +1551,22 @@ class TorchServeMarScanner(BaseScanner):
         module_name = self._static_string_value(module_arg)
         if not module_name:
             return frozenset()
-        return frozenset(
-            module_name.split(".", maxsplit=1)[0]
-            if resolved_helper_name in {"__import__", "builtins.__import__"}
-            else module_name
-            for resolved_helper_name in import_helpers
-        )
+
+        fromlist_node: ast.AST | None = node.args[3] if len(node.args) >= 4 else None
+        for keyword in node.keywords:
+            if keyword.arg == "fromlist" and fromlist_node is None:
+                fromlist_node = keyword.value
+        fromlist_truthiness = self._static_truthiness(fromlist_node) if fromlist_node is not None else False
+
+        module_names: set[str] = set()
+        for resolved_helper_name in import_helpers:
+            if resolved_helper_name not in {"__import__", "builtins.__import__"} or fromlist_truthiness is True:
+                module_names.add(module_name)
+            elif fromlist_truthiness is False:
+                module_names.add(module_name.split(".", maxsplit=1)[0])
+            else:
+                module_names.update({module_name, module_name.split(".", maxsplit=1)[0]})
+        return frozenset(module_names)
 
     def _resolve_dynamic_import_roots(
         self,
@@ -1451,7 +1600,23 @@ class TorchServeMarScanner(BaseScanner):
                 import_loader_aliases,
                 shadowed_names,
             )
-            return frozenset(root for root in factory_roots if root == "webbrowser.get")
+            retained_roots = {root for root in factory_roots if root == "webbrowser.get"}
+            if "ctypes.LibraryLoader" in factory_roots:
+                dlltype_node: ast.AST | None = node.args[0] if node.args else None
+                for keyword in node.keywords:
+                    if keyword.arg == "dlltype" and dlltype_node is None:
+                        dlltype_node = keyword.value
+                if dlltype_node is not None:
+                    dlltype_roots = self._resolve_dynamic_import_roots(
+                        dlltype_node,
+                        aliases,
+                        module_aliases,
+                        import_loader_aliases,
+                        shadowed_names,
+                    )
+                    if dlltype_roots & (_CTYPES_LIBRARY_LOADER_TYPES | _CTYPES_LIBRARY_LOADER_TYPE_ALIASES):
+                        retained_roots.add(_CTYPES_LIBRARY_LOADER_INSTANCE_ROOT)
+            return frozenset(retained_roots)
         return frozenset()
 
     def _resolve_dynamic_import_getattr_calls(
@@ -1512,6 +1677,15 @@ class TorchServeMarScanner(BaseScanner):
             return callable_aliases.get(node.id, frozenset())
 
         if isinstance(node, ast.Attribute):
+            if node.attr == "__call__":
+                return self._resolve_dynamic_import_execution_calls(
+                    node.value,
+                    aliases,
+                    module_aliases,
+                    callable_aliases,
+                    import_loader_aliases,
+                    shadowed_names,
+                )
             module_names = self._resolve_dynamic_import_roots(
                 node.value,
                 aliases,
@@ -1522,7 +1696,15 @@ class TorchServeMarScanner(BaseScanner):
             return frozenset(
                 call_name
                 for module_name in module_names
-                if (call_name := _normalized_high_risk_python_call_name(f"{module_name}.{node.attr}")) is not None
+                if (
+                    call_name := _normalized_high_risk_python_call_name(
+                        f"{module_name}.<dynamic>"
+                        if module_name == _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT
+                        and node.attr in {"LoadLibrary", "__getitem__"}
+                        else f"{module_name}.{node.attr}"
+                    )
+                )
+                is not None
             )
 
         if isinstance(node, ast.Subscript):
@@ -1536,7 +1718,14 @@ class TorchServeMarScanner(BaseScanner):
             return frozenset(
                 call_name
                 for module_name in module_names
-                if (call_name := _normalized_high_risk_python_call_name(f"{module_name}.__getitem__")) is not None
+                if (
+                    call_name := _normalized_high_risk_python_call_name(
+                        f"{module_name}.<dynamic>"
+                        if module_name == _CTYPES_LIBRARY_LOADER_INSTANCE_ROOT
+                        else f"{module_name}.__getitem__"
+                    )
+                )
+                is not None
             )
 
         if isinstance(node, ast.Call):
@@ -1551,7 +1740,6 @@ class TorchServeMarScanner(BaseScanner):
         return frozenset()
 
     def _find_dynamic_import_execution_calls(self, tree: ast.AST) -> set[str]:
-        module_import_aliases = self._collect_module_import_aliases(tree)
         scanner = self
 
         class DynamicImportExecutionVisitor(ast.NodeVisitor):
@@ -1559,8 +1747,18 @@ class TorchServeMarScanner(BaseScanner):
                 self.module_alias_stack: list[dict[str, frozenset[str]]] = [{}]
                 self.callable_alias_stack: list[dict[str, frozenset[str]]] = [{}]
                 self.import_loader_alias_stack: list[dict[str, frozenset[str]]] = [{}]
-                self.import_alias_stack: list[dict[str, str]] = [dict(module_import_aliases)]
+                self.import_alias_stack: list[dict[str, str]] = [{}]
                 self.shadowed_name_stack: list[set[str]] = [set()]
+                self.scope_kind_stack: list[str] = ["module"]
+                self.class_parent_state_stack: list[
+                    tuple[
+                        dict[str, frozenset[str]],
+                        dict[str, frozenset[str]],
+                        dict[str, frozenset[str]],
+                        dict[str, str],
+                        set[str],
+                    ]
+                ] = []
                 self.risky_calls: set[str] = set()
                 self.collecting_module_bindings = False
                 self.scope_depth = 0
@@ -1696,6 +1894,7 @@ class TorchServeMarScanner(BaseScanner):
                     set[str],
                 ]
                 | None = None,
+                scope_kind: str = "function",
             ) -> None:
                 state = inherited_state or self._snapshot_state()
                 self.module_alias_stack.append(dict(state[0]))
@@ -1703,6 +1902,7 @@ class TorchServeMarScanner(BaseScanner):
                 self.import_loader_alias_stack.append(dict(state[2]))
                 self.import_alias_stack.append(dict(state[3]))
                 self.shadowed_name_stack.append(set(state[4]))
+                self.scope_kind_stack.append(scope_kind)
                 self.scope_depth += 1
                 for parameter in parameters:
                     self._invalidate_name(parameter)
@@ -1713,6 +1913,7 @@ class TorchServeMarScanner(BaseScanner):
                 self.import_loader_alias_stack.pop()
                 self.import_alias_stack.pop()
                 self.shadowed_name_stack.pop()
+                self.scope_kind_stack.pop()
                 self.scope_depth -= 1
 
             @staticmethod
@@ -1824,8 +2025,18 @@ class TorchServeMarScanner(BaseScanner):
                 self._invalidate_name(node.name)
                 if self.collecting_module_bindings:
                     return
-                inherited_state = self.module_binding_state if self.scope_depth == 0 else None
-                self._push_scope(self._parameter_names(node.args), inherited_state)
+                if self.scope_kind_stack[-1] == "module":
+                    inherited_state = self.module_binding_state
+                elif self.scope_kind_stack[-1] == "class":
+                    inherited_state = self.class_parent_state_stack[-1]
+                else:
+                    inherited_state = None
+                local_bindings = scanner._function_local_binding_names(node)
+                self._push_scope(
+                    self._parameter_names(node.args) | local_bindings,
+                    inherited_state,
+                    scope_kind="function",
+                )
                 for statement in node.body:
                     self.visit(statement)
                 self._pop_scope()
@@ -1846,7 +2057,10 @@ class TorchServeMarScanner(BaseScanner):
                 if node.module is None:
                     return
                 for alias in node.names:
-                    if alias.name != "*":
+                    if alias.name == "*":
+                        for local_name, import_name in _wildcard_import_aliases(node.module):
+                            self._record_import_binding(local_name, import_name)
+                    else:
                         self._record_import_binding(alias.asname or alias.name, f"{node.module}.{alias.name}")
 
             def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -1857,18 +2071,30 @@ class TorchServeMarScanner(BaseScanner):
                 self._invalidate_name(node.name)
                 if self.collecting_module_bindings:
                     return
-                inherited_state = self.module_binding_state if self.scope_depth == 0 else None
-                self._push_scope(set(), inherited_state)
+                if self.scope_kind_stack[-1] == "module":
+                    class_body_state = self._snapshot_state()
+                    class_parent_state = self.module_binding_state or class_body_state
+                elif self.scope_kind_stack[-1] == "class":
+                    class_body_state = self.class_parent_state_stack[-1]
+                    class_parent_state = self.class_parent_state_stack[-1]
+                else:
+                    class_body_state = self._snapshot_state()
+                    class_parent_state = class_body_state
+                self.class_parent_state_stack.append(class_parent_state)
+                self._push_scope(set(), class_body_state, scope_kind="class")
                 for statement in node.body:
                     self.visit(statement)
                 self._pop_scope()
+                self.class_parent_state_stack.pop()
 
             def visit_Module(self, node: ast.Module) -> None:
+                initial_state = self._snapshot_state()
                 self.collecting_module_bindings = True
                 for statement in node.body:
                     self.visit(statement)
                 self.collecting_module_bindings = False
                 self.module_binding_state = self._snapshot_state()
+                self._restore_state(initial_state)
                 for statement in node.body:
                     self.visit(statement)
 
@@ -1905,6 +2131,10 @@ class TorchServeMarScanner(BaseScanner):
 
             def visit_If(self, node: ast.If) -> None:
                 self.visit(node.test)
+                if scanner._is_non_executing_import_guard(node):
+                    for statement in node.orelse:
+                        self.visit(statement)
+                    return
                 initial_state = self._snapshot_state()
                 for statement in node.body:
                     self.visit(statement)
@@ -1914,6 +2144,35 @@ class TorchServeMarScanner(BaseScanner):
                     self.visit(statement)
                 orelse_state = self._snapshot_state()
                 self._restore_state(self._merge_states(body_state, orelse_state))
+
+            def visit_Try(self, node: ast.Try) -> None:
+                initial_state = self._snapshot_state()
+                for statement in node.body:
+                    self.visit(statement)
+                body_state = self._snapshot_state()
+                for statement in node.orelse:
+                    self.visit(statement)
+                possible_states = [self._snapshot_state()]
+
+                handler_initial_state = self._merge_states(initial_state, body_state)
+                for handler in node.handlers:
+                    self._restore_state(handler_initial_state)
+                    if handler.type is not None:
+                        self.visit(handler.type)
+                    if handler.name is not None:
+                        self._invalidate_name(handler.name)
+                    for statement in handler.body:
+                        self.visit(statement)
+                    if handler.name is not None:
+                        self._invalidate_name(handler.name)
+                    possible_states.append(self._snapshot_state())
+
+                merged_state = possible_states[0]
+                for possible_state in possible_states[1:]:
+                    merged_state = self._merge_states(merged_state, possible_state)
+                self._restore_state(merged_state)
+                for statement in node.finalbody:
+                    self.visit(statement)
 
             @staticmethod
             def _nullcontext_enter_result(call: ast.Call) -> ast.expr | None:
