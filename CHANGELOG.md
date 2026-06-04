@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- run bounded secret and network-content checks for ML text sidecars and prefer strict LightGBM content over native Flax suffixes
 - bound Flax MessagePack decoding/traversal and Orbax metadata JSON parsing so oversized JAX/Flax checkpoints fail closed
 - avoid false inconclusive Flax overlap results for complete pickle payloads with no trailing data
 - fail closed on noncanonical Keras ZIP Lambda and external-reference versions
@@ -53,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed when cloud directory metadata cannot be read for every listed object
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
 - detect NeMo Hydra network and file-access callable targets that can perform SSRF, local reads, or arbitrary writes
+- scan and globally bound Keras ZIP wrapper-owned nested layers while preserving custom namespace warnings
 - detect external references in weights-only Keras HDF5 layouts without Keras metadata
 - bound standalone Keras HDF5 layout and external-reference analysis, and distrust artifact-controlled versions
 - inspect mixed dict/list Keras HDF5 Lambda bytecode with bounded, marshal-aware analysis

@@ -2,7 +2,11 @@
 
 import marshal
 
-from modelaudit.scanners.keras_utils import find_case_insensitive_substrings, find_lambda_dangerous_patterns
+from modelaudit.scanners.keras_utils import (
+    find_case_insensitive_substrings,
+    find_lambda_dangerous_patterns,
+    is_known_safe_keras_layer_class,
+)
 
 
 class _LowerCountingText(str):
@@ -54,3 +58,35 @@ def test_find_lambda_dangerous_patterns_detects_marshaled_dotted_symbols() -> No
     text = marshal.dumps(code).decode("utf-8", errors="replace")
 
     assert find_lambda_dangerous_patterns(text, ("open", "os.system", "os.popen")) == ["os.system"]
+
+
+def test_known_safe_keras_layer_class_accepts_trusted_qualified_names() -> None:
+    for layer_class in (
+        "keras.layers.Dense",
+        "keras.models.Sequential",
+        "tensorflow.keras.layers.TimeDistributed",
+        "tensorflow.python.keras.layers.InputLayer",
+        "tf_keras.models.Functional",
+        "tf_keras.layers.Bidirectional",
+    ):
+        assert is_known_safe_keras_layer_class(layer_class)
+
+
+def test_known_safe_keras_layer_class_rejects_non_public_or_untrusted_qualified_names() -> None:
+    for layer_class in (
+        "keras.evil.Dense",
+        "keras.Dense",
+        "keras.layers.evil.Dense",
+        "keras.src.layers.evil.Dense",
+        "keras.src.layers.core.dense.Dense",
+        "keras.src.engine.evil.Sequential",
+        "keras.layers.Sequential",
+        "keras.models.Dense",
+        "tensorflow.python.keras.layers.evil.Dense",
+        "tensorflow.keras_evil.layers.Dense",
+        "tf_keras.evil.Dense",
+        "tf_keras.src.layers.evil.Dense",
+        "tf_keras.src.engine.evil.Functional",
+        "myproject.keras.layers.Dense",
+    ):
+        assert not is_known_safe_keras_layer_class(layer_class)
