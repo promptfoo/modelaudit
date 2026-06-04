@@ -2122,6 +2122,13 @@ class TestJITScriptDetector:
                 b"H(eval).sink('1+1')\n"
             ),
             b"\x00\xffclass B:\n    sink = eval\nclass H(B):\n    pass\nH().sink('1+1')\n",
+            (b"\x00\xffdef payload():\n    first, *rest = [len, eval]\n    return rest[0]('1+1')\n"),
+            (b"\x00\xffdef run(callback):\n    return callback('1+1')\ndef get():\n    return run\nget()(eval)\n"),
+            (b"\x00\xffdef run(callback):\n    return callback('1+1')\ncallbacks = [run]\ncallbacks[0](eval)\n"),
+            (b"\x00\xffdef run(getter):\n    return getter(__builtins__, 'eval')('1+1')\nrun(getattr)\n"),
+            (b"\x00\xffdef framing():\n    return None\ncallbacks = []\ncallbacks.append(eval)\ncallbacks[0]('1+1')\n"),
+            (b"\x00\xffdef framing():\n    return None\nglobals()['sink'] = eval\nglobals()['sink']('1+1')\n"),
+            (b"\x00\xffclass H:\n    def run(self, callback):\n        return callback('1+1')\nH.run(H(), eval)\n"),
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
@@ -2227,6 +2234,46 @@ class TestJITScriptDetector:
                 b"unused = eval\n"
             ),
             (b"\x00\xffclass B:\n    sink = eval\nclass H(B):\n    sink = len\nH().sink([])\n"),
+            (b"\x00\xffdef benign():\n    first, *rest = [eval, len]\n    return rest[0]([])\n"),
+            b"\x00\xffdef get():\n    return len\nget()([])\nunused = eval\n",
+            (
+                b"\x00\xffdef run(callback):\n"
+                b"    return callback([])\n"
+                b"callbacks = [run]\n"
+                b"callbacks[0](len)\n"
+                b"unused = eval\n"
+            ),
+            (
+                b"\x00\xffdef run(callback):\n"
+                b"    return callback('1+1')\n"
+                b"callbacks = [run]\n"
+                b"callbacks[0] = len\n"
+                b"callbacks[0]([])\n"
+                b"unused = eval\n"
+            ),
+            (b"\x00\xffdef run(getter):\n    return getter(__builtins__, 'eval')([])\nrun(lambda *_args: len)\n"),
+            (
+                b"\x00\xffdef framing():\n"
+                b"    return None\n"
+                b"callbacks = []\n"
+                b"callbacks.append(len)\n"
+                b"callbacks[0]([])\n"
+                b"unused = eval\n"
+            ),
+            (
+                b"\x00\xffdef framing():\n"
+                b"    return None\n"
+                b"globals()['sink'] = eval\n"
+                b"globals()['sink'] = len\n"
+                b"globals()['sink']([])\n"
+            ),
+            (
+                b"\x00\xffclass H:\n"
+                b"    def run(self, callback):\n"
+                b"        return callback([])\n"
+                b"H.run(H(), len)\n"
+                b"unused = eval\n"
+            ),
         ],
     )
     def test_scan_model_avoids_false_positives_across_callable_summaries(self, data: bytes) -> None:
