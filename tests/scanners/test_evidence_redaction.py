@@ -850,6 +850,42 @@ def test_redacts_camel_case_authorization_key_aliases() -> None:
     }
 
 
+def test_redacts_authorization_aliases_in_specialized_string_contexts() -> None:
+    """Malformed, subscripted, and R assignments should share authorization alias coverage."""
+    subscript_secret = "SUBSCRIPT_AUTHORIZATION_SECRET"
+    r_left_secret = "R_LEFT_AUTHORIZATION_SECRET"
+    r_right_secret = "R_RIGHT_AUTHORIZATION_SECRET"
+    unterminated_secret = "UNTERMINATED_AUTHORIZATION_SECRET"
+    text = (
+        f'headers["proxyAuthorization"] = "{subscript_secret}" '
+        f'headers$proxyAuthorization <- "{r_left_secret}" '
+        f'"{r_right_secret}" -> headers$proxyAuthorization '
+        f"proxyAuthorization='{unterminated_secret}"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    for secret in (subscript_secret, r_left_secret, r_right_secret, unterminated_secret):
+        assert secret not in redacted
+    assert 'headers["proxyAuthorization"] = "<redacted>"' in redacted
+    assert 'headers$proxyAuthorization <- "<redacted>"' in redacted
+    assert '"<redacted>" -> headers$proxyAuthorization' in redacted
+    assert "proxyAuthorization='<redacted>" in redacted
+
+
+def test_preserves_non_secret_authorization_metadata_keys() -> None:
+    """Authorization-related status and method metadata should not be over-redacted."""
+    text = "authorizationStatus='allowed' proxyAuthorizationEnabled=true authorizationMethod='oauth'"
+    structured = {
+        "authorizationStatus": "allowed",
+        "proxyAuthorizationEnabled": True,
+        "authorizationMethod": "oauth",
+    }
+
+    assert redact_evidence_string(text, max_chars=None) == text
+    assert redact_evidence_value(structured) == structured
+
+
 def test_redacts_secret_bearing_structured_keys() -> None:
     """Secret-bearing dict keys should be redacted as evidence too."""
     token_key_secret = "ZIP_TOKEN_KEY_SECRET"
