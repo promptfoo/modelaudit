@@ -2093,6 +2093,13 @@ class TestJITScriptDetector:
             (b"\x00\xffdef payload(values):\n    order = sorted\n    return order(values, key=eval)\n"),
             b"\x00\xffdef payload():\n    return eval.__getattribute__('__call__')('1+1')\n",
             b"\x00\xffdef payload():\n    return object.__getattribute__(eval, '__call__')('1+1')\n",
+            b"\x00\xffdef run(callback):\n    return callback('1+1')\nrun(eval)\n",
+            b"\x00\xffclass H:\n    callbacks = [eval]\nH.callbacks[0]('1+1')\n",
+            (b"\x00\xffdef framing():\n    return None\nlocals()['sink'] = eval\nsink('1+1')\n"),
+            (b"\x00\xffdef payload(holder):\n    holder.callbacks = [eval]\n    return holder.callbacks[0]('1+1')\n"),
+            (b"\x00\xfffrom builtins import getattr as lookup\nlookup(__builtins__, 'eval')('1+1')\n"),
+            (b"\x00\xfffrom builtins import map as apply\nlist(apply(eval, ['1+1']))\n"),
+            (b"\x00\xffclass H:\n    def __init__(self):\n        self.sink = eval\nH().sink('1+1')\n"),
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
@@ -2138,6 +2145,32 @@ class TestJITScriptDetector:
                 b"    object = type('Safe', (), {'__getattribute__': lambda *_args: len})\n"
                 b"    return object.__getattribute__(eval, '__call__')([])\n"
             ),
+            b"\x00\xffdef run(callback):\n    return callback([])\nrun(len)\nunused = eval\n",
+            b"\x00\xffclass H:\n    callbacks = [eval]\n    callbacks = [len]\nH.callbacks[0]([])\n",
+            (b"\x00\xffdef framing():\n    return None\nlocals()['sink'] = eval\nlocals()['sink'] = len\nsink([])\n"),
+            (
+                b"\x00\xffdef benign(holder):\n"
+                b"    holder.callbacks = [eval]\n"
+                b"    holder.callbacks = [len]\n"
+                b"    return holder.callbacks[0]([])\n"
+            ),
+            (
+                b"\x00\xfffrom builtins import getattr as lookup\n"
+                b"lookup = lambda *_args: len\n"
+                b"lookup(__builtins__, 'eval')([])\n"
+            ),
+            (
+                b"\x00\xfffrom builtins import map as apply\n"
+                b"apply = lambda callback, values: values\n"
+                b"list(apply(eval, ['1+1']))\n"
+            ),
+            (
+                b"\x00\xffclass H:\n"
+                b"    def __init__(self):\n"
+                b"        self.sink = eval\n"
+                b"        self.sink = len\n"
+                b"H().sink([])\n"
+            ),
         ],
     )
     def test_scan_model_avoids_false_positives_across_callable_summaries(self, data: bytes) -> None:
@@ -2147,6 +2180,34 @@ class TestJITScriptDetector:
 
         assert not any(finding.type == "dangerous_builtin" for finding in findings)
         assert not any(finding.severity == "CRITICAL" for finding in findings)
+
+    @pytest.mark.parametrize(
+        ("data", "expected"),
+        [
+            (b"def get():\n    return {b'x': eval}\nget()[b'x']('1+1')\n", True),
+            (
+                b"def get():\n    return {b'x': len, b'unused': eval}\nget()[b'x']([])\n",
+                False,
+            ),
+        ],
+    )
+    def test_scan_model_serializes_non_json_function_container_keys(
+        self,
+        data: bytes,
+        expected: bool,
+    ) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector._extract_and_check_python_code(
+            data,
+            "Generic Python",
+            "payload.py",
+            include_full_source=True,
+        )
+
+        assert (
+            any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings) is expected
+        )
 
     @pytest.mark.parametrize(
         "data",
