@@ -188,6 +188,7 @@ SENSITIVE_DETAIL_KEY_SUFFIXES: Final[tuple[str, ...]] = (
     "accesstoken",
     "apikey",
     "authtoken",
+    "authorization",
     "clientsecret",
     "credential",
     "password",

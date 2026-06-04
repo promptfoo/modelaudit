@@ -2914,6 +2914,7 @@ __import__('pickle').loads(data)
         camel_case_key_secret = "ZIP_CAMEL_CASE_KEY_SECRET"
         camel_case_query_secret = "ZIP_CAMEL_CASE_QUERY_SECRET"
         authorization_secret = "ZIP_AUTHORIZATION_SECRET"
+        proxy_authorization_secret = "ZIP_PROXY_AUTHORIZATION_SECRET"
         config_key_secret = "ZIP_CONFIG_KEY_SECRET"
         metric_secret = "ZIP_METRIC_SECRET"
         metric_identifier_secret = "ZIP_METRIC_IDENTIFIER_SECRET"
@@ -2980,6 +2981,7 @@ __import__('pickle').loads(data)
                             f"awsSecretAccessKey={camel_case_key_secret}": "secret key should be redacted",
                             "source": (f"https://example.test/model.keras?clientSecret={camel_case_query_secret}&ok=1"),
                             "Authorization": f"Basic {authorization_secret}",
+                            "proxyAuthorization": proxy_authorization_secret,
                             "metadata": f'{{"api_key":"{json_string_secret}","safe":"ok"}}',
                             "metadata_container": f'{{"api_key":["{json_container_secret}"],"safe":["ok"]}}',
                             "escaped_assignment": f"awsSecretAccessKey='abc\\'{escaped_assignment_secret}'",
@@ -3033,6 +3035,7 @@ __import__('pickle').loads(data)
             camel_case_key_secret,
             camel_case_query_secret,
             authorization_secret,
+            proxy_authorization_secret,
             config_key_secret,
             metric_secret,
             metric_identifier_secret,

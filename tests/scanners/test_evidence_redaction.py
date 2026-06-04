@@ -824,6 +824,32 @@ def test_redacts_authorization_values_by_structured_key() -> None:
     }
 
 
+def test_redacts_camel_case_authorization_key_aliases() -> None:
+    """Authorization suffix aliases should redact string and structured values."""
+    secret = "CAMEL_AUTHORIZATION_SECRET"
+
+    redacted_text = redact_evidence_string(
+        f"proxyAuthorization={secret} authorizationValue='{secret}'",
+        max_chars=500,
+    )
+    redacted_value = redact_evidence_value(
+        {
+            "proxyAuthorization": secret,
+            "authorizationValue": secret,
+        },
+        max_string_chars=500,
+    )
+
+    assert secret not in redacted_text
+    assert secret not in json.dumps(redacted_value)
+    assert f"proxyAuthorization={REDACTED_EVIDENCE_VALUE}" in redacted_text
+    assert f"authorizationValue='{REDACTED_EVIDENCE_VALUE}'" in redacted_text
+    assert redacted_value == {
+        "proxyAuthorization": REDACTED_EVIDENCE_VALUE,
+        "authorizationValue": REDACTED_EVIDENCE_VALUE,
+    }
+
+
 def test_redacts_secret_bearing_structured_keys() -> None:
     """Secret-bearing dict keys should be redacted as evidence too."""
     token_key_secret = "ZIP_TOKEN_KEY_SECRET"
