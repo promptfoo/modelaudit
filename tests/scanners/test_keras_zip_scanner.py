@@ -1699,7 +1699,7 @@ __import__('pickle').loads(data)
         assert "X-Amz-Signature=<redacted>" in vocabulary
         assert "token=<redacted>" in vocabulary
 
-    def test_stringlookup_vocabulary_evidence_redacts_non_http_url_credentials(self, tmp_path: Path) -> None:
+    def test_stringlookup_vocabulary_evidence_redacts_arbitrary_url_scheme_credentials(self, tmp_path: Path) -> None:
         scanner = KerasZipScanner()
         config = {
             "class_name": "Sequential",
@@ -1708,7 +1708,7 @@ __import__('pickle').loads(data)
                     {
                         "class_name": "StringLookup",
                         "name": "string_lookup",
-                        "config": {"vocabulary": "ssh://SSHCAPABILITYTOKEN1234567890@git.example/vocab.txt"},
+                        "config": {"vocabulary": "gopher://user:pass@loader.example/vocab.txt?token=short-secret&ok=1"},
                     },
                 ],
             },
@@ -1720,8 +1720,12 @@ __import__('pickle').loads(data)
         serialized = result.to_json()
         cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-12058"]
         assert len(cve_checks) == 1
-        assert "SSHCAPABILITYTOKEN1234567890" not in serialized
-        assert cve_checks[0].details["vocabulary"] == "ssh://<credentials-redacted>@git.example/vocab.txt"
+        assert "user:pass" not in serialized
+        assert "short-secret" not in serialized
+        assert (
+            cve_checks[0].details["vocabulary"]
+            == "gopher://<credentials-redacted>@loader.example/vocab.txt?token=<redacted>&ok=1"
+        )
 
     def test_stringlookup_vocabulary_evidence_redacts_plain_path_capabilities(self, tmp_path: Path) -> None:
         scanner = KerasZipScanner()

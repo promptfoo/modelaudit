@@ -14,6 +14,7 @@ REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 URL_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)\b(?:https?|ftp|ftps|ssh|telnet|wss?|tcp|udp|s3|gs|az|wasbs?|abfss?|file)://[^\s\"'<>]+"
 )
+RFC_URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)^[a-z][a-z0-9+.-]*://[^\s\"'<>]+$")
 SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "access_key",
@@ -168,8 +169,7 @@ def _redact_malformed_url(raw_url: str) -> str:
     return f"{scheme}{REDACTED_URL_CREDENTIALS}@{rest.rsplit('@', 1)[1]}"
 
 
-def _redact_url(match: re.Match[str]) -> str:
-    raw_url = match.group(0)
+def _redact_url_value(raw_url: str) -> str:
     try:
         parsed = urlsplit(raw_url)
     except ValueError:
@@ -198,6 +198,10 @@ def _redact_url(match: re.Match[str]) -> str:
             "",
         )
     )
+
+
+def _redact_url(match: re.Match[str]) -> str:
+    return _redact_url_value(match.group(0))
 
 
 def _contains_nested_sensitive_query_assignment(value: str) -> bool:
@@ -307,8 +311,10 @@ def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
 
 def redact_evidence_path(path: str, max_chars: int | None = 180) -> str:
     """Redact secrets and capability tokens from a path-like evidence value."""
-    redacted = redact_evidence_string(path, max_chars=None)
-    if URL_RE.fullmatch(redacted) is None:
+    if RFC_URL_RE.fullmatch(path) is not None:
+        redacted = redact_evidence_string(_redact_url_value(path), max_chars=None)
+    else:
+        redacted = redact_evidence_string(path, max_chars=None)
         components = PATH_SEPARATOR_RE.split(redacted)
         for index in range(0, len(components), 2):
             if components[index]:

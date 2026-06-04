@@ -231,6 +231,18 @@ def test_redacts_capability_tokens_in_plain_paths() -> None:
     assert redacted == "/cache/<redacted>/weights.h5"
 
 
+def test_path_redaction_handles_arbitrary_rfc_url_schemes() -> None:
+    """Path evidence may use loader schemes outside the network detector allowlist."""
+    redacted = redact_evidence_path(
+        "gopher://user:pass@loader.example/vocab.txt?token=short-secret&ok=1",
+        max_chars=None,
+    )
+
+    assert "user:pass" not in redacted
+    assert "short-secret" not in redacted
+    assert redacted == "gopher://<credentials-redacted>@loader.example/vocab.txt?token=<redacted>&ok=1"
+
+
 def test_plain_path_redaction_preserves_benign_model_paths() -> None:
     """Ordinary artifact paths should remain useful in evidence."""
     path = r"C:\models\transformer_encoder\weights.h5"
