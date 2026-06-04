@@ -155,22 +155,21 @@ class ModelMetadataExtractor:
 
                         files_considered += 1
 
-                        if not is_symlink:
-                            try:
-                                is_regular_file = entry.is_file(follow_symlinks=False)
-                            except OSError as e:
-                                results["files"].append({"file": entry.name, "path": entry.path, "error": str(e)})
-                                continue
+                        try:
+                            is_regular_file = entry.is_file(follow_symlinks=is_symlink)
+                        except OSError as e:
+                            results["files"].append({"file": entry.name, "path": entry.path, "error": str(e)})
+                            continue
 
-                            if not is_regular_file:
-                                results["files"].append(
-                                    {
-                                        "file": entry.name,
-                                        "path": entry.path,
-                                        "error": NON_REGULAR_METADATA_ENTRY_ERROR,
-                                    }
-                                )
-                                continue
+                        if not is_regular_file:
+                            results["files"].append(
+                                {
+                                    "file": entry.name,
+                                    "path": entry.path,
+                                    "error": NON_REGULAR_METADATA_ENTRY_ERROR,
+                                }
+                            )
+                            continue
 
                         files.append(entry.name)
             except OSError as e:

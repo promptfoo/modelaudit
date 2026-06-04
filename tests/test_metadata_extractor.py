@@ -356,6 +356,48 @@ class TestModelMetadataExtractor:
             }
         ]
 
+    def test_extract_directory_metadata_does_not_dispatch_symlinks_to_named_pipes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """Symlinks must not let special filesystem entries reach scanners."""
+        mkfifo = getattr(os, "mkfifo", None)
+        if mkfifo is None:
+            pytest.skip("named pipes are not supported on this platform")
+
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        named_pipe = scan_dir / "target.pipe"
+        mkfifo(named_pipe)
+        linked_model = scan_dir / "blocking.pkl"
+        linked_model.symlink_to(named_pipe)
+        scanned_paths: list[str] = []
+
+        class FakeScanner:
+            name = "fake"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                scanned_paths.append(file_path)
+                return {"format": "fake", "file_size": 0}
+
+        monkeypatch.setattr(
+            metadata_extractor_module,
+            "get_scanner_for_file",
+            lambda _path, _config=None: FakeScanner(),
+        )
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert scanned_paths == []
+        assert metadata["summary"]["total_files"] == 0
+        assert {file_metadata["file"]: file_metadata["error"] for file_metadata in metadata["files"]} == {
+            linked_model.name: metadata_extractor_module.NON_REGULAR_METADATA_ENTRY_ERROR,
+            named_pipe.name: metadata_extractor_module.NON_REGULAR_METADATA_ENTRY_ERROR,
+        }
+
     def test_extract_directory_metadata_stops_at_depth_budget(
         self,
         tmp_path: Path,

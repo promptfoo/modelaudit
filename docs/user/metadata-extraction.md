@@ -34,9 +34,9 @@ Directory metadata extraction stops after 10,000 file entries, 20,000 total file
 an incomplete-extraction warning. JSON and YAML output include `analysis_incomplete: true`,
 `scan_outcome: inconclusive`, and a `budget_events` list describing the exceeded limit.
 
-Special filesystem entries such as named pipes and sockets are reported as errors and are not
-opened or sent to scanners. Regular files and in-directory symlinks to regular files remain
-eligible for metadata extraction.
+Special filesystem entries such as named pipes and sockets, including symlinks to those entries,
+are reported as errors and are not opened or sent to scanners. Regular files and in-directory
+symlinks to regular files remain eligible for metadata extraction.
 
 ## Trusting loaders (advanced)
 
