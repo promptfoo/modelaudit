@@ -78,7 +78,12 @@ from .utils.sources.huggingface import (
     redact_huggingface_url_for_display,
     redact_huggingface_urls_in_text,
 )
-from .utils.sources.jfrog import is_jfrog_url, redact_jfrog_error_for_display, redact_jfrog_url_for_display
+from .utils.sources.jfrog import (
+    is_jfrog_url,
+    is_jfrog_url_like,
+    redact_jfrog_error_for_display,
+    redact_jfrog_url_for_display,
+)
 from .utils.sources.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
 logger = logging.getLogger("modelaudit")
@@ -88,7 +93,7 @@ def _display_path(path: str) -> str:
     """Return a path safe for user-facing CLI output."""
     if is_cloud_url(path):
         return redact_url_for_display(path)
-    if is_jfrog_url(path):
+    if is_jfrog_url_like(path):
         return redact_jfrog_url_for_display(path)
     return redact_huggingface_url_for_display(path)
 
@@ -532,6 +537,10 @@ def _resolve_scan_runtime_config(
     if max_size is not None:
         with contextlib.suppress(ValueError):
             max_download_bytes = parse_size_string(max_size)
+    else:
+        configured_max_file_size = config_values.get("max_file_size", 0)
+        if isinstance(configured_max_file_size, int) and configured_max_file_size > 0:
+            max_download_bytes = configured_max_file_size
 
     scanner_selection = config_values.get(SCANNER_SELECTION_CONFIG_KEY)
     scanner_policy = policy_from_config(config_values)
@@ -1155,7 +1164,11 @@ def _resolve_scan_source_for_path(
                 hf_cache_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
                 temp_dir = str(hf_cache_dir)
 
-            download_path = download_file_from_hf(path, cache_dir=hf_cache_dir)
+            download_path = download_file_from_hf(
+                path,
+                cache_dir=hf_cache_dir,
+                max_size=runtime.max_download_bytes,
+            )
             source_model_id, source_model_source = extract_model_id_from_path(path)
 
             if not runtime.cache_enabled and temp_dir is None:
@@ -1683,7 +1696,7 @@ def _resolve_scan_source_for_path(
             return None
 
     if not os.path.exists(path):
-        click.echo(f"Error: Path does not exist: {path}", err=True)
+        click.echo(f"Error: Path does not exist: {_display_path(path)}", err=True)
         audit_result.has_errors = True
         return None
 
