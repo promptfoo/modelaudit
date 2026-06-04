@@ -42,6 +42,7 @@ from .keras_utils import (
     check_subclassed_model,
     find_lambda_dangerous_patterns,
     is_known_safe_keras_layer_class,
+    normalize_keras_layer_class,
 )
 from .zip_scanner import ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY
 
@@ -121,7 +122,19 @@ _HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
 _HDF5_USERBLOCK_FIRST_OFFSET = 512
 _HDF5_SIGNATURE_SCAN_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+_-]*)\s*$")
-_KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(r"(?i)^(?:a|alpha|b|beta|c|rc|pre|preview|dev)")
+_KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(
+    r"(?i)^[._-]?(?:"
+    r"(?:alpha|beta|preview|pre|rc|a|b|c)(?:[._-]?\d+)?"
+    r"(?:(?:[._-]?(?:post|rev|r)(?:[._-]?\d+)?)|-\d+)?"
+    r"(?:[._-]?dev(?:[._-]?\d+)?)?"
+    r"|dev(?:[._-]?\d+)?"
+    r")(?:\+[a-z0-9]+(?:[._-][a-z0-9]+)*)?$"
+)
+_KERAS_LOCAL_VERSION_SUFFIX_PATTERN = re.compile(r"(?i)^\+[a-z0-9]+(?:[._-][a-z0-9]+)*$")
+_KERAS_POSTRELEASE_SUFFIX_PATTERN = re.compile(
+    r"(?i)^(?:(?:[._-]?(?:post|rev|r)(?:[._-]?\d+)?)|-\d+)"
+    r"(?:[._-]?dev(?:[._-]?\d+)?)?(?:\+[a-z0-9]+(?:[._-][a-z0-9]+)*)?$"
+)
 
 
 def _hdf5_signature_offsets(file_size: int) -> list[int]:
@@ -198,6 +211,21 @@ class KerasZipScanner(BaseScanner):
 
     MAX_EMBEDDED_WEIGHTS_BYTES: ClassVar[int] = 100 * 1024 * 1024
     MAX_DUPLICATE_MEMBER_COMPARE_CANDIDATES: ClassVar[int] = 16
+    MAX_NESTED_LAYER_DEPTH: ClassVar[int] = 64
+    MAX_NESTED_LAYER_ITEMS: ClassVar[int] = 1_000
+    _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
+    _NESTED_LAYER_CONFIG_KEYS: ClassVar[tuple[str, ...]] = ("layer", "backward_layer", "cell", "cells")
+    _NESTED_LAYER_LIST_CONFIG_KEYS: ClassVar[frozenset[str]] = frozenset({"cell", "cells"})
+    _OPTIONAL_NESTED_LAYER_CONFIG_KEYS: ClassVar[frozenset[str]] = frozenset({"backward_layer"})
+    _NESTED_LAYER_CONFIG_KEYS_BY_CLASS: ClassVar[dict[str, frozenset[str]]] = {
+        "Bidirectional": frozenset({"layer", "backward_layer"}),
+        "RNN": frozenset({"cell"}),
+        "SpectralNormalization": frozenset({"layer"}),
+        "StackedRNNCells": frozenset({"cells"}),
+        "TimeDistributed": frozenset({"layer"}),
+        "Wrapper": frozenset({"layer"}),
+    }
+    _WRAPPED_LAYER_SCAN_MODEL: ClassVar[dict[str, Any]] = {"class_name": "Sequential", "config": {"layers": []}}
 
     name = "keras_zip"
     description = "Scans ZIP-based Keras model files for suspicious configurations and Lambda layers"
@@ -221,6 +249,7 @@ class KerasZipScanner(BaseScanner):
         if self.max_file_read_size > 0:
             configured_embedded_limit = min(configured_embedded_limit, self.max_file_read_size)
         self.max_embedded_weights_bytes = configured_embedded_limit
+        self._nested_layer_items_scanned = 0
 
     @staticmethod
     def _is_allowlisted_keras_module(module_value: Any) -> bool:
@@ -453,6 +482,7 @@ class KerasZipScanner(BaseScanner):
         """Scan a ZIP-based Keras model file for suspicious configurations"""
         # Initialize context for this file
         self._initialize_context(path)
+        self._nested_layer_items_scanned = 0
 
         # Check if path is valid
         path_check_result = self._check_path(path)
@@ -735,8 +765,29 @@ class KerasZipScanner(BaseScanner):
 
         result.finish(success=result.success and not result.has_errors)
 
-    def _scan_model_config(self, model_config: dict[str, Any], result: ScanResult) -> None:
+    def _scan_model_config(
+        self,
+        model_config: dict[str, Any],
+        result: ScanResult,
+        nested_layer_depth: int = 0,
+    ) -> None:
         """Scan the model configuration for suspicious elements"""
+        if nested_layer_depth > self.MAX_NESTED_LAYER_DEPTH:
+            self._mark_inconclusive_scan_result(result, "keras_zip_nested_layer_depth_exceeded")
+            result.add_check(
+                name="Nested Layer Depth Validation",
+                passed=False,
+                message=f"Nested Keras layer depth exceeds maximum of {self.MAX_NESTED_LAYER_DEPTH}",
+                rule_code="S902",
+                severity=IssueSeverity.INFO,
+                location=f"{self.current_file_path}/config.json",
+                details={
+                    "actual_depth": nested_layer_depth,
+                    "max_nested_layer_depth": self.MAX_NESTED_LAYER_DEPTH,
+                },
+            )
+            return
+
         # Check model class name
         model_class = model_config.get("class_name", "")
         result.metadata["model_class"] = model_class
@@ -864,7 +915,10 @@ class KerasZipScanner(BaseScanner):
             if is_lambda_layer:
                 self._check_lambda_layer(layer, result, layer_name)
                 keras_version = result.metadata.get("keras_version")
-                if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2024_3660(keras_version):
+                cve_2024_3660_status = (
+                    self._is_vulnerable_to_cve_2024_3660(keras_version) if isinstance(keras_version, str) else None
+                )
+                if cve_2024_3660_status is True:
                     # CVE-2024-3660: Lambda layers enable arbitrary code injection
                     result.add_check(
                         name="CVE-2024-3660: Lambda Layer Code Injection",
@@ -887,7 +941,7 @@ class KerasZipScanner(BaseScanner):
                         },
                         why=get_cve_2024_3660_explanation("lambda_code_injection"),
                     )
-                elif isinstance(keras_version, str):
+                elif cve_2024_3660_status is False:
                     result.add_check(
                         name="Lambda Version Risk Check",
                         passed=True,
@@ -899,20 +953,31 @@ class KerasZipScanner(BaseScanner):
                         details={"layer_name": layer_name, "layer_class": "Lambda", "keras_version": keras_version},
                     )
                 else:
+                    version_context = (
+                        f"keras_version '{keras_version}' is non-canonical"
+                        if isinstance(keras_version, str)
+                        else "keras_version is unavailable"
+                    )
                     result.add_check(
                         name="Lambda Risk (Version Unknown)",
                         passed=False,
                         message=(
-                            f"Lambda layer '{layer_name}' detected but keras_version is unavailable; "
-                            "cannot confidently attribute CVE-2024-3660 without version context"
+                            f"Lambda layer '{layer_name}' detected but {version_context}; "
+                            "cannot confidently attribute CVE-2024-3660 without reliable version context"
                         ),
                         severity=IssueSeverity.WARNING,
                         location=f"{self.current_file_path} (layer: {layer_name})",
                         details={
                             "layer_name": layer_name,
                             "layer_class": "Lambda",
+                            "keras_version": keras_version,
+                            "parse_status": "unknown",
                             "cve_id": "CVE-2024-3660",
+                            "cvss": 9.8,
+                            "cwe": "CWE-94",
+                            "description": "Lambda layer deserialization can enable arbitrary code injection.",
                             "affected_versions": "Keras < 2.13.0",
+                            "remediation": "Remove Lambda layers or upgrade Keras to >= 2.13",
                         },
                     )
             elif layer_class in self.suspicious_layer_types:
@@ -959,10 +1024,16 @@ class KerasZipScanner(BaseScanner):
                 )
 
             # Recursively check nested models
-            if layer_class in ["Model", "Functional", "Sequential"] and "config" in layer:
+            normalized_layer_class = (
+                normalize_keras_layer_class(layer_class) if isinstance(layer_class, str) else layer_class
+            )
+            nested_model_class = (
+                normalized_layer_class.rsplit(".", 1)[-1] if isinstance(normalized_layer_class, str) else None
+            )
+            if nested_model_class in self._MODEL_CONTAINER_CLASSES and "config" in layer:
                 nested_config = layer["config"]
                 if isinstance(nested_config, dict):
-                    self._scan_model_config(layer, result)
+                    self._scan_model_config_preserving_metadata(layer, result, nested_layer_depth + 1)
                 else:
                     self._mark_inconclusive_scan_result(result, "keras_zip_nested_model_config_invalid_type")
                     result.add_check(
@@ -975,8 +1046,219 @@ class KerasZipScanner(BaseScanner):
                         details={"actual_type": type(nested_config).__name__, "expected_type": "dict"},
                     )
 
+            self._scan_wrapped_layer_config(layer_class, layer_config, result, layer_name, nested_layer_depth)
+
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
+
+    def _scan_wrapped_layer_config(
+        self,
+        layer_class: Any,
+        layer_config: Any,
+        result: ScanResult,
+        layer_name: str,
+        nested_layer_depth: int,
+    ) -> None:
+        """Scan wrapper-owned nested layer payloads such as `TimeDistributed.config.layer`."""
+        if not isinstance(layer_config, dict):
+            return
+
+        nested_config_keys, require_layer_shape = self._nested_layer_config_for_class(layer_class)
+        if not nested_config_keys:
+            return
+
+        if require_layer_shape:
+            missing_required_keys = nested_config_keys.difference(
+                layer_config,
+                self._OPTIONAL_NESTED_LAYER_CONFIG_KEYS,
+            )
+            for config_key in sorted(missing_required_keys):
+                self._mark_inconclusive_scan_result(result, "keras_zip_wrapped_layer_required_config_missing")
+                result.add_check(
+                    name="Wrapped Layer Config Validation",
+                    passed=False,
+                    message=f"Wrapped Keras layer is missing required config key '{config_key}'",
+                    rule_code="S902",
+                    severity=IssueSeverity.INFO,
+                    location=f"{self.current_file_path} (layer: {layer_name}, config: {config_key})",
+                    details={"config_key": config_key, "required": True},
+                )
+
+        for config_key in self._NESTED_LAYER_CONFIG_KEYS:
+            if config_key not in nested_config_keys or config_key not in layer_config:
+                continue
+
+            nested_layer = layer_config.get(config_key)
+            if nested_layer is None and config_key == "backward_layer":
+                continue
+            if not require_layer_shape and not isinstance(nested_layer, (dict, list)):
+                continue
+
+            if isinstance(nested_layer, list) and config_key in self._NESTED_LAYER_LIST_CONFIG_KEYS:
+                self._scan_wrapped_layer_list(
+                    nested_layer,
+                    result,
+                    layer_name,
+                    config_key,
+                    nested_layer_depth,
+                    require_layer_shape=require_layer_shape,
+                )
+                continue
+
+            if self._reserve_nested_layer_items(result, layer_name, config_key, 1) == 0:
+                continue
+            self._scan_wrapped_layer_value(
+                nested_layer,
+                result,
+                layer_name,
+                config_key,
+                nested_layer_depth,
+                require_layer_shape=require_layer_shape,
+            )
+
+    @classmethod
+    def _nested_layer_config_for_class(cls, layer_class: Any) -> tuple[frozenset[str], bool]:
+        if not isinstance(layer_class, str):
+            return frozenset(), False
+
+        normalized_class = normalize_keras_layer_class(layer_class)
+        require_layer_shape = "." not in normalized_class
+        class_name = normalized_class if require_layer_shape else normalized_class.rsplit(".", 1)[-1]
+        return cls._NESTED_LAYER_CONFIG_KEYS_BY_CLASS.get(class_name, frozenset()), require_layer_shape
+
+    def _scan_wrapped_layer_list(
+        self,
+        nested_layers: list[Any],
+        result: ScanResult,
+        layer_name: str,
+        config_key: str,
+        nested_layer_depth: int,
+        *,
+        require_layer_shape: bool,
+    ) -> None:
+        candidate_layers = (
+            nested_layers if require_layer_shape else [layer for layer in nested_layers if isinstance(layer, dict)]
+        )
+        items_to_scan = self._reserve_nested_layer_items(result, layer_name, config_key, len(candidate_layers))
+        for index, nested_layer in enumerate(candidate_layers[:items_to_scan]):
+            self._scan_wrapped_layer_value(
+                nested_layer,
+                result,
+                layer_name,
+                f"{config_key}[{index}]",
+                nested_layer_depth,
+                require_layer_shape=require_layer_shape,
+            )
+
+    def _reserve_nested_layer_items(
+        self,
+        result: ScanResult,
+        layer_name: str,
+        config_key: str,
+        requested_items: int,
+    ) -> int:
+        if requested_items <= 0:
+            return 0
+
+        items_scanned_before = self._nested_layer_items_scanned
+        remaining_items = max(self.MAX_NESTED_LAYER_ITEMS - items_scanned_before, 0)
+        allowed_items = min(requested_items, remaining_items)
+        self._nested_layer_items_scanned += allowed_items
+
+        if allowed_items < requested_items:
+            reason = "keras_zip_nested_layer_item_limit_exceeded"
+            existing_reasons = result.metadata.get("scan_outcome_reasons")
+            already_reported = isinstance(existing_reasons, list) and reason in existing_reasons
+            self._mark_inconclusive_scan_result(result, "keras_zip_nested_layer_item_limit_exceeded")
+            if not already_reported:
+                result.add_check(
+                    name="Nested Layer Item Limit",
+                    passed=False,
+                    message=(
+                        f"Wrapped Keras nested-layer traversal exceeds maximum of {self.MAX_NESTED_LAYER_ITEMS} items"
+                    ),
+                    rule_code="S902",
+                    severity=IssueSeverity.INFO,
+                    location=f"{self.current_file_path} (layer: {layer_name}, config: {config_key})",
+                    details={
+                        "config_key": config_key,
+                        "actual_items": requested_items,
+                        "allowed_items": allowed_items,
+                        "items_scanned_before": items_scanned_before,
+                        "max_nested_layer_items": self.MAX_NESTED_LAYER_ITEMS,
+                    },
+                )
+
+        return allowed_items
+
+    def _scan_wrapped_layer_value(
+        self,
+        nested_layer: Any,
+        result: ScanResult,
+        layer_name: str,
+        config_key: str,
+        nested_layer_depth: int,
+        *,
+        require_layer_shape: bool,
+    ) -> None:
+        if isinstance(nested_layer, dict):
+            nested_layer_class = nested_layer.get("class_name")
+            if require_layer_shape and (not isinstance(nested_layer_class, str) or not nested_layer_class.strip()):
+                self._mark_inconclusive_scan_result(result, "keras_zip_wrapped_layer_structure_invalid")
+                result.add_check(
+                    name="Wrapped Layer Structure Validation",
+                    passed=False,
+                    message="Invalid wrapped layer structure: expected non-empty class_name",
+                    rule_code="S902",
+                    severity=IssueSeverity.INFO,
+                    location=f"{self.current_file_path} (layer: {layer_name}, config: {config_key})",
+                    details={"config_key": config_key, "expected_key": "class_name"},
+                )
+                return
+            self._scan_wrapped_layer_dict(nested_layer, result, nested_layer_depth)
+            return
+        if not require_layer_shape:
+            return
+
+        self._mark_inconclusive_scan_result(result, "keras_zip_wrapped_layer_invalid_type")
+        result.add_check(
+            name="Wrapped Layer Type Validation",
+            passed=False,
+            message=f"Invalid wrapped layer type: expected dict, got {type(nested_layer).__name__}",
+            rule_code="S902",
+            severity=IssueSeverity.INFO,
+            location=f"{self.current_file_path} (layer: {layer_name}, config: {config_key})",
+            details={"config_key": config_key, "actual_type": type(nested_layer).__name__, "expected_type": "dict"},
+        )
+
+    def _scan_wrapped_layer_dict(
+        self,
+        nested_layer: dict[str, Any],
+        result: ScanResult,
+        nested_layer_depth: int,
+    ) -> None:
+        synthetic_model_config = {
+            "class_name": self._WRAPPED_LAYER_SCAN_MODEL["class_name"],
+            "config": {"layers": [nested_layer]},
+        }
+        self._scan_model_config_preserving_metadata(synthetic_model_config, result, nested_layer_depth + 1)
+
+    def _scan_model_config_preserving_metadata(
+        self,
+        model_config: dict[str, Any],
+        result: ScanResult,
+        nested_layer_depth: int,
+    ) -> None:
+        metadata_snapshot = {
+            key: result.metadata[key] for key in ("model_class", "layer_counts") if key in result.metadata
+        }
+        missing_metadata_keys = {key for key in ("model_class", "layer_counts") if key not in result.metadata}
+        try:
+            self._scan_model_config(model_config, result, nested_layer_depth)
+        finally:
+            for key in missing_metadata_keys:
+                result.metadata.pop(key, None)
+            result.metadata.update(metadata_snapshot)
 
     def _scan_compile_config(self, compile_config: Any, result: ScanResult) -> None:
         """Inspect compile_config for custom metrics and losses."""
@@ -1706,7 +1988,10 @@ class KerasZipScanner(BaseScanner):
             "external_references": findings,
         }
 
-        if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2026_1669(keras_version):
+        cve_2026_1669_status = (
+            self._is_vulnerable_to_cve_2026_1669(keras_version) if isinstance(keras_version, str) else None
+        )
+        if cve_2026_1669_status is True:
             details["keras_version"] = keras_version
             result.add_check(
                 name="CVE-2026-1669: HDF5 External Weight Reference",
@@ -1722,7 +2007,7 @@ class KerasZipScanner(BaseScanner):
             )
             return
 
-        if isinstance(keras_version, str):
+        if cve_2026_1669_status is False:
             result.add_check(
                 name="HDF5 External Weight Reference Version Check",
                 passed=True,
@@ -1735,12 +2020,20 @@ class KerasZipScanner(BaseScanner):
             )
             return
 
+        version_context = (
+            f"keras_version '{keras_version}' is non-canonical"
+            if isinstance(keras_version, str)
+            else "keras_version is unavailable"
+        )
+        if isinstance(keras_version, str):
+            details["keras_version"] = keras_version
+            details["parse_status"] = "unknown"
         result.add_check(
             name="HDF5 External Weight Reference Risk (Version Unknown)",
             passed=False,
             message=(
-                "Embedded HDF5 external references detected in weights, but keras_version is unavailable; cannot "
-                "confidently attribute CVE-2026-1669 without version context"
+                f"Embedded HDF5 external references detected in weights, but {version_context}; cannot confidently "
+                "attribute CVE-2026-1669 without reliable version context"
             ),
             severity=IssueSeverity.WARNING,
             location=location,
@@ -2148,25 +2441,47 @@ class KerasZipScanner(BaseScanner):
                     )
 
     @staticmethod
-    def _is_vulnerable_to_cve_2024_3660(version: str) -> bool:
-        """Return True for Keras versions lower than 2.13.0.
+    def _is_vulnerable_to_cve_2024_3660(version: str) -> bool | None:
+        """Return True/False for parseable Keras versions, else None.
 
         Handles two-part versions (e.g. "2.10") by treating missing patch as 0.
         """
-        parts = version.split(".", 2)
-        if len(parts) < 2:
-            return False
+        version_match = _KERAS_RELEASE_VERSION_PATTERN.match(version)
+        if not version_match:
+            return None
+
         try:
-            major = int(parts[0])
-            minor = int(parts[1])
-            patch = 0
-            if len(parts) == 3:
-                patch_digits = "".join(ch for ch in parts[2] if ch.isdigit())
-                if patch_digits:
-                    patch = int(patch_digits)
-            return (major, minor, patch) < (2, 13, 0)
+            major = int(version_match.group(1))
+            minor = int(version_match.group(2))
+            patch = int(version_match.group(3) or 0)
         except ValueError:
+            return None
+
+        suffix = (version_match.group(4) or "").strip().lower()
+        parsed = (major, minor, patch)
+        if parsed < (2, 13, 0):
+            return True
+
+        suffix_status = KerasZipScanner._classify_keras_release_suffix(suffix)
+        if suffix_status is None:
+            return None
+        if parsed > (2, 13, 0):
             return False
+        return suffix_status
+
+    @staticmethod
+    def _classify_keras_release_suffix(suffix: str) -> bool | None:
+        """Return True for prerelease, False for stable/post/local, or None for unknown."""
+        if not suffix:
+            return False
+        if _KERAS_LOCAL_VERSION_SUFFIX_PATTERN.fullmatch(suffix):
+            return False
+        if _KERAS_POSTRELEASE_SUFFIX_PATTERN.fullmatch(suffix):
+            return False
+
+        if _KERAS_PRERELEASE_SUFFIX_PATTERN.fullmatch(suffix):
+            return True
+        return None
 
     @staticmethod
     def _is_vulnerable_to_cve_2025_12058(version: str) -> bool:
@@ -2192,23 +2507,24 @@ class KerasZipScanner(BaseScanner):
             return False
 
     @staticmethod
-    def _is_vulnerable_to_cve_2026_1669(version: str) -> bool:
-        """Return True for Keras versions in the known CVE-2026-1669 affected ranges."""
+    def _is_vulnerable_to_cve_2026_1669(version: str) -> bool | None:
+        """Return vulnerability status for Keras versions in the known CVE-2026-1669 ranges."""
         version_match = _KERAS_RELEASE_VERSION_PATTERN.match(version)
         if not version_match:
-            return False
+            return None
 
         try:
             major = int(version_match.group(1))
             minor = int(version_match.group(2))
             patch = int(version_match.group(3) or 0)
         except ValueError:
-            return False
+            return None
 
         suffix = (version_match.group(4) or "").strip().lower()
-        public_suffix = suffix.lstrip("._-")
-        is_prerelease = not suffix.startswith("+") and bool(_KERAS_PRERELEASE_SUFFIX_PATTERN.match(public_suffix))
+        suffix_status = KerasZipScanner._classify_keras_release_suffix(suffix)
         parsed = (major, minor, patch)
         if (3, 0, 0) <= parsed < (3, 12, 1) or (3, 13, 0) <= parsed < (3, 13, 2):
             return True
-        return parsed in {(3, 12, 1), (3, 13, 2)} and is_prerelease
+        if parsed in {(3, 12, 1), (3, 13, 2)}:
+            return suffix_status
+        return False
