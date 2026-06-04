@@ -4496,6 +4496,98 @@ def test_scan_bytes_warns_when_allowlisted_module_is_unresolved(monkeypatch: pyt
     )
 
 
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [
+        ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+        ("numpy._core.multiarray", "_reconstruct"),
+        ("torch._utils", "_rebuild_tensor_v2"),
+    ],
+)
+def test_scan_bytes_keeps_unresolved_framework_reconstruction_global_clean(
+    module: str,
+    name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._trusted_module_origin_kind",
+        lambda _module_name: "unresolved",
+    )
+
+    report = scan_bytes(f"c{module}\n{name}\n.".encode(), source="unresolved-framework-global.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_keeps_invoked_unresolved_framework_reconstruction_global_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._trusted_module_origin_kind",
+        lambda _module_name: "unresolved",
+    )
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._resolve_module_source", lambda _module_name: None)
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._find_module_spec_without_imports",
+        lambda _module_name: None,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._find_meta_path_module_spec_without_imports",
+        lambda _module_name: None,
+    )
+
+    report = scan_bytes(
+        b"ctorch._utils\n_rebuild_tensor_v2\n)R.",
+        source="invoked-unresolved-framework-global.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert all(notice.code != "call_graph_source_unavailable" for notice in report.notices)
+
+
+def test_scan_bytes_warns_when_framework_reconstruction_reference_resolves_to_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed-framework-reconstruction-marker"
+    package_dir = tmp_path / "torch"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "_utils.py").write_text(
+        f"open({str(marker)!r}, 'w').write('owned')\ndef _rebuild_tensor_v2():\n    return None\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_source_sensitive_caches()
+    payload = b"ctorch._utils\n_rebuild_tensor_v2\n."
+
+    report = scan_bytes(payload, source="shadowed-framework-reconstruction.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert marker.exists() is False
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
+        for finding in report.findings
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", f"import pickle; pickle.loads({payload!r})"],
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+
 def test_scan_bytes_warns_on_unresolved_import_only_custom_global() -> None:
     module_name = f"modelaudit_c095_missing_payload_{uuid.uuid4().hex}"
     payload = f"c{module_name}\nGadget\n.".encode()

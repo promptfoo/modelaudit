@@ -173,20 +173,69 @@ _TRUSTED_IMPORT_ONLY_REFERENCES = frozenset(
         ("tarfile", "TarInfo"),
         ("tempfile", "gettempdir"),
         ("tokenize", "generate_tokens"),
-        ("torch.serialization", "_get_layout"),
         ("weakref", "WeakMethod"),
         ("weakref", "proxy"),
         ("weakref", "ref"),
         ("zipfile", "ZipInfo"),
     }
 )
-_TRUSTED_REFERENCES_REQUIRING_INVOCATION_ANALYSIS = frozenset({("_xxsubinterpreters", "create")})
-_TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = frozenset(
+_TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES = frozenset(
     {
-        ("pathlib._local", "PurePath"),
-        ("pathlib._local", "PurePosixPath"),
-        ("pathlib._local", "PureWindowsPath"),
+        ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+        ("numpy", "dtype"),
+        ("numpy", "ndarray"),
+        ("numpy._core.multiarray", "_reconstruct"),
+        ("numpy._core.multiarray", "scalar"),
+        ("numpy.core.multiarray", "_reconstruct"),
+        ("numpy.core.multiarray", "scalar"),
+        ("torch", "BFloat16Storage"),
+        ("torch", "BoolStorage"),
+        ("torch", "ByteStorage"),
+        ("torch", "CharStorage"),
+        ("torch", "ComplexDoubleStorage"),
+        ("torch", "ComplexFloatStorage"),
+        ("torch", "DoubleStorage"),
+        ("torch", "FloatStorage"),
+        ("torch", "HalfStorage"),
+        ("torch", "IntStorage"),
+        ("torch", "LongStorage"),
+        ("torch", "QInt32Storage"),
+        ("torch", "QInt8Storage"),
+        ("torch", "QUInt2x4Storage"),
+        ("torch", "QUInt4x2Storage"),
+        ("torch", "QUInt8Storage"),
+        ("torch", "ShortStorage"),
+        ("torch", "Size"),
+        ("torch", "Storage"),
+        ("torch", "UntypedStorage"),
+        ("torch", "_rebuild_tensor"),
+        ("torch", "_rebuild_tensor_v2"),
+        ("torch._tensor", "_rebuild_from_type_v2"),
+        ("torch._utils", "_rebuild_device_tensor_from_numpy"),
+        ("torch._utils", "_rebuild_meta_tensor_no_storage"),
+        ("torch._utils", "_rebuild_nested_tensor"),
+        ("torch._utils", "_rebuild_parameter"),
+        ("torch._utils", "_rebuild_parameter_with_state"),
+        ("torch._utils", "_rebuild_qtensor"),
+        ("torch._utils", "_rebuild_sparse_tensor"),
+        ("torch._utils", "_rebuild_tensor"),
+        ("torch._utils", "_rebuild_tensor_v2"),
+        ("torch._utils", "_rebuild_tensor_v3"),
+        ("torch._utils", "_rebuild_wrapper_subclass"),
+        ("torch.serialization", "_get_layout"),
     }
+)
+_TRUSTED_IMPORT_ONLY_REFERENCES |= _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES
+_TRUSTED_REFERENCES_REQUIRING_INVOCATION_ANALYSIS = frozenset({("_xxsubinterpreters", "create")})
+_TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = (
+    frozenset(
+        {
+            ("pathlib._local", "PurePath"),
+            ("pathlib._local", "PurePosixPath"),
+            ("pathlib._local", "PureWindowsPath"),
+        }
+    )
+    | _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES
 )
 _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS = ("__new__", "__init__")
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS = ("__setstate__",)
@@ -771,7 +820,9 @@ def find_unanalyzed_callable_call_graph_references(
         if not module or not name or (module, name) in seen:
             continue
         seen.add((module, name))
-        if _is_skippable_torch_extension_global_reference(module, name):
+        if _is_skippable_torch_extension_global_reference(module, name) or _unresolved_trusted_import_reference_is_safe(
+            module, name
+        ):
             continue
         if _call_graph_entrypoints_for_reference(module, name, reference):
             continue
@@ -834,7 +885,11 @@ def _module_source_context_initialization_is_proven_inert(context: _ModuleSource
 def import_only_reference_is_proven_trusted(module_name: str, name: str) -> bool:
     """Return whether a known-safe reference resolves from a trusted installation path."""
     origin_kind = _trusted_module_origin_kind(module_name)
-    return (module_name, name) in _TRUSTED_IMPORT_ONLY_REFERENCES and origin_kind in {"stdlib", "site_packages"}
+    reference = (module_name, name)
+    return reference in _TRUSTED_IMPORT_ONLY_REFERENCES and (
+        origin_kind in {"stdlib", "site_packages"}
+        or (origin_kind == "unresolved" and reference in _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES)
+    )
 
 
 def trusted_import_reference_requires_invocation_analysis(module_name: str, name: str) -> bool:
@@ -850,6 +905,12 @@ def import_only_module_requires_origin_review(module_name: str, name: str) -> bo
     return origin_kind not in {"stdlib", "site_packages"} and not (
         origin_kind == "unresolved" and (module_name, name) in _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES
     )
+
+
+def _unresolved_trusted_import_reference_is_safe(module_name: str, name: str) -> bool:
+    return (module_name, name) in _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES and _trusted_module_origin_kind(
+        module_name
+    ) == "unresolved"
 
 
 @_register_source_sensitive_cache
