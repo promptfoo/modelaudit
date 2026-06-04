@@ -100,3 +100,55 @@ def test_redacts_escaped_and_backticked_r_assignments() -> None:
     assert f"`access-token` <- '{REDACTED_EVIDENCE_VALUE}'" in redacted
     assert f'"{REDACTED_EVIDENCE_VALUE}" -> `client-secret`' in redacted
     assert f'`api key` <- "{REDACTED_EVIDENCE_VALUE}"' in redacted
+
+
+def test_redacts_dotted_r_assignments_and_raw_strings() -> None:
+    """Dotted identifiers and native raw literals should not leak credential values."""
+    redacted = redact_evidence_string(
+        'api.key <- "DOT_LEFT_SECRET"; "DOT_RIGHT_SECRET" -> access.token; '
+        'token <- r"(RAW_LEFT_SECRET)"; R"---{RAW_RIGHT_SECRET}---" -> client.secret; '
+        'refresh.token <- r"[raw values may contain \\"quotes\\" and ; delimiters]"; '
+        '"access token" <- "QUOTED_NAME_SECRET"; r"(QUOTED_RAW_SECRET)" -> \'client.secret\'',
+        max_chars=700,
+    )
+
+    for secret in (
+        "DOT_LEFT_SECRET",
+        "DOT_RIGHT_SECRET",
+        "RAW_LEFT_SECRET",
+        "RAW_RIGHT_SECRET",
+        "QUOTED_NAME_SECRET",
+        "QUOTED_RAW_SECRET",
+    ):
+        assert secret not in redacted
+    assert "raw values may contain" not in redacted
+    assert f'api.key <- "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f'"{REDACTED_EVIDENCE_VALUE}" -> access.token' in redacted
+    assert f"token <- {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f"{REDACTED_EVIDENCE_VALUE} -> client.secret" in redacted
+    assert f"refresh.token <- {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f'"access token" <- "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f"{REDACTED_EVIDENCE_VALUE} -> 'client.secret'" in redacted
+
+
+def test_unterminated_r_raw_assignment_fails_closed() -> None:
+    """Malformed raw literals should not leak their remaining payload."""
+    redacted = redact_evidence_string(
+        'base::system("curl"); token <- r"(UNTERMINATED_RAW_SECRET',
+        max_chars=500,
+    )
+
+    assert "UNTERMINATED_RAW_SECRET" not in redacted
+    assert redacted.endswith(f"token <- {REDACTED_EVIDENCE_VALUE}")
+
+
+def test_rightward_raw_assignment_does_not_bypass_redaction_with_long_identifier() -> None:
+    """Rightward targets should be inspected beyond the stored evidence length."""
+    long_identifier = f"service_{'a' * 300}_token"
+    redacted = redact_evidence_string(
+        f'r"(LONG_RIGHTWARD_RAW_SECRET)" -> {long_identifier}',
+        max_chars=500,
+    )
+
+    assert "LONG_RIGHTWARD_RAW_SECRET" not in redacted
+    assert redacted.startswith(f"{REDACTED_EVIDENCE_VALUE} -> service_")

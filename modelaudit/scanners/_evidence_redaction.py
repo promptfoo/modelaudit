@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from typing import Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -43,21 +44,26 @@ SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
-    r"(?:[a-z0-9]+[_-])*"
-    r"(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|credential|"
-    r"password|passwd|private[_-]?key|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
-)
-SENSITIVE_BACKTICK_ASSIGNMENT_KEY: Final[str] = (
-    r"(?:[a-z0-9]+[\s_-]+)*"
-    r"(?:access[\s_-]*key|access[\s_-]*token|api[\s_-]*key|apikey|auth[\s_-]*token|client[\s_-]*secret|"
-    r"credential|password|passwd|private[\s_-]*key|refresh[\s_-]*token|sas|secret|secret[\s_-]*key|"
+    r"(?:[a-z0-9]+[._-])*"
+    r"(?:access[._-]?key|access[._-]?token|api[._-]?key|apikey|auth[._-]?token|client[._-]?secret|"
+    r"credential|password|passwd|private[._-]?key|refresh[._-]?token|sas|secret|secret[._-]?key|"
     r"signature|sig|token)"
 )
+SENSITIVE_BACKTICK_ASSIGNMENT_KEY: Final[str] = (
+    r"(?:[a-z0-9]+[\s._-]+)*"
+    r"(?:access[\s._-]*key|access[\s._-]*token|api[\s._-]*key|apikey|auth[\s._-]*token|"
+    r"client[\s._-]*secret|credential|password|passwd|private[\s._-]*key|refresh[\s._-]*token|sas|"
+    r"secret|secret[\s._-]*key|signature|sig|token)"
+)
 SENSITIVE_ASSIGNMENT_IDENTIFIER: Final[str] = (
-    rf"(?:`{SENSITIVE_BACKTICK_ASSIGNMENT_KEY}`|\b{SENSITIVE_ASSIGNMENT_KEY}\b)"
+    rf"""(?:`{SENSITIVE_BACKTICK_ASSIGNMENT_KEY}`|"{SENSITIVE_BACKTICK_ASSIGNMENT_KEY}"|"""
+    rf"""'{SENSITIVE_BACKTICK_ASSIGNMENT_KEY}'|\b{SENSITIVE_ASSIGNMENT_KEY}\b)"""
 )
 SENSITIVE_ASSIGNMENT_OPERATOR: Final[str] = r"(?:[:=]|<{1,2}-)"
 QUOTED_EVIDENCE_VALUE: Final[str] = r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')"""
+R_RAW_STRING_PREFIX_RE: Final[re.Pattern[str]] = re.compile(r"""[rR]"(?P<dashes>-*)(?P<delimiter>[\(\[\{])""")
+R_RAW_STRING_CLOSING_DELIMITERS: Final[dict[str, str]] = {"(": ")", "[": "]", "{": "}"}
+R_RAW_LEFT_ASSIGNMENT_CONTEXT_CHARS: Final[int] = 4_096
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?)" r"[^\s\"';&|]+"
 )
@@ -74,6 +80,46 @@ RIGHTWARD_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
 QUOTED_RIGHTWARD_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)({QUOTED_EVIDENCE_VALUE})(\s*->{{1,2}}\s*{SENSITIVE_ASSIGNMENT_IDENTIFIER})"
 )
+LEFTWARD_R_RAW_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i){SENSITIVE_ASSIGNMENT_IDENTIFIER}\s*{SENSITIVE_ASSIGNMENT_OPERATOR}\s*$"
+)
+RIGHTWARD_R_RAW_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)\s*->{{1,2}}\s*{SENSITIVE_ASSIGNMENT_IDENTIFIER}"
+)
+
+
+def _iter_r_raw_string_spans(text: str) -> Iterator[tuple[int, int, int, int, bool]]:
+    """Yield raw R literal and content spans, including unterminated candidates."""
+    cursor = 0
+    while prefix_match := R_RAW_STRING_PREFIX_RE.search(text, cursor):
+        literal_start = prefix_match.start()
+        content_start = prefix_match.end()
+        dashes = prefix_match.group("dashes")
+        closing_delimiter = R_RAW_STRING_CLOSING_DELIMITERS[prefix_match.group("delimiter")]
+        closing_sequence = f'{closing_delimiter}{dashes}"'
+        content_end = text.find(closing_sequence, content_start)
+        if content_end < 0:
+            yield literal_start, len(text), content_start, len(text), False
+            return
+
+        literal_end = content_end + len(closing_sequence)
+        yield literal_start, literal_end, content_start, content_end, True
+        cursor = literal_end
+
+
+def _redact_r_raw_assignments(text: str) -> str:
+    replacements: list[tuple[int, int]] = []
+    for literal_start, literal_end, _content_start, _content_end, _is_terminated in _iter_r_raw_string_spans(text):
+        left_context = text[max(0, literal_start - R_RAW_LEFT_ASSIGNMENT_CONTEXT_CHARS) : literal_start]
+        if LEFTWARD_R_RAW_SENSITIVE_ASSIGNMENT_RE.search(left_context) or RIGHTWARD_R_RAW_SENSITIVE_ASSIGNMENT_RE.match(
+            text,
+            literal_end,
+        ):
+            replacements.append((literal_start, literal_end))
+
+    for literal_start, literal_end in reversed(replacements):
+        text = f"{text[:literal_start]}{REDACTED_EVIDENCE_VALUE}{text[literal_end:]}"
+    return text
 
 
 def _redact_malformed_url(raw_url: str) -> str:
@@ -139,7 +185,8 @@ def _truncate(text: str, max_chars: int) -> str:
 
 def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
-    redacted = URL_RE.sub(_redact_url, text)
+    redacted = _redact_r_raw_assignments(text)
+    redacted = URL_RE.sub(_redact_url, redacted)
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = QUOTED_RIGHTWARD_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_rightward_assignment, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)

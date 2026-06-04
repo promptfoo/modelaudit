@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- redact secrets from R serialized executable evidence samples
+- redact and detect secrets in R serialized executable samples across native assignment syntax
 - fail closed on novel standalone picklescan import/callable metadata truncation without masking operational read errors or repeated benign imports
 - skip scan-result caching for sampled large-file fingerprints
 - classify high-confidence active code patterns in PyTorch binary artifacts as security findings so scan exits reflect them

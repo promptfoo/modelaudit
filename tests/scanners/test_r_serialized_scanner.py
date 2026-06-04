@@ -619,6 +619,14 @@ def test_scan_redacts_rightward_assignment_payload_samples(tmp_path: Path) -> No
         ('`access-token` <- "BACKTICK_LEFT_SECRET"', "BACKTICK_LEFT_SECRET"),
         ('"BACKTICK_RIGHT_SECRET" -> `client-secret`', "BACKTICK_RIGHT_SECRET"),
         ('`access token` <- "SPACED_BACKTICK_SECRET"', "SPACED_BACKTICK_SECRET"),
+        ('api.key <- "DOT_LEFT_SECRET"', "DOT_LEFT_SECRET"),
+        ('"DOT_RIGHT_SECRET" -> access.token', "DOT_RIGHT_SECRET"),
+        ('token <- r"(RAW_LEFT_SECRET)"', "RAW_LEFT_SECRET"),
+        ('R"---{RAW_RIGHT_SECRET}---" -> client.secret', "RAW_RIGHT_SECRET"),
+        ('refresh.token <- r"[raw values may contain \\"quotes\\" and ; delimiters]"', "raw values may contain"),
+        ('token <- r"(UNTERMINATED_RAW_SECRET', "UNTERMINATED_RAW_SECRET"),
+        ('"access token" <- "QUOTED_NAME_SECRET"', "QUOTED_NAME_SECRET"),
+        ("r\"(QUOTED_RAW_SECRET)\" -> 'client.secret'", "QUOTED_RAW_SECRET"),
     ],
 )
 def test_scan_redacts_complex_r_assignment_payload_samples(tmp_path: Path, assignment: str, secret: str) -> None:
@@ -654,6 +662,13 @@ def test_scan_redacts_complex_r_assignment_payload_samples(tmp_path: Path, assig
         "'BACKTICK_RIGHT_SECRET' -> `refresh-token`",
         "`api key` <- 'SPACED_BACKTICK_SECRET'",
         r'token <- "ABC\"ESCAPED_SECRET"',
+        "api.key <- 'DOT_LEFT_SECRET'",
+        "'DOT_RIGHT_SECRET' -> access.token",
+        'token <- r"(RAW_LEFT_SECRET)"',
+        'R"---{RAW_RIGHT_SECRET}---" -> client.secret',
+        'refresh.token <- r"[raw values may contain \\"quotes\\" and ; delimiters]"',
+        '"access token" <- "QUOTED_NAME_SECRET"',
+        "r\"(QUOTED_RAW_SECRET)\" -> 'client.secret'",
     ],
 )
 def test_scan_detects_native_r_credential_assignments(tmp_path: Path, assignment: str) -> None:
@@ -668,13 +683,52 @@ def test_scan_detects_native_r_credential_assignments(tmp_path: Path, assignment
     assert credential_checks[0].details["pattern_classes"] == ["generic_secret_assignment"]
 
 
+def test_scan_redacts_unterminated_raw_assignment_without_credential_false_positive(tmp_path: Path) -> None:
+    path = tmp_path / "unterminated-raw-assignment.rds"
+    _write_raw_r_serialized(
+        path,
+        'expression\nlanguage\nbase::system("curl"); token <- r"(UNTERMINATED_RAW_SECRET',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.PASSED
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    sample = symbol_checks[0].details["examples"][0]["sample"]
+    assert "UNTERMINATED_RAW_SECRET" not in sample
+    assert sample.endswith("token <- <redacted>")
+
+
+def test_scan_detects_long_rightward_raw_credential_identifier(tmp_path: Path) -> None:
+    path = tmp_path / "long-rightward-raw-assignment.rds"
+    long_identifier = f"service_{'a' * 300}_token"
+    _write_raw_r_serialized(
+        path,
+        f'expression\nlanguage\nbase::system("curl"); r"(LONG_RIGHTWARD_RAW_SECRET)" -> {long_identifier}',
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    sample = symbol_checks[0].details["examples"][0]["sample"]
+    assert "LONG_RIGHTWARD_RAW_SECRET" not in sample
+    assert sample.startswith('base::system("curl"); <redacted> -> service_')
+
+
 def test_scan_allows_benign_r_assignment_key_near_matches(tmp_path: Path) -> None:
     path = tmp_path / "benign-native-assignments.rds"
     _write_raw_r_serialized(
         path,
         "monkey <- 'BENIGN_VALUE'; tokenizer <- 'BENIGN_VALUE'; `not-a-tokenizer` <- 'BENIGN_VALUE'; "
         "`not a tokenizer` <- 'BENIGN_VALUE'; signature <- 'gaussian'; credential <- 'standard'; "
-        "sas <- 'dataset-value'; sig <- 'benign-value'",
+        "sas <- 'dataset-value'; sig <- 'benign-value'; token.count <- 'BENIGN_VALUE'; "
+        "api.keyboard <- 'BENIGN_VALUE'; `not.a.tokenizer` <- 'BENIGN_VALUE'; "
+        '"tokenizer" <- "BENIGN_VALUE"; "not a tokenizer" <- "BENIGN_VALUE"',
     )
 
     result = RSerializedScanner().scan(str(path))
