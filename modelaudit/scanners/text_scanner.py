@@ -3,13 +3,11 @@
 import os
 import re
 from typing import Any, ClassVar
+from urllib.parse import urlsplit
 
 from modelaudit.core_results import mark_operational_scan_error
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.rule_mapper import get_secret_rule_code
-
-MAX_TEXT_SECURITY_SCAN_BYTES = 100 * 1024 * 1024
 
 TEXT_CONTENT_SECURITY_SCAN_INCOMPLETE_REASON = "text_content_security_scan_incomplete"
 TEXT_CONTENT_SECURITY_DETECTOR_FAILED_REASON = "text_content_security_detector_failed"
@@ -20,10 +18,13 @@ DETECTOR_FINDING_LIMIT_TYPE = "detector_finding_limit"
 DOCUMENTATION_TEXT_FILENAMES = frozenset(
     {
         "license.md",
+        "license.rst",
         "license.txt",
         "model_card.md",
+        "model_card.rst",
         "readme.md",
         "readme.markdown",
+        "readme.rst",
         "readme.txt",
     }
 )
@@ -52,6 +53,48 @@ BARE_NETWORK_TOKEN_PATTERNS = (
     BARE_NETWORK_IPV6_TOKEN_PATTERN,
     BARE_NETWORK_DOMAIN_TOKEN_PATTERN,
 )
+MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
+DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(rb"(?:^|[\s{[(,;])[A-Za-z_][A-Za-z0-9_.-]*\s*=\s*[rubfRUBF]*[\"']?$")
+DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
+DOCUMENTATION_SHELL_COMMAND_PATTERN = re.compile(
+    rb"^\s*(?:[-*+]\s+)?(?:(?:[$>#]|[A-Za-z0-9._-]+[$#])\s*)?"
+    rb"(?:(?:bash|sh|zsh)\s+-c\s+[\"']?\s*)?"
+    rb"(?:curl|fetch|invoke-webrequest|iwr|powershell(?:\.exe)?|pwsh|wget)\b",
+    re.IGNORECASE,
+)
+DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN = re.compile(
+    rb"\b(?:beacon|callback|c2|command(?:[_ -]+and[_ -]+control)?|exfil(?:tration)?|phone[_ -]+home|webhook)\b"
+    rb"[^\n]{0,32}:\s*$",
+    re.IGNORECASE,
+)
+BENIGN_DOCUMENTATION_CC_PATTERN = re.compile(
+    rb"(?:"
+    rb"\b(?:not|no|without)\s+(?:a\s+)?(?:known\s+)?(?:malware|backdoor|trojan|botnet|zombie)\b"
+    rb"|\b(?:malware|backdoor|trojan|botnet|zombie)[ -]free\b"
+    rb"|\b(?:malware|backdoor|trojan|botnet|zombie)\s+"
+    rb"(?:analysis|benchmark|classification|classifier|dataset|defen[cs]e|detection|mitigation|research|resistance|robustness|testing)\b"
+    rb"|\b(?:detect(?:ing|ion|s)?|mitigat(?:e|ing|ion)|resistan(?:ce|t)|robust(?:ness)?)\s+"
+    rb"(?:malware|backdoor|trojan|botnet|zombie)\b"
+    rb")",
+    re.IGNORECASE,
+)
+GENERIC_CC_PROSE_PATTERNS = frozenset({"backdoor", "botnet", "malware", "trojan", "zombie"})
+REQUIREMENTS_URL_DIRECTIVE_PATTERN = re.compile(
+    rb"^(?:(?:--index-url|--extra-index-url|--find-links|-i|-f)\s+|--trusted-host\s+)",
+    re.IGNORECASE,
+)
+REQUIREMENTS_DIRECT_REFERENCE_PATTERN = re.compile(
+    rb"^[A-Za-z0-9_.-]+(?:\[[^\]\r\n]+\])?\s*@\s*[A-Za-z][A-Za-z0-9+.-]*://",
+    re.IGNORECASE,
+)
+TRUSTED_REQUIREMENTS_HOSTS = frozenset(
+    {
+        "download.pytorch.org",
+        "files.pythonhosted.org",
+        "pypi.org",
+        "pypi.python.org",
+    }
+)
 
 
 class TextScanner(BaseScanner):
@@ -76,6 +119,7 @@ class TextScanner(BaseScanner):
         filename = os.path.basename(path).lower()
         ml_text_files = {
             "readme.md",
+            "readme.rst",
             "readme.txt",
             "readme.markdown",
             "vocab.txt",
@@ -85,8 +129,10 @@ class TextScanner(BaseScanner):
             "labels.txt",
             "classes.txt",
             "model_card.md",
+            "model_card.rst",
             "license.txt",
             "license.md",
+            "license.rst",
             "requirements.txt",
         }
 
@@ -120,15 +166,119 @@ class TextScanner(BaseScanner):
         return filename in PASSIVE_DATA_TEXT_FILENAMES or filename.startswith(PASSIVE_DATA_TEXT_PREFIXES)
 
     @staticmethod
-    def _finding_line(payload: bytes, finding: dict[str, Any]) -> bytes | None:
+    def _finding_line_parts(payload: bytes, finding: dict[str, Any]) -> tuple[bytes, int] | None:
         position = finding.get("position")
         if not isinstance(position, int) or position < 0 or position > len(payload):
             return None
-        line_start = payload.rfind(b"\n", 0, position) + 1
+        line_start = max(payload.rfind(b"\n", 0, position) + 1, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
         line_end = payload.find(b"\n", position)
         if line_end < 0:
             line_end = len(payload)
-        return payload[line_start:line_end].strip()
+        line_end = min(line_end, position + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        return payload[line_start:line_end], position - line_start
+
+    @classmethod
+    def _finding_line(cls, payload: bytes, finding: dict[str, Any]) -> bytes | None:
+        line_parts = cls._finding_line_parts(payload, finding)
+        return line_parts[0].strip() if line_parts is not None else None
+
+    @staticmethod
+    def _finding_line_prefix_is_truncated(payload: bytes, finding: dict[str, Any]) -> bool:
+        position = finding.get("position")
+        if not isinstance(position, int) or position < 0 or position > len(payload):
+            return False
+        return position - (payload.rfind(b"\n", 0, position) + 1) > MAX_TEXT_FINDING_CONTEXT_BYTES
+
+    @staticmethod
+    def _documentation_line_is_code_shaped(line: bytes, position: int) -> bool:
+        prefix = line[:position]
+        stripped = line.lstrip()
+        return (
+            DOCUMENTATION_SHELL_COMMAND_PATTERN.match(stripped) is not None
+            or DOCUMENTATION_SUSPICIOUS_NETWORK_LABEL_PATTERN.search(prefix) is not None
+            or DOCUMENTATION_CODE_ASSIGNMENT_PATTERN.search(prefix) is not None
+            or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
+            or stripped.startswith((b"import ", b"from ", b"def ", b"class ", b"if "))
+            or stripped.startswith((b'"', b"'"))
+            or b";" in line
+            or b"lambda " in line
+        )
+
+    @classmethod
+    def _documentation_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        if finding.get("severity") in {"HIGH", "CRITICAL"}:
+            return True
+        if cls._finding_line_prefix_is_truncated(payload, finding):
+            return True
+        line_parts = cls._finding_line_parts(payload, finding)
+        if line_parts is not None and cls._documentation_line_is_code_shaped(*line_parts):
+            return True
+        position = finding.get("position")
+        if not isinstance(position, int) or position < 0 or position > len(payload):
+            return False
+        prefix = payload[max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
+        return (
+            DOCUMENTATION_CODE_ASSIGNMENT_PATTERN.search(prefix) is not None
+            or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
+        )
+
+    @classmethod
+    def _documentation_network_function_is_prose(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        line_parts = cls._finding_line_parts(payload, finding)
+        function = finding.get("function")
+        if (
+            line_parts is None
+            or not isinstance(function, str)
+            or cls._finding_line_prefix_is_truncated(payload, finding)
+        ):
+            return False
+        line, position = line_parts
+        cursor = position + len(function.encode())
+        while cursor < len(line) and line[cursor : cursor + 1] in {b" ", b"\t"}:
+            cursor += 1
+        return (
+            cursor >= len(line) or line[cursor : cursor + 1] != b"("
+        ) and not cls._documentation_line_is_code_shaped(
+            line,
+            position,
+        )
+
+    @classmethod
+    def _documentation_cc_finding_is_benign_prose(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        pattern = finding.get("pattern")
+        line_parts = cls._finding_line_parts(payload, finding)
+        if (
+            pattern not in GENERIC_CC_PROSE_PATTERNS
+            or line_parts is None
+            or cls._finding_line_prefix_is_truncated(payload, finding)
+        ):
+            return False
+        line, position = line_parts
+        return not cls._documentation_line_is_code_shaped(line, position) and bool(
+            BENIGN_DOCUMENTATION_CC_PATTERN.search(line)
+        )
+
+    @classmethod
+    def _standard_requirements_network_finding(cls, path: str, payload: bytes, finding: dict[str, Any]) -> bool:
+        if os.path.basename(path).lower() != "requirements.txt":
+            return False
+        line = cls._finding_line(payload, finding)
+        if line is None:
+            return False
+        url = finding.get("url")
+        domain = finding.get("domain")
+        try:
+            hostname = urlsplit(url).hostname if isinstance(url, str) else domain if isinstance(domain, str) else None
+        except ValueError:
+            return False
+        if hostname is None or hostname.casefold() not in TRUSTED_REQUIREMENTS_HOSTS:
+            return False
+        stripped = line.strip()
+        return (
+            REQUIREMENTS_URL_DIRECTIVE_PATTERN.match(stripped) is not None
+            or REQUIREMENTS_DIRECT_REFERENCE_PATTERN.match(stripped) is not None
+            or BARE_NETWORK_URL_TOKEN_PATTERN.fullmatch(stripped) is not None
+        )
 
     @classmethod
     def _is_bare_data_network_token(cls, payload: bytes, finding: dict[str, Any]) -> bool:
@@ -176,8 +326,6 @@ class TextScanner(BaseScanner):
     ) -> bool:
         if finding_limit.get("truncated_finding_type") not in PASSIVE_NETWORK_FINDING_TYPES:
             return False
-        if cls._is_documentation_sidecar(path):
-            return True
         truncated_finding = finding_limit.get("truncated_finding")
         return (
             cls._is_passive_data_sidecar(path)
@@ -188,20 +336,46 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
-    def _downgrade_passive_network_findings(
+    def _sidecar_network_finding_is_informational(
+        cls,
+        path: str,
+        payload: bytes,
+        finding: dict[str, Any],
+    ) -> bool:
+        if cls._is_documentation_sidecar(path):
+            finding_type = finding.get("type")
+            return (
+                (
+                    finding_type in PASSIVE_NETWORK_FINDING_TYPES
+                    and not cls._documentation_finding_is_actionable(payload, finding)
+                )
+                or (
+                    finding_type == "network_function"
+                    and cls._documentation_network_function_is_prose(payload, finding)
+                )
+                or (finding_type == "cc_pattern" and cls._documentation_cc_finding_is_benign_prose(payload, finding))
+            )
+        if cls._is_passive_data_sidecar(path):
+            return finding.get("type") in PASSIVE_NETWORK_FINDING_TYPES and cls._is_bare_data_network_token(
+                payload,
+                finding,
+            )
+        return finding.get("type") in PASSIVE_NETWORK_FINDING_TYPES and cls._standard_requirements_network_finding(
+            path,
+            payload,
+            finding,
+        )
+
+    @classmethod
+    def _downgrade_sidecar_network_findings(
         cls,
         path: str,
         payload: bytes,
         findings: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        documentation_sidecar = cls._is_documentation_sidecar(path)
-        passive_data_sidecar = cls._is_passive_data_sidecar(path)
-        if not documentation_sidecar and not passive_data_sidecar:
-            return findings
         return [
             {**finding, "severity": "INFO"}
-            if finding.get("type") in PASSIVE_NETWORK_FINDING_TYPES
-            and (documentation_sidecar or (passive_data_sidecar and cls._is_bare_data_network_token(payload, finding)))
+            if cls._sidecar_network_finding_is_informational(path, payload, finding)
             else finding
             for finding in findings
         ]
@@ -332,7 +506,7 @@ class TextScanner(BaseScanner):
                     max_findings=max_findings,
                 )
                 network_findings, finding_limit = self._split_detector_finding_limit(network_findings)
-                network_findings = self._downgrade_passive_network_findings(path, inspected_payload, network_findings)
+                network_findings = self._downgrade_sidecar_network_findings(path, inspected_payload, network_findings)
                 if network_findings or not truncated:
                     self.add_network_communication_findings(network_findings, result, context=path)
                 if finding_limit is not None:

@@ -868,6 +868,7 @@ class TestNetworkCommDetector:
         assert "socket.connect" in funcs
         assert "requests.post" in funcs
         assert "urlopen" in funcs
+        assert all(finding.get("position") == data.find(finding["function"].encode()) for finding in func_findings)
 
     def test_network_function_snippets_redact_url_path_tokens(self) -> None:
         """URL-bearing snippets should not leak capability tokens after URL findings are redacted."""
@@ -1073,6 +1074,7 @@ class TestNetworkCommDetector:
         assert "malware" in patterns
         assert "backdoor" in patterns
         assert "botnet" in patterns
+        assert all(finding.get("position") == data.lower().find(finding["pattern"].encode()) for finding in cc_findings)
 
     def test_cc_pattern_scan_reuses_lowered_payload(self) -> None:
         """Reuse one lowercase payload view across all C&C pattern checks."""

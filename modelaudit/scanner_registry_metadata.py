@@ -252,7 +252,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "class": "TextScanner",
         "description": "Scans ML-related text files",
         "extensions": [".txt", ".md", ".markdown", ".rst"],
-        "priority": 11,
+        "priority": 0,
         "dependencies": [],
         "numpy_sensitive": False,
     },

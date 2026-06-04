@@ -653,11 +653,15 @@ def test_get_scanner_for_path_routes_standalone_compressed_wrappers_to_compresse
     _assert_scanner_for_path(wrapper_path, "compressed")
 
 
-def test_get_scanner_for_path_routes_readme_to_metadata_scanner(tmp_path: Path) -> None:
-    readme_path = tmp_path / "README.md"
+@pytest.mark.parametrize("filename", ["README.md", "README.rst", "model_card.md"])
+def test_get_scanner_for_path_routes_suffixed_documentation_to_text_scanner(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    readme_path = tmp_path / filename
     readme_path.write_text("# Model Card\n\nSafe documentation.\n")
 
-    _assert_scanner_for_path(readme_path, "metadata")
+    _assert_scanner_for_path(readme_path, "text")
 
 
 def test_get_scanner_for_path_routes_extensionless_readme_to_metadata_scanner(tmp_path: Path) -> None:
@@ -894,7 +898,7 @@ def test_get_scanner_for_path_routes_generic_pkl_zip_without_pytorch_markers_to_
     ("filename", "scanner_name"),
     [
         ("README", "metadata"),
-        ("README.md", "metadata"),
+        ("README.md", "text"),
         ("model_card", "metadata"),
         ("unreadable.npy", "numpy"),
         ("unreadable.pdmodel", "paddle"),

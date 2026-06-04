@@ -195,6 +195,33 @@ class TestSecretsDetector:
         findings = detector.scan_text(ml_text, context="model/weights")
         assert len(findings) == 0, "Should not flag ML terms as secrets"
 
+    @pytest.mark.parametrize(
+        "placeholder",
+        [
+            "YOUR_CLIENT_SECRET",
+            "<CLIENT_SECRET>",
+            "${CLIENT_SECRET}",
+            "dummy_secret_value",
+            "xxxxxxxxxxxxxxxx",
+        ],
+    )
+    def test_obvious_secret_placeholders_are_ignored(self, placeholder: str) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_text(f"client_secret = {placeholder}", context="README.md")
+
+        assert findings == []
+
+    def test_realistic_client_secret_is_not_treated_as_placeholder(self) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_text(
+            "client_secret = Z9Y8X7W6V5U4T3S2R1Q0P9O8",
+            context="README.md",
+        )
+
+        assert any(finding.get("secret_type") == "Client Secret" for finding in findings)
+
     def test_redaction(self):
         """Test that secrets are properly redacted in findings."""
         detector = SecretsDetector()
