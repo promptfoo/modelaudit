@@ -15,6 +15,7 @@ from modelaudit_picklescan import (
     Severity,
 )
 
+from modelaudit.cache.cache_policy import should_cache_scan_result
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.executorch_scanner import ExecuTorchScanner
 from modelaudit.scanners.picklescan_adapter import (
@@ -566,6 +567,170 @@ def test_pickle_report_to_scan_result_fails_closed_for_truncated_literal_scan_no
         and check.details["pickle_notice_code"] == "literal_scan_truncated"
     )
     assert notice_check.message == "String literal scan truncated at configured limit"
+
+
+def test_pickle_report_to_scan_result_fails_closed_for_truncated_import_references() -> None:
+    report = PickleReport(
+        source="import-reference-cap.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message="Import reference metadata exceeded the scanner reporting limit",
+                severity=Severity.INFO,
+                location="import-reference-cap.pkl",
+                code="import_references_truncated",
+                details={"analysis_incomplete": True, "max_import_references": 10_000},
+            ),
+        ),
+        metadata={"analysis_incomplete": True, "import_references_truncated": True},
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["import_references_truncated"]
+    assert result.metadata["analysis_incomplete"] is True
+    assert should_cache_scan_result(result.to_dict()) is False
+    notice_check = next(
+        check
+        for check in result.checks
+        if check.name == "Standalone Pickle Notice"
+        and check.status.value == "failed"
+        and check.severity == IssueSeverity.INFO
+        and check.rule_code == "S902"
+        and check.details["pickle_notice_code"] == "import_references_truncated"
+    )
+    assert notice_check.message == "Import reference metadata exceeded the scanner reporting limit"
+
+
+def test_pickle_report_to_scan_result_fails_closed_for_legacy_complete_truncated_import_references() -> None:
+    report = PickleReport(
+        source="legacy-import-reference-cap.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        notices=(
+            Notice(
+                message="Import reference metadata exceeded the scanner reporting limit",
+                severity=Severity.INFO,
+                location="legacy-import-reference-cap.pkl",
+                code="import_references_truncated",
+                details={"analysis_incomplete": True, "max_import_references": 10_000},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["import_references_truncated"]
+    assert result.metadata["analysis_incomplete"] is True
+    assert should_cache_scan_result(result.to_dict()) is False
+
+
+def test_pickle_report_to_scan_result_keeps_legacy_truncated_findings_successful() -> None:
+    report = PickleReport(
+        source="legacy-import-reference-cap-finding.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(
+            Finding(
+                message="Dangerous global reference found: posix.system",
+                severity=Severity.WARNING,
+                location="legacy-import-reference-cap-finding.pkl (pos 0)",
+                rule_code="DANGEROUS_GLOBAL",
+                details={"module": "posix", "name": "system"},
+            ),
+        ),
+        notices=(
+            Notice(
+                message="Import reference metadata exceeded the scanner reporting limit",
+                severity=Severity.INFO,
+                location="legacy-import-reference-cap-finding.pkl",
+                code="import_references_truncated",
+                details={"analysis_incomplete": True, "max_import_references": 10_000},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["import_references_truncated"]
+    assert result.metadata["analysis_incomplete"] is True
+    assert should_cache_scan_result(result.to_dict()) is False
+    assert any(issue.rule_code == "S101" for issue in result.issues)
+
+
+def test_pickle_report_to_scan_result_keeps_operational_errors_unsuccessful_with_truncation_notice() -> None:
+    report = PickleReport(
+        source="short-read-import-reference-cap.pkl",
+        status=ScanStatus.ERROR,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(
+            Finding(
+                message="Dangerous global reference found: posix.system",
+                severity=Severity.WARNING,
+                location="short-read-import-reference-cap.pkl (pos 0)",
+                rule_code="DANGEROUS_GLOBAL",
+                details={"module": "posix", "name": "system"},
+            ),
+        ),
+        notices=(
+            Notice(
+                message="Import reference metadata exceeded the scanner reporting limit",
+                severity=Severity.INFO,
+                location="short-read-import-reference-cap.pkl",
+                code="import_references_truncated",
+                details={"analysis_incomplete": True, "max_import_references": 10_000},
+            ),
+        ),
+        errors=(
+            ScanError(
+                message="Could not read remainder of pickle stream",
+                category="short_read",
+                location="short-read-import-reference-cap.pkl",
+                exception_type="OSError",
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["import_references_truncated", "short_read"]
+    assert result.metadata["analysis_incomplete"] is True
+    assert should_cache_scan_result(result.to_dict()) is False
+    assert any(issue.rule_code == "S101" for issue in result.issues)
+
+
+def test_pickle_report_to_scan_result_fails_closed_for_legacy_complete_truncated_callable_invocations() -> None:
+    report = PickleReport(
+        source="legacy-callable-invocation-cap.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        notices=(
+            Notice(
+                message="Callable invocation metadata exceeded the scanner reporting limit",
+                severity=Severity.INFO,
+                location="legacy-callable-invocation-cap.pkl",
+                code="callable_invocations_truncated",
+                details={"analysis_incomplete": True, "max_callable_invocations": 10_000},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["callable_invocations_truncated"]
+    assert result.metadata["analysis_incomplete"] is True
+    assert should_cache_scan_result(result.to_dict()) is False
 
 
 def test_pickle_report_to_scan_result_fails_closed_for_encoded_nested_truncation_notice() -> None:

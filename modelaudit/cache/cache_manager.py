@@ -89,6 +89,9 @@ class CacheManager:
             file_path: Path to file that was scanned
             scan_result: Scan result to cache
             scan_duration_ms: Optional scan duration
+            version_context: Optional cache version context for config-sensitive invalidation
+            expected_file_stat: File metadata captured before the scan
+            expected_file_hash: Secure content hash captured before the scan
         """
         if not self.enabled or not self.cache:
             return False

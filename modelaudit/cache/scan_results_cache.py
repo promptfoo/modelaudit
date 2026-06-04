@@ -16,6 +16,11 @@ from .optimized_config import build_cache_version_context
 logger = logging.getLogger(__name__)
 
 
+def _is_sampled_fingerprint(value: object) -> bool:
+    """Return whether a stored hash represents sampled, incomplete file content."""
+    return isinstance(value, str) and value.startswith("fingerprint:")
+
+
 @dataclass
 class CacheEntry:
     """Data class for cache entries."""
@@ -172,6 +177,11 @@ class ScanResultsCache:
             with open(cache_file_path, encoding="utf-8") as f:
                 cache_entry = json.load(f)
 
+            if _is_sampled_fingerprint(cache_entry.get("file_info", {}).get("hash")):
+                cache_file_path.unlink()
+                self._record_cache_miss("invalid")
+                return None
+
             if (
                 file_path is not None
                 and file_stat is not None
@@ -214,10 +224,17 @@ class ScanResultsCache:
             file_path: Path to file that was scanned
             scan_result: Scan result dictionary to cache
             scan_duration_ms: Optional scan duration in milliseconds
+            version_context: Optional cache version context for config-sensitive invalidation
+            expected_file_stat: File metadata captured before the scan
+            expected_file_hash: Secure content hash captured before the scan
         Returns:
             True when a cache entry was persisted, False when storage was skipped or failed.
         """
         try:
+            if (expected_file_stat is None) != (expected_file_hash is None):
+                logger.debug("Skipping cache store for %s: incomplete expected file identity", file_path)
+                return False
+
             # Get file stats ONCE and reuse
             file_stat = os.stat(file_path)
             verified_current_hash: str | None = None
@@ -229,6 +246,11 @@ class ScanResultsCache:
                 if verified_current_hash != expected_file_hash:
                     logger.debug("Skipping cache store for %s: file hash changed during scan", file_path)
                     return False
+                post_hash_stat = os.stat(file_path)
+                if expected_file_stat is not None and not self._stat_matches(post_hash_stat, expected_file_stat):
+                    logger.debug("Skipping cache store for %s: file metadata changed during verification", file_path)
+                    return False
+                file_stat = post_hash_stat
 
             version_info = self._get_version_info(version_context)
             if version_info is None:
@@ -286,10 +308,14 @@ class ScanResultsCache:
     @staticmethod
     def _stat_matches(left: os.stat_result, right: os.stat_result) -> bool:
         return (
-            left.st_size == right.st_size
+            left.st_dev == right.st_dev
+            and left.st_ino == right.st_ino
+            and left.st_mode == right.st_mode
+            and left.st_size == right.st_size
             and getattr(left, "st_mtime_ns", int(left.st_mtime * 1_000_000_000))
             == getattr(right, "st_mtime_ns", int(right.st_mtime * 1_000_000_000))
-            and left.st_ino == right.st_ino
+            and getattr(left, "st_ctime_ns", int(left.st_ctime * 1_000_000_000))
+            == getattr(right, "st_ctime_ns", int(right.st_ctime * 1_000_000_000))
         )
 
     def generate_cache_key(
@@ -342,15 +368,20 @@ class ScanResultsCache:
     ) -> tuple[str | None, str | None]:
         """Generate a cache key and surface any secure content hash already computed for it."""
         try:
-            if file_stat is not None:
-                file_key, content_hash = self.key_generator.generate_key_material_with_stat_reuse(
+            if file_stat is None:
+                file_stat = os.stat(file_path)
+
+            file_key, content_hash = self.key_generator.generate_key_material_with_stat_reuse(
+                file_path,
+                file_stat,
+                content_hash=content_hash,
+            )
+            if _is_sampled_fingerprint(content_hash):
+                logger.debug(
+                    "Skipping scan-result cache key for %s: sampled large-file fingerprints are not cacheable",
                     file_path,
-                    file_stat,
-                    content_hash=content_hash,
                 )
-            else:
-                file_key = self.key_generator.generate_key(file_path)
-                content_hash = None
+                return None, None
 
             resolved_version_info = (
                 version_info if version_info is not None else self._get_version_info(version_context)

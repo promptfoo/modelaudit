@@ -126,6 +126,41 @@ def test_cache_manager_cached_scan_does_not_store_result_after_post_scan_replace
     assert calls["count"] == 2
 
 
+def test_cache_manager_cached_scan_does_not_cache_transient_clean_bytes(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="manager-restored-race.dat")
+    malicious_payload = b"evil!:" + (b"y" * 2042)
+    clean_payload = b"clean:" + (b"x" * 2042)
+    file_path.write_bytes(malicious_payload)
+    original_stat = file_path.stat()
+    cache_manager = get_cache_manager(str(tmp_path / "cache"), enabled=True)
+    version_context = build_cache_version_context({"timeout": 30})
+    calls = {"count": 0}
+
+    def scan(path: str) -> dict[str, Any]:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            Path(path).write_bytes(clean_payload)
+            prefix = Path(path).read_bytes()[:6].decode("utf-8")
+            Path(path).write_bytes(malicious_payload)
+            os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            deadline = time.monotonic() + 1.2
+            while Path(path).stat().st_ctime_ns == original_stat.st_ctime_ns and time.monotonic() < deadline:
+                time.sleep(0.01)
+                Path(path).write_bytes(malicious_payload)
+                os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            return {"payload_prefix": prefix}
+        return {"payload_prefix": Path(path).read_bytes()[:6].decode("utf-8")}
+
+    first = cache_manager.cached_scan(str(file_path), scan, version_context=version_context)
+    if file_path.stat().st_ctime_ns == original_stat.st_ctime_ns:
+        pytest.skip("filesystem does not expose a changed ctime for in-place writes")
+    second = cache_manager.cached_scan(str(file_path), scan, version_context=version_context)
+
+    assert first["payload_prefix"] == "clean:"
+    assert second["payload_prefix"] == "evil!:"
+    assert calls["count"] == 2
+
+
 def test_cache_manager_cached_scan_runs_when_pre_scan_hashing_fails(tmp_path: Path) -> None:
     file_path = tmp_path / "empty.dat"
     file_path.write_bytes(b"")
@@ -855,6 +890,129 @@ def test_large_file_store_reuses_verified_post_scan_hash_for_cache_key(
         is True
     )
     assert hash_calls["count"] == 1
+
+
+@pytest.mark.parametrize("missing_part", ["stat", "hash"])
+def test_store_result_rejects_incomplete_expected_identity(tmp_path: Path, missing_part: str) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="incomplete-identity.cache")
+    file_stat = file_path.stat()
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    file_hash = cache.hasher.hash_file_with_stat(str(file_path), file_stat)
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    stored = cache.store_result(
+        str(file_path),
+        expected,
+        10,
+        expected_file_stat=None if missing_part == "stat" else file_stat,
+        expected_file_hash=None if missing_part == "hash" else file_hash,
+    )
+
+    assert stored is False
+    assert cache.get_cache_stats()["total_entries"] == 0
+
+
+def test_store_result_rechecks_identity_after_verification_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="post-hash-race.cache")
+    expected_stat = file_path.stat()
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    expected_hash = cache.hasher.hash_file_with_stat(str(file_path), expected_stat)
+    original_hash_file_with_stat = cache.hasher.hash_file_with_stat
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    def mutate_after_hash(path: str, file_stat: os.stat_result) -> str:
+        current_hash = original_hash_file_with_stat(path, file_stat)
+        Path(path).write_bytes(b"y" * file_stat.st_size)
+        os.utime(path, ns=(file_stat.st_atime_ns, file_stat.st_mtime_ns + 1_000_000_000))
+        return current_hash
+
+    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", mutate_after_hash)
+
+    stored = cache.store_result(
+        str(file_path),
+        expected,
+        10,
+        expected_file_stat=expected_stat,
+        expected_file_hash=expected_hash,
+    )
+
+    assert stored is False
+    assert cache.get_cache_stats()["total_entries"] == 0
+
+
+def test_sampled_large_file_fingerprint_result_is_not_cached(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="sampled-large.cache")
+    file_path.write_bytes(b"x" * (16 * 1024 * 1024))
+    original_stat = file_path.stat()
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    cache.key_generator.hasher.full_hash_threshold = 1024
+    version_context = build_cache_version_context({"timeout": 30})
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    sampled_fingerprint = cache.key_generator.hasher.hash_file(str(file_path))
+    assert sampled_fingerprint.startswith("fingerprint:")
+    assert cache.store_result(str(file_path), expected, 10, version_context=version_context) is False
+
+    with file_path.open("r+b") as f:
+        f.seek(6 * 1024 * 1024)
+        f.write(b"evil")
+    os.utime(file_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    assert cache.key_generator.hasher.hash_file(str(file_path)) == sampled_fingerprint
+    assert cache.generate_cache_key(str(file_path), version_context=version_context) is None
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+def test_legacy_sampled_large_file_cache_entry_is_rejected_by_key(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="legacy-sampled-large.cache")
+    file_path.write_bytes(b"x" * (16 * 1024 * 1024))
+    original_stat = file_path.stat()
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    cache.key_generator.hasher.full_hash_threshold = 1024
+    sampled_fingerprint = cache.key_generator.hasher.hash_file(str(file_path))
+    cache_key = "legacy_sampled_cache_key"
+    cache_file_path = cache._get_cache_file_path(cache_key)
+    cache_file_path.parent.mkdir(parents=True, exist_ok=True)
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+    cache_file_path.write_text(
+        json.dumps(
+            {
+                "cache_key": cache_key,
+                "file_info": {
+                    "hash": sampled_fingerprint,
+                    "size": original_stat.st_size,
+                    "mtime": original_stat.st_mtime,
+                    "mtime_ns": original_stat.st_mtime_ns,
+                },
+                "version_info": {},
+                "scan_result": expected,
+                "cache_metadata": {
+                    "scanned_at": time.time(),
+                    "last_access": time.time(),
+                    "access_count": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with file_path.open("r+b") as f:
+        f.seek(6 * 1024 * 1024)
+        f.write(b"evil")
+    os.utime(file_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    assert cache.key_generator.hasher.hash_file(str(file_path)) == sampled_fingerprint
+    assert (
+        cache.get_cached_result_by_key(
+            cache_key,
+            file_path=str(file_path),
+            file_stat=file_path.stat(),
+        )
+        is None
+    )
+    assert not cache_file_path.exists()
 
 
 def test_same_size_rewrite_with_high_resolution_mtime_invalidates_cache(tmp_path: Path) -> None:
