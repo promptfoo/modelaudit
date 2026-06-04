@@ -43,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - harden legacy JAX checkpoint pickle routing against bounded-prefix bypasses and benign sidecar false positives
 - detect dangerous Python calls retrieved or installed through module namespace dictionaries in ZIP and TAR members, while avoiding comprehension-local false positives
 - preflight and stream-enforce cumulative SevenZip extraction budgets before writing oversized archives
+- mark oversized structured JSON/YAML Jinja template fields as incomplete coverage instead of clean
+- bound Jinja sandbox safety probes so render amplification fails closed instead of exhausting scanner resources
 - harden structured JSON/YAML/GGUF Jinja template extraction against oversized values, nested containers, and colliding template paths
 - redact capability tokens embedded in network URL path segments
 - redact secret previews and URL path credentials from metadata scanner findings
