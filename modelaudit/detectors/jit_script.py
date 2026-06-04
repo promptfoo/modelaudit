@@ -2324,6 +2324,21 @@ class JITScriptDetector:
                     (summary[2] if (summary := self._function_summary_for_node(node)) is not None else ()),
                 )
 
+            @staticmethod
+            def _binding_has_tracked_value(binding: _BuiltinAliasBinding) -> bool:
+                return any(
+                    (
+                        binding[0] is not None,
+                        binding[1],
+                        bool(binding[2]),
+                        bool(binding[3]),
+                        bool(binding[4]),
+                        binding[5] is not None,
+                        binding[6] is not None,
+                        bool(binding[7]),
+                    )
+                )
+
             def _binding_from_name(self, name: str, scope_index: int) -> _BuiltinAliasBinding:
                 marker_prefix = self._constant_string_marker_prefix(name)
                 return (
@@ -2866,6 +2881,13 @@ class JITScriptDetector:
                         and len(node.args) == 1
                         and self._is_builtins_module(node.args[0])
                     )
+                    or (
+                        isinstance(node, ast.Call)
+                        and len(node.args) >= 2
+                        and self._is_builtin_helper(node.func, "getattr")
+                        and self._is_builtins_module(node.args[0])
+                        and "__dict__" in self._constant_strings(node.args[1])
+                    )
                 )
 
             def _constant_strings(self, node: ast.AST) -> set[str]:
@@ -2977,8 +2999,14 @@ class JITScriptDetector:
                         and "__call__" in self._constant_strings(node.args[0])
                     ):
                         return self._resolve_builtin(node.func.value)
-                    if node.args and isinstance(node.func, ast.Attribute) and node.func.attr in {"get", "__getitem__"}:
-                        key_resolved, key = self._constant_container_key(node.args[0])
+                    if isinstance(node.func, ast.Attribute) and node.func.attr in {"get", "__getitem__", "pop"}:
+                        key_resolved, key = (
+                            (True, -1)
+                            if node.func.attr == "pop" and not node.args and not node.keywords
+                            else self._constant_container_key(node.args[0])
+                            if node.args
+                            else (False, None)
+                        )
                         if key_resolved:
                             container = self._resolve_builtin_container(node.func.value)
                             prefixes = self._container_access_prefixes(container, (key,))
@@ -4050,6 +4078,15 @@ class JITScriptDetector:
                 function_id = str(id(node))
                 self.function_nodes[function_id] = node
                 self._register_function_summary(node.name, (effects, return_binding, ((function_id, 0),)))
+                for decorator in reversed(node.decorator_list):
+                    decorated_call = ast.Call(
+                        func=decorator,
+                        args=[ast.Name(id=node.name, ctx=ast.Load())],
+                        keywords=[],
+                    )
+                    decorated_binding = self._binding_from_expression(decorated_call)
+                    if self._binding_has_tracked_value(decorated_binding):
+                        self._apply_binding(node.name, decorated_binding, scope_index=-1)
 
             def _sequence_binding(self, bindings: list[_BuiltinAliasBinding]) -> _BuiltinAliasBinding:
                 container: dict[tuple[object, ...], str | None] = {}
@@ -4739,10 +4776,20 @@ class JITScriptDetector:
                 return None
 
             def _visit_with(self, node: ast.With | ast.AsyncWith) -> ast.stmt | None:
+                enter_method = "__aenter__" if isinstance(node, ast.AsyncWith) else "__enter__"
                 for item in node.items:
                     self.visit(item.context_expr)
                     if item.optional_vars is not None:
-                        self._bind_target(item.optional_vars, None)
+                        enter_call = ast.Call(
+                            func=ast.Attribute(
+                                value=item.context_expr,
+                                attr=enter_method,
+                                ctx=ast.Load(),
+                            ),
+                            args=[],
+                            keywords=[],
+                        )
+                        self._bind_target_from_value(item.optional_vars, enter_call)
                 return self._visit_statements(node.body)
 
             def visit_With(self, node: ast.With) -> ast.stmt | None:
@@ -4875,36 +4922,58 @@ class JITScriptDetector:
                         )
 
             def _bind_container_mutation_call(self, node: ast.Call) -> None:
-                if (
-                    not isinstance(node.func, ast.Attribute)
-                    or node.func.attr != "append"
-                    or not isinstance(node.func.value, ast.Name)
-                    or len(node.args) != 1
-                    or node.keywords
-                ):
+                if not isinstance(node.func, ast.Attribute) or not isinstance(node.func.value, ast.Name):
                     return
                 container_name = node.func.value.id
                 container_identity = self._lookup_container_identity(container_name)
                 if container_identity is None:
                     return
-                bindings = [
-                    *(
-                        (builtin, False, nested, set(), {}, None, None, ())
-                        for builtin, nested in self._sequence_container_element_bindings(
-                            self._lookup_container_alias(container_name)
-                        )
-                    ),
-                    self._binding_from_expression(node.args[0]),
-                ]
-                container = self._sequence_binding(bindings)[2]
-                for identity_scope, container_scope in zip(
-                    self.container_identity_scopes,
-                    self.container_alias_scopes,
-                    strict=True,
+                container = dict(self._lookup_container_alias(container_name))
+                function_container = dict(self._lookup_container_functions(container_name))
+                if node.func.attr == "append" and len(node.args) == 1 and not node.keywords:
+                    bindings = [
+                        *(
+                            (builtin, False, nested, set(), {}, None, None, ())
+                            for builtin, nested in self._sequence_container_element_bindings(container)
+                        ),
+                        self._binding_from_expression(node.args[0]),
+                    ]
+                    container = self._sequence_binding(bindings)[2]
+                elif node.func.attr == "pop" and len(node.args) <= 1 and not node.keywords:
+                    key_resolved, key = self._constant_container_key(node.args[0]) if node.args else (True, -1)
+                    if not key_resolved:
+                        return
+                    prefixes = self._container_access_prefixes(container, (key,))
+                    if not prefixes:
+                        return
+                    container = {
+                        path: builtin
+                        for path, builtin in container.items()
+                        if not any(path[: len(prefix)] == prefix for prefix in prefixes)
+                    }
+                    function_prefixes = self._container_access_prefixes(function_container, (key,)) or prefixes
+                    function_container = {
+                        path: functions
+                        for path, functions in function_container.items()
+                        if not any(path[: len(prefix)] == prefix for prefix in function_prefixes)
+                    }
+                else:
+                    return
+                for scope_index, (identity_scope, container_scope) in enumerate(
+                    zip(
+                        self.container_identity_scopes,
+                        self.container_alias_scopes,
+                        strict=True,
+                    )
                 ):
                     for name, identity in identity_scope.items():
                         if identity == container_identity:
                             container_scope[name] = dict(container)
+                            self._register_container_functions(
+                                name,
+                                function_container,
+                                scope_index=scope_index,
+                            )
 
             def visit_Call(self, node: ast.Call) -> None:
                 if builtin := self._resolve_builtin(node.func):

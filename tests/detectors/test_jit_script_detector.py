@@ -2129,6 +2129,18 @@ class TestJITScriptDetector:
             (b"\x00\xffdef framing():\n    return None\ncallbacks = []\ncallbacks.append(eval)\ncallbacks[0]('1+1')\n"),
             (b"\x00\xffdef framing():\n    return None\nglobals()['sink'] = eval\nglobals()['sink']('1+1')\n"),
             (b"\x00\xffclass H:\n    def run(self, callback):\n        return callback('1+1')\nH.run(H(), eval)\n"),
+            (b"\x00\xffimport builtins\ngetattr(builtins, '__dict__')['eval']('1+1')\n"),
+            (
+                b"\x00\xffclass C:\n"
+                b"    def __enter__(self):\n"
+                b"        return eval\n"
+                b"    def __exit__(self, *_args):\n"
+                b"        pass\n"
+                b"with C() as sink:\n"
+                b"    sink('1+1')\n"
+            ),
+            (b"\x00\xffdef deco(function):\n    return eval\n@deco\ndef sink():\n    pass\nsink('1+1')\n"),
+            (b"\x00\xffdef framing():\n    return None\ncallbacks = [eval]\ncallbacks.pop()('1+1')\n"),
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
@@ -2273,6 +2285,31 @@ class TestJITScriptDetector:
                 b"        return callback([])\n"
                 b"H.run(H(), len)\n"
                 b"unused = eval\n"
+            ),
+            (
+                b"\x00\xffimport builtins\n"
+                b"getattr = lambda *_args: {'eval': len}\n"
+                b"getattr(builtins, '__dict__')['eval']([])\n"
+                b"unused = eval\n"
+            ),
+            (
+                b"\x00\xffclass C:\n"
+                b"    def __enter__(self):\n"
+                b"        return len\n"
+                b"    def __exit__(self, *_args):\n"
+                b"        pass\n"
+                b"with C() as sink:\n"
+                b"    sink([])\n"
+                b"unused = eval\n"
+            ),
+            (b"\x00\xffdef deco(function):\n    return len\n@deco\ndef sink():\n    pass\nsink([])\nunused = eval\n"),
+            (
+                b"\x00\xffdef framing():\n"
+                b"    return None\n"
+                b"callbacks = [eval]\n"
+                b"callbacks.pop()\n"
+                b"callbacks.append(len)\n"
+                b"callbacks[0]([])\n"
             ),
         ],
     )
