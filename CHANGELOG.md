@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- redact sensitive decoded previews in TensorFlow SavedModel collection, PyFunc, and Keras metadata findings
 - fail closed on novel standalone picklescan import/callable metadata truncation without masking operational read errors or repeated benign imports
 - skip scan-result caching for sampled large-file fingerprints
 - classify high-confidence active code patterns in PyTorch binary artifacts as security findings so scan exits reflect them

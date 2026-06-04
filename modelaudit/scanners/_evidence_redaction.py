@@ -8,81 +8,177 @@ import re
 import textwrap
 import tokenize
 from typing import Final
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
 
-from modelaudit.detectors.network_comm import redact_url_for_finding
+from modelaudit.detectors.network_comm import _redact_url_path_tokens
 
 REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
 REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 REDACTION_LOOKAHEAD_CHARS: Final[int] = 4096
 
 URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s\"'<>]+")
-SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
-    r"(?:(?:[a-z0-9]+[_.-])*authorization|"
-    r"(?:[a-z0-9]+[_.-])*(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|"
-    r"client[_-]?secret|credential|password|passwd|private[_-]?key|pwd|refresh[_-]?token|sas|secret|"
-    r"secret[_-]?key|signature|sig|token)(?:[_.-][a-z0-9]+)*)"
+SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "access_key",
+        "access-key",
+        "access_token",
+        "access-token",
+        "api_key",
+        "api-key",
+        "apikey",
+        "authorization",
+        "awsaccesskeyid",
+        "auth_token",
+        "auth-token",
+        "client_secret",
+        "client-secret",
+        "credential",
+        "password",
+        "passwd",
+        "pwd",
+        "private_key",
+        "private-key",
+        "refresh_token",
+        "refresh-token",
+        "sas",
+        "secret",
+        "secret_key",
+        "secret-key",
+        "sig",
+        "signature",
+        "token",
+        "x-amz-credential",
+        "x-amz-security-token",
+        "x-amz-signature",
+        "x-goog-credential",
+        "x-goog-signature",
+    }
 )
+SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
+    r"(?:[a-z0-9]+[_.-])*"
+    r"(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|credential|"
+    r"password|passwd|private[_-]?key|pwd|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
+    r"(?:[_.-][a-z0-9]+)*"
+)
+CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
+    r"(?:[a-z][A-Za-z0-9]*)?"
+    r"(?:AccessKey|accessKey|AccessToken|accessToken|APIKey|ApiKey|apiKey|AuthToken|authToken|"
+    r"ClientSecret|clientSecret|Credential|Password|Passwd|PrivateKey|privateKey|Pwd|"
+    r"RefreshToken|refreshToken|SAS|Secret|SecretKey|secretKey|Signature|Sig|Token)"
+    r"(?:[A-Z][A-Za-z0-9]*)?"
+)
+SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
+    rf"(?:{SEPARATED_SENSITIVE_ASSIGNMENT_KEY}|(?-i:{CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY}))"
+)
+SENSITIVE_CONTAINER_KEY: Final[str] = rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|authorization)"
+PYTHON_ANNOTATION_PATTERN: Final[str] = r"(?:[A-Za-z_][\w.\[\](), |]*|[\"'][^\"'\r\n]+[\"'])"
+SCALAR_ASSIGNMENT_OPERATOR_PATTERN: Final[str] = rf"(?:=|:(?!\s*{PYTHON_ANNOTATION_PATTERN}\s*=))"
+AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(\bauthorization\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
+    r"(?!(?:\(\s*)*(?:[rRuUbBfF]{0,3})?[\"'])"
+    r")"
+    r"(?:[A-Za-z][A-Za-z0-9._-]*\s+)?[^\s\"';&|,}\]]+"
+)
+AUTH_SCHEME_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\b(?:bearer|basic|token)\s+)[A-Za-z0-9._~+/=-]{8,}")
+STRING_LITERAL_PREFIX_PATTERN: Final[str] = r"(?P<string_prefix>[rRuUbBfF]{0,3})?"
+QUOTED_VALUE_PATTERN: Final[str] = (
+    rf"{STRING_LITERAL_PREFIX_PATTERN}(?P<quote>\"\"\"|'''|[\"'])(?:\\.|(?!(?P=quote)).)*?(?P=quote)"
+)
+UNTERMINATED_QUOTED_VALUE_PATTERN: Final[str] = (
+    rf"{STRING_LITERAL_PREFIX_PATTERN}(?P<quote>\"\"\"|'''|[\"'])(?:\\.|(?!(?P=quote)).)*\Z"
+)
+VALUE_OPENERS_PATTERN: Final[str] = r"(?:\(\s*)*"
+UNQUOTED_VALUE_PATTERN: Final[str] = r"(?!\()[^\s\"';&|,}\]]+(?![\"'])"
+SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
+    rf"{VALUE_OPENERS_PATTERN})"
+    rf"{UNQUOTED_VALUE_PATTERN}"
+)
+QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
+    rf"{VALUE_OPENERS_PATTERN})"
+    rf"{QUOTED_VALUE_PATTERN}"
+)
+QUOTED_AUTHORIZATION_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)\b(?P<prefix>authorization\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
+    rf"{VALUE_OPENERS_PATTERN}){QUOTED_VALUE_PATTERN}"
+)
+SIMPLE_QUOTED_VALUE_RE: Final[re.Pattern[str]] = re.compile(rf"(?is)\A(?:\(\s*)*{QUOTED_VALUE_PATTERN}(?:\s*\))*\Z")
+QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*:\s*"
+    rf"{VALUE_OPENERS_PATTERN})"
+    rf"{QUOTED_VALUE_PATTERN}"
+)
+SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>\b[a-z_][\w.]*(?:\s*\[[^\]\n]{{1,120}}\])*\s*"
+    rf"\[\s*(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*\]\s*=\s*"
+    rf"{VALUE_OPENERS_PATTERN})"
+    rf"{QUOTED_VALUE_PATTERN}"
+)
+ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>\\(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})\\(?P=key_quote)\s*:\s*)"
+    r"\\(?P<value_quote>[\"'])(?:(?!\\(?P=value_quote)).)*?\\(?P=value_quote)"
+)
+BRACKETED_MAPPING_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>(?:(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)"
+    rf"|\b(?:{SENSITIVE_ASSIGNMENT_KEY})\b)\s*:\s*)"
+    r"(?:\[[^\]]{0,4096}\]|\{[^}]{0,4096}\})"
+)
+UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
+    rf"{VALUE_OPENERS_PATTERN})"
+    rf"{UNTERMINATED_QUOTED_VALUE_PATTERN}"
+)
+UNTERMINATED_QUOTED_AUTHORIZATION_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)\b(?P<prefix>authorization\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
+    rf"{VALUE_OPENERS_PATTERN})"
+    rf"{UNTERMINATED_QUOTED_VALUE_PATTERN}"
+)
+UNTERMINATED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*:\s*"
+    rf"{VALUE_OPENERS_PATTERN})"
+    rf"{UNTERMINATED_QUOTED_VALUE_PATTERN}"
+)
+UNTERMINATED_SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<prefix>\b[a-z_][\w.]*(?:\s*\[[^\]\n]{{1,120}}\])*\s*"
+    rf"\[\s*(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*\]\s*=\s*"
+    rf"{VALUE_OPENERS_PATTERN})"
+    rf"{UNTERMINATED_QUOTED_VALUE_PATTERN}"
+)
+QUOTED_MAPPING_SENSITIVE_UNQUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(?P<prefix>(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*:\s*"
+    rf"{VALUE_OPENERS_PATTERN}){UNQUOTED_VALUE_PATTERN}"
+)
+SUBSCRIPTED_SENSITIVE_UNQUOTED_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(?P<prefix>\b[a-z_][\w.]*(?:\s*\[[^\]\n]{{1,120}}\])*\s*"
+    rf"\[\s*(?P<key_quote>[\"'])(?:{SENSITIVE_CONTAINER_KEY})(?P=key_quote)\s*\]\s*=\s*"
+    rf"{VALUE_OPENERS_PATTERN}){UNQUOTED_VALUE_PATTERN}"
+)
+HTML_QUERY_SEPARATOR_RE: Final[re.Pattern[str]] = re.compile(r"(?i)&amp;")
+SEMICOLON_QUERY_SEPARATOR_RE: Final[re.Pattern[str]] = re.compile(r"(?i);(?=(?:amp;)?[a-z0-9%_.\-\[\]]+\s*=)")
+NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(?:^|[?&;])(?:amp;)?{SENSITIVE_ASSIGNMENT_KEY}(?:\[[^\]]*\])*\s*[:=]"
+)
+BLOCK_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?im)(?P<prefix>\b(?:{SENSITIVE_ASSIGNMENT_KEY})\s*:\s*[|>][+-]?)"
+    r"(?P<block>(?:\n(?P<indent>[ \t]+)[^\n]*)+)"
+)
+BRACKETED_QUERY_KEY_SUFFIX_RE: Final[re.Pattern[str]] = re.compile(r"(?:\[[^\]]*\])+\Z")
 SENSITIVE_ASSIGNMENT_TARGET: Final[str] = (
-    rf"(?:\b{SENSITIVE_ASSIGNMENT_KEY}(?:\s*:\s*[^=\r\n]+)?|"
-    rf"\[\s*(?:[rubf]{{0,2}})?[\"']{SENSITIVE_ASSIGNMENT_KEY}[\"']\s*\])"
+    rf"(?<![?&;=/%])(?:\b{SENSITIVE_CONTAINER_KEY}(?:\s*:\s*{PYTHON_ANNOTATION_PATTERN})?|"
+    rf"\[\s*(?:[rubf]{{0,3}})?[\"']{SENSITIVE_CONTAINER_KEY}[\"']\s*\])"
 )
 SENSITIVE_ASSIGNMENT_TARGET_RE: Final[re.Pattern[str]] = re.compile(
     rf"{SENSITIVE_ASSIGNMENT_TARGET}\s*$",
     re.IGNORECASE,
 )
 ANNOTATED_SENSITIVE_ASSIGNMENT_TARGET_RE: Final[re.Pattern[str]] = re.compile(
-    rf"\b{SENSITIVE_ASSIGNMENT_KEY}\s*:\s*[^=\r\n]+\s*$",
+    rf"\b{SENSITIVE_CONTAINER_KEY}\s*:\s*{PYTHON_ANNOTATION_PATTERN}\s*$",
     re.IGNORECASE,
 )
 QUOTED_SENSITIVE_MAPPING_KEY_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?:[rubf]{{0,2}})?(?P<mapping_quote>[\"']){SENSITIVE_ASSIGNMENT_KEY}(?P=mapping_quote)\s*$",
+    rf"(?:[rubf]{{0,3}})?(?P<mapping_quote>[\"']){SENSITIVE_CONTAINER_KEY}(?P=mapping_quote)\s*$",
     re.IGNORECASE,
-)
-AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(\bauthorization\s*(?:=|:(?![^\r\n=]*=))\s*(?:(?:bearer|basic|token)\s+)?)"
-    r"[^\s\"';&|,\)\]\}]+"
-)
-AUTH_SCHEME_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\b(?:bearer|basic|token)\s+)[A-Za-z0-9._~+/=-]{8,}")
-SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)\b(({SENSITIVE_ASSIGNMENT_KEY})\s*(?:=|:(?![^\r\n=]*=))\s*)[^\s\"';&|,\)\]\}}]+"
-)
-QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)(?P<assignment_prefix>[rubf]{{0,2}})"
-    rf"(?P<assignment_quote>[\"']{{1,3}})(?![\"'])"
-    rf"(?:\\.|(?!(?P=assignment_quote)).)*(?P=assignment_quote)",
-    re.IGNORECASE | re.DOTALL,
-)
-PYTHON_CONTAINER_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)((?:\[\s*[\"']{SENSITIVE_ASSIGNMENT_KEY}[\"']\s*\]|[\"']{SENSITIVE_ASSIGNMENT_KEY}[\"'])"
-    rf"\s*[:=]\s*)(?P<container_prefix>[rubf]{{0,2}})(?P<container_quote>[\"']{{1,3}})(?![\"'])"
-    rf"(?:\\.|(?!(?P=container_quote)).)*"
-    rf"(?P=container_quote)",
-    re.IGNORECASE | re.DOTALL,
-)
-MULTILINE_MALFORMED_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)(?P<multiline_assignment_quote>[\"'])"
-    rf"(?!(?P=multiline_assignment_quote)(?P=multiline_assignment_quote))"
-    rf"(?:\\.|(?!(?P=multiline_assignment_quote))[^\r\n])*[\r\n].*$",
-    re.IGNORECASE | re.DOTALL,
-)
-MULTILINE_MALFORMED_PYTHON_CONTAINER_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"((?:\[\s*[\"']{SENSITIVE_ASSIGNMENT_KEY}[\"']\s*\]|[\"']{SENSITIVE_ASSIGNMENT_KEY}[\"'])"
-    rf"\s*[:=]\s*)(?P<multiline_container_quote>[\"'])"
-    rf"(?!(?P=multiline_container_quote)(?P=multiline_container_quote))"
-    rf"(?:\\.|(?!(?P=multiline_container_quote))[^\r\n])*[\r\n].*$",
-    re.IGNORECASE | re.DOTALL,
-)
-MALFORMED_QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"\b(({SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)(?P<malformed_assignment_quote>[\"']{{1,3}})(?![\"'])"
-    rf"(?!{re.escape(REDACTED_EVIDENCE_VALUE)}(?P=malformed_assignment_quote)).*$",
-    re.IGNORECASE | re.DOTALL,
-)
-MALFORMED_PYTHON_CONTAINER_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
-    rf"((?:\[\s*[\"']{SENSITIVE_ASSIGNMENT_KEY}[\"']\s*\]|[\"']{SENSITIVE_ASSIGNMENT_KEY}[\"'])"
-    rf"\s*[:=]\s*)(?P<malformed_container_quote>[\"']{{1,3}})(?![\"'])"
-    rf"(?!{re.escape(REDACTED_EVIDENCE_VALUE)}(?P=malformed_container_quote)).*$",
-    re.IGNORECASE | re.DOTALL,
 )
 PYTHON_COMPOUND_ASSIGNMENT_OPERATORS: Final[tuple[str, ...]] = (
     "**=",
@@ -108,7 +204,7 @@ SENSITIVE_EXPRESSION_ASSIGNMENT_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?P<target>{SENSITIVE_ASSIGNMENT_TARGET})\s*(?P<operator>{PYTHON_ASSIGNMENT_OPERATOR_PATTERN})",
     re.IGNORECASE,
 )
-STRING_LITERAL_START_RE: Final[re.Pattern[str]] = re.compile(r"(?:[rubf]{0,2})?[\"']", re.IGNORECASE)
+STRING_LITERAL_START_RE: Final[re.Pattern[str]] = re.compile(r"(?:[rubf]{0,3})?[\"']", re.IGNORECASE)
 GENERIC_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
     r"(?<![a-z0-9_])(?:[a-z_]\w*(?:\.[a-z_]\w*)*(?:\[\s*[\"'][^\"']+[\"']\s*\])?|[\"'][^\"']+[\"'])"
     rf"\s*(?:{PYTHON_ASSIGNMENT_OPERATOR_PATTERN}|:(?![^\r\n=]*=))",
@@ -130,67 +226,111 @@ def _redact_malformed_url(raw_url: str) -> str:
     return f"{scheme}{REDACTED_URL_CREDENTIALS}@{rest.rsplit('@', 1)[1]}"
 
 
-def _redact_file_url(raw_url: str) -> str | None:
-    """Preserve valid absolute file paths while removing URL credentials."""
+def _redact_url(match: re.Match[str]) -> str:
+    raw_url = match.group(0)
     try:
         parsed = urlsplit(raw_url)
     except ValueError:
-        return None
-
-    if parsed.scheme.lower() != "file" or not parsed.path.startswith("/"):
-        return None
-
-    hostname = parsed.hostname
-    if parsed.netloc and hostname is None:
-        return None
-    if hostname is not None and ":" in hostname and not hostname.startswith("["):
-        hostname = f"[{hostname}]"
-
-    return urlunsplit((parsed.scheme, hostname or "", parsed.path, "", ""))
-
-
-def _redact_url(match: re.Match[str]) -> str:
-    raw_url = match.group(0)
-    safe_file_url = _redact_file_url(raw_url)
-    if safe_file_url is not None:
-        return safe_file_url
-
-    safe_url = redact_url_for_finding(raw_url)
-    if safe_url == "[invalid-url]":
         return _redact_malformed_url(raw_url)
-    return safe_url
+
+    netloc = parsed.netloc
+    if "@" in netloc:
+        netloc = f"{REDACTED_URL_CREDENTIALS}@{netloc.rsplit('@', 1)[1]}"
+    hostname = parsed.hostname or ""
+    path = _redact_url_path_tokens(parsed.scheme.lower(), hostname.lower(), parsed.path)
+
+    query_items = []
+    normalized_query = SEMICOLON_QUERY_SEPARATOR_RE.sub("&", HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query))
+    for key, value in parse_qsl(normalized_query, keep_blank_values=True):
+        if _normalize_query_key(key) in SENSITIVE_QUERY_KEYS or _contains_nested_sensitive_query_assignment(value):
+            query_items.append((key, REDACTED_EVIDENCE_VALUE))
+        else:
+            query_items.append((key, value))
+
+    return urlunsplit(
+        (
+            parsed.scheme,
+            netloc,
+            path,
+            urlencode(query_items, doseq=True, safe="<>"),
+            "",
+        )
+    )
+
+
+def _contains_nested_sensitive_query_assignment(value: str) -> bool:
+    """Recognize credential assignments nested inside encoded query values."""
+    decoded = value
+    for _ in range(3):
+        next_decoded = unquote_plus(decoded)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+    return bool(
+        NESTED_SENSITIVE_QUERY_ASSIGNMENT_RE.search(decoded)
+        or QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
+        or ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
+        or BRACKETED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
+        or BLOCK_SENSITIVE_ASSIGNMENT_RE.search(decoded)
+        or _contains_nested_url_secret(decoded)
+        or QUOTED_MAPPING_SENSITIVE_UNQUOTED_ASSIGNMENT_RE.search(decoded)
+        or UNTERMINATED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.search(decoded)
+    )
+
+
+def _contains_nested_url_secret(value: str) -> bool:
+    """Detect credential-bearing URLs embedded inside decoded query values."""
+    for match in URL_RE.finditer(value):
+        raw_url = match.group(0)
+        try:
+            parsed = urlsplit(raw_url)
+        except ValueError:
+            if "@" in raw_url:
+                return True
+            continue
+
+        hostname = parsed.hostname or ""
+        if "@" in parsed.netloc:
+            return True
+        if _redact_url_path_tokens(parsed.scheme.lower(), hostname.lower(), parsed.path) != parsed.path:
+            return True
+        normalized_query = SEMICOLON_QUERY_SEPARATOR_RE.sub("&", HTML_QUERY_SEPARATOR_RE.sub("&", parsed.query))
+        if any(
+            _normalize_query_key(key) in SENSITIVE_QUERY_KEYS
+            or _contains_nested_sensitive_query_assignment(query_value)
+            for key, query_value in parse_qsl(normalized_query, keep_blank_values=True)
+        ):
+            return True
+    return False
+
+
+def _normalize_query_key(key: str) -> str:
+    return BRACKETED_QUERY_KEY_SUFFIX_RE.sub("", key).lower()
 
 
 def _redact_quoted_assignment(match: re.Match[str]) -> str:
-    prefix = match.group("assignment_prefix")
-    quote = match.group("assignment_quote")
-    return f"{match.group(1)}{prefix}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
+    quote = match.group("quote")
+    string_prefix = match.group("string_prefix") or ""
+    return f"{match.group('prefix')}{string_prefix}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
 
 
-def _redact_python_container_assignment(match: re.Match[str]) -> str:
-    prefix = match.group("container_prefix")
-    quote = match.group("container_quote")
-    return f"{match.group(1)}{prefix}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
+def _redact_escaped_quoted_mapping_assignment(match: re.Match[str]) -> str:
+    value_quote = match.group("value_quote")
+    return f"{match.group('prefix')}\\{value_quote}{REDACTED_EVIDENCE_VALUE}\\{value_quote}"
 
 
-def _redact_multiline_malformed_quoted_assignment(match: re.Match[str]) -> str:
-    quote = match.group("multiline_assignment_quote")
-    return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
+def _redact_block_assignment(match: re.Match[str]) -> str:
+    indent = match.group("indent") or "  "
+    return f"{match.group('prefix')}\n{indent}{REDACTED_EVIDENCE_VALUE}"
 
 
-def _redact_multiline_malformed_python_container_assignment(match: re.Match[str]) -> str:
-    quote = match.group("multiline_container_quote")
-    return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
+def _redact_unterminated_quoted_assignment(match: re.Match[str]) -> str:
+    string_prefix = match.group("string_prefix") or ""
+    return f"{match.group('prefix')}{string_prefix}{match.group('quote')}{REDACTED_EVIDENCE_VALUE}"
 
 
-def _redact_malformed_quoted_assignment(match: re.Match[str]) -> str:
-    quote = match.group("malformed_assignment_quote")
-    return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
-
-
-def _redact_malformed_python_container_assignment(match: re.Match[str]) -> str:
-    quote = match.group("malformed_container_quote")
-    return f"{match.group(1)}{quote}{REDACTED_EVIDENCE_VALUE}{quote}"
+def _redact_unquoted_assignment(match: re.Match[str]) -> str:
+    return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
 
 
 def _line_offsets(text: str) -> list[int]:
@@ -261,7 +401,38 @@ def _assignment_value_end(
     return text_length, significant
 
 
+def _is_simple_sensitive_assignment_tokens(tokens: list[tokenize.TokenInfo]) -> bool:
+    significant = tokens
+    while (
+        len(significant) >= 3
+        and significant[0].type == tokenize.OP
+        and significant[0].string == "("
+        and significant[-1].type == tokenize.OP
+        and significant[-1].string == ")"
+    ):
+        depth = 0
+        wraps_entire_value = True
+        for index, token in enumerate(significant):
+            if token.type != tokenize.OP:
+                continue
+            if token.string == "(":
+                depth += 1
+            elif token.string == ")":
+                depth -= 1
+                if depth == 0 and index != len(significant) - 1:
+                    wraps_entire_value = False
+                    break
+        if depth != 0 or not wraps_entire_value:
+            break
+        significant = significant[1:-1]
+
+    return len(significant) == 1 and significant[0].type in {tokenize.NAME, tokenize.NUMBER, tokenize.STRING}
+
+
 def _is_simple_sensitive_assignment_value(value: str) -> bool:
+    if SIMPLE_QUOTED_VALUE_RE.fullmatch(value.strip()) is not None:
+        return True
+
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(value).readline))
     except (IndentationError, tokenize.TokenError):
@@ -279,41 +450,92 @@ def _is_simple_sensitive_assignment_value(value: str) -> bool:
             tokenize.COMMENT,
         }
     ]
-    return len(significant) == 1 and significant[0].type in {tokenize.NAME, tokenize.NUMBER, tokenize.STRING}
+    return _is_simple_sensitive_assignment_tokens(significant)
+
+
+def _assignment_boundary_start(text: str, assignment_start: int, value_start: int) -> int:
+    boundary = assignment_start
+    while boundary > value_start and text[boundary - 1] in " \t":
+        boundary -= 1
+    while boundary > value_start and text[boundary - 1] in "([{":
+        boundary -= 1
+        while boundary > value_start and text[boundary - 1] in " \t":
+            boundary -= 1
+    return boundary
 
 
 def _unparseable_assignment_value_end(text: str, value_start: int) -> tuple[int, bool]:
-    """Find a physical statement boundary, following explicit line continuations."""
-    cursor = value_start
-    had_continuation = False
-    while cursor < len(text):
-        newline = text.find("\n", cursor)
-        semicolon = text.find(";", cursor)
-        if semicolon >= 0 and (newline < 0 or semicolon < newline):
-            return semicolon, had_continuation
-        if newline < 0:
-            return len(text), had_continuation
+    """Find a statement boundary while respecting strings and continued expressions."""
+    index = value_start
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    had_explicit_continuation = False
 
-        backslash_index = newline - 1
-        if backslash_index >= cursor and text[backslash_index] == "\r":
+    while index < len(text):
+        if quote is not None:
+            if escaped:
+                escaped = False
+                index += 1
+                continue
+            if text[index] == "\\":
+                escaped = True
+                index += 1
+                continue
+            if text.startswith(quote, index):
+                index += len(quote)
+                quote = None
+                continue
+            index += 1
+            continue
+
+        if text.startswith('"""', index) or text.startswith("'''", index):
+            quote = text[index : index + 3]
+            index += 3
+            continue
+        if text[index] in "\"'":
+            quote = text[index]
+            index += 1
+            continue
+        if text[index] in "([{":
+            depth += 1
+            index += 1
+            continue
+        if text[index] in ")]}":
+            depth = max(0, depth - 1)
+            index += 1
+            continue
+        if text[index] == ";" and depth == 0:
+            return index, had_explicit_continuation
+        if text[index] != "\n":
+            index += 1
+            continue
+
+        backslash_index = index - 1
+        if backslash_index >= value_start and text[backslash_index] == "\r":
             backslash_index -= 1
         backslash_count = 0
-        while backslash_index >= cursor and text[backslash_index] == "\\":
+        while backslash_index >= value_start and text[backslash_index] == "\\":
             backslash_count += 1
             backslash_index -= 1
-        if backslash_count % 2 == 0:
-            return newline, had_continuation
+        if backslash_count % 2 == 1:
+            had_explicit_continuation = True
+            index += 1
+            continue
+        if depth == 0:
+            return index, had_explicit_continuation
+        index += 1
 
-        had_continuation = True
-        cursor = newline + 1
-
-    return len(text), had_continuation
+    return len(text), had_explicit_continuation
 
 
 def _redact_unparseable_sensitive_expression_assignments(text: str) -> str:
     matches = list(SENSITIVE_EXPRESSION_ASSIGNMENT_PREFIX_RE.finditer(text))
     assignment_starts = sorted(
-        {match.start() for match in matches} | {match.start() for match in GENERIC_ASSIGNMENT_START_RE.finditer(text)}
+        {
+            _assignment_boundary_start(text, match.start(), 0)
+            for match in (*matches, *GENERIC_ASSIGNMENT_START_RE.finditer(text))
+        }
     )
     replacements: list[tuple[int, int]] = []
     for match in matches:
@@ -414,16 +636,14 @@ def _redact_python_expression_assignments(text: str) -> str:
             text_length,
             offsets,
         )
-        is_simple_value = len(significant) == 1 and significant[0].type in {
-            tokenize.NAME,
-            tokenize.NUMBER,
-            tokenize.STRING,
-        }
+        value_start = _position_offset(offsets, tokens[value_index].start, text_length)
+        is_simple_value = _is_simple_sensitive_assignment_tokens(significant) or (
+            SIMPLE_QUOTED_VALUE_RE.fullmatch(text[value_start:value_end].strip()) is not None
+        )
         is_annotated_target = ANNOTATED_SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is not None
         if is_simple_value and token.string not in PYTHON_COMPOUND_ASSIGNMENT_OPERATORS and not is_annotated_target:
             continue
 
-        value_start = _position_offset(offsets, tokens[value_index].start, text_length)
         while value_end > value_start and text[value_end - 1].isspace():
             value_end -= 1
         if value_end > value_start:
@@ -455,26 +675,25 @@ def _truncate(text: str, max_chars: int) -> str:
     return f"{text[: max_chars - 3]}..."
 
 
-def redact_evidence_string(text: str, max_chars: int = 180) -> str:
+def redact_evidence_string(text: str, max_chars: int | None = 180) -> str:
     """Redact credentials from a scanner evidence string before truncating it."""
-    redacted = URL_RE.sub(_redact_url, text[: max(0, max_chars) + REDACTION_LOOKAHEAD_CHARS])
+    redaction_input = text if max_chars is None else text[: max(0, max_chars) + REDACTION_LOOKAHEAD_CHARS]
+    redacted = URL_RE.sub(_redact_url, redaction_input)
     redacted = _redact_python_expression_assignments(redacted)
-    redacted = MULTILINE_MALFORMED_PYTHON_CONTAINER_SENSITIVE_ASSIGNMENT_RE.sub(
-        _redact_multiline_malformed_python_container_assignment,
-        redacted,
-    )
-    redacted = MULTILINE_MALFORMED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(
-        _redact_multiline_malformed_quoted_assignment,
-        redacted,
-    )
-    redacted = PYTHON_CONTAINER_SENSITIVE_ASSIGNMENT_RE.sub(_redact_python_container_assignment, redacted)
+    redacted = ESCAPED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_escaped_quoted_mapping_assignment, redacted)
+    redacted = BRACKETED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
+    redacted = BLOCK_SENSITIVE_ASSIGNMENT_RE.sub(_redact_block_assignment, redacted)
+    redacted = QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
+    redacted = SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
+    redacted = QUOTED_AUTHORIZATION_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
     redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
-    redacted = MALFORMED_PYTHON_CONTAINER_SENSITIVE_ASSIGNMENT_RE.sub(
-        _redact_malformed_python_container_assignment,
-        redacted,
-    )
-    redacted = MALFORMED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_malformed_quoted_assignment, redacted)
+    redacted = UNTERMINATED_QUOTED_MAPPING_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unterminated_quoted_assignment, redacted)
+    redacted = UNTERMINATED_SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unterminated_quoted_assignment, redacted)
+    redacted = UNTERMINATED_QUOTED_AUTHORIZATION_ASSIGNMENT_RE.sub(_redact_unterminated_quoted_assignment, redacted)
+    redacted = UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unterminated_quoted_assignment, redacted)
     redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = AUTH_SCHEME_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
-    redacted = SENSITIVE_ASSIGNMENT_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
-    return _truncate(redacted, max_chars)
+    redacted = QUOTED_MAPPING_SENSITIVE_UNQUOTED_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
+    redacted = SUBSCRIPTED_SENSITIVE_UNQUOTED_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
+    redacted = SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_assignment, redacted)
+    return redacted if max_chars is None else _truncate(redacted, max_chars)
