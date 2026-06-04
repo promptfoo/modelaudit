@@ -74,6 +74,29 @@ def test_redacts_prefixed_string_literal_secret_assignments() -> None:
     assert f'"client_secret": f"{REDACTED_EVIDENCE_VALUE}"' in redacted
 
 
+def test_redacts_bare_quoted_authorization_assignments() -> None:
+    """Authorization assignments should redact arbitrary quoted auth schemes."""
+    text = 'Authorization = "ApiKey AUTHSECRET123" authorization = r"Custom AUTHSECRET456"'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "AUTHSECRET123" not in redacted
+    assert "AUTHSECRET456" not in redacted
+    assert f'Authorization = "{REDACTED_EVIDENCE_VALUE}"' in redacted
+    assert f'authorization = r"{REDACTED_EVIDENCE_VALUE}"' in redacted
+
+
+def test_redacts_escaped_json_mapping_secret_values() -> None:
+    """Escaped JSON/config mappings embedded in strings should be sanitized."""
+    text = r'payload="{\"api_key\":\"ESCAPEDJSONSECRET123\", \"safe\":\"ok\"}"'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "ESCAPEDJSONSECRET123" not in redacted
+    assert r"\"api_key\":\"<redacted>\"" in redacted
+    assert r"\"safe\":\"ok\"" in redacted
+
+
 def test_redacts_camel_case_secret_assignments() -> None:
     """Common camelCase credential keys should not preserve raw values."""
     text = (

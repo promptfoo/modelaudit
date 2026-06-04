@@ -815,6 +815,22 @@ def test_savedmodel_preview_redaction_removes_prefixed_and_camel_case_secrets() 
     assert "os.system" in preview
 
 
+def test_savedmodel_preview_redaction_removes_authorization_and_escaped_json_secrets() -> None:
+    preview = _safe_decoded_preview(
+        'Authorization = "ApiKey AUTHSECRET123"\n'
+        r'payload="{\"api_key\":\"ESCAPEDJSONSECRET456\", \"safe\":\"ok\"}"'
+        '\nos.system("id")',
+        500,
+    )
+
+    assert "AUTHSECRET123" not in preview
+    assert "ESCAPEDJSONSECRET456" not in preview
+    assert 'Authorization = "<redacted>"' in preview
+    assert r"\"api_key\":\"<redacted>\"" in preview
+    assert r"\"safe\":\"ok\"" in preview
+    assert "os.system" in preview
+
+
 def test_savedmodel_preview_redaction_removes_parenthesized_secret_values() -> None:
     preview = _safe_decoded_preview(
         'api_key = ("PARENSECRET123")\n'
