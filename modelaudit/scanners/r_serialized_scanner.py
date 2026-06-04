@@ -81,6 +81,28 @@ _R_LEFTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE = re.compile(
 _R_RIGHTWARD_RAW_CREDENTIAL_ASSIGNMENT_RE = re.compile(rf"(?i)\s*(?P<operator>->{{1,2}})\s*{_R_CREDENTIAL_TARGET}")
 _R_LEFTWARD_CREDENTIAL_TARGET_RE = re.compile(rf"(?i){_R_CREDENTIAL_TARGET}\s*(?P<operator>=|<{{1,2}}-)\s*")
 _R_RIGHTWARD_CREDENTIAL_TARGET_RE = re.compile(rf"(?i)->{{1,2}}\s*{_R_CREDENTIAL_TARGET}")
+_R_NON_CALL_PAREN_PREFIXES = frozenset(
+    {
+        "break",
+        "else",
+        "false",
+        "for",
+        "if",
+        "in",
+        "inf",
+        "na",
+        "na_character_",
+        "na_complex_",
+        "na_integer_",
+        "na_real_",
+        "nan",
+        "next",
+        "null",
+        "repeat",
+        "true",
+        "while",
+    }
+)
 
 
 def _position_is_in_r_suppressing_non_code_span(
@@ -123,6 +145,10 @@ def _r_equals_is_named_argument(
     if not stack or stack[-1][0] not in {"(", "["}:
         return False
     target = stack[-1]
+    if target[0] == "(" and not _r_open_paren_starts_argument_list(text, target[1], non_code_spans):
+        return False
+    if target[0] == "[" and not _r_open_bracket_starts_subscript(text, target[1], non_code_spans):
+        return False
 
     while cursor < len(text):
         if span_index < len(non_code_spans) and cursor == non_code_spans[span_index][0]:
@@ -139,6 +165,98 @@ def _r_equals_is_named_argument(
             closed = stack.pop()
             if closed == target:
                 return True
+        cursor += 1
+    return False
+
+
+def _r_open_paren_starts_argument_list(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> bool:
+    cursor = position - 1
+    crossed_newline = False
+    while cursor >= 0 and text[cursor].isspace():
+        crossed_newline = crossed_newline or text[cursor] in "\r\n"
+        cursor -= 1
+
+    if cursor < 0:
+        return False
+
+    span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+    if span_index >= 0 and cursor < non_code_spans[span_index][1]:
+        span_start, span_end = non_code_spans[span_index]
+        return not crossed_newline and span_end == cursor + 1 and text[span_start] in "\"'`"
+
+    character = text[cursor]
+    if character == "]":
+        return not crossed_newline and _r_closing_delimiter_is_matched(text, cursor, non_code_spans)
+    if character == "\\":
+        return True
+    if not (character.isalnum() or character in "._"):
+        return False
+
+    token_end = cursor + 1
+    while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "._"):
+        cursor -= 1
+    token = text[cursor + 1 : token_end].lower()
+    if token == "function":
+        return True
+    token_starts_like_number = token[0].isdigit() or (token.startswith(".") and len(token) > 1 and token[1].isdigit())
+    return not crossed_newline and not token_starts_like_number and token not in _R_NON_CALL_PAREN_PREFIXES
+
+
+def _r_open_bracket_starts_subscript(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> bool:
+    cursor = position - 1
+    crossed_newline = False
+    while cursor >= 0 and text[cursor].isspace():
+        crossed_newline = crossed_newline or text[cursor] in "\r\n"
+        cursor -= 1
+
+    if cursor < 0 or crossed_newline:
+        return False
+    if text[cursor] == "[":
+        return _r_open_bracket_starts_subscript(text, cursor, non_code_spans)
+    if text[cursor] == "]":
+        return _r_closing_delimiter_is_matched(text, cursor, non_code_spans)
+
+    span_index = bisect_right(non_code_spans, cursor, key=lambda span: span[0]) - 1
+    if span_index >= 0 and cursor < non_code_spans[span_index][1]:
+        span_start, span_end = non_code_spans[span_index]
+        return span_end == cursor + 1 and text[span_start] in "\"'`"
+    return text[cursor].isalnum() or text[cursor] in "._"
+
+
+def _r_closing_delimiter_is_matched(
+    text: str,
+    position: int,
+    non_code_spans: list[tuple[int, int]],
+) -> bool:
+    closing_delimiters = {")": "(", "]": "[", "}": "{"}
+    stack: list[str] = []
+    cursor = 0
+    span_index = 0
+    while cursor <= position:
+        if span_index < len(non_code_spans) and cursor == non_code_spans[span_index][0]:
+            cursor = non_code_spans[span_index][1]
+            span_index += 1
+            continue
+
+        character = text[cursor]
+        if character in "([{":
+            stack.append(character)
+        elif character in ")]}":
+            if stack and stack[-1] != closing_delimiters[character]:
+                return False
+            is_matched = bool(stack)
+            if cursor == position:
+                return is_matched
+            if is_matched:
+                stack.pop()
         cursor += 1
     return False
 

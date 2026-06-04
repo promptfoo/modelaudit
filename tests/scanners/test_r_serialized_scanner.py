@@ -918,6 +918,11 @@ def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None
         ') list(token = "standard")',
         '] list(token = r"(standard)")',
         '} function(token = paste0("stan", "dard")) NULL',
+        'base::list(token = "standard")',
+        '`list`(token = r"(standard)")',
+        '\\(token = "standard") NULL',
+        'x[token = "standard"]',
+        'x[[token = r"(standard)"]]',
     ],
 )
 def test_scan_allows_assignment_examples_inside_benign_metadata(tmp_path: Path, metadata: str) -> None:
@@ -944,6 +949,33 @@ def test_scan_allows_assignment_examples_inside_benign_metadata(tmp_path: Path, 
 )
 def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path, assignment: str) -> None:
     path = tmp_path / "unmatched-delimiter-credential.rds"
+    _write_raw_r_serialized(path, assignment)
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        '(token = "GROUPED_QUOTED_SECRET")',
+        '(token = r"(GROUPED_RAW_SECRET)")',
+        '(token = paste0("GROUPED_", "EXPRESSION_SECRET"))',
+        'if (token = "CONDITION_SECRET") TRUE',
+        'list((token = "NESTED_GROUP_SECRET"))',
+        ') (token = "STRAY_CLOSER_SECRET")',
+        '1(token = r"(NUMERIC_PREFIX_SECRET)")',
+        'if (TRUE) (token = "CONTROL_BODY_SECRET")',
+        'function() (token = r"(FUNCTION_BODY_SECRET)")',
+        '[token = "STANDALONE_BRACKET_SECRET"]',
+        '[[token = r"(STANDALONE_DOUBLE_BRACKET_SECRET)"]]',
+    ],
+)
+def test_scan_grouped_equal_assignments_are_detected(tmp_path: Path, assignment: str) -> None:
+    path = tmp_path / "grouped-credential-assignment.rds"
     _write_raw_r_serialized(path, assignment)
 
     result = RSerializedScanner().scan(str(path))
