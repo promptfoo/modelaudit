@@ -960,16 +960,22 @@ def _detect_jfrog_content_route_format(
     api_token: str | None = None,
     access_token: str | None = None,
     timeout: int = 30,
+    max_probe_bytes: int = _JFROG_CONTENT_SNIFF_BYTES,
+    probe_bytes_counter: list[int] | None = None,
 ) -> tuple[str | None, str]:
     """Return a content-routed model format for a JFrog file, if cheaply identifiable."""
+    if max_probe_bytes <= 0:
+        raise ValueError("JFrog folder selective filtering incomplete: content probe download budget exhausted")
     file_url = str(file_info["path"])
     headers = _build_jfrog_probe_auth_headers(file_url, api_token=api_token, access_token=access_token)
     prefix, probe_download_url = _read_jfrog_content_prefix(
         file_url,
         headers=headers,
         timeout=timeout,
-        max_bytes=_JFROG_CONTENT_SNIFF_BYTES,
+        max_bytes=min(max_probe_bytes, _JFROG_CONTENT_SNIFF_BYTES),
     )
+    if probe_bytes_counter is not None:
+        probe_bytes_counter[0] += len(prefix)
 
     if not prefix:
         return None, probe_download_url
@@ -1130,6 +1136,8 @@ def _filter_scannable_jfrog_files(
     timeout: int = 30,
     scannable_extensions: Collection[str] | None = None,
     scanner_selection: Mapping[str, Any] | None = None,
+    max_total_probe_bytes: int | None = None,
+    probe_bytes_counter: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Select suffix-matching files plus bounded content-routed renamed model files."""
     scannable = filter_scannable_files(files, scannable_extensions=scannable_extensions)
@@ -1138,6 +1146,8 @@ def _filter_scannable_jfrog_files(
 
     scannable_paths = {str(file["path"]) for file in scannable}
     probe_count = 0
+    if probe_bytes_counter is None:
+        probe_bytes_counter = [0]
     for file_info in files:
         file_path = str(file_info["path"])
         if file_path in scannable_paths:
@@ -1148,11 +1158,22 @@ def _filter_scannable_jfrog_files(
                 "JFrog folder selective filtering incomplete: skipped artifact content probe limit "
                 f"({_MAX_JFROG_CONTENT_PROBES}) exceeded"
             )
+        remaining_probe_bytes = (
+            max_total_probe_bytes - probe_bytes_counter[0] if max_total_probe_bytes is not None else None
+        )
+        if remaining_probe_bytes is not None and remaining_probe_bytes <= 0:
+            raise ValueError("JFrog folder selective filtering incomplete: content probe download budget exhausted")
         detected_format, probe_download_url = _detect_jfrog_content_route_format(
             file_info,
             api_token=api_token,
             access_token=access_token,
             timeout=timeout,
+            max_probe_bytes=(
+                min(_JFROG_CONTENT_SNIFF_BYTES, remaining_probe_bytes)
+                if remaining_probe_bytes is not None
+                else _JFROG_CONTENT_SNIFF_BYTES
+            ),
+            probe_bytes_counter=probe_bytes_counter,
         )
         if detected_format is None:
             continue
@@ -1400,6 +1421,7 @@ def download_jfrog_folder(
         fetch_sizes=fetch_sizes or total_limit is not None or per_file_limit is not None,
         **list_kwargs,
     )
+    probe_bytes_counter = [0]
     if selective:
         files = _filter_scannable_jfrog_files(
             files,
@@ -1408,12 +1430,14 @@ def download_jfrog_folder(
             timeout=timeout,
             scannable_extensions=scannable_extensions,
             scanner_selection=scanner_selection,
+            max_total_probe_bytes=total_limit,
+            probe_bytes_counter=probe_bytes_counter,
         )
 
     if not files:
         raise ValueError("No scannable model files found in JFrog folder")
 
-    declared_total_size = 0
+    declared_total_size = probe_bytes_counter[0]
     for file_info in files:
         file_url = str(file_info["path"])
         display_file_url = redact_jfrog_url_for_display(file_url)
@@ -1465,7 +1489,7 @@ def download_jfrog_folder(
 
     completed_downloads = 0
     downloaded_files: list[Path] = []
-    actual_downloaded_size = 0
+    actual_downloaded_size = probe_bytes_counter[0]
     backup_dir: Path | None = None
     backup_paths: dict[Path, Path] = {}
     protected_existing_paths: set[Path] = set()

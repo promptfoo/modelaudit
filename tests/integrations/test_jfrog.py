@@ -315,6 +315,28 @@ class TestJFrogDownload:
         mock_response.iter_content.assert_called_once_with(chunk_size=JFROG_DOWNLOAD_CHUNK_SIZE)
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_allows_content_length_equal_to_max_size(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An artifact exactly at the configured boundary should remain downloadable."""
+        mock_response = mock_get.return_value
+        mock_response.status_code = 200
+        mock_response.raise_for_status.return_value = None
+        mock_response.headers = {"Content-Length": "5"}
+        mock_response.iter_content.return_value = [b"123", b"45"]
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+
+        result = download_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            cache_dir=tmp_path,
+            api_token="test-token",
+            max_size=5,
+        )
+
+        assert result.read_bytes() == b"12345"
+        mock_response.iter_content.assert_called_once_with(chunk_size=JFROG_DOWNLOAD_CHUNK_SIZE)
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_download_treats_zero_max_size_as_unlimited(
         self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1542,6 +1564,92 @@ class TestJFrogFolderDownload:
         assert seen_limits == [9, 5]
         assert (tmp_path / "model1.pt").stat().st_size == 4
         assert (tmp_path / "model2.pt").stat().st_size == 5
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_counts_content_probes_toward_total_budget(
+        self,
+        mock_list: MagicMock,
+        mock_get: MagicMock,
+        mock_download: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Selective-routing probes should consume the same acquisition budget as downloads."""
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        payload_url = "https://company.jfrog.io/artifactory/repo/models/model.payload"
+        payload = b"cposix\nsystem\n(S'echo pwned'\ntR."
+        mock_list.return_value = [
+            {
+                "name": "model.payload",
+                "path": payload_url,
+                "size": len(payload),
+                "size_known": True,
+                "human_size": f"{len(payload)} B",
+            }
+        ]
+        mock_get.return_value = _FakeStreamingResponse(payload)
+
+        def download_side_effect(url: str, cache_dir: Path, **kwargs: object) -> Path:
+            assert url == payload_url
+            assert kwargs["max_size"] == len(payload)
+            path = cache_dir / "model.payload"
+            path.write_bytes(payload)
+            return path
+
+        mock_download.side_effect = download_side_effect
+
+        result = download_jfrog_folder(
+            "https://company.jfrog.io/artifactory/repo/models/",
+            cache_dir=tmp_path,
+            api_token="test-token",
+            show_progress=False,
+            max_size=len(payload) * 2,
+        )
+
+        assert result == tmp_path
+        assert (tmp_path / "model.payload").read_bytes() == payload
+        mock_get.assert_called_once()
+        mock_download.assert_called_once()
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_stops_when_content_probes_exhaust_total_budget(
+        self,
+        mock_list: MagicMock,
+        mock_get: MagicMock,
+        mock_download: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An exhausted probe budget must abort instead of silently skipping later artifacts."""
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        mock_list.return_value = [
+            {
+                "name": f"model-{index}.payload",
+                "path": f"https://company.jfrog.io/artifactory/repo/models/model-{index}.payload",
+                "size": 20,
+                "size_known": True,
+                "human_size": "20 B",
+            }
+            for index in range(2)
+        ]
+        mock_get.return_value = _FakeStreamingResponse(b"not-a-model")
+
+        with pytest.raises(ValueError, match="content probe download budget exhausted"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                api_token="test-token",
+                show_progress=False,
+                max_size=len(b"not-a-model"),
+            )
+
+        mock_get.assert_called_once()
+        mock_download.assert_not_called()
+        assert not any(tmp_path.iterdir())
 
     @patch("modelaudit.utils.sources.jfrog.download_artifact")
     @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
