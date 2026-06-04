@@ -421,7 +421,8 @@ def _redact_url_path_tokens(scheme: str, hostname: str, path: str) -> str:
     return "/".join(segments)
 
 
-def _redact_url_for_finding(url: str) -> str:
+def redact_url_for_finding(url: str) -> str:
+    """Return a URL safe for findings by removing credentials and sensitive tokens."""
     try:
         parsed = urlsplit(url)
     except ValueError:
@@ -454,7 +455,7 @@ def _redact_url_for_finding(url: str) -> str:
 
 
 def _redact_urls_in_text(text: str) -> str:
-    return _URL_IN_TEXT_PATTERN.sub(lambda match: _redact_url_for_finding(match.group()), text)
+    return _URL_IN_TEXT_PATTERN.sub(lambda match: redact_url_for_finding(match.group()), text)
 
 
 def _bounded_url_start_before_match(data: bytes, match_start: int, scan_start: int) -> int | None:
@@ -533,7 +534,7 @@ def _is_domain_match_redacted_from_url_path(data: bytes, match_start: int, domai
         return False
     if domain not in parsed.path.lower():
         return False
-    return domain not in _redact_url_for_finding(url).lower()
+    return domain not in redact_url_for_finding(url).lower()
 
 
 _DOC_CONTEXT_EXTENSIONS: tuple[str, ...] = (
@@ -1046,7 +1047,7 @@ class NetworkCommDetector:
         """Scan for URL patterns."""
         for match in self.URL_PATTERN.finditer(data):
             url = match.group().decode("utf-8", errors="ignore")
-            safe_url = _redact_url_for_finding(url)
+            safe_url = redact_url_for_finding(url)
 
             # Calculate confidence based on URL characteristics
             confidence = 0.5
@@ -1088,7 +1089,7 @@ class NetworkCommDetector:
         for pattern, description, provider in self.CLOUD_STORAGE_PATTERNS:
             for match in pattern.finditer(data):
                 url = match.group().decode("utf-8", errors="ignore")
-                safe_url = _redact_url_for_finding(url)
+                safe_url = redact_url_for_finding(url)
 
                 # Skip duplicates
                 if url in seen_urls:
