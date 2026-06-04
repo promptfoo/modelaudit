@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import struct
 import tempfile
 from collections.abc import Collection, Mapping
@@ -152,11 +153,22 @@ def is_jfrog_url(url: str) -> bool:
     hostname = _normalize_hostname(parsed.hostname or "")
     if not hostname or hostname != _get_requests_prepared_hostname(url):
         return False
-    if parsed.scheme != "https" and not (parsed.scheme == "http" and _is_local_jfrog_host(hostname)):
+    if parsed.scheme != "https" or _is_local_jfrog_host(hostname):
         return False
     if "/artifactory/" not in parsed.path:
         return False
     return _is_jfrog_service_host(hostname) or hostname in _get_trusted_jfrog_hosts()
+
+
+def is_jfrog_url_like(url: str) -> bool:
+    """Return True for JFrog-shaped URLs that need safe user-facing redaction."""
+    parsed = urlparse(url)
+    hostname = _normalize_hostname(parsed.hostname or "")
+    if parsed.scheme not in {"http", "https"} or not hostname or "/artifactory/" not in parsed.path:
+        return False
+    return (
+        _is_jfrog_service_host(hostname) or _is_local_jfrog_host(hostname) or hostname in _get_configured_jfrog_hosts()
+    )
 
 
 def _normalize_hostname(hostname: str) -> str:
@@ -173,8 +185,8 @@ def _host_from_config_value(value: str) -> str:
     return _normalize_hostname(parsed.hostname or candidate.split("/", 1)[0].split(":", 1)[0])
 
 
-def _get_trusted_jfrog_hosts() -> set[str]:
-    """Return explicitly allowlisted JFrog hosts.
+def _get_configured_jfrog_hosts() -> set[str]:
+    """Return normalized explicitly configured JFrog hosts.
 
     MODELAUDIT_JFROG_ALLOWED_HOSTS accepts a comma-separated list of hostnames
     or JFrog base URLs.
@@ -185,24 +197,37 @@ def _get_trusted_jfrog_hosts() -> set[str]:
     return {host for host in (_host_from_config_value(value) for value in raw_hosts.split(",")) if host}
 
 
+def _get_trusted_jfrog_hosts() -> set[str]:
+    """Return configured JFrog hosts that are safe credential targets."""
+    return {host for host in _get_configured_jfrog_hosts() if not _is_local_jfrog_host(host)}
+
+
 def _is_local_jfrog_host(hostname: str) -> bool:
     """Return True when a hostname is local-only development infrastructure."""
     if not hostname:
         return False
 
-    if hostname == "localhost":
+    if hostname == "localhost" or hostname.endswith(".localhost"):
         return True
 
     try:
         parsed_ip = ipaddress.ip_address(hostname)
     except ValueError:
-        parsed_ip = None
+        try:
+            parsed_ip = ipaddress.ip_address(socket.inet_aton(hostname))
+        except OSError:
+            parsed_ip = None
 
-    return parsed_ip is not None and parsed_ip.is_loopback
+    if parsed_ip is None:
+        return False
+    if parsed_ip.is_loopback or parsed_ip.is_unspecified:
+        return True
+    mapped_ip = getattr(parsed_ip, "ipv4_mapped", None)
+    return mapped_ip is not None and (mapped_ip.is_loopback or mapped_ip.is_unspecified)
 
 
 def _is_jfrog_service_host(hostname: str) -> bool:
-    return hostname == "jfrog.io" or hostname.endswith(".jfrog.io") or _is_local_jfrog_host(hostname)
+    return hostname == "jfrog.io" or hostname.endswith(".jfrog.io")
 
 
 def _get_requests_prepared_hostname(url: str) -> str:
@@ -254,6 +279,12 @@ def _get_jfrog_probe_origin(url: str) -> tuple[str, str, int | None] | None:
     return parsed_origin if parsed_origin == prepared_origin and parsed_origin[1] else None
 
 
+def _is_safe_jfrog_download_target(url: str) -> bool:
+    """Return True for unambiguous, non-local HTTPS download targets."""
+    origin = _get_jfrog_probe_origin(url)
+    return origin is not None and origin[0] == "https" and not _is_local_jfrog_host(origin[1])
+
+
 def _is_trusted_jfrog_auth_target(url: str) -> bool:
     """Return True when credentials may be sent to this JFrog URL."""
     parsed = urlparse(url)
@@ -262,18 +293,17 @@ def _is_trusted_jfrog_auth_target(url: str) -> bool:
 
     hostname = _normalize_hostname(parsed.hostname or "")
     prepared_hostname = _get_requests_prepared_hostname(url)
-    return bool(hostname and hostname == prepared_hostname and hostname in _get_trusted_jfrog_hosts())
+    return bool(
+        hostname
+        and not _is_local_jfrog_host(hostname)
+        and hostname == prepared_hostname
+        and hostname in _get_trusted_jfrog_hosts()
+    )
 
 
 def _is_trusted_jfrog_probe_auth_target(url: str) -> bool:
     """Return True when bounded probe credentials may be sent to this effective JFrog URL."""
-    parsed = urlparse(url)
-    if parsed.scheme != "https":
-        return False
-
-    hostname = _normalize_hostname(parsed.hostname or "")
-    prepared_hostname = _get_requests_prepared_hostname(url)
-    return bool(hostname and hostname == prepared_hostname and hostname in _get_trusted_jfrog_hosts())
+    return _is_trusted_jfrog_auth_target(url)
 
 
 def _build_jfrog_auth_headers(
@@ -322,6 +352,10 @@ def _get_with_jfrog_redirect_policy(
     trusted_redirect_cookies = requests.cookies.RequestsCookieJar()
     untrusted_redirect_cookies = requests.cookies.RequestsCookieJar()
     for _redirect_count in range(_MAX_JFROG_REDIRECTS + 1):
+        if not _is_safe_jfrog_download_target(current_url):
+            raise requests.exceptions.RequestException(
+                f"Refusing unsafe JFrog download target {redact_jfrog_url_for_display(current_url)}"
+            )
         current_cookies = trusted_redirect_cookies if current_is_trusted else untrusted_redirect_cookies
         response = requests.get(
             current_url,

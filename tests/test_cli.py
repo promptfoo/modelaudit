@@ -1980,6 +1980,21 @@ def test_scan_jfrog_url_download_failure_redacts_sensitive_url(mock_scan_jfrog, 
     assert "?token=" not in result.output
 
 
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_scan_rejected_jfrog_url_redacts_sensitive_url(scheme: str) -> None:
+    """Rejected local or plaintext JFrog URLs must be redacted in generic path errors."""
+    raw_url = f"{scheme}://user:leaky-pass@localhost/artifactory/repo/model.bin?token=leaky-token"
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", raw_url])
+
+    assert result.exit_code == 2
+    assert f"{scheme}://<credentials-redacted>@localhost/artifactory/repo/model.bin" in result.output
+    assert "user:leaky-pass" not in result.output
+    assert "leaky-token" not in result.output
+    assert "?token=" not in result.output
+
+
 @patch("modelaudit.cli.is_jfrog_url")
 @patch("modelaudit.cli.scan_jfrog_artifact")
 def test_scan_jfrog_url_with_auth(
