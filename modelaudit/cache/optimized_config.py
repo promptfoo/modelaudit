@@ -9,7 +9,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-CACHE_SCHEMA_VERSION = "2.0"
+CACHE_SCHEMA_VERSION = "2.1"
 
 _CACHE_ONLY_CONFIG_KEYS = frozenset(
     {
