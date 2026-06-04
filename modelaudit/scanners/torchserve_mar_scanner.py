@@ -1902,6 +1902,12 @@ class TorchServeMarScanner(BaseScanner):
                     import_loader_aliases,
                     shadowed_names,
                 )
+            container_name = self._resolve_call_name(node.value)
+            key_name = self._static_string_value(node.slice)
+            if container_name is not None and key_name is not None:
+                mapped_name = f"{container_name}.{key_name}"
+                if mapped_name in module_aliases:
+                    return module_aliases[mapped_name]
         if isinstance(node, ast.Attribute):
             attribute_name = self._resolve_call_name(node)
             if attribute_name is not None and attribute_name in module_aliases:
@@ -2019,10 +2025,20 @@ class TorchServeMarScanner(BaseScanner):
         ):
             module_names |= frozenset({self._apply_alias(target_name, aliases)})
         attr_name = self._static_string_value(attr_node)
-        if not module_names or attr_name is None:
-            return frozenset()
-
-        return frozenset(f"{module_name}.{attr_name}" for module_name in module_names)
+        resolved_roots = (
+            frozenset(f"{module_name}.{attr_name}" for module_name in module_names)
+            if module_names and attr_name is not None
+            else frozenset()
+        )
+        if len(expanded_args) == 3:
+            resolved_roots |= self._resolve_dynamic_import_roots(
+                expanded_args[2],
+                aliases,
+                module_aliases,
+                import_loader_aliases,
+                shadowed_names,
+            )
+        return resolved_roots
 
     def _resolve_dynamic_import_execution_calls(
         self,
@@ -2091,6 +2107,12 @@ class TorchServeMarScanner(BaseScanner):
                     import_loader_aliases,
                     shadowed_names,
                 )
+            container_name = self._resolve_call_name(node.value)
+            key_name = self._static_string_value(node.slice)
+            if container_name is not None and key_name is not None:
+                mapped_name = f"{container_name}.{key_name}"
+                if mapped_name in callable_aliases:
+                    return callable_aliases[mapped_name]
             if isinstance(node.value, ast.Attribute) and node.value.attr == "__dict__":
                 module_names = self._resolve_dynamic_import_roots(
                     node.value.value,
@@ -2493,13 +2515,27 @@ class TorchServeMarScanner(BaseScanner):
                     ({}, {}, {}, {}, set(), {}, {}, {}),
                 )
                 if replace:
-                    state[0].pop(name, None)
-                    state[1].pop(name, None)
-                    state[2].pop(name, None)
-                    state[3].pop(name, None)
-                    state[5].pop(name, None)
-                    state[6].pop(name, None)
-                    state[7].pop(name, None)
+                    names_to_replace = {
+                        candidate_name
+                        for candidate_name in (
+                            state[0].keys()
+                            | state[1].keys()
+                            | state[2].keys()
+                            | state[3].keys()
+                            | state[5].keys()
+                            | state[6].keys()
+                            | state[7].keys()
+                        )
+                        if candidate_name == name or candidate_name.startswith(f"{name}.")
+                    }
+                    for candidate_name in names_to_replace | {name}:
+                        state[0].pop(candidate_name, None)
+                        state[1].pop(candidate_name, None)
+                        state[2].pop(candidate_name, None)
+                        state[3].pop(candidate_name, None)
+                        state[5].pop(candidate_name, None)
+                        state[6].pop(candidate_name, None)
+                        state[7].pop(candidate_name, None)
                 if name in self.module_aliases:
                     state[0][name] = state[0].get(name, frozenset()) | self.module_aliases[name]
                 if name in self.callable_aliases:
@@ -2533,8 +2569,6 @@ class TorchServeMarScanner(BaseScanner):
 
             def _resolved_static_truthiness(self, node: ast.AST) -> bool | None:
                 if isinstance(node, ast.Name):
-                    if node.id in self.module_aliases:
-                        return True
                     return self.static_truthiness_aliases.get(node.id)
                 if isinstance(node, ast.Call) and scanner._dynamic_import_module_names(
                     node,
@@ -2750,6 +2784,8 @@ class TorchServeMarScanner(BaseScanner):
                 assignable_alias_names = helper_names | eager_consumer_names
                 import_helper_names = helper_names & _DYNAMIC_IMPORT_HELPERS
                 static_truthiness = self._resolved_static_truthiness(value)
+                if static_truthiness is None and module_names:
+                    static_truthiness = True
 
                 self._invalidate_name(name)
                 if isinstance(value, ast.GeneratorExp):
@@ -2971,6 +3007,7 @@ class TorchServeMarScanner(BaseScanner):
                         for child_pattern in pattern.patterns:
                             self._invalidate_pattern(child_pattern)
                 elif isinstance(pattern, ast.MatchMapping):
+                    matched_key_dumps: set[str] = set()
                     if (
                         isinstance(value, ast.Dict)
                         and len(pattern.keys) == len(pattern.patterns)
@@ -2986,12 +3023,19 @@ class TorchServeMarScanner(BaseScanner):
                             if matched_value is None:
                                 self._invalidate_pattern(child_pattern)
                             else:
+                                matched_key_dumps.add(ast.dump(key))
                                 self._record_pattern_assignment(child_pattern, matched_value)
                     else:
                         for child_pattern in pattern.patterns:
                             self._invalidate_pattern(child_pattern)
                     if pattern.rest is not None:
                         self._invalidate_name(pattern.rest)
+                        if isinstance(value, ast.Dict) and all(key is not None for key in value.keys):
+                            for rest_key, child_value in zip(value.keys, value.values, strict=True):
+                                assert rest_key is not None
+                                key_name = scanner._static_string_value(rest_key)
+                                if key_name is not None and ast.dump(rest_key) not in matched_key_dumps:
+                                    self._record_name_assignment(f"{pattern.rest}.{key_name}", child_value)
                 elif isinstance(pattern, ast.MatchClass):
                     for child_pattern in [*pattern.patterns, *pattern.kwd_patterns]:
                         self._invalidate_pattern(child_pattern)
@@ -3078,6 +3122,26 @@ class TorchServeMarScanner(BaseScanner):
                         )
                     )
                     return leading_mismatch or trailing_mismatch
+                if (
+                    isinstance(pattern, ast.MatchMapping)
+                    and isinstance(value, ast.Dict)
+                    and all(key is not None for key in value.keys)
+                ):
+                    value_by_key = {
+                        ast.dump(key): child_value
+                        for key, child_value in zip(value.keys, value.values, strict=True)
+                        if key is not None
+                    }
+                    for key, child_pattern in zip(pattern.keys, pattern.patterns, strict=True):
+                        matched_value = value_by_key.get(ast.dump(key))
+                        if matched_value is None or (
+                            DynamicImportExecutionVisitor._pattern_definitely_does_not_match(
+                                child_pattern,
+                                matched_value,
+                            )
+                        ):
+                            return True
+                    return False
                 return False
 
             @staticmethod
@@ -3150,6 +3214,24 @@ class TorchServeMarScanner(BaseScanner):
                         )
                     )
                     return leading_matches and trailing_matches
+                if (
+                    isinstance(pattern, ast.MatchMapping)
+                    and isinstance(value, ast.Dict)
+                    and all(key is not None for key in value.keys)
+                ):
+                    value_by_key = {
+                        ast.dump(key): child_value
+                        for key, child_value in zip(value.keys, value.values, strict=True)
+                        if key is not None
+                    }
+                    return all(
+                        (matched_value := value_by_key.get(ast.dump(key))) is not None
+                        and DynamicImportExecutionVisitor._pattern_definitely_matches(
+                            child_pattern,
+                            matched_value,
+                        )
+                        for key, child_pattern in zip(pattern.keys, pattern.patterns, strict=True)
+                    )
                 return False
 
             def _invalidate_pattern(self, pattern: ast.pattern) -> None:
@@ -3173,6 +3255,94 @@ class TorchServeMarScanner(BaseScanner):
                     for child_pattern in [*pattern.patterns, *pattern.kwd_patterns]:
                         self._invalidate_pattern(child_pattern)
 
+            @staticmethod
+            def _receiver_attribute_binding_names(
+                node: ast.FunctionDef | ast.AsyncFunctionDef,
+                receiver_name: str | None,
+            ) -> set[str]:
+                if receiver_name is None:
+                    return set()
+
+                class ReceiverBindingVisitor(ast.NodeVisitor):
+                    def __init__(self) -> None:
+                        self.names: set[str] = set()
+
+                    def _record_target(self, target: ast.AST) -> None:
+                        if isinstance(target, ast.Attribute):
+                            target_name = scanner._resolve_call_name(target)
+                            if target_name is not None and target_name.startswith(f"{receiver_name}."):
+                                self.names.add(target_name)
+                            return
+                        if isinstance(target, ast.Starred):
+                            self._record_target(target.value)
+                            return
+                        if isinstance(target, ast.Tuple | ast.List):
+                            for child_target in target.elts:
+                                self._record_target(child_target)
+
+                    def visit_Assign(self, assignment: ast.Assign) -> None:
+                        for target in assignment.targets:
+                            self._record_target(target)
+                        self.visit(assignment.value)
+
+                    def visit_AnnAssign(self, assignment: ast.AnnAssign) -> None:
+                        self._record_target(assignment.target)
+                        if assignment.value is not None:
+                            self.visit(assignment.value)
+
+                    def visit_AugAssign(self, assignment: ast.AugAssign) -> None:
+                        self._record_target(assignment.target)
+                        self.visit(assignment.value)
+
+                    def visit_Delete(self, deletion: ast.Delete) -> None:
+                        for target in deletion.targets:
+                            self._record_target(target)
+
+                    def visit_For(self, loop: ast.For) -> None:
+                        self._record_target(loop.target)
+                        self.visit(loop.iter)
+                        for statement in [*loop.body, *loop.orelse]:
+                            self.visit(statement)
+
+                    def visit_AsyncFor(self, loop: ast.AsyncFor) -> None:
+                        self._record_target(loop.target)
+                        self.visit(loop.iter)
+                        for statement in [*loop.body, *loop.orelse]:
+                            self.visit(statement)
+
+                    def visit_With(self, with_node: ast.With) -> None:
+                        for item in with_node.items:
+                            self.visit(item.context_expr)
+                            if item.optional_vars is not None:
+                                self._record_target(item.optional_vars)
+                        for statement in with_node.body:
+                            self.visit(statement)
+
+                    def visit_AsyncWith(self, with_node: ast.AsyncWith) -> None:
+                        for item in with_node.items:
+                            self.visit(item.context_expr)
+                            if item.optional_vars is not None:
+                                self._record_target(item.optional_vars)
+                        for statement in with_node.body:
+                            self.visit(statement)
+
+                    def visit_FunctionDef(self, function: ast.FunctionDef) -> None:
+                        return
+
+                    def visit_AsyncFunctionDef(self, function: ast.AsyncFunctionDef) -> None:
+                        return
+
+                    def visit_ClassDef(self, class_node: ast.ClassDef) -> None:
+                        return
+
+                    def visit_Lambda(self, lambda_node: ast.Lambda) -> None:
+                        return
+
+                binding_visitor = ReceiverBindingVisitor()
+                for statement in node.body:
+                    binding_visitor.visit(statement)
+                return binding_visitor.names
+
             def _visit_function_definition(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
                 receiver_name: str | None = None
                 positional_parameters = [*node.args.posonlyargs, *node.args.args]
@@ -3189,13 +3359,18 @@ class TorchServeMarScanner(BaseScanner):
                 if self.class_name_stack and positional_parameters and not is_static_method:
                     receiver_name = positional_parameters[0].arg
                 if self.collecting_class_attribute_bindings:
+                    receiver_attribute_names = self._receiver_attribute_binding_names(node, receiver_name)
                     self._push_scope(
                         self._parameter_names(node.args) | scanner._callable_local_binding_names(node),
                         self._callable_inherited_state(),
                         scope_kind="function",
                     )
                     self._inherit_class_attribute_bindings(receiver_name)
+                    self.collecting_class_attribute_bindings = False
                     self._visit_statement_block(node.body)
+                    self.collecting_class_attribute_bindings = True
+                    for attribute_name in receiver_attribute_names:
+                        self._record_class_attribute_binding(attribute_name, replace=True)
                     self._pop_scope()
                     return
                 for decorator in node.decorator_list:
@@ -3989,10 +4164,13 @@ class TorchServeMarScanner(BaseScanner):
 
             def visit_Match(self, node: ast.Match) -> None:
                 self.visit(node.subject)
-                initial_state = self._snapshot_state()
-                possible_states = [initial_state]
+                remaining_state: _DynamicAliasState | None = self._snapshot_state()
+                possible_states: list[_DynamicAliasState] = []
                 for case in node.cases:
-                    self._restore_state(initial_state)
+                    if remaining_state is None:
+                        break
+                    case_initial_state = remaining_state
+                    self._restore_state(case_initial_state)
                     if self._pattern_definitely_does_not_match(case.pattern, node.subject):
                         continue
                     case_definitely_matches = self._pattern_definitely_matches(
@@ -4005,17 +4183,29 @@ class TorchServeMarScanner(BaseScanner):
                         self.visit(case.guard)
                         guard_state = self._snapshot_state()
                         guard_truthiness = self._resolved_static_truthiness(case.guard)
-                        if guard_truthiness is False:
-                            possible_states.append(guard_state)
-                            continue
-                        if guard_truthiness is None:
-                            possible_states.append(guard_state)
-                    self._visit_statement_block(case.body)
-                    possible_states.append(self._snapshot_state())
-                    if case_definitely_matches and guard_truthiness is True:
-                        possible_states = possible_states[1:]
-                        break
+                    else:
+                        guard_state = self._snapshot_state()
 
+                    if guard_truthiness is not False:
+                        self._visit_statement_block(case.body)
+                        possible_states.append(self._snapshot_state())
+
+                    continuing_states: list[_DynamicAliasState] = []
+                    if not case_definitely_matches:
+                        continuing_states.append(case_initial_state)
+                    if case.guard is not None and guard_truthiness is not True:
+                        continuing_states.append(guard_state)
+                    if not continuing_states:
+                        remaining_state = None
+                        break
+                    remaining_state = continuing_states[0]
+                    for continuing_state in continuing_states[1:]:
+                        remaining_state = self._merge_states(remaining_state, continuing_state)
+
+                if remaining_state is not None:
+                    possible_states.append(remaining_state)
+                if not possible_states:
+                    return
                 merged_state = possible_states[0]
                 for possible_state in possible_states[1:]:
                     merged_state = self._merge_states(merged_state, possible_state)
