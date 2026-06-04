@@ -6,6 +6,15 @@ use crate::strings_policy::{
     SUBPROCESS_CALL_NEEDLES,
 };
 
+const MAX_SUFFIX_CALL_LOOKAHEAD_CHARS: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundedParseStep {
+    Consumed,
+    NoMatch,
+    LimitReached,
+}
+
 #[derive(Default)]
 struct GetattrMatches {
     system: bool,
@@ -551,71 +560,221 @@ fn leading_whitespace_has_line_break(value: &str) -> bool {
 }
 
 fn suffix_starts_with_call_expression(value: &str) -> bool {
-    let mut chars = value.chars().peekable();
-    if !consume_python_identifier(&mut chars) {
-        return false;
+    let mut chars = value
+        .chars()
+        .take(MAX_SUFFIX_CALL_LOOKAHEAD_CHARS + 1)
+        .collect::<Vec<_>>();
+    let truncated = chars.len() > MAX_SUFFIX_CALL_LOOKAHEAD_CHARS;
+    chars.truncate(MAX_SUFFIX_CALL_LOOKAHEAD_CHARS);
+    let mut cursor = 0usize;
+    // Python identifiers are unbounded, so exhausting this cap is treated as
+    // code-like instead of scanning attacker-controlled suffixes without limit.
+    match consume_python_identifier(&chars, &mut cursor, truncated) {
+        BoundedParseStep::Consumed => {}
+        BoundedParseStep::NoMatch => return false,
+        BoundedParseStep::LimitReached => return true,
+    }
+    let first_identifier = &chars[..cursor];
+    if starts_expression_statement(first_identifier) {
+        match skip_call_expression_spacing(&chars, &mut cursor, truncated) {
+            BoundedParseStep::Consumed => {}
+            BoundedParseStep::NoMatch => return false,
+            BoundedParseStep::LimitReached => return true,
+        }
+        if first_identifier.iter().copied().eq("yield".chars())
+            && chars
+                .get(cursor..cursor + 4)
+                .is_some_and(|candidate| candidate.iter().copied().eq("from".chars()))
+            && chars
+                .get(cursor + 4)
+                .is_none_or(|ch| !is_suffix_identifier_continue(*ch))
+        {
+            cursor += 4;
+            match skip_call_expression_spacing(&chars, &mut cursor, truncated) {
+                BoundedParseStep::Consumed => {}
+                BoundedParseStep::NoMatch => return false,
+                BoundedParseStep::LimitReached => return true,
+            }
+        }
+        if chars.get(cursor) != Some(&'(') {
+            match consume_python_identifier(&chars, &mut cursor, truncated) {
+                BoundedParseStep::Consumed => {}
+                BoundedParseStep::NoMatch => return false,
+                BoundedParseStep::LimitReached => return true,
+            }
+        }
     }
     loop {
-        if !skip_call_expression_spacing(&mut chars) {
-            return false;
+        let spacing_start = cursor;
+        match skip_call_expression_spacing(&chars, &mut cursor, truncated) {
+            BoundedParseStep::Consumed => {}
+            BoundedParseStep::NoMatch => return false,
+            BoundedParseStep::LimitReached => return true,
         }
-        match chars.peek() {
-            Some('(') => return true,
+        match chars.get(cursor) {
+            Some('(') => {
+                return cursor == spacing_start || chars[spacing_start..cursor].contains(&'\\');
+            }
             Some('.') => {
-                chars.next();
-                if !skip_call_expression_spacing(&mut chars) {
-                    return false;
+                cursor += 1;
+                match skip_call_expression_spacing(&chars, &mut cursor, truncated) {
+                    BoundedParseStep::Consumed => {}
+                    BoundedParseStep::NoMatch => return false,
+                    BoundedParseStep::LimitReached => return true,
                 }
-                if !consume_python_identifier(&mut chars) {
-                    return false;
+                match consume_python_identifier(&chars, &mut cursor, truncated) {
+                    BoundedParseStep::Consumed => {}
+                    BoundedParseStep::NoMatch => return false,
+                    BoundedParseStep::LimitReached => return true,
                 }
             }
+            Some('[') => match consume_balanced_expression(&chars, &mut cursor, truncated) {
+                BoundedParseStep::Consumed => {}
+                BoundedParseStep::NoMatch => return false,
+                BoundedParseStep::LimitReached => return true,
+            },
+            None if truncated => return true,
             _ => return false,
         }
     }
 }
 
-fn skip_call_expression_spacing<I>(chars: &mut std::iter::Peekable<I>) -> bool
-where
-    I: Iterator<Item = char>,
-{
+fn starts_expression_statement(identifier: &[char]) -> bool {
+    ["await", "return", "raise", "yield", "assert"]
+        .iter()
+        .any(|keyword| identifier.iter().copied().eq(keyword.chars()))
+}
+
+fn skip_call_expression_spacing(
+    chars: &[char],
+    cursor: &mut usize,
+    truncated: bool,
+) -> BoundedParseStep {
     loop {
-        match chars.peek().copied() {
+        match chars.get(*cursor).copied() {
             Some(ch) if ch.is_whitespace() && !matches!(ch, '\n' | '\r') => {
-                chars.next();
+                *cursor += 1;
             }
             Some('\\') => {
-                chars.next();
-                match chars.next() {
-                    Some('\n') => {}
+                *cursor += 1;
+                match chars.get(*cursor).copied() {
+                    Some('\n') => *cursor += 1,
                     Some('\r') => {
-                        if chars.peek() == Some(&'\n') {
-                            chars.next();
+                        *cursor += 1;
+                        if chars.get(*cursor) == Some(&'\n') {
+                            *cursor += 1;
                         }
                     }
-                    _ => return false,
+                    None if truncated => return BoundedParseStep::LimitReached,
+                    _ => return BoundedParseStep::NoMatch,
                 }
             }
-            _ => return true,
+            None if truncated => return BoundedParseStep::LimitReached,
+            _ => return BoundedParseStep::Consumed,
         }
     }
 }
 
-fn consume_python_identifier<I>(chars: &mut std::iter::Peekable<I>) -> bool
-where
-    I: Iterator<Item = char>,
-{
-    let Some(first) = chars.peek().copied() else {
-        return false;
+fn consume_python_identifier(
+    chars: &[char],
+    cursor: &mut usize,
+    truncated: bool,
+) -> BoundedParseStep {
+    let Some(first) = chars.get(*cursor).copied() else {
+        return if truncated {
+            BoundedParseStep::LimitReached
+        } else {
+            BoundedParseStep::NoMatch
+        };
     };
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return false;
+    if !(first == '_' || first.is_alphabetic()) {
+        return BoundedParseStep::NoMatch;
     }
-    chars.next();
-    while chars.peek().is_some_and(|ch| is_python_word_char(*ch)) {
-        chars.next();
+    *cursor += 1;
+    while chars
+        .get(*cursor)
+        .is_some_and(|ch| is_suffix_identifier_continue(*ch))
+    {
+        *cursor += 1;
     }
-    true
+    if *cursor == chars.len() && truncated {
+        BoundedParseStep::LimitReached
+    } else {
+        BoundedParseStep::Consumed
+    }
+}
+
+fn is_suffix_identifier_continue(ch: char) -> bool {
+    is_python_word_char(ch)
+        || matches!(
+            ch,
+            '\u{0300}'..='\u{036f}'
+                | '\u{1ab0}'..='\u{1aff}'
+                | '\u{1dc0}'..='\u{1dff}'
+                | '\u{20d0}'..='\u{20ff}'
+                | '\u{fe20}'..='\u{fe2f}'
+        )
+}
+
+fn consume_balanced_expression(
+    chars: &[char],
+    cursor: &mut usize,
+    truncated: bool,
+) -> BoundedParseStep {
+    if chars.get(*cursor) != Some(&'[') {
+        return BoundedParseStep::NoMatch;
+    }
+
+    let mut delimiters = Vec::with_capacity(4);
+    let mut quote = None;
+    let mut escaped = false;
+    while let Some(ch) = chars.get(*cursor).copied() {
+        *cursor += 1;
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '#' => {
+                while chars
+                    .get(*cursor)
+                    .is_some_and(|next| !matches!(next, '\n' | '\r'))
+                {
+                    *cursor += 1;
+                }
+            }
+            '[' | '(' | '{' => delimiters.push(ch),
+            ']' | ')' | '}' => {
+                let expected = match ch {
+                    ']' => '[',
+                    ')' => '(',
+                    '}' => '{',
+                    _ => unreachable!(),
+                };
+                if delimiters.pop() != Some(expected) {
+                    return BoundedParseStep::NoMatch;
+                }
+                if delimiters.is_empty() {
+                    return BoundedParseStep::Consumed;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if truncated {
+        BoundedParseStep::LimitReached
+    } else {
+        BoundedParseStep::NoMatch
+    }
 }
 
 fn find_module_attr(lower: &str, module: &str, attr: &str, prefix: bool) -> bool {
@@ -1083,6 +1242,56 @@ mod tests {
         assert!(suspicious_string_matches("eval(payload)\nfoo()").contains(&"eval(".to_string()));
         assert!(suspicious_string_matches("eval(payload)\nos.system('id')")
             .contains(&"eval(".to_string()));
+        assert!(suspicious_string_matches("eval(payload)\ncallbacks[0]()")
+            .contains(&"eval(".to_string()));
+        assert!(suspicious_string_matches("eval(payload)\nawait callback()")
+            .contains(&"eval(".to_string()));
+        assert!(
+            suspicious_string_matches("eval(payload)\nawait (callback())")
+                .contains(&"eval(".to_string())
+        );
+        assert!(
+            suspicious_string_matches("eval(payload)\nawait callbacks[0]()")
+                .contains(&"eval(".to_string())
+        );
+        assert!(
+            suspicious_string_matches("eval(payload)\nreturn callback()")
+                .contains(&"eval(".to_string())
+        );
+        assert!(
+            suspicious_string_matches("eval(payload)\nraise RuntimeError()")
+                .contains(&"eval(".to_string())
+        );
+        assert!(
+            suspicious_string_matches("eval(payload)\nyield from callbacks[0]()")
+                .contains(&"eval(".to_string())
+        );
+        assert!(
+            suspicious_string_matches("eval(payload)\n回调[0]()").contains(&"eval(".to_string())
+        );
+        assert!(
+            suspicious_string_matches("eval(payload)\nregistry['handler]'].run()")
+                .contains(&"eval(".to_string())
+        );
+        assert!(
+            suspicious_string_matches("eval(payload)\ncallbacks[lookup(0)]()")
+                .contains(&"eval(".to_string())
+        );
+        assert!(
+            suspicious_string_matches("eval(payload)\ncallbacks[{'key': [0]}['key'][0]]()")
+                .contains(&"eval(".to_string())
+        );
+        assert!(suspicious_string_matches(
+            "eval(payload)\ncallbacks[ # ] closes only in comment\n0\n]()"
+        )
+        .contains(&"eval(".to_string()));
+        assert!(
+            suspicious_string_matches("eval(payload)\na\u{301}()").contains(&"eval(".to_string())
+        );
+        assert!(
+            suspicious_string_matches("eval(payload)\ncallbacks[\n0\n]()")
+                .contains(&"eval(".to_string())
+        );
         assert!(
             suspicious_string_matches("eval(payload)\nfoo \\\n()").contains(&"eval(".to_string())
         );
@@ -1091,6 +1300,22 @@ mod tests {
         assert!(suspicious_string_matches("eval(x)\nwhere x is input").is_empty());
         assert!(suspicious_string_matches("eval(x)\nexample\n(text)").is_empty());
         assert!(suspicious_string_matches("eval(x)\nexample.\ntext()").is_empty());
+        assert!(suspicious_string_matches("eval(x)\ncallbacks[0] is documented").is_empty());
+        assert!(suspicious_string_matches("eval(x)\ncallbacks[0]\n(text)").is_empty());
+        assert!(suspicious_string_matches("eval(x)\ncallbacks[0").is_empty());
+        assert!(suspicious_string_matches("eval(x)\nresult == expected").is_empty());
+        assert!(suspicious_string_matches("eval(x)\nresult: documented prose").is_empty());
+        assert!(suspicious_string_matches("eval(x)\nawaiting callback completion").is_empty());
+        assert!(suspicious_string_matches("eval(x)\nreturning value documentation").is_empty());
+        assert!(suspicious_string_matches("eval(x)\nreturn value documentation").is_empty());
+        assert!(suspicious_string_matches("eval(x)\nfor example, continue reading").is_empty());
+        assert!(suspicious_string_matches("eval(x)\nif needed, continue reading").is_empty());
+        assert!(suspicious_string_matches("eval(x)\nNote (details follow)").is_empty());
+        assert!(
+            suspicious_string_matches("eval(x)\nR\u{e9}sum\u{e9}\u{2014}details follow").is_empty()
+        );
+        let overlong_identifier = "a".repeat(2 * 1024 * 1024);
+        assert!(suffix_starts_with_call_expression(&overlong_identifier));
         assert!(
             suspicious_string_matches("Do not call os.system(command) from loaders").is_empty()
         );
