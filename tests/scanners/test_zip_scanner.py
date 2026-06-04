@@ -3014,6 +3014,7 @@ def test_executable_zip_composed_routing_fails_closed_when_subtype_scanner_unava
                 }
             ),
         )
+        archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
 
     original_loader = _registry.load_scanner_by_id
 
@@ -3042,6 +3043,12 @@ def test_executable_zip_composed_routing_fails_closed_when_subtype_scanner_unava
     assert check.severity == IssueSeverity.INFO
     assert check.details["format"] == "skops"
     assert check.details["preferred_scanner_id"] == "skops"
+    assert any(
+        issue.rule_code == "S201"
+        and issue.details.get("zip_entry") == "payload.pkl"
+        and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
 
 
 def test_executable_zip_unavailable_subtype_fails_closed_and_is_not_cached(
@@ -3078,6 +3085,46 @@ def test_executable_zip_unavailable_subtype_fails_closed_and_is_not_cached(
         "recognized_format_scanner_unavailable",
         tmp_path / "cache",
     )
+
+
+def test_executable_zip_unavailable_subtype_ignores_benign_schema_near_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "generic-polyglot.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "schema.json",
+            json.dumps(
+                {
+                    "__loader__": "ObjectNode",
+                    "__module__": "sklearn.pipeline",
+                    "__class__": "Pipeline",
+                    "content": {},
+                }
+            ),
+        )
+
+    original_loader = _registry.load_scanner_by_id
+
+    def load_scanner_by_id(scanner_id: str) -> type[BaseScanner] | None:
+        if scanner_id == "skops":
+            raise AssertionError("benign schema near-match routed to the Skops scanner")
+        return original_loader(scanner_id)
+
+    monkeypatch.setattr(_registry, "load_scanner_by_id", load_scanner_by_id)
+
+    result = ScanResult(scanner_name="zip")
+    archive_dispatch.merge_executable_zip_container_findings(
+        str(archive_path),
+        result,
+        {"cache_enabled": False},
+        context="test executable ZIP polyglot",
+    )
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert all(check.name != "Format Detection" for check in result.checks)
 
 
 def test_scan_nested_file_does_not_fail_closed_for_extension_only_member(
