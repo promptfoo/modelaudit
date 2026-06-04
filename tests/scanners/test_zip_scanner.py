@@ -1843,6 +1843,7 @@ def test_scan_zip_allows_shadowed_direct_python_member_primitives(tmp_path: Path
 
     result = ZipScanner().scan(str(archive_path))
 
+    assert result.success is True
     assert not any(
         check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
     )

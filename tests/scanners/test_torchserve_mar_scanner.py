@@ -844,6 +844,7 @@ def test_scan_allows_shadowed_direct_handler_primitives(tmp_path: Path, handler_
 
     result = TorchServeMarScanner().scan(str(mar_path))
 
+    assert result.success is True
     assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
 
 

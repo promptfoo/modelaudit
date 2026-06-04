@@ -930,6 +930,7 @@ class TestTarScanner:
 
         result = self.scanner.scan(str(archive_path))
 
+        assert result.success is True
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
 
     def test_path_traversal_detection(self):
