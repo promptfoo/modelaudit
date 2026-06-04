@@ -888,9 +888,47 @@ class TestModelDownloadStreaming:
             SimpleNamespace(path="second.bin", size=3),
         ]
 
-        with pytest.raises(Exception, match="downloaded selected Hugging Face files total 8 bytes exceeds max size 6"):
+        with pytest.raises(
+            Exception,
+            match=r"downloaded bytes plus selected file second\.bin would total 7 bytes, exceeding max size 6",
+        ):
             list(download_model_streaming("https://huggingface.co/test/model", max_size=6))
 
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="first.bin",
+            revision="abc123",
+        )
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_at_revision",
+        return_value=(["first.bin", "second.bin"], "abc123"),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_allows_underreported_files_within_cumulative_limit(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Actual bytes may exceed metadata when the cumulative download still fits."""
+        first_file = tmp_path / "first.bin"
+        second_file = tmp_path / "second.bin"
+        first_file.write_bytes(b"123")
+        second_file.write_bytes(b"45")
+        mock_hf_hub_download.side_effect = [str(first_file), str(second_file)]
+        mock_get_paths_info.return_value = [
+            SimpleNamespace(path="first.bin", size=2),
+            SimpleNamespace(path="second.bin", size=2),
+        ]
+
+        results = list(download_model_streaming("https://huggingface.co/test/model", max_size=6))
+
+        assert results == [(first_file, False), (second_file, True)]
         assert mock_hf_hub_download.call_count == 2
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})

@@ -240,11 +240,11 @@ def _ensure_huggingface_selection_within_max_size(
     *,
     requested_revision: str | None = None,
     resolved_revision: str | None = None,
-) -> str | None:
-    """Fail before transfer when selected Hugging Face files exceed the download budget."""
+) -> tuple[str | None, dict[str, int]]:
+    """Preflight selected files and return their pinned revision and verified sizes."""
     size_limit = _normalize_download_size_limit(max_size)
     if size_limit is None or not filenames:
-        return None
+        return None, {}
 
     filenames = list(dict.fromkeys(filenames))
     sizes, revision = _get_huggingface_path_sizes(
@@ -264,7 +264,7 @@ def _ensure_huggingface_selection_within_max_size(
                 f"Cannot download {repo_id}: selected Hugging Face files total {total_size} bytes "
                 f"exceeds max size {size_limit} bytes"
             )
-    return revision
+    return revision, {filename: size for filename, size in sizes.items() if size is not None}
 
 
 def _verify_huggingface_selection_within_max_size(
@@ -500,7 +500,7 @@ def download_model(
 
         # If we found specific model files, download them
         if model_files:
-            revision = _ensure_huggingface_selection_within_max_size(
+            revision, _ = _ensure_huggingface_selection_within_max_size(
                 repo_id,
                 model_files,
                 size_limit,
@@ -631,7 +631,7 @@ def download_model_streaming(
 
         if not model_files:
             _raise_no_scannable_hf_files(repo_id)
-        revision = _ensure_huggingface_selection_within_max_size(
+        revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
             repo_id,
             model_files,
             size_limit,
@@ -649,6 +649,15 @@ def download_model_streaming(
         downloaded_total_size = 0
         for idx, filename in enumerate(model_files):
             is_last = idx == total_files - 1
+
+            if size_limit is not None:
+                advertised_size = selected_sizes[filename]
+                projected_total = downloaded_total_size + advertised_size
+                if projected_total > size_limit:
+                    raise ValueError(
+                        f"Cannot download {repo_id}: downloaded bytes plus selected file {filename} "
+                        f"would total {projected_total} bytes, exceeding max size {size_limit} bytes"
+                    )
 
             # Download single file
             download_kwargs: dict[str, Any] = {
