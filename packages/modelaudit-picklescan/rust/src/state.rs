@@ -5760,7 +5760,23 @@ impl<'a> ScanState<'a> {
     }
 
     fn scan_raw_nested_unicode_text(&mut self, value: &str, position: usize) {
-        let mut segment = Vec::new();
+        if value.is_ascii() {
+            self.scan_raw_nested_unicode_pickle_bytes(value.as_bytes(), position);
+            return;
+        }
+
+        let overlap_bytes = self.options.max_nested_pickle_bytes;
+        if overlap_bytes == 0 {
+            return;
+        }
+        // Advance by at least the overlap size so a small literal-scan limit
+        // cannot turn a large Unicode value into repeated multi-megabyte scans.
+        let chunk_advance_bytes = self
+            .options
+            .max_string_literal_scan_chars
+            .max(overlap_bytes);
+        let chunk_limit = overlap_bytes.saturating_add(chunk_advance_bytes);
+        let mut segment = Vec::with_capacity(value.len().min(chunk_limit));
         let mut segment_position = position;
         for (offset, character) in value.char_indices() {
             let Ok(byte) = u8::try_from(u32::from(character)) else {
@@ -5774,6 +5790,12 @@ impl<'a> ScanState<'a> {
                 segment_position = position.saturating_add(offset);
             }
             segment.push(byte);
+            if segment.len() >= chunk_limit {
+                self.scan_raw_nested_unicode_pickle_bytes(&segment, segment_position);
+                let discard_bytes = segment.len().saturating_sub(overlap_bytes);
+                segment = segment.split_off(discard_bytes);
+                segment_position = segment_position.saturating_add(discard_bytes);
+            }
         }
         if !segment.is_empty() {
             self.scan_raw_nested_unicode_pickle_bytes(&segment, segment_position);
@@ -9571,6 +9593,117 @@ mod tests {
                         == Some("os.system")
             }));
         }
+    }
+
+    #[test]
+    fn unicode_string_opcodes_fail_closed_for_malformed_protocol0_container_payloads() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let nested_bytes = b"(cos\nsystem\n)R";
+        let mut payload = b"\x80\x04".to_vec();
+        payload.extend_from_slice(&short_binunicode(nested_bytes));
+        payload.push(b'.');
+        let mut scan = ScanState::new(
+            "unicode-malformed-protocol0-container.pkl".to_string(),
+            &payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert_eq!(scan.status, "inconclusive");
+        assert_eq!(scan.verdict, "malicious");
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("S213")
+                && detail_string(&finding.details, "encoding").as_deref() == Some("raw")
+                && finding.details.iter().any(|(key, value)| {
+                    key == "analysis_incomplete" && matches!(value, DetailValue::Bool(true))
+                })
+        }));
+    }
+
+    #[test]
+    fn unicode_string_opcodes_scan_large_ascii_literals_without_copying() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: 1024,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut nested_bytes = vec![b'A'; 128 * 1024];
+        nested_bytes.extend_from_slice(b"cos\nsystem\n)R.");
+        let mut payload = b"\x80\x04X".to_vec();
+        payload.extend_from_slice(&(nested_bytes.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&nested_bytes);
+        payload.push(b'.');
+        let mut scan = ScanState::new(
+            "unicode-large-ascii-raw-nested.pkl".to_string(),
+            &payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert_eq!(scan.status, "inconclusive");
+        assert_eq!(scan.verdict, "malicious");
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("DANGEROUS_CALL")
+                && detail_string(&finding.details, "import_reference").as_deref()
+                    == Some("os.system")
+        }));
+    }
+
+    #[test]
+    fn unicode_raw_nested_scan_detects_payload_across_bounded_conversion_chunks() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: 0,
+            max_nested_pickle_bytes: 32,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "unicode-chunk-boundary.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+        let value = format!("{}{}", "\u{ff}".repeat(60), "cos\nsystem\n)R.");
+
+        scan.scan_raw_nested_unicode_text(&value, 0);
+        scan.finalize_verdict();
+
+        assert_eq!(scan.verdict, "malicious");
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("S213")
+                && detail_string(&finding.details, "encoding").as_deref() == Some("raw")
+                && detail_usize(&finding.details, "payload_size") == Some(14)
+        }));
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("DANGEROUS_CALL")
+                && detail_string(&finding.details, "import_reference").as_deref()
+                    == Some("os.system")
+        }));
     }
 
     #[test]
