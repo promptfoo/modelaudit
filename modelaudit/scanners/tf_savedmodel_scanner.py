@@ -148,6 +148,10 @@ _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
 _MAX_PROTOBUF_PARSE_BYTES = 20 * 1024 * 1024
 _MAX_KERAS_METADATA_PARSE_BYTES = _MAX_PROTOBUF_PARSE_BYTES
 _MAX_COLLECTION_VALUE_BYTES = 256 * 1024
+_PROTOBUF_STRING_LENGTH_CHECK_THRESHOLD = 10_000
+_MAX_PROTOBUF_STRING_FULL_SCAN_CHARS = 32 * 1024
+_PROTOBUF_STRING_SCAN_WINDOW_CHARS = 16 * 1024
+_PROTOBUF_STRING_INCOMPLETE_REASON = "savedmodel_protobuf_string_scan_incomplete"
 _CORE_ROOT_MODEL_FILES = frozenset({"saved_model.pb", "keras_metadata.pb", "fingerprint.pb"})
 _CORE_ROOT_MODEL_DIRS = frozenset({"assets", "assets.extra", "variables"})
 _CORE_ROOT_ASSET_DIRS = frozenset({"assets", "assets.extra"})
@@ -1672,6 +1676,39 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # coverage, so wiring them in would expand SavedModel findings beyond
         # the narrowly-scoped function-definition fix until they are validated.
 
+    @staticmethod
+    def _protobuf_string_scan_windows(string_val: str) -> tuple[list[tuple[int, int, str]], bool]:
+        """Return bounded merged scan regions and whether they cover the whole string."""
+        string_length = len(string_val)
+        if string_length <= _MAX_PROTOBUF_STRING_FULL_SCAN_CHARS:
+            return [(0, string_length, string_val)], True
+
+        window_size = min(_PROTOBUF_STRING_SCAN_WINDOW_CHARS, string_length)
+        starts = [
+            0,
+            max(0, _PROTOBUF_STRING_LENGTH_CHECK_THRESHOLD - window_size // 4),
+            min(_PROTOBUF_STRING_LENGTH_CHECK_THRESHOLD, max(0, string_length - window_size)),
+            max(0, string_length // 2 - window_size // 2),
+            max(0, string_length - window_size),
+        ]
+        seen: set[tuple[int, int]] = set()
+        for start in starts:
+            end = min(string_length, start + window_size)
+            seen.add((start, end))
+
+        merged_intervals: list[tuple[int, int]] = []
+        for start, end in sorted(seen):
+            if not merged_intervals or start > merged_intervals[-1][1]:
+                merged_intervals.append((start, end))
+                continue
+
+            previous_start, previous_end = merged_intervals[-1]
+            merged_intervals[-1] = (previous_start, max(previous_end, end))
+
+        windows = [(start, end, string_val[start:end]) for start, end in merged_intervals]
+        scanned_entire_string = len(windows) == 1 and windows[0][0] == 0 and windows[0][1] >= string_length
+        return windows, scanned_entire_string
+
     def _check_protobuf_string_injection(self, saved_model: Any, result: ScanResult) -> None:
         """Check for string injection attacks in protobuf fields"""
 
@@ -1700,8 +1737,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
             # Base64 encoded payloads — require at least one trailing '=' pad
             # character to avoid matching normal TF node names that use '/'
             # as a hierarchical separator (e.g. "bidirectional/forward_lstm",
-            # "Adam/embedding/embeddings").
-            (r"[A-Za-z0-9+/]{20,}={1,2}", "encoded_payload", "potential base64 payload"),
+            # "Adam/embedding/embeddings"). Boundaries also prevent quadratic
+            # backtracking on long unpadded alphanumeric runs.
+            (
+                r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{20,}={1,2}(?![A-Za-z0-9+/=])",
+                "encoded_payload",
+                "potential base64 payload",
+            ),
         ]
 
         for node_context in self._iter_saved_model_node_contexts(saved_model):
@@ -1710,66 +1752,101 @@ class TensorFlowSavedModelScanner(BaseScanner):
             # Check string values in node attributes
             if hasattr(node, "attr"):
                 for attr_name, attr_value in node.attr.items():
-                    string_vals_to_check = []
+                    string_vals_to_check: list[str] = []
 
-                    # Extract string values from different attribute types
-                    if hasattr(attr_value, "s"):  # String attribute
+                    value_kind = attr_value.WhichOneof("value")
+                    if value_kind == "s":
+                        encoded_values = (attr_value.s,)
+                    elif value_kind == "list":
+                        encoded_values = attr_value.list.s
+                    else:
+                        continue
+
+                    for encoded_value in encoded_values:
                         try:
-                            string_vals_to_check.append(attr_value.s.decode("utf-8", errors="ignore"))
+                            string_vals_to_check.append(encoded_value.decode("utf-8", errors="ignore"))
                         except (UnicodeDecodeError, AttributeError):
                             continue
 
-                    elif hasattr(attr_value, "list") and hasattr(attr_value.list, "s"):  # String list
-                        for s_val in attr_value.list.s:
-                            try:
-                                string_vals_to_check.append(s_val.decode("utf-8", errors="ignore"))
-                            except (UnicodeDecodeError, AttributeError):
-                                continue
-
                     # Check each string value against injection patterns
                     for string_val in string_vals_to_check:
-                        if len(string_val) > 10000:  # Skip extremely long strings to avoid performance issues
+                        scan_windows, scanned_entire_string = self._protobuf_string_scan_windows(string_val)
+                        matched_injection: tuple[str, str, str, list[Any], int, int] | None = None
+                        for pattern, attack_type, description in injection_patterns:
+                            for window_start, window_end, scan_text in scan_windows:
+                                matches = re.findall(pattern, scan_text, re.IGNORECASE)
+                                if matches:
+                                    matched_injection = (
+                                        pattern,
+                                        attack_type,
+                                        description,
+                                        matches,
+                                        window_start,
+                                        window_end,
+                                    )
+                                    break
+                            if matched_injection is not None:
+                                break
+
+                        if len(string_val) > _PROTOBUF_STRING_LENGTH_CHECK_THRESHOLD:
+                            string_details = self._build_node_details(
+                                node_context,
+                                {
+                                    "attribute_name": attr_name,
+                                    "string_length": len(string_val),
+                                    "attack_type": "protobuf_string_bomb",
+                                    "string_scan_strategy": "full" if scanned_entire_string else "windowed",
+                                    "string_scan_window_count": len(scan_windows),
+                                    "max_full_scan_chars": _MAX_PROTOBUF_STRING_FULL_SCAN_CHARS,
+                                },
+                            )
+                            if not scanned_entire_string:
+                                mark_inconclusive_scan_result(result, _PROTOBUF_STRING_INCOMPLETE_REASON)
+                                mark_operational_scan_error(result, _PROTOBUF_STRING_INCOMPLETE_REASON)
+                                string_details.update(
+                                    {
+                                        "analysis_incomplete": True,
+                                        "scan_outcome_reason": _PROTOBUF_STRING_INCOMPLETE_REASON,
+                                        "window_size_chars": _PROTOBUF_STRING_SCAN_WINDOW_CHARS,
+                                    }
+                                )
                             result.add_check(
                                 name="Protobuf String Length Check",
                                 passed=False,
                                 message=f"Abnormally long string in node attribute (length: {len(string_val)})",
                                 severity=IssueSeverity.INFO,
                                 location=self._build_node_location(node_context, attr_name=attr_name),
-                                details=self._build_node_details(
-                                    node_context,
-                                    {
-                                        "attribute_name": attr_name,
-                                        "string_length": len(string_val),
-                                        "attack_type": "protobuf_string_bomb",
-                                    },
-                                ),
+                                details=string_details,
                             )
+
+                        if matched_injection is None:
                             continue
 
-                        for pattern, attack_type, description in injection_patterns:
-                            matches = re.findall(pattern, string_val, re.IGNORECASE)
-                            if matches:
-                                result.add_check(
-                                    name="Protobuf String Injection Check",
-                                    passed=False,
-                                    message=f"Potential {description} detected in protobuf string",
-                                    severity=IssueSeverity.CRITICAL
-                                    if attack_type in ["code_injection", "system_command"]
-                                    else IssueSeverity.WARNING,
-                                    location=self._build_node_location(node_context, attr_name=attr_name),
-                                    details=self._build_node_details(
-                                        node_context,
-                                        {
-                                            "attribute_name": attr_name,
-                                            "pattern_matched": pattern,
-                                            "matches": matches[:5],  # Limit to first 5 matches
-                                            "attack_type": attack_type,
-                                            "description": description,
-                                            "total_matches": len(matches),
-                                        },
-                                    ),
-                                )
-                                break  # Only report first match per string to avoid spam
+                        pattern, attack_type, description, matches, window_start, window_end = matched_injection
+                        result.add_check(
+                            name="Protobuf String Injection Check",
+                            passed=False,
+                            message=f"Potential {description} detected in protobuf string",
+                            severity=IssueSeverity.CRITICAL
+                            if attack_type in ["code_injection", "system_command"]
+                            else IssueSeverity.WARNING,
+                            location=self._build_node_location(node_context, attr_name=attr_name),
+                            details=self._build_node_details(
+                                node_context,
+                                {
+                                    "attribute_name": attr_name,
+                                    "pattern_matched": pattern,
+                                    "matches": matches[:5],  # Limit to first 5 matches
+                                    "attack_type": attack_type,
+                                    "description": description,
+                                    "total_matches": len(matches),
+                                    "string_length": len(string_val),
+                                    "string_scan_strategy": "full" if scanned_entire_string else "windowed",
+                                    "matched_window_start": window_start,
+                                    "matched_window_end": window_end,
+                                },
+                            ),
+                        )
 
     def _check_protobuf_buffer_overflow(self, saved_model: Any, result: ScanResult) -> None:
         """Check for potential buffer overflow patterns in protobuf data"""
