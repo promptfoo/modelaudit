@@ -58,6 +58,7 @@ SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[a-z0-9]+[_.-])*"
     r"(?:access[_-]?key|access[_-]?token|api[_-]?key|apikey|auth[_-]?token|client[_-]?secret|credential|"
     r"password|passwd|private[_-]?key|pwd|refresh[_-]?token|sas|secret|secret[_-]?key|signature|sig|token)"
+    r"(?!(?:[_.-](?:cache|count))\b)"
     r"(?:[_.-][a-z0-9]+)*"
 )
 CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
@@ -68,9 +69,12 @@ CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[A-Z][A-Za-z0-9]*)?"
 )
 SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
-    rf"(?:{SEPARATED_SENSITIVE_ASSIGNMENT_KEY}|(?-i:{CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY}))"
+    rf"_*(?!credentials(?![A-Za-z0-9]))"
+    rf"(?:{SEPARATED_SENSITIVE_ASSIGNMENT_KEY}|(?-i:{CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY}))(?:s|[0-9]+)?"
 )
-SENSITIVE_CONTAINER_KEY: Final[str] = rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|authorization)"
+SENSITIVE_CONTAINER_KEY: Final[str] = (
+    rf"(?:{SENSITIVE_ASSIGNMENT_KEY}|authorization|cookie|set[_-]?cookie|session[_-]?id|sessionid)"
+)
 PYTHON_ANNOTATION_PATTERN: Final[str] = r"(?:[A-Za-z_][\w.\[\](), |]*|[\"'][^\"'\r\n]+[\"'])"
 SCALAR_ASSIGNMENT_OPERATOR_PATTERN: Final[str] = rf"(?:=(?!=)|:(?!=)(?!\s*{PYTHON_ANNOTATION_PATTERN}\s*=))"
 AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
@@ -897,7 +901,7 @@ def _comparison_target_start(
             continue
         if token.type in {tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT}:
             return index + 1
-        if token.type == tokenize.NAME and token.string in {"and", "or", "if", "while", "assert"}:
+        if token.type == tokenize.NAME and token.string in {"and", "or", "if", "in", "not", "while", "assert"}:
             return index + 1
         if token.type == tokenize.OP and (
             token.string in {",", ";", ":"} or token.string in PYTHON_SENSITIVE_COMPARISON_OPERATORS
@@ -961,7 +965,7 @@ def _redact_sensitive_keyed_calls(text: str) -> str:
             for argument_start, argument_end in argument_ranges
         ]
         for keyword, argument_value_tokens in arguments:
-            if keyword == "auth" and argument_value_tokens:
+            if keyword in {"auth", "cookie", "cookies"} and argument_value_tokens:
                 replacements.append(
                     (
                         _position_offset(offsets, argument_value_tokens[0].start, len(text)),
@@ -1026,7 +1030,7 @@ def _comparison_value_end(
                 token.string in ":;,)]}" or token.string in PYTHON_SENSITIVE_COMPARISON_OPERATORS
             ):
                 return _position_offset(offsets, token.start, text_length), significant
-            if token.type == tokenize.NAME and token.string in {"and", "or"}:
+            if token.type == tokenize.NAME and token.string in {"and", "in", "not", "or"}:
                 return _position_offset(offsets, token.start, text_length), significant
         if token.type not in {
             tokenize.NL,
@@ -1053,12 +1057,26 @@ def _redact_sensitive_comparisons(text: str) -> str:
     replacements: list[tuple[int, int]] = []
     ignored_value_tokens = {tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT, tokenize.COMMENT}
     for index, token in enumerate(tokens):
-        if token.type != tokenize.OP or token.string not in PYTHON_SENSITIVE_COMPARISON_OPERATORS:
+        is_symbol_comparison = token.type == tokenize.OP and token.string in PYTHON_SENSITIVE_COMPARISON_OPERATORS
+        is_membership_comparison = token.type == tokenize.NAME and token.string == "in"
+        if not is_symbol_comparison and not is_membership_comparison:
             continue
         operator_depth = depths[index]
-        target_start_index = _comparison_target_start(tokens, depths, index, operator_depth)
+        operator_start_index = index
+        if is_membership_comparison:
+            previous_index = index - 1
+            while previous_index >= 0 and tokens[previous_index].type in ignored_value_tokens:
+                previous_index -= 1
+            if (
+                previous_index >= 0
+                and depths[previous_index] == operator_depth
+                and tokens[previous_index].type == tokenize.NAME
+                and tokens[previous_index].string == "not"
+            ):
+                operator_start_index = previous_index
+        target_start_index = _comparison_target_start(tokens, depths, operator_start_index, operator_depth)
         target_start = _position_offset(offsets, tokens[target_start_index].start, text_length)
-        target_end = _position_offset(offsets, token.start, text_length)
+        target_end = _position_offset(offsets, tokens[operator_start_index].start, text_length)
         target = text[target_start:target_end]
         left_target_is_sensitive = SENSITIVE_ASSIGNMENT_TARGET_RE.search(target) is not None
 

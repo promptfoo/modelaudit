@@ -706,6 +706,78 @@ def test_unparseable_literal_credential_pairs_fail_closed() -> None:
     assert '("region", "visible")' in redacted
 
 
+def test_redacts_sensitive_membership_comparisons() -> None:
+    """Membership operands for sensitive targets should not retain literals."""
+    text = (
+        'if api_key in ["MEMBERSHIPSECRET1234567890"]: eval("1 + 1")\n'
+        'if client_secret not in ("NOTINSECRET1234567890",): exec("pass")\n'
+        'if "REVERSEMEMBERSHIPSECRET1234567890" in api_keys: eval("2 + 2")\n'
+        'if tokenizer in ["visible"]: eval("3 + 3")\n'
+        "if api_key_count in [1, 2]: eval('4 + 4')"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "MEMBERSHIPSECRET1234567890" not in redacted
+    assert "NOTINSECRET1234567890" not in redacted
+    assert "REVERSEMEMBERSHIPSECRET1234567890" not in redacted
+    assert "api_key in <redacted>" in redacted
+    assert "client_secret not in <redacted>" in redacted
+    assert "<redacted> in api_keys" in redacted
+    assert 'tokenizer in ["visible"]' in redacted
+    assert "api_key_count in [1, 2]" in redacted
+    assert 'eval("1 + 1")' in redacted
+    assert 'exec("pass")' in redacted
+
+
+def test_redacts_affixed_sensitive_targets_without_control_false_positives() -> None:
+    """Private, numeric, and plural credentials should not broaden control names."""
+    text = (
+        '_api_key = "PRIVATESECRET1234567890"; '
+        'api_key2 = build("NUMBEREDSECRET1234567890"); '
+        'api_keys = ["PLURALSECRET1234567890"]; '
+        "api_key_count = 2; token_cache = True; passwordless = True; tokenizer = visible"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "PRIVATESECRET1234567890" not in redacted
+    assert "NUMBEREDSECRET1234567890" not in redacted
+    assert "PLURALSECRET1234567890" not in redacted
+    assert '_api_key = "<redacted>"' in redacted
+    assert "api_key2 = <redacted>" in redacted
+    assert "api_keys = <redacted>" in redacted
+    assert "api_key_count = 2" in redacted
+    assert "token_cache = True" in redacted
+    assert "passwordless = True" in redacted
+    assert "tokenizer = visible" in redacted
+
+
+def test_redacts_cookie_call_arguments_and_header_mappings() -> None:
+    """Cookie-bearing calls and exact cookie/session keys should be sensitive."""
+    text = (
+        'requests.get(url, cookies={"sessionid": "COOKIECALLSECRET1234567890"}); '
+        'headers = {"Cookie": "session=COOKIEHEADERSECRET1234567890"}; '
+        'response = {"Set-Cookie": "SESSIONCOOKIESECRET1234567890"}; '
+        'state = {"session_id": "SESSIONIDSECRET1234567890"}; '
+        'requests.get(url, cookie_timeout="visible"); cookie_count = 1; eval("1 + 1")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "COOKIECALLSECRET1234567890" not in redacted
+    assert "COOKIEHEADERSECRET1234567890" not in redacted
+    assert "SESSIONCOOKIESECRET1234567890" not in redacted
+    assert "SESSIONIDSECRET1234567890" not in redacted
+    assert "cookies=<redacted>" in redacted
+    assert '"Cookie": "<redacted>"' in redacted
+    assert '"Set-Cookie": "<redacted>"' in redacted
+    assert '"session_id": "<redacted>"' in redacted
+    assert 'cookie_timeout="visible"' in redacted
+    assert "cookie_count = 1" in redacted
+    assert 'eval("1 + 1")' in redacted
+
+
 def test_redaction_bounds_expression_analysis_to_output_lookahead() -> None:
     """Very large evidence strings should still redact secrets near the visible prefix."""
     secret = "BOUNDEDSECRET1234567890"
