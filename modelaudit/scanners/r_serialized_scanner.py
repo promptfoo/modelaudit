@@ -114,8 +114,8 @@ def _r_equals_is_named_argument(
         character = text[cursor]
         if character in "([{":
             stack.append((character, cursor))
-        elif character in ")]}":
-            if not stack or closing_delimiters[stack[-1][0]] != character:
+        elif character in ")]}" and stack:
+            if closing_delimiters[stack[-1][0]] != character:
                 return False
             stack.pop()
         cursor += 1
@@ -133,8 +133,8 @@ def _r_equals_is_named_argument(
         character = text[cursor]
         if character in "([{":
             stack.append((character, cursor))
-        elif character in ")]}":
-            if not stack or closing_delimiters[stack[-1][0]] != character:
+        elif character in ")]}" and stack:
+            if closing_delimiters[stack[-1][0]] != character:
                 return False
             closed = stack.pop()
             if closed == target:

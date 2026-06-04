@@ -915,6 +915,9 @@ def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None
         'list(token = r"(standard)")',
         'function(token = "standard") NULL',
         'function(token = r"(standard)") NULL',
+        ') list(token = "standard")',
+        '] list(token = r"(standard)")',
+        '} function(token = paste0("stan", "dard")) NULL',
     ],
 )
 def test_scan_allows_assignment_examples_inside_benign_metadata(tmp_path: Path, metadata: str) -> None:
@@ -935,6 +938,8 @@ def test_scan_allows_assignment_examples_inside_benign_metadata(tmp_path: Path, 
         '[ token = "UNMATCHED_BRACKET_SECRET"',
         '( token = r"(UNMATCHED_RAW_PAREN_SECRET)"',
         '[ token = r"(UNMATCHED_RAW_BRACKET_SECRET)"',
+        '(] token = "MISMATCHED_PAREN_SECRET")',
+        '[) token = r"(MISMATCHED_RAW_BRACKET_SECRET)"]',
     ],
 )
 def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path, assignment: str) -> None:
