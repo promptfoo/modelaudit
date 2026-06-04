@@ -2006,7 +2006,7 @@ def test_scan_bytes_marks_lookup_failures_as_unanalyzable(
     assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
 
 
-def test_scan_bytes_analyzes_source_available_modules_without_custom_meta_path_finders(
+def test_scan_bytes_fails_closed_when_custom_meta_path_finder_can_shadow_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2042,9 +2042,9 @@ def test_scan_bytes_analyzes_source_available_modules_without_custom_meta_path_f
     finally:
         _clear_call_graph_caches()
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert not _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
     assert not marker.exists()
 
 
@@ -2052,6 +2052,8 @@ def test_scan_bytes_analyzes_stdlib_source_modules_without_custom_meta_path_find
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import statistics
+
     module_name = "statistics"
     marker = tmp_path / "meta_path_called"
 
@@ -2083,6 +2085,7 @@ def test_scan_bytes_analyzes_stdlib_source_modules_without_custom_meta_path_find
     assert report.verdict == SafetyVerdict.CLEAN
     assert not _has_call_graph_source_unavailable_notice(report, module_name, "mean", "source_unavailable")
     assert not marker.exists()
+    assert statistics.mean([1, 2, 3]) == 2
 
 
 def test_scan_bytes_keeps_frozen_stdlib_globals_clean_without_custom_meta_path_finders(
@@ -2119,6 +2122,43 @@ def test_scan_bytes_keeps_frozen_stdlib_globals_clean_without_custom_meta_path_f
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert not _has_call_graph_source_unavailable_notice(report, module_name, "ModuleSpec", "source_unavailable")
+    assert not marker.exists()
+
+
+def test_call_graph_trusts_only_exact_builtin_module_names() -> None:
+    assert call_graph._call_graph_source_unavailable_reason("_io") is None
+    assert call_graph._call_graph_source_unavailable_reason("_io.nonexistent") == "source_unavailable"
+
+
+def test_call_graph_fails_closed_when_custom_meta_path_finder_can_shadow_frozen_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "__hello__"
+    marker = tmp_path / "meta_path_called"
+
+    class CustomMetaPathFinder:
+        @staticmethod
+        def find_spec(
+            fullname: str,
+            path: object | None = None,
+            target: object | None = None,
+        ) -> ModuleSpec | None:
+            del path, target
+            if fullname == module_name:
+                marker.write_text(fullname, encoding="utf-8")
+                return ModuleSpec(fullname, loader=None, origin="custom://module")
+            return None
+
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    monkeypatch.setattr(sys, "meta_path", [CustomMetaPathFinder(), *sys.meta_path])
+    _clear_call_graph_caches()
+
+    try:
+        assert call_graph._call_graph_source_unavailable_reason(module_name) == "source_unavailable"
+    finally:
+        _clear_call_graph_caches()
+
     assert not marker.exists()
 
 
@@ -2183,6 +2223,9 @@ def test_scan_bytes_marks_custom_path_entry_specs_as_unanalyzable_without_invoki
     module_name = "modelaudit_tp_path_entry_spec_probe"
     marker = tmp_path / "path_entry_finder_called"
     path_entry = str(tmp_path / "custom-path-entry")
+    extension_dir = tmp_path / "extensions"
+    extension_dir.mkdir()
+    (extension_dir / f"{module_name}{EXTENSION_SUFFIXES[0]}").write_bytes(b"not imported")
 
     class CustomPathEntryFinder:
         @staticmethod
@@ -2193,7 +2236,7 @@ def test_scan_bytes_marks_custom_path_entry_specs_as_unanalyzable_without_invoki
                 return ModuleSpec(fullname, loader=None, origin="custom://module")
             return None
 
-    monkeypatch.syspath_prepend(path_entry)
+    monkeypatch.setattr(sys, "path", [path_entry, str(extension_dir), *sys.path])
     monkeypatch.setitem(sys.path_importer_cache, path_entry, CustomPathEntryFinder())
     _clear_call_graph_caches()
 
@@ -2208,6 +2251,57 @@ def test_scan_bytes_marks_custom_path_entry_specs_as_unanalyzable_without_invoki
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.UNKNOWN
     assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+    assert not marker.exists()
+
+
+def test_call_graph_honors_bytecode_precedence_over_later_extension(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_bytecode_shadowing_extension"
+    bytecode_dir = tmp_path / "bytecode"
+    extension_dir = tmp_path / "extension"
+    bytecode_dir.mkdir()
+    extension_dir.mkdir()
+    source_path = bytecode_dir / f"{module_name}.py"
+    source_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
+    py_compile.compile(str(source_path), cfile=str(bytecode_dir / f"{module_name}.pyc"), doraise=True)
+    source_path.unlink()
+    (extension_dir / f"{module_name}{EXTENSION_SUFFIXES[0]}").write_bytes(b"not imported")
+    monkeypatch.setattr(sys, "path", [str(bytecode_dir), str(extension_dir), *sys.path])
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+    try:
+        assert call_graph._call_graph_source_unavailable_reason(module_name) == "source_unavailable"
+    finally:
+        _clear_call_graph_caches()
+
+
+def test_call_graph_does_not_invoke_custom_path_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_uncached_path_hook_probe"
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    (module_dir / f"{module_name}.py").write_text("def invoke(command):\n    return command\n", encoding="utf-8")
+    marker = tmp_path / "path_hook_called"
+
+    def custom_path_hook(path: str) -> object:
+        marker.write_text(path, encoding="utf-8")
+        raise ImportError
+
+    monkeypatch.syspath_prepend(str(module_dir))
+    monkeypatch.setattr(sys, "path_hooks", [custom_path_hook, *sys.path_hooks])
+    sys.path_importer_cache.pop(str(module_dir), None)
+    _clear_call_graph_caches()
+
+    try:
+        assert call_graph._call_graph_source_unavailable_reason(module_name) == "source_unavailable"
+    finally:
+        _clear_call_graph_caches()
+
     assert not marker.exists()
 
 

@@ -14,9 +14,22 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
-from importlib.machinery import EXTENSION_SUFFIXES, FrozenImporter, ModuleSpec
+from importlib.machinery import (
+    BYTECODE_SUFFIXES,
+    EXTENSION_SUFFIXES,
+    SOURCE_SUFFIXES,
+    BuiltinImporter,
+    ExtensionFileLoader,
+    FileFinder,
+    FrozenImporter,
+    ModuleSpec,
+    PathFinder,
+    SourceFileLoader,
+    SourcelessFileLoader,
+)
 from pathlib import Path
 from typing import Any, Protocol, TypeVar, cast
+from zipimport import zipimporter
 
 # Bound per-pass import/callable fan-out for untrusted inputs. The 32-reference
 # cap has kept call-graph enrichment useful while preventing pathological scan
@@ -33,6 +46,9 @@ _MAX_CALLS_PER_FUNCTION = 128
 _MAX_ASSIGNMENT_ALIASES = 128
 _MAX_ASSIGNMENT_ALIAS_PASSES = 256
 _MAX_FUNCTION_INSTANCE_ALIASES = 32
+_TRUSTED_META_PATH_FINDERS = tuple(sys.meta_path)
+_TRUSTED_PATH_HOOKS = tuple(sys.path_hooks)
+_TRUSTED_PATH_IMPORTERS = tuple(finder for finder in sys.path_importer_cache.values() if finder is not None)
 _MAX_CLASS_INSTANCE_ALIASES = 128
 _MAX_INHERITED_CLASS_METHODS = 128
 _MAX_WILDCARD_IMPORTS = 16
@@ -1007,9 +1023,6 @@ def _call_graph_source_unavailable_reason(module_name: str) -> str | None:
             return "source_parse_error"
         return None
 
-    if module_name.split(".", maxsplit=1)[0] in sys.builtin_module_names:
-        return None
-
     try:
         spec = _find_module_spec_without_imports(module_name)
     except Exception:
@@ -1029,24 +1042,108 @@ def _find_module_spec_without_imports(module_name: str) -> ModuleSpec | None:
     if not parts or any(not part or "/" in part or "\\" in part for part in parts):
         return None
 
-    frozen_spec = FrozenImporter.find_spec(module_name)
-    if frozen_spec is not None:
-        return frozen_spec
+    loaded_module = sys.modules.get(module_name)
+    loaded_spec = getattr(loaded_module, "__spec__", None)
+    if isinstance(loaded_spec, ModuleSpec):
+        return loaded_spec
 
+    if not _untrusted_meta_path_finder_precedes(BuiltinImporter):
+        builtin_spec = BuiltinImporter.find_spec(module_name)
+        if builtin_spec is not None:
+            return builtin_spec
+
+    if not _untrusted_meta_path_finder_precedes(FrozenImporter):
+        frozen_spec = FrozenImporter.find_spec(module_name)
+        if frozen_spec is not None:
+            return frozen_spec
+
+    if _untrusted_meta_path_finder_precedes(PathFinder) or _has_untrusted_path_hook():
+        return None
+
+    return _find_standard_filesystem_spec(module_name)
+
+
+def _find_standard_filesystem_spec(module_name: str) -> ModuleSpec | None:
+    parts = module_name.split(".")
+    if not parts or any(not part or "/" in part or "\\" in part for part in parts):
+        return None
+
+    search_path = [str(Path(entry or os.getcwd())) for entry in sys.path]
+    spec: ModuleSpec | None = None
+    for index in range(len(parts)):
+        qualified_name = ".".join(parts[: index + 1])
+        spec = _find_standard_path_spec(qualified_name, search_path)
+        if spec is None:
+            return None
+        if index == len(parts) - 1:
+            return spec
+        locations = spec.submodule_search_locations
+        if locations is None:
+            return None
+        search_path = list(locations)
+    return spec
+
+
+def _untrusted_meta_path_finder_precedes(target: object) -> bool:
+    for finder in sys.meta_path:
+        if finder is target:
+            return False
+        if finder is BuiltinImporter or finder is FrozenImporter or finder is PathFinder:
+            continue
+        if any(finder is trusted_finder for trusted_finder in _TRUSTED_META_PATH_FINDERS):
+            continue
+        return True
+    return True
+
+
+def _is_standard_path_hook(hook: object) -> bool:
+    if hook is zipimporter:
+        return True
+    return getattr(hook, "__module__", None) == "_frozen_importlib_external" and getattr(
+        hook, "__qualname__", ""
+    ).endswith("FileFinder.path_hook.<locals>.path_hook_for_FileFinder")
+
+
+def _has_untrusted_path_hook() -> bool:
+    if any(
+        not _is_standard_path_hook(hook) and not any(hook is trusted_hook for trusted_hook in _TRUSTED_PATH_HOOKS)
+        for hook in sys.path_hooks
+    ):
+        return True
     for entry in sys.path:
-        current = Path(entry or os.getcwd())
-        for index, part in enumerate(parts):
-            if index == len(parts) - 1:
-                for suffix in EXTENSION_SUFFIXES:
-                    for candidate in (current / f"{part}{suffix}", current / part / f"__init__{suffix}"):
-                        if candidate.is_file():
-                            return ModuleSpec(module_name, loader=None, origin=str(candidate))
-                break
+        cache_key = entry or os.getcwd()
+        finder = sys.path_importer_cache.get(cache_key)
+        if (
+            finder is not None
+            and not isinstance(finder, (FileFinder, zipimporter))
+            and not any(finder is trusted_finder for trusted_finder in _TRUSTED_PATH_IMPORTERS)
+        ):
+            return True
+    return False
 
-            current /= part
-            if not current.is_dir():
-                break
-    return None
+
+def _find_standard_path_spec(module_name: str, search_path: list[str]) -> ModuleSpec | None:
+    namespace_locations: list[str] = []
+    loader_details = (
+        (ExtensionFileLoader, EXTENSION_SUFFIXES),
+        (SourceFileLoader, SOURCE_SUFFIXES),
+        (SourcelessFileLoader, BYTECODE_SUFFIXES),
+    )
+    for entry in search_path:
+        finder = FileFinder(entry, *loader_details)
+        spec = finder.find_spec(module_name)
+        if spec is None:
+            continue
+        if spec.loader is not None:
+            return spec
+        if spec.submodule_search_locations is not None:
+            namespace_locations.extend(spec.submodule_search_locations)
+
+    if not namespace_locations:
+        return None
+    namespace_spec = ModuleSpec(module_name, loader=None, is_package=True)
+    namespace_spec.submodule_search_locations = namespace_locations
+    return namespace_spec
 
 
 @_register_source_sensitive_cache
@@ -3471,22 +3568,23 @@ def _resolve_module_source(module_name: str) -> Path | None:
     if not parts or any(not part or "/" in part or "\\" in part for part in parts):
         return None
     _track_shared_source_candidates(tuple(parts))
-    for entry in sys.path:
-        root = Path(entry or os.getcwd())
-        current = root
-        for index, part in enumerate(parts):
-            is_last = index == len(parts) - 1
-            if is_last:
-                module_file = current / f"{part}.py"
-                if module_file.is_file():
-                    return module_file
-                package_file = current / part / "__init__.py"
-                if package_file.is_file():
-                    return package_file
-            else:
-                current = current / part
-                if not current.is_dir():
-                    break
+    loaded_module = sys.modules.get(module_name)
+    loaded_spec = getattr(loaded_module, "__spec__", None)
+    if isinstance(loaded_spec, ModuleSpec) and isinstance(loaded_spec.origin, str):
+        if loaded_spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
+            loaded_source_path = Path(loaded_spec.origin)
+            if loaded_source_path.is_file():
+                return loaded_source_path
+        if loaded_spec.origin not in {"built-in", "frozen"}:
+            return None
+    elif _untrusted_meta_path_finder_precedes(PathFinder) or _has_untrusted_path_hook():
+        return None
+
+    spec = _find_standard_filesystem_spec(module_name)
+    if spec is not None and isinstance(spec.origin, str) and spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
+        source_path = Path(spec.origin)
+        if source_path.is_file():
+            return source_path
     return None
 
 
