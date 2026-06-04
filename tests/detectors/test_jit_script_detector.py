@@ -6279,6 +6279,15 @@ class TestJITScriptDetector:
             (b"(lambda callback: callback('1+1'))(eval)\n"),
             (b"\x00\xffglobals().update({'sink': eval})\nsink('1+1')\n"),
             (b"\x00\xffdef run(callbacks=[]):\n    callbacks.append(eval)\n    return callbacks[0]('1+1')\nrun()\n"),
+            (b"callbacks = {'run': eval}\nfor callback in callbacks.values():\n    callback('1+1')\n"),
+            (b"callbacks = {**{'run': eval}}\ncallbacks['run']('1+1')\n"),
+            (b"callbacks = [len, eval]\ncallbacks[1:][0]('1+1')\n"),
+            (b"callbacks = [len] + [eval]\ncallbacks[1]('1+1')\n"),
+            (b"callbacks = [] + [eval]\ncallbacks[0]('1+1')\n"),
+            (b"def run(callback):\n    callback('1+1')\ncallbacks = [] + [run]\ncallbacks[0](eval)\n"),
+            (b"class C:\n    def __call__(self, callback):\n        callback('1+1')\nC()(eval)\n"),
+            (b"class C:\n    def __new__(cls):\n        return eval\nC()('1+1')\n"),
+            (b"callbacks = {eval}\nfor callback in callbacks:\n    callback('1+1')\n"),
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
@@ -6555,6 +6564,29 @@ class TestJITScriptDetector:
                 b"run()\n"
                 b"unused = eval\n"
             ),
+            (b"callbacks = {'run': len}\nfor callback in callbacks.values():\n    callback([])\nunused = eval\n"),
+            (b"callbacks = {**{'run': len}}\ncallbacks['run']([])\nunused = eval\n"),
+            (b"callbacks = [eval, len]\ncallbacks[1:][0]([])\n"),
+            (b"callbacks = [eval] + [len]\ncallbacks[1]([])\n"),
+            (b"callbacks = {**{'run': {'inner': eval}}, 'run': len}\ncallbacks['run']([])\n"),
+            (
+                b"def run(callback):\n"
+                b"    callback('1+1')\n"
+                b"callbacks = {**{'run': run}, 'run': len}\n"
+                b"callbacks['run']([])\n"
+                b"unused = eval\n"
+            ),
+            (b"class C:\n    def __call__(self, callback):\n        callback([])\nC()(len)\nunused = eval\n"),
+            (b"class C:\n    def __new__(cls):\n        return len\nC()([])\nunused = eval\n"),
+            (
+                b"class C:\n"
+                b"    def __new__(cls):\n"
+                b"        return len\n"
+                b"    def __call__(self, callback):\n"
+                b"        callback('1+1')\n"
+                b"C()(eval)\n"
+            ),
+            (b"callbacks = {len}\nfor callback in callbacks:\n    callback([])\nunused = eval\n"),
         ],
     )
     def test_scan_model_avoids_false_positives_across_callable_summaries(self, data: bytes) -> None:

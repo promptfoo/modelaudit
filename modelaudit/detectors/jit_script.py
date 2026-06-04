@@ -16,7 +16,7 @@ import re
 import textwrap
 from bisect import bisect_left, bisect_right
 from collections.abc import Iterator, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 if TYPE_CHECKING:
     from modelaudit.models import JITScriptFinding
@@ -36,6 +36,7 @@ _FunctionAliasSummary = tuple[
     _BuiltinAliasBinding | None,
     tuple[tuple[str, int], ...],
 ]
+_ContainerValue = TypeVar("_ContainerValue")
 
 
 def create_jit_finding(**kwargs: Any) -> "JITScriptFinding":
@@ -9394,6 +9395,7 @@ class JITScriptDetector:
 
         class DangerousBuiltinCallVisitor(ast.NodeVisitor):
             _SEQUENCE_INDEX_MARKER = "__modelaudit_sequence_index__"
+            _UNORDERED_ELEMENT_MARKER = "__modelaudit_unordered_element__"
             # Store import identities with scoped aliases so branch snapshots preserve them.
             _FUNCTOOLS_MODULE_MARKER = "__modelaudit_functools_module__:"
             _FUNCTOOLS_PARTIAL_MARKER = "__modelaudit_functools_partial__:"
@@ -9861,6 +9863,16 @@ class JITScriptDetector:
                 if isinstance(node, ast.Lambda):
                     return self.lambda_summaries.get(id(node))
                 if isinstance(node, ast.Call):
+                    if self._is_class_name(node.func):
+                        allocator = ast.Attribute(value=node.func, attr="__new__", ctx=ast.Load())
+                        allocator_summary = self._function_summary_for_node(allocator)
+                        allocator_return = allocator_summary[1] if allocator_summary is not None else None
+                        if allocator_return is not None and any(allocator_return):
+                            callable_functions = allocator_return[7]
+                            return ([], None, callable_functions) if callable_functions else None
+                        callable_method = ast.Attribute(value=node.func, attr="__call__", ctx=ast.Load())
+                        if summary := self._function_summary_for_node(callable_method):
+                            return summary
                     callee_summary = self._function_summary_for_node(node.func)
                     if callee_summary is not None and callee_summary[1] is not None:
                         callable_functions = callee_summary[1][7]
@@ -9871,6 +9883,10 @@ class JITScriptDetector:
             def _function_return_binding(self, node: ast.AST) -> _BuiltinAliasBinding | None:
                 if not isinstance(node, ast.Call):
                     return None
+                if self._is_class_name(node.func):
+                    allocator = ast.Attribute(value=node.func, attr="__new__", ctx=ast.Load())
+                    if (summary := self._function_summary_for_node(allocator)) is not None:
+                        return summary[1]
                 summary = self._function_summary_for_node(node.func)
                 return summary[1] if summary is not None else None
 
@@ -10147,6 +10163,141 @@ class JITScriptDetector:
                 return cls._SEQUENCE_INDEX_MARKER, index, length
 
             @classmethod
+            def _unordered_element(cls, index: int) -> tuple[str, int]:
+                return cls._UNORDERED_ELEMENT_MARKER, index
+
+            @classmethod
+            def _sequence_container_length(
+                cls,
+                container: Mapping[tuple[object, ...], object],
+            ) -> int | None:
+                lengths = {
+                    element[2]
+                    for path in container
+                    if path
+                    and isinstance((element := path[0]), tuple)
+                    and len(element) == 3
+                    and element[0] == cls._SEQUENCE_INDEX_MARKER
+                    and isinstance(element[1], int)
+                    and isinstance(element[2], int)
+                }
+                return next(iter(lengths)) if len(lengths) == 1 else None
+
+            @classmethod
+            def _reindex_sequence_container(
+                cls,
+                container: Mapping[tuple[object, ...], _ContainerValue],
+                index_map: Mapping[int, int],
+                new_length: int,
+            ) -> dict[tuple[object, ...], _ContainerValue]:
+                reindexed: dict[tuple[object, ...], _ContainerValue] = {}
+                for path, value in container.items():
+                    if (
+                        not path
+                        or not isinstance((element := path[0]), tuple)
+                        or len(element) != 3
+                        or element[0] != cls._SEQUENCE_INDEX_MARKER
+                        or not isinstance(element[1], int)
+                        or element[1] not in index_map
+                    ):
+                        continue
+                    item = cls._sequence_index_element(index_map[element[1]], new_length)
+                    reindexed[(item, *path[1:])] = value
+                return reindexed
+
+            @classmethod
+            def _slice_sequence_container(
+                cls,
+                container: Mapping[tuple[object, ...], _ContainerValue],
+                node: ast.Slice,
+            ) -> dict[tuple[object, ...], _ContainerValue]:
+                length = cls._sequence_container_length(container)
+                if length is None:
+                    return {}
+                selected = cls._slice_indexes(length, node)
+                if selected is None:
+                    return {}
+                return cls._reindex_sequence_container(
+                    container,
+                    {old_index: new_index for new_index, old_index in enumerate(selected)},
+                    len(selected),
+                )
+
+            @staticmethod
+            def _slice_indexes(length: int, node: ast.Slice) -> list[int] | None:
+                bounds: list[int | None] = []
+                for bound in (node.lower, node.upper, node.step):
+                    if bound is None:
+                        bounds.append(None)
+                        continue
+                    if not isinstance(bound, ast.Constant) or not isinstance(bound.value, int):
+                        return None
+                    bounds.append(bound.value)
+                try:
+                    return list(range(length))[slice(*bounds)]
+                except ValueError:
+                    return None
+
+            def _sequence_expression_length(
+                self,
+                node: ast.AST,
+                container: Mapping[tuple[object, ...], object],
+            ) -> int | None:
+                if (length := self._sequence_container_length(container)) is not None:
+                    return length
+                if isinstance(node, (ast.List, ast.Tuple)):
+                    return len(node.elts)
+                if (
+                    isinstance(node, ast.Call)
+                    and len(node.args) == 1
+                    and not node.keywords
+                    and any(self._is_builtin_helper(node.func, name) for name in ("list", "tuple"))
+                ):
+                    return self._sequence_expression_length(node.args[0], container)
+                if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+                    source = self._resolve_builtin_container(node.value)
+                    source_length = self._sequence_expression_length(node.value, source)
+                    if source_length is None:
+                        return None
+                    selected = self._slice_indexes(source_length, node.slice)
+                    return len(selected) if selected is not None else None
+                if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                    left = self._resolve_builtin_container(node.left)
+                    right = self._resolve_builtin_container(node.right)
+                    left_length = self._sequence_expression_length(node.left, left)
+                    right_length = self._sequence_expression_length(node.right, right)
+                    if left_length is not None and right_length is not None:
+                        return left_length + right_length
+                return None
+
+            @classmethod
+            def _concatenate_sequence_containers(
+                cls,
+                left: Mapping[tuple[object, ...], _ContainerValue],
+                right: Mapping[tuple[object, ...], _ContainerValue],
+                *,
+                left_length: int | None = None,
+                right_length: int | None = None,
+            ) -> dict[tuple[object, ...], _ContainerValue]:
+                left_length = left_length if left_length is not None else cls._sequence_container_length(left)
+                right_length = right_length if right_length is not None else cls._sequence_container_length(right)
+                if left_length is None or right_length is None:
+                    return {}
+                new_length = left_length + right_length
+                return {
+                    **cls._reindex_sequence_container(
+                        left,
+                        {index: index for index in range(left_length)},
+                        new_length,
+                    ),
+                    **cls._reindex_sequence_container(
+                        right,
+                        {index: left_length + index for index in range(right_length)},
+                        new_length,
+                    ),
+                }
+
+            @classmethod
             def _container_path_element_matches(cls, element: object, key: object) -> bool:
                 if (
                     isinstance(element, tuple)
@@ -10191,6 +10342,18 @@ class JITScriptDetector:
                         if builtin is not None or path not in merged:
                             merged[path] = builtin
                 return merged
+
+            @staticmethod
+            def _replace_mapping_container_entries(
+                container: dict[tuple[object, ...], _ContainerValue],
+                replacement: Mapping[tuple[object, ...], _ContainerValue],
+                keys: set[object] | None = None,
+            ) -> None:
+                replacement_keys = keys or {path[0] for path in replacement if path}
+                for path in list(container):
+                    if path and path[0] in replacement_keys:
+                        del container[path]
+                container.update(replacement)
 
             def _constant_container_key(self, node: ast.AST) -> tuple[bool, object]:
                 if isinstance(node, ast.Constant):
@@ -10237,14 +10400,27 @@ class JITScriptDetector:
                         for path, builtin in nested.items():
                             resolved[(item, *path)] = builtin
                     return resolved
+                if isinstance(node, ast.Set):
+                    resolved = {}
+                    for index, element in enumerate(node.elts):
+                        unordered_item = self._unordered_element(index)
+                        resolved[(unordered_item,)] = self._resolve_builtin(element)
+                        for path, builtin in self._resolve_builtin_container(element).items():
+                            resolved[(unordered_item, *path)] = builtin
+                    return resolved
                 if isinstance(node, ast.Dict):
                     resolved = {}
                     for key_node, value_node in zip(node.keys, node.values, strict=True):
                         if key_node is None:
+                            self._replace_mapping_container_entries(
+                                resolved,
+                                self._resolve_builtin_container(value_node),
+                            )
                             continue
                         key_resolved, key = self._constant_container_key(key_node)
                         builtin = self._resolve_builtin(value_node)
                         if key_resolved:
+                            self._replace_mapping_container_entries(resolved, {}, {key})
                             resolved[(key,)] = builtin
                             for path, nested_builtin in self._resolve_builtin_container(value_node).items():
                                 resolved[(key, *path)] = nested_builtin
@@ -10272,6 +10448,11 @@ class JITScriptDetector:
                                 resolved[(keyword.arg, *path)] = builtin
                         return resolved
                 if isinstance(node, ast.Subscript):
+                    if isinstance(node.slice, ast.Slice):
+                        return self._slice_sequence_container(
+                            self._resolve_builtin_container(node.value),
+                            node.slice,
+                        )
                     key_resolved, key = self._constant_container_key(node.slice)
                     if not key_resolved:
                         return {}
@@ -10288,6 +10469,15 @@ class JITScriptDetector:
                         for prefix in prefixes
                     ]
                     return self._merge_container_aliases(*nested_containers)
+                if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                    left = self._resolve_builtin_container(node.left)
+                    right = self._resolve_builtin_container(node.right)
+                    return self._concatenate_sequence_containers(
+                        left,
+                        right,
+                        left_length=self._sequence_expression_length(node.left, left),
+                        right_length=self._sequence_expression_length(node.right, right),
+                    )
                 if isinstance(node, ast.IfExp):
                     truth = self._constant_truth(node.test)
                     if truth is True:
@@ -10319,14 +10509,30 @@ class JITScriptDetector:
                         for path, functions in self._resolve_function_container(element).items():
                             resolved[(item, *path)] = functions
                     return resolved
+                if isinstance(node, ast.Set):
+                    resolved = {}
+                    for index, element in enumerate(node.elts):
+                        unordered_item = self._unordered_element(index)
+                        if summary := self._function_summary_for_node(element):
+                            resolved[(unordered_item,)] = summary[2]
+                        for path, functions in self._resolve_function_container(element).items():
+                            resolved[(unordered_item, *path)] = functions
+                    return resolved
                 if isinstance(node, ast.Dict):
                     resolved = {}
                     for key_node, value_node in zip(node.keys, node.values, strict=True):
                         if key_node is None:
+                            builtin_keys = {path[0] for path in self._resolve_builtin_container(value_node) if path}
+                            self._replace_mapping_container_entries(
+                                resolved,
+                                self._resolve_function_container(value_node),
+                                builtin_keys,
+                            )
                             continue
                         key_resolved, key = self._constant_container_key(key_node)
                         if not key_resolved:
                             continue
+                        self._replace_mapping_container_entries(resolved, {}, {key})
                         if summary := self._function_summary_for_node(value_node):
                             resolved[(key,)] = summary[2]
                         for path, functions in self._resolve_function_container(value_node).items():
@@ -10353,6 +10559,11 @@ class JITScriptDetector:
                                 resolved[(keyword.arg, *path)] = functions
                         return resolved
                 if isinstance(node, ast.Subscript):
+                    if isinstance(node.slice, ast.Slice):
+                        return self._slice_sequence_container(
+                            self._resolve_function_container(node.value),
+                            node.slice,
+                        )
                     key_resolved, key = self._constant_container_key(node.slice)
                     if not key_resolved:
                         return {}
@@ -10364,6 +10575,17 @@ class JITScriptDetector:
                         for path, functions in container.items()
                         if len(path) > len(prefix) and path[: len(prefix)] == prefix
                     }
+                if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                    left = self._resolve_function_container(node.left)
+                    right = self._resolve_function_container(node.right)
+                    left_builtins = self._resolve_builtin_container(node.left)
+                    right_builtins = self._resolve_builtin_container(node.right)
+                    return self._concatenate_sequence_containers(
+                        left,
+                        right,
+                        left_length=self._sequence_expression_length(node.left, left_builtins),
+                        right_length=self._sequence_expression_length(node.right, right_builtins),
+                    )
                 if isinstance(node, ast.IfExp):
                     truth = self._constant_truth(node.test)
                     if truth is True:
@@ -11090,6 +11312,54 @@ class JITScriptDetector:
                         bindings.append((builtin, nested))
                 return bindings
 
+            def _unordered_container_element_bindings(
+                self,
+                container: dict[tuple[object, ...], str | None],
+            ) -> list[tuple[str | None, dict[tuple[object, ...], str | None]]]:
+                markers = sorted(
+                    {
+                        element
+                        for path in container
+                        if path
+                        and isinstance((element := path[0]), tuple)
+                        and len(element) == 2
+                        and element[0] == self._UNORDERED_ELEMENT_MARKER
+                        and isinstance(element[1], int)
+                    },
+                    key=lambda element: element[1],
+                )
+                bindings = []
+                for marker in markers:
+                    builtin = container.get((marker,))
+                    nested = {
+                        path[1:]: candidate
+                        for path, candidate in container.items()
+                        if len(path) > 1 and path[0] == marker
+                    }
+                    bindings.append((builtin, nested))
+                return bindings
+
+            def _mapping_container_value_bindings(
+                self,
+                container: dict[tuple[object, ...], str | None],
+            ) -> list[tuple[str | None, dict[tuple[object, ...], str | None]]]:
+                keys = {
+                    path[0]
+                    for path in container
+                    if path
+                    and not (
+                        isinstance(path[0], tuple)
+                        and path[0]
+                        and path[0][0] in {self._SEQUENCE_INDEX_MARKER, self._UNORDERED_ELEMENT_MARKER}
+                    )
+                }
+                bindings = []
+                for key in sorted(keys, key=repr):
+                    found, builtin, nested = self._container_child_binding(container, key)
+                    if found:
+                        bindings.append((builtin, nested))
+                return bindings
+
             def _bind_target_from_container_candidates(
                 self,
                 target: ast.AST,
@@ -11222,7 +11492,22 @@ class JITScriptDetector:
             def _bind_loop_target_from_iterable(self, target: ast.AST, iterable: ast.AST) -> None:
                 elements = self._literal_iterable_elements(iterable)
                 if elements is None:
-                    candidates = self._sequence_container_element_bindings(self._resolve_builtin_container(iterable))
+                    if (
+                        isinstance(iterable, ast.Call)
+                        and not iterable.args
+                        and not iterable.keywords
+                        and isinstance(iterable.func, ast.Attribute)
+                        and iterable.func.attr == "values"
+                    ):
+                        candidates = self._mapping_container_value_bindings(
+                            self._resolve_builtin_container(iterable.func.value)
+                        )
+                    else:
+                        container = self._resolve_builtin_container(iterable)
+                        candidates = [
+                            *self._sequence_container_element_bindings(container),
+                            *self._unordered_container_element_bindings(container),
+                        ]
                     if candidates:
                         self._bind_target_from_container_candidates(target, candidates)
                         return
