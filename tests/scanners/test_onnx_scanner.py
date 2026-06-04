@@ -1894,10 +1894,10 @@ class TestRawDetectorCoverage:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         model_path = create_onnx_model(tmp_path)
-        leaked_secret = "JIT_DETECTOR_SECRET_123456"
+        leaked_secret = "UNSTRUCTURED-ONNX-JIT-SECRET-123456"
 
         def _raise_analysis_failure(self: JITScriptDetector, *_args: Any, **_kwargs: Any) -> list[Any]:
-            raise RuntimeError(f"jit detector unavailable: token={leaked_secret}")
+            raise RuntimeError(f"jit detector rejected {leaked_secret}")
 
         monkeypatch.setattr(JITScriptDetector, "scan_model", _raise_analysis_failure)
 
@@ -1917,10 +1917,10 @@ class TestRawDetectorCoverage:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         model_path = create_onnx_model(tmp_path)
-        leaked_secret = "NETWORK_DETECTOR_SECRET_123456"
+        leaked_secret = "UNSTRUCTURED-ONNX-NETWORK-SECRET-123456"
 
         def _raise_analysis_failure(self: NetworkCommDetector, *_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
-            raise RuntimeError(f"network detector unavailable: token={leaked_secret}")
+            raise RuntimeError(f"network detector rejected {leaked_secret}")
 
         monkeypatch.setattr(NetworkCommDetector, "scan", _raise_analysis_failure)
 

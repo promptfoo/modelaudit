@@ -1,6 +1,10 @@
 """Tests for scanner evidence redaction helpers."""
 
-from modelaudit.scanners._evidence_redaction import REDACTED_EVIDENCE_VALUE, redact_evidence_string
+from modelaudit.scanners._evidence_redaction import (
+    REDACTED_EVIDENCE_VALUE,
+    redact_evidence_string,
+    redact_untrusted_error_message,
+)
 
 
 def test_redacts_compound_credential_assignments() -> None:
@@ -54,3 +58,12 @@ def test_existing_token_assignment_redaction_still_applies() -> None:
 
     assert "CANONICALTOKEN123" not in redacted
     assert redacted == f"token={REDACTED_EVIDENCE_VALUE}"
+
+
+def test_untrusted_error_message_discards_mixed_secret_shapes() -> None:
+    leaked_secret = "UNSTRUCTURED-CREDENTIAL-MATERIAL-123456"
+
+    redacted = redact_untrusted_error_message(RuntimeError(f"token=KNOWN_TOKEN_123 detector rejected {leaked_secret}"))
+
+    assert redacted == REDACTED_EVIDENCE_VALUE
+    assert leaked_secret not in redacted

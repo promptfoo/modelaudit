@@ -24,7 +24,7 @@ from ..scanner_results import (
     mark_inconclusive_scan_result,
 )
 from ..utils.helpers.interrupt_handler import check_interrupted
-from ._evidence_redaction import redact_evidence_string
+from ._evidence_redaction import redact_untrusted_error_message
 from .rule_mapper import get_embedded_code_rule_code, get_network_rule_code, get_secret_rule_code
 
 # Progress tracking imports with circular dependency detection
@@ -578,7 +578,7 @@ class BaseScanner(ABC):
         }
         if error is not None:
             failure_details["exception_type"] = type(error).__name__
-            failure_details["exception"] = redact_evidence_string(str(error), max_chars=500)
+            failure_details["exception"] = redact_untrusted_error_message(error)
 
         failures = result.metadata.setdefault(RAW_DETECTOR_FAILURES_METADATA_KEY, [])
         if isinstance(failures, list) and len(failures) < 20:
@@ -627,51 +627,17 @@ class BaseScanner(ABC):
         Returns:
             Number of secrets detected
         """
-        if not enable_check or not self.config.get("check_secrets", True):
+        if not enable_check or not self._get_bool_config("check_secrets", True):
             return 0
 
         try:
-            from modelaudit.detectors.secrets import SecretsDetector
-
-            detector = SecretsDetector(self.config.get("secrets_config"))
-            findings = detector.scan_model_weights(data, context)
-
-            for finding in findings:
-                severity_map = {
-                    "CRITICAL": IssueSeverity.CRITICAL,
-                    "WARNING": IssueSeverity.WARNING,
-                    "INFO": IssueSeverity.INFO,
-                }
-                severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
-                secret_descriptor = str(
-                    finding.get("secret_type") or finding.get("type") or finding.get("message") or "embedded_secret"
-                )
-                secret_rule_code = get_secret_rule_code(secret_descriptor)
-
-                result.add_check(
-                    name="Embedded Secrets Detection",
-                    passed=False,
-                    message=finding.get("message", "Secret detected"),
-                    rule_code=secret_rule_code,
-                    severity=severity,
-                    location=finding.get("context", context),
-                    details=finding,
-                    why=finding.get("recommendation", "Remove sensitive data from model"),
-                )
-
-            # Add a passing check if no secrets were found
-            if not findings and context:
-                result.add_check(
-                    name="Embedded Secrets Detection",
-                    passed=True,
-                    message="No embedded secrets detected",
-                    location=context,
-                )
-
-            return len(findings)
-
+            findings = self.collect_embedded_secret_findings(
+                data,
+                context,
+                enable_check=enable_check,
+                raise_on_error=True,
+            )
         except ImportError:
-            # SecretsDetector not available, log as debug
             logger.debug("SecretsDetector not available, skipping secrets check")
             self._mark_raw_detector_analysis_incomplete(
                 result,
@@ -681,7 +647,7 @@ class BaseScanner(ABC):
             )
             return 0
         except Exception as e:
-            logger.warning("Error checking for embedded secrets: %s", redact_evidence_string(str(e), max_chars=500))
+            logger.warning("Error checking for embedded secrets: %s", redact_untrusted_error_message(e))
             self._mark_raw_detector_analysis_incomplete(
                 result,
                 detector="embedded_secrets",
@@ -689,6 +655,84 @@ class BaseScanner(ABC):
                 error=e,
             )
             return 0
+
+        return self.add_embedded_secret_findings(findings, result, context=context)
+
+    def collect_embedded_secret_findings(
+        self,
+        data: Any,
+        context: str = "",
+        enable_check: bool = True,
+        raise_on_error: bool = False,
+        max_findings: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Collect embedded secret findings without creating checks."""
+        if not enable_check or not self._get_bool_config("check_secrets", True):
+            return []
+
+        try:
+            from modelaudit.detectors.secrets import SecretsDetector
+
+            detector_config = self.config.get("secrets_config")
+            if max_findings is not None:
+                if detector_config is not None and not isinstance(detector_config, dict):
+                    raise TypeError("secrets_config must be a mapping")
+                detector_config = {**(detector_config or {}), "max_findings": max_findings}
+            detector = SecretsDetector(detector_config)
+            findings = detector.scan_model_weights(data, context)
+            return [dict(finding) for finding in findings]
+
+        except ImportError:
+            if raise_on_error:
+                raise
+            # SecretsDetector not available, log as debug
+            logger.debug("SecretsDetector not available, skipping secrets check")
+            return []
+        except Exception as e:
+            if raise_on_error:
+                raise
+            logger.warning("Error checking for embedded secrets: %s", redact_untrusted_error_message(e))
+            return []
+
+    def add_embedded_secret_findings(
+        self,
+        findings: list[dict[str, Any]],
+        result: ScanResult,
+        context: str = "",
+    ) -> int:
+        """Emit explicit embedded secret checks from detector findings and return the count."""
+        for finding in findings:
+            severity_map = {
+                "CRITICAL": IssueSeverity.CRITICAL,
+                "WARNING": IssueSeverity.WARNING,
+                "INFO": IssueSeverity.INFO,
+            }
+            severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+            secret_descriptor = str(
+                finding.get("secret_type") or finding.get("type") or finding.get("message") or "embedded_secret"
+            )
+            secret_rule_code = get_secret_rule_code(secret_descriptor)
+
+            result.add_check(
+                name="Embedded Secrets Detection",
+                passed=False,
+                message=finding.get("message", "Secret detected"),
+                rule_code=secret_rule_code,
+                severity=severity,
+                location=finding.get("context", context),
+                details=finding,
+                why=finding.get("recommendation", "Remove sensitive data from model"),
+            )
+
+        if not findings and context:
+            result.add_check(
+                name="Embedded Secrets Detection",
+                passed=True,
+                message="No embedded secrets detected",
+                location=context,
+            )
+
+        return len(findings)
 
     def collect_jit_script_findings(
         self,
@@ -749,7 +793,7 @@ class BaseScanner(ABC):
         except Exception as e:
             if raise_on_error:
                 raise
-            logger.warning("Error checking for JIT/Script code: %s", redact_evidence_string(str(e), max_chars=500))
+            logger.warning("Error checking for JIT/Script code: %s", redact_untrusted_error_message(e))
             if result is not None:
                 self._mark_raw_detector_analysis_incomplete(
                     result,
@@ -870,7 +914,7 @@ class BaseScanner(ABC):
             )
             return 0
         except Exception as e:
-            logger.warning("Error checking for JIT/Script code: %s", redact_evidence_string(str(e), max_chars=500))
+            logger.warning("Error checking for JIT/Script code: %s", redact_untrusted_error_message(e))
             self._mark_raw_detector_analysis_incomplete(
                 result,
                 detector="jit_script",
@@ -916,6 +960,14 @@ class BaseScanner(ABC):
                 recommendation = getattr(finding, "recommendation", "Review JIT/Script code for security")
                 details = finding.__dict__ if hasattr(finding, "__dict__") else {"object": str(finding)}
 
+            finding_details = details.get("details") if isinstance(details, dict) else None
+            if isinstance(finding_details, dict) and finding_details.get("analysis_incomplete"):
+                reason = finding_details.get("reason")
+                mark_inconclusive_scan_result(
+                    result,
+                    reason if isinstance(reason, str) and reason else "jit_script_analysis_incomplete",
+                )
+
             jit_indicator = f"{details.get('type', '')} {message} {model_type}".strip()
             jit_rule_code = get_embedded_code_rule_code(jit_indicator)
             if not jit_rule_code:
@@ -949,6 +1001,7 @@ class BaseScanner(ABC):
         context: str = "",
         enable_check: bool = True,
         raise_on_error: bool = False,
+        max_findings: int | None = None,
         result: ScanResult | None = None,
     ) -> list[dict]:
         """Collect network communication findings without creating checks.
@@ -962,13 +1015,18 @@ class BaseScanner(ABC):
         Returns:
             List of findings
         """
-        if not enable_check or not self.config.get("check_network_comm", True):
+        if not enable_check or not self._get_bool_config("check_network_comm", True):
             return []
 
         try:
             from modelaudit.detectors.network_comm import NetworkCommDetector
 
-            detector = NetworkCommDetector(self.config.get("network_comm_config"))
+            detector_config = self.config.get("network_comm_config")
+            if max_findings is not None:
+                if detector_config is not None and not isinstance(detector_config, dict):
+                    raise TypeError("network_comm_config must be a mapping")
+                detector_config = {**(detector_config or {}), "max_findings": max_findings}
+            detector = NetworkCommDetector(detector_config)
             findings = detector.scan(data, context)
             return findings
 
@@ -987,9 +1045,7 @@ class BaseScanner(ABC):
         except Exception as e:
             if raise_on_error:
                 raise
-            logger.warning(
-                "Error checking for network communication: %s", redact_evidence_string(str(e), max_chars=500)
-            )
+            logger.warning("Error checking for network communication: %s", redact_untrusted_error_message(e))
             if result is not None:
                 self._mark_raw_detector_analysis_incomplete(
                     result,
@@ -1100,7 +1156,7 @@ class BaseScanner(ABC):
         Returns:
             Number of network communication patterns detected
         """
-        if not enable_check or not self.config.get("check_network_comm", True):
+        if not enable_check or not self._get_bool_config("check_network_comm", True):
             return 0
 
         try:
@@ -1121,9 +1177,7 @@ class BaseScanner(ABC):
             )
             return 0
         except Exception as e:
-            logger.warning(
-                "Error checking for network communication: %s", redact_evidence_string(str(e), max_chars=500)
-            )
+            logger.warning("Error checking for network communication: %s", redact_untrusted_error_message(e))
             self._mark_raw_detector_analysis_incomplete(
                 result,
                 detector="network_communication",

@@ -31,6 +31,7 @@ def exponential_backoff(
     exponential_base: float = 2.0,
     jitter: bool = True,
     retry_on: tuple[type[Exception], ...] | None = None,
+    do_not_retry_on: tuple[type[Exception], ...] | None = None,
     verbose: bool = False,
     sanitize_error: Callable[[Exception], object] | None = None,
 ) -> Callable[..., T]:
@@ -45,6 +46,7 @@ def exponential_backoff(
         exponential_base: Base for exponential backoff calculation
         jitter: Add random jitter to delays to prevent thundering herd
         retry_on: Tuple of exception types to retry on (None = all exceptions)
+        do_not_retry_on: Tuple of exception types that must fail immediately
         verbose: Show retry messages to user
 
     Returns:
@@ -59,6 +61,9 @@ def exponential_backoff(
             try:
                 return func(*args, **kwargs)
             except Exception as e:
+                if do_not_retry_on and isinstance(e, do_not_retry_on):
+                    raise
+
                 # Check if we should retry this exception
                 if retry_on and not isinstance(e, retry_on):
                     raise
@@ -107,6 +112,7 @@ def retry_with_backoff(
     exponential_base: float = 2.0,
     jitter: bool = True,
     retry_on: tuple[type[Exception], ...] | None = None,
+    do_not_retry_on: tuple[type[Exception], ...] | None = None,
     verbose: bool = False,
     sanitize_error: Callable[[Exception], object] | None = None,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
@@ -129,6 +135,7 @@ def retry_with_backoff(
             exponential_base=exponential_base,
             jitter=jitter,
             retry_on=retry_on,
+            do_not_retry_on=do_not_retry_on,
             verbose=verbose,
             sanitize_error=sanitize_error,
         )

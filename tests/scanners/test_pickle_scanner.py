@@ -330,11 +330,12 @@ def test_pickle_raw_secret_detector_exception_marks_scan_inconclusive(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     path = tmp_path / "secret-detector-error.pkl"
+    cache_dir = tmp_path / "cache"
     path.write_bytes(pickle.dumps({"api_key": "sk-" + ("A" * 48)}, protocol=4))
-    leaked_secret = "SUPER_SECRET_123456"
+    leaked_secret = "UNSTRUCTURED-PICKLE-SECRET-123456"
 
     def raise_detector_error(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
-        raise RuntimeError(f"secret detector failed: token={leaked_secret}")
+        raise RuntimeError(f"secret detector rejected {leaked_secret}")
 
     monkeypatch.setattr("modelaudit.detectors.secrets.SecretsDetector.scan_model_weights", raise_detector_error)
 
@@ -355,6 +356,23 @@ def test_pickle_raw_secret_detector_exception_marks_scan_inconclusive(
     assert leaked_secret not in str(coverage_checks[0].details)
     assert leaked_secret not in caplog.text
     assert "<redacted>" in str(result.metadata)
+
+    reset_cache_manager()
+    try:
+        aggregate = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        metadata = aggregate.file_metadata[str(path)]
+
+        assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "raw_detector_analysis_incomplete" in metadata["scan_outcome_reasons"]
+        assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_pickle_raw_jit_detector_exception_marks_scan_inconclusive(

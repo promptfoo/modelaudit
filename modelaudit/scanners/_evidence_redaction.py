@@ -123,3 +123,8 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_ASSIGNMENT_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     return _truncate(redacted, max_chars)
+
+
+def redact_untrusted_error_message(_error: BaseException | str) -> str:
+    """Discard detector exception text that may contain attacker-controlled model content."""
+    return REDACTED_EVIDENCE_VALUE

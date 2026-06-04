@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from ..utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
-from ._evidence_redaction import redact_evidence_string
+from ._evidence_redaction import redact_untrusted_error_message
 from .base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger("modelaudit.scanners")
@@ -516,7 +516,7 @@ class OnnxScanner(BaseScanner):
                         raise_on_error=True,
                     )
                 except Exception as e:
-                    redacted_error = redact_evidence_string(str(e), max_chars=500)
+                    redacted_error = redact_untrusted_error_message(e)
                     logger.warning("ONNX JIT/script detector analysis failed: %s", redacted_error)
                     self._mark_raw_detection_incomplete(
                         result,
@@ -545,7 +545,7 @@ class OnnxScanner(BaseScanner):
                         raise_on_error=True,
                     )
                 except Exception as e:
-                    redacted_error = redact_evidence_string(str(e), max_chars=500)
+                    redacted_error = redact_untrusted_error_message(e)
                     logger.warning("ONNX network detector analysis failed: %s", redacted_error)
                     self._mark_raw_detection_incomplete(
                         result,
