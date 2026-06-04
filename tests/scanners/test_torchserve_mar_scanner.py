@@ -1624,6 +1624,29 @@ def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
         ),
         (b"def handle(data, context):\n    return any(call() for call in [lambda: True, __import__('os').system])\n"),
         (b"def handle(data, context):\n    return all(call() for call in [lambda: False, __import__('os').system])\n"),
+        (b"def handle(data, context):\n    return (lambda module: module.system('id'))()\n"),
+        (b"def handle(data, context):\n    return [__import__('os').system][1]('id')\n"),
+        (
+            b"class Handler:\n"
+            b"    module = __import__('os')\n"
+            b"\n"
+            b"    @staticmethod\n"
+            b"    def handle(data, context):\n"
+            b"        return self.module.system('id')\n"
+        ),
+        (
+            b"class Handler:\n"
+            b"    module = __import__('os')\n"
+            b"    module = __import__('math')\n"
+            b"\n"
+            b"    def handle(self, data, context):\n"
+            b"        return self.module.system('id')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    vars = lambda value: {'system': lambda command: None}\n"
+            b"    return vars(__import__('os'))['system']('id')\n"
+        ),
     ],
 )
 def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
@@ -1822,6 +1845,19 @@ def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
         ),
         (b"def handle(data, context):\n    return any(call() for call in [lambda: False, __import__('os').system])\n"),
         (b"def handle(data, context):\n    return all(call() for call in [lambda: True, __import__('os').system])\n"),
+        (b"def handle(data, context):\n    return (load := __import__)('os').system('id')\n"),
+        (b"def handle(data, context):\n    return (lambda module: module.system('id'))(__import__('os'))\n"),
+        (b"def handle(data, context):\n    return __import__(f'os').system('id')\n"),
+        (b"def handle(data, context):\n    return [__import__('os').system][0]('id')\n"),
+        (
+            b"class Handler:\n"
+            b"    def handle(self, data, context):\n"
+            b"        return self.module.system('id')\n"
+            b"\n"
+            b"    module = __import__('os')\n"
+        ),
+        (b"class Handler(object, marker=__import__('os').system('id')):\n    pass\n"),
+        (b"def handle(data, context):\n    return vars(__import__('os'))['system']('id')\n"),
     ],
 )
 def test_dynamic_import_handler_analysis_preserves_reachable_aliases(
