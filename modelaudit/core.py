@@ -1323,6 +1323,7 @@ def scan_model_directory_or_file(
                         _finish_phase_timing(phase_timings, "result_merge", result_merge_started_at)
 
                         if max_total_size > 0 and results.bytes_scanned > max_total_size:
+                            aggregate_hash_complete = False
                             _add_issue_to_model(
                                 results,
                                 f"Total scan size limit exceeded: {results.bytes_scanned} bytes "
@@ -1443,6 +1444,7 @@ def scan_model_directory_or_file(
                         results.file_metadata[target] = FileMetadataModel(**license_metadata)
 
                 if max_total_size > 0 and results.bytes_scanned > max_total_size:
+                    aggregate_hash_complete = False
                     _add_issue_to_model(
                         results,
                         f"Total scan size limit exceeded: {results.bytes_scanned} bytes (max: {max_total_size})",
@@ -2456,6 +2458,7 @@ def scan_model_streaming(
 
                 files_processed += 1
                 if max_total_size > 0 and results.bytes_scanned > max_total_size:
+                    aggregate_hash_complete = False
                     _add_issue_to_model(
                         results,
                         f"Total scan size limit exceeded: {results.bytes_scanned} bytes (max: {max_total_size})",

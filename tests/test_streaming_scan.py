@@ -786,6 +786,8 @@ def test_scan_model_streaming_fails_closed_after_max_total_size(
 ) -> None:
     payload = tmp_path / "oversized.pkl"
     payload.write_bytes(pickle.dumps({"safe": True}) + b"X" * 128)
+    later = tmp_path / "later.pkl"
+    later.write_bytes(pickle.dumps({"safe": "later"}))
     scan_result = ScanResult(scanner_name="bounded_test")
     scan_result.bytes_scanned = 128
     scan_result.finish(success=True)
@@ -800,7 +802,7 @@ def test_scan_model_streaming_fails_closed_after_max_total_size(
     monkeypatch.setattr("modelaudit.core.scan_file", lambda _path, **_kwargs: scan_result)
 
     result = scan_model_streaming(
-        file_generator=iter([(payload, True)]),
+        file_generator=iter([(payload, False), (later, True)]),
         timeout=30,
         delete_after_scan=False,
         max_total_size=64,
@@ -812,6 +814,7 @@ def test_scan_model_streaming_fails_closed_after_max_total_size(
     assert result.success is False
     assert determine_exit_code(result) == 2
     assert any(issue.message.startswith("Total scan size limit exceeded") for issue in result.issues)
+    assert result.content_hash is None
 
 
 def test_scan_model_streaming_stops_hashing_at_max_total_size(

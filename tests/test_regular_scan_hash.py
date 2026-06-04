@@ -460,6 +460,39 @@ class TestHashGenerationEdgeCases:
         assert determine_exit_code(result) == 2
         assert any(issue.message.startswith("File too large to scan") for issue in result.issues)
 
+    def test_directory_scan_omits_content_hash_when_expanded_scan_bytes_exceed_limit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A scan stopped by expanded bytes must not publish its precomputed aggregate hash."""
+        from modelaudit import core
+        from modelaudit.scanner_results import ScanResult
+
+        first = tmp_path / "first.pkl"
+        first.write_bytes(b"A")
+        second = tmp_path / "second.pkl"
+        second.write_bytes(b"B")
+        scanned_paths: list[str] = []
+
+        def expanded_scan(path: str, _config: dict[str, object]) -> ScanResult:
+            scanned_paths.append(path)
+            scan_result = ScanResult(scanner_name="bounded_test")
+            scan_result.bytes_scanned = 128
+            scan_result.finish(success=True)
+            return scan_result
+
+        monkeypatch.setattr(core, "scan_file", expanded_scan)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            max_total_size=64,
+            cache_enabled=False,
+        )
+
+        assert scanned_paths == [str(first)]
+        assert result.content_hash is None
+        assert determine_exit_code(result) == 2
+        assert any(issue.message.startswith("Total scan size limit exceeded") for issue in result.issues)
+
     def test_single_file_scan_fails_closed_after_max_total_size(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -493,6 +526,7 @@ class TestHashGenerationEdgeCases:
         assert determine_exit_code(result) == 2
         assert any(issue.message.startswith("Total scan size limit exceeded") for issue in result.issues)
         assert result.has_errors is True
+        assert result.content_hash is None
 
     def test_unhashable_files_excluded_from_hash(self, tmp_path, monkeypatch):
         """Test that files failing to hash are excluded from aggregate hash."""
