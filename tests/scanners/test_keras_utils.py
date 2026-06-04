@@ -1,8 +1,15 @@
 """Tests for shared Keras scanner helpers."""
 
+import json
 import marshal
 
+import pytest
+
+from modelaudit.scanners import keras_utils
+from modelaudit.scanners.base import ScanResult
 from modelaudit.scanners.keras_utils import (
+    check_lambda_list_function,
+    check_subclassed_model,
     find_case_insensitive_substrings,
     find_lambda_dangerous_patterns,
     is_known_safe_keras_layer_class,
@@ -90,3 +97,38 @@ def test_known_safe_keras_layer_class_rejects_non_public_or_untrusted_qualified_
         "myproject.keras.layers.Dense",
     ):
         assert not is_known_safe_keras_layer_class(layer_class)
+
+
+def test_lambda_list_findings_redact_layer_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret = "LAMBDA_LAYER_SECRET"
+    layer_name = f"token={secret}"
+
+    missing_code_result = ScanResult("keras_test")
+    assert check_lambda_list_function([], missing_code_result, "model.h5", layer_name)
+
+    monkeypatch.setattr(keras_utils, "_MAX_LAMBDA_CODE_B64_CHARS", 4)
+    oversized_code_result = ScanResult("keras_test")
+    assert check_lambda_list_function(["AAAAA"], oversized_code_result, "model.h5", layer_name)
+
+    serialized = json.dumps(
+        [
+            *[check.model_dump() for check in missing_code_result.checks],
+            *[check.model_dump() for check in oversized_code_result.checks],
+        ],
+        default=str,
+    )
+    assert secret not in serialized
+    assert "token=<redacted>" in serialized
+
+
+def test_subclassed_model_finding_redacts_secret_assignment_without_redacting_identifier_words() -> None:
+    secret = "MODEL_CLASS_SECRET"
+    secret_result = ScanResult("keras_test")
+    check_subclassed_model(f"token={secret}", secret_result, "model.keras")
+
+    benign_result = ScanResult("keras_test")
+    check_subclassed_model("CustomTokenLayer", benign_result, "model.keras")
+
+    assert secret_result.checks[0].details["model_class"] == "token=<redacted>"
+    assert secret not in secret_result.checks[0].message
+    assert benign_result.checks[0].details["model_class"] == "CustomTokenLayer"

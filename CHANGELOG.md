@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - skip cache writes when a scanned file changes before result storage
+- scan padded TensorFlow SavedModel protobuf scalar and repeated string attributes past the legacy 10 KB injection-check window
+- mark malformed SavedModel `keras_metadata.pb` analysis as inconclusive instead of a clean scan
+- fail closed on pickle protocol 5 `NEXT_BUFFER` opcodes instead of reporting clean coverage
+- bound `keras_metadata.pb` parsing in SavedModel scans, fail closed when the budget is exceeded, and continue analysis when a system hash policy disables MD5
+- fail closed when structurally recognized Keras ZIP scanners are unavailable while retaining generic ZIP security findings
+- redact sensitive decoded previews in TensorFlow SavedModel collection, PyFunc, and Keras metadata findings
 - fail closed on novel standalone picklescan import/callable metadata truncation without masking operational read errors or repeated benign imports
 - skip scan-result caching for sampled large-file fingerprints
 - classify high-confidence active code patterns in PyTorch binary artifacts as security findings so scan exits reflect them
@@ -20,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - scan ONNX external data references in sparse initializers, tensor-valued attributes, and function defaults
 - avoid false-positive process-launch findings for parsed framed Python string literals
 - detect dangerous Python calls retrieved through module namespace dictionaries in ZIP and TAR members
+- fail closed when executable ZIP subtype scanners are unavailable
+- reject local, plaintext, and redirecting JFrog credential targets
 - detect embedded Python `os.exec*`, `os.spawn*`, `os.posix_spawn*`, and `os.startfile` process-launch calls in archives and JIT-scanned content
 - detect embedded Python `asyncio.create_subprocess_*` calls and resolved JIT `subprocess` launch aliases
 - detect embedded Python `runpy.run_module`, `runpy.run_path`, and `runpy._run_module_as_main` dynamic-module execution calls
@@ -56,7 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
 - redact compound credential names and malformed userinfo URLs in scanner evidence
 - restrict JFrog credential forwarding to explicitly trusted HTTPS hosts
-- block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
+- block weight distribution `torch.load` on PyTorch prerelease, dev, and unknown versions before deserialization while preserving final, local, and PEP 440 post-release patched builds
+- fail closed on unverified Keras ZIP `StringLookup` vocabulary paths and redact remote URL evidence
 - fail closed when cloud directory metadata cannot be read for every listed object
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
 - fail closed on interpolation-bearing NeMo Hydra `_target_` selectors whose resolved callable cannot be verified
@@ -94,8 +103,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - scan decompressed Python and content-disguised executable payloads through bounded security checks without caching ephemeral inner files
 - detect executable PyTorch ZIP sidecars hidden behind ordinary filenames while excluding raw tensor-storage bytes
 - scan 7-Zip Python members and content-disguised executable sidecars through shared archive security checks
+- detect structurally valid executable payloads throughout PyTorch binary files while bounding context analysis and findings
 - skip non-numeric weight metadata and report incomplete weight-distribution analysis accurately
 - classify unavailable Paddle, NumPy, PyTorch binary, and SavedModel reads as inconclusive rather than security findings
+- fail closed when scanner selection disables required NumPy object-dtype embedded pickle analysis
 - classify unavailable CoreML, SafeTensors, and TensorRT reads as inconclusive rather than security findings
 - classify unavailable TensorFlow MetaGraph reads as operational errors rather than security findings, including stale cache transitions
 - classify unavailable CNTK and LightGBM reads as inconclusive rather than security findings
