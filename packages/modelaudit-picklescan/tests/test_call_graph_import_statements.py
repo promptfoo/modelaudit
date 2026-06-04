@@ -200,10 +200,6 @@ def test_trusted_origin_recognizes_uv_environment_overlay(
     (site_packages / "_pytest" / "__init__.py").write_text("", encoding="utf-8")
     (package_dir / "__init__.py").write_text("", encoding="utf-8")
     (package_dir / "path.py").write_text("class LocalPath:\n    pass\n", encoding="utf-8")
-    dist_info = site_packages / "pytest-1.0.dist-info"
-    dist_info.mkdir()
-    (dist_info / "METADATA").write_text("Name: pytest\nVersion: 1.0\n", encoding="utf-8")
-    (dist_info / "top_level.txt").write_text("_pytest\n", encoding="utf-8")
     monkeypatch.syspath_prepend(str(site_packages))
     call_graph._clear_source_sensitive_caches()
 

@@ -749,7 +749,7 @@ def _trusted_module_origin_kind(module_name: str) -> str | None:
         origin = Path(spec.origin).resolve()
     except (OSError, RuntimeError, ValueError):
         return None
-    if any(origin.is_relative_to(path) for path in _TRUSTED_SITE_PACKAGE_PATHS):
+    if _path_is_in_trusted_package_environment(origin):
         return "site_packages"
     top_level_name = parts[0]
     if any(origin.is_relative_to(path) for path in _installed_distribution_roots(top_level_name)):
