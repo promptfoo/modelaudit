@@ -3490,7 +3490,7 @@ class TestCVE202523304HydraTarget:
 
     @pytest.mark.parametrize(
         "target",
-        ["${target_value}", "${oc.select:target_value,{}}"],
+        ["${target_value}", r"\${target_value}", "${oc.select:target_value,{}}"],
     )
     def test_interpolated_target_fails_aggregate_scan(self, tmp_path: Path, target: str) -> None:
         """A dynamic Hydra callable selector should produce aggregate exit 1."""
@@ -3524,21 +3524,21 @@ class TestCVE202523304HydraTarget:
         )
 
     @pytest.mark.parametrize("target", [r"\${safe_target}", r"prefix\\\${safe_target}"])
-    def test_escaped_interpolation_like_target_remains_review_only(self, tmp_path: Path, target: str) -> None:
-        """Odd-backslash OmegaConf escapes are literals rather than dynamic callable selectors."""
+    def test_escaped_interpolation_like_target_fails_closed(self, tmp_path: Path, target: str) -> None:
+        """Escaped selectors can become active after repeated OmegaConf/Hydra resolution passes."""
         config = {"safe_target": "nemo.Model", "model": {"_target_": target}}
         path = _create_nemo_file(tmp_path, config)
 
         result = NemoScanner().scan(str(path))
 
-        assert not any(check.name == "CVE-2025-23304: Interpolated Hydra _target_" for check in result.checks)
         assert any(
-            check.name == "Hydra _target_ Review"
+            check.name == "CVE-2025-23304: Interpolated Hydra _target_"
             and check.status == CheckStatus.FAILED
-            and check.severity == IssueSeverity.INFO
+            and check.severity == IssueSeverity.CRITICAL
             and check.details.get("target") == target
             for check in result.checks
         )
+        assert not any(check.name == "Hydra _target_ Review" for check in result.checks)
 
     def test_interpolated_target_diagnostics_redact_and_bound_config_evidence(self, tmp_path: Path) -> None:
         """Interpolation findings should not retain unbounded secret-bearing config strings."""

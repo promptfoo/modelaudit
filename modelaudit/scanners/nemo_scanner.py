@@ -161,7 +161,7 @@ _SUSPICIOUS_TARGET_PATTERNS = (
     "vars",
 )
 _TARGET_TOKEN_RE = re.compile(r"__import__|[A-Z]+(?=[A-Z][a-z0-9]|[0-9_]|$)|[A-Z]?[a-z0-9]+")
-_UNESCAPED_HYDRA_INTERPOLATION_RE = re.compile(r"(?<!\\)(?:\\\\)*\$\{")
+_HYDRA_INTERPOLATION_OPENER = "${"
 _NEMO_MAX_CONFIG_EVIDENCE_CHARS = 256
 
 CVE_2025_23304_ID = "CVE-2025-23304"
@@ -2166,7 +2166,8 @@ class NemoScanner(BaseScanner):
         target_config: dict[str, Any] | None = None,
     ) -> None:
         """Evaluate a single _target_ value for dangerous patterns."""
-        if _UNESCAPED_HYDRA_INTERPOLATION_RE.search(target):
+        # Escaped interpolation openers can become active after repeated OmegaConf/Hydra resolution passes.
+        if _HYDRA_INTERPOLATION_OPENER in target:
             self._add_interpolated_target_check(target, config_path, config_name, archive_path, result)
             return
 
@@ -2257,7 +2258,7 @@ class NemoScanner(BaseScanner):
             message=(
                 f"{CVE_2025_23304_ID}: Interpolated _target_ "
                 f"'{display_target}' at {display_config_path} in {display_config_name} "
-                "can resolve to a dangerous callable at load time"
+                "cannot be statically verified as a safe callable"
             ),
             severity=IssueSeverity.CRITICAL,
             location=f"{archive_path}:{display_config_name}",
@@ -2272,7 +2273,8 @@ class NemoScanner(BaseScanner):
                 "remediation": CVE_2025_23304_REMEDIATION,
             },
             why=(
-                "Hydra and OmegaConf resolve interpolation expressions before instantiating _target_. "
+                "Hydra and OmegaConf can resolve interpolation expressions, including escaped forms across "
+                "repeated resolution passes, before instantiating _target_. "
                 "A static scan cannot prove this dynamic callable selector is safe, so the scanner fails closed."
             ),
         )
