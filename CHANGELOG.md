@@ -54,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - block weight distribution `torch.load` on PyTorch prerelease and unknown versions before deserialization
 - fail closed when cloud directory metadata cannot be read for every listed object
 - treat prereleases of fixed Keras ZIP CVE-2026-1669 versions as vulnerable
+- fail closed on interpolation-bearing NeMo Hydra `_target_` selectors whose resolved callable cannot be verified
 - scan and globally bound Keras ZIP wrapper-owned nested layers while preserving custom namespace warnings
 - detect external references in weights-only Keras HDF5 layouts without Keras metadata
 - bound standalone Keras HDF5 layout and external-reference analysis, and distrust artifact-controlled versions
