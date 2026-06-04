@@ -1386,6 +1386,9 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
     list_secret = "H5_LIST_SECRET"
     invalid_secret = "H5_INVALID_SECRET"
     pycompile_secret = "H5_PYCOMPILE_SECRET"
+    layer_name_secret = "H5_LAYER_NAME_SECRET"
+    dangerous_module_secret = "H5_DANGEROUS_MODULE_SECRET"
+    safe_module_secret = "H5_SAFE_MODULE_SECRET"
 
     dict_code = compile(
         f"client_secret = '{dict_secret}'\nimport os\nos.system('id')",
@@ -1409,7 +1412,7 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
                     {
                         "class_name": "Lambda",
                         "config": {
-                            "name": "direct_lambda",
+                            "name": f"direct_lambda?token={layer_name_secret}",
                             "function": f"lambda x: (eval('1'), '{direct_secret}', x)[-1]",
                         },
                     },
@@ -1439,6 +1442,22 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
                         "config": {
                             "name": "pycompile_invalid_lambda",
                             "function": f"return '{pycompile_secret}'  # exec",
+                        },
+                    },
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "dangerous_module_lambda",
+                            "module": f"os?token={dangerous_module_secret}",
+                            "function_name": "system",
+                        },
+                    },
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "safe_module_lambda",
+                            "module": f"math?token={safe_module_secret}",
+                            "function_name": "sqrt",
                         },
                     },
                 ],
@@ -1473,7 +1492,16 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
     json_output = audit_result.model_dump_json(indent=2, exclude_none=True)
     sarif_output = format_sarif_output(audit_result, [str(model_path)])
 
-    for secret in (direct_secret, dict_secret, list_secret, invalid_secret, pycompile_secret):
+    for secret in (
+        direct_secret,
+        dict_secret,
+        list_secret,
+        invalid_secret,
+        pycompile_secret,
+        layer_name_secret,
+        dangerous_module_secret,
+        safe_module_secret,
+    ):
         assert secret not in json_output
         assert secret not in sarif_output
 

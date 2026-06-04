@@ -23,6 +23,7 @@ from ..config.explanations import (
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
+from ._evidence_redaction import redact_evidence_string, redact_evidence_value
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
@@ -792,7 +793,9 @@ class KerasH5Scanner(BaseScanner):
                     raw_layer_name = layer.get("name")
                     if not raw_layer_name and isinstance(layer_config, dict):
                         raw_layer_name = layer_config.get("name")
-                    layer_name = raw_layer_name or f"lambda_{layer_counts.get('Lambda', 1)}"
+                    layer_name = redact_evidence_string(
+                        str(raw_layer_name or f"lambda_{layer_counts.get('Lambda', 1)}")
+                    )
                     self._check_lambda_layer(layer_config, result)
                     keras_version = result.metadata.get("keras_version")
 
@@ -1115,16 +1118,21 @@ class KerasH5Scanner(BaseScanner):
         if has_module_reference or has_invalid_module_reference:
             # Module/function reference - check for dangerous imports
             if self._is_lambda_module_reference_dangerous(module_name, function_name):
+                redacted_module_name = redact_evidence_value(module_name)
+                redacted_function_name = redact_evidence_value(function_name)
                 result.add_check(
                     name="Lambda Layer Module Reference Check",
                     passed=False,
-                    message=f"Lambda layer references potentially dangerous module: {module_name}",
+                    message=(
+                        "Lambda layer references potentially dangerous module: "
+                        f"{redact_evidence_string(str(module_name))}"
+                    ),
                     severity=IssueSeverity.CRITICAL,
                     location=self.current_file_path,
                     details={
                         "layer_class": "Lambda",
-                        "module": module_name,
-                        "function": function_name,
+                        "module": redacted_module_name,
+                        "function": redacted_function_name,
                     },
                     why=get_pattern_explanation("lambda_layer"),
                     rule_code="S1103",
@@ -1153,8 +1161,8 @@ class KerasH5Scanner(BaseScanner):
                     location=self.current_file_path,
                     details={
                         "layer_class": "Lambda",
-                        "module": module_name,
-                        "function": function_name,
+                        "module": redact_evidence_value(module_name),
+                        "function": redact_evidence_value(function_name),
                     },
                     rule_code=None,  # Passing check
                 )
